@@ -1367,6 +1367,13 @@ impl FrontendQuerySession {
             optimizer_settings,
             sql_semantics.clone(),
         ));
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            preparation_scope,
+            preparation_window.as_ref().expect("preparation validated its window").clone(),
+        ).map_err(|error| GovernedPreparationError::Service(internal_error(error.to_string())))?;
+        let context = context.with_result_capacity(capacity).map_err(|error| {
+            GovernedPreparationError::Service(internal_error(error.to_string()))
+        })?;
         let query_options = with_query_hints(
             query_options_from_session_settings(&execution_settings),
             &sql_semantics,
@@ -1916,6 +1923,25 @@ impl FrontendQuerySession {
         let add_files_engine = Arc::clone(&self.service.add_files_engine);
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
+        let window = match statement.result_window_alias() {
+            Some(window) => window,
+            None => {
+                return Ok(self.governed_typed_error(
+                    internal_error("typed statement has no admitted result capacity"),
+                    statement,
+                ));
+            }
+        };
+        let capacity = match novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(statement.scope(), window) {
+            Ok(capacity) => capacity,
+            Err(error) => return Ok(self.governed_typed_error(internal_error(error.to_string()), statement)),
+        };
+        let context = match context.with_result_capacity(capacity) {
+            Ok(context) => context,
+            Err(error) => {
+                return Ok(self.governed_typed_error(internal_error(error.to_string()), statement));
+            }
+        };
         let query_options = with_query_hints(
             query_options_from_session_settings(&execution_settings),
             &sql_semantics,

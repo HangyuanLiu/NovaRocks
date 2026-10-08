@@ -215,6 +215,8 @@ struct FrontendDistributedAttemptFactory {
     /// Catalog observation, scan negotiation, or native template encoder.
     logical_execution: Arc<crate::query_execution::contract::RestartableReadExecution>,
     statement: StatementAdmissionContext,
+    result_capacity:
+        Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
     profile_plan: Arc<novarocks_physical_plan::PhysicalPlan>,
     profile_annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
     planning_started_at: std::time::Instant,
@@ -226,7 +228,17 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
         &mut self,
         topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
-        let execution = self.statement.for_topology(topology);
+        let mut execution = self.statement.for_topology(topology);
+        if let Some(binding) = &self.result_capacity {
+            execution = execution
+                .with_result_capacity(binding.clone())
+                .map_err(|error| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        error.to_string(),
+                    )
+                })?;
+        }
         let request = self
             .logical_execution
             .instantiate_attempt(execution.execution());
@@ -860,6 +872,7 @@ impl FrontendQueryCompiler {
             PreparedQueryDistributedOperation::new(request, completion, logical_reservation)
                 .with_attempt_factory(Box::new(FrontendDistributedAttemptFactory {
                     logical_execution,
+                    result_capacity: execution.result_capacity().cloned(),
                     statement: StatementAdmissionContext::new(
                         current_catalog.map(str::to_string),
                         current_database.to_string(),

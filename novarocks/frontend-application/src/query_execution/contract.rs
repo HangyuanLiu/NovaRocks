@@ -206,6 +206,7 @@ pub enum DistributedQueryIntent {
 /// capabilities.
 pub struct DistributedQueryRequest {
     result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+    result_scope: Option<novarocks_workload_control::WorkScope>,
     cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
     payload: DistributedQueryPayload,
     topology: novarocks_query_application::api::BackendTopologySnapshot,
@@ -250,7 +251,12 @@ impl RestartableReadExecution {
         execution: &QueryExecutionContext,
     ) -> DistributedQueryRequest {
         DistributedQueryRequest {
-            result_window: None,
+            result_window: execution
+                .result_capacity()
+                .map(|binding| binding.window_alias()),
+            result_scope: execution
+                .result_capacity()
+                .map(|binding| binding.scope().clone()),
             cow_match: None,
             payload: DistributedQueryPayload::RestartableRead(Arc::clone(self)),
             topology: execution.topology().clone(),
@@ -303,6 +309,13 @@ impl DistributedQueryRequest {
                 "distributed request already owns its result window",
             ));
         }
+        scope.check().map_err(|error| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?;
+        self.result_scope = Some(scope.clone());
         self.result_window = Some(window);
         Ok(self)
     }
@@ -374,6 +387,7 @@ impl DistributedQueryRequest {
         };
         DistributedQueryRequestParts {
             result_window: self.result_window,
+            result_scope: self.result_scope,
             cow_match: self.cow_match,
             description,
             artifacts,
@@ -393,6 +407,7 @@ impl DistributedQueryRequest {
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
     pub(crate) result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+    pub(crate) result_scope: Option<novarocks_workload_control::WorkScope>,
     pub(crate) cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
     pub description: Arc<FrozenExecutionDescription>,
     pub artifacts: PreparedDistributedQuery,
@@ -446,7 +461,12 @@ pub(crate) fn build_request_from_finalized_execution(
         }
     };
     Ok(DistributedQueryRequest {
-        result_window: None,
+        result_window: execution
+            .result_capacity()
+            .map(|binding| binding.window_alias()),
+        result_scope: execution
+            .result_capacity()
+            .map(|binding| binding.scope().clone()),
         cow_match: None,
         payload,
         topology: execution.topology().clone(),

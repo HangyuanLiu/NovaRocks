@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
+use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_execution_contract::{MaxWait, ResultByteLimit};
 use novarocks_native_adapter::FrontendTaskTransportBudget;
@@ -185,8 +186,6 @@ impl std::error::Error for FrontendApplicationError {}
 /// concrete: services may clone only the narrow capabilities below, never the
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
-use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
-
 struct FrontendExecutionRuntimeOwner {
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,

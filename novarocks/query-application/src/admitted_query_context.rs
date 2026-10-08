@@ -25,6 +25,7 @@ use crate::cancellation::QueryCancellationView;
 use crate::request_session::RequestSessionContext;
 use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
+use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
 
 /// All inputs accepted at the frontend statement-admission boundary.
 ///
@@ -139,6 +140,41 @@ impl StatementAdmissionContext {
     }
 }
 
+/// Exact runtime capacity supplied by admission. It is never projected into
+/// a completed plan, frozen semantic description, or native plan DTO.
+#[derive(Clone)]
+pub struct QueryResultCapacityBinding {
+    scope: WorkScope,
+    window: ResultWindowAlias,
+}
+impl QueryResultCapacityBinding {
+    pub fn try_new(scope: &WorkScope, window: ResultWindowAlias) -> Result<Self, WorkError> {
+        if !window.is_for_scope(scope) || window.class() == ResultWindowClass::Closing {
+            return Err(WorkError::Conflict);
+        }
+        scope.check()?;
+        Ok(Self {
+            scope: scope.clone(),
+            window,
+        })
+    }
+    pub fn scope(&self) -> &WorkScope {
+        &self.scope
+    }
+    pub fn window_alias(&self) -> ResultWindowAlias {
+        self.window.clone()
+    }
+    pub fn class(&self) -> ResultWindowClass {
+        self.window.class()
+    }
+
+    /// A nested stage keeps its parent's whole envelope, with exact child
+    /// attribution. No result-capacity admission is performed here.
+    pub fn for_child(&self, child: &WorkScope) -> Result<Self, WorkError> {
+        Self::try_new(child, self.window.for_child(child)?)
+    }
+}
+
 /// Execution inputs which must remain identical from planning through native
 /// coordinator submission.
 ///
@@ -148,6 +184,7 @@ impl StatementAdmissionContext {
 /// receive it as a parameter. Those consumers leave with CLS-R3 and CLS-R5.
 #[derive(Clone)]
 pub struct QueryExecutionContext {
+    result_capacity: Option<QueryResultCapacityBinding>,
     role: ClusterRole,
     topology: BackendTopologySnapshot,
     deadline: Option<Instant>,
@@ -172,6 +209,7 @@ impl QueryExecutionContext {
             optimizer_settings.effective_backend_count = Some(topology.targets().len() as f64);
         }
         Self {
+            result_capacity: None,
             role,
             topology,
             deadline,
@@ -179,6 +217,22 @@ impl QueryExecutionContext {
             optimizer_settings,
             sql_semantics,
         }
+    }
+
+    pub fn with_result_capacity(
+        mut self,
+        binding: QueryResultCapacityBinding,
+    ) -> Result<Self, WorkError> {
+        if self.result_capacity.is_some() {
+            return Err(WorkError::Conflict);
+        }
+        binding.scope().check()?;
+        self.result_capacity = Some(binding);
+        Ok(self)
+    }
+
+    pub fn result_capacity(&self) -> Option<&QueryResultCapacityBinding> {
+        self.result_capacity.as_ref()
     }
 
     pub const fn role(&self) -> ClusterRole {
@@ -245,6 +299,15 @@ impl RequestContext {
         statement.for_topology(admission.topology)
     }
 
+    /// Bind admission's runtime sidecar before source preparation begins.
+    pub fn with_result_capacity(
+        mut self,
+        binding: QueryResultCapacityBinding,
+    ) -> Result<Self, WorkError> {
+        self.execution = self.execution.with_result_capacity(binding)?;
+        Ok(self)
+    }
+
     pub fn session(&self) -> &RequestSessionContext {
         &self.session
     }
@@ -287,6 +350,132 @@ mod tests {
     use super::*;
     use crate::api::LiveBackendTarget;
     use crate::cancellation::QueryCancellationSource;
+
+    fn capacity_control() -> (
+        novarocks_workload_control::WorkloadControl,
+        novarocks_workload_control::ResultCapacityHandle,
+    ) {
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        (control, capacity)
+    }
+
+    #[test]
+    fn runtime_capacity_is_explicit_and_survives_execution_clones() {
+        use novarocks_workload_control::{WorkClass, WorkRequest};
+        let (control, capacity) = capacity_control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let context = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db1".to_string(),
+            ClusterRole::Fe,
+            topology(7, 3),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        ))
+        .with_result_capacity(
+            QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias())
+                .unwrap(),
+        )
+        .unwrap();
+        let execution = context.execution().clone();
+        assert!(
+            execution
+                .clone()
+                .with_result_capacity(execution.result_capacity().unwrap().clone(),)
+                .is_err()
+        );
+        let replacement = StatementAdmissionContext::new(
+            None,
+            "db1".to_string(),
+            execution.role(),
+            execution.deadline(),
+            execution.cancellation().clone(),
+            execution.optimizer_settings().clone(),
+            execution.sql_semantics().clone(),
+        )
+        .for_topology(topology(8, 1));
+        assert!(replacement.execution().result_capacity().is_none());
+        assert_eq!(
+            execution.result_capacity().unwrap().class(),
+            ResultWindowClass::Internal
+        );
+        drop(context);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(execution);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
+    fn runtime_capacity_rejects_foreign_scope_and_delegates_without_new_position() {
+        use novarocks_workload_control::{WorkClass, WorkRequest};
+        let (control, capacity) = capacity_control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let binding =
+            QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias())
+                .unwrap();
+        let (foreign, _) = capacity_control();
+        let other = foreign
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        assert!(
+            QueryResultCapacityBinding::try_new(&other.owner.scope(), window.retain_alias())
+                .is_err()
+        );
+        let child = root
+            .owner
+            .scope()
+            .child(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let delegated = binding.for_child(&child.scope()).unwrap();
+        assert!(delegated.window_alias().is_for_scope(&child.scope()));
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(binding);
+        drop(window);
+        child.complete();
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        assert!(
+            QueryResultCapacityBinding::try_new(&other.owner.scope(), delegated.window_alias())
+                .is_err()
+        );
+        drop(delegated);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        other.owner.complete();
+        other.business.release();
+    }
 
     fn topology(revision: u64, backend_count: usize) -> BackendTopologySnapshot {
         let targets = (0..backend_count)
