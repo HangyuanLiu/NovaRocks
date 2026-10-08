@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "stage": "P09 independent Decimal string functions golden correction",
+  "source_revision": "75ec922cd7512f0558e4422ad36b87fcf5f62015",
+  "outcome": "independent oracle passed on both native versions; reviewed golden corrected",
+  "topology": "1FE+3BE",
+  "oracle": {
+    "path": "docs/testing/mem-1-m07/oracles/decimal-string-functions-v1.py",
+    "sha256": "cff643c00e56ee3b6b4641d4f33389f0c124b03882c8a82254408c7a2150b9cf"
+  },
+  "audit": {
+    "schema_version": 1,
+    "sql_sha256": "ed98c27d550d18ac4bdf46c9c07a85823c3ce5442cdf34315c01eeed1fe99af7",
+    "oracle_sha256": "cff643c00e56ee3b6b4641d4f33389f0c124b03882c8a82254408c7a2150b9cf",
+    "result_sha256": "9e97c9de45c5c58cbc19eeb40a696e8b7c9e901bc6943185ce54953a2a535190",
+    "basis": "Exact literal Decimal values at actual DDL scale, fixed SQL hash, independently evaluated ASCII string operations. No database or golden values used.",
+    "queries": 8,
+    "rows": 56
+  },
+  "expected": {
+    "path": "logs/mem-1-m07/p09-decimal-string-oracle-20261009/test_decimal256_string_functions.result",
+    "sha256": "9e97c9de45c5c58cbc19eeb40a696e8b7c9e901bc6943185ce54953a2a535190"
+  },
+  "previous_golden": {
+    "path": "logs/mem-1-m07/p09-decimal-string-oracle-20261009/legacy-golden-before.result",
+    "sha256": "9191a8cfa3cf75764018e5748f5d0ef252bfa54204b6c6702da548db1234f2b2"
+  },
+  "sql": {
+    "path": "tests/sql/correctness/decimal/sql/test_decimal256_string_functions.sql",
+    "sha256": "ed98c27d550d18ac4bdf46c9c07a85823c3ce5442cdf34315c01eeed1fe99af7"
+  },
+  "review": {
+    "queries": 8,
+    "rows": 56,
+    "changed_queries": [
+      2,
+      4,
+      5,
+      6,
+      8,
+      9
+    ],
+    "changed_cells": 144,
+    "headers_unchanged": true,
+    "row_counts_unchanged": true,
+    "sql_unchanged": true,
+    "padding_trailing_spaces_preserved": true
+  },
+  "mutation_checks": {
+    "update_in_setup": {
+      "rejected": true,
+      "reason": "frozen SQL changed; oracle review required"
+    },
+    "changed_string_expression": {
+      "rejected": true,
+      "reason": "frozen SQL changed; oracle review required"
+    }
+  },
+  "native_runs": [
+    {
+      "label": "candidate",
+      "matrix": {
+        "source_revision": "75ec922cd7512f0558e4422ad36b87fcf5f62015",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+        "launch_profile": "fault-scenario",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_decimal256_string_functions.sql",
+            "exit_code": 0,
+            "duration_seconds": 1.012
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "passed_steps": 9,
+      "comparison": "exact strings, epsilon=None",
+      "pids": [
+        90452,
+        90453,
+        90454,
+        90455
+      ],
+      "all_pids_absent": true,
+      "raw": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-string-candidate-20261009/matrix-status.json",
+          "sha256": "0b7a1484807edc37f1b37a7b30184b5bf3ba3bb9b3027c960389379a37a81cfe"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-string-candidate-20261009/decimal.log",
+          "sha256": "d7d42f97ff339fce4ab1c0897566ce984d632cc875cc648be9a8b7c9d0b12ce3"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-string-candidate-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    },
+    {
+      "label": "old-main",
+      "matrix": {
+        "source_revision": "75ec922cd7512f0558e4422ad36b87fcf5f62015",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/mem-1-m07-main-baseline/NovaRocks/target/release/novarocks",
+        "server_sha256": "5c5bdea5490f209cc0140c1b1e73a30f6ce32c48052673e5fee23ea1300f5756",
+        "launch_profile": "performance",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_decimal256_string_functions.sql",
+            "exit_code": 0,
+            "duration_seconds": 0.35
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+      "passed_steps": 9,
+      "comparison": "exact strings, epsilon=None",
+      "pids": [
+        90576,
+        90577,
+        90578,
+        90579
+      ],
+      "all_pids_absent": true,
+      "raw": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-string-old-main-20261009/matrix-status.json",
+          "sha256": "74e8a0e069e646f56ec49e5640ef798e9302877c33c5d1e4b5744f24256e7dec"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-string-old-main-20261009/decimal.log",
+          "sha256": "deeae21f1a5866c6190f1cee93be6dfb4b0a11da08a31d904a20099265426fbb"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-string-old-main-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    }
+  ],
+  "scope": "Only this Decimal/string fixture. No product source changes, higher persistent precision claim, remaining four Decimal goldens/full SQL/P09/P10 acceptance remain open.",
+  "local_only": true,
+  "corrected_golden": {
+    "path": "tests/sql/correctness/decimal/result/test_decimal256_string_functions.result",
+    "sha256": "9e97c9de45c5c58cbc19eeb40a696e8b7c9e901bc6943185ce54953a2a535190"
+  }
+}
