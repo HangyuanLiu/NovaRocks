@@ -2735,6 +2735,9 @@ pub(super) fn dynamic_definition_parts(
             value: error.to_string().into(),
         })?;
     let pure_effects = match name {
+        name if super::array_difference_owner::operation(name).is_some() => {
+            Some(super::array_difference_owner::effects())
+        }
         "__array_literal" => Some(super::array_literal_owner::effects()),
         "md5sum_numeric" => Some(super::md5sum_numeric_owner::effects()),
         "null_or_empty" => Some(super::string_null_or_empty_owner::effects()),
@@ -2790,6 +2793,9 @@ pub fn contribute_builtin_functions(
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {
+            name if super::array_difference_owner::operation(name).is_some() => {
+                super::array_difference_owner::definition(name, declaration, resolver)?
+            }
             "__array_literal" => {
                 super::array_literal_owner::definition(name, declaration, resolver)?
             }

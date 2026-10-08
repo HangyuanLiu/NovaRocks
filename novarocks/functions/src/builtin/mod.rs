@@ -286,3 +286,7 @@ pub mod bytes_output;
 pub mod array_match_core;
 mod array_match_owner;
 mod array_match_selected;
+
+pub mod array_difference_core;
+mod array_difference_owner;
+mod array_difference_selected;
