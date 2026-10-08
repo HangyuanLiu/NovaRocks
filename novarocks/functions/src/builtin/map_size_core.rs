@@ -16,8 +16,7 @@
 // under the License.
 //! ONE original arena-free MAP_SIZE root NULL/offset computation.
 use super::array_literal_core::CollectionObservation;
-use arrow_array::{Array, ArrayRef, Int32Array, MapArray};
-use std::sync::Arc;
+use arrow_array::{Array, ArrayRef, MapArray};
 #[derive(Debug)]
 pub enum MapSizeFailure<E> {
     Data(String),
@@ -34,24 +33,17 @@ pub fn map_input(array: &dyn Array) -> Result<&MapArray, String> {
 pub fn count_observed<E>(
     map: &MapArray,
     selection: crate::Selection<'_>,
-    mut row: impl FnMut(usize, usize) -> Result<usize, E>,
+    row: impl FnMut(usize, usize) -> Result<usize, E>,
     observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, MapSizeFailure<E>> {
     let offsets = map.value_offsets();
-    observer(CollectionObservation::OpaqueBoundary).map_err(MapSizeFailure::Control)?;
-    let mut out = Vec::with_capacity(selection.len());
-    observer(CollectionObservation::OpaqueBoundary).map_err(MapSizeFailure::Control)?;
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        observer(CollectionObservation::Step).map_err(MapSizeFailure::Control)?;
-        let row = row(ordinal, batch_row).map_err(MapSizeFailure::Control)?;
-        if map.is_null(row) {
-            out.push(None);
-        } else {
-            out.push(Some(offsets[row + 1] - offsets[row]));
-        }
-    }
-    observer(CollectionObservation::OpaqueBoundary).map_err(MapSizeFailure::Control)?;
-    let out = Arc::new(Int32Array::from(out)) as ArrayRef;
-    observer(CollectionObservation::OpaqueBoundary).map_err(MapSizeFailure::Control)?;
-    Ok(out)
+    super::collection_offset_count::count_observed(map, || Ok(offsets), selection, row, observer)
+        .map_err(|failure| match failure {
+            super::collection_offset_count::OffsetCountFailure::Data(message) => {
+                MapSizeFailure::Data(message)
+            }
+            super::collection_offset_count::OffsetCountFailure::Control(cause) => {
+                MapSizeFailure::Control(cause)
+            }
+        })
 }

@@ -271,3 +271,6 @@ pub mod sm3_shared;
 pub mod string_parse_url_shared;
 mod string_parse_url;
 mod string_parse_url_owner;
+
+pub mod collection_offset_count;
+pub mod collection_cardinality_core;

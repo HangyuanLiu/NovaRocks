@@ -16,9 +16,13 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Int32Array, ListArray, MapArray};
-use std::sync::Arc;
-
+use arrow::array::ArrayRef;
+use novarocks_functions::{
+    Selection,
+    builtin::{
+        collection_cardinality_core::count_observed, collection_offset_count::OffsetCountFailure,
+    },
+};
 pub fn eval_cardinality(
     arena: &ExprArena,
     expr: ExprId,
@@ -26,33 +30,14 @@ pub fn eval_cardinality(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
-
-    let mut out = Vec::with_capacity(arr.len());
-    if let Some(map) = arr.as_any().downcast_ref::<MapArray>() {
-        let offsets = map.value_offsets();
-        for row in 0..map.len() {
-            if map.is_null(row) {
-                out.push(None);
-            } else {
-                out.push(Some(offsets[row + 1] - offsets[row]));
-            }
-        }
-    } else if let Some(list) = arr.as_any().downcast_ref::<ListArray>() {
-        let offsets = list.value_offsets();
-        for row in 0..list.len() {
-            if list.is_null(row) {
-                out.push(None);
-            } else {
-                out.push(Some(offsets[row + 1] - offsets[row]));
-            }
-        }
-    } else {
-        return Err(format!(
-            "cardinality expects ARRAY or MAP, got {:?}",
-            arr.data_type()
-        ));
-    }
-
-    let out = Arc::new(Int32Array::from(out)) as ArrayRef;
+    let out = count_observed(
+        arr.as_ref(),
+        Selection::all(arr.len()),
+        |_, row| Ok::<_, String>(row),
+        &mut |_| Ok(()),
+    )
+    .map_err(|failure| match failure {
+        OffsetCountFailure::Data(message) | OffsetCountFailure::Control(message) => message,
+    })?;
     super::common::cast_output(out, arena.data_type(expr), "cardinality")
 }
