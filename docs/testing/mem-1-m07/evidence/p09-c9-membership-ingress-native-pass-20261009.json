@@ -1,0 +1,290 @@
+{
+  "schema_version": 1,
+  "stage": "P09 existing C9 membership and ingress/control regression",
+  "topology": "1FE+3BE",
+  "matrix": {
+    "source_revision": "70dc18f8a975f2235fac016cda3390ead9bff5c3",
+    "source_dirty": false,
+    "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+    "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "ca328f8686242473c180e4f664a7ccddca2664777afbb1a8f1d9b8357f01a53d",
+    "launch_profile": "fault-scenario",
+    "results": [
+      {
+        "scenarios": [
+          "membership/self-registration",
+          "membership/pre-ready-replan",
+          "membership/pre-ready-dml-no-recovery",
+          "native-ingress/outer-preflight-rejection",
+          "native-ingress/query-message-bounds",
+          "native-ingress/current-gate-observation",
+          "native-ingress/blocking-saturation-control",
+          "native-ingress/resident-envelope-calibration",
+          "native-ingress/async-scheduling-pressure",
+          "native-ingress/partial-body-deadline",
+          "native-ingress/registry-contention-control"
+        ],
+        "exit_code": 0,
+        "duration_seconds": 11.253
+      }
+    ],
+    "fixture_startup_exit_code": 0,
+    "base_config_projection": "Generated FE facts plus exact generated BE data credential; runner filters role purpose",
+    "fixture_cleanup_exit_code": 0
+  },
+  "actual_product_identity": "70dc18f8a975f2235fac016cda3390ead9bff5c3",
+  "passed_scenarios": 11,
+  "scenarios": [
+    {
+      "scenario": "membership/pre-ready-dml-no-recovery",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "armed token-scoped restart after BE[0] DML EstablishQueryContext; old_process_id=01a11d64-40eb-7eb3-8be5-1d4b7a264006",
+        "replaced BE[0] after DML EstablishQueryContext; the first attempt returned KnownUncommitted without published data, then an explicit client statement retry published once; new_process_id=01a11d64-4228-7060-8659-7fdb64ef041a",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/membership-pre-ready-dml-no-recovery/scenario-evidence.json",
+        "sha256": "b16b4e038df2f1e98ef2f76b95c34de59c9ce4950f470d2e54016fbac87df437"
+      }
+    },
+    {
+      "scenario": "membership/pre-ready-replan",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "armed token-scoped restart after BE[0] EstablishQueryContext; old_process_id=01a11d64-3da8-72e3-ad98-7ab1ff29ff23",
+        "replaced BE[0] after EstablishQueryContext and observed successful statement attempt=2 completion with new_process_id=01a11d64-3f42-75a1-b61f-0184f909a5fa",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/membership-pre-ready-replan/scenario-evidence.json",
+        "sha256": "98dfb303f9f096349deeaa0360a204cd5d52944472e4c968ed52d905cbe0aef5"
+      }
+    },
+    {
+      "scenario": "membership/self-registration",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "observed 3 eligible self-registered backend process identities",
+        "proved SIGTERM removes a BE from future eligibility while the remaining BEs serve queries",
+        "proved FE restart rebuilds only from BE renew announce and heartbeat",
+        "proved endpoint replacement cannot inherit the prior process identity and remains queryable only after re-verification",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/membership-self-registration/scenario-evidence.json",
+        "sha256": "cb0e0077d4f7169430b7c1abcc5e716bac27dcce93519b1a692afb6ddd12c7af"
+      }
+    },
+    {
+      "scenario": "native-ingress/async-scheduling-pressure",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "distributed query active before control: shuffle_bytes=2670, ordinary_running=0, ordinary_waiting=0",
+        "small Cancel returned a real control receipt while distributed queries were active",
+        "four distributed queries completed; Exchange shuffle bytes before/after=0/10680",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-async-scheduling-pressure/scenario-evidence.json",
+        "sha256": "3eb476fe4d755b5ebf0c8b9fcb8a27cdc213adb4a60cfbb0a6dcd82d0904d421"
+      }
+    },
+    {
+      "scenario": "native-ingress/blocking-saturation-control",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "BE[0] eight real ordinary Worker closures held; ordinary blocking pool and running gate full",
+        "ninth ordinary request visibly waited at Native gate",
+        "task-free Cancel returned the exact Worker refusal while eight ordinary closures and one waiter were present",
+        "Quiesce installed fence version one with an empty accepted-task set under ordinary saturation",
+        "Release of the exact quiesced, task-free context returned Released and TerminalRetained under ordinary saturation",
+        "ordinary running/waiting returned to zero after release and queue drain",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-blocking-saturation-control/scenario-evidence.json",
+        "sha256": "c6de616b3a820d22459002958a37c0ffe16d0c681406acbdc78034691000a786"
+      }
+    },
+    {
+      "scenario": "native-ingress/current-gate-observation",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "BE[0] current Native slots and Worker reservations exposed at rest; future Exchange/MEM readouts explicitly unavailable",
+        "BE[1] current Native slots and Worker reservations exposed at rest; future Exchange/MEM readouts explicitly unavailable",
+        "BE[2] current Native slots and Worker reservations exposed at rest; future Exchange/MEM readouts explicitly unavailable",
+        "BE[0] ordinary running slot rose to one during a real held Worker closure",
+        "BE[0] ordinary running slot returned to zero after closure release",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-current-gate-observation/scenario-evidence.json",
+        "sha256": "305e9832c8fe8236608c30e0dfd64bd17fed330e6b05a12931e96c391cb130aa"
+      }
+    },
+    {
+      "scenario": "native-ingress/outer-preflight-rejection",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "malformed grpc-timeout rejected without sending a request body",
+        "control method Content-Length rejected without sending a request body",
+        "ordinary method 64 MiB Content-Length rejected before reading DATA",
+        "33-item batch rejected by the raw codec resource preflight",
+        "Tower body_limit counters advanced; Worker reservations and created tasks remained zero",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-outer-preflight-rejection/scenario-evidence.json",
+        "sha256": "89abe6bb471a4c5f40f219750006af1cb0bf7b45454fa5783840e1e83e0fab87"
+      }
+    },
+    {
+      "scenario": "native-ingress/partial-body-deadline",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "ordinary half-open DATA ended after 103.384708ms with TransportAbort; running_deadline count advanced (RST has no readable gRPC status)",
+        "partial-body holder returned and a later small Cancel completed",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-partial-body-deadline/scenario-evidence.json",
+        "sha256": "d4ac9a083da39965fd9d3a534ba9422b0c79db28e51f55d86cdf8ba630ba2788"
+      }
+    },
+    {
+      "scenario": "native-ingress/query-message-bounds",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "ordinary batch encoded_bytes=50331648 accepted=true grpc_status=0",
+        "ordinary batch encoded_bytes=50331649 accepted=false grpc_status=8",
+        "control batch encoded_bytes=1048576 accepted=true grpc_status=0",
+        "control batch encoded_bytes=1048577 accepted=false grpc_status=11",
+        "control over-limit DATA with legal frame length returned grpc_status=status: ResourceExhausted, message: \"native request body exceeds method limit\", details: [], metadata: MetadataMap { headers: {\"content-type\": \"application/grpc\", \"x-novarocks-ingress-rejection\": \"body_limit\", \"date\": \"Thu, 08 Oct 2026 21:21:13 GMT\", \"content-length\": \"0\"} }",
+        "control DATA over-limit recorded by Tower body gate: body_limit_rejections=1",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-query-message-bounds/scenario-evidence.json",
+        "sha256": "c2e87e03d7a7d4104a9039ca4c6578847bf8a613f8aa65ebd75e6284628ba0b2"
+      }
+    },
+    {
+      "scenario": "native-ingress/registry-contention-control",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "BE[0] first Acquire held the real Worker registry mutex before mutation",
+        "control executor started and held one control-running slot, but its receipt waited for the Worker mutex",
+        "registry lock released; control receipt completed, lock wait samples before/after=5/10",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-registry-contention-control/scenario-evidence.json",
+        "sha256": "b2994c67424e25d5656cf03c53526ca0f7138ce7ea34ec5c63f44c0dbdd93101"
+      }
+    },
+    {
+      "scenario": "native-ingress/resident-envelope-calibration",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "BE[0] RSS MiB before/during-one-48MiB-ordinary-plus-seven-small-held/after=70.3/75.7/78.2; outer padding is not a frozen-plan carrier; process samples at /Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-resident-envelope-calibration/process-resources.json",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "phase_observation_count": 0,
+      "raw": {
+        "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native/native-ingress-resident-envelope-calibration/scenario-evidence.json",
+        "sha256": "eb122ad88df9d6d0050aad69ba5281a0a9ded8c2ed9d64cfcbb27a153a125a7d"
+      }
+    }
+  ],
+  "pids": [
+    29919,
+    29920,
+    29921,
+    29922,
+    29923,
+    29924,
+    29925,
+    29996,
+    29997,
+    29998,
+    29999,
+    30000,
+    30071,
+    30072,
+    30073,
+    30075,
+    30077,
+    30148,
+    30149,
+    30150,
+    30151,
+    30222,
+    30223,
+    30224,
+    30225,
+    30296,
+    30297,
+    30298,
+    30299,
+    30370,
+    30371,
+    30372,
+    30373,
+    30445,
+    30446,
+    30447,
+    30448,
+    30519,
+    30520,
+    30521,
+    30522,
+    30594,
+    30595,
+    30596,
+    30597,
+    30669,
+    30670,
+    30671,
+    30672
+  ],
+  "all_pids_absent": true,
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/matrix-status.json",
+      "sha256": "9eccecdb35bf26681b447e7880f9d74ff3c6b805e5db79c1ed9d5d67a0579676"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/native-driver.log",
+      "sha256": "550dba1b0f046f09c5c3c47c9bbdf052305cd74ae671e9c6a74f180e848258cf"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-c9-membership-ingress-native-20261009/cleanup.log",
+      "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+    }
+  ],
+  "scope": "Three membership and eight existing registered native ingress/control scenarios, including partial body deadline and real control progress under saturation. Existing resident-envelope calibration does not establish v6/v7 E_native_transport coefficients or CM soak; new result-delivery cases and final C9 remain open.",
+  "local_only": true
+}

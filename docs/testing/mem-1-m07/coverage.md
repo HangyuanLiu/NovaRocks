@@ -136,3 +136,5 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 2026-10-09 P09 correctness checkpoint：六份历史Decimal共同失败golden均由独立exact-literal/actual-DDL oracle推导，在old main及candidate完整原生核验后修正；原SQL与比较策略保留。完整Decimal20/20、617步PASS。另aggregate100/sort14/filter15/join64原生全部PASS（193case），见 `evidence/p09-decimal-complete-native-suite-20261009.json`、`evidence/p09-relational-native-sql-pass-20261009.json`。实际产品仍为63f16c67e，后续检查点只有测试/证据变化；不是最终同HEAD全CI。真实Paimon五项原生通过，snapshot因writer30s覆盖producer等待而失败；相关重大裁决待用户决定，大provider CL继续OPEN。
 
 2026-10-09 statistics完整7/7原生1FE+3BE PASS，含真实Spark及Trino483 Puffin互通；actual63f16c67e，4PID退出，任务私有canonical shared fixture清理0。见 `evidence/p09-statistics-complete-native-pass-20261009.json`。不是大provider CL、release性能或最终同HEAD验收。
+
+2026-10-09 additional native coverage：statistics7/63步、MV七suite33/537步、真实HMS1/6步已PASS；前台rewrite接线补齐后actual70dc18f8a完整Iceberg27/compatibility20/resilience13（60/536步）及membership/ingress11场景PASS，全部记录PID退出、私有fixture cleanup0。普通64承载/writer决定、real大provider CL、result-delivery新case、transport/CM/P00b/final仍OPEN；历史63 C0不能当作70dc全量。详见对应20261009 JSON收据。
