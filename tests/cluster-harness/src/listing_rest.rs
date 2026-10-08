@@ -415,7 +415,7 @@ async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Res
 }
 
 fn empty_s3_list_body(bytes: usize) -> Result<Vec<u8>> {
-    let prefix = b"<ListBucketResult><Name>cl-fixture</Name><Prefix>warehouse/source/</Prefix><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated>";
+    let prefix = b"<ListBucketResult><Name>cl-fixture</Name><Prefix>import-source/</Prefix><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated>";
     let suffix = b"</ListBucketResult>";
     ensure!(
         bytes >= prefix.len() + suffix.len(),

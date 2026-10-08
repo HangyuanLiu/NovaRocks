@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "stage": "P09 OpenDAL native list response boundary",
+  "extends": {
+    "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v1.json",
+    "sha256": "b161c0ec87caf7eacb72fe2da7bd6d4fb3da2e7e1cb965ab87407cc1714185a2"
+  },
+  "topology": "native 1FE+3BE",
+  "route": "ALTER TABLE ... ADD FILES FROM s3://cl-fixture/import-source/",
+  "object_store_public_fetcher_cap_bytes": 16777216,
+  "response_body_bytes": [
+    16777216,
+    16777217
+  ],
+  "response": "One valid empty S3 ListObjectsV2 XML page, padded with XML whitespace inside the root element. Standard REST fixture supplies one exact empty target table. No row data.",
+  "expected": [
+    {
+      "bytes": 16777216,
+      "outcome": "List reaches XML parsing and then the existing no-visible-Parquet-files semantic refusal; no ResourceExhausted"
+    },
+    {
+      "bytes": 16777217,
+      "outcome": "Whole response ResourceExhausted refusal"
+    }
+  ],
+  "per_phase": {
+    "object_store_requests": 1,
+    "table_commits": 0,
+    "destructive_mutations": 0,
+    "same_connection_next_statement": "SELECT 1",
+    "convergence": "existing native resource oracle"
+  },
+  "scope": "Protocol boundary and non-retry verification through the production SQL/FS path; no SDK XML allocation upper bound, remote provider scale acceptance, or successful file import is claimed.",
+  "correction_of": {
+    "path": "docs/testing/mem-1-m07/inputs/opendal-listing-freeze-v1.json",
+    "sha256": "3e8fd55c70843b9b23a77d3fa8b1fc739550511ba43afa53fe0a93b65edf1ae1"
+  },
+  "correction_scope": "Only the source location changes to a non-overlapping import prefix accepted by the existing ADD FILES contract; byte limits and expectations are identical."
+}

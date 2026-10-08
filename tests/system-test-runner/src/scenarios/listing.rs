@@ -346,7 +346,7 @@ impl Scenario for ObjectStoreListingBoundary {
             fixture.set_object_store_list_body_bytes(bytes)?;
             measure(context, "opendal-list-body-boundary", || {
                 let error = control
-                    .query_drop("ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 ADD FILES FROM 's3://cl-fixture/warehouse/source/'")
+                    .query_drop("ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 ADD FILES FROM 's3://cl-fixture/import-source/'")
                     .err()
                     .context("empty or oversized source listing must not commit ADD FILES")?;
                 let diagnostic = error.to_string();
