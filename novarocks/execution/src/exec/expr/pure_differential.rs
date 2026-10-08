@@ -1571,3 +1571,7 @@ mod abs_tests;
 #[cfg(test)]
 #[path = "pure_differential_string_case_tests.rs"]
 mod string_case_tests;
+
+#[cfg(test)]
+#[path = "pure_differential/to_date_tests.rs"]
+mod to_date_tests;

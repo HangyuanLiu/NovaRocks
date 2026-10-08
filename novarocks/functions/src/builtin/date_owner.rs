@@ -37,7 +37,8 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// Only the actually registered three one-argument date profiles have an owner.
+/// The registered date/to_date identities share one original extraction owner.
+/// The declared to_date Int64 profile is explicitly refused during preparation.
 /// The old helper's other timestamp units/zones are not selected targets.
 pub(super) fn operation(name: &str) -> Option<()> {
     (name == "date").then_some(())
@@ -83,10 +84,12 @@ impl DateOwner {
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        operation(name).ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
-            subject: "uninstalled date extraction",
-            value: name.into(),
-        })?;
+        if !matches!(name, "date" | "to_date") {
+            return Err(FunctionCatalogError::InvalidStableIdentity {
+                subject: "uninstalled date extraction",
+                value: name.into(),
+            });
+        }
         let function = format!("builtin.scalar/{name}/v1");
         let expected = effects();
         if declaration.function_id().as_str() != function
@@ -259,6 +262,13 @@ impl PureScalarImplementation for DateOwner {
                     FunctionBindingError::Control(error) => compile_failure(error),
                     _ => invalid("date extraction preparation has a stale selected binding"),
                 })?;
+            if self.declaration.function_id().as_str() == "builtin.scalar/to_date/v1"
+                && matches!(contract.selected().argument_types.as_ref(),[crate::FunctionArgumentType::Value(source)] if source.data_type==arrow_schema::DataType::Int64)
+            {
+                return Err(invalid(
+                    "to_date declared Int64 profile has no legacy date reader",
+                ));
+            }
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
             Ok(Arc::new(PreparedDate { contract }) as Arc<dyn PreparedScalarKernel>)

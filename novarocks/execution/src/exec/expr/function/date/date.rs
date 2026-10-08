@@ -33,9 +33,7 @@ fn eval_to_date_inner(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
-    let dates = extract_date_array(&arr)?;
-    let out: Vec<Option<i32>> = dates.into_iter().map(|d| d.map(naive_to_date32)).collect();
-    Ok(Arc::new(Date32Array::from(out)) as ArrayRef)
+    novarocks_functions::builtin::calendar_to_date::evaluate_legacy_to_date(&arr)
 }
 
 #[inline]
