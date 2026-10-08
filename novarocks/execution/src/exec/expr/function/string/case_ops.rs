@@ -16,27 +16,16 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::ArrayRef;
+#[cfg(test)]
+use arrow::array::{Array, StringArray};
+use novarocks_functions::builtin::string_case::{StringCaseOp, evaluate_legacy_case};
+#[cfg(test)]
 use std::sync::Arc;
-
 fn eval_lower_impl(arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
-    let arr = input
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "lower expects string".to_string())?;
-    let len = arr.len();
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        if arr.is_null(i) {
-            out.push(None);
-        } else {
-            out.push(Some(arr.value(i).to_lowercase()));
-        }
-    }
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    evaluate_legacy_case(StringCaseOp::Lower, &input)
 }
-
 pub fn eval_lower(
     arena: &ExprArena,
     _expr: ExprId,
@@ -45,7 +34,6 @@ pub fn eval_lower(
 ) -> Result<ArrayRef, String> {
     eval_lower_impl(arena, args, chunk)
 }
-
 pub fn eval_lcase(
     arena: &ExprArena,
     _expr: ExprId,
@@ -54,7 +42,6 @@ pub fn eval_lcase(
 ) -> Result<ArrayRef, String> {
     eval_lower_impl(arena, args, chunk)
 }
-
 #[cfg(test)]
 #[path = "legacy_string_case_baseline_tests.rs"]
 mod legacy_string_case_baseline_tests;

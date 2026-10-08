@@ -21,7 +21,8 @@
 //! it is not internally cooperative or a formal host memory grant.
 
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
+    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
+    ScalarCallInput, SelectedValues, Selection,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
@@ -32,7 +33,7 @@ use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StringCaseOp {
+pub enum StringCaseOp {
     Lower,
     Upper,
 }
@@ -189,32 +190,35 @@ pub(super) fn evaluate_string_case<'a>(
         work.flush()?;
         offsets.push(0i32);
         let mut has_null = false;
-        for (ordinal, batch_row) in selection.iter().enumerate() {
-            let row = argument.value_row(ordinal, batch_row);
-            if values.is_null(row) {
-                has_null = true;
-                validity.append(false);
-            } else {
-                work.flush()?;
-                let converted = match op {
-                    StringCaseOp::Lower => values.value(row).to_lowercase(),
-                    StringCaseOp::Upper => values.value(row).to_uppercase(),
-                };
-                work.flush()?;
-                if converted.len() > output_bytes - bytes.len() {
-                    return Err(internal(
-                        "string case conversion exceeded its measured output extent",
-                    ));
+        walk_case_values(
+            op,
+            *argument,
+            selection,
+            source.nullable,
+            &mut work,
+            |converted, work| {
+                if let Some(converted) = converted {
+                    if converted.len() > output_bytes - bytes.len() {
+                        return Err(internal(
+                            "string case conversion exceeded its measured output extent",
+                        ));
+                    }
+                    for byte in converted.bytes() {
+                        bytes.push(byte);
+                        work.step()?;
+                    }
+                    validity.append(true);
+                } else {
+                    has_null = true;
+                    validity.append(false);
                 }
-                for byte in converted.bytes() {
-                    bytes.push(byte);
-                    work.step()?;
-                }
-                validity.append(true);
-            }
-            offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
-            work.step()?;
-        }
+                offsets.push(
+                    i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?,
+                );
+                work.step()?;
+                Ok(())
+            },
+        )?;
         if bytes.len() != output_bytes {
             return Err(internal(
                 "string case conversion differs from its measured output extent",
@@ -245,6 +249,101 @@ pub(super) fn evaluate_string_case<'a>(
     }
     work.finish()?;
     result
+}
+
+/// One original whole-string calculation walk for both value boundaries.
+/// The per-char pass above only measures output; final sigma still depends on
+/// its complete input string in Rust's original Unicode implementation.
+fn walk_case_values(
+    op: StringCaseOp,
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    source_nullable: bool,
+    work: &mut EvaluationCheckpoints<'_>,
+    mut append: impl FnMut(Option<String>, &mut EvaluationCheckpoints<'_>) -> Result<(), KernelFailure>,
+) -> Result<(), KernelFailure> {
+    let values = argument
+        .array()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| internal("string case conversion selected carrier is not Utf8"))?;
+    for (ordinal, batch_row) in selection.iter().enumerate() {
+        work.step()?;
+        let row = argument.value_row(ordinal, batch_row);
+        if row >= values.len() {
+            return Err(internal(
+                "string case conversion selected row is outside its carrier",
+            ));
+        }
+        let converted = if values.is_null(row) {
+            if !source_nullable {
+                return Err(internal(
+                    "string case conversion non-null source contains selected SQL NULL",
+                ));
+            }
+            None
+        } else {
+            work.flush()?;
+            let converted = match op {
+                StringCaseOp::Lower => values.value(row).to_lowercase(),
+                StringCaseOp::Upper => values.value(row).to_uppercase(),
+            };
+            work.flush()?;
+            Some(converted)
+        };
+        append(converted, work)?;
+    }
+    Ok(())
+}
+/// V1 owns child evaluation and calls the same calculation on all input rows.
+/// Keep its original carrier diagnostics and original Arrow assembly sink;
+/// unsupported carriers are not coerced and output metadata is not applied.
+/// Its Vec/StringArray allocation and offset panic behavior remains unchanged.
+pub fn evaluate_legacy_case(op: StringCaseOp, input: &ArrayRef) -> Result<ArrayRef, String> {
+    let values = input
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            match op {
+                StringCaseOp::Lower => "lower expects string",
+                StringCaseOp::Upper => "upper: argument must be a string array",
+            }
+            .to_string()
+        })?;
+    let mut output = Vec::with_capacity(values.len());
+    let mut work = EvaluationCheckpoints::new(&LegacyControl);
+    walk_case_values(
+        op,
+        EvaluatedArgument::Column(input),
+        Selection::all(values.len()),
+        true,
+        &mut work,
+        |converted, _| {
+            output.push(converted);
+            Ok(())
+        },
+    )
+    .map_err(|failure| match failure {
+        KernelFailure::InvalidProgram(message)
+        | KernelFailure::Internal(message)
+        | KernelFailure::Operational(message) => message.message().to_string(),
+        other => other.to_string(),
+    })?;
+    let output = match op {
+        StringCaseOp::Lower => StringArray::from(output),
+        StringCaseOp::Upper => StringArray::from_iter(output),
+    };
+    Ok(Arc::new(output))
+}
+struct LegacyControl;
+impl KernelEvaluationControl for LegacyControl {
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        panic!("pure scalar calculation never waits")
+    }
+
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

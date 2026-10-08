@@ -125,7 +125,7 @@ mod rounding_binding;
 mod string_append_trailing;
 mod string_append_trailing_owner;
 mod string_binary;
-mod string_case;
+pub mod string_case;
 mod string_case_owner;
 mod string_concat;
 mod string_concat_owner;
