@@ -26,3 +26,6 @@ python3 docs/testing/mem-1-m07/oracles/decimal-read-write-v1.py \
 
 
 `decimal-complex-v1.py` 以完整SQL SHA固定四张表的实际递归DDL和15行literal，独立解析ARRAY/MAP/ROW/NULL及精确Decimal文本。根据实际precision/scale执行nullable cast，独立计算元素/字段/lookup、排序的MAP_KEYS/VALUES和 capped Decimal128算术域；MySQL嵌套文本以原entry顺序render，数值不经float。原NULL依据实际overflow判定，不能把历史golden中的额外NULL当规范。未知DDL、lookup或setup变化拒绝。只生成11个读取query候选；必须old/new完整原生核验并审阅后才能修订仓库golden。
+
+
+`decimal-predicate-v1.py` 以完整SQL SHA固定25行、172个读取query，独立三值逻辑（包括NULL IN/NOT IN、BETWEEN、AND/OR）、CASE和实际scale下的精确Decimal聚合/AVG HALF_UP、NULL分组与排序。所有输入可由实际DDL精确表示。closed parser对未知语法拒绝，预期不读数据库或golden。既有runner order_sensitive=false，以精确multiset比较，不证明重复排序键之间的行序；不改变原SQL/比较配置。原生old/new完整核验并审阅前不修仓库golden。
