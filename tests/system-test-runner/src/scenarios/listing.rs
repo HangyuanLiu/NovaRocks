@@ -364,9 +364,7 @@ impl Scenario for CatalogListingCancellation {
         fixture.set_mode(ListingMode::Delayed)?;
         let mut victim = mysql_actor::connect(&user, port, timeout)?;
         victim.query_drop("USE cl_cancel.cl_ns_0000")?;
-        let connection_id = victim
-            .query_first::<u64, _>("SELECT CONNECTION_ID()")?
-            .context("missing cancellation connection identity")?;
+        let connection_id = victim.connection_id();
         measure(context, "listing-kill-query", || {
             let error = std::thread::scope(|scope| -> Result<mysql::Error> {
                 let target = scope.spawn(|| victim.query::<String, _>("SHOW VIEWS"));

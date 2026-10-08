@@ -1,0 +1,105 @@
+{
+  "source_revision": "2c17863f562fa17d5ed375c65e2badcf0faff317",
+  "source_dirty": false,
+  "primary_binary": "target/debug/novarocks",
+  "process_launch_identities": [
+    {
+      "role": "fe",
+      "pid": 25482,
+      "process_start_token": "macos:1791482182:845378"
+    },
+    {
+      "role": "be-0",
+      "pid": 25483,
+      "process_start_token": "macos:1791482183:46593"
+    },
+    {
+      "role": "be-1",
+      "pid": 25484,
+      "process_start_token": "macos:1791482183:115549"
+    },
+    {
+      "role": "be-2",
+      "pid": 25485,
+      "process_start_token": "macos:1791482183:174773"
+    }
+  ],
+  "outcome": "failed",
+  "schema_version": 1,
+  "stage": "P09 CL cancellation public deadline checkpoint",
+  "input_freeze": {
+    "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v3.json",
+    "sha256": "e279724dc4ab2ce34dfdef5f3a939ad3f0f05ed076c36c5c60a7b7d7c6c1a3d3"
+  },
+  "raw_evidence": {
+    "path": "logs/mem-1-m07/p09-native-cl-cancellation-v2-20261009/catalog-mem-1-m07-sdk-listing-cancellation/scenario-evidence.json",
+    "sha256": "77d1bbb27dc60c10550085fc19f1806bcf80d961abc29baa8dd3b59452a775ca"
+  },
+  "phases": [
+    {
+      "artifact": {
+        "path": "logs/mem-1-m07/p09-native-cl-cancellation-v2-20261009/catalog-mem-1-m07-sdk-listing-cancellation/listing-phase-001.json",
+        "sha256": "1f5f031c32aabbe22643f0c9befd49d58febcf5453fab284d63640b98bbecfb6"
+      },
+      "observations": {
+        "after": {
+          "active": 40615936,
+          "allocated": 22040552,
+          "resident": 49479680
+        },
+        "before": {
+          "active": 32931840,
+          "allocated": 20585736,
+          "resident": 42434560
+        },
+        "error": null,
+        "outcome": "passed",
+        "phase": "listing-deadline",
+        "process_launch_identities": [
+          {
+            "pid": 25482,
+            "process_start_token": "macos:1791482182:845378",
+            "role": "fe"
+          },
+          {
+            "pid": 25483,
+            "process_start_token": "macos:1791482183:46593",
+            "role": "be-0"
+          },
+          {
+            "pid": 25484,
+            "process_start_token": "macos:1791482183:115549",
+            "role": "be-1"
+          },
+          {
+            "pid": 25485,
+            "process_start_token": "macos:1791482183:174773",
+            "role": "be-2"
+          }
+        ],
+        "result": {
+          "error": "MySqlError { ERROR 1105 (HY000): query timed out after 1000 ms }",
+          "provider": {
+            "active_listing_requests": 0,
+            "destructive_mutations": 0,
+            "emitted_entries": 0,
+            "emitted_name_bytes": 0,
+            "namespace_pages": 0,
+            "peak_listing_requests": 1,
+            "table_loads": 0,
+            "table_pages": 0,
+            "view_pages": 1
+          }
+        },
+        "sampled_peak": {
+          "active": 33751040,
+          "allocated": 20972056,
+          "resident": 43171840
+        },
+        "samples": 10
+      }
+    }
+  ],
+  "classification": "Public one-second deadline and same-session next statement passed. Harness then selected unsupported CONNECTION_ID() SQL; use the existing MySQL client handshake connection_id() API used by other native cancellation scenarios. KILL/reuse did not execute.",
+  "local_only": true
+}
