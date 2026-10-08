@@ -1,0 +1,1804 @@
+{
+  "schema_version": 1,
+  "stage": "P09 C0 and native cache/OpenDAL convergence checkpoint",
+  "source_revision": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "source_dirty": false,
+  "actual_server_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "outcome": "passed",
+  "c0": {
+    "summary": {
+      "path": "logs/ci-full/20261009-024603/summary.md",
+      "sha256": "3728299797076c35e89e86a16e7bc0a36b3ae31d9744302f6133a74d5f94d984"
+    },
+    "passed": 12266,
+    "failed": 0,
+    "ignored": 7,
+    "scope": "cargo-only; complete dependency/architecture guards, fmt, all-targets, System allocator, Clippy, build, SQL error manifest, components, server owners and process smoke"
+  },
+  "native": {
+    "topology": "1FE+3BE",
+    "driver": {
+      "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/driver.log",
+      "sha256": "f3f9b47de96d4d41cdf9a48aef2c3a826b9a0604c52ba2ce9e34b47101afedcf"
+    },
+    "scenarios": [
+      {
+        "scenario": "query-output/schema-once",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/query-output-schema-once/scenario-evidence.json",
+          "sha256": "1dc2c0e15235264d91e62e9ba9910d83b62d08148911f6ca15c50c71b8df4de5"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 79568,
+            "process_start_token": "macos:1791485896:913041"
+          },
+          {
+            "role": "be-0",
+            "pid": 79569,
+            "process_start_token": "macos:1791485896:988693"
+          },
+          {
+            "role": "be-1",
+            "pid": 79570,
+            "process_start_token": "macos:1791485897:46972"
+          },
+          {
+            "role": "be-2",
+            "pid": 79571,
+            "process_start_token": "macos:1791485897:103654"
+          }
+        ]
+      },
+      {
+        "scenario": "query-output/non-negotiated-multi-statement",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/query-output-non-negotiated-multi-statement/scenario-evidence.json",
+          "sha256": "3006c2d0ca36dfd2b7ea4792e6363e18e2456fed0348302eb36e368386d7348a"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 79642,
+            "process_start_token": "macos:1791485897:436515"
+          },
+          {
+            "role": "be-0",
+            "pid": 79643,
+            "process_start_token": "macos:1791485897:498217"
+          },
+          {
+            "role": "be-1",
+            "pid": 79644,
+            "process_start_token": "macos:1791485897:556616"
+          },
+          {
+            "role": "be-2",
+            "pid": 79645,
+            "process_start_token": "macos:1791485897:613823"
+          }
+        ]
+      },
+      {
+        "scenario": "query-output/negotiated-multi-result",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/query-output-negotiated-multi-result/scenario-evidence.json",
+          "sha256": "7473de0c9176084307715af0c8a5b816942e429a954781cebfddf133b33be5a4"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 79717,
+            "process_start_token": "macos:1791485897:877964"
+          },
+          {
+            "role": "be-0",
+            "pid": 79718,
+            "process_start_token": "macos:1791485897:937139"
+          },
+          {
+            "role": "be-1",
+            "pid": 79719,
+            "process_start_token": "macos:1791485897:995950"
+          },
+          {
+            "role": "be-2",
+            "pid": 79720,
+            "process_start_token": "macos:1791485898:51844"
+          }
+        ]
+      },
+      {
+        "scenario": "query-output/scalar-session",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/query-output-scalar-session/scenario-evidence.json",
+          "sha256": "e6ffb2ba546d29dbff524f2e4a3f7f46aacbc89037647b6dd013ced199b5921d"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 79791,
+            "process_start_token": "macos:1791485898:330746"
+          },
+          {
+            "role": "be-0",
+            "pid": 79792,
+            "process_start_token": "macos:1791485898:391550"
+          },
+          {
+            "role": "be-1",
+            "pid": 79793,
+            "process_start_token": "macos:1791485898:450188"
+          },
+          {
+            "role": "be-2",
+            "pid": 79794,
+            "process_start_token": "macos:1791485898:499910"
+          }
+        ]
+      },
+      {
+        "scenario": "connector/distributed-writer-dataflow",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/connector-distributed-writer-dataflow/scenario-evidence.json",
+          "sha256": "9b51f3f54b44d28dbcd351bab82199d41e74374b7bfb101d653d99bbdc83f322"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 79865,
+            "process_start_token": "macos:1791485898:908920"
+          },
+          {
+            "role": "be-0",
+            "pid": 79866,
+            "process_start_token": "macos:1791485898:966495"
+          },
+          {
+            "role": "be-1",
+            "pid": 79867,
+            "process_start_token": "macos:1791485899:22696"
+          },
+          {
+            "role": "be-2",
+            "pid": 79868,
+            "process_start_token": "macos:1791485899:78805"
+          }
+        ]
+      },
+      {
+        "scenario": "connector/distributed-writer-row-level",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/connector-distributed-writer-row-level/scenario-evidence.json",
+          "sha256": "00594ddbfb0525e368e21ac93c99aa9c50176e991390c7bcaf8e59c2f16dd314"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 79957,
+            "process_start_token": "macos:1791485900:280053"
+          },
+          {
+            "role": "be-0",
+            "pid": 79958,
+            "process_start_token": "macos:1791485900:337962"
+          },
+          {
+            "role": "be-1",
+            "pid": 79959,
+            "process_start_token": "macos:1791485900:393638"
+          },
+          {
+            "role": "be-2",
+            "pid": 79960,
+            "process_start_token": "macos:1791485900:450815"
+          }
+        ]
+      },
+      {
+        "scenario": "statistics/native-aggregate-and-collect-on-write",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/statistics-native-aggregate-and-collect-on-write/scenario-evidence.json",
+          "sha256": "431fafe7eb270bed6960c38c28e619aa23b5957b2b435f22d9dd30523074fbb1"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 80031,
+            "process_start_token": "macos:1791485903:332401"
+          },
+          {
+            "role": "be-0",
+            "pid": 80032,
+            "process_start_token": "macos:1791485903:394958"
+          },
+          {
+            "role": "be-1",
+            "pid": 80033,
+            "process_start_token": "macos:1791485903:451208"
+          },
+          {
+            "role": "be-2",
+            "pid": 80034,
+            "process_start_token": "macos:1791485903:502497"
+          }
+        ]
+      },
+      {
+        "scenario": "connector/iceberg-typed-read-data",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/connector-iceberg-typed-read-data/scenario-evidence.json",
+          "sha256": "be1d5cdca2eb9030d2d1757502ebacb6967470b27895117c0a5bb082c49fa5a8"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 80471,
+            "process_start_token": "macos:1791486020:823644"
+          },
+          {
+            "role": "be-0",
+            "pid": 80472,
+            "process_start_token": "macos:1791486020:885222"
+          },
+          {
+            "role": "be-1",
+            "pid": 80473,
+            "process_start_token": "macos:1791486020:941748"
+          },
+          {
+            "role": "be-2",
+            "pid": 80474,
+            "process_start_token": "macos:1791486020:995949"
+          }
+        ]
+      },
+      {
+        "scenario": "query-concurrency/warehouse-admission",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/query-concurrency-warehouse-admission/scenario-evidence.json",
+          "sha256": "39f095aeeaaa07af8bbadfcaf9f4148b1da705a0847e8ed294e991209c34a160"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 80545,
+            "process_start_token": "macos:1791486022:639281"
+          },
+          {
+            "role": "be-0",
+            "pid": 80546,
+            "process_start_token": "macos:1791486022:711674"
+          },
+          {
+            "role": "be-1",
+            "pid": 80547,
+            "process_start_token": "macos:1791486022:760927"
+          },
+          {
+            "role": "be-2",
+            "pid": 80548,
+            "process_start_token": "macos:1791486022:818177"
+          }
+        ]
+      },
+      {
+        "scenario": "query-concurrency/terminal-releases-slot",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/query-concurrency-terminal-releases-slot/scenario-evidence.json",
+          "sha256": "f212cb9c6fc45167871134b37a3a216bccbdd01950202fd10fe58df8fa01ac03"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 80745,
+            "process_start_token": "macos:1791486028:193120"
+          },
+          {
+            "role": "be-0",
+            "pid": 80746,
+            "process_start_token": "macos:1791486028:255609"
+          },
+          {
+            "role": "be-1",
+            "pid": 80747,
+            "process_start_token": "macos:1791486028:312748"
+          },
+          {
+            "role": "be-2",
+            "pid": 80748,
+            "process_start_token": "macos:1791486028:369474"
+          }
+        ]
+      },
+      {
+        "scenario": "catalog/mem-1-m07-sdk-listing",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/scenario-evidence.json",
+          "sha256": "9fa3ef22995eef770f3e8dd3fb858aadf9fdbe252f57a820d53dc69ee018f15f"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 80819,
+            "process_start_token": "macos:1791486031:74848"
+          },
+          {
+            "role": "be-0",
+            "pid": 80820,
+            "process_start_token": "macos:1791486031:146894"
+          },
+          {
+            "role": "be-1",
+            "pid": 80821,
+            "process_start_token": "macos:1791486031:200375"
+          },
+          {
+            "role": "be-2",
+            "pid": 80822,
+            "process_start_token": "macos:1791486031:260858"
+          }
+        ]
+      },
+      {
+        "scenario": "catalog/mem-1-m07-sdk-listing-cancellation",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing-cancellation/scenario-evidence.json",
+          "sha256": "259239758e0a55461338daed4710bbe55df32bf127b347eecb00b7824bc9a34e"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 81456,
+            "process_start_token": "macos:1791486092:25903"
+          },
+          {
+            "role": "be-0",
+            "pid": 81457,
+            "process_start_token": "macos:1791486092:88709"
+          },
+          {
+            "role": "be-1",
+            "pid": 81458,
+            "process_start_token": "macos:1791486092:143854"
+          },
+          {
+            "role": "be-2",
+            "pid": 81459,
+            "process_start_token": "macos:1791486092:201110"
+          }
+        ]
+      },
+      {
+        "scenario": "catalog/mem-1-m07-opendal-listing-boundary",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-opendal-listing-boundary/scenario-evidence.json",
+          "sha256": "1690a5218e14cdd667603e100ce8531795cd70d0ef03ec85b0b5608b14e5438f"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 81545,
+            "process_start_token": "macos:1791486098:558131"
+          },
+          {
+            "role": "be-0",
+            "pid": 81546,
+            "process_start_token": "macos:1791486098:620624"
+          },
+          {
+            "role": "be-1",
+            "pid": 81547,
+            "process_start_token": "macos:1791486098:680049"
+          },
+          {
+            "role": "be-2",
+            "pid": 81548,
+            "process_start_token": "macos:1791486098:731322"
+          }
+        ]
+      },
+      {
+        "scenario": "connector/catalog-read-write-runtime",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/connector-catalog-read-write-runtime/scenario-evidence.json",
+          "sha256": "5ae6a0563b99159c37d3fb8a4d8735aeedde83aa02e9b6bbbb5b2d28e499262a"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 81656,
+            "process_start_token": "macos:1791486100:323253"
+          },
+          {
+            "role": "be-0",
+            "pid": 81662,
+            "process_start_token": "macos:1791486100:997253"
+          },
+          {
+            "role": "be-1",
+            "pid": 81658,
+            "process_start_token": "macos:1791486100:442669"
+          },
+          {
+            "role": "be-2",
+            "pid": 81659,
+            "process_start_token": "macos:1791486100:502760"
+          }
+        ]
+      },
+      {
+        "scenario": "connector/vended-credential-read-write",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/connector-vended-credential-read-write/scenario-evidence.json",
+          "sha256": "4fd0f1d9a4232eb490f8925997a9261d79dd2f0e3322d8b7578caadbd27e9e6b"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 81846,
+            "process_start_token": "macos:1791486105:253971"
+          },
+          {
+            "role": "be-0",
+            "pid": 81847,
+            "process_start_token": "macos:1791486105:327265"
+          },
+          {
+            "role": "be-1",
+            "pid": 81848,
+            "process_start_token": "macos:1791486105:385176"
+          },
+          {
+            "role": "be-2",
+            "pid": 81849,
+            "process_start_token": "macos:1791486105:440492"
+          }
+        ]
+      },
+      {
+        "scenario": "connector/vended-credential-refresh",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/connector-vended-credential-refresh/scenario-evidence.json",
+          "sha256": "d19ab032960f0c7c7b8ed3289641bfe6426bda1d3c04604080dd047c6ab07eb2"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 82043,
+            "process_start_token": "macos:1791486111:166428"
+          },
+          {
+            "role": "be-0",
+            "pid": 82044,
+            "process_start_token": "macos:1791486111:258245"
+          },
+          {
+            "role": "be-1",
+            "pid": 82046,
+            "process_start_token": "macos:1791486111:320698"
+          },
+          {
+            "role": "be-2",
+            "pid": 82050,
+            "process_start_token": "macos:1791486111:375075"
+          }
+        ]
+      },
+      {
+        "scenario": "connector/vended-credential-targeted-deadline",
+        "evidence": {
+          "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/connector-vended-credential-targeted-deadline/scenario-evidence.json",
+          "sha256": "6b079b0d9a524f2c63e93d9a3d57816afe3e0ed874608825af825df2fbf4fda9"
+        },
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 82262,
+            "process_start_token": "macos:1791486135:855674"
+          },
+          {
+            "role": "be-0",
+            "pid": 82263,
+            "process_start_token": "macos:1791486135:939680"
+          },
+          {
+            "role": "be-1",
+            "pid": 82264,
+            "process_start_token": "macos:1791486136:7541"
+          },
+          {
+            "role": "be-2",
+            "pid": 82265,
+            "process_start_token": "macos:1791486136:81267"
+          }
+        ]
+      }
+    ],
+    "listing_phases": [
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-opendal-listing-boundary/listing-phase-001.json",
+          "sha256": "0ed78f692eb085b9a35d462104c31a6478bb4a5b3ea44543d742ce00d3dbd71d"
+        },
+        "observations": {
+          "after": {
+            "active": 42647552,
+            "allocated": 25145448,
+            "resident": 79527936
+          },
+          "before": {
+            "active": 33226752,
+            "allocated": 21487048,
+            "resident": 42745856
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "opendal-list-body-boundary",
+          "process_launch_identities": [
+            {
+              "pid": 81545,
+              "process_start_token": "macos:1791486098:558131",
+              "role": "fe"
+            },
+            {
+              "pid": 81546,
+              "process_start_token": "macos:1791486098:620624",
+              "role": "be-0"
+            },
+            {
+              "pid": 81547,
+              "process_start_token": "macos:1791486098:680049",
+              "role": "be-1"
+            },
+            {
+              "pid": 81548,
+              "process_start_token": "macos:1791486098:731322",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "error": "MySqlError { ERROR 1105 (HY000): Executor: Internal: ADD FILES: no visible Parquet files found under s3://cl-fixture/import-source/ }",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 0,
+              "emitted_name_bytes": 0,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 16777216,
+              "object_store_list_requests": 1,
+              "peak_listing_requests": 0,
+              "table_commits": 0,
+              "table_loads": 2,
+              "table_pages": 0,
+              "view_pages": 0
+            },
+            "response_bytes": 16777216
+          },
+          "sampled_peak": {
+            "active": 123273216,
+            "allocated": 109129032,
+            "resident": 145817600
+          },
+          "samples": 9
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-opendal-listing-boundary/listing-phase-002.json",
+          "sha256": "73a76c8ecbff8aef802fce9399f2333f10c7c09b62e5bd42e934ff83af82cdf7"
+        },
+        "observations": {
+          "after": {
+            "active": 46776320,
+            "allocated": 26639352,
+            "resident": 102432768
+          },
+          "before": {
+            "active": 42762240,
+            "allocated": 25217184,
+            "resident": 79642624
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "opendal-list-body-boundary",
+          "process_launch_identities": [
+            {
+              "pid": 81545,
+              "process_start_token": "macos:1791486098:558131",
+              "role": "fe"
+            },
+            {
+              "pid": 81546,
+              "process_start_token": "macos:1791486098:620624",
+              "role": "be-0"
+            },
+            {
+              "pid": 81547,
+              "process_start_token": "macos:1791486098:680049",
+              "role": "be-1"
+            },
+            {
+              "pid": 81548,
+              "process_start_token": "macos:1791486098:731322",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "error": "MySqlError { ERROR 1105 (HY000): Executor: ResourceExhausted: ResourceExhausted: list object-store entries }",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 0,
+              "emitted_name_bytes": 0,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 16777217,
+              "object_store_list_requests": 1,
+              "peak_listing_requests": 0,
+              "table_commits": 0,
+              "table_loads": 2,
+              "table_pages": 0,
+              "view_pages": 0
+            },
+            "response_bytes": 16777217
+          },
+          "sampled_peak": {
+            "active": 43270144,
+            "allocated": 25321560,
+            "resident": 80150528
+          },
+          "samples": 1
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-001.json",
+          "sha256": "25ee1fe4a62955d2b32b20636b2791f6c36338fd4456bdc3419de2da2c9d5ac9"
+        },
+        "observations": {
+          "after": {
+            "active": 56344576,
+            "allocated": 16289112,
+            "resident": 103710720
+          },
+          "before": {
+            "active": 32047104,
+            "allocated": 20669776,
+            "resident": 41074688
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "lake-discovery",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 16416,
+              "emitted_name_bytes": 246080,
+              "namespace_pages": 1,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 16384,
+              "table_pages": 128,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 92143616,
+            "allocated": 75912816,
+            "resident": 104054784
+          },
+          "samples": 102
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-002.json",
+          "sha256": "7ebea142befe3fb02daa69aa64b43f9f6614bf7160416f2b0b70162d21ef6212"
+        },
+        "observations": {
+          "after": {
+            "active": 63389696,
+            "allocated": 19601792,
+            "resident": 154550272
+          },
+          "before": {
+            "active": 56344576,
+            "allocated": 16323464,
+            "resident": 103710720
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "information-schema",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "clients": 1,
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 16416,
+              "emitted_name_bytes": 246080,
+              "namespace_pages": 1,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 64,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 161349632,
+            "allocated": 125692696,
+            "resident": 178520064
+          },
+          "samples": 31
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-003.json",
+          "sha256": "4a4dc1e54244fd62cde2129d9e2d1f1c0aa962e53bf8c6e24759160a1731be67"
+        },
+        "observations": {
+          "after": {
+            "active": 79249408,
+            "allocated": 22432104,
+            "resident": 772685824
+          },
+          "before": {
+            "active": 63504384,
+            "allocated": 19679528,
+            "resident": 154664960
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "information-schema",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "clients": 8,
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 131328,
+              "emitted_name_bytes": 1968640,
+              "namespace_pages": 8,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 8,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 512,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 952139776,
+            "allocated": 903658720,
+            "resident": 1046970368
+          },
+          "samples": 50
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-004.json",
+          "sha256": "ddede6ed4cea2b033cac2eef1c0f54f57f9dd58d7ee83c256e44027da7113ceb"
+        },
+        "observations": {
+          "after": {
+            "active": 95109120,
+            "allocated": 25448856,
+            "resident": 1292517376
+          },
+          "before": {
+            "active": 79249408,
+            "allocated": 22475576,
+            "resident": 772685824
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "information-schema",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "clients": 16,
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 262656,
+              "emitted_name_bytes": 3937280,
+              "namespace_pages": 16,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 8,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 1024,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 1859190784,
+            "allocated": 1795597976,
+            "resident": 2168832000
+          },
+          "samples": 75
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-005.json",
+          "sha256": "c25df681411df842238cd4bb3c9ce0aeb3c85bc3d30fb934e6d0e85a568c9f5f"
+        },
+        "observations": {
+          "after": {
+            "active": 95911936,
+            "allocated": 26830672,
+            "resident": 1285816320
+          },
+          "before": {
+            "active": 94896128,
+            "allocated": 25447000,
+            "resident": 1292222464
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "show-views",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 512,
+              "emitted_name_bytes": 7168,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 0,
+              "view_pages": 2
+            },
+            "rows": 512
+          },
+          "sampled_peak": {
+            "active": 95027200,
+            "allocated": 25843712,
+            "resident": 1292222464
+          },
+          "samples": 1
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-006.json",
+          "sha256": "7969ef6679494bac9a06fd633eaa03222a1b1169bebd52ea80f7a022ea46f51e"
+        },
+        "observations": {
+          "after": {
+            "active": 93831168,
+            "allocated": 26326048,
+            "resident": 1181302784
+          },
+          "before": {
+            "active": 95911936,
+            "allocated": 26826440,
+            "resident": 1285816320
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "drop-refusal",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "mode": "PagedOverflow",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 65537,
+              "emitted_name_bytes": 983055,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 257,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 96878592,
+            "allocated": 29240576,
+            "resident": 1286750208
+          },
+          "samples": 47
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-007.json",
+          "sha256": "43153f8927219568da66becf01b42c468277b53251851aa71f9ad653737feaea"
+        },
+        "observations": {
+          "after": {
+            "active": 95240192,
+            "allocated": 27056920,
+            "resident": 1201373184
+          },
+          "before": {
+            "active": 93831168,
+            "allocated": 26352912,
+            "resident": 1181302784
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "drop-refusal",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "mode": "TerminalOverflow",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 65537,
+              "emitted_name_bytes": 983055,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 1,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 106725376,
+            "allocated": 38749840,
+            "resident": 1192001536
+          },
+          "samples": 4
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-008.json",
+          "sha256": "8934e7444e3effdb0eec5ae39a8e818372980bc2e3440572d712d6363deb482d"
+        },
+        "observations": {
+          "after": {
+            "active": 95387648,
+            "allocated": 27193016,
+            "resident": 1244905472
+          },
+          "before": {
+            "active": 95240192,
+            "allocated": 27083784,
+            "resident": 1201373184
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "drop-refusal",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "mode": "NameOverflow",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 257,
+              "emitted_name_bytes": 16777217,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 2,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 126910464,
+            "allocated": 56779632,
+            "resident": 1227374592
+          },
+          "samples": 5
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-009.json",
+          "sha256": "cac394bff75492aa7d92495f1b4a7b85a2e94fc2f5023a71d5c2a162442a1065"
+        },
+        "observations": {
+          "after": {
+            "active": 96174080,
+            "allocated": 27641072,
+            "resident": 1237565440
+          },
+          "before": {
+            "active": 95387648,
+            "allocated": 27219880,
+            "resident": 1244905472
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "drop-refusal",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "mode": "TokenOverflow",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 1,
+              "emitted_name_bytes": 15,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 1,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 96075776,
+            "allocated": 27554736,
+            "resident": 1244905472
+          },
+          "samples": 1
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-010.json",
+          "sha256": "487b67892455be36ccf22d7657db62fbd6fecea004dd198f5183bac90cec5f3e"
+        },
+        "observations": {
+          "after": {
+            "active": 97107968,
+            "allocated": 27993360,
+            "resident": 1237532672
+          },
+          "before": {
+            "active": 96174080,
+            "allocated": 27641088,
+            "resident": 1237565440
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "drop-refusal",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "mode": "TokenCycle",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 3,
+              "emitted_name_bytes": 45,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 3,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 96813056,
+            "allocated": 27848976,
+            "resident": 1237565440
+          },
+          "samples": 1
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-011.json",
+          "sha256": "7b1d17a1d8e60244cbd7b754fe45c9837e4f927373df8b8ef946065dc147778b"
+        },
+        "observations": {
+          "after": {
+            "active": 97222656,
+            "allocated": 28132696,
+            "resident": 1102495744
+          },
+          "before": {
+            "active": 97107968,
+            "allocated": 27983136,
+            "resident": 1237532672
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "drop-refusal",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "mode": "PageOverflow",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 0,
+              "emitted_name_bytes": 0,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 1024,
+              "view_pages": 0
+            }
+          },
+          "sampled_peak": {
+            "active": 97927168,
+            "allocated": 28760480,
+            "resident": 1237532672
+          },
+          "samples": 174
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-012.json",
+          "sha256": "5dd229e2641ea541a6e74778b2b30624e2f3ab34f86eae035da414bcdc88ac9e"
+        },
+        "observations": {
+          "after": {
+            "active": 97763328,
+            "allocated": 28206584,
+            "resident": 1048887296
+          },
+          "before": {
+            "active": 97304576,
+            "allocated": 28159560,
+            "resident": 1102577664
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "exact-entries",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 65536,
+              "emitted_name_bytes": 917504,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 0,
+              "view_pages": 256
+            },
+            "rows": 65536
+          },
+          "sampled_peak": {
+            "active": 101302272,
+            "allocated": 31938928,
+            "resident": 1107197952
+          },
+          "samples": 47
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-013.json",
+          "sha256": "1cec82903d8dda2ec5eb7143283ab0416eb84fd391d5100a78d67ef48afc0884"
+        },
+        "observations": {
+          "after": {
+            "active": 98877440,
+            "allocated": 28066880,
+            "resident": 1027489792
+          },
+          "before": {
+            "active": 97763328,
+            "allocated": 28223208,
+            "resident": 1048887296
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "drop-success",
+          "process_launch_identities": [
+            {
+              "pid": 80819,
+              "process_start_token": "macos:1791486031:74848",
+              "role": "fe"
+            },
+            {
+              "pid": 80820,
+              "process_start_token": "macos:1791486031:146894",
+              "role": "be-0"
+            },
+            {
+              "pid": 80821,
+              "process_start_token": "macos:1791486031:200375",
+              "role": "be-1"
+            },
+            {
+              "pid": 80822,
+              "process_start_token": "macos:1791486031:260858",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 1025,
+              "emitted_entries": 1024,
+              "emitted_name_bytes": 14848,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 1024,
+              "table_pages": 2,
+              "view_pages": 2
+            }
+          },
+          "sampled_peak": {
+            "active": 99778560,
+            "allocated": 30587600,
+            "resident": 1049198592
+          },
+          "samples": 12
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing-cancellation/listing-phase-001.json",
+          "sha256": "905675f1cb1b09d9cef128905c6a6d0b0646785b9ac9c454e1e56de295de80f2"
+        },
+        "observations": {
+          "after": {
+            "active": 41959424,
+            "allocated": 24170536,
+            "resident": 52035584
+          },
+          "before": {
+            "active": 36978688,
+            "allocated": 22685432,
+            "resident": 48660480
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "listing-deadline",
+          "process_launch_identities": [
+            {
+              "pid": 81456,
+              "process_start_token": "macos:1791486092:25903",
+              "role": "fe"
+            },
+            {
+              "pid": 81457,
+              "process_start_token": "macos:1791486092:88709",
+              "role": "be-0"
+            },
+            {
+              "pid": 81458,
+              "process_start_token": "macos:1791486092:143854",
+              "role": "be-1"
+            },
+            {
+              "pid": 81459,
+              "process_start_token": "macos:1791486092:201110",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "error": "MySqlError { ERROR 1105 (HY000): query timed out after 1000 ms }",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 0,
+              "emitted_name_bytes": 0,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 0,
+              "view_pages": 1
+            }
+          },
+          "sampled_peak": {
+            "active": 38223872,
+            "allocated": 23437480,
+            "resident": 49512448
+          },
+          "samples": 10
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing-cancellation/listing-phase-002.json",
+          "sha256": "47b3f8f4e86182fda3c8d2ddc9e5006248156c668a0d39ae31112ca56335e10b"
+        },
+        "observations": {
+          "after": {
+            "active": 46039040,
+            "allocated": 26579248,
+            "resident": 56934400
+          },
+          "before": {
+            "active": 43712512,
+            "allocated": 24939968,
+            "resident": 54804480
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "listing-kill-query",
+          "process_launch_identities": [
+            {
+              "pid": 81456,
+              "process_start_token": "macos:1791486092:25903",
+              "role": "fe"
+            },
+            {
+              "pid": 81457,
+              "process_start_token": "macos:1791486092:88709",
+              "role": "be-0"
+            },
+            {
+              "pid": 81458,
+              "process_start_token": "macos:1791486092:143854",
+              "role": "be-1"
+            },
+            {
+              "pid": 81459,
+              "process_start_token": "macos:1791486092:201110",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "error": "MySqlError { ERROR 1317 (70100): query cancelled }",
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 0,
+              "emitted_name_bytes": 0,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 1,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 0,
+              "view_pages": 1
+            }
+          },
+          "sampled_peak": {
+            "active": 44679168,
+            "allocated": 25391744,
+            "resident": 55148544
+          },
+          "samples": 3
+        }
+      },
+      {
+        "artifact": {
+          "path": "logs/mem-1-m07/p09-cache-opendal-c0-native-20261009/catalog-mem-1-m07-sdk-listing-cancellation/listing-phase-003.json",
+          "sha256": "5e8926b2de913e71ad6e000422d269d3a619fc2f9a45e2e9c9257a394a451ade"
+        },
+        "observations": {
+          "after": {
+            "active": 64733184,
+            "allocated": 35891128,
+            "resident": 93650944
+          },
+          "before": {
+            "active": 46120960,
+            "allocated": 26456416,
+            "resident": 57131008
+          },
+          "error": null,
+          "outcome": "passed",
+          "phase": "listing-eight-position-reuse",
+          "process_launch_identities": [
+            {
+              "pid": 81456,
+              "process_start_token": "macos:1791486092:25903",
+              "role": "fe"
+            },
+            {
+              "pid": 81457,
+              "process_start_token": "macos:1791486092:88709",
+              "role": "be-0"
+            },
+            {
+              "pid": 81458,
+              "process_start_token": "macos:1791486092:143854",
+              "role": "be-1"
+            },
+            {
+              "pid": 81459,
+              "process_start_token": "macos:1791486092:201110",
+              "role": "be-2"
+            }
+          ],
+          "result": {
+            "clients": 8,
+            "provider": {
+              "active_listing_requests": 0,
+              "destructive_mutations": 0,
+              "emitted_entries": 4096,
+              "emitted_name_bytes": 57344,
+              "namespace_pages": 0,
+              "object_store_list_body_bytes": 0,
+              "object_store_list_requests": 0,
+              "peak_listing_requests": 8,
+              "table_commits": 0,
+              "table_loads": 0,
+              "table_pages": 0,
+              "view_pages": 16
+            }
+          },
+          "sampled_peak": {
+            "active": 67223552,
+            "allocated": 43723320,
+            "resident": 93650944
+          },
+          "samples": 38
+        }
+      }
+    ],
+    "pids_absent_after_cleanup": [
+      79568,
+      79569,
+      79570,
+      79571,
+      79642,
+      79643,
+      79644,
+      79645,
+      79717,
+      79718,
+      79719,
+      79720,
+      79791,
+      79792,
+      79793,
+      79794,
+      79865,
+      79866,
+      79867,
+      79868,
+      79957,
+      79958,
+      79959,
+      79960,
+      80031,
+      80032,
+      80033,
+      80034,
+      80471,
+      80472,
+      80473,
+      80474,
+      80545,
+      80546,
+      80547,
+      80548,
+      80745,
+      80746,
+      80747,
+      80748,
+      80819,
+      80820,
+      80821,
+      80822,
+      81456,
+      81457,
+      81458,
+      81459,
+      81545,
+      81546,
+      81547,
+      81548,
+      81656,
+      81657,
+      81658,
+      81659,
+      81662,
+      81846,
+      81847,
+      81848,
+      81849,
+      82043,
+      82044,
+      82046,
+      82050,
+      82262,
+      82263,
+      82264,
+      82265
+    ]
+  },
+  "frozen_inputs": [
+    {
+      "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v2.json",
+      "sha256": "0f289a3f4f650507f7196be524b769cd246ba3f7b9d318265336bc3c15ec7419"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v3.json",
+      "sha256": "e279724dc4ab2ce34dfdef5f3a939ad3f0f05ed076c36c5c60a7b7d7c6c1a3d3"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/opendal-listing-freeze-v2.json",
+      "sha256": "8aaacde63ee46399266c89d402bb9c652c7964a643abb63c633dcad59c90d142"
+    }
+  ],
+  "scope": "A clean same-SHA convergence checkpoint for these 17 native scenarios and full cargo-only C0. Whole-FE allocator samples are observations; controlled REST/S3 fixtures do not establish real provider scale CL or an SDK allocation upper bound.",
+  "remaining": [
+    "ordinary ingress carrying decision",
+    "transport coefficients and checked envelope",
+    "valid P00b relative baseline",
+    "real REST/HMS/Paimon large CL",
+    "remaining SQL and P09/P10 final same-HEAD acceptance"
+  ],
+  "local_only": true
+}
