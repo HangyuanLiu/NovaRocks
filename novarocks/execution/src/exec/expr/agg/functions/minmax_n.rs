@@ -629,3 +629,7 @@ mod retained_bytes_tests {
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "minmax_n_baseline_tests.rs"]
+mod minmax_n_baseline_tests;

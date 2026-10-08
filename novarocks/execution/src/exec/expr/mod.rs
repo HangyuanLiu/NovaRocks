@@ -32,9 +32,13 @@ mod legacy_calendar_add_baseline_tests;
 #[cfg(test)]
 mod legacy_calendar_duration_baseline_tests;
 #[cfg(test)]
+mod legacy_calendar_unix_baseline_tests;
+#[cfg(test)]
 mod legacy_calendar_month_baseline_tests;
 #[cfg(test)]
 mod legacy_conditional_baseline_tests;
+#[cfg(test)]
+mod legacy_coalesce_assembly_baseline_tests;
 #[cfg(test)]
 mod legacy_date_carrier_baseline_tests;
 #[cfg(test)]

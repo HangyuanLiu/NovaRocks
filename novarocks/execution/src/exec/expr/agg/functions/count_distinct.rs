@@ -957,3 +957,7 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "count_distinct_baseline_tests.rs"]
+mod count_distinct_baseline_tests;
