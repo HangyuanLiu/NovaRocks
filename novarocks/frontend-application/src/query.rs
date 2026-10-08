@@ -28,7 +28,9 @@ use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
-use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
+use crate::query::compiler::{
+    FrontendQueryCompiler, FrontendQueryCompilerError, FrontendQueryPurpose,
+};
 use crate::query_execution::completion::PreparedQueryOperation;
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
@@ -1118,13 +1120,14 @@ impl FrontendQuerySession {
         let mut governed = self
             .service
             .query_control
-            .begin_governed_statement(
+            .begin_governed_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 WorkClass::Management,
                 None,
                 None,
                 Some(Arc::from(source)),
+                ResultWindowClass::Local,
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let result = match statement {
@@ -1293,7 +1296,14 @@ impl FrontendQuerySession {
         cancellation: novarocks_workload_control::CancellationView,
         preparation_scope: &novarocks_workload_control::WorkScope,
         preparation_window: Option<ResultWindowAlias>,
+        purpose: FrontendQueryPurpose,
     ) -> Result<PreparedQueryOperation, GovernedPreparationError> {
+        if preparation_window.as_ref().map(ResultWindowAlias::class) != Some(purpose.window_class())
+        {
+            return Err(GovernedPreparationError::Service(internal_error(
+                "query preparation requires its exact admitted result window",
+            )));
+        }
         let parsed_statement =
             state
                 .substitute_user_variables(parsed_statement)
@@ -1357,6 +1367,7 @@ impl FrontendQuerySession {
                 });
                 compiler.prepare_statement(
                     &parsed_statement,
+                    purpose,
                     &context,
                     Some(query_options),
                     &preparation_scope,
@@ -1524,6 +1535,7 @@ impl FrontendQuerySession {
                 statement.cancellation().clone(),
                 statement.scope(),
                 statement.result_window_alias(),
+                FrontendQueryPurpose::ScalarValue,
             )
             .await
             .map_err(|error| match error {
@@ -1609,22 +1621,29 @@ impl FrontendQuerySession {
         sql: String,
         parsed_statement: ParsedStatement,
     ) -> Result<StatementResult, QueryServiceError> {
-        debug_assert!(matches!(&parsed_statement, ParsedStatement::Query(_)));
-        let state = self.state.lock().map_err(poisoned_state)?.clone();
-        let (deadline, timeout_ms) = governed_query_deadline(&state)?;
+        let ParsedStatement::Query(query) = &parsed_statement else {
+            return Err(internal_error("read admission requires a query statement"));
+        };
+        let purpose = FrontendQueryPurpose::client_query(query);
+        let (deadline, timeout_ms) = {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            governed_query_deadline(&state)?
+        };
         let token = self.token()?;
         let mut statement = self
             .service
             .query_control
-            .begin_queued_governed_query_statement(
+            .begin_queued_governed_query_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
                 Some(Arc::from(sql.as_str())),
+                purpose.window_class(),
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
+        let state = self.state.lock().map_err(poisoned_state)?.clone();
         let prepared = match self
             .prepare_governed_query_operation(
                 &sql,
@@ -1636,6 +1655,7 @@ impl FrontendQuerySession {
                 statement.cancellation().clone(),
                 statement.scope(),
                 statement.result_window_alias(),
+                purpose,
             )
             .await
         {
@@ -1716,16 +1736,12 @@ impl FrontendQuerySession {
         parsed_statement: ParsedStatement,
     ) -> Result<StatementResult, QueryServiceError> {
         reject_plain_query_from_legacy_typed_route(&parsed_statement)?;
-        let state = self.state.lock().map_err(poisoned_state)?.clone();
-        let parsed_statement = state
-            .substitute_user_variables(parsed_statement)
-            .map_err(|error| internal_error(error.to_string()))?;
-        novarocks_query_application::sql::admission::admit_persisted_definition_semantics(
-            &sql,
-            &parsed_statement,
-            state.sql_semantics(),
-        )?;
-        let query_timeout_secs = state.execution_settings().query_timeout_secs();
+        let query_timeout_secs = self
+            .state
+            .lock()
+            .map_err(poisoned_state)?
+            .execution_settings()
+            .query_timeout_secs();
         let session_deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()
                 .checked_add(Duration::from_secs(seconds))
@@ -1753,15 +1769,23 @@ impl FrontendQuerySession {
         let timeout_ms = timeout_duration.map(timeout_message_millis);
         let token = self.token()?;
         let work_class = typed_statement_work_class(&parsed_statement);
-        // Plain EXPLAIN produces a bounded FE-local result. Keep warehouse
-        // queueing, but acquire its complete Local window before compilation.
-        // ANALYZE's CountOnly/internal handoff is installed at the full cut.
-        let local_explain = matches!(
-            &parsed_statement,
+        let preparation_purpose = match &parsed_statement {
             ParsedStatement::ExplainQuery(explain)
-                if explain.format != ast::ExplainFormat::Analyze
-        );
-        let mut statement = if local_explain {
+                if explain.format == ast::ExplainFormat::Analyze =>
+            {
+                Some(FrontendQueryPurpose::ProfileCountOnly)
+            }
+            ParsedStatement::ExplainQuery(_) => Some(FrontendQueryPurpose::LocalRows),
+            _ => None,
+        };
+        let window_class = preparation_purpose
+            .map(FrontendQueryPurpose::window_class)
+            .unwrap_or(if work_class == WorkClass::Query {
+                ResultWindowClass::Internal
+            } else {
+                ResultWindowClass::Local
+            });
+        let mut statement = if work_class == WorkClass::Query {
             self.service
                 .query_control
                 .begin_queued_governed_query_statement_with_result(
@@ -1770,18 +1794,7 @@ impl FrontendQuerySession {
                     deadline.map(tokio::time::Instant::from_std),
                     timeout_ms,
                     Some(Arc::from(sql.as_str())),
-                    ResultWindowClass::Local,
-                )
-                .await
-        } else if work_class == WorkClass::Query {
-            self.service
-                .query_control
-                .begin_queued_governed_query_statement(
-                    token,
-                    &self.service.workload_root_admission,
-                    deadline.map(tokio::time::Instant::from_std),
-                    timeout_ms,
-                    Some(Arc::from(sql.as_str())),
+                    window_class,
                 )
                 .await
         } else {
@@ -1794,10 +1807,19 @@ impl FrontendQuerySession {
                     deadline.map(tokio::time::Instant::from_std),
                     timeout_ms,
                     Some(Arc::from(sql.as_str())),
-                    ResultWindowClass::Local,
+                    window_class,
                 )
         }
         .map_err(|error| self.governed_statement_begin_error(error))?;
+        let state = self.state.lock().map_err(poisoned_state)?.clone();
+        let parsed_statement = state
+            .substitute_user_variables(parsed_statement)
+            .map_err(|error| internal_error(error.to_string()))?;
+        novarocks_query_application::sql::admission::admit_persisted_definition_semantics(
+            &sql,
+            &parsed_statement,
+            state.sql_semantics(),
+        )?;
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),
@@ -1941,6 +1963,8 @@ impl FrontendQuerySession {
                             compiler
                                 .prepare_statement(
                                     &statement,
+                                    preparation_purpose
+                                        .expect("EXPLAIN has an admitted preparation purpose"),
                                     &context,
                                     Some(query_options),
                                     &preparation_scope,
@@ -3852,8 +3876,7 @@ mod tests {
         assert_abandoned_synchronous_window(true).await;
     }
 
-    #[tokio::test]
-    async fn cancelled_scalar_preparation_keeps_internal_window_until_worker_exit() {
+    async fn assert_cancelled_preparation_window_until_worker_exit(class: ResultWindowClass) {
         use novarocks_query_application::cpu::{QueryCpuExecutorConfig, QueryCpuExecutorOwner};
         use novarocks_workload_control::{ResultCapacityConfig, WorkloadConfig, WorkloadControl};
 
@@ -3877,7 +3900,7 @@ mod tests {
         let (permit, window) = root
             .owner
             .scope()
-            .admit_query_with_result(ResultWindowClass::Internal)
+            .admit_query_with_result(class)
             .unwrap()
             .await
             .unwrap();
@@ -3918,7 +3941,13 @@ mod tests {
         drop(permit);
         root.owner.complete();
         drop(window);
-        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let expected = match class {
+            ResultWindowClass::Client => [1, 0, 0, 0],
+            ResultWindowClass::Local => [0, 1, 0, 0],
+            ResultWindowClass::Internal => [0, 0, 1, 0],
+            ResultWindowClass::Closing => unreachable!("preparation cannot enter Closing"),
+        };
+        assert_eq!(capacity.snapshot().held_positions, expected);
         let (open, changed) = &*gate;
         *open.lock().unwrap() = true;
         changed.notify_all();
@@ -3926,6 +3955,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_scalar_preparation_keeps_internal_window_until_worker_exit() {
+        assert_cancelled_preparation_window_until_worker_exit(ResultWindowClass::Internal).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_client_preparation_keeps_client_window_until_worker_exit() {
+        assert_cancelled_preparation_window_until_worker_exit(ResultWindowClass::Client).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_local_read_preparation_keeps_local_window_until_worker_exit() {
+        assert_cancelled_preparation_window_until_worker_exit(ResultWindowClass::Local).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -84,15 +84,12 @@ pub fn try_query_materialized_views(
     readiness: &MvReadinessPort,
     query: &ast::Query,
 ) -> Result<Option<StatementResult>, String> {
+    if !is_local_materialized_views_query(query) {
+        return Ok(None);
+    }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
+        unreachable!("local materialized-view admission requires SELECT");
     };
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Ok(None);
-    }
-    if !is_information_schema_materialized_views(&select.from[0].relation) {
-        return Ok(None);
-    }
 
     let projection = projection_columns(select)?;
     let mut rows = materialized_view_rows(readiness)?;
@@ -177,16 +174,26 @@ fn materialized_view_row(projection: &StoredMvProjection) -> MaterializedViewInf
     }
 }
 
+/// Borrow the exact shape used by the immediate producer before any result
+/// window or catalog snapshot is acquired. Other system queries stay distributed.
+pub(crate) fn is_local_materialized_views_query(query: &ast::Query) -> bool {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.from.len() == 1
+        && select.from[0].joins.is_empty()
+        && is_information_schema_materialized_views(&select.from[0].relation)
+}
+
 fn is_information_schema_materialized_views(factor: &ast::TableFactor) -> bool {
     let ast::TableFactor::Table { name, .. } = factor else {
         return false;
     };
-    let parts = object_name_parts(name);
     matches!(
-        parts.as_slice(),
+        name.parts.as_slice(),
         [schema, table]
-            if schema.eq_ignore_ascii_case("information_schema")
-                && table.eq_ignore_ascii_case("materialized_views")
+            if schema.value.eq_ignore_ascii_case("information_schema")
+                && table.value.eq_ignore_ascii_case("materialized_views")
     )
 }
 

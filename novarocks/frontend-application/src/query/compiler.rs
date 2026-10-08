@@ -60,6 +60,61 @@ use novarocks_sql::compiler::{
 };
 use novarocks_sql::planning::catalog::TableLookupMode;
 
+/// Application intent is supplied by the caller, never inferred from a
+/// physical plan's column count. Wire installation remains a separate cut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrontendQueryPurpose {
+    ClientRows,
+    LocalRows,
+    ScalarValue,
+    ProfileCountOnly,
+}
+
+impl FrontendQueryPurpose {
+    pub(crate) fn client_query(query: &Query) -> Self {
+        if information_schema::is_local_materialized_views_query(query) {
+            Self::LocalRows
+        } else {
+            Self::ClientRows
+        }
+    }
+
+    pub(crate) fn window_class(self) -> novarocks_workload_control::ResultWindowClass {
+        use novarocks_workload_control::ResultWindowClass;
+        match self {
+            Self::ClientRows => ResultWindowClass::Client,
+            Self::LocalRows => ResultWindowClass::Local,
+            Self::ScalarValue | Self::ProfileCountOnly => ResultWindowClass::Internal,
+        }
+    }
+
+    fn validate(self, statement: &Statement) -> Result<(), FrontendQueryCompilerError> {
+        let valid = match (self, statement) {
+            (Self::ClientRows, Statement::Query(query)) => {
+                !information_schema::is_local_materialized_views_query(query)
+            }
+            (Self::LocalRows, Statement::Query(query)) => {
+                information_schema::is_local_materialized_views_query(query)
+            }
+            (Self::LocalRows, Statement::ExplainQuery(explain)) => {
+                explain.format != ExplainFormat::Analyze
+            }
+            (Self::ScalarValue, Statement::Query(_)) => true,
+            (Self::ProfileCountOnly, Statement::ExplainQuery(explain)) => {
+                explain.format == ExplainFormat::Analyze
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(FrontendQueryCompilerError::Engine(
+                "query preparation purpose does not match the admitted statement".to_owned(),
+            ))
+        }
+    }
+}
+
 /// Preserves SQL analyze-domain facts until the session still has the original
 /// SQL source required to render a user location.
 #[derive(Debug)]
@@ -239,10 +294,12 @@ impl FrontendQueryCompiler {
     pub(crate) fn prepare_statement(
         &self,
         statement: &Statement,
+        purpose: FrontendQueryPurpose,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
+        purpose.validate(statement)?;
         let connector_planning_context = connector_planning_context_for_query_on_runtime(
             self.connector_blocking_io.runtime(),
             query_options.as_ref(),
@@ -999,4 +1056,87 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
         level,
         explain.logical || matches!(explain.format, ExplainFormat::Logical),
     )
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    use super::*;
+
+    fn statement(sql: &str) -> Statement {
+        novarocks_query_application::sql::parse_single_statement(sql).unwrap()
+    }
+
+    #[test]
+    fn client_admission_uses_only_the_exact_local_immediate_shape() {
+        for sql in [
+            "SELECT * FROM information_schema.materialized_views",
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.MATERIALIZED_VIEWS WHERE IS_ACTIVE = true ORDER BY TABLE_NAME",
+        ] {
+            let parsed = statement(sql);
+            let Statement::Query(query) = &parsed else {
+                panic!("expected query")
+            };
+            assert_eq!(
+                FrontendQueryPurpose::client_query(query),
+                FrontendQueryPurpose::LocalRows,
+                "{sql}"
+            );
+            assert!(FrontendQueryPurpose::LocalRows.validate(&parsed).is_ok());
+            assert!(FrontendQueryPurpose::ClientRows.validate(&parsed).is_err());
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT TABLE_NAME FROM information_schema.tables",
+            "SELECT * FROM catalog.information_schema.materialized_views",
+            "SELECT * FROM information_schema.materialized_views m JOIN t ON m.TABLE_NAME = t.name",
+            "SELECT * FROM information_schema.materialized_views UNION ALL SELECT * FROM information_schema.materialized_views",
+            "SELECT * FROM (SELECT * FROM information_schema.materialized_views) m",
+        ] {
+            let parsed = statement(sql);
+            let Statement::Query(query) = &parsed else {
+                panic!("expected query")
+            };
+            assert_eq!(
+                FrontendQueryPurpose::client_query(query),
+                FrontendQueryPurpose::ClientRows,
+                "{sql}"
+            );
+            assert!(FrontendQueryPurpose::ClientRows.validate(&parsed).is_ok());
+            assert!(FrontendQueryPurpose::LocalRows.validate(&parsed).is_err());
+        }
+    }
+
+    #[test]
+    fn scalar_and_profile_intent_cannot_be_guessed_from_output_shape() {
+        let select = statement("SELECT 1");
+        assert!(FrontendQueryPurpose::ClientRows.validate(&select).is_ok());
+        assert!(FrontendQueryPurpose::ScalarValue.validate(&select).is_ok());
+        assert!(
+            FrontendQueryPurpose::ProfileCountOnly
+                .validate(&select)
+                .is_err()
+        );
+        let explain = statement("EXPLAIN SELECT 1");
+        assert!(FrontendQueryPurpose::LocalRows.validate(&explain).is_ok());
+        assert!(
+            FrontendQueryPurpose::ScalarValue
+                .validate(&explain)
+                .is_err()
+        );
+        assert!(
+            FrontendQueryPurpose::ProfileCountOnly
+                .validate(&explain)
+                .is_err()
+        );
+        let profile = statement("EXPLAIN ANALYZE SELECT 1");
+        assert!(
+            FrontendQueryPurpose::ProfileCountOnly
+                .validate(&profile)
+                .is_ok()
+        );
+        assert!(FrontendQueryPurpose::LocalRows.validate(&profile).is_err());
+        assert!(FrontendQueryPurpose::ClientRows.validate(&profile).is_err());
+        let local = statement("SELECT TABLE_NAME FROM information_schema.materialized_views");
+        assert!(FrontendQueryPurpose::ScalarValue.validate(&local).is_ok());
+    }
 }
