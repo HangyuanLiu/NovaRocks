@@ -14,232 +14,40 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Date32Array, Decimal128Array,
-    Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    Int64Builder, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
-};
-use arrow::datatypes::{DataType, TimeUnit};
-
-use crate::exec::node::aggregate::AggFunction;
-use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
-
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{AggScalarValue, scalar_from_array as scalar_from_any_array};
-
-struct DistinctSet {
-    allocator: AggregateAllocator,
-    values: AggregateHashSet<AggregateVec<u8>>,
-}
-
-impl DistinctSet {
-    fn new(tracker: Arc<MemTracker>) -> Self {
-        let allocator = AggregateAllocator::new(tracker);
-        Self {
-            values: aggregate_hash_set(allocator.clone()),
-            allocator,
-        }
-    }
-
-    fn insert(&mut self, value: Vec<u8>) -> Result<(), String> {
-        if self
-            .values
-            .iter()
-            .any(|existing| existing.as_slice() == value.as_slice())
-        {
-            return Ok(());
-        }
-        self.values
-            .try_reserve(1)
-            .map_err(|_| self.allocator.allocation_error("reserve distinct hash set"))?;
-        let value = aggregate_bytes(self.allocator.clone(), &value)?;
-        self.values.insert(value);
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &AggregateVec<u8>> {
-        self.values.iter()
-    }
-
-    fn retained_bytes(&self) -> usize {
-        0
+use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
+use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Builder};
+#[cfg(test)]
+use arrow::array::{
+    Date32Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
+use arrow::datatypes::DataType;
+use novarocks_functions::aggregate_scalar::ScalarWork;
+use novarocks_functions::builtin::aggregate_count_distinct_core::{
+    self as core, CountDistinctState, LegacyCountReader,
+};
+type DistinctSet = CountDistinctState<AggregateAllocator>;
+impl From<Arc<MemTracker>> for AggregateAllocator {
+    fn from(tracker: Arc<MemTracker>) -> Self {
+        Self::new(tracker)
     }
 }
-
 pub(super) struct CountDistinctAgg;
-
 unsafe fn get_or_init_set<'a>(ptr: *mut u8) -> &'a mut DistinctSet {
     unsafe { &mut *ptr.cast::<DistinctSet>() }
 }
-
-fn encode_u8(v: u8) -> Vec<u8> {
-    vec![v]
-}
-
-fn encode_le<T: Copy>(v: T) -> Vec<u8> {
-    // Safety: We only use this for plain-old-data numeric scalars.
-    unsafe {
-        std::slice::from_raw_parts((&v as *const T) as *const u8, std::mem::size_of::<T>()).to_vec()
-    }
-}
-
-fn encode_scalar_value(value: &Option<AggScalarValue>) -> Vec<u8> {
-    fn encode_into(buf: &mut Vec<u8>, value: &AggScalarValue) {
-        match value {
-            AggScalarValue::Bool(v) => {
-                buf.push(1);
-                buf.push(*v as u8);
-            }
-            AggScalarValue::Int64(v) => {
-                buf.push(2);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Float64(v) => {
-                buf.push(3);
-                buf.extend_from_slice(&v.to_bits().to_le_bytes());
-            }
-            AggScalarValue::Utf8(v) => {
-                buf.push(4);
-                let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(v.as_bytes());
-            }
-            AggScalarValue::Date32(v) => {
-                buf.push(5);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Timestamp(v) => {
-                buf.push(6);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal128(v) => {
-                buf.push(7);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal256(v) => {
-                buf.push(11);
-                let text = v.to_string();
-                let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(text.as_bytes());
-            }
-            AggScalarValue::Binary(v) => {
-                buf.push(12);
-                let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(v);
-            }
-            AggScalarValue::Struct(items) => {
-                buf.push(8);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                }
-            }
-            AggScalarValue::Map(items) => {
-                buf.push(9);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                for (k, v) in items {
-                    match k {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                    match v {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                }
-            }
-            AggScalarValue::List(items) => {
-                buf.push(10);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    match value {
-        Some(v) => {
-            out.push(1);
-            encode_into(&mut out, v);
-        }
-        None => out.push(0),
-    }
-    out
-}
-
-fn struct_contains_null_field(value: &AggScalarValue) -> bool {
-    match value {
-        AggScalarValue::Struct(items) => items.iter().any(|item| item.is_none()),
-        _ => false,
-    }
-}
-
 fn serialize_set(set: &DistinctSet) -> Vec<u8> {
-    let mut out = Vec::new();
-    let count = set.len() as u32;
-    out.extend_from_slice(&count.to_le_bytes());
-    for v in set.iter() {
-        let len = v.len() as u32;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(v);
-    }
-    out
+    core::serialize_set(set, Vec::new(), &mut ScalarWork::new(None))
+        .expect("legacy serialization uses infallible scratch")
 }
-
 fn deserialize_set(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    if bytes.len() < 4 {
-        return Err("invalid distinct set encoding".to_string());
-    }
-    let mut pos = 0usize;
-    let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    let mut vals = Vec::with_capacity(count);
-    for _ in 0..count {
-        if pos + 4 > bytes.len() {
-            return Err("invalid distinct set encoding".to_string());
-        }
-        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + len > bytes.len() {
-            return Err("invalid distinct set encoding".to_string());
-        }
-        vals.push(bytes[pos..pos + len].to_vec());
-        pos += len;
-    }
-    Ok(vals)
+    core::deserialize_set(bytes, Vec::new(), &mut ScalarWork::new(None))
+        .map_err(|error| error.to_string())
 }
-
 impl AggregateFunction for CountDistinctAgg {
     fn build_spec_from_type(
         &self,
@@ -340,298 +148,24 @@ impl AggregateFunction for CountDistinctAgg {
         let AggInputView::Any(array) = input else {
             return Err("count_distinct batch input type mismatch".to_string());
         };
-        match array.data_type() {
-            DataType::Null => Ok(()),
-            DataType::Int64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)))?;
-                }
-                Ok(())
+        core::validate_legacy_array(array)?;
+        for (row, &base) in state_ptrs.iter().enumerate() {
+            let key = core::encode_row(
+                array,
+                row,
+                &LegacyCountReader,
+                Vec::new(),
+                &mut ScalarWork::new(None),
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(key) = key {
+                let ptr = unsafe { (base as *mut u8).add(offset) };
+                let set = unsafe { get_or_init_set(ptr) };
+                set.insert(key)?;
             }
-            DataType::Int32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)))?;
-                }
-                Ok(())
-            }
-            DataType::Int16 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)))?;
-                }
-                Ok(())
-            }
-            DataType::Int8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)))?;
-                }
-                Ok(())
-            }
-            DataType::Float64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row).to_bits()))?;
-                }
-                Ok(())
-            }
-            DataType::Float32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row).to_bits()))?;
-                }
-                Ok(())
-            }
-            DataType::Boolean => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_u8(arr.value(row) as u8))?;
-                }
-                Ok(())
-            }
-            DataType::Utf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).as_bytes().to_vec())?;
-                }
-                Ok(())
-            }
-            DataType::Binary => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).to_vec())?;
-                }
-                Ok(())
-            }
-            DataType::Date32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)))?;
-                }
-                Ok(())
-            }
-            DataType::Timestamp(unit, _) => match unit {
-                TimeUnit::Second => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
-                    for (row, &base) in state_ptrs.iter().enumerate() {
-                        if arr.is_null(row) {
-                            continue;
-                        }
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)))?;
-                    }
-                    Ok(())
-                }
-                TimeUnit::Millisecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMillisecondArray".to_string()
-                        })?;
-                    for (row, &base) in state_ptrs.iter().enumerate() {
-                        if arr.is_null(row) {
-                            continue;
-                        }
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)))?;
-                    }
-                    Ok(())
-                }
-                TimeUnit::Microsecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMicrosecondArray".to_string()
-                        })?;
-                    for (row, &base) in state_ptrs.iter().enumerate() {
-                        if arr.is_null(row) {
-                            continue;
-                        }
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)))?;
-                    }
-                    Ok(())
-                }
-                TimeUnit::Nanosecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampNanosecondArray".to_string()
-                        })?;
-                    for (row, &base) in state_ptrs.iter().enumerate() {
-                        if arr.is_null(row) {
-                            continue;
-                        }
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)))?;
-                    }
-                    Ok(())
-                }
-            },
-            DataType::Decimal128(_, _) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).to_le_bytes().to_vec())?;
-                }
-                Ok(())
-            }
-            DataType::Decimal256(_, _) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Decimal256Array>()
-                    .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).to_le_bytes().to_vec())?;
-                }
-                Ok(())
-            }
-            DataType::List(_) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if array.is_null(row) {
-                        continue;
-                    }
-                    let value = scalar_from_any_array(array, row)?;
-                    let Some(value) = value else {
-                        continue;
-                    };
-
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_scalar_value(&Some(value)))?;
-                }
-                Ok(())
-            }
-            DataType::Struct(_) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if array.is_null(row) {
-                        continue;
-                    }
-                    let value = scalar_from_any_array(array, row)?;
-                    let Some(value) = value else {
-                        continue;
-                    };
-                    if struct_contains_null_field(&value) {
-                        continue;
-                    }
-
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_scalar_value(&Some(value)))?;
-                }
-                Ok(())
-            }
-            other => Err(format!(
-                "unsupported count_distinct input type: {:?}",
-                other
-            )),
         }
+        Ok(())
     }
-
     fn merge_batch(
         &self,
         _spec: &AggSpec,
@@ -642,22 +176,18 @@ impl AggregateFunction for CountDistinctAgg {
         let AggInputView::Binary(arr) = input else {
             return Err("count_distinct merge input type mismatch".to_string());
         };
-
         for (row, &base) in state_ptrs.iter().enumerate() {
             if arr.is_null(row) {
                 continue;
             }
-            let bytes = arr.value(row);
-            let vals = deserialize_set(bytes)?;
+            let values = deserialize_set(arr.value(row))?;
             let ptr = unsafe { (base as *mut u8).add(offset) };
             let set = unsafe { get_or_init_set(ptr) };
-            for v in vals {
-                set.insert(v)?;
-            }
+            core::merge_decoded(set, values, &mut ScalarWork::new(None))
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
-
     fn build_array(
         &self,
         _spec: &AggSpec,

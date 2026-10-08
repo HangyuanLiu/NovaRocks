@@ -2940,6 +2940,9 @@ pub fn contribute_builtin_functions(
             [FunctionOverloadDeclaration {
                 effects: match declaration.name {
                     "count" => Some(super::aggregate_count_owner::effects()),
+                    "multi_distinct_count" => {
+                        Some(super::aggregate_count_distinct_owner::effects())
+                    }
                     "any_value" => Some(super::aggregate_any_value_owner::effects()),
                     "max_by" | "min_by" => Some(super::aggregate_by_owner::effects()),
                     "min_n" | "max_n" => Some(super::aggregate_n_owner::effects()),
@@ -2999,6 +3002,14 @@ pub fn contribute_builtin_functions(
         }
         if declaration.name == "any_value" {
             builder.register(super::aggregate_any_value_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if declaration.name == "multi_distinct_count" {
+            builder.register(super::aggregate_count_distinct_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,

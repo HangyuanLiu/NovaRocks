@@ -1547,3 +1547,7 @@ mod n_tests;
 #[cfg(test)]
 #[path = "pure_differential_s1_parts_tests.rs"]
 mod s1_parts_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_count_distinct_tests.rs"]
+mod count_distinct_tests;
