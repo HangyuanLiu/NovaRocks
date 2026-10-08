@@ -2580,6 +2580,7 @@ pub(super) fn scalar_definition_parts(
                     "md5sum" => Some(super::md5sum_owner::effects()),
                     "split" => Some(super::string_split_owner::effects()),
                     "__map_element_at" => Some(super::map_element_at_owner::effects()),
+                    "__array_element_at" => Some(super::array_element_at_owner::effects()),
                     name if super::string_md5_owner::operation(name).is_some() => {
                         Some(super::string_md5_owner::effects())
                     }
@@ -2890,6 +2891,9 @@ pub fn contribute_builtin_functions(
             "split" => super::string_split_owner::definition(&name, declaration, resolver)?,
             "__map_element_at" => {
                 super::map_element_at_owner::definition(&name, declaration, resolver)?
+            }
+            "__array_element_at" => {
+                super::array_element_at_owner::definition(&name, declaration, resolver)?
             }
             name if super::string_md5_owner::operation(name).is_some() => {
                 super::string_md5_owner::definition(name, declaration, resolver)?

@@ -35,7 +35,7 @@ pub(super) enum Operation {
     ArrayLiteral,
     MapLookup,
 }
-fn copy_error(error: CopyError) -> KernelFailure {
+pub(super) fn copy_error(error: CopyError) -> KernelFailure {
     match error {
         CopyError::Control(cause) => cause,
         CopyError::Extent => KernelFailure::ResourceExhausted,
@@ -48,7 +48,7 @@ fn value<'a>(arg: &'a FunctionArgumentType) -> Result<&'a FunctionValueType, Ker
         _ => Err(invalid("collection call requires exact value arguments")),
     }
 }
-fn nullable_take_type(
+pub(super) fn nullable_take_type(
     ty: &DataType,
     observe: &mut dyn FnMut() -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
@@ -163,7 +163,7 @@ pub(super) fn validate_profile(
     }
     Ok(())
 }
-fn reserve<T>(
+pub(super) fn reserve<T>(
     len: usize,
     work: &RefCell<EvaluationCheckpoints<'_>>,
 ) -> Result<Vec<T>, KernelFailure> {
@@ -176,7 +176,7 @@ fn reserve<T>(
     work.borrow_mut().flush()?;
     Ok(values)
 }
-fn compact(
+pub(super) fn compact(
     argument: EvaluatedArgument<'_>,
     selection: crate::Selection<'_>,
     work: &RefCell<EvaluationCheckpoints<'_>>,

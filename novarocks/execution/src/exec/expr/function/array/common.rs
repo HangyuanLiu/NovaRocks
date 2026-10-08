@@ -40,21 +40,15 @@ pub(super) fn is_logically_null(array: &dyn Array, index: usize) -> bool {
 }
 
 pub(super) fn row_index(row: usize, len: usize) -> usize {
-    if len == 1 { 0 } else { row }
+    novarocks_functions::builtin::map_lookup_core::row_index(row, len)
 }
-
 pub(super) fn cast_output(
     out: ArrayRef,
     output_type: Option<&DataType>,
     fn_name: &str,
 ) -> Result<ArrayRef, String> {
-    let Some(target) = output_type else {
-        return Ok(out);
-    };
-    if out.data_type() == target {
-        return Ok(out);
-    }
-    cast(&out, target).map_err(|e| format!("{}: failed to cast output: {}", fn_name, e))
+    novarocks_functions::builtin::map_lookup_core::cast_output(out, output_type)
+        .map_err(|cause| format!("{fn_name}: failed to cast output: {cause}"))
 }
 
 pub(super) fn adjust_legacy_decimalv2_target_type(

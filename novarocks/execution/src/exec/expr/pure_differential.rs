@@ -1641,3 +1641,6 @@ mod bitwise_shared_tests;
 
 #[path = "pure_differential_collection_construct_access_tests.rs"]
 mod collection_construct_access_tests;
+
+#[path = "pure_differential_array_element_access_tests.rs"]
+mod array_element_access_tests;
