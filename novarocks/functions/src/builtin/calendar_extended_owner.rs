@@ -47,6 +47,10 @@ pub(super) fn operation(name: &str) -> Option<CalendarExtendedOp> {
         "date_sub" | "subdate" | "days_sub" => Some(CalendarExtendedOp::DaysShift(-1)),
         "weeks_add" => Some(CalendarExtendedOp::DaysShift(7)),
         "weeks_sub" => Some(CalendarExtendedOp::DaysShift(-7)),
+        "add_months" | "months_add" => Some(CalendarExtendedOp::MonthsShift(1)),
+        "months_sub" => Some(CalendarExtendedOp::MonthsShift(-1)),
+        "years_add" => Some(CalendarExtendedOp::MonthsShift(12)),
+        "years_sub" => Some(CalendarExtendedOp::MonthsShift(-12)),
         "date_format" => Some(CalendarExtendedOp::DateFormat),
         "str_to_date" => Some(CalendarExtendedOp::Parse(
             super::calendar_extended_parse::CalendarParseOp::StrToDate,
@@ -94,7 +98,9 @@ pub(super) fn effects(operation: CalendarExtendedOp) -> FunctionEffectDeclaratio
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: if matches!(
             operation,
-            CalendarExtendedOp::Trunc | CalendarExtendedOp::DaysShift(_)
+            CalendarExtendedOp::Trunc
+                | CalendarExtendedOp::DaysShift(_)
+                | CalendarExtendedOp::MonthsShift(_)
         ) {
             FunctionNullBehavior::CalledOnNull
         } else {
@@ -312,6 +318,14 @@ impl PureScalarImplementation for CalendarExtendedOwner {
                     FunctionBindingError::Control(error) => compile_failure(error),
                     _ => invalid("extended calendar preparation has a stale selected binding"),
                 })?;
+            if matches!(self.operation, CalendarExtendedOp::MonthsShift(_))
+                && contract.result_type().data_type == arrow_schema::DataType::Date32
+            {
+                return Err(invalid(&format!(
+                    "{} rejects declared Date32 result: legacy month shift returns Timestamp(Microsecond, None)",
+                    self.declaration.function_id().as_str()
+                )));
+            }
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
             Ok(Arc::new(PreparedCalendarExtended {

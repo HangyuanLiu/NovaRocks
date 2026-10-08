@@ -701,3 +701,142 @@ fn pure_differential_s1_day_week_profiles_have_nonnull_and_constant_broadcast_co
         }
     }
 }
+#[test]
+fn pure_differential_s1_month_year_all_consistent_declared_profiles() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(-25),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(12),
+        Some(25),
+        None,
+        Some(1_i64 << 32),
+    ]));
+    for name in [
+        "add_months",
+        "months_add",
+        "months_sub",
+        "years_add",
+        "years_sub",
+    ] {
+        let date: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            Some(0),
+        ]));
+        let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(0),
+            Some(-1),
+            Some(1),
+            Some(0),
+            Some(0),
+            None,
+            Some(0),
+            Some(0),
+        ]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("2024-01-31 12:34:56.123456"),
+            Some("2024-03-31"),
+            Some("2024-02-29"),
+            Some("0000-01-31"),
+            Some("invalid"),
+            None,
+            Some("2024-01-31"),
+            Some("2024-01-31"),
+        ]));
+        let sources = if name == "add_months" {
+            vec![date, timestamp]
+        } else {
+            vec![timestamp, text]
+        };
+        for source in sources {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_month_year_consistent_profiles_have_nonnull_and_constant_broadcast_coverage()
+ {
+    for name in [
+        "add_months",
+        "months_add",
+        "months_sub",
+        "years_add",
+        "years_sub",
+    ] {
+        let date: ArrayRef = Arc::new(Date32Array::from(vec![0; 8]));
+        let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0; 8]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["2024-01-31 12:34:56.123456"; 8]));
+        let sources = if name == "add_months" {
+            vec![date, timestamp]
+        } else {
+            vec![timestamp, text]
+        };
+        for source in sources {
+            let interval: ArrayRef = Arc::new(Int64Array::from(vec![1; 8]));
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .typed_column(
+                        FunctionValueType::new(source.data_type().clone(), false),
+                        Arc::clone(&source),
+                    )
+                    .typed_column(
+                        FunctionValueType::new(DataType::Int64, false),
+                        Arc::clone(&interval),
+                    ),
+            );
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .constant_rows(8)
+                    .constant_array(source.slice(0, 1))
+                    .constant_array(interval.slice(0, 1)),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_month_year_consistent_profiles_generated_inputs() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(
+        (0..256)
+            .map(|row| {
+                if row % 11 == 0 {
+                    None
+                } else {
+                    Some((row as i64 % 51) - 25)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    for name in [
+        "add_months",
+        "months_add",
+        "months_sub",
+        "years_add",
+        "years_sub",
+    ] {
+        for source in temporal_sources(0xA10A).into_iter().filter(|source| {
+            if name == "add_months" {
+                source.data_type() != &DataType::Utf8
+            } else {
+                source.data_type() != &DataType::Date32
+            }
+        }) {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}

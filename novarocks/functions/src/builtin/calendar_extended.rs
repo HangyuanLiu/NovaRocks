@@ -40,6 +40,7 @@ pub(super) enum CalendarExtendedOp {
     Trunc,
     TimestampDiff,
     DaysShift(i64),
+    MonthsShift(i32),
     DateFormat,
     Parse(super::calendar_extended_parse::CalendarParseOp),
     WeeksDiff,
@@ -374,6 +375,9 @@ pub(super) fn evaluate_calendar_input<'a>(
     }
     if let CalendarExtendedOp::DaysShift(factor) = op {
         return super::calendar_add::evaluate_day_shift(factor, input, control);
+    }
+    if let CalendarExtendedOp::MonthsShift(factor) = op {
+        return super::calendar_month::evaluate_month_shift(factor, input, control);
     }
     if let CalendarExtendedOp::Parse(operation) = op {
         return super::calendar_extended_parse::evaluate_calendar_parse(operation, input, control);

@@ -83,6 +83,7 @@ pub enum CalendarOperation {
     Trunc,
     TimestampDiff,
     DaysShift(i64),
+    MonthsShift(i32),
     Timestamp,
     WeeksDiff,
     HoursDiff,
@@ -101,6 +102,7 @@ impl CalendarOperation {
             Self::Trunc => CalendarExtendedOp::Trunc,
             Self::TimestampDiff => CalendarExtendedOp::TimestampDiff,
             Self::DaysShift(factor) => CalendarExtendedOp::DaysShift(factor),
+            Self::MonthsShift(factor) => CalendarExtendedOp::MonthsShift(factor),
             Self::Timestamp => CalendarExtendedOp::Timestamp,
             Self::WeeksDiff => CalendarExtendedOp::WeeksDiff,
             Self::HoursDiff => CalendarExtendedOp::HoursDiff,
@@ -167,7 +169,11 @@ pub fn evaluate_legacy_calendar(
         .iter()
         .map(|argument| {
             // The original day/week family explicitly broadcasts a one-row child.
-            if matches!(operation, CalendarOperation::DaysShift(_)) && argument.len() == 1 {
+            if matches!(
+                operation,
+                CalendarOperation::DaysShift(_) | CalendarOperation::MonthsShift(_)
+            ) && argument.len() == 1
+            {
                 EvaluatedArgument::Scalar(argument)
             } else {
                 EvaluatedArgument::Column(argument)
@@ -179,18 +185,21 @@ pub fn evaluate_legacy_calendar(
     for argument in arguments {
         assert!(
             argument.len() >= rows
-                || (matches!(operation, CalendarOperation::DaysShift(_)) && argument.len() == 1),
+                || (matches!(
+                    operation,
+                    CalendarOperation::DaysShift(_) | CalendarOperation::MonthsShift(_)
+                ) && argument.len() == 1),
             "legacy calendar row out of bounds"
         );
     }
     let target = FunctionValueType::new(output_type.clone(), true);
-    let carrier = if matches!(operation, CalendarOperation::Timestamp)
-        || (matches!(
-            operation,
-            CalendarOperation::Trunc
-                | CalendarOperation::StrToDate
-                | CalendarOperation::DaysShift(_)
-        ) && *output_type != DataType::Date32)
+    let carrier = if matches!(
+        operation,
+        CalendarOperation::Timestamp | CalendarOperation::MonthsShift(_)
+    ) || (matches!(
+        operation,
+        CalendarOperation::Trunc | CalendarOperation::StrToDate | CalendarOperation::DaysShift(_)
+    ) && *output_type != DataType::Date32)
     {
         DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
     } else {
@@ -581,4 +590,12 @@ mod carrier_diagnostic_tests {
             expected_date
         );
     }
+}
+
+/// The legacy timestampadd month/year branch shares this same calendar computation.
+pub fn legacy_add_months_to_datetime(
+    date: chrono::NaiveDateTime,
+    months: i32,
+) -> chrono::NaiveDateTime {
+    super::calendar_month::add_months_to_datetime(date, months)
 }

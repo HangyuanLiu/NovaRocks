@@ -63,6 +63,7 @@ mod calendar_diff_owner;
 mod calendar_extended;
 mod calendar_extended_timestampdiff;
 mod calendar_add;
+mod calendar_month;
 pub mod calendar_add_interval;
 pub mod calendar_extended_shared;
 mod calendar_extended_format;
