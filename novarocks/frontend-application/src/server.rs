@@ -650,7 +650,6 @@ fn build_frontend_query_session_factory_from_role_products(
         query_execution,
         Arc::clone(&products.logical_read_launcher),
         host.workload_root_admission(),
-        host.workload_resources(),
         role,
         topology,
         Arc::clone(&products.dml_service),

@@ -593,7 +593,7 @@ mod tests {
                     ResultWindowClass::Local,
                 )
                 .unwrap();
-            GovernedProtocolOwner::new(statement, self.host.resources())
+            GovernedProtocolOwner::new(statement)
         }
         fn result(&self, value: String) -> GovernedImmediateStatementResult {
             let statement = self
@@ -610,7 +610,7 @@ mod tests {
                 .unwrap();
             // The source is called only after its complete producer admission.
             let graph = build_string_query_result("value", vec![value]).unwrap();
-            GovernedImmediateStatementResult::try_new(graph, self.host.resources(), statement)
+            GovernedImmediateStatementResult::try_new(graph, statement)
                 .unwrap_or_else(|(error, _)| panic!("{error}"))
         }
     }

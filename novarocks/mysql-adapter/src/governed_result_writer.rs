@@ -244,7 +244,7 @@ mod streaming_result_tests {
             AttemptId::new(1).expect("test attempt"),
         )
         .expect("test execution");
-        let (producer, execution, resources, schema_receipt) = ResultStreamTestProducer::open(
+        let (producer, execution, _resources, schema_receipt) = ResultStreamTestProducer::open(
             execution_id,
             fields,
             1,
@@ -287,9 +287,8 @@ mod streaming_result_tests {
             .take_execution_owner()
             .expect("test transfers execution owner")
             .complete();
-        let result =
-            StreamingStatementResult::try_from_execution(execution, resources.clone(), statement)
-                .expect("bind streaming statement");
+        let result = StreamingStatementResult::try_from_execution(execution, statement)
+            .expect("bind streaming statement");
         Fixture {
             result: Some(result),
             capacity: producer.result_capacity(),

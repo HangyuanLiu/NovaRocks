@@ -1018,12 +1018,8 @@ mod tests {
             owner.cancellation_requester(),
             ExecutionOutput::Rows(stream),
         );
-        let mut result = StreamingStatementResult::try_from_execution(
-            execution,
-            workload.resources(),
-            statement,
-        )
-        .unwrap();
+        let mut result =
+            StreamingStatementResult::try_from_execution(execution, statement).unwrap();
         control.kill_query(session, 7);
         let grant = result.try_closing_capacity(true).unwrap();
         assert_eq!(workload.snapshot().admitted_queries, 0);
@@ -1116,7 +1112,7 @@ mod tests {
             let grant = capacity
                 .try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation)
                 .unwrap();
-            let protocol = GovernedProtocolOwner::new(statement, workload.resources());
+            let protocol = GovernedProtocolOwner::new(statement);
             let closing = ClosingDelivery::try_new((), protocol, grant, 1024)
                 .unwrap_or_else(|_| panic!("accepted closing cut"));
             let alias = closing.retained_guard();

@@ -37,9 +37,7 @@ use novarocks_types::identity::{
     AttemptId, FrontendProcessId, LocalQuerySequence, QueryExecutionId, QueryIdAttribution,
     QueryProcessNamespace,
 };
-use novarocks_workload_control::{
-    CancellationReason, LocalResourceAuthority, Stage, WorkError, WorkOwner,
-};
+use novarocks_workload_control::{CancellationReason, Stage, WorkError, WorkOwner};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -207,7 +205,6 @@ impl LogicalExecutionSupervisor {
     pub fn new(
         runtime: Handle,
         native: Arc<dyn LogicalExecutionNativePort>,
-        resources: LocalResourceAuthority,
         namespace: QueryProcessNamespace,
         frontend_process_id: FrontendProcessId,
         config: LogicalExecutionSupervisorConfig,
@@ -226,7 +223,6 @@ impl LogicalExecutionSupervisor {
         let join = runtime.spawn(run_supervisor(
             registry_handle,
             native,
-            resources,
             namespace,
             frontend_process_id,
             config,
@@ -438,7 +434,6 @@ impl ProcessQueryIdAllocator {
 async fn run_supervisor(
     registry: LogicalExecutionRuntimeRegistryHandle,
     native: Arc<dyn LogicalExecutionNativePort>,
-    resources: LocalResourceAuthority,
     namespace: QueryProcessNamespace,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
@@ -464,7 +459,6 @@ async fn run_supervisor(
                 logical_tasks.spawn(run_logical_execution(
                     command,
                     Arc::clone(&native),
-                    resources.clone(),
                     Arc::clone(&query_ids),
                     frontend_process_id,
                     config,
@@ -519,7 +513,6 @@ async fn run_supervisor(
 async fn run_logical_execution(
     command: StartCommand,
     native: Arc<dyn LogicalExecutionNativePort>,
-    resources: LocalResourceAuthority,
     query_ids: Arc<ProcessQueryIdAllocator>,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
@@ -2244,19 +2237,6 @@ mod tests {
         root.business.release();
     }
 
-    fn supervisor_resources() -> LocalResourceAuthority {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 12,
-                per_scope_bytes: (1 << 20) - (1 << 12),
-            },
-        )
-        .unwrap();
-        control.resources()
-    }
-
     #[tokio::test]
     async fn uninstalled_failure_settles_its_known_cancel_control() {
         let (control, root) = governance();
@@ -2670,7 +2650,6 @@ mod tests {
         let (supervisor, _client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             failing_native().0,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x4f),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -2696,7 +2675,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x45),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -2728,7 +2706,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x46),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -2927,7 +2904,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x52),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -3394,7 +3370,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x59),
             FrontendProcessId::new_v7(),
             config,
@@ -3542,7 +3517,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x5a),
             FrontendProcessId::new_v7(),
             config,
@@ -3656,7 +3630,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x54),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -3740,7 +3713,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x55),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -3830,7 +3802,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x55),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4020,7 +3991,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x56),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4200,7 +4170,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(namespace),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4256,7 +4225,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x53),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4300,7 +4268,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x50),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4537,7 +4504,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x50),
             frontend,
             supervisor_config(),
@@ -4640,7 +4606,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x4a),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4805,7 +4770,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x51),
             frontend,
             supervisor_config(),
@@ -4882,7 +4846,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(PanickingOpenNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x49),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4968,7 +4931,6 @@ mod tests {
             Arc::new(PendingOpenNativePort {
                 entered: Arc::clone(&entered),
             }),
-            control.resources(),
             QueryProcessNamespace::new(0x4a),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -5011,7 +4973,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(DelayedShutdownNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x47),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -5057,7 +5018,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(PanickingOpenNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x4f),
             FrontendProcessId::new_v7(),
             supervisor_config(),

@@ -34,9 +34,8 @@ use novarocks_query_application::cpu::{
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_workload_control::{
-    CancellationReason, DeadlineExpiryHandle, LocalResourceAuthority, ResourceConfig,
-    RootAdmissionHandle, WorkloadConfig, WorkloadControl, WorkloadObservationHandle,
-    WorkloadShutdownError,
+    CancellationReason, DeadlineExpiryHandle, ResourceConfig, RootAdmissionHandle, WorkloadConfig,
+    WorkloadControl, WorkloadObservationHandle, WorkloadShutdownError,
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
@@ -189,7 +188,6 @@ struct FrontendExecutionRuntimeOwner {
     deadline_supervisor: FrontendWorkloadDeadlineSupervisor,
     root_admission: RootAdmissionHandle,
     workload_observation: WorkloadObservationHandle,
-    resources: LocalResourceAuthority,
     query_cpu: QueryCpuExecutorOwner,
     query_cpu_executor: QueryCpuExecutor,
     query_blocking: QueryBlockingExecutorOwner,
@@ -340,7 +338,6 @@ impl FrontendExecutionRuntimeOwner {
         let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
             runtime.clone(),
             Arc::new(FrontendLogicalExecutionNativePort),
-            workload.resources.clone(),
             namespace,
             frontend_process_id,
             supervisor_config,
@@ -357,7 +354,6 @@ impl FrontendExecutionRuntimeOwner {
             deadline_supervisor,
             root_admission: workload.root_admission,
             workload_observation: workload.observation,
-            resources: workload.resources,
             query_cpu,
             query_cpu_executor,
             query_blocking,
@@ -545,10 +541,6 @@ impl FrontendExecutionRuntimeOwner {
 
     fn workload_observation(&self) -> WorkloadObservationHandle {
         self.workload_observation.clone()
-    }
-
-    fn resources(&self) -> LocalResourceAuthority {
-        self.resources.clone()
     }
 
     fn query_cpu_executor(&self) -> QueryCpuExecutor {
@@ -1695,14 +1687,6 @@ impl FrontendApplicationHost {
     /// while it drains admitted Frontend work.
     pub fn workload_observation(&self) -> WorkloadObservationHandle {
         self.execution_runtime_owner.workload_observation()
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Product integrations consume this local resource authority."
-    )]
-    pub(crate) fn workload_resources(&self) -> LocalResourceAuthority {
-        self.execution_runtime_owner.resources()
     }
 
     pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {

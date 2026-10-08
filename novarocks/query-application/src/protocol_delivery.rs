@@ -28,23 +28,19 @@ use crate::session_control::{
     GovernedStatementVisibilitySealOutcome,
 };
 use crate::session_error::QueryServiceError;
-use novarocks_workload_control::{
-    LocalResourceAuthority, ResultWindowClass, ResultWindowGrant, WorkError, WorkScope,
-};
+use novarocks_workload_control::{ResultWindowClass, ResultWindowGrant, WorkError};
 
 /// Shared move-only owner for any governed query result presented to a client.
 #[must_use = "the governed protocol owner must be settled by its protocol adapter"]
 pub struct GovernedProtocolOwner {
     statement: Option<GovernedQueryStatementOwner>,
-    resources: LocalResourceAuthority,
     settled: bool,
 }
 
 impl GovernedProtocolOwner {
-    pub fn new(statement: GovernedQueryStatementOwner, resources: LocalResourceAuthority) -> Self {
+    pub fn new(statement: GovernedQueryStatementOwner) -> Self {
         Self {
             statement: Some(statement),
-            resources,
             settled: false,
         }
     }
@@ -55,14 +51,6 @@ impl GovernedProtocolOwner {
             .as_ref()
             .expect("protocol result retains its governed owner");
         QueryCancellationView::governed(statement.cancellation().clone(), statement.timeout_ms())
-    }
-
-    pub fn reservation_inputs(&self) -> (LocalResourceAuthority, WorkScope) {
-        let statement = self
-            .statement
-            .as_ref()
-            .expect("protocol result retains its governed owner");
-        (self.resources.clone(), statement.scope().clone())
     }
 
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
@@ -90,7 +78,8 @@ impl GovernedProtocolOwner {
         cut: novarocks_workload_control::ResultClosingCut,
     ) -> Result<ResultWindowGrant, WorkError> {
         let statement = self.statement.as_ref().ok_or(WorkError::Released)?;
-        self.resources
+        statement
+            .scope()
             .result_capacity()?
             .try_acquire_closing(statement.scope(), cut)
     }
@@ -350,7 +339,6 @@ impl GovernedImmediateStatementResult {
     #[allow(clippy::result_large_err)]
     pub fn try_new(
         result: QueryResult,
-        resources: LocalResourceAuthority,
         statement: GovernedQueryStatementOwner,
     ) -> Result<Self, (String, GovernedQueryStatementOwner)> {
         let sealed = (|| {
@@ -363,7 +351,7 @@ impl GovernedImmediateStatementResult {
         match sealed {
             Ok(result) => Ok(Self {
                 result,
-                protocol: GovernedProtocolOwner::new(statement, resources),
+                protocol: GovernedProtocolOwner::new(statement),
             }),
             Err(error) => Err((error, statement)),
         }
@@ -382,9 +370,9 @@ pub struct GovernedCompletionStatementResult {
 }
 
 impl GovernedCompletionStatementResult {
-    pub fn new(resources: LocalResourceAuthority, statement: GovernedQueryStatementOwner) -> Self {
+    pub fn new(statement: GovernedQueryStatementOwner) -> Self {
         Self {
-            protocol: GovernedProtocolOwner::new(statement, resources),
+            protocol: GovernedProtocolOwner::new(statement),
         }
     }
 
@@ -402,14 +390,10 @@ pub struct GovernedErrorStatementResult {
 }
 
 impl GovernedErrorStatementResult {
-    pub fn new(
-        error: QueryServiceError,
-        resources: LocalResourceAuthority,
-        statement: GovernedQueryStatementOwner,
-    ) -> Self {
+    pub fn new(error: QueryServiceError, statement: GovernedQueryStatementOwner) -> Self {
         Self {
             error,
-            protocol: GovernedProtocolOwner::new(statement, resources),
+            protocol: GovernedProtocolOwner::new(statement),
         }
     }
 
@@ -427,7 +411,6 @@ impl GovernedErrorStatementResult {
 pub struct StreamingStatementResult {
     execution: ExecutionHandle,
     stream: QueryResultStream,
-    resources: LocalResourceAuthority,
     protocol: GovernedProtocolOwner,
     settled: bool,
 }
@@ -435,7 +418,6 @@ pub struct StreamingStatementResult {
 impl StreamingStatementResult {
     pub fn try_from_execution(
         mut execution: ExecutionHandle,
-        resources: LocalResourceAuthority,
         statement: GovernedQueryStatementOwner,
     ) -> Result<Self, QueryExecutionError> {
         let stream = match execution.take_output() {
@@ -458,8 +440,7 @@ impl StreamingStatementResult {
         Ok(Self {
             execution,
             stream,
-            resources: resources.clone(),
-            protocol: GovernedProtocolOwner::new(statement, resources),
+            protocol: GovernedProtocolOwner::new(statement),
             settled: false,
         })
     }
@@ -474,14 +455,6 @@ impl StreamingStatementResult {
 
     pub fn failure_view(&self) -> Option<ResultFailureView> {
         self.stream.failure_view()
-    }
-
-    pub const fn resources(&self) -> &LocalResourceAuthority {
-        &self.resources
-    }
-
-    pub fn reservation_inputs(&self) -> (LocalResourceAuthority, WorkScope) {
-        self.protocol.reservation_inputs()
     }
 
     pub fn request_cancel(&self) -> Result<(), QueryExecutionError> {
@@ -528,7 +501,6 @@ impl StreamingStatementResult {
             &mut self.protocol,
             GovernedProtocolOwner {
                 statement: None,
-                resources: self.resources.clone(),
                 settled: true,
             },
         );

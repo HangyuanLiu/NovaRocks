@@ -114,8 +114,7 @@ use novarocks_user_error::UserError;
 use novarocks_workload_control::WorkError;
 use novarocks_workload_control::WorkOwner;
 use novarocks_workload_control::{
-    LocalResourceAuthority, ResultWindowAlias, ResultWindowClass, RootAdmissionHandle, WorkClass,
-    WorkRequest,
+    ResultWindowAlias, ResultWindowClass, RootAdmissionHandle, WorkClass, WorkRequest,
 };
 
 pub(crate) mod compiler;
@@ -899,7 +898,6 @@ pub struct FrontendQueryService {
     query_execution: QueryExecutionService,
     logical_read_launcher: Arc<dyn LogicalReadLauncher>,
     workload_root_admission: RootAdmissionHandle,
-    workload_resources: LocalResourceAuthority,
     role: ClusterRole,
     topology: BackendTopologyService,
     dml: Arc<DmlService>,
@@ -933,7 +931,6 @@ impl FrontendQueryService {
         query_execution: QueryExecutionService,
         logical_read_launcher: Arc<dyn LogicalReadLauncher>,
         workload_root_admission: RootAdmissionHandle,
-        workload_resources: LocalResourceAuthority,
         role: ClusterRole,
         topology: BackendTopologyService,
         dml: Arc<DmlService>,
@@ -966,7 +963,6 @@ impl FrontendQueryService {
             query_execution,
             logical_read_launcher,
             workload_root_admission,
-            workload_resources,
             role,
             topology,
             dml,
@@ -1196,10 +1192,7 @@ impl FrontendQuerySession {
         };
         match result {
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
-                GovernedCompletionStatementResult::new(
-                    self.service.workload_resources.clone(),
-                    governed,
-                ),
+                GovernedCompletionStatementResult::new(governed),
             )),
             Ok(StatementResult::Query(result)) => {
                 // Local delivery may still use transitional LRA credits under
@@ -1224,11 +1217,7 @@ impl FrontendQuerySession {
         result: QueryResult,
         statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
     ) -> StatementResult {
-        match GovernedImmediateStatementResult::try_new(
-            result,
-            self.service.workload_resources.clone(),
-            statement,
-        ) {
+        match GovernedImmediateStatementResult::try_new(result, statement) {
             Ok(result) => StatementResult::GovernedQuery(result),
             Err((error, statement)) => self.governed_typed_error(internal_error(error), statement),
         }
@@ -1523,7 +1512,6 @@ impl FrontendQuerySession {
                 statement.complete_execution();
                 Ok(StatementResult::GovernedCompletion(
                     GovernedCompletionStatementResult::new(
-                        self.service.workload_resources.clone(),
                         statement,
                     ),
                 ))
@@ -1750,7 +1738,6 @@ impl FrontendQuerySession {
         };
         novarocks_query_application::protocol_delivery::StreamingStatementResult::try_from_execution(
             execution,
-            self.service.workload_resources.clone(),
             statement,
         )
         .map(StatementResult::StreamingQuery)
@@ -2484,10 +2471,7 @@ impl FrontendQuerySession {
         match result {
             Ok(StatementResult::Query(result)) => Ok(self.governed_local_result(result, statement)),
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
-                GovernedCompletionStatementResult::new(
-                    self.service.workload_resources.clone(),
-                    statement,
-                ),
+                GovernedCompletionStatementResult::new(statement),
             )),
             Ok(
                 StatementResult::GovernedQuery(_)
@@ -2516,11 +2500,7 @@ impl FrontendQuerySession {
         error: QueryServiceError,
         statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
     ) -> StatementResult {
-        StatementResult::GovernedError(GovernedErrorStatementResult::new(
-            error,
-            self.service.workload_resources.clone(),
-            statement,
-        ))
+        StatementResult::GovernedError(GovernedErrorStatementResult::new(error, statement))
     }
 }
 
@@ -2618,7 +2598,6 @@ impl QuerySession for FrontendQuerySession {
             Ok(()) => Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
                     StatementResult::GovernedCompletion(GovernedCompletionStatementResult::new(
-                        self.service.workload_resources.clone(),
                         statement,
                     )),
                 ),
@@ -3134,10 +3113,9 @@ mod tests {
     ) -> (
         ResultStreamTestProducer,
         novarocks_query_application::api::ExecutionHandle,
-        LocalResourceAuthority,
         novarocks_query_application::test_support::TestResultDeliveryReceipt,
     ) {
-        ResultStreamTestProducer::open(
+        let (producer, execution, _resources, receipt) = ResultStreamTestProducer::open(
             QueryExecutionId::new(
                 QueryId::new(83, 1),
                 AttemptId::new(1).expect("test attempt"),
@@ -3151,7 +3129,8 @@ mod tests {
                 per_scope_bytes: 1024 * 1024 - 1024,
             },
         )
-        .expect("open scalar result stream")
+        .expect("open scalar result stream");
+        (producer, execution, receipt)
     }
 
     #[test]
@@ -3531,7 +3510,7 @@ mod tests {
     #[tokio::test]
     async fn governed_scalar_stream_rejects_schema_and_fails_its_delivery() {
         let fields = vec![scalar_field(false), scalar_field(false)];
-        let (producer, mut execution, _resources, schema_receipt) = scalar_stream_fixture(fields);
+        let (producer, mut execution, schema_receipt) = scalar_stream_fixture(fields);
         let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
             panic!("expected row output")
         };

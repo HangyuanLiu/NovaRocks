@@ -205,6 +205,19 @@ impl crate::LocalResourceAuthority {
     }
 }
 
+impl WorkScope {
+    /// Access this scope's original installed host capacity. This never creates a
+    /// fallback pool or changes the admission geometry.
+    pub fn result_capacity(&self) -> Result<ResultCapacityHandle, WorkError> {
+        if self.inner.state.lock().unwrap().result_capacity.is_none() {
+            return Err(WorkError::NotReady);
+        }
+        Ok(ResultCapacityHandle {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+}
+
 pub(crate) fn reserve_window(
     state: &mut State,
     scope: &WorkScope,
@@ -893,6 +906,10 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         assert!(matches!(
+            root.owner.scope().result_capacity(),
+            Err(WorkError::NotReady)
+        ));
+        assert!(matches!(
             root.owner
                 .scope()
                 .admit_query_with_result(ResultWindowClass::Client),
@@ -908,7 +925,7 @@ mod tests {
                 .configure_result_capacity(ResultCapacityConfig::V1)
                 .is_err()
         );
-        let (other, _) = control();
+        let (other, other_capacity) = control();
         let root = other
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
@@ -916,6 +933,14 @@ mod tests {
             capacity.try_acquire(&root.owner.scope(), ResultWindowClass::Client),
             Err(WorkError::ForeignAuthority)
         ));
+        let scoped_capacity = root.owner.scope().result_capacity().unwrap();
+        let window = scoped_capacity
+            .try_acquire(&root.owner.scope(), ResultWindowClass::Client)
+            .unwrap();
+        assert_eq!(other_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        drop(window);
+        assert_eq!(other_capacity.snapshot().held_positions, [0; 4]);
         assert!(
             ResultCapacityConfig {
                 all_objects_bytes: [u64::MAX; 4],
