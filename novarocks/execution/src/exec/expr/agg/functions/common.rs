@@ -321,181 +321,23 @@ pub(super) fn tracked_key_fingerprint(
     key: &TrackedAggScalarValue,
     allocator: &AggregateAllocator,
 ) -> Result<AggregateVec<u8>, String> {
-    let encoded_len = tracked_scalar_encoded_len(key)?;
-    let mut output = aggregate_vec_with_capacity(
+    novarocks_functions::aggregate_scalar_fingerprint::tracked_key_fingerprint(
+        key,
         allocator,
-        encoded_len,
-        "reserve aggregate scalar fingerprint",
-    )?;
-    encode_tracked_scalar(&mut output, key)?;
-    debug_assert_eq!(output.len(), encoded_len);
-    Ok(output)
+        &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+    )
+    .map_err(|error| error.to_string())
 }
-
 pub(super) fn tracked_optional_key_fingerprint(
     value: &Option<TrackedAggScalarValue>,
     allocator: &AggregateAllocator,
 ) -> Result<AggregateVec<u8>, String> {
-    let value_len = value
-        .as_ref()
-        .map(tracked_scalar_encoded_len)
-        .transpose()?
-        .unwrap_or(0);
-    let encoded_len = 1usize
-        .checked_add(value_len)
-        .ok_or_else(|| "aggregate scalar fingerprint length overflow".to_string())?;
-    let mut output = aggregate_vec_with_capacity(
+    novarocks_functions::aggregate_scalar_fingerprint::tracked_optional_key_fingerprint(
+        value,
         allocator,
-        encoded_len,
-        "reserve optional aggregate scalar fingerprint",
-    )?;
-    encode_tracked_optional_value(&mut output, value)?;
-    debug_assert_eq!(output.len(), encoded_len);
-    Ok(output)
-}
-
-fn checked_encoded_len_add(total: &mut usize, additional: usize) -> Result<(), String> {
-    *total = total
-        .checked_add(additional)
-        .ok_or_else(|| "aggregate scalar fingerprint length overflow".to_string())?;
-    Ok(())
-}
-
-fn checked_u32_len(len: usize) -> Result<u32, String> {
-    u32::try_from(len).map_err(|_| "aggregate scalar fingerprint exceeds u32 length".to_string())
-}
-
-fn tracked_scalar_encoded_len(value: &TrackedAggScalarValue) -> Result<usize, String> {
-    let mut len = 1usize;
-    match value {
-        TrackedAggScalarValue::Bool(_) => checked_encoded_len_add(&mut len, 1)?,
-        TrackedAggScalarValue::Int64(_)
-        | TrackedAggScalarValue::Float64(_)
-        | TrackedAggScalarValue::Timestamp(_) => checked_encoded_len_add(&mut len, 8)?,
-        TrackedAggScalarValue::Date32(_) => checked_encoded_len_add(&mut len, 4)?,
-        TrackedAggScalarValue::Decimal128(_) => checked_encoded_len_add(&mut len, 16)?,
-        TrackedAggScalarValue::Decimal256(_) => checked_encoded_len_add(&mut len, 32)?,
-        TrackedAggScalarValue::Utf8(bytes) | TrackedAggScalarValue::Binary(bytes) => {
-            let _ = checked_u32_len(bytes.len())?;
-            checked_encoded_len_add(&mut len, 4)?;
-            checked_encoded_len_add(&mut len, bytes.len())?;
-        }
-        TrackedAggScalarValue::Struct(values) | TrackedAggScalarValue::List(values) => {
-            let _ = checked_u32_len(values.len())?;
-            checked_encoded_len_add(&mut len, 4)?;
-            for value in values {
-                checked_encoded_len_add(&mut len, 1)?;
-                if let Some(value) = value {
-                    checked_encoded_len_add(&mut len, tracked_scalar_encoded_len(value)?)?;
-                }
-            }
-        }
-        TrackedAggScalarValue::Map(entries) => {
-            let _ = checked_u32_len(entries.len())?;
-            checked_encoded_len_add(&mut len, 4)?;
-            for (key, value) in entries {
-                for value in [key, value] {
-                    checked_encoded_len_add(&mut len, 1)?;
-                    if let Some(value) = value {
-                        checked_encoded_len_add(&mut len, tracked_scalar_encoded_len(value)?)?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(len)
-}
-
-fn encode_tracked_scalar(
-    output: &mut AggregateVec<u8>,
-    value: &TrackedAggScalarValue,
-) -> Result<(), String> {
-    match value {
-        TrackedAggScalarValue::Bool(value) => {
-            output.push(1);
-            output.push(u8::from(*value));
-        }
-        TrackedAggScalarValue::Int64(value) => {
-            output.push(2);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Float64(value) => {
-            output.push(3);
-            let bits = if value.is_nan() {
-                f64::NAN.to_bits()
-            } else {
-                value.to_bits()
-            };
-            output.extend_from_slice(&bits.to_le_bytes());
-        }
-        TrackedAggScalarValue::Utf8(value) => {
-            output.push(4);
-            output.extend_from_slice(&checked_u32_len(value.len())?.to_le_bytes());
-            output.extend_from_slice(value);
-        }
-        TrackedAggScalarValue::Date32(value) => {
-            output.push(5);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Timestamp(value) => {
-            output.push(6);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Decimal128(value) => {
-            output.push(7);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Struct(values) => {
-            output.push(8);
-            encode_tracked_optional_values(output, values)?;
-        }
-        TrackedAggScalarValue::Map(entries) => {
-            output.push(9);
-            output.extend_from_slice(&checked_u32_len(entries.len())?.to_le_bytes());
-            for (key, value) in entries {
-                encode_tracked_optional_value(output, key)?;
-                encode_tracked_optional_value(output, value)?;
-            }
-        }
-        TrackedAggScalarValue::List(values) => {
-            output.push(10);
-            encode_tracked_optional_values(output, values)?;
-        }
-        TrackedAggScalarValue::Decimal256(value) => {
-            output.push(11);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Binary(value) => {
-            output.push(12);
-            output.extend_from_slice(&checked_u32_len(value.len())?.to_le_bytes());
-            output.extend_from_slice(value);
-        }
-    }
-    Ok(())
-}
-
-fn encode_tracked_optional_values(
-    output: &mut AggregateVec<u8>,
-    values: &[Option<TrackedAggScalarValue>],
-) -> Result<(), String> {
-    output.extend_from_slice(&checked_u32_len(values.len())?.to_le_bytes());
-    for value in values {
-        encode_tracked_optional_value(output, value)?;
-    }
-    Ok(())
-}
-
-fn encode_tracked_optional_value(
-    output: &mut AggregateVec<u8>,
-    value: &Option<TrackedAggScalarValue>,
-) -> Result<(), String> {
-    if let Some(value) = value {
-        output.push(1);
-        encode_tracked_scalar(output, value)?;
-    } else {
-        output.push(0);
-    }
-    Ok(())
+        &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Heap bytes owned by a scalar value, excluding the inline enum body.
@@ -561,189 +403,19 @@ pub fn compare_scalar_values(
     left: &AggScalarValue,
     right: &AggScalarValue,
 ) -> Result<Ordering, String> {
-    match (left, right) {
-        (AggScalarValue::Bool(l), AggScalarValue::Bool(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Int64(l), AggScalarValue::Int64(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Float64(l), AggScalarValue::Float64(r)) => l
-            .partial_cmp(r)
-            .ok_or_else(|| "float comparison is not ordered".to_string()),
-        (AggScalarValue::Utf8(l), AggScalarValue::Utf8(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Date32(l), AggScalarValue::Date32(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Timestamp(l), AggScalarValue::Timestamp(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Decimal128(l), AggScalarValue::Decimal128(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Decimal256(l), AggScalarValue::Decimal256(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Binary(l), AggScalarValue::Binary(r)) => Ok(l.cmp(r)),
-        (AggScalarValue::Struct(l), AggScalarValue::Struct(r)) => {
-            let min_len = l.len().min(r.len());
-            for idx in 0..min_len {
-                let ord = compare_optional_scalar_values(&l[idx], &r[idx])?;
-                if !ord.is_eq() {
-                    return Ok(ord);
-                }
-            }
-            Ok(l.len().cmp(&r.len()))
-        }
-        (AggScalarValue::Map(l), AggScalarValue::Map(r)) => {
-            let min_len = l.len().min(r.len());
-            for idx in 0..min_len {
-                let (lk, lv) = &l[idx];
-                let (rk, rv) = &r[idx];
-                let key_ord = compare_optional_scalar_values(lk, rk)?;
-                if !key_ord.is_eq() {
-                    return Ok(key_ord);
-                }
-                let value_ord = compare_optional_scalar_values(lv, rv)?;
-                if !value_ord.is_eq() {
-                    return Ok(value_ord);
-                }
-            }
-            Ok(l.len().cmp(&r.len()))
-        }
-        (AggScalarValue::List(l), AggScalarValue::List(r)) => {
-            let min_len = l.len().min(r.len());
-            for idx in 0..min_len {
-                let ord = compare_optional_scalar_values(&l[idx], &r[idx])?;
-                if !ord.is_eq() {
-                    return Ok(ord);
-                }
-            }
-            Ok(l.len().cmp(&r.len()))
-        }
-        _ => Err("scalar comparison type mismatch".to_string()),
-    }
+    novarocks_functions::aggregate_scalar_fingerprint::compare_scalar_values(
+        left,
+        right,
+        &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+    )
+    .map_err(|error| error.to_string())
 }
-
-fn compare_optional_scalar_values(
-    left: &Option<AggScalarValue>,
-    right: &Option<AggScalarValue>,
-) -> Result<Ordering, String> {
-    match (left, right) {
-        (None, None) => Ok(Ordering::Equal),
-        (None, Some(_)) => Ok(Ordering::Less),
-        (Some(_), None) => Ok(Ordering::Greater),
-        (Some(l), Some(r)) => compare_scalar_values(l, r),
-    }
-}
-
-/// Stable byte fingerprint of an `AggScalarValue` suitable for use as a
-/// `HashMap`/`HashSet` key when ordinary `PartialEq + Hash` is not available
-/// (e.g. floats, decimals). Notable properties:
-///
-/// - `Utf8` is length-prefixed so `"ab"+"c"` and `"a"+"bc"` cannot collide.
-/// - `Float32`/`Float64` NaN values are normalized to a single canonical bit
-///   pattern so multiple NaN inputs collapse into one bucket.
-/// - Composite types (`Struct`/`Map`/`List`) are encoded recursively for
-///   safety, even though aggregate callers reject them upstream when needed.
-///
-/// Shared by aggregate functions that need stable scalar-key identity.
 pub(in crate::exec::expr::agg) fn key_fingerprint(key: &AggScalarValue) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_scalar(&mut out, key);
-    out
-}
-
-fn encode_scalar(out: &mut Vec<u8>, key: &AggScalarValue) {
-    match key {
-        AggScalarValue::Bool(v) => {
-            out.push(1);
-            out.push(if *v { 1 } else { 0 });
-        }
-        AggScalarValue::Int64(v) => {
-            out.push(2);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Float64(v) => {
-            out.push(3);
-            // Normalize NaN: any NaN maps to the same fingerprint so
-            // multiple NaN inputs collapse into one bucket.
-            let bits = if v.is_nan() {
-                f64::NAN.to_bits()
-            } else {
-                v.to_bits()
-            };
-            out.extend_from_slice(&bits.to_le_bytes());
-        }
-        AggScalarValue::Utf8(v) => {
-            out.push(4);
-            let len = v.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(v.as_bytes());
-        }
-        AggScalarValue::Date32(v) => {
-            out.push(5);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Timestamp(v) => {
-            out.push(6);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Decimal128(v) => {
-            out.push(7);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Decimal256(v) => {
-            out.push(11);
-            let text = v.to_string();
-            let len = text.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(text.as_bytes());
-        }
-        AggScalarValue::Binary(v) => {
-            out.push(12);
-            let len = v.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(v);
-        }
-        AggScalarValue::Struct(items) => {
-            out.push(8);
-            let len = items.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            for item in items {
-                match item {
-                    Some(v) => {
-                        out.push(1);
-                        encode_scalar(out, v);
-                    }
-                    None => out.push(0),
-                }
-            }
-        }
-        AggScalarValue::Map(items) => {
-            out.push(9);
-            let len = items.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            for (k, v) in items {
-                match k {
-                    Some(k) => {
-                        out.push(1);
-                        encode_scalar(out, k);
-                    }
-                    None => out.push(0),
-                }
-                match v {
-                    Some(v) => {
-                        out.push(1);
-                        encode_scalar(out, v);
-                    }
-                    None => out.push(0),
-                }
-            }
-        }
-        AggScalarValue::List(items) => {
-            out.push(10);
-            let len = items.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            for item in items {
-                match item {
-                    Some(v) => {
-                        out.push(1);
-                        encode_scalar(out, v);
-                    }
-                    None => out.push(0),
-                }
-            }
-        }
-    }
+    novarocks_functions::aggregate_scalar_fingerprint::key_fingerprint(
+        key,
+        &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+    )
+    .expect("legacy fingerprint observer cannot fail")
 }
 
 pub fn build_scalar_array(

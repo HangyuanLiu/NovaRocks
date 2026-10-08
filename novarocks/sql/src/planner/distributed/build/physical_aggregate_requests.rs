@@ -375,17 +375,15 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
         source,
         work,
     )?;
-    if let Some(facts) = captured.binding().group_concat_source() {
+    if let Some(facts) = captured.binding().aggregate_state_source() {
         let original = source.binding.state_interpretation.as_ref().ok_or(
             PhysicalAggregateRequestError::InvalidSource(
-                "group_concat update has no original state interpretation",
+                "aggregate update has no original state interpretation",
             ),
         )?;
-        if !facts.state.matches_observed(original, || work.step())?
-            || facts.state.distinct != source.distinct
-        {
+        if !facts.matches_observed(original, || work.step())? || facts.distinct != source.distinct {
             return Err(PhysicalAggregateRequestError::InvalidSource(
-                "group_concat physical update changes its logical source interpretation",
+                "aggregate physical update changes its logical source interpretation",
             ));
         }
     }
@@ -566,7 +564,15 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
                 let actual = producer.captured().binding().group_concat_source();
                 let same_semantics = match (expected, actual) {
                     (None, None) => true,
-                    (Some(a), Some(b)) => a.legacy == b.legacy && a.max_len == b.max_len && a.state.matches_observed(&b.state, || work.step())?,
+                    (Some(a), Some(b)) => a.legacy == b.legacy && a.max_len == b.max_len,
+                    _ => false,
+                };
+                let same_source_receipt = match (
+                    entry.captured().binding().aggregate_state_source(),
+                    producer.captured().binding().aggregate_state_source(),
+                ) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.matches_observed(b, || work.step())?,
                     _ => false,
                 };
                 let same_state = match (&source.binding.state_interpretation, &producer.source().binding.state_interpretation) {
@@ -574,7 +580,7 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
                     (Some(a), Some(b)) => a.matches_observed(b, || work.step())?,
                     _ => false,
                 };
-                if !same_semantics || !same_state {
+                if !same_semantics || !same_source_receipt || !same_state {
                     return Err(super::lowered_draft::SqlSourceJournalError::InvalidSource(
                         "aggregate state producer changes its original interpretation or semantic source",
                     ));

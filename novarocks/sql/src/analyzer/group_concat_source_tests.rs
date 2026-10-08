@@ -59,6 +59,18 @@ fn facts(query: &crate::analysis::ResolvedQuery) -> &crate::binding::GroupConcat
     };
     resolved.group_concat_source().unwrap()
 }
+fn state(
+    query: &crate::analysis::ResolvedQuery,
+) -> &novarocks_type_contract::AggregateStateInterpretation {
+    let QueryBody::Select(select) = &query.body else {
+        panic!("select")
+    };
+    let ExprKind::AggregateCall { resolved, .. } = &select.projection[0].expr.kind else {
+        panic!("expected aggregate call");
+    };
+    resolved.aggregate_state_source().unwrap()
+}
+
 #[test]
 fn actual_gc_call_captures_lexical_hint_raw_limit_distinct_and_order() {
     let query = analyze(
@@ -69,9 +81,9 @@ fn actual_gc_call_captures_lexical_hint_raw_limit_distinct_and_order() {
     let actual = facts(&query);
     assert!(actual.legacy);
     assert_eq!(actual.max_len, Some(-1));
-    assert!(actual.state.distinct);
+    assert!(state(&query).distinct);
     assert_eq!(
-        actual.state.order_keys.as_ref(),
+        state(&query).order_keys.as_ref(),
         [novarocks_type_contract::AggregateStateOrderKey {
             ascending: false,
             nulls_first: true
@@ -84,7 +96,50 @@ fn explicit_separator_does_not_guess_mode_and_missing_limit_stays_absent() {
         let query = analyze("select group_concat('a' separator '|')", mode, None);
         assert_eq!(facts(&query).legacy, mode == "GROUP_CONCAT_LEGACY");
         assert_eq!(facts(&query).max_len, None);
-        assert!(!facts(&query).state.distinct);
-        assert!(facts(&query).state.order_keys.is_empty());
+        assert!(!state(&query).distinct);
+        assert!(state(&query).order_keys.is_empty());
     }
+}
+
+#[test]
+fn actual_array_calls_author_generic_receipt_without_gc_environment() {
+    for (sql, distinct, ascending, nulls_first) in [
+        (
+            "select array_agg(distinct 7 order by 1 desc nulls first)",
+            true,
+            false,
+            true,
+        ),
+        (
+            "select array_agg(7 order by 1 asc nulls last)",
+            false,
+            true,
+            false,
+        ),
+    ] {
+        let query = analyze(sql, "32", None);
+        let receipt = state(&query);
+        assert_eq!(receipt.distinct, distinct);
+        assert_eq!(
+            receipt.order_keys.as_ref(),
+            [novarocks_type_contract::AggregateStateOrderKey {
+                ascending,
+                nulls_first
+            }]
+        );
+        let QueryBody::Select(select) = &query.body else {
+            panic!("select")
+        };
+        let ExprKind::AggregateCall { resolved, .. } = &select.projection[0].expr.kind else {
+            panic!("aggregate")
+        };
+        assert!(resolved.group_concat_source().is_none());
+    }
+}
+#[test]
+fn ordinary_aggregate_receipt_is_authored_from_real_plain_call() {
+    let query = analyze("select sum(7)", "32", None);
+    let receipt = state(&query);
+    assert!(!receipt.distinct);
+    assert!(receipt.order_keys.is_empty());
 }

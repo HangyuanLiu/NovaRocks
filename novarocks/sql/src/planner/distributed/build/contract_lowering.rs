@@ -11159,8 +11159,8 @@ fn lower_aggregate_binding_from_selection(
     // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
         state_interpretation: resolved
-            .group_concat_source()
-            .map(|facts| facts.state.clone_observed(work))
+            .aggregate_state_source()
+            .map(|facts| facts.clone_observed(work))
             .transpose()?,
         state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved.resolved(), selected, result_type),

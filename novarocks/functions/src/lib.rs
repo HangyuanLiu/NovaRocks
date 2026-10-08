@@ -36,6 +36,7 @@ pub mod aggregate_format;
 mod aggregate_host_allocator;
 mod aggregate_kernel;
 pub mod aggregate_scalar;
+pub mod aggregate_scalar_fingerprint;
 mod aggregate_state_column;
 pub mod aggregate_types;
 mod arithmetic;

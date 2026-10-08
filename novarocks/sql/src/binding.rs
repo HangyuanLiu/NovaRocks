@@ -59,7 +59,6 @@ pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
 pub(crate) struct GroupConcatSourceFacts {
     pub legacy: bool,
     pub max_len: Option<i64>,
-    pub state: novarocks_type_contract::AggregateStateInterpretation,
 }
 impl GroupConcatSourceFacts {
     pub fn environment(&self) -> [novarocks_type_contract::SemanticParameterRef; 2] {
@@ -88,6 +87,7 @@ struct SqlFunctionCallFacts {
     /// A real producer-supplied result target, separate from inferred selection.
     result_constraint: Option<novarocks_functions::FunctionValueType>,
     group_concat: Option<GroupConcatSourceFacts>,
+    aggregate_state_source: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
 }
 
 impl SqlFunctionBinding {
@@ -100,6 +100,7 @@ impl SqlFunctionBinding {
             decimal_overflow_policy,
             result_constraint: None,
             group_concat: None,
+            aggregate_state_source: None,
         }))
     }
 
@@ -115,6 +116,7 @@ impl SqlFunctionBinding {
             decimal_overflow_policy,
             result_constraint: Some(result_constraint),
             group_concat: None,
+            aggregate_state_source: None,
         }))
     }
 
@@ -125,9 +127,32 @@ impl SqlFunctionBinding {
             decimal_overflow_policy: old.decimal_overflow_policy,
             result_constraint: old.result_constraint.clone(),
             group_concat: Some(facts),
+            aggregate_state_source: old.aggregate_state_source.clone(),
         });
         self
     }
+    /// Retain the actual lexical aggregate producer's DISTINCT and ORDER facts.
+    /// This receipt is independent of a consuming merge call's execution flags.
+    pub(crate) fn with_aggregate_state_source(
+        mut self,
+        facts: novarocks_type_contract::AggregateStateInterpretation,
+    ) -> Self {
+        let old = &self.0;
+        self.0 = Arc::new(SqlFunctionCallFacts {
+            resolved: old.resolved.clone(),
+            decimal_overflow_policy: old.decimal_overflow_policy,
+            result_constraint: old.result_constraint.clone(),
+            group_concat: old.group_concat.clone(),
+            aggregate_state_source: Some(Arc::new(facts)),
+        });
+        self
+    }
+    pub(crate) fn aggregate_state_source(
+        &self,
+    ) -> Option<&novarocks_type_contract::AggregateStateInterpretation> {
+        self.0.aggregate_state_source.as_deref()
+    }
+
     pub(crate) fn group_concat_source(&self) -> Option<&GroupConcatSourceFacts> {
         self.0.group_concat.as_ref()
     }

@@ -3020,7 +3020,7 @@ impl<'a> super::AnalyzerContext<'a> {
             // Aggregate function
             let mut signature =
                 bound_aggregate.expect("catalog-classified aggregate must be resolved");
-            if matches!(name.as_str(), "group_concat" | "string_agg") {
+            {
                 use novarocks_type_contract::{
                     AggregateStateInterpretation, AggregateStateOrderKey, CompileCheckpoints,
                     CompilePhase,
@@ -3041,15 +3041,18 @@ impl<'a> super::AnalyzerContext<'a> {
                     work.step().map_err(AnalyzeError::control)?;
                 }
                 work.flush().map_err(AnalyzeError::control)?;
-                signature =
-                    signature.with_group_concat_source(crate::binding::GroupConcatSourceFacts {
-                        legacy: self.sql_semantics.sql_mode().group_concat_legacy(),
-                        max_len: self.sql_semantics.group_concat_max_len(),
-                        state: AggregateStateInterpretation {
-                            distinct: is_distinct,
-                            order_keys: keys.into_boxed_slice(),
+                signature = signature.with_aggregate_state_source(AggregateStateInterpretation {
+                    distinct: is_distinct,
+                    order_keys: keys.into_boxed_slice(),
+                });
+                if matches!(name.as_str(), "group_concat" | "string_agg") {
+                    signature = signature.with_group_concat_source(
+                        crate::binding::GroupConcatSourceFacts {
+                            legacy: self.sql_semantics.sql_mode().group_concat_legacy(),
+                            max_len: self.sql_semantics.group_concat_max_len(),
                         },
-                    });
+                    );
+                }
                 work.finish().map_err(AnalyzeError::control)?;
             }
             let value_type = crate::functions::aggregate_result_type(&signature).clone();

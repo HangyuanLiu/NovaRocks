@@ -526,3 +526,7 @@ fn journal_update_shared_signature_comparison_rejects_full_type_drift_and_ignore
     ));
     prefixes(invoke, false);
 }
+
+#[cfg(test)]
+#[path = "array_state_source_tests.rs"]
+mod array_state_source_tests;

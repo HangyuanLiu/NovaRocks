@@ -1611,3 +1611,7 @@ mod split_tests;
 #[cfg(test)]
 #[path = "pure_differential_null_or_empty_tests.rs"]
 mod null_or_empty_tests;
+
+#[cfg(test)]
+#[path = "pure_differential/array_tests.rs"]
+mod array_tests;
