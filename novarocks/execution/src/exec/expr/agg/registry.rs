@@ -763,10 +763,16 @@ where
         &self,
         context: &AggregatePrepareContext<'_>,
     ) -> Result<Arc<dyn ErasedAggregateKernel>, String> {
-        self.family
+        let kernel = self
+            .family
             .prepare(context.selected, context.options)
-            .map(|kernel| Arc::new(TypedKernelAdapter { kernel }) as Arc<dyn ErasedAggregateKernel>)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if kernel.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked {
+            return Err(
+                "legacy typed aggregate cannot supply an allocation-tracked state allocator".into(),
+            );
+        }
+        Ok(Arc::new(TypedKernelAdapter { kernel }) as Arc<dyn ErasedAggregateKernel>)
     }
 }
 
@@ -956,6 +962,9 @@ where
 
     fn retained_memory_policy(&self) -> RetainedMemoryPolicy {
         match self.kernel.memory_policy() {
+            AggregateStateMemoryPolicy::AllocationTracked => {
+                RetainedMemoryPolicy::AllocationTracked
+            }
             AggregateStateMemoryPolicy::FixedZero => RetainedMemoryPolicy::FixedZero,
             AggregateStateMemoryPolicy::BoundedRetained {
                 max_retained_bytes_per_state,
@@ -971,6 +980,11 @@ where
         offset: usize,
         _tracker: Option<Arc<MemTracker>>,
     ) -> Result<(), PreparedAggregateError> {
+        if self.kernel.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked {
+            return Err(PreparedAggregateError::CreateState(
+                "legacy typed aggregate cannot supply an allocation-tracked state allocator".into(),
+            ));
+        }
         let state = self
             .kernel
             .create_state()

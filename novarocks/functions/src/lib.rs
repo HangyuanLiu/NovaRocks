@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 
 mod aggregate_call;
 mod aggregate_erasure;
+mod aggregate_host_allocator;
 mod aggregate_kernel;
 mod aggregate_state_column;
 pub mod aggregate_types;
@@ -662,6 +663,9 @@ pub trait TypedAggregateKernel: Send + Sync + 'static {
 pub enum AggregateStateMemoryPolicy {
     /// The state never owns memory outside its inline arena body.
     FixedZero,
+    /// Every state-owned allocation is authorized and released by the explicit
+    /// host allocator. Retained bytes are a fact, never a capacity grant.
+    AllocationTracked,
     /// The state may retain heap memory up to this per-state bound.
     ///
     /// Execution reserves the unconsumed headroom before every state mutation,

@@ -293,6 +293,7 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
             pending: VecDeque::new(),
             finishing: false,
             finished: false,
+            failed: None,
         })
     }
 }
@@ -317,9 +318,46 @@ struct CompiledAggregateProcessor {
     pending: VecDeque<Chunk>,
     finishing: bool,
     finished: bool,
+    /// The first failure owns its original typed category and diagnostic.
+    failed: Option<ExecutionFailure>,
 }
 
 impl CompiledAggregateProcessor {
+    /// Dropping the actual owners destroys initialized states before their
+    /// allocator returns backing; a status change alone cannot release them.
+    fn release_owned(&mut self) {
+        self.states = None;
+        self.key_table = None;
+        self.instances = None;
+        drop(std::mem::take(&mut self.pending));
+        self.groups = 0;
+    }
+
+    fn failure_result<T>(&mut self, result: ExecutionResult<T>) -> ExecutionResult<T> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if self.failed.is_none() {
+                    self.failed = Some(error);
+                    self.finishing = true;
+                    self.finished = true;
+                    // A failed update may have changed a prefix of the calls,
+                    // and a failed emission may have built a prefix of output.
+                    // Neither prefix can be resumed or exposed after failure.
+                    self.release_owned();
+                }
+                Err(self
+                    .failed
+                    .as_ref()
+                    .expect("first failure was retained")
+                    .clone())
+            }
+        }
+    }
+
     fn tracker(&self) -> ExecutionResult<Arc<MemTracker>> {
         if let Some(tracker) = self.tracker.as_ref() {
             return Ok(Arc::clone(tracker));
@@ -637,6 +675,12 @@ impl CompiledAggregateProcessor {
     }
 }
 
+impl Drop for CompiledAggregateProcessor {
+    fn drop(&mut self) {
+        self.release_owned();
+    }
+}
+
 impl Operator for CompiledAggregateProcessor {
     fn name(&self) -> &str {
         &self.name
@@ -657,21 +701,28 @@ impl Operator for CompiledAggregateProcessor {
 
 impl ProcessorOperator for CompiledAggregateProcessor {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished
+        self.failed.is_none() && !self.finishing && !self.finished
     }
     fn has_output(&self) -> bool {
-        !self.pending.is_empty()
+        self.failed.is_none() && !self.pending.is_empty()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Err("compiled Aggregate received input after finishing".into());
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
         }
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        self.consume(&chunk)
+        let result = if self.finishing || self.finished {
+            Err("compiled Aggregate received input after finishing".into())
+        } else if chunk.is_empty() {
+            Ok(())
+        } else {
+            self.consume(&chunk)
+        };
+        self.failure_result(result)
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         let output = self.pending.pop_front();
         if self.finishing && self.pending.is_empty() {
             self.finished = true;
@@ -679,11 +730,15 @@ impl ProcessorOperator for CompiledAggregateProcessor {
         Ok(output)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         if self.finishing || self.finished {
             return Ok(());
         }
         self.finishing = true;
-        self.emit()?;
+        let result = self.emit();
+        self.failure_result(result)?;
         // The states and keys are released once their output is built.
         self.states = None;
         self.key_table = None;
@@ -692,5 +747,244 @@ impl ProcessorOperator for CompiledAggregateProcessor {
             self.finished = true;
         }
         Ok(())
+    }
+}
+
+// Reuse the checked physical-plan fixture; tests never forge a LocalProgram.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../pipeline/builder/compiled_aggregate_fixture.rs"]
+mod aggregate_fixture;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../pipeline/builder/compiled_family_fixture.rs"]
+mod family_fixture;
+
+#[cfg(test)]
+mod failure_latch_tests {
+    use super::aggregate_fixture::{
+        CallSpec, add_aggregate, bind, compile, extrema_catalog, finish, packages, values,
+    };
+    use super::family_fixture::{FixtureControl, int64};
+    use super::*;
+    use crate::runtime::fragment::{
+        ExecutionFailureCause, PipelineOperation, RequiredExpressionRowError,
+    };
+    use arrow::array::Int64Array;
+    use novarocks_physical_plan::{
+        AggregateCallId, AggregateGrouping, AggregatePhase, FragmentBuilder, FragmentId,
+        FragmentSink, LiteralValue, PlanBuilder, PlanVersionId, ResultField, ResultPort,
+    };
+
+    fn processor() -> (
+        CompiledAggregateProcessor,
+        Chunk,
+        Arc<RuntimeErrorState>,
+        Arc<MemTracker>,
+    ) {
+        let catalog = extrema_catalog();
+        let count = bind(&catalog, "count", &[]);
+        let fragment = FragmentId::new(1);
+        let mut builder = FragmentBuilder::new(fragment);
+        let source = builder.reserve_node_id().unwrap();
+        let keys = values(
+            &mut builder,
+            source,
+            &[int64(false)],
+            &[vec![LiteralValue::Int64(1)], vec![LiteralValue::Int64(2)]],
+        );
+        let (node, _) = add_aggregate(
+            &mut builder,
+            source,
+            &keys,
+            &[CallSpec {
+                bound: &count,
+                phase: AggregatePhase::Single,
+                id: AggregateCallId::new(1),
+                arguments: Vec::new(),
+                distinct: false,
+            }],
+            AggregateGrouping::Complete,
+        );
+        let definition = finish(builder, node, FragmentSink::Result, 1);
+        let output = definition.nodes()[&node].output.clone();
+        let mut plan = PlanBuilder::new(PlanVersionId::try_new([101; 16]).unwrap());
+        plan.add_fragment(definition).unwrap();
+        plan.set_result_port(ResultPort {
+            fragment,
+            fields: output
+                .columns
+                .iter()
+                .zip([int64(false), count.result_type()])
+                .enumerate()
+                .map(|(ordinal, (value, ty))| ResultField {
+                    name: format!("c{ordinal}").into_boxed_str(),
+                    alias: None,
+                    value: *value,
+                    ty,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            output,
+        })
+        .unwrap();
+        let plan = plan.finish_observed(&FixtureControl).unwrap();
+        let package = packages(&plan, &catalog).remove(&fragment).unwrap();
+        let program = compile(package, &catalog, 1, true);
+        let source = program
+            .graph()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), ProgramNodeKind::Values { .. }))
+            .unwrap();
+        let ProgramNodeKind::Values { values } = source.kind() else {
+            unreachable!()
+        };
+        let input = Chunk::new_with_chunk_schema(
+            values.batch().unwrap().clone(),
+            ChunkSchema::from_compiled_layout(source.output_layout()).unwrap(),
+        );
+        let node = program.graph().root();
+        let error = Arc::new(RuntimeErrorState::default());
+        let factory =
+            CompiledAggregateProcessorFactory::try_new(program, node, Arc::clone(&error)).unwrap();
+        let tracker = MemTracker::new_root("CompiledAggregateFailureLatchTest");
+        let processor = CompiledAggregateProcessor {
+            name: factory.name,
+            program: factory.program,
+            sites: factory.sites,
+            group_roots: factory.groups,
+            calls: factory.calls,
+            key_types: factory.key_types,
+            output: factory.output,
+            control: RuntimeKernelControl::new(Arc::clone(&error)),
+            tracker: Some(Arc::clone(&tracker)),
+            instances: None,
+            key_table: None,
+            states: None,
+            groups: 0,
+            pending: VecDeque::new(),
+            finishing: false,
+            finished: false,
+            failed: None,
+        };
+        (processor, input, error, tracker)
+    }
+    fn assert_failed_reentry(
+        processor: &mut CompiledAggregateProcessor,
+        expected: &ExecutionFailure,
+        input: &Chunk,
+    ) {
+        let state = RuntimeState::default();
+        assert!(!processor.need_input());
+        assert!(!processor.has_output());
+        assert!(processor.is_finished());
+        assert!(processor.states.is_none());
+        assert!(processor.key_table.is_none());
+        assert!(processor.instances.is_none());
+        assert!(processor.pending.is_empty());
+        assert_eq!(processor.pending.capacity(), 0);
+        assert_eq!(
+            processor.push_chunk(&state, input.clone()).unwrap_err(),
+            *expected
+        );
+        assert_eq!(
+            processor.push_chunk(&state, Chunk::default()).unwrap_err(),
+            *expected
+        );
+        assert_eq!(processor.pull_chunk(&state).unwrap_err(), *expected);
+        assert_eq!(processor.set_finishing(&state).unwrap_err(), *expected);
+    }
+    fn pending_prefix(
+        processor: &mut CompiledAggregateProcessor,
+        input: &Chunk,
+    ) -> std::sync::Weak<dyn arrow::array::Array> {
+        let column = Arc::new(Int64Array::from(vec![999, 1000])) as ArrayRef;
+        let weak = Arc::downgrade(&column);
+        let batch = RecordBatch::try_new(input.batch.schema(), vec![column]).unwrap();
+        processor.pending.push_back(Chunk::new_like(batch, input));
+        weak
+    }
+    #[test]
+    fn compiled_aggregate_failure_latch_push_cannot_replay_accumulated_prefix() {
+        let (mut processor, input, error, tracker) = processor();
+        let state = RuntimeState::default();
+        processor.push_chunk(&state, input.clone()).unwrap();
+        assert_eq!(processor.groups, 2);
+        assert!(tracker.current() > 0);
+        error.set_error("originating task stop");
+        let original = processor.push_chunk(&state, input.clone()).unwrap_err();
+        assert_eq!(
+            original.cause(),
+            &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+        );
+        assert_eq!(tracker.current(), 0, "failed owners must actually drop");
+        assert_failed_reentry(&mut processor, &original, &input);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn compiled_aggregate_failure_latch_finish_discards_pending_prefix() {
+        let (mut processor, input, error, tracker) = processor();
+        let state = RuntimeState::default();
+        processor.push_chunk(&state, input.clone()).unwrap();
+        let prefix = pending_prefix(&mut processor, &input);
+        assert!(prefix.upgrade().is_some());
+        error.set_error("stop before aggregate emission");
+        let original = processor.set_finishing(&state).unwrap_err();
+        assert_eq!(
+            original.cause(),
+            &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+        );
+        assert!(
+            prefix.upgrade().is_none(),
+            "failed output prefix must actually drop"
+        );
+        assert_eq!(tracker.current(), 0);
+        assert_failed_reentry(&mut processor, &original, &input);
+    }
+    #[test]
+    fn compiled_aggregate_failure_latch_keeps_first_typed_payload_and_context() {
+        let (mut processor, input, _, tracker) = processor();
+        let state = RuntimeState::default();
+        processor.push_chunk(&state, input.clone()).unwrap();
+        let row = RequiredExpressionRowError::try_new(
+            processor.sites[0],
+            Selection::all(2),
+            novarocks_functions::RowDataError::new(1, "original required row"),
+        )
+        .unwrap();
+        let original = ExecutionFailure::from(row).at_operator(7, PipelineOperation::Push);
+        let result = processor
+            .failure_result::<()>(Err(original.clone()))
+            .unwrap_err();
+        assert_eq!(result, original);
+        assert_eq!(tracker.current(), 0);
+        let secondary = ExecutionFailure::from(KernelFailure::ResourceExhausted)
+            .at_operator(9, PipelineOperation::Finishing);
+        assert_eq!(
+            processor.failure_result::<()>(Err(secondary)).unwrap_err(),
+            original
+        );
+        assert_failed_reentry(&mut processor, &original, &input);
+    }
+    #[test]
+    fn compiled_aggregate_failure_latch_drop_releases_live_owners_and_pending() {
+        let (mut processor, input, _, tracker) = processor();
+        processor
+            .push_chunk(&RuntimeState::default(), input.clone())
+            .unwrap();
+        let prefix = pending_prefix(&mut processor, &input);
+        assert!(tracker.current() > 0);
+        assert!(
+            processor
+                .states
+                .as_ref()
+                .is_some_and(|states| states[0].len() == 2)
+        );
+        assert!(processor.key_table.is_some());
+        assert!(processor.instances.is_some());
+        drop(processor);
+        assert_eq!(tracker.current(), 0);
+        assert!(prefix.upgrade().is_none());
     }
 }

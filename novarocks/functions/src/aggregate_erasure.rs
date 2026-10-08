@@ -24,8 +24,8 @@ use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
     AggregateCallContract, AggregateMergeInvocation, AggregateStateMemoryPolicy,
     AggregateUpdateInvocation, KernelEvaluationControl, KernelFailure, PreparedAggregateKernel,
-    SelectedAggregateMergeInput, SelectedAggregateUpdateInput, create_aggregate_state,
-    emit_aggregate,
+    SelectedAggregateMergeInput, SelectedAggregateUpdateInput,
+    create_aggregate_state_with_allocator, emit_aggregate,
 };
 use arrow_array::ArrayRef;
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
@@ -77,6 +77,14 @@ impl PreparedAggregateHandle {
         storage: &'storage mut [MaybeUninit<u8>],
         control: &dyn KernelEvaluationControl,
     ) -> Result<AggregateStateSlot<'storage>, KernelFailure> {
+        self.initialize_in_with_allocator(storage, None, control)
+    }
+    pub fn initialize_in_with_allocator<'storage>(
+        &self,
+        storage: &'storage mut [MaybeUninit<u8>],
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<AggregateStateSlot<'storage>, KernelFailure> {
         control.checkpoint(0)?;
         let layout = self.state_layout();
         let pointer = NonNull::new(storage.as_mut_ptr().cast::<u8>())
@@ -92,7 +100,7 @@ impl PreparedAggregateHandle {
         // slot's lifetime, has enough bytes and satisfies actual State alignment.
         // The private generic adapter initializes exactly its State type.
         unsafe {
-            owner.initialize(pointer, control)?;
+            owner.initialize(pointer, allocator, control)?;
         }
         // No fallible operation may intervene between successful write and
         // installing this unique typed destruction owner.
@@ -247,6 +255,7 @@ trait ErasedAggregateOps: Send + Sync + fmt::Debug {
     unsafe fn initialize(
         &self,
         pointer: NonNull<u8>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), KernelFailure>;
     unsafe fn destroy(&self, pointer: NonNull<u8>);
@@ -301,6 +310,7 @@ impl<K: PreparedAggregateKernel> TypedOps<K> {
     }
     fn validate_retained(&self, state: &K::State) -> Result<(), KernelFailure> {
         let bound = match self.policy {
+            AggregateStateMemoryPolicy::AllocationTracked => return Ok(()),
             AggregateStateMemoryPolicy::FixedZero => 0,
             AggregateStateMemoryPolicy::BoundedRetained {
                 max_retained_bytes_per_state,
@@ -328,10 +338,12 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
     unsafe fn initialize(
         &self,
         pointer: NonNull<u8>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), KernelFailure> {
         self.validate_metadata()?;
-        let state = create_aggregate_state(self.kernel.as_ref(), control)?;
+        let state =
+            create_aggregate_state_with_allocator(self.kernel.as_ref(), allocator, control)?;
         self.validate_retained(&state)?;
         self.validate_metadata()?;
         // SAFETY: the private caller checked the layout of this exact K::State

@@ -1772,3 +1772,43 @@ fn owned_state_column_refused_block_leaves_prior_states_intact() {
     assert_eq!(owner.counts.drop.load(Ordering::Relaxed), destroyed + 1);
     assert_eq!(allocator.released.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn owned_state_column_unpublished_block_is_released_on_initialization_failure() {
+    for states_per_block in [1, 2] {
+        let owner = Owner::new(1, false);
+        let runtime = RuntimeControl::default();
+        let allocator = Arc::new(CountingAllocator::default());
+        let handle = prepared_handle(&owner, AggregateKernelPhase::Partial);
+        let mut column = crate::AggregateStateColumn::try_new(
+            handle,
+            allocator.clone(),
+            std::num::NonZeroUsize::new(states_per_block).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(column.push(&runtime).unwrap(), 0);
+        let before_bytes = column.backing_bytes();
+        let control = FinishControl {
+            failure: KernelFailure::Cancelled,
+            zeroes: AtomicUsize::new(0),
+        };
+        assert_eq!(column.push(&control), Err(KernelFailure::Cancelled));
+        assert_eq!(column.len(), 1);
+        assert_eq!(column.backing_bytes(), before_bytes);
+        assert_eq!(
+            allocator.released.load(Ordering::Relaxed),
+            usize::from(states_per_block == 1)
+        );
+        assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+        assert_eq!(column.push(&runtime).unwrap(), 1);
+        drop(column);
+        assert_eq!(
+            allocator.allocated.load(Ordering::Relaxed),
+            allocator.released.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            owner.counts.create.load(Ordering::Relaxed),
+            owner.counts.drop.load(Ordering::Relaxed)
+        );
+    }
+}

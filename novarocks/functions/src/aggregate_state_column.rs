@@ -157,6 +157,7 @@ impl AggregateStateColumn {
         self.states
             .try_reserve(1)
             .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut new_block = None;
         let pointer = if self.stride == 0 {
             // A zero-sized state needs no backing, only its alignment.
             NonNull::new(self.state_layout.align() as *mut u8)
@@ -168,11 +169,16 @@ impl AggregateStateColumn {
                     .try_reserve(1)
                     .map_err(|_| KernelFailure::ResourceExhausted)?;
                 let block = self.allocator.allocate(self.block_layout)?;
-                self.blocks.push(block);
+                new_block = Some(UnpublishedBlock {
+                    pointer: Some(block),
+                    layout: self.block_layout,
+                    allocator: Arc::clone(&self.allocator),
+                });
             }
-            let block = *self
-                .blocks
-                .last()
+            let block = new_block
+                .as_ref()
+                .and_then(|block| block.pointer)
+                .or_else(|| self.blocks.last().copied())
                 .ok_or_else(|| invalid("aggregate state block is absent"))?;
             // SAFETY: `within * stride` lies inside the block, which holds
             // `states_per_block` strides.
@@ -185,7 +191,15 @@ impl AggregateStateColumn {
         let storage: &'static mut [MaybeUninit<u8>] = unsafe {
             std::slice::from_raw_parts_mut(pointer.as_ptr().cast::<MaybeUninit<u8>>(), self.stride)
         };
-        let slot = self.handle.initialize_in(storage, control)?;
+        let slot = self.handle.initialize_in_with_allocator(
+            storage,
+            Some(Arc::clone(&self.allocator)),
+            control,
+        )?;
+        if let Some(mut block) = new_block.take() {
+            self.blocks
+                .push(block.pointer.take().expect("unpublished aggregate block"));
+        }
         self.states.push(slot);
         Ok(index)
     }
@@ -222,6 +236,20 @@ impl AggregateStateColumn {
     ) -> Result<ArrayRef, KernelFailure> {
         self.handle
             .emit(&self.states, indices, row_capacity, control)
+    }
+}
+
+struct UnpublishedBlock {
+    pointer: Option<NonNull<u8>>,
+    layout: Layout,
+    allocator: Arc<dyn AggregateStateAllocator>,
+}
+impl Drop for UnpublishedBlock {
+    fn drop(&mut self) {
+        // SAFETY: construction has not published a state borrowing this block.
+        if let Some(pointer) = self.pointer {
+            unsafe { self.allocator.release(pointer, self.layout) };
+        }
     }
 }
 

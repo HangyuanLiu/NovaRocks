@@ -1516,3 +1516,6 @@ mod s2_tests;
 
 #[path = "pure_differential_regexp_replace_tests.rs"]
 mod regexp_replace_tests;
+
+#[path = "pure_differential_distinct_numeric_tests.rs"]
+mod distinct_numeric_tests;

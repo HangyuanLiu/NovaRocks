@@ -54,6 +54,19 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
         &self,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self::State, KernelFailure>;
+    /// Construct state with the host authority for owned heap allocations.
+    fn create_state_with_allocator(
+        &self,
+        _allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self::State, KernelFailure> {
+        if self.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked {
+            return Err(invalid(
+                "allocation-tracked aggregate requires a host allocator implementation",
+            ));
+        }
+        self.create_state(control)
+    }
     /// Borrow only actually selected values; never inspect unused batch rows
     /// or advance group state while preparing the input view.
     fn prepare_update<'batch>(
@@ -286,8 +299,9 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
 
 pub(crate) fn state_retained_bound<K: PreparedAggregateKernel>(
     kernel: &K,
-) -> Result<usize, KernelFailure> {
+) -> Result<Option<usize>, KernelFailure> {
     let heap = match kernel.memory_policy() {
+        AggregateStateMemoryPolicy::AllocationTracked => return Ok(None),
         AggregateStateMemoryPolicy::FixedZero => 0,
         AggregateStateMemoryPolicy::BoundedRetained {
             max_retained_bytes_per_state,
@@ -296,13 +310,13 @@ pub(crate) fn state_retained_bound<K: PreparedAggregateKernel>(
     size_of::<K::State>()
         .checked_add(heap)
         .ok_or(KernelFailure::ResourceExhausted)?;
-    Ok(heap)
+    Ok(Some(heap))
 }
 fn validate_state_retained<K: PreparedAggregateKernel>(
     kernel: &K,
     state: &K::State,
 ) -> Result<(), KernelFailure> {
-    if kernel.retained_bytes(state) > state_retained_bound(kernel)? {
+    if state_retained_bound(kernel)?.is_some_and(|bound| kernel.retained_bytes(state) > bound) {
         Err(internal(
             "aggregate state exceeded its immutable retained bound",
         ))
@@ -318,9 +332,24 @@ pub fn create_aggregate_state<K: PreparedAggregateKernel>(
     kernel: &K,
     control: &dyn KernelEvaluationControl,
 ) -> Result<K::State, KernelFailure> {
+    create_aggregate_state_with_allocator(kernel, None, control)
+}
+
+pub fn create_aggregate_state_with_allocator<K: PreparedAggregateKernel>(
+    kernel: &K,
+    allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<K::State, KernelFailure> {
     control.checkpoint(0)?;
     state_retained_bound(kernel)?;
-    let state = kernel.create_state(control)?;
+    if kernel.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked
+        && allocator.is_none()
+    {
+        return Err(invalid(
+            "allocation-tracked aggregate state requires a host allocator",
+        ));
+    }
+    let state = kernel.create_state_with_allocator(allocator, control)?;
     validate_state_retained(kernel, &state)?;
     control.checkpoint(0)?;
     Ok(state)

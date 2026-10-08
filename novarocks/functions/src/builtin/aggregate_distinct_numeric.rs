@@ -71,6 +71,10 @@ pub trait NumericDistinctSet {
 /// requests the exact admitted extent and appends its frozen wire bytes.
 pub trait NumericDistinctBuffer {
     fn reserve_exact(&mut self, size: usize) -> Result<(), String>;
+    fn reserve_exact_typed(&mut self, size: usize) -> Result<(), DistinctComputationError> {
+        self.reserve_exact(size)
+            .map_err(DistinctComputationError::from)
+    }
     fn append(&mut self, bytes: &[u8]);
 }
 
@@ -497,7 +501,7 @@ pub fn serialize_set_into(
         return Err(("distinct state payload exceeds the Binary offset domain".to_string()).into());
     }
     work.flush()?;
-    out.reserve_exact(size)?;
+    out.reserve_exact_typed(size)?;
     work.flush()?;
     out.append(&count.to_le_bytes());
     for value in set.keys() {
@@ -527,6 +531,15 @@ pub fn visit_serialized_keys(
     width: usize,
     work: &mut EvaluationCheckpoints<'_>,
     mut visit: impl FnMut(&[u8]) -> Result<(), DistinctComputationError>,
+) -> Result<(), DistinctComputationError> {
+    visit_serialized_keys_with_work(bytes, width, work, |bytes, _| visit(bytes))
+}
+
+pub fn visit_serialized_keys_with_work(
+    bytes: &[u8],
+    width: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+    mut visit: impl FnMut(&[u8], &mut EvaluationCheckpoints<'_>) -> Result<(), DistinctComputationError>,
 ) -> Result<(), DistinctComputationError> {
     let read = |at: usize| -> Result<u32, String> {
         let end = at
@@ -559,7 +572,7 @@ pub fn visit_serialized_keys(
     for index in 0..count {
         work.step()?;
         let start = 8 + index * stride;
-        visit(&bytes[start..start + width])?;
+        visit(&bytes[start..start + width], work)?;
     }
     Ok(())
 }

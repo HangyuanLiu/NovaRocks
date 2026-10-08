@@ -2939,6 +2939,9 @@ pub fn contribute_builtin_functions(
                 effects: match declaration.name {
                     "count" => Some(super::aggregate_count_owner::effects()),
                     "sum" => Some(super::aggregate_sum_owner::effects()),
+                    name if super::aggregate_distinct_numeric_kernel::operation(name).is_some() => {
+                        Some(super::aggregate_distinct_numeric_owner::effects())
+                    }
                     name if super::aggregate_basic::operation(name).is_some() => {
                         Some(super::aggregate_basic_owner::effects())
                     }
@@ -2991,6 +2994,14 @@ pub fn contribute_builtin_functions(
         }
         if super::aggregate_extrema_owner::operation(declaration.name).is_some() {
             builder.register(super::aggregate_extrema_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if super::aggregate_distinct_numeric_kernel::operation(declaration.name).is_some() {
+            builder.register(super::aggregate_distinct_numeric_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
