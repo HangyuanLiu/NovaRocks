@@ -690,6 +690,8 @@ struct InstalledProtocolManifest {
     scope: String,
     retention_input_sha256: String,
     phase_ms: u64,
+    max_wait_millis: u64,
+    correction_of: BTreeMap<String, String>,
     request_frame_bytes: usize,
     response_data_bytes: usize,
     max_identity_candidates: usize,
@@ -703,6 +705,24 @@ struct InstalledProtocolManifest {
     cases: Vec<String>,
 }
 
+fn installed_root_request(
+    task: &proto::TaskIdentity,
+    wanted_sequence: Option<u64>,
+    consumed_sequence: u64,
+    max_wait_millis: u64,
+) -> proto::FetchRootResultRequest {
+    proto::FetchRootResultRequest {
+        root_task: Some(task.clone()),
+        profile_id: 1,
+        output_kind: Some(result_proto::RootOutputKind {
+            kind: Some(result_proto::root_output_kind::Kind::ClientRows(true)),
+        }),
+        wanted_sequence,
+        consumed_sequence,
+        max_wait_millis,
+    }
+}
+
 fn installed_root_protocol(
     context: &mut ScenarioContext,
     before_logs: &[String],
@@ -713,7 +733,7 @@ fn installed_root_protocol(
     use novarocks_execution_contract::root_result::RootReadOutcome;
     use sha2::{Digest, Sha256};
     let freeze: InstalledProtocolManifest = serde_json::from_str(include_str!(
-        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json"
+        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
     ))?;
     let retention_digest = format!(
         "{:x}",
@@ -722,11 +742,23 @@ fn installed_root_protocol(
         ))
     );
     ensure!(
-        freeze.schema_version == 1
+        freeze.schema_version == 2
             && freeze.topology == "1FE+3BE"
             && !freeze.scope.is_empty()
             && freeze.retention_input_sha256 == retention_digest
             && freeze.phase_ms == 5000
+            && freeze.max_wait_millis == 100
+            && freeze.correction_of.len() == 3
+            && freeze.correction_of["path"]
+                == "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json"
+            && !freeze.correction_of["reason"].is_empty()
+            && freeze.correction_of["sha256"]
+                == format!(
+                    "{:x}",
+                    Sha256::digest(include_bytes!(
+                        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json"
+                    ))
+                )
             && freeze.max_identity_candidates == 8
             && freeze.request_frame_bytes == 4096
             && freeze.response_data_bytes == 1048576 + 4096
@@ -772,16 +804,7 @@ fn installed_root_protocol(
             Instant::now() < deadline && !job.is_finished(),
             "root discovery expired or actor exited"
         );
-        let request = proto::FetchRootResultRequest {
-            root_task: Some(candidate.clone()),
-            profile_id: 1,
-            output_kind: Some(result_proto::RootOutputKind {
-                kind: Some(result_proto::root_output_kind::Kind::ClientRows(true)),
-            }),
-            wanted_sequence: None,
-            consumed_sequence: 0,
-            max_wait_millis: 0,
-        };
+        let request = installed_root_request(&candidate, None, 0, freeze.max_wait_millis);
         let (reply, mut observation) = super::result_delivery_root_protocol::probe_candidate(
             context, backend, &request, 0, deadline,
         )?;
@@ -820,16 +843,7 @@ fn installed_root_protocol(
             "retired1" => (Some(1), proven),
             _ => anyhow::bail!("unknown frozen root operation"),
         };
-        let request = proto::FetchRootResultRequest {
-            root_task: Some(task.clone()),
-            profile_id: 1,
-            output_kind: Some(result_proto::RootOutputKind {
-                kind: Some(result_proto::root_output_kind::Kind::ClientRows(true)),
-            }),
-            wanted_sequence: wanted,
-            consumed_sequence: consumed,
-            max_wait_millis: 0,
-        };
+        let request = installed_root_request(&task, wanted, consumed, freeze.max_wait_millis);
         let (reply, mut observation) = super::result_delivery_root_protocol::probe(
             context, backend, &request, proven, deadline,
         )?;
@@ -925,6 +939,40 @@ fn installed_root_protocol(
 
 #[cfg(test)]
 mod census_tests {
+    #[test]
+    fn frozen_installed_root_requests_pass_the_production_decoder() {
+        let freeze: super::InstalledProtocolManifest = serde_json::from_str(include_str!(
+            "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
+        ))
+        .unwrap();
+        let task = super::foreign_root_task();
+        for (wanted, consumed) in [
+            (None, 0),
+            (Some(1), 0),
+            (Some(2), 0),
+            (None, 3),
+            (Some(1), 3),
+        ] {
+            let request =
+                super::installed_root_request(&task, wanted, consumed, freeze.max_wait_millis);
+            assert!(
+                novarocks_task_codec::root_result::decode_read(
+                    &request,
+                    novarocks_proto_codec::FieldPath::root("frozen_probe")
+                )
+                .is_ok()
+            );
+        }
+        let invalid = super::installed_root_request(&task, None, 0, 0);
+        assert!(
+            novarocks_task_codec::root_result::decode_read(
+                &invalid,
+                novarocks_proto_codec::FieldPath::root("invalid_zero_wait")
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
     #[test]
     fn census_missing_partial_duplicate_stale_and_invalid_samples_are_refused() {

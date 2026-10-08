@@ -42,6 +42,7 @@ const CANDIDATE_CAP: usize = 8;
 
 /// Resolve the sole new task, rather than infer a stage or task from SQL shape.
 /// The caller separately proves that this task owns the sole occupied root.
+#[cfg(test)]
 pub(super) fn parse_unique_created_task(
     before: &[String],
     after: &[String],
