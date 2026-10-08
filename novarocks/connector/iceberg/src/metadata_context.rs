@@ -44,9 +44,9 @@ use crate::resources::IcebergMetadataResources;
 
 static NEXT_ATTEMPT_METADATA_CACHE_OWNER: AtomicU64 = AtomicU64::new(1);
 
-/// Provider-private, attempt-local successful table materialization cache. It
-/// is stored inside `ConnectorRequestScope`, so neither a process-global cache
-/// nor a query plan can retain a request-bound FileIO or response-local secret.
+/// Provider-private, attempt-local successful metadata observation cache. Only
+/// resource-free frozen facts may enter it: retaining a request-bound FileIO
+/// here would keep its own `ConnectorRequestScope` alive through a strong cycle.
 #[derive(Default)]
 struct AttemptMetadataTableCache {
     entries: Mutex<HashMap<AttemptMetadataTableKey, Arc<AttemptMetadataTableEntry>>>,
@@ -60,7 +60,7 @@ struct AttemptMetadataTableKey {
 }
 
 struct AttemptMetadataTableEntry {
-    result: Mutex<Option<Result<IcebergPhysicalTable, (ConnectorErrorKind, String)>>>,
+    result: Mutex<Option<Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>>>,
     ready: Condvar,
 }
 
@@ -77,8 +77,8 @@ impl AttemptMetadataTableCache {
     fn get_or_load(
         &self,
         key: AttemptMetadataTableKey,
-        load: impl FnOnce() -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)>,
-    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        load: impl FnOnce() -> Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>,
+    ) -> Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)> {
         let (entry, loader) = {
             let mut entries = self.entries.lock().expect("attempt metadata cache lock");
             match entries.get(&key) {
@@ -542,8 +542,8 @@ impl IcebergMetadataContext {
         // one request scope, including the metadata/statistics/typed-scan
         // paths before an attempt collector exists. A terminal write context
         // deliberately drops that collector and retains a replacement storage
-        // resolver; it must reload through that resolver rather than reuse a
-        // FileIO bound to the completed attempt.
+        // resolver; it must reload through that resolver rather than reuse the
+        // completed attempt's observation.
         //
         // Terminal reloads must also reach the catalog rather than the
         // control-state table cache: a commit decides against that current
@@ -562,7 +562,7 @@ impl IcebergMetadataContext {
         }
         let cache = request_context
             .request_scope_extension_or_insert_with(AttemptMetadataTableCache::default);
-        cache.get_or_load(
+        let frozen = cache.get_or_load(
             AttemptMetadataTableKey {
                 owner: self.attempt_metadata_cache_owner,
                 namespace: namespace.clone(),
@@ -575,8 +575,16 @@ impl IcebergMetadataContext {
                     credential_lease_collection,
                     Some(request_context),
                 )
+                .map(IcebergAttemptTableAccess::freeze)
             },
-        )
+        )?;
+        frozen
+            .reacquired_request_scoped(
+                self.resources
+                    .planning_binding()
+                    .for_request(request_context.clone()),
+            )
+            .map_err(|error| (error.kind(), error.to_string()))
     }
 
     /// Perform the one physical catalog observation for a cache miss. The
@@ -699,8 +707,9 @@ impl IcebergMetadataContext {
             .map_err(|error| (error.kind(), error.to_string()))?;
         let physical = IcebergPhysicalTable::new(loaded_table);
         // The Hadoop read may have built this table with a request-bound
-        // FileIO. It can live in the request cache, never in the generation
-        // cache that later requests reuse.
+        // FileIO. Only its resource-free facts may enter the request cache;
+        // the complete table may enter the generation cache only without a
+        // request binding.
         if request_context.is_none() {
             self.control_state
                 .physical_table_cache()
@@ -934,8 +943,180 @@ mod tests {
     };
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::ConnectorRequestScope;
+    use serde::{Deserialize, Serialize};
+
+    use crate::iceberg::io::{FileIOBuilder, Storage, StorageConfig, StorageFactory};
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
 
     use super::*;
+
+    struct ScopeDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for ScopeDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct ScopeRetainingFileIoFactory {
+        #[serde(skip, default)]
+        scope: ConnectorRequestScope,
+        #[serde(skip, default)]
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Debug for ScopeRetainingFileIoFactory {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ScopeRetainingFileIoFactory")
+        }
+    }
+
+    impl Drop for ScopeRetainingFileIoFactory {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for ScopeRetainingFileIoFactory {
+        fn build(&self, _config: &StorageConfig) -> crate::iceberg::Result<Arc<dyn Storage>> {
+            // A metadata-only freeze must never need to instantiate storage.
+            let _ = &self.scope;
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::Unexpected,
+                "metadata cache test must not perform storage I/O",
+            ))
+        }
+    }
+
+    fn scope_retaining_table(
+        scope: ConnectorRequestScope,
+        drops: Arc<AtomicUsize>,
+    ) -> IcebergPhysicalTable {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let spec = PartitionSpec::builder(Arc::new(schema.clone()))
+            .with_spec_id(0)
+            .build()
+            .expect("partition spec");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            spec,
+            SortOrder::builder().build_unbound().expect("sort"),
+            "file:///tmp/attempt-cache".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        IcebergPhysicalTable::new(
+            crate::iceberg::table::Table::builder()
+                .identifier(TableIdent::from_strs(["analytics", "frozen"]).expect("identity"))
+                .metadata(Arc::new(metadata))
+                .metadata_location("file:///tmp/attempt-cache/v1.metadata.json".to_string())
+                .readonly(true)
+                .file_io(
+                    FileIOBuilder::new(Arc::new(ScopeRetainingFileIoFactory { scope, drops }))
+                        .build(),
+                )
+                .build()
+                .expect("table"),
+        )
+    }
+
+    #[test]
+    fn successful_request_cache_releases_file_io_and_its_own_scope() {
+        let scope = ConnectorRequestScope::new();
+        let scope_drops = Arc::new(AtomicUsize::new(0));
+        let file_io_drops = Arc::new(AtomicUsize::new(0));
+        scope.extension_or_insert_with(|| ScopeDropProbe(Arc::clone(&scope_drops)));
+        let cache = scope.extension_or_insert_with(AttemptMetadataTableCache::default);
+        let key = AttemptMetadataTableKey {
+            owner: 1,
+            namespace: "analytics".to_string(),
+            table: "frozen".to_string(),
+        };
+        let table = scope_retaining_table(scope.clone(), Arc::clone(&file_io_drops));
+        let metadata = table.table.metadata_ref();
+        let frozen = cache
+            .get_or_load(key.clone(), || Ok(IcebergAttemptTableAccess::freeze(table)))
+            .expect("freeze");
+        assert_eq!(file_io_drops.load(Ordering::SeqCst), 1);
+        drop(scope);
+        assert_eq!(scope_drops.load(Ordering::SeqCst), 1);
+        // Even an independently retained cache must own no request runtime.
+        let cached = cache
+            .get_or_load(key, || panic!("successful metadata is loaded only once"))
+            .expect("cached metadata");
+        assert!(std::ptr::eq(cached.metadata(), metadata.as_ref()));
+        assert!(std::ptr::eq(frozen.metadata(), cached.metadata()));
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let rebuilt = cached.reacquired_request_scoped(binding).expect("rebuild");
+        assert!(Arc::ptr_eq(&metadata, &rebuilt.table.metadata_ref()));
+        assert_eq!(rebuilt.table.identifier(), frozen.identifier());
+        assert_eq!(
+            rebuilt.table.metadata_location(),
+            Some("file:///tmp/attempt-cache/v1.metadata.json")
+        );
+        assert!(rebuilt.table.readonly());
+    }
+
+    #[test]
+    fn successful_request_observation_is_single_flight_across_concurrent_readers() {
+        let cache = AttemptMetadataTableCache::default();
+        let key = AttemptMetadataTableKey {
+            owner: 1,
+            namespace: "analytics".to_string(),
+            table: "frozen".to_string(),
+        };
+        let frozen = IcebergAttemptTableAccess::freeze(scope_retaining_table(
+            ConnectorRequestScope::new(),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let calls = AtomicUsize::new(0);
+        let readers = std::sync::Barrier::new(8);
+        std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    threads.spawn(|| {
+                        readers.wait();
+                        cache
+                            .get_or_load(key.clone(), || {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Ok(frozen.clone())
+                            })
+                            .expect("observation")
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let observed = handle.join().expect("reader");
+                assert!(std::ptr::eq(observed.metadata(), frozen.metadata()));
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn failed_request_observation_is_not_retained_after_a_create_boundary() {
