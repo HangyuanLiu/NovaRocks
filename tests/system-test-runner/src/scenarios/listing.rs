@@ -136,8 +136,13 @@ impl Scenario for CatalogListing {
                     .err()
                     .context("over-bound discovery must refuse the whole DROP")?;
                 let diagnostic = error.to_string();
+                let expected_kind = if mode == ListingMode::TokenCycle {
+                    "CorruptData"
+                } else {
+                    "ResourceExhausted"
+                };
                 ensure!(
-                    diagnostic.contains("ResourceExhausted") || diagnostic.contains("listing"),
+                    diagnostic.contains(expected_kind),
                     "DROP failed outside its listing boundary"
                 );
                 let audit = fixture.snapshot()?;
