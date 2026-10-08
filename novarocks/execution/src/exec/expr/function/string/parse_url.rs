@@ -18,7 +18,6 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
-use url::Url;
 
 pub fn eval_parse_url(
     arena: &ExprArena,
@@ -56,30 +55,19 @@ pub fn eval_parse_url(
             out.push(None);
             continue;
         }
-        let url_str = url_arr.value(i);
-        let part = part_arr.value(i).to_uppercase();
-        let url = Url::parse(url_str).ok();
-        let val = match (url, part.as_str()) {
-            (Some(u), "HOST") => u.host_str().map(|s| s.to_string()),
-            (Some(u), "PATH") => Some(u.path().to_string()),
-            (Some(u), "PROTOCOL") => Some(u.scheme().to_string()),
-            (Some(u), "REF") => u.fragment().map(|s| s.to_string()),
-            (Some(u), "QUERY") => {
-                if let Some(key_arr) = key_arr.as_ref() {
+        let val = novarocks_functions::builtin::string_parse_url_shared::parse_value(
+            url_arr.value(i),
+            part_arr.value(i),
+            &mut || {
+                key_arr.as_ref().map(|key_arr| {
                     if key_arr.is_null(i) {
                         None
                     } else {
-                        let key = key_arr.value(i);
-                        u.query_pairs()
-                            .find(|(k, _)| k == key)
-                            .map(|(_, v)| v.to_string())
+                        Some(key_arr.value(i))
                     }
-                } else {
-                    u.query().map(|s| s.to_string())
-                }
-            }
-            _ => None,
-        };
+                })
+            },
+        );
         out.push(val);
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)

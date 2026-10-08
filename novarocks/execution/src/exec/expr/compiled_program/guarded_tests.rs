@@ -1418,3 +1418,6 @@ pub(crate) fn record_temporal_invocation_data(
 }
 #[path = "regexp_count_tests.rs"]
 mod regexp_count_tests;
+
+#[path = "parse_url_tests.rs"]
+mod parse_url_tests;
