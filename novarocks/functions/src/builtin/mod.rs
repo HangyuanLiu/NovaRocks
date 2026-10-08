@@ -246,3 +246,7 @@ mod calendar_unixtime_owner;
 
 pub mod calendar_slice;
 mod calendar_slice_owner;
+
+pub mod array_append_core;
+mod array_append_owner;
+mod array_append_selected;
