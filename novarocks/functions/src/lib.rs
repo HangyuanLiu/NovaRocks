@@ -49,6 +49,7 @@ mod call_contract;
 mod carrier_map_tests;
 pub mod carrier_text;
 mod cast;
+pub mod control_values;
 mod comparison;
 pub mod datetime_value;
 mod effect_metadata;

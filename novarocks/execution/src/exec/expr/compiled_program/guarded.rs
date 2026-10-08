@@ -20,22 +20,12 @@
 //! borrow into owned values before resuming the parent continuation.
 use super::boolean_region::BooleanRows;
 use super::*;
-use arrow::{
-    array::{Array, BooleanArray},
-    compute::interleave,
-};
+use arrow::array::{Array, BooleanArray};
 use novarocks_local_program::ProgramNodeId;
 use novarocks_type_contract::EvaluationDemand;
 
 pub(super) fn supports_result(ty: &DataType) -> bool {
-    matches!(
-        ty,
-        DataType::Boolean
-            | DataType::Utf8
-            | DataType::Binary
-            | DataType::LargeUtf8
-            | DataType::LargeBinary
-    ) || ty.primitive_width().is_some()
+    novarocks_functions::control_values::supports_indexed_result(ty)
 }
 
 enum OwnedValue {
@@ -869,61 +859,31 @@ fn assemble(
     selection: Selection<'_>,
     work: &mut Work<'_>,
 ) -> Result<OwnedValue, KernelFailure> {
-    // The exact guarded carrier protocol is admitted before entering branch
-    // state. Actual payload admission uses the complete source-choice plan.
-    if !supports_result(ty) {
-        return Err(invalid(
-            "guarded result requires its dedicated carrier protocol",
-        ));
-    }
-    work.flush()?;
-    let mut sources = vec![new_null_array(ty, 1)];
-    work.flush()?;
-    let mut source_ids = Vec::with_capacity(children.len());
+    // The shared pure assembly receives only already-evaluated compact values.
+    // Frame scheduling and its original lazy row demand remain in this host.
+    let mut sources = Vec::with_capacity(children.len());
     for child in children {
-        let id = match &child.value {
-            OwnedValue::Selected(array, _) if array.data_type() == ty => {
-                sources.push(Arc::clone(array));
-                Some(sources.len() - 1)
-            }
-            _ => None, // The IF condition is not a result source.
-        };
-        source_ids.push(id);
-        work.step()?;
-    }
-    let mut indices = Vec::with_capacity(choices.len());
-    for &choice in choices {
-        indices.push(match choice {
-            Some((child, ordinal)) => (
-                source_ids[child]
-                    .ok_or_else(|| internal("missing actual guarded result source"))?,
-                ordinal,
-            ),
-            None => (0, 0),
+        sources.push(match &child.value {
+            OwnedValue::Selected(array, _) => Some(array),
+            _ => None,
         });
         work.step()?;
     }
-    novarocks_functions::selected_copy::preflight_guarded_interleave(
-        ty,
-        &sources,
-        &indices,
-        |boundary| {
-            if boundary { work.flush() } else { work.step() }
+    work.flush()?;
+    let array = novarocks_functions::control_values::assemble_values(
+        novarocks_functions::control_values::AssemblyPlan::Indexed {
+            result_type: ty,
+            sources: &sources,
+            choices,
         },
+        work.control,
     )
     .map_err(|error| match error {
-        novarocks_functions::selected_copy::CopyError::Control(error) => error,
-        novarocks_functions::selected_copy::CopyError::Extent => KernelFailure::ResourceExhausted,
-        _ => invalid("guarded result requires its dedicated carrier protocol"),
+        novarocks_functions::control_values::AssemblyFailure::Kernel(error) => error,
+        novarocks_functions::control_values::AssemblyFailure::Arrow(_) => {
+            internal("checked guarded result could not be assembled")
+        }
     })?;
-    let mut arrays = Vec::with_capacity(sources.len());
-    for source in &sources {
-        arrays.push(source.as_ref());
-        work.step()?;
-    }
-    work.flush()?;
-    let array = interleave(&arrays, &indices)
-        .map_err(|_| internal("checked guarded result could not be assembled"))?;
     work.flush()?;
     let mut errors = Vec::with_capacity(row_errors.len());
     for error in std::mem::take(row_errors).into_values() {
