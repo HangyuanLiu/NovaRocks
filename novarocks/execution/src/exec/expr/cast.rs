@@ -31,10 +31,7 @@ use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
-use novarocks_functions::calendar_numeric::{
-    numeric_datetime_literal_to_naive as datetime_literal_to_naive_datetime,
-    standardize_numeric_datetime_literal as standardize_date_literal,
-};
+use novarocks_functions::calendar_numeric::numeric_datetime_literal_to_naive as datetime_literal_to_naive_datetime;
 use novarocks_type_contract::{
     DecimalOverflowPolicy, decimal_error_policy_cast_supported, is_checked_decimal_numeric_cast,
 };
@@ -50,25 +47,6 @@ use novarocks_types::value::variant::{
     variant_to_time_micros,
 };
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-fn date_literal_to_date32(value: i64) -> Result<i32, String> {
-    let standardized =
-        standardize_date_literal(value).ok_or_else(|| format!("invalid date literal {value}"))?;
-    let date_part = standardized / 1_000_000;
-    let time_part = standardized % 1_000_000;
-    let year = (date_part / 10000) as i32;
-    let month = ((date_part / 100) % 100) as u32;
-    let day = (date_part % 100) as u32;
-    let hour = (time_part / 10000) as i32;
-    let minute = ((time_part / 100) % 100) as i32;
-    let second = (time_part % 100) as i32;
-    if hour > 23 || minute > 59 || second > 59 {
-        return Err(format!("invalid date literal {value}"));
-    }
-    let date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| format!("invalid date literal {value}"))?;
-    Ok(date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET)
-}
-
 fn pow10_i128(scale: u32) -> Option<i128> {
     let mut out: i128 = 1;
     for _ in 0..scale {
@@ -459,13 +437,9 @@ fn cast_float64_to_date32(arr: &Float64Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let value = arr.value(i);
-        if !value.is_finite() {
-            return Err(format!("invalid date literal {value}"));
-        }
-        let literal = value as i64;
-        let days = date_literal_to_date32(literal)?;
-        builder.append_value(days);
+        builder.append_value(novarocks_functions::float_date_cast::value_f64(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -477,13 +451,9 @@ fn cast_float32_to_date32(arr: &Float32Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let value = arr.value(i) as f64;
-        if !value.is_finite() {
-            return Err(format!("invalid date literal {value}"));
-        }
-        let literal = value as i64;
-        let days = date_literal_to_date32(literal)?;
-        builder.append_value(days);
+        builder.append_value(novarocks_functions::float_date_cast::value_f32(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }

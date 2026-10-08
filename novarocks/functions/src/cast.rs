@@ -158,6 +158,10 @@ impl UnsignedWidth {
 /// Successful-NULL obligations of exact primitive carrier casts. This is a
 /// static semantic fact, not an installed runtime capability whitelist.
 pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
+    // These original arena branches reject invalid/nonfinite literals even with false ALLOW.
+    if target == &DataType::Date32 && matches!(source, DataType::Float32 | DataType::Float64) {
+        return false;
+    }
     if matches!(target, DataType::Date32 | DataType::Timestamp(_, None))
         && !matches!(source, DataType::Date32 | DataType::Timestamp(_, _))
         && Source::from_type(source).is_some()
@@ -318,6 +322,9 @@ enum CastBody {
         source: Source,
     },
     Text {
+        source: Source,
+    },
+    FloatDate {
         source: Source,
     },
     Calendar {
@@ -484,6 +491,21 @@ impl PreparedCastRecipe {
                     allow_throw_exception,
                 });
             }
+            if source_kind.is_float() && result.data_type == DataType::Date32 {
+                if source.nullable && !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::FloatDate {
+                        source: source_kind,
+                    },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
             if !matches!(source_kind, Source::Timestamp(_))
                 && matches!(
                     result.data_type,
@@ -596,6 +618,7 @@ impl PreparedCastRecipe {
             CastBody::TemporalCarrier { .. } => {
                 matches!(self.result.data_type, DataType::Date32 | DataType::Utf8)
             }
+            CastBody::FloatDate { .. } => true,
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
             CastBody::LargeIntText | CastBody::Identity | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {
@@ -811,6 +834,47 @@ impl PreparedCastRecipe {
                     .map_err(|_| internal("checked text cast has a foreign carrier"))?;
                 work.flush()?;
                 return Ok(CastRowResult::Text(text));
+            }
+            if let CastBody::FloatDate { source } = self.body {
+                let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                work.flush()?;
+                let converted = match source {
+                    Source::F32 => crate::float_date_cast::value_f32(
+                        argument
+                            .array()
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .ok_or_else(|| internal("checked float DATE has a foreign carrier"))?
+                            .value(row),
+                    ),
+                    Source::F64 => crate::float_date_cast::value_f64(
+                        argument
+                            .array()
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| internal("checked float DATE has a foreign carrier"))?
+                            .value(row),
+                    ),
+                    _ => return Err(internal("float DATE has a foreign frozen source")),
+                };
+                work.flush()?;
+                return Ok(match converted {
+                    Ok(value) => CastRowResult::Signed(i64::from(value)),
+                    Err(message) => CastRowResult::RowError(RowDataError::new(
+                        ordinal,
+                        &format!(
+                            "CAST failed: from {:?} to Date32: {message}",
+                            self.source.data_type
+                        ),
+                    )),
+                });
             }
             if let CastBody::Calendar { source, unit } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
@@ -1224,3 +1288,7 @@ mod largeint_text_tests;
 #[cfg(test)]
 #[path = "cast_date_float_tests.rs"]
 mod date_float_tests;
+
+#[cfg(test)]
+#[path = "cast_float_date_tests.rs"]
+mod float_date_tests;

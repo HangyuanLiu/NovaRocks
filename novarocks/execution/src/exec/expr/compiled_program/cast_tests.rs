@@ -1098,3 +1098,9 @@ mod largeint_text_profile_tests;
 
 #[path = "cast_date_float_tests.rs"]
 mod date_float_profile_tests;
+
+#[path = "cast_float_date_tests.rs"]
+mod float_date_profile_tests;
+
+#[path = "cast_date_float_review_tests.rs"]
+mod date_float_review_probe_tests;
