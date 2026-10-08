@@ -131,3 +131,6 @@ FE FD含accept拒绝瞬时socket共710；handshake总量160。定向与完整Nat
 Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing owner 已接线；6项新增 TCP/partial/flush 反例与 MySQL77、Frontend1446、vendor lib150 PASS。范围/原始日志/失败与锁种子处理见 `evidence/p07-terminal-delivery.md`。整体 distributed/domain 矩阵与原生/性能门仍 OPEN；旧防护保留。
 
 2026-10-09 request metadata cache：仅保留既有纯 IcebergAttemptTableAccess，FileIO/scope真实Drop与八并发single-flight回归通过；真实Hadoop读写/BE替换、REST vended读写/指定BE续租/定向deadline原生PASS。受控REST CL同冻结32×512 lake观察allocated peak694848456→76311360、after342812752→16339960 bytes；whole-process观察不替代SDK字节上界、实际job退出或跨provider验收。见 evidence/p09-request-cache-resource-exit-20261009.json 与 p09-request-cache-native-20261009.json。
+
+
+2026-10-09 P09 correctness checkpoint：六份历史Decimal共同失败golden均由独立exact-literal/actual-DDL oracle推导，在old main及candidate完整原生核验后修正；原SQL与比较策略保留。完整Decimal20/20、617步PASS。另aggregate100/sort14/filter15/join64原生全部PASS（193case），见 `evidence/p09-decimal-complete-native-suite-20261009.json`、`evidence/p09-relational-native-sql-pass-20261009.json`。实际产品仍为63f16c67e，后续检查点只有测试/证据变化；不是最终同HEAD全CI。真实Paimon五项原生通过，snapshot因writer30s覆盖producer等待而失败；相关重大裁决待用户决定，大provider CL继续OPEN。
