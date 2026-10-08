@@ -1396,6 +1396,13 @@ pub struct QueryConcurrencyPermit {
 }
 
 impl QueryConcurrencyPermit {
+    /// Verify both the host and exact admitted root before a runtime handoff.
+    pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|held| held.id == scope.id && Arc::ptr_eq(&held.inner, &scope.inner))
+    }
+
     pub fn release(self) {
         drop(self);
     }

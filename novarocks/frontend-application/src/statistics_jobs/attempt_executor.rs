@@ -138,10 +138,13 @@ struct PendingThreePhaseStatisticsAttempt {
     session: Box<dyn novarocks_spi::connector::StatisticsCollectionSession>,
     request: Option<crate::query_execution::contract::DistributedQueryRequest>,
     artifacts: Option<Vec<novarocks_spi::connector::StatisticsArtifactDraft>>,
+    _result_capacity:
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 }
 
 fn empty_collection_pending(
     session: Box<dyn novarocks_spi::connector::StatisticsCollectionSession>,
+    result_capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> PendingThreePhaseStatisticsAttempt {
     PendingThreePhaseStatisticsAttempt {
         session,
@@ -150,6 +153,7 @@ fn empty_collection_pending(
         // publish. This keeps closure and the authoritative publication fact
         // in the final phase.
         artifacts: Some(Vec::new()),
+        _result_capacity: result_capacity,
     }
 }
 
@@ -356,10 +360,16 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
     fn prepare(
         &self,
         job: &StatisticsJob,
-        scope: &novarocks_workload_control::WorkScope,
+        phase: &novarocks_statistics_application::StatisticsAttemptContext,
     ) -> Result<(), CoreStatisticsAttemptError> {
+        let capacity = phase.root_result_capacity();
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )
+        .map_err(Self::failure)?;
         let request = Self::request(job)?;
-        let (deadline, cancellation) = self.context(scope)?;
+        let (deadline, cancellation) = self.context(phase.stage_scope())?;
         let context = self
             .collection_context(deadline, cancellation.clone())
             .map_err(Self::application_error)?;
@@ -398,7 +408,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .map_err(|error| Self::failure(error.to_string()))?;
         let (table, data_version, read_version_ordinal, required, session) = start.into_parts();
         let pending = if required.is_empty() {
-            empty_collection_pending(session)
+            empty_collection_pending(session, capacity.clone())
         } else {
             let request = (|| {
                 let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
@@ -426,7 +436,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                         cancellation,
                         novarocks_sql::compiler::SessionOptimizerSettings::default(),
                         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-                    );
+                    ).with_result_capacity(capacity.clone()).map_err(|error| Self::failure(error.to_string()))?;
                 let relation =
                     crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
                         request.connector_instance_id.as_str(),
@@ -455,6 +465,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                             session,
                             request: None,
                             artifacts: None,
+                            _result_capacity: capacity.clone(),
                         },
                         error,
                     ));
@@ -464,6 +475,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                 session,
                 request: Some(request),
                 artifacts: None,
+                _result_capacity: capacity.clone(),
             }
         };
         let mut attempts = self
@@ -482,9 +494,9 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
     fn collect(
         &self,
         job: &StatisticsJob,
-        scope: &novarocks_workload_control::WorkScope,
+        phase: &novarocks_statistics_application::StatisticsAttemptContext,
     ) -> Result<(), CoreStatisticsAttemptError> {
-        if let Err(error) = scope.check().map_err(Self::scope_error) {
+        if let Err(error) = phase.stage_scope().check().map_err(Self::scope_error) {
             return Err(self.abort_pending(job.id, error));
         }
         let mut pending = self
@@ -533,9 +545,9 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
     fn publish(
         &self,
         job: &StatisticsJob,
-        scope: &novarocks_workload_control::WorkScope,
+        phase: &novarocks_statistics_application::StatisticsAttemptContext,
     ) -> Result<StatisticsPublicationOutcome, CoreStatisticsAttemptError> {
-        if let Err(error) = scope.check().map_err(Self::scope_error) {
+        if let Err(error) = phase.stage_scope().check().map_err(Self::scope_error) {
             return Err(self.abort_pending(job.id, error));
         }
         let pending = self
@@ -569,6 +581,38 @@ mod tests {
     };
 
     use super::*;
+
+    fn test_root_capacity() -> (
+        novarocks_workload_control::RootWork,
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) {
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+            WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+        (root, capacity)
+    }
 
     struct EmptyCollectionSession {
         descriptor: ConnectorInstanceDescriptor,
@@ -637,18 +681,23 @@ mod tests {
             .expect("data version");
         let finish_calls = Arc::new(AtomicUsize::new(0));
         let abort_calls = Arc::new(AtomicUsize::new(0));
-        let pending = empty_collection_pending(Box::new(EmptyCollectionSession {
-            descriptor,
-            incarnation,
-            operation_id,
-            data_version,
-            finish_calls: Arc::clone(&finish_calls),
-            abort_calls: Arc::clone(&abort_calls),
-        }));
+        let (_root, capacity) = test_root_capacity();
+        let pending = empty_collection_pending(
+            Box::new(EmptyCollectionSession {
+                descriptor,
+                incarnation,
+                operation_id,
+                data_version,
+                finish_calls: Arc::clone(&finish_calls),
+                abort_calls: Arc::clone(&abort_calls),
+            }),
+            capacity,
+        );
         let PendingThreePhaseStatisticsAttempt {
             session,
             request,
             artifacts,
+            _result_capacity,
         } = pending;
 
         assert!(request.is_none());
@@ -672,15 +721,19 @@ mod tests {
             instance_id: ConnectorInstanceId::parse("ice.main").expect("instance ID"),
         };
         let abort_calls = Arc::new(AtomicUsize::new(0));
-        let pending = empty_collection_pending(Box::new(EmptyCollectionSession {
-            descriptor,
-            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
-            operation_id: ConnectorMutationOperationId::from_bytes([8; 16]),
-            data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-42"))
-                .expect("data version"),
-            finish_calls: Arc::new(AtomicUsize::new(0)),
-            abort_calls: Arc::clone(&abort_calls),
-        }));
+        let (_root, capacity) = test_root_capacity();
+        let pending = empty_collection_pending(
+            Box::new(EmptyCollectionSession {
+                descriptor,
+                incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+                operation_id: ConnectorMutationOperationId::from_bytes([8; 16]),
+                data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-42"))
+                    .expect("data version"),
+                finish_calls: Arc::new(AtomicUsize::new(0)),
+                abort_calls: Arc::clone(&abort_calls),
+            }),
+            capacity,
+        );
 
         let error = FrontendThreePhaseStatisticsAttemptExecutor::abort_pending_session(
             pending,

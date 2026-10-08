@@ -29,8 +29,9 @@ use std::time::{Duration, Instant};
 use super::application;
 use super::model::StatisticsJobTarget;
 use novarocks_statistics_application::{
-    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobCreate,
-    StatisticsJobId, StatisticsJobRuntime, StatisticsJobService, StatisticsTarget,
+    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobAdmission,
+    StatisticsJobCreate, StatisticsJobId, StatisticsJobRuntime, StatisticsJobService,
+    StatisticsTarget,
 };
 use novarocks_workload_control::{PendingQueryRoot, RootAdmissionHandle, WorkClass, WorkRequest};
 
@@ -191,10 +192,12 @@ impl FrontendStatisticsApplicationPort {
                     .root_scope
                     .begin_statistics_job()
                     .map_err(application::StatisticsApplicationError::new)?;
-                let permit = root
+                let (permit, window) = root
                     .owner
                     .scope()
-                    .admit_query()
+                    .admit_query_with_result(
+                        novarocks_workload_control::ResultWindowClass::Internal,
+                    )
                     .map_err(|error| {
                         application::StatisticsApplicationError::new(error.to_string())
                     })?
@@ -202,7 +205,10 @@ impl FrontendStatisticsApplicationPort {
                     .map_err(|error| {
                         application::StatisticsApplicationError::new(error.to_string())
                     })?;
-                let owner = root.owner;
+                let admission = StatisticsJobAdmission::try_new(root.owner, permit, window)
+                    .map_err(|error| {
+                        application::StatisticsApplicationError::new(error.to_string())
+                    })?;
                 let columns = match columns {
                     application::StatisticsColumnIntent::AllColumns => StatisticsColumns::All,
                     application::StatisticsColumnIntent::Explicit(columns) => {
@@ -223,8 +229,7 @@ impl FrontendStatisticsApplicationPort {
                             columns,
                             submitted_at_ms,
                         },
-                        owner,
-                        permit,
+                        admission,
                     )
                     .await
                     .map(StatisticsStatementResult::JobSubmitted)

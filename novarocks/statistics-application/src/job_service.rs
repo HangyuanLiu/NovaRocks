@@ -22,11 +22,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use novarocks_workload_control::{QueryConcurrencyPermit, WorkOwner};
-
 use crate::{
-    StatisticsAttemptExecutor, StatisticsJob, StatisticsJobCreate, StatisticsJobId,
-    StatisticsJobRepository, StatisticsRepositoryError, StatisticsWorker,
+    StatisticsAttemptExecutor, StatisticsJob, StatisticsJobAdmission, StatisticsJobCreate,
+    StatisticsJobId, StatisticsJobRepository, StatisticsRepositoryError, StatisticsWorker,
 };
 
 /// The process-local owner of statistics job submission and lifecycle lookup.
@@ -60,41 +58,20 @@ impl StatisticsJobService {
         }
     }
 
-    pub async fn submit(
-        &self,
-        request: StatisticsJobCreate,
-        owner: WorkOwner,
-    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.repository.create(request, owner).await
-    }
-
     pub async fn submit_admitted(
         &self,
         request: StatisticsJobCreate,
-        owner: WorkOwner,
-        query_concurrency: QueryConcurrencyPermit,
+        admission: StatisticsJobAdmission,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.repository
-            .create_admitted(request, owner, query_concurrency)
-            .await
-    }
-
-    fn submit_now(
-        &self,
-        request: StatisticsJobCreate,
-        owner: WorkOwner,
-    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.repository.create_now(request, owner)
+        self.repository.create_admitted(request, admission).await
     }
 
     fn submit_admitted_now(
         &self,
         request: StatisticsJobCreate,
-        owner: WorkOwner,
-        query_concurrency: QueryConcurrencyPermit,
+        admission: StatisticsJobAdmission,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.repository
-            .create_now_with_permit(request, owner, Some(query_concurrency))
+        self.repository.create_now_admitted(request, admission)
     }
 
     pub async fn list(&self) -> Result<Vec<StatisticsJob>, StatisticsRepositoryError> {
@@ -189,42 +166,10 @@ impl StatisticsJobRuntime {
         }
     }
 
-    pub async fn submit(
-        &self,
-        request: StatisticsJobCreate,
-        owner: WorkOwner,
-    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        let _admission = self.admission.lock().map_err(|_| {
-            StatisticsRepositoryError::new(
-                crate::StatisticsRepositoryErrorKind::Conflict,
-                "statistics worker admission lock poisoned",
-            )
-        })?;
-        if *self.stop.borrow() {
-            return Err(StatisticsRepositoryError::new(
-                crate::StatisticsRepositoryErrorKind::Conflict,
-                "statistics worker is stopping",
-            ));
-        }
-        let job = self.service.submit_now(request, owner)?;
-        if let Err(mpsc::error::TrySendError::Closed(_)) = self.wake.try_send(()) {
-            // Submission must not leave a job that no live process runner can
-            // own. The cancellation result is best effort only: the caller
-            // still receives the authoritative admission failure.
-            let _ = self.service.request_cancel_now(job.id, now_ms());
-            return Err(StatisticsRepositoryError::new(
-                crate::StatisticsRepositoryErrorKind::Conflict,
-                "statistics worker is unavailable",
-            ));
-        }
-        Ok(job)
-    }
-
     pub async fn submit_admitted(
         &self,
         request: StatisticsJobCreate,
-        owner: WorkOwner,
-        query_concurrency: QueryConcurrencyPermit,
+        admission: StatisticsJobAdmission,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         let _admission = self.admission.lock().map_err(|_| {
             StatisticsRepositoryError::new(
@@ -238,9 +183,7 @@ impl StatisticsJobRuntime {
                 "statistics worker is stopping",
             ));
         }
-        let job = self
-            .service
-            .submit_admitted_now(request, owner, query_concurrency)?;
+        let job = self.service.submit_admitted_now(request, admission)?;
         if let Err(mpsc::error::TrySendError::Closed(_)) = self.wake.try_send(()) {
             let _ = self.service.request_cancel_now(job.id, now_ms());
             return Err(StatisticsRepositoryError::new(
