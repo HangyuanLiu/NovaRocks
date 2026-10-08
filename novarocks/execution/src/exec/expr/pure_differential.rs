@@ -1753,3 +1753,6 @@ mod to_base64_tests;
 
 #[path = "pure_differential_calendar_leaf_dedup_tests.rs"]
 mod calendar_leaf_dedup_tests;
+
+#[path = "pure_differential_to_binary_metadata_tests.rs"]
+mod to_binary_metadata_tests;

@@ -1320,3 +1320,6 @@ mod legacy_numeric_unary_intrinsic_baseline_tests;
 
 #[cfg(test)]
 mod legacy_to_base64_source_baseline_tests;
+
+#[cfg(test)]
+mod legacy_to_binary_metadata_baseline_tests;
