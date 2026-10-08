@@ -22,7 +22,7 @@ def spread(values):
     return (max(values) - min(values)) / median if median > 0 else None
 
 
-def summarize(evidence, resources, gates):
+def summarize(evidence, resources, gates, window_resources=None):
     workload = evidence["workload"]
     expected = sum(workload["concurrency"]) * workload["repetitions"] * len(workload["queries"])
     queries = {query["name"]: query for query in workload["queries"]}
@@ -85,14 +85,41 @@ def summarize(evidence, resources, gates):
     cpu = 0
     cpu_complete = set(role_samples) == {"fe", "be-0", "be-1", "be-2"}
     role_resources = {}
+    expected_windows = len(queries) * len(workload["concurrency"]) * workload["repetitions"]
+    if window_resources is not None:
+        expected_names = {f"{name}-{concurrency}-{repetition}"
+                          for name in queries for concurrency in workload["concurrency"]
+                          for repetition in range(workload["repetitions"])}
+        observed_names = [window["run_id"] for window in window_resources]
+        cpu_complete &= all({sample["role"] for sample in window["samples"]} == set(role_samples)
+                            for window in window_resources)
+        cpu_complete &= (len(observed_names) == expected_windows
+                         and len(set(observed_names)) == expected_windows
+                         and set(observed_names) == expected_names)
     for role, samples in sorted(role_samples.items()):
         samples.sort(key=lambda sample: sample["elapsed_millis"])
-        readable = all(s["cpu_user_nanos"] is not None and s["cpu_system_nanos"] is not None
-                       and s["unavailable_reason"] is None for s in samples)
-        exact = len({(s["pid"], s["process_start_token"]) for s in samples}) == 1
-        total = lambda sample: sample["cpu_user_nanos"] + sample["cpu_system_nanos"]
-        delta = total(samples[-1]) - total(samples[0]) if readable and exact and len(samples) >= 2 else None
-        if delta is None or delta < 0:
+        identities = {(s["pid"], s["process_start_token"]) for s in samples}
+        exact = len(identities) == 1
+        groups = [samples] if window_resources is None else [
+            [sample for sample in window["samples"] if sample["role"] == role]
+            for window in window_resources]
+        delta = 0
+        for group in groups:
+            readable = all(s["cpu_user_nanos"] is not None and s["cpu_system_nanos"] is not None
+                           and s["unavailable_reason"] is None for s in group)
+            same_identity = {(s["pid"], s["process_start_token"]) for s in group} == identities
+            exact &= same_identity
+            count_valid = len(group) >= 2 if window_resources is None else len(group) == 2
+            if not (readable and same_identity and count_valid):
+                delta = None
+                break
+            total = lambda sample: sample["cpu_user_nanos"] + sample["cpu_system_nanos"]
+            difference = total(group[-1]) - total(group[0])
+            if difference < 0:
+                delta = None
+                break
+            delta += difference
+        if delta is None or not groups:
             cpu_complete = False
         else:
             cpu += delta
@@ -112,6 +139,9 @@ def summarize(evidence, resources, gates):
             "paired_repetitions_complete": paired,
             "deterministic_mismatch_queries": evidence["deterministic_mismatch_queries"],
             "cpu_evidence_complete": cpu_complete, "roles": role_resources,
+            "cpu_scope": "explicit per-window connect through actual owner convergence" if window_resources is not None
+                         else "whole-run diagnostic cumulative CPU",
+            "cpu_windows": len(window_resources) if window_resources is not None else None,
             "fe_plus_be_cpu_seconds_per_success": cpu / 1e9 / successes if successes and cpu_complete else None,
             "quality": quality, "windows": windows,
             "acceptance_scope": "old-path baseline only; no candidate, transport or Linux acceptance"}
@@ -123,10 +153,16 @@ if __name__ == "__main__":
     parser.add_argument("--resources", type=Path, required=True)
     parser.add_argument("--gates", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--window-resources-dir", type=Path)
     args = parser.parse_args()
-    report = summarize(*(json.loads(path.read_text()) for path in (args.input, args.resources, args.gates)))
+    window_paths = sorted(args.window_resources_dir.glob("window-cpu-*.json")) if args.window_resources_dir else None
+    windows = [json.loads(path.read_text()) for path in window_paths] if window_paths is not None else None
+    report = summarize(*(json.loads(path.read_text()) for path in (args.input, args.resources, args.gates)), windows)
     report["source_sha256"] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                                for path in (args.input, args.resources, args.gates)}
+    if window_paths is not None:
+        report["window_cpu_sha256"] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                                       for path in window_paths}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({key: report[key] for key in ("status", "observed_samples", "successes", "failures")}))

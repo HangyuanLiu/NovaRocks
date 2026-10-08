@@ -1,0 +1,41 @@
+{
+  "schema_version": 3,
+  "status": "FROZEN_BEFORE_CURRENT_MAIN_AND_CANDIDATE_SAMPLING",
+  "frozen_at_utc": "2026-10-08T13:57:52.768610+00:00",
+  "baseline_server_revision": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+  "server_profile": "release",
+  "topology": "native 1FE+3BE",
+  "inputs_sha256": {
+    "inputs/wire-baseline-v1.json": "50422e3061ae2152c5d7777a9137cf5145fc0ff01ae7167267ffed0275c19c39",
+    "inputs/wire-baseline-smoke-v1.json": "796e7edc57bc9df90d9fe7197f4230a3aa8ecab3ef60a0dd84496145eabf425f",
+    "inputs/mac-native-performance-v1.toml": "98a4584eb008ddd74d8161bef3060ad7aafb211f162927af80bc87b185585be0",
+    "performance-gates-v1.json": "4e538606237c74e80eb413aa0b390137d7784d1c66bd2a2e5bc86afca4bb7819"
+  },
+  "host": {
+    "os": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "architecture": "arm64",
+    "logical_cpus": 10,
+    "memory_bytes": 25769803776
+  },
+  "measurement": {
+    "query_windows": "each query x concurrency x manifest repetition; setup/connect reported separately",
+    "goodput": "Unchanged successful expected-row observations / query execution span in microseconds; connect and owner convergence excluded from query goodput/latency and archived separately.",
+    "quantiles": "nearest-rank over successful observations; failures retained and counted separately",
+    "relative_spread": "(maximum - minimum) / median across the three manifest repetitions of each query/concurrency window",
+    "cpu": "Sum exact same PID/start-token per-role cumulative CPU over explicit before-connect and after-actual-owner-convergence window boundaries, divided by successful observations. Each window must have exactly two samples per role and the complete unique frozen window set. Continuous monitor is RSS/diagnostic only. Post-window management observation cost is included equally for old/candidate; inter-window idle wait excluded.",
+    "rss": "per-role monitor high water; not an attribution charge or transport coefficient",
+    "probe": "64KiB row scratch; wire rows hashed while streamed, metadata separately hashed",
+    "background_load": "no concurrent task-owned Cargo, full suite, or benchmark during sampling; inspect external process load and record contamination; do not terminate unrelated work",
+    "on_noise": "inconclusive; rerun identical inputs and frozen gates after identifying external load",
+    "owner_barrier": "Before and after each query x concurrency x repetition, two consecutive observed zero snapshots separated by at least 100ms; 30s absolute barrier cap, at most 301 snapshots; actual Worker reservation publication required, ordinary/control ingress running/waiting and candidate root_result ingress; exact FE active/governance plus old held/result credits or new four window positions. Missing, duplicate, malformed observations fail, never default zero. Every barrier sample and error archived."
+  },
+  "acceptance": "NOT_RUN; smoke cannot replace frozen matrix, native tails, transport coefficients or Linux manual gate",
+  "previous_freeze": "mac-measurement-freeze-v2.json",
+  "refinement": "Retain failed v1/v2 results. Observe actual ownership between windows rather than allowing preceding settlement to overlap the next measurement. Explicit CPU boundaries avoid inventing cross-clock alignment. Same old release server, SQL, configuration, repetitions and numeric gates; no admission changes, replay eviction, server restart between windows or threshold relaxation. In-window overload remains failure.",
+  "probe_files_sha256": {
+    "tests/system-test-runner/src/actors/mysql_stream.rs": "58a80f012bd040469407a7451aecd138fd6820980d13c0f043b9e420742f0697",
+    "tests/system-test-runner/src/scenarios/result_delivery_baseline.rs": "063bf4a1742c6f7958155430f1115c89044bceb149ef592f504095b3ae0c2dfb",
+    "docs/testing/mem-1-m07/scripts/summarize_wire_baseline.py": "67671f9fe439631c458bc511e32bbdd0032f44d322eb6efa7897aa0686b80784"
+  },
+  "baseline_server_sha256": "5c5bdea5490f209cc0140c1b1e73a30f6ce32c48052673e5fee23ea1300f5756"
+}
