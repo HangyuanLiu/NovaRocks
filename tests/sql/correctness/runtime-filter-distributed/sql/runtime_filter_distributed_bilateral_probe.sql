@@ -115,12 +115,16 @@ SET disable_optimizer_rules = 'JoinAssociativity,JoinCommutativity';
 -- the bilateral/transitive M3 claim: the filter built on t3.k must appear as
 -- a probe on both t1's scan AND t2's scan below.
 -- @explain_contains=HASH JOIN (PARTITIONED
--- @explain_contains=HASH_PARTITIONED (k)
+-- @explain_contains=HASH_PARTITIONED (t1.k)
+-- @explain_contains=HASH_PARTITIONED (t2.k)
+-- @explain_contains=HASH_PARTITIONED (t3.k)
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
--- The completed plan names the producer's fragment-local key `k`. Fragment 2
--- contains the t3 scan, while channel 2 reaches both t1 and t2 below.
--- @explain_contains=producer binding 1, fragment = 2
+-- Qualified display annotations preserve each partition key's source. Channel 2
+-- is produced by t3 and reaches both t1 and t2 below.
+-- @explain_contains=producer binding 2, fragment = 1, node = 4, expr = (t3.k)
+-- @explain_contains=consumer binding 2, fragment = 3, node = 10, expr = (t1.k)
+-- @explain_contains=consumer binding 2, fragment = 4, node = 11, expr = (t2.k)
 -- @explain_contains=rf_dist_bi_t3
 -- @explain_contains=expr = (t1.k)
 -- @explain_contains=expr = (t2.k)
