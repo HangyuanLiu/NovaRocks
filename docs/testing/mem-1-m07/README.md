@@ -95,3 +95,5 @@ P04 固定 H2 writer 与本地出站 frame cap 已完成可验证切片；[收�
 P04 本地出站HPACK表上限已完成切片；[收据](evidence/p04-h2-send-header-table/README.md)。fresh0在peer大设置下保留正确size-update/static/literal语义且Table两容器0分配，positive仅逻辑界、晚清零保留spare。75实际协议/Native574/Worker313共962非重复workspace tests、actualsource35/1ignored及7Miri通过；五类runtime负例实际失败/byteexact恢复。wholeheaderblock/HTTPmetadata与完整2MiBconnection/Native安装继续，P04executing/V1未advertise。
 
 线协议探针校验完整 ColumnDefinition41 结构，并比较执行前 v4 冻结的列名和 MySQL type。v3 的合法大行 root backing 拒绝已保留为 FAIL；历史行字节观察不证明列元数据正确。原生复跑须使用强化探针，全部输入与上限不变。
+
+`result-delivery/root-read-profile-kind-refusal` 使用真实认证 Native RootResult endpoint：结构合法的 foreign-process V1 请求必须进入准确身份拒绝；其余六个仅改变 profile/kind/sequence 的请求必须在结构 decode 被拒绝。此场景明确限定 authenticated plaintext/IP；每次请求有绝对 RPC probe deadline 与 4KiB gRPC 请求 frame 与累计响应 DATA 界（不作为 header/第三方分配界），不外推 DNS/TLS teardown 界，完成后用真正 Native SUM 查询验证精确行字节及公开 owner 收敛。冻结输入 `inputs/root-read-refusal-freeze-v1.json`；不证明 installed-root replay/ACK/生产退休/ClosingRow，也不证明非法响应拒绝。

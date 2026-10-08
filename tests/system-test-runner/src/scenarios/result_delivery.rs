@@ -20,6 +20,8 @@ use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Result, ensure};
 use novarocks_cluster_harness::ServerHandle;
+use novarocks_proto_models::{novarocks as proto, result as result_proto};
+use prost::Message;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -55,7 +57,190 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
             "result-delivery/many-small-rows-cross-segment",
         )),
         Box::new(WireBoundary("result-delivery/large-row-cross-u24")),
+        Box::new(RootReadRefusal),
     ]
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefusalManifest {
+    schema_version: u32,
+    topology: String,
+    scope: String,
+    path: String,
+    cases: Vec<RefusalCase>,
+    health: HealthQuery,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RefusalCase {
+    name: String,
+    profile_id: u32,
+    kind: String,
+    wanted_sequence: u64,
+    grpc_status: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthQuery {
+    sql: String,
+    expected_row_sha256: String,
+}
+
+fn foreign_root_task() -> proto::TaskIdentity {
+    proto::TaskIdentity {
+        query_execution_id: Some(proto::QueryExecutionId {
+            query_id: Some(novarocks_proto_models::common::UniqueId { hi: 1, lo: 2 }),
+            attempt_id: 1,
+        }),
+        stage_id: 1,
+        task_id: 1,
+        // Deliberately foreign, but structurally valid. A valid V1 read
+        // must reach exact-process refusal; each malformed field below
+        // must instead be rejected before that same route lookup.
+        backend_process_id: Some(proto::BackendProcessId {
+            value: novarocks_types::BackendProcessId::new_v7()
+                .to_bytes()
+                .to_vec()
+                .into(),
+        }),
+    }
+}
+
+fn refusal_request(
+    case: &RefusalCase,
+    root_task: &proto::TaskIdentity,
+) -> Result<proto::FetchRootResultRequest> {
+    use result_proto::root_output_kind::Kind;
+    let kind = match case.kind.as_str() {
+        "client_rows_true" => Some(Kind::ClientRows(true)),
+        "client_rows_false" => Some(Kind::ClientRows(false)),
+        "absent" => None,
+        "unknown_domain_999" => Some(Kind::InternalFacts(999)),
+        _ => anyhow::bail!("unknown frozen root refusal case"),
+    };
+    Ok(proto::FetchRootResultRequest {
+        root_task: Some(root_task.clone()),
+        profile_id: case.profile_id,
+        output_kind: kind.map(|kind| result_proto::RootOutputKind { kind: Some(kind) }),
+        wanted_sequence: Some(case.wanted_sequence),
+        consumed_sequence: 0,
+        max_wait_millis: 100,
+    })
+}
+
+struct RootReadRefusal;
+
+impl Scenario for RootReadRefusal {
+    fn name(&self) -> &'static str {
+        "result-delivery/root-read-profile-kind-refusal"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        ensure!(
+            context.handle().be_count() == 3,
+            "root refusal requires native 1FE+3BE"
+        );
+        let manifest: RefusalManifest = serde_json::from_str(include_str!(
+            "../../../../docs/testing/mem-1-m07/inputs/root-read-refusal-freeze-v1.json"
+        ))?;
+        ensure!(
+            manifest.schema_version == 1
+                && manifest.topology == "1FE+3BE"
+                && !manifest.scope.is_empty()
+                && manifest.cases.len() == 7
+                && manifest.path == "/novarocks.NovaRocksGrpc/FetchRootResult",
+            "unsupported root refusal manifest"
+        );
+        let epoch = Instant::now();
+        await_idle(context, "root-refusal", "before", epoch)?;
+        let root_task = foreign_root_task();
+        let mut observations = Vec::new();
+        for case in &manifest.cases {
+            let payload = refusal_request(case, &root_task)?.encode_to_vec();
+            let mut frame = vec![0];
+            frame.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
+            frame.extend_from_slice(&payload);
+            let response =
+                super::native_trust::bounded_authenticated_probe(context, &manifest.path, &frame)?;
+            let matches =
+                response.http_status == 200 && response.grpc_status == Some(case.grpc_status);
+            observations.push(serde_json::json!({"expected":case,"response":response,"request_bytes":frame.len()}));
+            std::fs::write(
+                context
+                    .scenario_root()
+                    .join("root-read-refusal-observations.json"),
+                serde_json::to_vec_pretty(&observations)?,
+            )?;
+            ensure!(
+                matches,
+                "root read refusal differs from frozen case {}",
+                case.name
+            );
+        }
+        let before = (0..3)
+            .map(|index| context.handle().backend_task_execution_tasks_created(index))
+            .collect::<Result<Vec<_>>>()?;
+        let timeout = context
+            .remaining("root refusal follow-up query")?
+            .min(Duration::from_secs(10));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let health = runtime.block_on(async {
+            let mut stream =
+                AsyncMysqlStream::connect(context.mysql_user(), context.mysql_port(), timeout)
+                    .await?;
+            Ok::<_, anyhow::Error>(
+                stream
+                    .observe_text_query(&manifest.health.sql, Duration::ZERO)
+                    .await,
+            )
+        })?;
+        std::fs::write(
+            context.scenario_root().join("root-refusal-follow-up.json"),
+            serde_json::to_vec_pretty(&health)?,
+        )?;
+        ensure!(
+            health.error.is_none()
+                && health.rows == 1
+                && health.row_payload_bytes == 5
+                && health.packets == 5
+                && health.row_sha256 == manifest.health.expected_row_sha256
+                && health.schema
+                    == [TextColumnObservation {
+                        name: "total".to_owned(),
+                        mysql_type: 8
+                    }],
+            "native follow-up query failed after root refusals"
+        );
+        let after = (0..3)
+            .map(|index| context.handle().backend_task_execution_tasks_created(index))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            before
+                .iter()
+                .zip(&after)
+                .all(|(a, b)| a.is_finite() && b.is_finite() && b >= a)
+                && before.iter().zip(&after).any(|(a, b)| b > a),
+            "follow-up never created a native task"
+        );
+        await_idle(context, "root-refusal", "after", epoch)?;
+        context.record_phase_observation(
+            "root-read-refusal",
+            1,
+            1,
+            1,
+            "authenticated-native-root",
+            7,
+            "passed",
+            BTreeMap::from([("refusal_probes", 7), ("health_rows", health.rows)]),
+        )?;
+        context.action("verified seven frozen authenticated root request refusals, exact native follow-up rows and public owner convergence");
+        Ok(())
+    }
 }
 
 struct WireBoundary(&'static str);

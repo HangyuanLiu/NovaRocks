@@ -692,11 +692,43 @@ fn assert_query_crossed_trust_boundary(
     task_evidence::assert_query_completed_across_boundary(context, snapshot, subject)
 }
 
-#[derive(Debug)]
-struct GrpcProbe {
-    http_status: u16,
-    grpc_status: Option<u16>,
-    grpc_message: Option<String>,
+#[derive(Debug, serde::Serialize)]
+pub(super) struct GrpcProbe {
+    pub(super) http_status: u16,
+    pub(super) grpc_status: Option<u16>,
+    pub(super) grpc_message: Option<String>,
+}
+
+/// An authenticated plaintext/IP probe for malformed, metadata-only requests. The
+/// authorization value is neither returned nor included in its observation.
+pub(super) fn bounded_authenticated_probe(
+    context: &mut ScenarioContext,
+    path: &str,
+    frame: &[u8],
+) -> Result<GrpcProbe> {
+    ensure!(
+        frame.len() <= 4096,
+        "raw Native probe request exceeds its bound"
+    );
+    let endpoint = context.handle().native_be_endpoint(0)?;
+    let mode = context.handle().native_trust_mode();
+    ensure!(
+        mode == NativeTrustFixtureMode::Plaintext
+            && endpoint.host().parse::<std::net::IpAddr>().is_ok(),
+        "bounded malformed-request probe requires plaintext and an IP endpoint"
+    );
+    let connector = context.handle().native_probe_connector(endpoint, mode)?;
+    let authorization = authorization_header(&context.handle().native_probe_trust()?)?;
+    let deadline = context
+        .remaining("bounded authenticated Native probe")?
+        .min(Duration::from_secs(10));
+    raw_grpc_probe_with_deadline(
+        connector,
+        path,
+        Some(&authorization),
+        Some(frame),
+        Some(deadline),
+    )
 }
 
 fn authorization_header(trust: &NativeTrust) -> Result<String> {
@@ -737,68 +769,94 @@ fn raw_grpc_probe(
     authorization: Option<&str>,
     body: Option<&[u8]>,
 ) -> Result<GrpcProbe> {
+    raw_grpc_probe_with_deadline(connector, path, authorization, body, None)
+}
+
+fn raw_grpc_probe_with_deadline(
+    connector: NativeEndpointConnector,
+    path: &str,
+    authorization: Option<&str>,
+    body: Option<&[u8]>,
+    deadline: Option<Duration>,
+) -> Result<GrpcProbe> {
     tokio::runtime::Runtime::new()
         .context("create Native raw probe runtime")?
         .block_on(async move {
-            let stream = connector
-                .connect()
-                .await
-                .map_err(anyhow::Error::msg)
-                .context("connect Native raw probe")?;
-            let (mut sender, connection) = client::handshake(stream)
-                .await
-                .context("perform Native raw probe HTTP/2 handshake")?;
-            let driver = tokio::spawn(async move { connection.await });
-            let mut request = Request::builder()
-                .method("POST")
-                .uri(path)
-                .header(header::CONTENT_TYPE, "application/grpc")
-                .header("te", "trailers");
-            if let Some(authorization) = authorization {
-                request = request.header(header::AUTHORIZATION, authorization);
+            let probe = async move {
+                let stream = connector
+                    .connect()
+                    .await
+                    .map_err(anyhow::Error::msg)
+                    .context("connect Native raw probe")?;
+                let (mut sender, connection) = client::handshake(stream)
+                    .await
+                    .context("perform Native raw probe HTTP/2 handshake")?;
+                let driver = tokio::spawn(async move { connection.await });
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/grpc")
+                    .header("te", "trailers");
+                if let Some(authorization) = authorization {
+                    request = request.header(header::AUTHORIZATION, authorization);
+                }
+                let request = request.body(()).context("build Native raw probe request")?;
+                let end_of_stream = body.is_none();
+                let (response, mut send_stream) = sender
+                    .send_request(request, end_of_stream)
+                    .context("send Native raw probe request")?;
+                if let Some(body) = body {
+                    send_stream
+                        .send_data(Bytes::copy_from_slice(body), true)
+                        .context("send Native raw probe gRPC frame")?;
+                }
+                let response = response
+                    .await
+                    .context("receive Native raw probe response")?;
+                let http_status = response.status().as_u16();
+                let header_status = grpc_status(response.headers());
+                let header_message = grpc_message(response.headers());
+                let mut body = response.into_body();
+                let mut response_bytes = 0usize;
+                while let Some(bytes) = body
+                    .data()
+                    .await
+                    .transpose()
+                    .context("read Native raw probe body")?
+                {
+                    response_bytes = response_bytes
+                        .checked_add(bytes.len())
+                        .context("Native probe response byte overflow")?;
+                    ensure!(
+                        deadline.is_none() || response_bytes <= 4096,
+                        "malformed-request Native response exceeds probe bound"
+                    );
+                }
+                let trailer_status = body
+                    .trailers()
+                    .await
+                    .context("read Native raw probe trailers")?;
+                let grpc_status =
+                    header_status.or_else(|| trailer_status.as_ref().and_then(grpc_status));
+                let grpc_message =
+                    header_message.or_else(|| trailer_status.as_ref().and_then(grpc_message));
+                // Native listeners are long-lived. The probe has received the
+                // complete response, so waiting for the peer to close would turn
+                // a successful keep-alive into a scenario timeout.
+                driver.abort();
+                let _ = driver.await;
+                Ok(GrpcProbe {
+                    http_status,
+                    grpc_status,
+                    grpc_message,
+                })
+            };
+            match deadline {
+                Some(deadline) => tokio::time::timeout(deadline, probe)
+                    .await
+                    .context("absolute Native probe deadline exceeded")?,
+                None => probe.await,
             }
-            let request = request.body(()).context("build Native raw probe request")?;
-            let end_of_stream = body.is_none();
-            let (response, mut send_stream) = sender
-                .send_request(request, end_of_stream)
-                .context("send Native raw probe request")?;
-            if let Some(body) = body {
-                send_stream
-                    .send_data(Bytes::copy_from_slice(body), true)
-                    .context("send Native raw probe gRPC frame")?;
-            }
-            let response = response
-                .await
-                .context("receive Native raw probe response")?;
-            let http_status = response.status().as_u16();
-            let header_status = grpc_status(response.headers());
-            let header_message = grpc_message(response.headers());
-            let mut body = response.into_body();
-            while body
-                .data()
-                .await
-                .transpose()
-                .context("read Native raw probe body")?
-                .is_some()
-            {}
-            let trailer_status = body
-                .trailers()
-                .await
-                .context("read Native raw probe trailers")?;
-            let grpc_status =
-                header_status.or_else(|| trailer_status.as_ref().and_then(grpc_status));
-            let grpc_message =
-                header_message.or_else(|| trailer_status.as_ref().and_then(grpc_message));
-            // Native listeners are long-lived. The probe has received the
-            // complete response, so waiting for the peer to close would turn
-            // a successful keep-alive into a scenario timeout.
-            driver.abort();
-            let _ = driver.await;
-            Ok(GrpcProbe {
-                http_status,
-                grpc_status,
-                grpc_message,
-            })
         })
 }
 

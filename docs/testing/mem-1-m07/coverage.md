@@ -167,3 +167,9 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 - 干净 `7607dae64053ab853c47d827deb64eebddb29030` 的 dev cargo-only C0 全部 PASS，706s；component12091、Server owner178、binary smoke4，共12273 PASS/0 FAIL/7既有ignored。守卫/Cargo依赖政策/fmt/all-targets/System allocator/Clippy/build/错误清单通过；初次错误CLI组合在任何检查前被拒绝（2），原始诊断保留。收据 `p09-root-shared-backing-c0-pass-20261009.json`，没有把 Cargo-only 当作 runtime 验收。
 - 同一 clean HEAD 与实际产品 `7607dae64` 的原生1FE+3BE：query-output 的 schema-once、non-negotiated-multi-statement、negotiated-multi-result、scalar-session；query-concurrency/terminal-releases-slot；native-trust 三项 plaintext/automatic/PEM 正常配置与三项 transport mismatch，11/11 PASS。44 个启动 PID 全部退出；无外部fixture更改。收据 `p09-c9-protocol-trust-native-pass-20261009.json`。名为 reject-jwt-domain-mismatch 的既有负例实际使用错误 automatic TLS reference，拒绝发生在 authenticated dispatch 前，不能据名称宣称另一种 JWT issuer 故障。
 - P09其余直接 root 状态/晚 alias/ClosingRow/满池、真实 cross-provider CL、transport coefficients/CM/CP/P10/final 保持OPEN。ordinary支持承载与write deadline两个决定仍未得到答复；未改gate/cap/deadline/失败语义，goal active，无push/PR/归档。
+
+### 2026-10-09：C9 authenticated root request refusal 切片
+
+- 新注册 `result-delivery/root-read-profile-kind-refusal`；执行前冻结七个请求、精确 gRPC status 与 SUM1..100 健康查询字节摘要。结构合法的 V1 foreign-process baseline 必须到达准确身份拒绝(9)，其余六项 profile/kind/wanted 变体必须在结构 decode 返回3；全部共享同一合法foreign identity，避免不同身份掩盖判错阶段。
+- probe限定 authenticated plaintext/IP；完整异步RPC包含absolute deadline，请求frame/响应DATA各≤4KiB，headers/第三方分配不在此界，Runtime teardown不冒充deadline内的物理退出。成功响应后的driver真实abort/join；授权不入观察。后续健康查询要求真实Native task、独立字节/schema oracle与公开owner连续归零。scope不覆盖malformed replies/installed-root ACK/retirement/closing。
+- 首轮helper重复mutable借用编译失败已保留并修正；最后完整system runner96 PASS/0 FAIL/2既有ignored；独立只读审查无默认IP场景PASS漏洞。收据 `p09-root-refusal-focused-20261009.json`。原生尚待执行，未改产品code/cap/deadline。
