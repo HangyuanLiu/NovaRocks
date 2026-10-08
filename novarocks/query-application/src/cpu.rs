@@ -30,12 +30,11 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use crate::{
-    cancellation::{QueryCancellationReason, QueryCancellationView},
-    coordination::{
-        BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
-        ResultDecodeJob,
-    },
+use crate::cancellation::{QueryCancellationReason, QueryCancellationView};
+
+pub(crate) mod bounded_worker;
+use bounded_worker::{
+    BoundedWorkerConfig, BoundedWorkerHandle, BoundedWorkerJob, BoundedWorkerOwner,
 };
 
 type CpuResult = Box<dyn Any + Send>;
@@ -400,13 +399,13 @@ impl QueryBlockingExecutorConfig {
 /// The process owner for bounded synchronous command edges that have not yet
 /// acquired an asynchronous provider contract.
 pub struct QueryBlockingExecutorOwner {
-    owner: BoundedResultDecodeOwner<CpuResult>,
+    owner: BoundedWorkerOwner<CpuResult>,
     executor: QueryBlockingExecutor,
 }
 
 #[derive(Clone)]
 pub struct QueryBlockingExecutor {
-    handle: BoundedResultDecodeHandle<CpuResult>,
+    handle: BoundedWorkerHandle<CpuResult>,
 }
 
 impl QueryCpuExecutorOwner {
@@ -493,7 +492,7 @@ impl QueryCpuExecutor {
 
 impl QueryBlockingExecutorOwner {
     pub fn try_new(config: QueryBlockingExecutorConfig) -> Result<Self, String> {
-        let owner = BoundedResultDecodeOwner::try_new(ResultDecodeExecutorConfig::new(
+        let owner = BoundedWorkerOwner::try_new(BoundedWorkerConfig::new(
             config.worker_threads(),
             config.queue_capacity(),
         ))
@@ -535,7 +534,7 @@ impl QueryBlockingExecutor {
     {
         let receipt = self
             .handle
-            .submit(ResultDecodeJob::new(move || Box::new(work()) as CpuResult))
+            .submit(BoundedWorkerJob::new(move || Box::new(work()) as CpuResult))
             .await
             .map_err(|_| "query blocking executor closed before admitting work".to_owned())?;
         receipt

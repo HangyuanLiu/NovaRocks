@@ -30,7 +30,6 @@ mod plan_activation;
 mod recovery;
 mod replacement;
 mod result;
-mod result_decode;
 mod result_pump;
 mod root_relay;
 mod runtime_registry;
@@ -63,14 +62,6 @@ pub use stand_down::*;
 pub use status::*;
 pub use supervisor::*;
 pub use task_update_retry::*;
-
-// The fixed-worker queue is a process-runtime primitive. Product runtimes
-// retain their own typed owners around it; they do not share admission or
-// lifecycle authority merely because they share this implementation.
-pub(crate) use result_decode::{
-    BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
-    ResultDecodeJob,
-};
 
 /// Enforces a process owner's explicit-shutdown invariant from its `Drop`.
 ///

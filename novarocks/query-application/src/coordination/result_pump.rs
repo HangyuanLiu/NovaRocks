@@ -47,16 +47,16 @@ use crate::api::{BoundedRootReadPort, RetainedRootReply};
 use crate::api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement};
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind, ResultSchema};
 
-use super::result_decode::{
-    BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
-    ResultDecodeJob, ResultDecodeShutdownError, ResultDecodeWorkerError,
-};
 use super::{
     AttemptFailureClass, LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError,
     ReplacementQualification, RootResultObserver, RootTerminalFailure, RunningAttemptHandoffError,
     RunningAttemptPermit,
 };
 use crate::api::DecodedResultBatch;
+use crate::cpu::bounded_worker::{
+    BoundedWorkerConfig, BoundedWorkerError, BoundedWorkerHandle, BoundedWorkerJob,
+    BoundedWorkerOwner, BoundedWorkerShutdownError,
+};
 
 /// Unique process-lifetime owner of the synchronous Arrow decode workers.
 ///
@@ -66,7 +66,7 @@ use crate::api::DecodedResultBatch;
 /// worker.
 #[doc(hidden)]
 pub struct RootResultDecodeRuntimeOwner {
-    owner: BoundedResultDecodeOwner<Result<DecodedRootResult, RootResultFetchFailure>>,
+    owner: BoundedWorkerOwner<Result<DecodedRootResult, RootResultFetchFailure>>,
     runtime: RootResultDecodeRuntime,
 }
 
@@ -75,16 +75,14 @@ impl RootResultDecodeRuntimeOwner {
         worker_threads: NonZeroUsize,
         queue_capacity: NonZeroUsize,
     ) -> Result<Self, QueryExecutionError> {
-        let owner = BoundedResultDecodeOwner::try_new(ResultDecodeExecutorConfig::new(
-            worker_threads,
-            queue_capacity,
-        ))
-        .map_err(|error| {
-            QueryExecutionError::new(
-                QueryExecutionErrorKind::Failed,
-                format!("open result decode runtime failed: {error}"),
-            )
-        })?;
+        let owner =
+            BoundedWorkerOwner::try_new(BoundedWorkerConfig::new(worker_threads, queue_capacity))
+                .map_err(|error| {
+                QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed,
+                    format!("open result decode runtime failed: {error}"),
+                )
+            })?;
         let runtime = RootResultDecodeRuntime {
             handle: owner.handle(),
         };
@@ -119,7 +117,7 @@ impl RootResultDecodeRuntimeOwner {
     /// can retry the same shutdown after in-flight decode work converges.
     pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), QueryExecutionError> {
         self.owner.shutdown_until(deadline).await.map_err(|error| {
-            let kind = if matches!(error, ResultDecodeShutdownError::DeadlineExceeded { .. }) {
+            let kind = if matches!(error, BoundedWorkerShutdownError::DeadlineExceeded { .. }) {
                 QueryExecutionErrorKind::DeadlineExceeded
             } else {
                 QueryExecutionErrorKind::Failed
@@ -138,7 +136,7 @@ impl RootResultDecodeRuntimeOwner {
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct RootResultDecodeRuntime {
-    handle: BoundedResultDecodeHandle<Result<DecodedRootResult, RootResultFetchFailure>>,
+    handle: BoundedWorkerHandle<Result<DecodedRootResult, RootResultFetchFailure>>,
 }
 
 /// Metadata-only bounds established before an adapter may return a raw packet.
@@ -405,8 +403,8 @@ impl RootResultDecodeInput {
     fn into_job(
         self,
         schema: ResultSchema,
-    ) -> ResultDecodeJob<Result<DecodedRootResult, RootResultFetchFailure>> {
-        ResultDecodeJob::new(move || self.decode(schema))
+    ) -> BoundedWorkerJob<Result<DecodedRootResult, RootResultFetchFailure>> {
+        BoundedWorkerJob::new(move || self.decode(schema))
     }
 
     fn decode(mut self, schema: ResultSchema) -> Result<DecodedRootResult, RootResultFetchFailure> {
@@ -1494,7 +1492,7 @@ pub(crate) async fn run_root_result_pump(
                         return Err(bound_pump_failure(
                             &observer_owner,
                             permit,
-                            decode_supervisor_failure(ResultDecodeWorkerError::ExecutorClosed),
+                            decode_supervisor_failure(BoundedWorkerError::ExecutorClosed),
                         )
                         .await);
                     }
@@ -2218,13 +2216,13 @@ fn work_interruption(error: WorkError) -> PumpInterruption {
     }
 }
 
-fn decode_supervisor_failure(error: ResultDecodeWorkerError) -> RootResultFetchFailure {
+fn decode_supervisor_failure(error: BoundedWorkerError) -> RootResultFetchFailure {
     let (class, kind) = match error {
-        ResultDecodeWorkerError::Panicked => (
+        BoundedWorkerError::Panicked => (
             AttemptFailureClass::ContractViolation,
             QueryExecutionErrorKind::Failed,
         ),
-        ResultDecodeWorkerError::ExecutorClosed => (
+        BoundedWorkerError::ExecutorClosed => (
             AttemptFailureClass::ResourceGovernance,
             QueryExecutionErrorKind::Rejected,
         ),
@@ -2664,7 +2662,7 @@ mod tests {
             .build()
             .unwrap();
         let receipt = tokio
-            .block_on(runtime.handle.submit(ResultDecodeJob::new(|| {
+            .block_on(runtime.handle.submit(BoundedWorkerJob::new(|| {
                 Err(contract_failure(contract_error("expected test result")))
             })))
             .unwrap();
@@ -3250,7 +3248,7 @@ mod tests {
         let (release, decode_release) = mpsc::channel();
         let blocker = decode
             .handle
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 started.send(()).unwrap();
                 decode_release.recv().unwrap();
                 Err(contract_failure(contract_error(
