@@ -415,8 +415,12 @@ impl ScalarDiffSpec {
 
     /// A constant authored from a one-row array; nullable iff the row is NULL.
     pub(crate) fn constant_array(self, single_row: ArrayRef) -> Self {
-        let value_type =
-            FunctionValueType::new(single_row.data_type().clone(), single_row.is_null(0));
+        let value_type = FunctionValueType::new(
+            single_row.data_type().clone(),
+            single_row
+                .logical_nulls()
+                .is_some_and(|nulls| nulls.is_null(0)),
+        );
         self.constant(constant(value_type, single_row))
     }
 
@@ -1595,3 +1599,7 @@ mod regexp_position_tests;
 #[cfg(test)]
 #[path = "pure_differential/concat_tests.rs"]
 mod concat_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_md5_family_tests.rs"]
+mod md5_family_tests;
