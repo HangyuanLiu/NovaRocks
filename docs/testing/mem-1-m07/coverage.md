@@ -155,3 +155,9 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 - Arrow 58.2 IPC 将 offsets/values 切成共享 message body 的 Buffer；原 borrowed inspector 每个 alias 再计完整 capacity。修正在该纯借用检查内使用固定 64 项 `data_ptr()+capacity()` 缓存，同一个 payload backing 只收一次，所有 Buffer owner metadata/scaffold 仍逐项保守计入。缓存满后继续重复收，不按 len() 漏掉 sliced-away 容量，不修改 96MiB/节点/深度界、owner 责任或 driver 交付。custom declared region 仍需原 source owner 的完整 backing receipt，缓存不认证其任意私有 owner。
 - 真正 IPC 17 列共享 backing、独立大 backing、缓存溢出三项反例与既有容量 introspection 共 23 PASS；检查区计数 allocator 均零分配。独立审查确认 fixed cache 有限结构工作及 custom source receipt 连续，尚未以此宣称原生修复 PASS。
 - 历史 raw actor 只排除 ERR，畸形 ColumnDefinition41 `[3]` 可被当作列定义；因此历史 schema 正确性不宣称 PASS。强化探针检查六个 length-encoded 字符串和准确 fixed 12 B 区、filler/尾部；v4 在原 v3 SQL/行摘要/packet/全部容量和期限不变下新增独立冻结列名及 MySQL type。收敛 barrier 的第二次 idle 成功也须发生在既定 deadline 内。新原生复跑仍待执行。
+
+### 2026-10-09：C9 两项强化 wire boundary 原生 PASS
+
+- 干净源码与实际产品同为 `a4a6ce16bb3533839a81dbe841caa104669a46d0`，原生 1FE+3BE：200000 小行（1288895 B/200004 packets）和 17 列合法大行（17825860 B/22 packets）均 PASS。v4 仅新增独立列名/type oracle，原 SQL/行数据/全部 cap/deadline 不变；schema 结构、名字/type、sequence、精确字节摘要/行序及成功终态均验证。
+- 每场景均实际创建 Native task；前后公开 FE governance/window 与 BE reservation/ingress 连续两次归零，8 个启动 PID 全部退出。收据 `p09-result-wire-v4-native-pass-20261009.json`。v2 输入错误、v3 backing 拒绝与探针审查历史保留，没有重写为 PASS。
+- 这两项不证明全 C9、逐个晚 alias 的真实退出、RSS、transport envelope/CM/CP；P00b/P09/P10/final 与两个未收到答复的重大决定保持 OPEN。执行当前检查点的 cargo-only C0 收敛，再继续独立矩阵，无 push/PR/归档。

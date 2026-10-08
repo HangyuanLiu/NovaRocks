@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 strict result wire boundaries",
+  "outcome": "passed",
+  "scope": "Two default result-delivery wire correctness scenarios and public owner convergence; not all C9, individual alias lifetime, RSS, P00b/CM/CP or final M07 acceptance",
+  "unchanged": "Original v3 SQL/payload/rows/packet counts; all frozen product capacities and deadlines. v4 adds column-name/type oracle only.",
+  "processes_absent": 8,
+  "cases": [
+    {
+      "name": "result-delivery/large-row-cross-u24",
+      "outcome": "passed",
+      "actual_observation": {
+        "columns": 17,
+        "elapsed_micros": 986317,
+        "error": null,
+        "first_payload_chunk_micros": 59725,
+        "first_row_micros": 986294,
+        "metadata_sha256": "e41af3c8b561a13b5a2d687f006c90516cf524b5c530cc916c64ceb08512388f",
+        "packets": 22,
+        "row_payload_bytes": 17825860,
+        "row_sha256": "51433c7930844aec5dca09a6dcb7e13e1a98801a483a30b04f9f3be064c9ffb4",
+        "rows": 1,
+        "schema": [
+          {
+            "mysql_type": 253,
+            "name": "c0"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c1"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c2"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c3"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c4"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c5"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c6"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c7"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c8"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c9"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c10"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c11"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c12"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c13"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c14"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c15"
+          },
+          {
+            "mysql_type": 253,
+            "name": "c16"
+          }
+        ],
+        "wire_bytes": 17826374,
+        "wire_prefix_sha256": "734e928834d58dfe1c5112428fd578a3a3db6e5190c727115b2c0afa188ed72e"
+      },
+      "phase_observations": [
+        {
+          "phase": "wire-correctness",
+          "phase_sequence": 1,
+          "logical_read_ordinal": 1,
+          "attempt_ordinal": 1,
+          "capability_path": "public-mysql-native-root",
+          "provider_call_sequence": 1,
+          "outcome": "passed",
+          "counters": {
+            "native_tasks_created": 2,
+            "packets": 22,
+            "row_payload_bytes": 17825860,
+            "rows": 1
+          }
+        }
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 64972,
+          "process_start_token": "macos:1791497190:510872"
+        },
+        {
+          "role": "be-0",
+          "pid": 64973,
+          "process_start_token": "macos:1791497190:573897"
+        },
+        {
+          "role": "be-1",
+          "pid": 64974,
+          "process_start_token": "macos:1791497190:632826"
+        },
+        {
+          "role": "be-2",
+          "pid": 64975,
+          "process_start_token": "macos:1791497190:683190"
+        }
+      ],
+      "raw_artifacts": [
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-large-row-cross-u24/owner-barrier-wire-boundary-after.json",
+          "sha256": "bf477aa74b3848fe5842cc6867f31291bde7e5a69599a15b482644e9dd931d2d"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-large-row-cross-u24/owner-barrier-wire-boundary-before.json",
+          "sha256": "8005f470893ad5d94120dcc151066454c0782749fd06b11c5a79cbdde913ad0f"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-large-row-cross-u24/scenario-evidence.json",
+          "sha256": "3fc26f624efa2da6082cce392dea873ed453cc7dbc205c1062b7abd86d54ef9f"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-large-row-cross-u24/wire-boundary-observation.json",
+          "sha256": "5ad1da8e71118a5ac8433139ac29044a7c9dc3e0851b7442e4999bd624711581"
+        }
+      ]
+    },
+    {
+      "name": "result-delivery/many-small-rows-cross-segment",
+      "outcome": "passed",
+      "actual_observation": {
+        "columns": 1,
+        "elapsed_micros": 751103,
+        "error": null,
+        "first_payload_chunk_micros": 98991,
+        "first_row_micros": 99001,
+        "metadata_sha256": "55407a631bfbf8d2630cd926fb1f1de23a3fdfeb586ef1999087471d43db519b",
+        "packets": 200004,
+        "row_payload_bytes": 1288895,
+        "row_sha256": "1bf6122c65bb585e58121bfe81b8b784aa0de130525dc9257d64ac474fc5dedf",
+        "rows": 200000,
+        "schema": [
+          {
+            "mysql_type": 8,
+            "name": "generate_series"
+          }
+        ],
+        "wire_bytes": 2088959,
+        "wire_prefix_sha256": "e3fe3fa0761347901f5f484e850326bbda517d4544628456c1cf5f865e37a0aa"
+      },
+      "phase_observations": [
+        {
+          "phase": "wire-correctness",
+          "phase_sequence": 1,
+          "logical_read_ordinal": 1,
+          "attempt_ordinal": 1,
+          "capability_path": "public-mysql-native-root",
+          "provider_call_sequence": 1,
+          "outcome": "passed",
+          "counters": {
+            "native_tasks_created": 2,
+            "packets": 200004,
+            "row_payload_bytes": 1288895,
+            "rows": 200000
+          }
+        }
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 64772,
+          "process_start_token": "macos:1791497186:165814"
+        },
+        {
+          "role": "be-0",
+          "pid": 64858,
+          "process_start_token": "macos:1791497189:10131"
+        },
+        {
+          "role": "be-1",
+          "pid": 64859,
+          "process_start_token": "macos:1791497189:68762"
+        },
+        {
+          "role": "be-2",
+          "pid": 64860,
+          "process_start_token": "macos:1791497189:122607"
+        }
+      ],
+      "raw_artifacts": [
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-many-small-rows-cross-segment/owner-barrier-wire-boundary-after.json",
+          "sha256": "d85a1d7c82df3f4121c81984f7f3034a6257863e96c8c7666c7ead8afe54f3c1"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-many-small-rows-cross-segment/owner-barrier-wire-boundary-before.json",
+          "sha256": "2eca55693266099431afaf4219d739642c62007677d6ad27f576a5a8a53b83a0"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-many-small-rows-cross-segment/scenario-evidence.json",
+          "sha256": "ea8952a6dd8a1221f5146a6032d1db110d989d0a9e2a4527556fef18819602be"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/result-delivery-many-small-rows-cross-segment/wire-boundary-observation.json",
+          "sha256": "118f42630a56ab9103105219addcbf23cf07013923dc6bdbb9025a27cc035bd2"
+        }
+      ]
+    }
+  ],
+  "source_revision": "a4a6ce16bb3533839a81dbe841caa104669a46d0",
+  "source_dirty": false,
+  "server_sha256": "b0fe6a30415d99fa5b9bcafdafb8153a8865ed38e469dcf372660540b61e9cf2",
+  "runner_sha256": "bf932b2c83adebbda091af03c47d3077be9bdd0a2d870e689752dd65a5953c21",
+  "input_sha256": "364bb8e54f1509f36f250f1fbc9a98c475d2c34262d16cc3ab43ad5789c505b8",
+  "topology": "1FE+3BE",
+  "exit_code": 0,
+  "duration_seconds": 7.22,
+  "actual_server_build_identity": "a4a6ce16bb3533839a81dbe841caa104669a46d0",
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/driver.log",
+      "sha256": "1ba5c645bbb5916326eafd5cd9807a787a02907e9120ee9a773700c30823ff62"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-result-wire-v4-native-20261009/driver-status.json",
+      "sha256": "ff0454f4baa21bb69ef0769c3f9e5e9872cbed4bbc5d1677d8d5c9a23994927f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-result-wire-v4-clean-build-20261009.log",
+      "sha256": "89b0ae3bdec252cc7696f04f0cce78a27c9d3e2bcaa140a3fa9dad2aaa0411be"
+    }
+  ]
+}
