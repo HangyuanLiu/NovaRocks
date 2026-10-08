@@ -22,3 +22,6 @@ pub mod table_writer_metrics;
 pub use execution_runtime::{
     ExecutionRuntime, ExecutionRuntimeConfig, ExecutionRuntimeConfigError,
 };
+
+#[cfg(test)]
+mod kernel_memory_observation_tests;

@@ -32,7 +32,7 @@ pub unsafe fn install_ambient(reference: RecordRef) -> RecordRef {
 /// before releasing the installed owner. Outer owners remain held too.
 #[doc(hidden)]
 pub unsafe fn restore_ambient(previous: RecordRef) {
-    tls::replace(previous, false, true);
+    let _ = unsafe { try_restore_ambient(previous) };
 }
 /// # Safety
 /// Same lifetime/thread/global-store requirements as install_ambient. Explicit
@@ -83,4 +83,11 @@ pub(crate) unsafe fn publish_small_transfer(reference: RecordRef, bytes: i64, co
 /// Same owner/restoration contract as install_explicit.
 pub(crate) unsafe fn try_install_explicit(reference: RecordRef) -> Option<RecordRef> {
     tls::try_replace(reference, true, false)
+}
+
+/// # Safety
+/// Same held-owner and synchronous restoration contract as restore_ambient.
+/// The result reports the actual TLS operation; it does not reject allocation.
+pub(crate) unsafe fn try_restore_ambient(previous: RecordRef) -> bool {
+    tls::try_replace(previous, false, true).is_some()
 }
