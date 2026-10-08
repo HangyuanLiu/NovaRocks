@@ -1240,4 +1240,7 @@ mod legacy_split_baseline_tests;
 mod legacy_null_or_empty_baseline_tests;
 
 #[cfg(test)]
+mod cast_decimal_text_oracle_tests;
+
+#[cfg(test)]
 mod legacy_time_text_baseline_tests;

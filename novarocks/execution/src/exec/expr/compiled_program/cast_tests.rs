@@ -1087,3 +1087,6 @@ mod cast_timestamp_tests;
 #[cfg(test)]
 #[path = "cast_temporal_carrier_tests.rs"]
 mod cast_temporal_carrier_tests;
+
+#[path = "cast_decimal_text_tests.rs"]
+mod decimal_text_profile_tests;

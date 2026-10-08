@@ -27,10 +27,10 @@ use crate::{
     ScopedExpressionEffects,
 };
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_cast::cast::{cast_num_to_bool, num_cast};
 use arrow_schema::{DataType, TimeUnit};
@@ -288,9 +288,28 @@ pub enum CastRowResult {
     RowError(RowDataError),
 }
 
+/// Only decimal text admission, independent from general carrier conversions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecimalTextSource {
+    Decimal128,
+    Decimal256,
+}
+impl DecimalTextSource {
+    fn validate(self, array: &dyn Array) -> bool {
+        match self {
+            Self::Decimal128 => array.as_any().is::<Decimal128Array>(),
+            Self::Decimal256 => array.as_any().is::<Decimal256Array>(),
+        }
+    }
+}
+
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    DecimalText {
+        source: DecimalTextSource,
+        scale: i8,
+    },
     TemporalCarrier {
         source: Source,
     },
@@ -363,6 +382,35 @@ impl PreparedCastRecipe {
             work.step()?;
             if operation != CastOperation::Carrier || !physical {
                 return Err(CastPrepareError::Unsupported);
+            }
+            if result.data_type == DataType::Utf8
+                && matches!(
+                    source.data_type,
+                    DataType::Decimal128(..) | DataType::Decimal256(..)
+                )
+            {
+                let decimal = match source.data_type {
+                    DataType::Decimal128(_, scale) => Some((DecimalTextSource::Decimal128, scale)),
+                    DataType::Decimal256(_, scale) => Some((DecimalTextSource::Decimal256, scale)),
+                    _ => None,
+                };
+                work.step()?;
+                if let Some((decimal, scale)) = decimal {
+                    if source.nullable && !result.nullable {
+                        return Err(CastPrepareError::TypeMismatch);
+                    }
+                    return Ok(Self {
+                        operation,
+                        source: source.clone(),
+                        result: result.clone(),
+                        body: CastBody::DecimalText {
+                            source: decimal,
+                            scale,
+                        },
+                        decimal_overflow_policy: policy,
+                        allow_throw_exception,
+                    });
+                }
             }
             let source_kind =
                 Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
@@ -492,6 +540,16 @@ impl PreparedCastRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
+            // Conservatively retain failure awareness for the original i128 MIN
+            // positive-scale abs bug; do not translate its panic into a row error.
+            CastBody::DecimalText {
+                source: DecimalTextSource::Decimal128,
+                scale,
+            } => scale > 0,
+            CastBody::DecimalText {
+                source: DecimalTextSource::Decimal256,
+                ..
+            } => false,
             CastBody::TemporalCarrier { .. } => {
                 matches!(self.result.data_type, DataType::Date32 | DataType::Utf8)
             }
@@ -530,6 +588,53 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if let CastBody::DecimalText { source, scale } = self.body {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| source.validate(array),
+                )?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                work.flush()?;
+                let text = match source {
+                    DecimalTextSource::Decimal128 => {
+                        crate::decimal_text::format_decimal_with_scale(
+                            argument
+                                .array()
+                                .as_any()
+                                .downcast_ref::<Decimal128Array>()
+                                .ok_or_else(|| {
+                                    internal("checked decimal text has a foreign carrier")
+                                })?
+                                .value(row),
+                            scale,
+                        )
+                    }
+                    DecimalTextSource::Decimal256 => {
+                        crate::decimal_text::format_decimal256_with_scale(
+                            argument
+                                .array()
+                                .as_any()
+                                .downcast_ref::<Decimal256Array>()
+                                .ok_or_else(|| {
+                                    internal("checked decimal text has a foreign carrier")
+                                })?
+                                .value(row),
+                            scale,
+                        )
+                    }
+                };
+                work.flush()?;
+                return Ok(CastRowResult::Text(text));
+            }
             if let CastBody::TemporalCarrier { source } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
                 let is_null = logical_is_null(argument.array().as_ref(), row, 1, &mut work)?;
@@ -899,6 +1004,18 @@ impl PreparedCastRecipe {
         logical_row: usize,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<usize, KernelFailure> {
+        self.checked_row_with_shape(argument, ordinal, logical_row, work, |array| {
+            source_kind.validate(array)
+        })
+    }
+    fn checked_row_with_shape(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        ordinal: usize,
+        logical_row: usize,
+        work: &mut EvaluationCheckpoints<'_>,
+        concrete_shape: impl FnOnce(&dyn Array) -> bool,
+    ) -> Result<usize, KernelFailure> {
         if let EvaluatedArgument::Constant(value) = argument {
             let actual = value.value_type();
             let matches = actual.logical_type == self.source.logical_type
@@ -952,7 +1069,7 @@ impl PreparedCastRecipe {
         if !in_bounds {
             return Err(invalid("cast selected address is outside its array"));
         }
-        let concrete = source_kind.validate(array.as_ref());
+        let concrete = concrete_shape(array.as_ref());
         work.step()?;
         if !concrete {
             return Err(internal("cast carrier has a foreign array implementation"));
@@ -988,3 +1105,7 @@ mod timestamp_tests;
 #[cfg(test)]
 #[path = "cast_temporal_carrier_tests.rs"]
 mod temporal_carrier_tests;
+
+#[cfg(test)]
+#[path = "cast_decimal_text_tests.rs"]
+mod decimal_text_tests;
