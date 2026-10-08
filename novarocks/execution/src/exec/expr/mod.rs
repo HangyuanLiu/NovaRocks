@@ -1320,3 +1320,8 @@ mod legacy_sm3_additional_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_array_repeat_baseline_tests.rs"]
 mod legacy_array_repeat_baseline_tests;
+
+#[cfg(test)]
+mod legacy_date_float_cast_baseline_tests;
+#[cfg(test)]
+mod cast_date_float_oracle_tests;
