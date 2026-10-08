@@ -25,7 +25,6 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -108,9 +107,7 @@ impl ListingRestFixture {
                         let listener = tokio::net::TcpListener::from_std(listener)?;
                         axum::serve(
                             listener,
-                            Router::new()
-                                .route("/{*path}", any(serve))
-                                .with_state(server_state),
+                            Router::new().fallback(serve).with_state(server_state),
                         )
                         .with_graceful_shutdown(async {
                             let _ = stopped.await;
@@ -429,6 +426,38 @@ fn listing_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn controlled_rest_listener_serves_catalog_and_load_protocols() {
+        let fixture = ListingRestFixture::start().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let config: Value = client
+            .get(format!("{}/v1/config", fixture.endpoint()))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(config, json!({"defaults":{},"overrides":{}}));
+        fixture.set_mode(ListingMode::Normal).unwrap();
+        let table: Value = client
+            .get(format!(
+                "{}/v1/namespaces/cl_ns_0000/tables/cl_table_000000",
+                fixture.endpoint()
+            ))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(table["metadata"]["format-version"], 2);
+        assert_eq!(fixture.snapshot().unwrap().table_loads, 1);
+    }
     #[test]
     fn controlled_listing_pages_preserve_frozen_boundaries() {
         let (first, token) = listing_page(ListingMode::Normal, "tables", "").unwrap();
