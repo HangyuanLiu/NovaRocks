@@ -561,13 +561,24 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .map_err(|_| Self::failure("statistics phase state lock poisoned"))?
             .remove(&job.id)
             .ok_or_else(|| Self::failure("statistics publication has no collected attempt"))?;
+        Self::publish_pending(pending)
+    }
+}
+
+impl FrontendThreePhaseStatisticsAttemptExecutor {
+    fn publish_pending(
+        pending: PendingThreePhaseStatisticsAttempt,
+    ) -> Result<StatisticsPublicationOutcome, CoreStatisticsAttemptError> {
         let Some(artifacts) = pending.artifacts else {
             let error = Self::failure("statistics publication requires collected artifacts");
             return Err(Self::abort_pending_session(pending, error));
         };
-        pending
-            .session
-            .finish(artifacts)
+        // The provider's plain SDK publication facts are covered by this
+        // original root through its actual synchronous callback return.
+        let outcome = pending.session.finish(artifacts);
+        drop(pending.request);
+        drop(pending._result_capacity);
+        outcome
             .map(Self::publication_outcome)
             .map_err(|error| Self::failure(error.to_string()))
     }
@@ -626,6 +637,7 @@ mod tests {
         data_version: StatisticsDataVersion,
         finish_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
+        callback_capacity: Option<novarocks_workload_control::ResultCapacityHandle>,
     }
 
     impl StatisticsCollectionSession for EmptyCollectionSession {
@@ -653,6 +665,9 @@ mod tests {
             novarocks_spi::connector::ConnectorError,
         > {
             assert!(artifacts.is_empty());
+            if let Some(capacity) = &self.callback_capacity {
+                assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            }
             self.finish_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::NoOp,
@@ -669,6 +684,9 @@ mod tests {
         }
 
         fn abort(self: Box<Self>) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            if let Some(capacity) = &self.callback_capacity {
+                assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            }
             self.abort_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -695,6 +713,7 @@ mod tests {
                 data_version,
                 finish_calls: Arc::clone(&finish_calls),
                 abort_calls: Arc::clone(&abort_calls),
+                callback_capacity: None,
             }),
             capacity,
         );
@@ -720,6 +739,48 @@ mod tests {
     }
 
     #[test]
+    fn publication_and_abort_callbacks_retain_the_last_root_window_after_logical_exit() {
+        for publish in [true, false] {
+            let (_control, root, binding, capacity) =
+                crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let aborts = Arc::new(AtomicUsize::new(0));
+            let pending = empty_collection_pending(
+                Box::new(EmptyCollectionSession {
+                    descriptor: ConnectorInstanceDescriptor {
+                        provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                        instance_id: ConnectorInstanceId::parse("ice.main").unwrap(),
+                    },
+                    incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+                    operation_id: ConnectorMutationOperationId::from_bytes([8; 16]),
+                    data_version: StatisticsDataVersion::try_new(Bytes::from_static(
+                        b"snapshot-42",
+                    ))
+                    .unwrap(),
+                    finish_calls: Arc::clone(&finishes),
+                    abort_calls: Arc::clone(&aborts),
+                    callback_capacity: Some(capacity.clone()),
+                }),
+                binding,
+            );
+            root.owner.complete();
+            assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            if publish {
+                FrontendThreePhaseStatisticsAttemptExecutor::publish_pending(pending)
+                    .expect("publication");
+            } else {
+                let _ = FrontendThreePhaseStatisticsAttemptExecutor::abort_pending_session(
+                    pending,
+                    FrontendThreePhaseStatisticsAttemptExecutor::failure("collection failed"),
+                );
+            }
+            assert_eq!(finishes.load(Ordering::SeqCst), usize::from(publish));
+            assert_eq!(aborts.load(Ordering::SeqCst), usize::from(!publish));
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        }
+    }
+
+    #[test]
     fn abandoning_a_prepared_collection_consumes_the_provider_session_once() {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
@@ -736,6 +797,7 @@ mod tests {
                     .expect("data version"),
                 finish_calls: Arc::new(AtomicUsize::new(0)),
                 abort_calls: Arc::clone(&abort_calls),
+                callback_capacity: None,
             }),
             capacity,
         );

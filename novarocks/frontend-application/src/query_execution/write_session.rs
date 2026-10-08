@@ -1270,6 +1270,7 @@ pub(crate) mod tests {
         /// or writes a manifest, so recording it here is recording whether the
         /// commit could have happened at all.
         pub(crate) terminal_storage: Option<Result<String, String>>,
+        expected_finish_capacity: Option<novarocks_workload_control::ResultCapacityHandle>,
     }
 
     struct FakeSession {
@@ -1343,6 +1344,9 @@ pub(crate) mod tests {
             {
                 let mut recorded = self.recorded.lock().expect("recorded");
                 recorded.finish += 1;
+                if let Some(capacity) = &recorded.expected_finish_capacity {
+                    assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+                }
                 recorded.statistics = request.statistics.clone();
                 recorded.publication = Some(request.publication.clone());
                 recorded.terminal_storage = Some(probe_vended_storage(&request.context));
@@ -2426,6 +2430,36 @@ pub(crate) mod tests {
         // One commit for the whole statement, not one per query.
         assert_eq!(fixture.session.finish_invocations(), 1);
         assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    }
+
+    #[test]
+    fn finish_callback_retains_fragment_only_capacity_after_root_logical_exit() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let fixture = fixture(1, 1);
+        fixture.recorded.lock().unwrap().expected_finish_capacity = Some(capacity.clone());
+        fixture
+            .session
+            .accumulate(
+                DecodedPreparedWriteSet::for_test(
+                    7,
+                    vec![(
+                        WriteTargetOrdinal::try_new(0).unwrap(),
+                        commit_fragment_bytes(),
+                    )],
+                )
+                .with_test_capacity(&binding),
+            )
+            .expect("accumulate admitted fragments");
+        drop(binding);
+        root.owner.complete();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        fixture
+            .session
+            .finish_accumulated(request_context())
+            .expect("provider callback returned");
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[test]
