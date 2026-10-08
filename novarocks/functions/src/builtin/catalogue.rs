@@ -2703,6 +2703,7 @@ pub(super) fn dynamic_definition_parts(
         })?;
     let pure_effects = match name {
         "md5sum_numeric" => Some(super::md5sum_numeric_owner::effects()),
+        "null_or_empty" => Some(super::string_null_or_empty_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
         "round" => Some(super::round_owner::effects()),
         name if super::scalar_extrema_owner::operation(name) => {
@@ -2757,6 +2758,9 @@ pub fn contribute_builtin_functions(
         let definition = match *name {
             "md5sum_numeric" => {
                 super::md5sum_numeric_owner::definition(name, declaration, resolver)?
+            }
+            "null_or_empty" => {
+                super::string_null_or_empty_owner::definition(name, declaration, resolver)?
             }
             "truncate" => super::truncate_owner::definition(declaration, resolver)?,
             "round" => super::round_owner::definition(declaration, resolver)?,

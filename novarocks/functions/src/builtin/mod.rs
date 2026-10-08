@@ -158,6 +158,8 @@ mod string_md5_owner;
 mod string_measure;
 mod string_measure_owner;
 mod string_money;
+pub mod string_null_or_empty;
+mod string_null_or_empty_owner;
 mod string_pad;
 mod string_pad_owner;
 mod string_repeat;
