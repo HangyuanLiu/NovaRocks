@@ -20,6 +20,7 @@
 //! Opaque library calls keep original-control boundaries. Checked output
 //! layouts are representation gates, not a formal host memory grant.
 
+use super::sm3_shared::{Observation, output_width, visit_digest};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -29,7 +30,6 @@ use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-use sm3::{Digest, Sm3};
 use std::{alloc::Layout, sync::Arc};
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
@@ -58,34 +58,14 @@ fn append_digest(
     bytes: &mut Vec<u8>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
-    work.flush()?;
-    let mut digest = Sm3::new();
-    work.flush()?;
-    // The compression algorithm remains opaque. Completed selected source
-    // chunks are observed; NULL and inactive source spans never reach it.
-    for chunk in text.chunks(256) {
-        work.flush()?;
-        digest.update(chunk);
-        work.flush()?;
-        for _ in chunk {
-            work.step()?;
-        }
-    }
-    work.flush()?;
-    let output = digest.finalize();
-    work.flush()?;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for (index, byte) in output.into_iter().enumerate() {
-        if index >= 4 && index % 4 == 0 {
-            bytes.push(b' ');
-            work.step()?;
-        }
-        bytes.push(HEX[usize::from(byte >> 4)]);
-        work.step()?;
-        bytes.push(HEX[usize::from(byte & 15)]);
-        work.step()?;
-    }
-    Ok(())
+    visit_digest(
+        text,
+        &mut |observation| match observation {
+            Observation::Step => work.step(),
+            Observation::OpaqueBoundary => work.flush(),
+        },
+        &mut |byte| bytes.push(byte),
+    )
 }
 
 pub(super) fn evaluate_string_sm3<'a>(
@@ -147,9 +127,9 @@ pub(super) fn evaluate_string_sm3<'a>(
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;
         for (ordinal, row) in selection.iter().enumerate() {
-            if selected(ordinal, row, &mut work)?.is_some_and(|text| !text.is_empty()) {
+            if let Some(text) = selected(ordinal, row, &mut work)? {
                 total = total
-                    .checked_add(71)
+                    .checked_add(output_width(text.as_bytes()))
                     .ok_or(KernelFailure::ResourceExhausted)?;
             }
             work.step()?;
@@ -177,15 +157,12 @@ pub(super) fn evaluate_string_sm3<'a>(
                     has_null = true;
                 }
                 Some(text) => {
-                    let width = if text.is_empty() { 0 } else { 71 };
+                    let width = output_width(text.as_bytes());
                     if width > total - bytes.len() {
                         return Err(internal("sm3 exceeded its measured output extent"));
                     }
-                    // Original SM3 owns a special empty-input result, not the
-                    // standard digest of empty bytes and not SQL NULL.
-                    if !text.is_empty() {
-                        append_digest(text.as_bytes(), &mut bytes, &mut work)?;
-                    }
+                    // The shared original author owns successful empty text and hashing.
+                    append_digest(text.as_bytes(), &mut bytes, &mut work)?;
                     validity.append(true);
                 }
             }
