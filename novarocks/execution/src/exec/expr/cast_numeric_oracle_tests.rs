@@ -689,3 +689,76 @@ fn legacy_timestamp_text_cast_oracle_preserves_units_fraction_negative_and_epoch
         );
     }
 }
+
+#[test]
+fn legacy_date_carrier_cast_profiles_match_shared_selected_rows() {
+    use arrow::array::Date32Array;
+    use arrow::datatypes::TimeUnit;
+    for nullable in [false, true] {
+        let dates: ArrayRef = Arc::new(Date32Array::from(if nullable {
+            vec![Some(-1), None, Some(0), Some(1), Some(19782)]
+        } else {
+            vec![Some(-1), Some(0), Some(1), Some(19782)]
+        }));
+        for target in [
+            DataType::Utf8,
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ] {
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                for allow in [false, true] {
+                    compare_legacy_rows(
+                        dates.clone(),
+                        nullable,
+                        target.clone(),
+                        nullable,
+                        policy,
+                        allow,
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn legacy_timestamp_date_cast_profiles_match_shared_selected_rows() {
+    use arrow::array::{
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    for nullable in [false, true] {
+        let values = if nullable {
+            vec![Some(-1), Some(0), None, Some(1)]
+        } else {
+            vec![Some(-1), Some(0), Some(1)]
+        };
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(TimestampSecondArray::from(values.clone())),
+            Arc::new(TimestampMillisecondArray::from(values.clone())),
+            Arc::new(TimestampMicrosecondArray::from(values.clone())),
+            Arc::new(TimestampNanosecondArray::from(values)),
+        ];
+        for array in arrays {
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                for allow in [false, true] {
+                    compare_legacy_rows(
+                        array.clone(),
+                        nullable,
+                        DataType::Date32,
+                        nullable,
+                        policy,
+                        allow,
+                    );
+                }
+            }
+        }
+    }
+}

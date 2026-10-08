@@ -17,7 +17,8 @@
 
 //! Immutable selected casts for exact Physical numeric and unzoned timestamp domains.
 //! The caller retains original policies and full types; this recipe performs no
-//! output allocation, registry lookup, coercion or memory admission.
+//! registry lookup, coercion or memory admission. Temporal Arrow casts retain
+//! the original allocation body, bounded to one already selected row.
 
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, logical_is_null, validate_type_observed};
@@ -26,9 +27,10 @@ use crate::{
     ScopedExpressionEffects,
 };
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_cast::cast::{cast_num_to_bool, num_cast};
 use arrow_schema::{DataType, TimeUnit};
@@ -157,7 +159,7 @@ impl UnsignedWidth {
 /// static semantic fact, not an installed runtime capability whitelist.
 pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
     if matches!(target, DataType::Date32 | DataType::Timestamp(_, None))
-        && !matches!(source, DataType::Timestamp(_, _))
+        && !matches!(source, DataType::Date32 | DataType::Timestamp(_, _))
         && Source::from_type(source).is_some()
     {
         return true;
@@ -202,6 +204,7 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
+    Date32,
     Utf8,
     Boolean,
     Signed(SignedWidth),
@@ -216,6 +219,7 @@ impl Source {
             .map(Self::Signed)
             .or_else(|| UnsignedWidth::from_type(ty).map(Self::Unsigned))
             .or(match ty {
+                DataType::Date32 => Some(Self::Date32),
                 DataType::Utf8 => Some(Self::Utf8),
                 DataType::Boolean => Some(Self::Boolean),
                 DataType::Float32 => Some(Self::F32),
@@ -226,6 +230,7 @@ impl Source {
     }
     fn validate(self, array: &dyn Array) -> bool {
         match self {
+            Self::Date32 => array.as_any().is::<Date32Array>(),
             Self::Utf8 => array.as_any().is::<StringArray>(),
             Self::Boolean => array.as_any().is::<BooleanArray>(),
             Self::Signed(width) => width.validate(array),
@@ -286,6 +291,9 @@ pub enum CastRowResult {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    TemporalCarrier {
+        source: Source,
+    },
     Text {
         source: Source,
     },
@@ -358,6 +366,21 @@ impl PreparedCastRecipe {
             }
             let source_kind =
                 Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
+            if crate::temporal_carrier::supports(&source.data_type, &result.data_type) {
+                if source.nullable && !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::TemporalCarrier {
+                        source: source_kind,
+                    },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
             if result.data_type == DataType::Utf8 && source_kind != Source::Utf8 {
                 if source.nullable && !result.nullable {
                     return Err(CastPrepareError::TypeMismatch);
@@ -469,6 +492,9 @@ impl PreparedCastRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
+            CastBody::TemporalCarrier { .. } => {
+                matches!(self.result.data_type, DataType::Date32 | DataType::Utf8)
+            }
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
             CastBody::Identity | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {
@@ -504,6 +530,61 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if let CastBody::TemporalCarrier { source } = self.body {
+                let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
+                let is_null = logical_is_null(argument.array().as_ref(), row, 1, &mut work)?;
+                if is_null && !self.source.nullable {
+                    return Err(invalid("non-null cast argument contains a selected NULL"));
+                }
+                // The original Arrow body controls NULL visitation. Do not mask
+                // Date32's hidden-payload multiplication before invoking it.
+                work.flush()?;
+                let selected = argument.array().slice(row, 1);
+                let converted =
+                    crate::temporal_carrier::cast(selected.as_ref(), &self.result.data_type);
+                work.flush()?;
+                let converted = match converted {
+                    Ok(array) => array,
+                    Err(message) => {
+                        return Ok(CastRowResult::RowError(RowDataError::new(
+                            ordinal, &message,
+                        )));
+                    }
+                };
+                if converted.is_null(0) {
+                    return if self.result.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(internal("temporal cast NULL contradicts its exact result"))
+                    };
+                }
+                macro_rules! value {
+                    ($array:ty) => {
+                        converted
+                            .as_any()
+                            .downcast_ref::<$array>()
+                            .ok_or_else(|| internal("temporal cast returned a foreign carrier"))?
+                            .value(0)
+                    };
+                }
+                return Ok(match &self.result.data_type {
+                    DataType::Date32 => CastRowResult::Signed(i64::from(value!(Date32Array))),
+                    DataType::Utf8 => CastRowResult::Text(value!(StringArray).to_owned()),
+                    DataType::Timestamp(TimeUnit::Second, None) => {
+                        CastRowResult::Timestamp(value!(TimestampSecondArray))
+                    }
+                    DataType::Timestamp(TimeUnit::Millisecond, None) => {
+                        CastRowResult::Timestamp(value!(TimestampMillisecondArray))
+                    }
+                    DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                        CastRowResult::Timestamp(value!(TimestampMicrosecondArray))
+                    }
+                    DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                        CastRowResult::Timestamp(value!(TimestampNanosecondArray))
+                    }
+                    _ => return Err(internal("temporal cast has a foreign frozen result")),
+                });
+            }
             if let CastBody::Text { source } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
@@ -761,6 +842,7 @@ impl PreparedCastRecipe {
                 }};
             }
             Ok(match source_kind {
+                Source::Date32 => return Err(internal("date cast escaped its checked operation")),
                 Source::Utf8 => return Err(internal("text cast escaped its checked operation")),
                 Source::Timestamp(_) => {
                     return Err(internal("timestamp cast escaped its checked operation"));
@@ -902,3 +984,7 @@ mod unsigned_tests;
 #[cfg(test)]
 #[path = "cast_timestamp_tests.rs"]
 mod timestamp_tests;
+
+#[cfg(test)]
+#[path = "cast_temporal_carrier_tests.rs"]
+mod temporal_carrier_tests;

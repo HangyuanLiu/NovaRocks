@@ -42,11 +42,11 @@ pub mod bit_numeric;
 pub mod builtin;
 pub mod calendar_julian;
 pub mod calendar_numeric;
-pub mod carrier_text;
 pub mod calendar_period_numeric;
 mod call_contract;
 #[cfg(test)]
 mod carrier_map_tests;
+pub mod carrier_text;
 mod cast;
 mod comparison;
 pub mod datetime_value;
@@ -69,6 +69,7 @@ pub mod selected_copy;
 mod specialization;
 mod table_call;
 mod table_kernel;
+pub mod temporal_carrier;
 mod window_call;
 mod window_kernel;
 

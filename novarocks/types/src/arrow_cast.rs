@@ -932,6 +932,10 @@ pub fn cast_scalar_with_special_rules(
         return Ok(new_null_array(target_type, array.len()));
     }
 
+    if novarocks_functions::temporal_carrier::supports(array.data_type(), target_type) {
+        return novarocks_functions::temporal_carrier::cast(array.as_ref(), target_type);
+    }
+
     if target_type == &DataType::Utf8
         && matches!(
             array.data_type(),
