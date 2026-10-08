@@ -202,3 +202,6 @@ mod string_regexp_replace;
 
 pub mod scalar_extrema;
 mod scalar_extrema_owner;
+
+pub mod xx_hash3_128;
+mod xx_hash3_128_owner;

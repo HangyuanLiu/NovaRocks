@@ -53,5 +53,7 @@ ryu.workspace = true
 sha2.workspace = true
 sm3 = "0.4"
 
+twox-hash = "2.1"
+
 [dev-dependencies]
 arrow-ord = "58.2.0"

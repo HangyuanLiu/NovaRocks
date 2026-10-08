@@ -2701,6 +2701,9 @@ pub(super) fn dynamic_definition_parts(
         name if super::scalar_extrema_owner::operation(name) => {
             Some(super::scalar_extrema_owner::effects())
         }
+        name if super::xx_hash3_128_owner::operation(name) => {
+            Some(super::xx_hash3_128_owner::effects())
+        }
         _ => None,
     };
     let overload_declaration = if let Some(effects) = pure_effects {
@@ -2749,6 +2752,9 @@ pub fn contribute_builtin_functions(
             "round" => super::round_owner::definition(declaration, resolver)?,
             name if super::scalar_extrema_owner::operation(name) => {
                 super::scalar_extrema_owner::definition(name, declaration, resolver)?
+            }
+            name if super::xx_hash3_128_owner::operation(name) => {
+                super::xx_hash3_128_owner::definition(name, declaration, resolver)?
             }
             _ => FunctionDefinition::try_new_bound(
                 name,
