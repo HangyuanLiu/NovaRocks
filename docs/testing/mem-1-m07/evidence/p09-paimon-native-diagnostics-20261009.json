@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "stage": "P09 real Paimon native diagnostic",
+  "outcome": "failed; read-data passed and snapshot actor terminated before S2 publication",
+  "matrix": {
+    "source_revision": "ebf6cb371fb56852e4e47df6b639872406f54b4d",
+    "source_dirty": false,
+    "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+    "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "launch_profile": "fault-scenario",
+    "results": [
+      {
+        "scenarios": [
+          "connector/paimon-read-data",
+          "connector/paimon-snapshot-and-schema",
+          "connector/paimon-merge-filter-correctness",
+          "connector/paimon-cancel-and-budget",
+          "connector/paimon-unsupported-and-binding",
+          "connector/iceberg-paimon-read"
+        ],
+        "exit_code": 1,
+        "duration_seconds": 292.554
+      }
+    ],
+    "fixture_startup_exit_code": 0,
+    "paimon_prepare_exit_code": 0,
+    "paimon_cleanup_exit_code": 0,
+    "fixture_cleanup_exit_code": 0
+  },
+  "actual_product_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "scenarios": [
+    {
+      "scenario": "connector/paimon-read-data",
+      "outcome": "passed",
+      "evidence": {
+        "path": "logs/mem-1-m07/p09-paimon-native-20261009/native/connector-paimon-read-data/scenario-evidence.json",
+        "sha256": "506e6ddd634f0cc66bec00c9ea03c30901bdd7feb6a96aacb474abd38eab4f0d"
+      },
+      "actual_runner_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3"
+    },
+    {
+      "scenario": "connector/paimon-snapshot-and-schema",
+      "outcome": "failed",
+      "evidence": {
+        "path": "logs/mem-1-m07/p09-paimon-native-20261009/native/connector-paimon-snapshot-and-schema/scenario-evidence.json",
+        "sha256": "f7d8537824f2a3068775cfaa2713e7fb42fcd5bf8ee7e521c2dff7e5c6a3fd48"
+      },
+      "actual_runner_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3"
+    }
+  ],
+  "unreached_scenarios": [
+    "connector/paimon-merge-filter-correctness",
+    "connector/paimon-cancel-and-budget",
+    "connector/paimon-unsupported-and-binding",
+    "connector/iceberg-paimon-read"
+  ],
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-paimon-native-20261009/native-driver.log",
+      "sha256": "292c1a20f5f68c0ff4b4d9c7686f109caed0958754be2ee6d1fa717818771432"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-paimon-native-20261009/matrix-status.json",
+      "sha256": "0f1fedda807b43db12c5d9a1e73aa806ddeaac61f2cd5218b0a443aae42bef33"
+    }
+  ],
+  "exact_prefix_cleanups": [
+    {
+      "path": "logs/mem-1-m07/p09-paimon-native-20261009/paimon-fixture/CLEANED",
+      "sha256": "ff76c3c06d18891840eb2b84b9035b00695dc7ec021dbdb5aa624dbc8e1aa5ee"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-paimon-native-20261009/native/connector-paimon-snapshot-and-schema/paimon-fixture/CLEANED",
+      "sha256": "54a0353a478d1aeb349db58ad8f7ec56be5e37d6b1136829408447138cb7d0e2"
+    }
+  ],
+  "all_startup_pids_absent": true,
+  "pids": [
+    94157,
+    94158,
+    94159,
+    94160,
+    94995,
+    94996,
+    94997,
+    94998
+  ],
+  "suspected_cause": "The relayed MySQL writer sets one 30s absolute write deadline before metadata, then applies it while waiting for a root delivery. Logs show S1 QUERY_FAILED after ~30s. The snapshot harness consumed and discarded the actor result, so the actual MySQL error requires a focused reproduction.",
+  "product_failure_status": "OPEN; no timeout, workload or cap changed; not a snapshot isolation pass or large-provider CL acceptance.",
+  "local_only": true
+}
