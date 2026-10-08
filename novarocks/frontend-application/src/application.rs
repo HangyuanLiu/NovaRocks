@@ -185,6 +185,8 @@ impl std::error::Error for FrontendApplicationError {}
 /// concrete: services may clone only the narrow capabilities below, never the
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
+use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
+
 struct FrontendExecutionRuntimeOwner {
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
@@ -198,6 +200,8 @@ struct FrontendExecutionRuntimeOwner {
     query_cpu_executor: QueryCpuExecutor,
     query_blocking: QueryBlockingExecutorOwner,
     query_blocking_executor: QueryBlockingExecutor,
+    internal_result_cpu: InternalResultCpuOwner,
+    internal_result_cpu_runtime: InternalResultCpu,
     decode: RootResultDecodeRuntimeOwner,
     decode_runtime: RootResultDecodeRuntime,
     /// The complete result-window profile, installed before readiness.
@@ -321,6 +325,13 @@ impl FrontendExecutionRuntimeOwner {
                 )
             })?;
         let query_blocking_executor = query_blocking.executor();
+        let internal_result_cpu = InternalResultCpuOwner::try_new().map_err(|error| {
+            FrontendApplicationError::new(
+                FrontendApplicationErrorKind::ResultDecodeRuntimeOpen,
+                error,
+            )
+        })?;
+        let internal_result_cpu_runtime = internal_result_cpu.runtime();
         let decode =
             RootResultDecodeRuntimeOwner::try_new(decode_worker_count, decode_queue_capacity)
                 .map_err(|error| {
@@ -371,6 +382,8 @@ impl FrontendExecutionRuntimeOwner {
             query_cpu_executor,
             query_blocking,
             query_blocking_executor,
+            internal_result_cpu,
+            internal_result_cpu_runtime,
             decode,
             decode_runtime,
             result_capacity,
@@ -451,6 +464,8 @@ impl FrontendExecutionRuntimeOwner {
             return Err(error);
         }
 
+        self.internal_result_cpu.shutdown_until(deadline).await?;
+
         if let Err(error) = self.decode.shutdown_until(deadline).await {
             if error.kind() == QueryExecutionErrorKind::DeadlineExceeded {
                 return Err(error.to_string());
@@ -468,6 +483,7 @@ impl FrontendExecutionRuntimeOwner {
         self.supervisor.abandon_for_process_exit();
         self.query_cpu.request_shutdown_for_process_exit();
         self.query_blocking.request_shutdown_for_process_exit();
+        self.internal_result_cpu.request_shutdown_for_process_exit();
         self.decode.request_shutdown_for_process_exit();
         self.workload.take();
         self.shutdown_complete = true;
@@ -571,6 +587,10 @@ impl FrontendExecutionRuntimeOwner {
 
     fn query_blocking_executor(&self) -> QueryBlockingExecutor {
         self.query_blocking_executor.clone()
+    }
+
+    fn internal_result_cpu(&self) -> InternalResultCpu {
+        self.internal_result_cpu_runtime.clone()
     }
 
     fn decode_runtime(&self) -> RootResultDecodeRuntime {
