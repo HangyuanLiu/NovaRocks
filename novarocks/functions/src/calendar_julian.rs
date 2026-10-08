@@ -33,6 +33,11 @@ pub fn julian_from_date(date: NaiveDate) -> i32 {
     d + ((153 * m + 2) / 5) + 365 * y + y / 4 - y / 100 + y / 400 - 32045
 }
 
+/// Original TO_DAYS projection, including signed Julian arithmetic for negative years.
+pub fn day_number_from_date(date: NaiveDate) -> i64 {
+    (julian_from_date(date) - BC_EPOCH_JULIAN) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

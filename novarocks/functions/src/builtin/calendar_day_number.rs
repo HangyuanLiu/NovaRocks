@@ -193,9 +193,7 @@ pub(super) fn evaluate_calendar_day_number<'a>(
                     // This exact finite helper deliberately retains signed Rust
                     // division for negative years; it is not CE-day rebasing.
                     work.flush()?;
-                    let number = (crate::calendar_julian::julian_from_date(date)
-                        - crate::calendar_julian::BC_EPOCH_JULIAN)
-                        as i64;
+                    let number = crate::calendar_julian::day_number_from_date(date);
                     work.flush()?;
                     Some(number)
                 }
