@@ -85,8 +85,7 @@ pub use observation::{
 };
 pub use resource::{
     AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, ResourceConfig,
-    ResourceSnapshot, ResultCredit, ResultCreditReservationError, ResultCreditSnapshot,
-    ResultCreditStage,
+    ResourceSnapshot,
 };
 pub use result_window::{
     ResultCapacityConfig, ResultCapacityHandle, ResultCapacitySnapshot, ResultClosingCut,
@@ -115,15 +114,9 @@ pub enum WorkError {
     CapacityWaitTimeout,
     AlreadyAdmitted,
     AlreadyWaitingForResource(ResourceClass),
-    AlreadyWaitingForResultFetch,
-    AlreadyWaitingForResultDecode,
     Conflict,
     OwnerStillPresent,
     ArithmeticOverflow,
-    InvalidResultCreditTransition {
-        from: ResultCreditStage,
-        requested: ResultCreditStage,
-    },
 }
 
 impl std::fmt::Display for WorkError {
@@ -141,21 +134,9 @@ impl std::fmt::Display for WorkError {
             Self::AlreadyWaitingForResource(class) => {
                 write!(f, "Work already has a {class:?} resource capacity wait")
             }
-            Self::AlreadyWaitingForResultFetch => {
-                f.write_str("Work already has a result fetch capacity wait")
-            }
-            Self::AlreadyWaitingForResultDecode => {
-                f.write_str("Work already has a result decode capacity wait")
-            }
             Self::Conflict => f.write_str("Work identity has conflicting facts"),
             Self::OwnerStillPresent => f.write_str("Work still has an active owner"),
             Self::ArithmeticOverflow => f.write_str("Work accounting overflow"),
-            Self::InvalidResultCreditTransition { from, requested } => {
-                write!(
-                    f,
-                    "Invalid result-credit transition from {from:?} to {requested:?}"
-                )
-            }
         }
     }
 }

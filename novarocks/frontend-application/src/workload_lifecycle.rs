@@ -153,7 +153,6 @@ pub struct FrontendWorkloadGovernanceSnapshot {
     pub resource_limit_bytes: u64,
     pub held_bytes: u64,
     pub peak_held_bytes: u64,
-    pub result_credit_held_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -299,7 +298,6 @@ fn frontend_workload_snapshot(
             resource_limit_bytes: workload.resource_limit_bytes,
             held_bytes: workload.held_bytes,
             peak_held_bytes: workload.peak_held_bytes,
-            result_credit_held_bytes: workload.result_credit_held_bytes,
         },
         rejected_admissions,
         completed_during_drain: frontend_totals_from_root(
@@ -504,7 +502,6 @@ mod tests {
         assert_eq!(initial_governance.resource_limit_bytes, 128);
         assert_eq!(initial_governance.held_bytes, 0);
         assert_eq!(initial_governance.peak_held_bytes, 0);
-        assert_eq!(initial_governance.result_credit_held_bytes, 0);
 
         assert_eq!(
             lifecycle.begin_drain(Duration::from_secs(1)),

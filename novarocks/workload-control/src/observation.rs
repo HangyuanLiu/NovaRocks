@@ -81,7 +81,6 @@ pub struct ScopeSnapshot {
     pub restarts: usize,
     pub reserved_bytes: u64,
     pub used_bytes: u64,
-    pub result_credit: crate::ResultCreditSnapshot,
     pub result_windows: crate::ResultCapacitySnapshot,
     pub resource_holders: usize,
     pub resource_waiters: usize,
@@ -171,7 +170,6 @@ pub struct WorkloadSnapshot {
     /// Exact high-water mark recorded by that authority.
     pub peak_held_bytes: u64,
     /// Current subset of `held_bytes` retained by result delivery credits.
-    pub result_credit_held_bytes: u64,
     pub result_windows: crate::ResultCapacitySnapshot,
     pub root_lifecycle: RootLifecycleSnapshot,
     pub scopes: Vec<ScopeSnapshot>,
@@ -247,7 +245,6 @@ fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
             .saturating_add(state.control_reserved)
             .saturating_add(state.control_used),
         peak_held_bytes: state.peak_held_bytes,
-        result_credit_held_bytes: state.result_credit.held_bytes(),
         result_windows: state.result_windows,
         root_lifecycle: state.root_lifecycle.clone(),
         scopes: state
@@ -267,7 +264,6 @@ fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
                 restarts: node.restarts,
                 reserved_bytes: node.reserved_bytes,
                 used_bytes: node.used_bytes,
-                result_credit: node.result_credit,
                 result_windows: node.result_windows,
                 resource_holders: node.resource_holders,
                 resource_waiters: node.resource_waiters,

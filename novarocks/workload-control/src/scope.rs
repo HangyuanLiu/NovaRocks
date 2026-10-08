@@ -201,7 +201,6 @@ pub(crate) struct Node {
     pub resource_waiters: usize,
     pub reserved_bytes: u64,
     pub used_bytes: u64,
-    pub result_credit: crate::ResultCreditSnapshot,
     pub result_windows: crate::ResultCapacitySnapshot,
     /// The result window class a queued query admission must take together
     /// with its computation permit; `None` when it is not queued or takes none.
@@ -240,7 +239,6 @@ impl Node {
             resource_waiters: 0,
             reserved_bytes: 0,
             used_bytes: 0,
-            result_credit: crate::ResultCreditSnapshot::default(),
             result_windows: crate::ResultCapacitySnapshot::default(),
             pending_query_window: None,
             control_pending: ControlIntents::empty(),
@@ -274,10 +272,7 @@ pub(crate) struct State {
     pub preparation: usize,
     pub execution: usize,
     pub requests: BTreeMap<u64, PendingAdmission>,
-    pub resource_waiters: ResourceWaiters,
-    pub next_result_fetch_waiter_id: u64,
-    pub next_decode_waiter_id: u64,
-    pub next_protocol_waiter_id: u64,
+    pub resource_waiters: BTreeSet<(WorkId, ResourceClass)>,
     pub preparation_queue: FairQueue,
     pub execution_queue: FairQueue,
     pub query_queue: FairQueue,
@@ -296,7 +291,6 @@ pub(crate) struct State {
     pub control_reserved: u64,
     pub control_used: u64,
     pub peak_held_bytes: u64,
-    pub result_credit: crate::ResultCreditSnapshot,
     pub result_capacity: Option<crate::ResultCapacityConfig>,
     pub result_windows: crate::ResultCapacitySnapshot,
     pub peak_waiting: usize,
@@ -327,10 +321,7 @@ impl State {
             && self.preparation == 0
             && self.execution == 0
             && self.requests.is_empty()
-            && self.resource_waiters.generic.is_empty()
-            && self.resource_waiters.result_fetch.is_empty()
-            && self.resource_waiters.decode.is_empty()
-            && self.resource_waiters.protocol.is_empty()
+            && self.resource_waiters.is_empty()
             && self.waiting_bytes == 0
             && self.old_attempts == 0
             && self.unknown_creates == 0
@@ -342,7 +333,6 @@ impl State {
             && self.data_used == 0
             && self.control_reserved == 0
             && self.control_used == 0
-            && self.result_credit.held_bytes() == 0
     }
 
     pub(crate) fn next_id(&mut self) -> Result<u64, WorkError> {
@@ -351,30 +341,6 @@ impl State {
             .checked_add(1)
             .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(self.next_id)
-    }
-
-    pub(crate) fn next_protocol_waiter_id(&mut self) -> Result<u64, WorkError> {
-        self.next_protocol_waiter_id = self
-            .next_protocol_waiter_id
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(self.next_protocol_waiter_id)
-    }
-
-    pub(crate) fn next_decode_waiter_id(&mut self) -> Result<u64, WorkError> {
-        self.next_decode_waiter_id = self
-            .next_decode_waiter_id
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(self.next_decode_waiter_id)
-    }
-
-    pub(crate) fn next_result_fetch_waiter_id(&mut self) -> Result<u64, WorkError> {
-        self.next_result_fetch_waiter_id = self
-            .next_result_fetch_waiter_id
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(self.next_result_fetch_waiter_id)
     }
 
     pub(crate) fn collect(&mut self, mut id: WorkId) {
@@ -410,27 +376,6 @@ impl State {
     }
 }
 
-pub(crate) struct ResultWaiter {
-    pub scope: WorkId,
-    pub bytes: u64,
-}
-
-#[derive(Default)]
-pub(crate) struct ResourceWaiters {
-    pub generic: BTreeSet<(WorkId, ResourceClass)>,
-    pub result_fetch: BTreeMap<u64, ResultWaiter>,
-    pub result_fetch_by_scope: BTreeMap<WorkId, u64>,
-    pub decode: BTreeMap<u64, ResultWaiter>,
-    pub decode_by_scope: BTreeMap<WorkId, u64>,
-    pub protocol: BTreeMap<u64, ResultWaiter>,
-}
-
-impl ResourceWaiters {
-    pub(crate) fn len(&self) -> usize {
-        self.generic.len() + self.result_fetch.len() + self.decode.len() + self.protocol.len()
-    }
-}
-
 pub(crate) struct Inner {
     pub config: WorkloadConfig,
     pub resource_config: ResourceConfig,
@@ -452,9 +397,8 @@ impl Inner {
         result
     }
 
-    /// Mutate accounting facts that cannot make a capacity waiter runnable.
-    /// Result packet state transitions use this path while capacity is held or
-    /// reduced, avoiding a process-wide waiter wakeup for every packet step.
+    /// Mutate reservation and allocation facts without waking capacity waiters.
+    /// Capacity release separately notifies waiters after the actual holder exits.
     pub(crate) fn update_facts_silent<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.state.lock().unwrap();
         let result = f(&mut state);

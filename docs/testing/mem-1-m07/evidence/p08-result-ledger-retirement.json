@@ -1,0 +1,47 @@
+{
+  "status": "PASS_COMPONENT_RESULT_LEDGER_RETIRED_P08_PARTIAL",
+  "base_revision": "4d519f120",
+  "changes": [
+    "Deleted ResultCredit/Stage/Snapshot/ReservationError and all result-fetch/decode/protocol wait registrations, FIFOs, counters, error variants and public exports.",
+    "Deleted result-credit observations from workload snapshots and FE lifecycle. Generic resource reservation/allocation/wait/control ledgers remain.",
+    "Removed 22 obsolete ledger helper/test functions; generic exact-scope authority, allocation, cancellation, timeout, control and cleanup tests remain.",
+    "BE process/retained result protections are unchanged. Query/Frontend/MySQL already consume the original full-window path before this deletion."
+  ],
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-result-ledger-retirement-tests-v1.log",
+      "sha256": "cf351e221437d85a470eb4132d122dee1caaaf5743442767ed01bb43cf645a22",
+      "result": [
+        "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s",
+        "test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-result-ledger-worker-tests.log",
+      "sha256": "d82e891383c9e38d8b4788be00e17c6050e1efd3d67e5cca740ce4671cd6b8a8",
+      "result": [
+        "test result: ok. 318 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-result-ledger-native-tests.log",
+      "sha256": "00f73d562cf04ac4594f3f9e4125a79e1bd5231bbda4d80e91e3840b12b30bc6",
+      "result": [
+        "test result: ok. 718 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.36s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-result-ledger-fe-lifecycle-tests.log",
+      "sha256": "95d1b59039a90cdeab22a291d4f206795135ada863840591d0e16c39dd770b16",
+      "result": [
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1444 filtered out; finished in 0.01s"
+      ]
+    }
+  ],
+  "remaining": [
+    "FE resource handle plumbing, obsolete config and unfrozen carrier metadata",
+    "Clean C0/native convergence after next slice",
+    "P00b measured transport coefficients, P09/P10 and final same-HEAD evidence"
+  ]
+}
