@@ -46,8 +46,8 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_v3;
 
 -- query 4
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
--- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE writes an operation=delete snapshot.
 TRUNCATE TABLE ${case_db}.t_v3;
@@ -83,8 +83,8 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_v2;
 
 -- query 11
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
--- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 TRUNCATE TABLE ${case_db}.t_v2;
 
@@ -113,8 +113,8 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_empty;
 
 -- query 17
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
--- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE on empty still writes a delete snapshot (audit-trail entry).
 TRUNCATE TABLE ${case_db}.t_empty;
@@ -161,8 +161,8 @@ SELECT id, v FROM ${case_db}.t_branch
 
 -- query 26
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
--- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE only the dev branch.
 TRUNCATE TABLE ${case_db}.t_branch.branch_dev;
@@ -206,8 +206,8 @@ SELECT id, v FROM ${case_db}.t_dv ORDER BY id;
 
 -- query 34
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
--- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE must mark both data files and delete-content files as DELETED.
 TRUNCATE TABLE ${case_db}.t_dv;
