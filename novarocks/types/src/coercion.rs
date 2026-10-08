@@ -173,8 +173,9 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::Decimal256(p1, s1), DataType::Decimal256(p2, s2)) => {
             wider_decimal_type(*p1, *s1, true, *p2, *s2, true)
         }
-        // Decimal + Integer -> Decimal. Keep the existing decimal metadata;
-        // integer literal narrowing happens before this common-type step.
+        // Decimal + Integer -> Decimal with room for both integer ranges.
+        // Literal narrowing has already selected the integer width; copying
+        // only the decimal metadata could understate a mixed array's precision.
         (
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
@@ -183,11 +184,11 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
         ) => match (a, b) {
-            (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => {
-                DataType::Decimal128(*p, *s)
+            (DataType::Decimal128(p, s), integer) | (integer, DataType::Decimal128(p, s)) => {
+                wider_decimal_type(*p, *s, false, integer_decimal_precision(integer), 0, false)
             }
-            (DataType::Decimal256(p, s), _) | (_, DataType::Decimal256(p, s)) => {
-                DataType::Decimal256(*p, *s)
+            (DataType::Decimal256(p, s), integer) | (integer, DataType::Decimal256(p, s)) => {
+                wider_decimal_type(*p, *s, true, integer_decimal_precision(integer), 0, false)
             }
             _ => unreachable!(),
         },
@@ -217,6 +218,16 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::Int32, _) | (_, DataType::Int32) => DataType::Int64,
         (DataType::Int16, _) | (_, DataType::Int16) => DataType::Int16,
         _ => a.clone(),
+    }
+}
+
+fn integer_decimal_precision(data_type: &DataType) -> u8 {
+    match data_type {
+        DataType::Int8 => 3,
+        DataType::Int16 => 5,
+        DataType::Int32 => 10,
+        DataType::Int64 => 19,
+        _ => unreachable!("only signed integer carriers need decimal range widening"),
     }
 }
 
@@ -899,6 +910,25 @@ mod tests {
     fn wider_type_float32_vs_decimal_returns_float64() {
         let result = wider_type(&DataType::Float32, &DataType::Decimal128(18, 6));
         assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn mixed_decimal_integer_common_type_covers_the_integer_range() {
+        for (integer, precision) in [
+            (DataType::Int8, 4),
+            (DataType::Int16, 6),
+            (DataType::Int32, 11),
+            (DataType::Int64, 20),
+        ] {
+            let decimal = DataType::Decimal128(2, 1);
+            let expected = DataType::Decimal128(precision, 1);
+            assert_eq!(wider_type(&decimal, &integer), expected);
+            assert_eq!(wider_type(&integer, &decimal), expected);
+        }
+        assert_eq!(
+            wider_type(&DataType::Decimal128(38, 37), &DataType::Int64),
+            DataType::Decimal256(56, 37)
+        );
     }
 
     #[test]

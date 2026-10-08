@@ -6529,6 +6529,37 @@ mod tests {
         )
     }
 
+    #[test]
+    fn mixed_decimal_array_literal_freezes_precision_for_every_integer() {
+        for sql in [
+            "SELECT [123, NULL, 1.0]",
+            "SELECT [1.0, NULL, 123]",
+            "SELECT [NULL, 123, 1.0]",
+        ] {
+            let expression = analyze_projection_expr(sql).expect("analyze mixed array literal");
+            let DataType::List(element) = &expression.data_type else {
+                panic!("mixed array literal must produce a list");
+            };
+            assert_eq!(element.data_type(), &DataType::Decimal128(4, 1), "{sql}");
+            assert!(element.is_nullable(), "{sql}");
+            let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
+                panic!("array literal must retain its exact function binding");
+            };
+            for (arg, selected) in args.iter().zip(&binding.selected.argument_types) {
+                let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
+                    panic!("array literal arguments are values");
+                };
+                assert_eq!(selected.data_type, arg.data_type, "{sql}");
+            }
+            let novarocks_functions::FunctionResultType::Scalar(selected) =
+                &binding.selected.result_type
+            else {
+                panic!("array literal produces one scalar container value");
+            };
+            assert_eq!(selected.data_type, expression.data_type, "{sql}");
+        }
+    }
+
     fn analyze_projection_expr_with_function_catalog(
         sql: &str,
         function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
@@ -8975,7 +9006,7 @@ mod tests {
                 "SELECT {outer} k AS merged FROM (SELECT {inner} CAST(1 AS DECIMAL(3,0)) k) l FULL OUTER JOIN (SELECT {inner} CAST(1000 AS BIGINT) k) r USING(k)"
             );
             let typed = analyze_projection_expr(&sql).unwrap();
-            assert_eq!(typed.data_type, DataType::Decimal128(3, 0));
+            assert_eq!(typed.data_type, DataType::Decimal128(19, 0));
             let ExprKind::FunctionCall {
                 name,
                 args,
@@ -8994,9 +9025,19 @@ mod tests {
                     .iter()
                     .all(|arg| matches!(arg,
                 novarocks_functions::FunctionArgumentType::Value(value)
-                    if value.data_type == DataType::Decimal128(3, 0)))
+                    if value.data_type == DataType::Decimal128(19, 0)))
             );
-            assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
+            let ExprKind::Cast {
+                expr,
+                target,
+                decimal_overflow_policy,
+            } = &args[0].kind
+            else {
+                panic!("expected widening decimal cast: {sql}")
+            };
+            assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
+            assert_eq!(*target, DataType::Decimal128(19, 0));
+            assert_eq!(*decimal_overflow_policy, expected);
             let ExprKind::Cast {
                 expr,
                 target,
@@ -9007,7 +9048,7 @@ mod tests {
             };
             assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
             assert_eq!(expr.data_type, DataType::Int64);
-            assert_eq!(*target, DataType::Decimal128(3, 0));
+            assert_eq!(*target, DataType::Decimal128(19, 0));
             assert_eq!(*decimal_overflow_policy, expected, "{sql}");
         }
     }
