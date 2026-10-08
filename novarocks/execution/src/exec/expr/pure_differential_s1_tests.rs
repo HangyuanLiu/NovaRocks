@@ -18,7 +18,9 @@
 //! S1 calendar owner differential evidence against the original v1 algorithms.
 
 use super::generate::{InputGenerator, InputProfile, TextProfile};
-use super::{ScalarDiffSpec, assert_scalar_matches_v1};
+use super::{
+    DifferentialFailure, ScalarDiffSpec, assert_scalar_matches_v1, run_scalar_differential,
+};
 use arrow::array::{
     ArrayRef, Date32Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
@@ -838,5 +840,158 @@ fn pure_differential_s1_month_year_consistent_profiles_generated_inputs() {
                     .column(Arc::clone(&intervals)),
             );
         }
+    }
+}
+#[test]
+fn pure_differential_s1_duration_all_consistent_declared_profiles() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(-366),
+        Some(-31),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(31),
+        Some(366),
+        None,
+    ]));
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        for source in [
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(0),
+                Some(0),
+                Some(-1),
+                None,
+                Some(1),
+                Some(0),
+                Some(0),
+                Some(0),
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("2024-02-29 12:34:56.123456"),
+                Some("0000-01-01"),
+                Some("9999-12-31 23:59:59.999999"),
+                None,
+                Some("invalid"),
+                Some("2024-02-29"),
+                Some("2023-01-31"),
+                Some("invalid"),
+            ])),
+        ] {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_duration_consistent_profiles_have_nonnull_and_constant_broadcast_coverage()
+{
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        for source in [
+            Arc::new(TimestampMicrosecondArray::from(vec![0; 8])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["2024-02-29 12:34:56.123456"; 8])),
+        ] {
+            let interval: ArrayRef = Arc::new(Int64Array::from(vec![1; 8]));
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .typed_column(
+                        FunctionValueType::new(source.data_type().clone(), false),
+                        Arc::clone(&source),
+                    )
+                    .typed_column(
+                        FunctionValueType::new(DataType::Int64, false),
+                        Arc::clone(&interval),
+                    ),
+            );
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .constant_rows(8)
+                    .constant_array(source.slice(0, 1))
+                    .constant_array(interval.slice(0, 1)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_duration_consistent_profiles_generated_inputs() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(
+        (0..256)
+            .map(|row| {
+                if row % 11 == 0 {
+                    None
+                } else {
+                    Some(row as i64 - 128)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        for source in temporal_sources(0xD042)
+            .into_iter()
+            .filter(|source| source.data_type() != &DataType::Date32)
+        {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_duration_date32_declared_carrier_drift_is_refused_by_name() {
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        let source: ArrayRef = Arc::new(arrow::array::Date32Array::from(vec![Some(0), None]));
+        let interval: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(1)]));
+        let failure =
+            run_scalar_differential(&ScalarDiffSpec::new(name).column(source).column(interval))
+                .expect_err("the legacy Date32 carrier drift must be refused");
+        let DifferentialFailure::Specialization(message) = failure else {
+            panic!("{name}: expected exact profile preparation refusal, got {failure}");
+        };
+        assert!(message.contains(name), "{message}");
+        assert!(
+            message.contains("legacy duration shift returns Timestamp(Microsecond, None)"),
+            "{message}"
+        );
     }
 }

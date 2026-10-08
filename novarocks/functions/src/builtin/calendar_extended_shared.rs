@@ -18,6 +18,8 @@
 //! One selected calendar computation used by canonical owners and legacy arena shells.
 //! Legacy projection preserves its existing raw carrier and diagnostic surface.
 
+pub use super::calendar_duration::CalendarDurationShift;
+
 use super::{
     calendar_extended::{self, CalendarCarrierError, CalendarExtendedOp},
     calendar_extended_parse::CalendarParseOp,
@@ -84,6 +86,7 @@ pub enum CalendarOperation {
     TimestampDiff,
     DaysShift(i64),
     MonthsShift(i32),
+    DurationShift(CalendarDurationShift),
     Timestamp,
     WeeksDiff,
     HoursDiff,
@@ -103,6 +106,7 @@ impl CalendarOperation {
             Self::TimestampDiff => CalendarExtendedOp::TimestampDiff,
             Self::DaysShift(factor) => CalendarExtendedOp::DaysShift(factor),
             Self::MonthsShift(factor) => CalendarExtendedOp::MonthsShift(factor),
+            Self::DurationShift(operation) => CalendarExtendedOp::DurationShift(operation),
             Self::Timestamp => CalendarExtendedOp::Timestamp,
             Self::WeeksDiff => CalendarExtendedOp::WeeksDiff,
             Self::HoursDiff => CalendarExtendedOp::HoursDiff,
@@ -168,10 +172,12 @@ pub fn evaluate_legacy_calendar(
     let arguments_view: Vec<_> = arguments
         .iter()
         .map(|argument| {
-            // The original day/week family explicitly broadcasts a one-row child.
+            // The original interval families explicitly broadcast a one-row child.
             if matches!(
                 operation,
-                CalendarOperation::DaysShift(_) | CalendarOperation::MonthsShift(_)
+                CalendarOperation::DaysShift(_)
+                    | CalendarOperation::MonthsShift(_)
+                    | CalendarOperation::DurationShift(_)
             ) && argument.len() == 1
             {
                 EvaluatedArgument::Scalar(argument)
@@ -187,7 +193,9 @@ pub fn evaluate_legacy_calendar(
             argument.len() >= rows
                 || (matches!(
                     operation,
-                    CalendarOperation::DaysShift(_) | CalendarOperation::MonthsShift(_)
+                    CalendarOperation::DaysShift(_)
+                        | CalendarOperation::MonthsShift(_)
+                        | CalendarOperation::DurationShift(_)
                 ) && argument.len() == 1),
             "legacy calendar row out of bounds"
         );
@@ -195,7 +203,9 @@ pub fn evaluate_legacy_calendar(
     let target = FunctionValueType::new(output_type.clone(), true);
     let carrier = if matches!(
         operation,
-        CalendarOperation::Timestamp | CalendarOperation::MonthsShift(_)
+        CalendarOperation::Timestamp
+            | CalendarOperation::MonthsShift(_)
+            | CalendarOperation::DurationShift(_)
     ) || (matches!(
         operation,
         CalendarOperation::Trunc | CalendarOperation::StrToDate | CalendarOperation::DaysShift(_)

@@ -51,6 +51,31 @@ pub(super) fn operation(name: &str) -> Option<CalendarExtendedOp> {
         "months_sub" => Some(CalendarExtendedOp::MonthsShift(-1)),
         "years_add" => Some(CalendarExtendedOp::MonthsShift(12)),
         "years_sub" => Some(CalendarExtendedOp::MonthsShift(-12)),
+        "seconds_add" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::SecondsAdd,
+        )),
+        "seconds_sub" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::SecondsSub,
+        )),
+        "minutes_add" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::MinutesAdd,
+        )),
+        "minutes_sub" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::MinutesSub,
+        )),
+        "hours_add" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::HoursAdd,
+        )),
+        "hours_sub" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::HoursSub,
+        )),
+        "microseconds_add" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::MicrosecondsAdd,
+        )),
+        "microseconds_sub" => Some(CalendarExtendedOp::DurationShift(
+            super::calendar_duration::CalendarDurationShift::MicrosecondsSub,
+        )),
+
         "date_format" => Some(CalendarExtendedOp::DateFormat),
         "str_to_date" => Some(CalendarExtendedOp::Parse(
             super::calendar_extended_parse::CalendarParseOp::StrToDate,
@@ -101,6 +126,7 @@ pub(super) fn effects(operation: CalendarExtendedOp) -> FunctionEffectDeclaratio
             CalendarExtendedOp::Trunc
                 | CalendarExtendedOp::DaysShift(_)
                 | CalendarExtendedOp::MonthsShift(_)
+                | CalendarExtendedOp::DurationShift(_)
         ) {
             FunctionNullBehavior::CalledOnNull
         } else {
@@ -323,6 +349,14 @@ impl PureScalarImplementation for CalendarExtendedOwner {
             {
                 return Err(invalid(&format!(
                     "{} rejects declared Date32 result: legacy month shift returns Timestamp(Microsecond, None)",
+                    self.declaration.function_id().as_str()
+                )));
+            }
+            if matches!(self.operation, CalendarExtendedOp::DurationShift(_))
+                && contract.result_type().data_type == arrow_schema::DataType::Date32
+            {
+                return Err(invalid(&format!(
+                    "{} rejects declared Date32 result: legacy duration shift returns Timestamp(Microsecond, None)",
                     self.declaration.function_id().as_str()
                 )));
             }
