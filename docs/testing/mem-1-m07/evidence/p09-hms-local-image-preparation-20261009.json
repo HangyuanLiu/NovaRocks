@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "source_revision": "b6f8c2df6fdc8213b13328e68b58562122cfffdc",
+  "base_image_id": "sha256:c0b241c544d341c16a6d8cafcb801a071be9b02054a5add255e9a0e826095e88",
+  "task_image_tag": "novarocks/mem-1-m07-hive:20261009",
+  "network": "none",
+  "pull": false,
+  "recipe_derivation": "Exact current repository Dockerfile, verified local FROM tag; resulting layer prefix and before/after base identity checked",
+  "inputs": [
+    {
+      "path": "docker/iceberg-hive/Dockerfile",
+      "sha256": "cf5232ef636ddda7d12e47543abf77133a7c6363d3ee5fd66dffe5e7e2539368"
+    },
+    {
+      "path": "docker/iceberg-hive/core-site.xml",
+      "sha256": "b55efd2c1d9b75b2af1a95320c5670bbeecb430666c4b3966c4ccb9350dc7948"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-image-preparation-v2-20261009/Dockerfile",
+      "sha256": "cf5232ef636ddda7d12e47543abf77133a7c6363d3ee5fd66dffe5e7e2539368"
+    }
+  ],
+  "shared_alias_changed": false,
+  "command": [
+    "/Applications/Docker.app/Contents/Resources/bin/docker",
+    "build",
+    "--pull=false",
+    "--network=none",
+    "--platform",
+    "linux/arm64",
+    "--label",
+    "novarocks.task=mem-1-m07-hms-preparation",
+    "-t",
+    "novarocks/mem-1-m07-hive:20261009",
+    "-f",
+    "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-hms-image-preparation-v2-20261009/Dockerfile",
+    "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-hive"
+  ],
+  "build_exit_code": 0,
+  "image_id": "sha256:b748d30841d84294c2c2f0e0f9115adb65080695c09861beb58dbd10c18ea2fc",
+  "verified_base_layers": [
+    "sha256:e4f85c7c2b1fddac675cb2be9672426c32293e7a509e2c2e6a198394aa46bbd1",
+    "sha256:392801f05f0298b8272706f62f9a039a660e1d8e9809311e4628884e7540fa93",
+    "sha256:feb0ebe31d6d69cdad312d72d15b110c1aad28aa43b53a72e9a79a467da8a92f",
+    "sha256:29cdb5c3b4d29c2c25cfab2e86e3a0936ed56339008888553330e3ec94cb7a5e",
+    "sha256:2cb439d814b633f99ffa07465de0673ff8fbca2d1f82190877638b3588329e6a",
+    "sha256:4fa1e783ec7e925e8d176f2721801b0879e25821939dcb525701a662d65adfb7",
+    "sha256:b02d2fd52fa5a9416e3e5f070647812d58b2755d92e98f6e584a6c39c00aa095",
+    "sha256:23089f2e6b61665c9bb860f0f7c66629fd89fcc21d0503a48486b838197b79a8",
+    "sha256:c6048a9e1bb745c932f6101f89377d45164c6003c6cf713306cf79a7a17985c1",
+    "sha256:ccf1ea12dc6fd89680cf2d88dad2202ea1911a748f722e81e3a4381365b793ae",
+    "sha256:e59844dd69ed0a3e775b1e25795335ffa3eac86e99c5c2124e19f6eb6da68f3e",
+    "sha256:b823fcf19b8d8b1837e17865f78ae59375f927b577dc2c9088cc8c76117df638",
+    "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+  ],
+  "permissions_exit_code": 0,
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-hms-image-preparation-v2-20261009/build.log",
+      "sha256": "87b091d97e7f8f143bd7a861142ed84f3fbc69c7da96e0e7fb8a2bb7a66c9325"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-image-preparation-v2-20261009/permissions.log",
+      "sha256": "2921f6397bfd22c613c9a92f948a2e862104509d152dfb5a140f18d4f668f2ec"
+    }
+  ],
+  "existing_shared_hms_alias_identity": "sha256:13141e78e650347b9c78eb39e8bd86653fc1735ad50ec616c4289f435a20de42",
+  "interrupted_digest_recipe_attempt": {
+    "path": "logs/mem-1-m07/p09-hms-image-preparation-20261009/receipt.json",
+    "sha256": "f6017c411dc05e9dc80bfb6eb8b04b9a009a5bfc7fb0ac3b3806fb9dc270c9ab",
+    "exit_code": 130,
+    "reason": "Stopped exact task BuildKit process while remote digest metadata lookup stalled; no task image produced in this attempt."
+  }
+}
