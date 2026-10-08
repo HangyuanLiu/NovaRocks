@@ -114,3 +114,11 @@ P04 本地出站HPACK表上限已完成切片；[收据](evidence/p04-h2-send-he
 - resident S+8：连续两次W=2/producer guard exited/task退休/End未ACK；KILL仅0.789ms，101ms后观察Client=0/Closing=1；恢复得到完整1048580B行、5packets、独立digest/schema一致、ERR1317。同socket SUM精确5050/native task counter总增2。
 - missing-tail17MiB：W=2/payload2S/producer仍running/End未发布，KILL后收到655360B行前缀、零完整行并真实EOF；后续同socket查询zero wire/schema/row/packet、EOF且三BE task counter完全不变。KILL仅0.755ms。该行为不证明FE parser未收到命令，不外推具体framing cursor/partial-tail/fullpool/allocator最后退出。
 - 定向runner101 PASS/0 FAIL/2既有ignored；上一个产品切片C0为9695源码12280/0/7，当前test-only增量不冒充final同HEAD C0。ACK-only、small/large精确partial矩阵、满池、real CL、CM/CP/P00b/P10/final及两项待裁决语义继续OPEN，无push/PR/归档。
+
+
+### 2026-10-09：P09 installed-root ACK/replay 冻结，native 待执行
+
+- 新 `installed-root-protocol-freeze-v1.json` 依附准确原S+8 retention输入：解析三BE fresh TaskCreateApplied完整typed identities，仅允许同一execution、无重复、occupied BE最多8候选；零ACK路由必须定位恰一个真实installed root，其余仅exact UnknownRoot/status5/零DATA。不猜stage/task或假定单task，不加产品marker/registry。
+- ZeroAck场景两次ACK0/no-retirement后恢复正常wire独立oracle。FinalAck独立协议干扰场景真实fetch Data1(S)/Data2(8B+End3/rows1)、replay1摘要/元数据等价、实际End3后ACK3两次、Retired1，逐步fresh census要求context持有/producer exited、最后Data0/payload0/EndACK1；随后KILL/resume/save事实wire，不宣称正常结果或physical-last-alias。
+- Whole probe链5s，实际BE上游认证plaintext/IP；请求frame4KiB/累计响应DATA≤S+4096，逐块释放h2 flow-control。严格唯一application/grpc、有DATA成功仅final trailer0、重复status拒绝、单未压缩message，使用生产task-codec解码与实际proven watermark，不设无限上界。Busy/Preparing/其它状态直接FAIL不重试。失败仍resume/join/savewire。
+- runner all-target111 PASS/0 FAIL/2既有ignored；10个helper负例覆盖实际身份/候选与response结构。独立只读复核重算native prefix与Data1/Data2摘要，并修正content-type/status位置宽松点。生产配置/容量/deadline未改；P09其它门/两个裁决/P00b/P10/final仍OPEN，无push/PR/归档。

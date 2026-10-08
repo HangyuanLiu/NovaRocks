@@ -28,6 +28,7 @@ mod query_output;
 mod result_delivery;
 mod result_delivery_baseline;
 mod result_delivery_closing;
+mod result_delivery_root_protocol;
 mod runtime_filter;
 mod state_family;
 mod table_maintenance;

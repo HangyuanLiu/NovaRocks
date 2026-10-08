@@ -1,0 +1,24 @@
+{
+  "task": "MEM-1-M07",
+  "stage": "P09 installed-root zero ACK/replay/final ACK protocol probe",
+  "outcome": "focused-passed-native-pending",
+  "source_parent": "064212bb1ea177a93ba33adce0b32ac6b9407c44",
+  "source_dirty": true,
+  "tests": {
+    "system_runner_all_targets": {
+      "passed": 111,
+      "failed": 0,
+      "ignored": 2
+    }
+  },
+  "input": {
+    "path": "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json",
+    "sha256": "aed1b7c70236be9fca6c870d6bca4963b4b637e7ab9c56d1b254c96d0b0f9564"
+  },
+  "scope": "Installed-root exact identity from fresh exact TaskCreateApplied identities in one execution, up to eight candidates on the occupied BE. ACK0 routing must identify exactly one typed installed root; other candidates must be exact unknown-context-root refusals. Zero ACK twice preserves logical root and normal wire. Separate protocol-interference case offers/replays actual Data1/Data2+End3, ACKs actually observed End twice, proves Retired and context-held logical retirement then KILL/resume/save factual wire. Does not claim normal wire after interference or last-alias/allocator exit.",
+  "raw_log": {
+    "path": "logs/mem-1-m07/p09-installed-root-runner-tests-20261009.log",
+    "sha256": "f921e3682d36c8a7f6f42322f449699bbf0139e9305f037170e71dd95614cd28"
+  },
+  "independent_review": "Read-only p07 integration review recomputed exact native body digests, verified proven ACK frontier, strict gRPC framing and error cleanup after fixes; no blocker."
+}

@@ -16,7 +16,7 @@
 // under the License.
 
 use super::result_delivery_baseline::await_idle;
-use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation};
+use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation, TextResultObservation};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::ServerHandle;
@@ -58,7 +58,9 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         )),
         Box::new(WireBoundary("result-delivery/large-row-cross-u24")),
         Box::new(RootReadRefusal),
-        Box::new(ContextRootRetention),
+        Box::new(ContextRootRetention(RootProtocolMode::None)),
+        Box::new(ContextRootRetention(RootProtocolMode::ZeroAck)),
+        Box::new(ContextRootRetention(RootProtocolMode::FinalAck)),
     ]
 }
 
@@ -444,11 +446,23 @@ pub(super) fn root_census(rows: &[serde_json::Value]) -> Result<Option<BTreeMap<
         .map(Some)
 }
 
-struct ContextRootRetention;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootProtocolMode {
+    None,
+    ZeroAck,
+    FinalAck,
+}
+struct ContextRootRetention(RootProtocolMode);
 
 impl Scenario for ContextRootRetention {
     fn name(&self) -> &'static str {
-        "result-delivery/producer-exit-context-retention"
+        match self.0 {
+            RootProtocolMode::None => "result-delivery/producer-exit-context-retention",
+            RootProtocolMode::ZeroAck => "result-delivery/installed-root-zero-ack-normal-wire",
+            RootProtocolMode::FinalAck => {
+                "result-delivery/installed-root-replay-final-ack-interference"
+            }
+        }
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -487,6 +501,10 @@ impl Scenario for ContextRootRetention {
             manifest.mysql_client_max_packet_bytes,
             manifest.client_receive_buffer_bytes,
         ))?;
+        let connection_id = stream.connection_id()?;
+        let before_logs = (0..3)
+            .map(|index| context.handle().be_log_contents(index))
+            .collect::<Result<Vec<_>>>()?;
         let applied = stream
             .receive_buffer_bytes()
             .context("missing applied client receive buffer")?;
@@ -589,6 +607,28 @@ impl Scenario for ContextRootRetention {
                 );
                 consecutive = if matches { consecutive + 1 } else { 0 };
                 if consecutive == 2 {
+                    if self.0 != RootProtocolMode::None {
+                        let occupied_be = roots
+                            .iter()
+                            .position(|root| {
+                                root.as_ref().is_some_and(|root| root["channels"] == 1)
+                            })
+                            .context("held root has no exact backend")?;
+                        installed_root_protocol(context, &before_logs, occupied_be, self.0, &job)?;
+                        if self.0 == RootProtocolMode::FinalAck {
+                            let kill_deadline = Instant::now()
+                                + context
+                                    .remaining("interference KILL")?
+                                    .min(Duration::from_secs(2));
+                            context
+                                .handle()
+                                .kill_query_until(connection_id, kill_deadline)?;
+                            ensure!(
+                                Instant::now() < kill_deadline,
+                                "interference KILL exceeded deadline"
+                            );
+                        }
+                    }
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(manifest.phase_sample_interval_ms));
@@ -605,16 +645,24 @@ impl Scenario for ContextRootRetention {
             serde_json::to_vec_pretty(&observation)?,
         )?;
         held?;
-        ensure!(
-            observation.error.is_none()
-                && observation.columns == manifest.expected_columns
-                && observation.schema == manifest.expected_schema
-                && observation.rows == manifest.expected_rows
-                && observation.row_payload_bytes == manifest.expected_row_payload_bytes
-                && observation.packets == manifest.expected_packets
-                && observation.row_sha256 == manifest.expected_row_sha256,
-            "resumed client bytes differ from independent frozen oracle"
-        );
+        if self.0 != RootProtocolMode::FinalAck {
+            ensure!(
+                observation.error.is_none()
+                    && observation.columns == manifest.expected_columns
+                    && observation.schema == manifest.expected_schema
+                    && observation.rows == manifest.expected_rows
+                    && observation.row_payload_bytes == manifest.expected_row_payload_bytes
+                    && observation.packets == manifest.expected_packets
+                    && observation.row_sha256 == manifest.expected_row_sha256,
+                "resumed client bytes differ from independent frozen oracle"
+            );
+        } else {
+            ensure!(
+                observation.columns == manifest.expected_columns
+                    && observation.schema == manifest.expected_schema,
+                "protocol interference wire metadata changed"
+            );
+        }
         await_idle(context, "root-retention", "after", epoch)?;
         context.record_phase_observation(
             "producer-retired-context-held-root",
@@ -632,6 +680,247 @@ impl Scenario for ContextRootRetention {
         )?;
         Ok(())
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledProtocolManifest {
+    schema_version: u32,
+    topology: String,
+    scope: String,
+    retention_input_sha256: String,
+    phase_ms: u64,
+    request_frame_bytes: usize,
+    response_data_bytes: usize,
+    max_identity_candidates: usize,
+    data1_sha256: String,
+    data2_sha256: String,
+    data1_bytes: usize,
+    data2_bytes: usize,
+    end_sequence: u64,
+    output_rows: u64,
+    operations: Vec<String>,
+    cases: Vec<String>,
+}
+
+fn installed_root_protocol(
+    context: &mut ScenarioContext,
+    before_logs: &[String],
+    backend: usize,
+    mode: RootProtocolMode,
+    job: &tokio::task::JoinHandle<TextResultObservation>,
+) -> Result<()> {
+    use novarocks_execution_contract::root_result::RootReadOutcome;
+    use sha2::{Digest, Sha256};
+    let freeze: InstalledProtocolManifest = serde_json::from_str(include_str!(
+        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json"
+    ))?;
+    let retention_digest = format!(
+        "{:x}",
+        Sha256::digest(include_bytes!(
+            "../../../../docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json"
+        ))
+    );
+    ensure!(
+        freeze.schema_version == 1
+            && freeze.topology == "1FE+3BE"
+            && !freeze.scope.is_empty()
+            && freeze.retention_input_sha256 == retention_digest
+            && freeze.phase_ms == 5000
+            && freeze.max_identity_candidates == 8
+            && freeze.request_frame_bytes == 4096
+            && freeze.response_data_bytes == 1048576 + 4096
+            && freeze.data1_bytes == 1048576
+            && freeze.data2_bytes == 8
+            && freeze.end_sequence == 3
+            && freeze.output_rows == 1
+            && freeze.cases
+                == [
+                    "result-delivery/installed-root-zero-ack-normal-wire",
+                    "result-delivery/installed-root-replay-final-ack-interference"
+                ]
+            && freeze.operations
+                == [
+                    "ack0",
+                    "ack0",
+                    "fetch1",
+                    "fetch2-end3",
+                    "replay1",
+                    "ack3",
+                    "ack3",
+                    "retired1"
+                ],
+        "unsupported installed-root protocol freeze"
+    );
+    let deadline = Instant::now() + Duration::from_millis(freeze.phase_ms);
+    let after_logs = (0..3)
+        .map(|index| context.handle().be_log_contents(index))
+        .collect::<Result<Vec<_>>>()?;
+    let candidates = super::result_delivery_root_protocol::parse_created_task_candidates(
+        before_logs,
+        &after_logs,
+        backend,
+    )?;
+    ensure!(
+        candidates.len() <= freeze.max_identity_candidates,
+        "root identity candidates exceeded freeze"
+    );
+    let mut observations = Vec::new();
+    let mut installed = None;
+    for candidate in candidates {
+        ensure!(
+            Instant::now() < deadline && !job.is_finished(),
+            "root discovery expired or actor exited"
+        );
+        let request = proto::FetchRootResultRequest {
+            root_task: Some(candidate.clone()),
+            profile_id: 1,
+            output_kind: Some(result_proto::RootOutputKind {
+                kind: Some(result_proto::root_output_kind::Kind::ClientRows(true)),
+            }),
+            wanted_sequence: None,
+            consumed_sequence: 0,
+            max_wait_millis: 0,
+        };
+        let (reply, mut observation) = super::result_delivery_root_protocol::probe_candidate(
+            context, backend, &request, 0, deadline,
+        )?;
+        observation["operation"] = serde_json::json!("discover-exact-root-by-zero-ack");
+        observations.push(observation);
+        std::fs::write(
+            context.scenario_root().join("installed-root-protocol.json"),
+            serde_json::to_vec_pretty(&observations)?,
+        )?;
+        if let Some(reply) = reply {
+            ensure!(
+                matches!(reply.outcome, RootReadOutcome::AckOnly) && reply.accepted_consumed == 0,
+                "root discovery changed or did not acknowledge the zero frontier"
+            );
+            ensure!(installed.is_none(), "more than one actual task owns a root");
+            installed = Some(candidate);
+        }
+    }
+    let task = installed.context("no actual task identity routes to the held installed root")?;
+    let mut proven = 0;
+    let count = if mode == RootProtocolMode::ZeroAck {
+        2
+    } else {
+        freeze.operations.len()
+    };
+    for (index, operation) in freeze.operations.iter().take(count).enumerate() {
+        ensure!(
+            Instant::now() < deadline && !job.is_finished(),
+            "installed-root protocol phase expired or actor exited"
+        );
+        let (wanted, consumed) = match operation.as_str() {
+            "ack0" => (None, 0),
+            "fetch1" | "replay1" => (Some(1), 0),
+            "fetch2-end3" => (Some(2), 0),
+            "ack3" => (None, proven),
+            "retired1" => (Some(1), proven),
+            _ => anyhow::bail!("unknown frozen root operation"),
+        };
+        let request = proto::FetchRootResultRequest {
+            root_task: Some(task.clone()),
+            profile_id: 1,
+            output_kind: Some(result_proto::RootOutputKind {
+                kind: Some(result_proto::root_output_kind::Kind::ClientRows(true)),
+            }),
+            wanted_sequence: wanted,
+            consumed_sequence: consumed,
+            max_wait_millis: 0,
+        };
+        let (reply, mut observation) = super::result_delivery_root_protocol::probe(
+            context, backend, &request, proven, deadline,
+        )?;
+        let matches = match (&reply.outcome, operation.as_str()) {
+            (RootReadOutcome::AckOnly, "ack0") => reply.accepted_consumed == 0,
+            (RootReadOutcome::AckOnly, "ack3") => {
+                proven == freeze.end_sequence && reply.accepted_consumed == proven
+            }
+            (RootReadOutcome::Retired, "retired1") => {
+                proven == freeze.end_sequence && reply.accepted_consumed == proven
+            }
+            (RootReadOutcome::Data(data), "fetch1" | "replay1") => {
+                let digest = format!("{:x}", Sha256::digest(data.body()));
+                data.sequence().get() == 1
+                    && data.end_after_data().is_none()
+                    && data.body().len() == freeze.data1_bytes
+                    && digest == freeze.data1_sha256
+                    && reply.accepted_consumed == 0
+            }
+            (RootReadOutcome::Data(data), "fetch2-end3") => {
+                let end = data
+                    .end_after_data()
+                    .context("frozen final Data has no End")?;
+                let matches = data.sequence().get() == 2
+                    && data.body().len() == freeze.data2_bytes
+                    && format!("{:x}", Sha256::digest(data.body())) == freeze.data2_sha256
+                    && end.sequence.get() == freeze.end_sequence
+                    && end.output_rows == freeze.output_rows
+                    && reply.accepted_consumed == 0;
+                if matches {
+                    proven = end.sequence.get();
+                }
+                matches
+            }
+            _ => false,
+        };
+        observation["operation"] = serde_json::json!(operation);
+        observation["matches"] = serde_json::json!(matches);
+        observation["proven_delivered_consumed"] = serde_json::json!(proven);
+        observations.push(observation);
+        std::fs::write(
+            context.scenario_root().join("installed-root-protocol.json"),
+            serde_json::to_vec_pretty(&observations)?,
+        )?;
+        ensure!(
+            matches,
+            "installed root operation {operation} differs from frozen oracle"
+        );
+        // Each typed reply owns only client-side decoded bytes. Release it
+        // before another RPC; it never stands in for a backend holder receipt.
+        drop(reply);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(1)),
+            )
+            .build()?;
+        let rows: serde_json::Value = client
+            .get(format!(
+                "http://127.0.0.1:{}/metrics?type=json",
+                context.handle().runtime().be[backend].http
+            ))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let census = root_census(rows.as_array().context("invalid installed-root census")?)?
+            .context("installed-root census unavailable")?;
+        let retired = index >= 5;
+        ensure!(
+            census["channels"] == 1
+                && census["terminal_task_records"] == 1
+                && census["producers_exited"] == 1
+                && census["producers_running"] == 0
+                && census["ends_published"] == 1
+                && census["sealed"] == 0
+                && census["ends_acknowledged"] == u64::from(retired)
+                && census["data_positions"] == if retired { 0 } else { 2 }
+                && census["payload_bytes"] == if retired { 0 } else { 1048584 },
+            "installed root changed outside its proven ACK frontier"
+        );
+        let census_path = context
+            .scenario_root()
+            .join(format!("installed-root-census-{index}.json"));
+        std::fs::write(census_path, serde_json::to_vec_pretty(&census)?)?;
+        ensure!(
+            Instant::now() < deadline && !job.is_finished(),
+            "installed-root chain exceeded deadline or paused actor exited"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
