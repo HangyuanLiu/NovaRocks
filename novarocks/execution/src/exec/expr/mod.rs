@@ -1325,3 +1325,8 @@ mod legacy_array_repeat_baseline_tests;
 mod legacy_date_float_cast_baseline_tests;
 #[cfg(test)]
 mod cast_date_float_oracle_tests;
+
+#[cfg(test)]
+mod legacy_float_date_cast_baseline_tests;
+#[cfg(test)]
+mod cast_float_date_oracle_tests;
