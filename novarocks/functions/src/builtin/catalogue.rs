@@ -2581,6 +2581,9 @@ pub(super) fn scalar_definition_parts(
                     "split" => Some(super::string_split_owner::effects()),
                     "__map_element_at" => Some(super::map_element_at_owner::effects()),
                     "__array_element_at" => Some(super::array_element_at_owner::effects()),
+                    name if super::calendar_slice_owner::operation(name).is_some() => {
+                        Some(super::calendar_slice_owner::effects())
+                    }
                     name if super::calendar_unixtime_owner::operation(name).is_some() => {
                         Some(super::calendar_unixtime_owner::effects())
                     }
@@ -2897,6 +2900,9 @@ pub fn contribute_builtin_functions(
             }
             "__array_element_at" => {
                 super::array_element_at_owner::definition(&name, declaration, resolver)?
+            }
+            name if super::calendar_slice_owner::operation(name).is_some() => {
+                super::calendar_slice_owner::definition(name, declaration, resolver)?
             }
             name if super::calendar_unixtime_owner::operation(name).is_some() => {
                 super::calendar_unixtime_owner::definition(name, declaration, resolver)?

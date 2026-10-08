@@ -60,6 +60,10 @@ pub(super) fn parse_i64_from_utf8(s: &str) -> Option<i64> {
     float_to_i64(float_v)
 }
 
+pub(super) fn legacy_int32_interval_at(values: &Int32Array, row: usize) -> Option<i64> {
+    (!values.is_null(row)).then(|| values.value(row) as i64)
+}
+
 pub fn legacy_extract_calendar_intervals(
     array: &ArrayRef,
     func_name: &str,
@@ -89,7 +93,7 @@ pub fn legacy_extract_calendar_intervals(
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
             Ok((0..arr.len())
-                .map(|i| (!arr.is_null(i)).then(|| arr.value(i) as i64))
+                .map(|i| legacy_int32_interval_at(arr, i))
                 .collect())
         }
         DataType::Int64 => {

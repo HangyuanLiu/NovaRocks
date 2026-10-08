@@ -815,7 +815,7 @@ fn column_argument(data_type: DataType) -> DiffArgument {
 #[test]
 fn pure_differential_reports_missing_owners_for_the_census() {
     let scalar_census: Vec<(&str, Vec<DiffArgument>)> = vec![
-        ("from_unixtime", vec![column_argument(DataType::Int64)]),
+        ("to_datetime", vec![column_argument(DataType::Int64)]),
         ("hour_from_unixtime", vec![column_argument(DataType::Int64)]),
         ("time_to_sec", vec![column_argument(timestamp())]),
     ];
@@ -835,7 +835,8 @@ fn pure_differential_reports_missing_owners_for_the_census() {
         );
         inventory.push(failure.to_string());
     }
-    let aggregate_census: Vec<(&str, Vec<DataType>)> = vec![("approx_count_distinct", vec![DataType::Int64])];
+    let aggregate_census: Vec<(&str, Vec<DataType>)> =
+        vec![("approx_count_distinct", vec![DataType::Int64])];
     for (name, types) in aggregate_census {
         let mut spec = AggregateDiffSpec::new(name);
         spec.arguments = types.into_iter().map(column_argument).collect();

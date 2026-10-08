@@ -243,3 +243,6 @@ mod array_element_at_owner;
 
 pub mod calendar_unixtime;
 mod calendar_unixtime_owner;
+
+pub mod calendar_slice;
+mod calendar_slice_owner;
