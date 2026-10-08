@@ -1522,3 +1522,6 @@ mod distinct_numeric_tests;
 
 #[path = "pure_differential_numeric_elementary_tests.rs"]
 mod numeric_elementary_tests;
+
+#[path = "pure_differential_regexp_extract_tests.rs"]
+mod regexp_extract_tests;

@@ -4020,6 +4020,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "ryu",
+ "serde_json",
  "sha2",
  "sm3",
 ]

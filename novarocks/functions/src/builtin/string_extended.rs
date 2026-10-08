@@ -45,14 +45,16 @@ pub(super) fn validate_profile(
         Operation::Unhex | Operation::Money => types.len() == 1,
         Operation::ToBinary => types.len() == 1 || types.len() == 2,
         Operation::Murmur => !types.is_empty(),
-        Operation::RegexpReplace => types.len() == 3,
+        Operation::RegexpReplace | Operation::RegexpExtract | Operation::RegexpExtractAll => {
+            types.len() == 3
+        }
     };
     if !arity {
         return Err(invalid(
             "extended string call differs from its exact selected arity",
         ));
     }
-    for ty in types {
+    for (ordinal, ty) in types.iter().enumerate() {
         let FunctionArgumentType::Value(ty) = ty else {
             return Err(invalid("extended string requires value arguments"));
         };
@@ -61,6 +63,14 @@ pub(super) fn validate_profile(
         let admitted = match op {
             Operation::Unhex | Operation::ToBinary | Operation::RegexpReplace => {
                 physical && ty.data_type == DataType::Utf8
+            }
+            Operation::RegexpExtract | Operation::RegexpExtractAll => {
+                physical
+                    && if ordinal < 2 {
+                        ty.data_type == DataType::Utf8
+                    } else {
+                        ty.data_type == DataType::Int32
+                    }
             }
             Operation::Money => {
                 physical
@@ -104,7 +114,10 @@ pub(super) fn validate_profile(
     }
     let expected = match op {
         Operation::Unhex | Operation::ToBinary => DataType::Binary,
-        Operation::Money | Operation::RegexpReplace => DataType::Utf8,
+        Operation::Money
+        | Operation::RegexpReplace
+        | Operation::RegexpExtract
+        | Operation::RegexpExtractAll => DataType::Utf8,
         Operation::Murmur => DataType::Int32,
     };
     step()?;
@@ -214,6 +227,9 @@ fn visit_row(
         Operation::RegexpReplace => {
             Err(internal("regexp_replace must use its shared selected core"))
         }
+        Operation::RegexpExtract | Operation::RegexpExtractAll => Err(internal(
+            "regexp extraction must use its shared selected core",
+        )),
         Operation::Murmur => {
             let mut seed = 104_729u32;
             for i in 0..input.arguments().len() {
@@ -303,11 +319,21 @@ pub fn evaluate_selected<'a>(
     if matches!(op, Operation::RegexpReplace) {
         return super::string_regexp_replace::evaluate_selected(input, control);
     }
+    if matches!(op, Operation::RegexpExtract | Operation::RegexpExtractAll) {
+        return super::string_regexp_extract::evaluate_selected(
+            matches!(op, Operation::RegexpExtractAll),
+            input,
+            control,
+        );
+    }
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
     let target = match op {
         Operation::Unhex | Operation::ToBinary => DataType::Binary,
-        Operation::Money | Operation::RegexpReplace => DataType::Utf8,
+        Operation::Money
+        | Operation::RegexpReplace
+        | Operation::RegexpExtract
+        | Operation::RegexpExtractAll => DataType::Utf8,
         Operation::Murmur => DataType::Int32,
     };
     let result = (|| {
@@ -401,7 +427,10 @@ pub fn evaluate_selected<'a>(
         work.flush()?;
         let array: ArrayRef = match op {
             Operation::Murmur => Arc::new(Int32Array::from(hashes)),
-            Operation::Money | Operation::RegexpReplace => Arc::new(StringArray::new(
+            Operation::Money
+            | Operation::RegexpReplace
+            | Operation::RegexpExtract
+            | Operation::RegexpExtractAll => Arc::new(StringArray::new(
                 OffsetBuffer::new(offsets.into()),
                 Buffer::from(bytes),
                 has_null.then(|| NullBuffer::new(validity.finish())),

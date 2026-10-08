@@ -29,6 +29,7 @@ doctest = false
 
 [dependencies]
 regex.workspace = true
+serde_json.workspace = true
 allocator-api2 = "0.2"
 hashbrown = { version = "0.14.5", features = ["raw", "allocator-api2"] }
 hex.workspace = true

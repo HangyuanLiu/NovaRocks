@@ -174,4 +174,5 @@ mod window_value_owner;
 #[cfg(test)]
 mod window_value_tests;
 
+mod string_regexp_extract;
 mod string_regexp_replace;

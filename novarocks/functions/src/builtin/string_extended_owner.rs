@@ -44,6 +44,8 @@ pub enum Operation {
     Money,
     Murmur,
     RegexpReplace,
+    RegexpExtract,
+    RegexpExtractAll,
 }
 pub(super) fn operation(name: &str) -> Option<Operation> {
     match name {
@@ -52,13 +54,21 @@ pub(super) fn operation(name: &str) -> Option<Operation> {
         "money_format" => Some(Operation::Money),
         "murmur_hash3_32" => Some(Operation::Murmur),
         "regexp_replace" => Some(Operation::RegexpReplace),
+        "regexp_extract" => Some(Operation::RegexpExtract),
+        "regexp_extract_all" => Some(Operation::RegexpExtractAll),
         _ => None,
     }
 }
 pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: if matches!(operation, Operation::Money | Operation::RegexpReplace) {
+        own_row_error: if matches!(
+            operation,
+            Operation::Money
+                | Operation::RegexpReplace
+                | Operation::RegexpExtract
+                | Operation::RegexpExtractAll
+        ) {
             FunctionIntrinsicRowError::MayRaise
         } else {
             FunctionIntrinsicRowError::NoRowError
