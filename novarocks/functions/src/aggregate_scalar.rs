@@ -1007,3 +1007,293 @@ pub fn tracked_scalar_heap_capacity<A: ScalarStateAllocator>(
     }
     Ok(bytes)
 }
+
+/// The original owned scalar reader. Legacy callers keep their original
+/// temporary materialization; selected callers borrow the same work scope.
+pub fn scalar_from_array(
+    array: &ArrayRef,
+    row: usize,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<Option<AggScalarValue>, ScalarStateError> {
+    work.step()?;
+    match array.data_type() {
+        DataType::Null => Ok(None),
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Bool(arr.value(row))))
+            }
+        }
+        DataType::Int8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Int64(arr.value(row) as i64)))
+            }
+        }
+        DataType::Int16 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Int64(arr.value(row) as i64)))
+            }
+        }
+        DataType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Int64(arr.value(row) as i64)))
+            }
+        }
+        DataType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Int64(arr.value(row))))
+            }
+        }
+        DataType::Float32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Float64(arr.value(row) as f64)))
+            }
+        }
+        DataType::Float64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Float64(arr.value(row))))
+            }
+        }
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                for _ in arr.value(row).as_bytes() {
+                    work.step()?;
+                }
+                work.flush()?;
+                let value = arr.value(row).to_string();
+                work.flush()?;
+                Ok(Some(AggScalarValue::Utf8(value)))
+            }
+        }
+        DataType::Binary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                for _ in arr.value(row) {
+                    work.step()?;
+                }
+                work.flush()?;
+                let value = arr.value(row).to_vec();
+                work.flush()?;
+                Ok(Some(AggScalarValue::Binary(value)))
+            }
+        }
+        DataType::LargeBinary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                for _ in arr.value(row) {
+                    work.step()?;
+                }
+                work.flush()?;
+                let value = arr.value(row).to_vec();
+                work.flush()?;
+                Ok(Some(AggScalarValue::Binary(value)))
+            }
+        }
+        DataType::Date32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Date32(arr.value(row))))
+            }
+        }
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Ok(Some(AggScalarValue::Timestamp(arr.value(row))))
+                }
+            }
+            TimeUnit::Millisecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?;
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Ok(Some(AggScalarValue::Timestamp(arr.value(row))))
+                }
+            }
+            TimeUnit::Microsecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Ok(Some(AggScalarValue::Timestamp(arr.value(row))))
+                }
+            }
+            TimeUnit::Nanosecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?;
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Ok(Some(AggScalarValue::Timestamp(arr.value(row))))
+                }
+            }
+        },
+        DataType::Decimal128(_, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Decimal128(arr.value(row))))
+            }
+        }
+        DataType::Decimal256(_, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Decimal256(arr.value(row))))
+            }
+        }
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                let v = largeint::value_at(arr, row)?;
+                Ok(Some(AggScalarValue::Decimal128(v)))
+            }
+        }
+        DataType::List(_item) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+            if arr.is_null(row) {
+                return Ok(None);
+            }
+            let offsets = arr.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let values = arr.values();
+            let mut out = Vec::with_capacity(end.saturating_sub(start));
+            for idx in start..end {
+                work.step()?;
+                out.push(scalar_from_array(values, idx, work)?);
+            }
+            Ok(Some(AggScalarValue::List(out)))
+        }
+        DataType::Struct(fields) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+            if arr.is_null(row) {
+                return Ok(None);
+            }
+            let mut out = Vec::with_capacity(fields.len());
+            for col in arr.columns() {
+                work.step()?;
+                out.push(scalar_from_array(col, row, work)?);
+            }
+            Ok(Some(AggScalarValue::Struct(out)))
+        }
+        DataType::Map(_, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+            if arr.is_null(row) {
+                return Ok(None);
+            }
+            let offsets = arr.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let keys = arr.keys();
+            let values = arr.values();
+            let mut out = Vec::with_capacity(end.saturating_sub(start));
+            for idx in start..end {
+                work.step()?;
+                out.push((
+                    scalar_from_array(keys, idx, work)?,
+                    scalar_from_array(values, idx, work)?,
+                ));
+            }
+            Ok(Some(AggScalarValue::Map(out)))
+        }
+        other => Err(format!("unsupported scalar type: {:?}", other).into()),
+    }
+}
