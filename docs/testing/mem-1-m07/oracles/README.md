@@ -20,3 +20,6 @@ python3 docs/testing/mem-1-m07/oracles/decimal-read-write-v1.py \
 
 
 `decimal-partitioned-v1.py` 以原SQL SHA冻结24行literal setup及9个读取query，独立计算month/category分组、SUM/AVG（固定scale，HALF_UP）、排序、rank/running SUM/LAG和筛选。所有原input Decimal均在实际精度/scale内。query9保留既有nullable Decimal128中间溢出：scale15的除法先把left unscaled值乘10^15，15行均超出有符号128位范围，按照已有OutputNull合同为NULL；不是按无限精度数学改成100。该约束来自 `type-contract/src/arithmetic.rs` 的division/output域及 `execution/src/exec/expr/arithmetic.rs` 的checked intermediate，不是数据库输出。AVG合同来自canonical_agg_decimal_type和既有HALF_UP整数除法。60行预期不读取任何golden；原生old/new核验通过并审阅后才能修原golden。
+
+
+`decimal-window-v1.py` 以完整原SQL SHA固定12行输入和6个窗口query（72行）。独立排序/rank、按行frame、category累计AVG/MAX、LAG/LEAD及固定default、FIRST/LAST和moving AVG；原实际scale为15/20/0，AVG HALF_UP。query7的乘积保留nullable Decimal128中间/precision溢出，所有乘积超过i128和DECIMAL(38,35)域，SUM全NULL仍为NULL。未知frame或SQL变更拒绝。原生old/new验证之前不修改golden，不从引擎结果取期望值。
