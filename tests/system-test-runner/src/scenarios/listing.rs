@@ -72,15 +72,17 @@ impl Scenario for CatalogListing {
             )
         };
         control.query_drop(catalog_sql("cl_normal"))?;
+        await_fixture(&fixture, timeout, |audit| {
+            audit.namespace_pages == 1 && audit.active_listing_requests == 0
+        })?;
         let mut phases = Vec::new();
         fixture.set_mode(ListingMode::Normal)?;
         phases.push(measure(context, "lake-discovery", || {
             control.query_drop(catalog_sql("cl_discovery"))?;
-            let audit = fixture.snapshot()?;
-            ensure!(
-                audit.table_loads == (NAMESPACES * MEMBERS) as u64,
-                "MV lake discovery did not observe every controlled table"
-            );
+            let audit = await_fixture(&fixture, timeout, |audit| {
+                audit.table_loads == (NAMESPACES * MEMBERS) as u64
+                    && audit.active_listing_requests == 0
+            })?;
             Ok(json!({"provider":audit}))
         })?);
         for clients in [1, 8, 16] {
@@ -176,6 +178,28 @@ impl Scenario for CatalogListing {
             }))?,
         )?;
         Ok(())
+    }
+}
+
+fn await_fixture(
+    fixture: &ListingRestFixture,
+    timeout: Duration,
+    predicate: impl Fn(&novarocks_cluster_harness::listing_rest::ListingSnapshot) -> bool,
+) -> Result<novarocks_cluster_harness::listing_rest::ListingSnapshot> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut previous_match = false;
+    loop {
+        let audit = fixture.snapshot()?;
+        let matches = predicate(&audit);
+        if matches && previous_match {
+            return Ok(audit);
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "controlled listing phase did not converge: {audit:?}"
+        );
+        previous_match = matches;
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
