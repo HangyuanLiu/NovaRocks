@@ -96,3 +96,12 @@ unsafe impl Allocator for HostAggregateAllocator {
         }
     }
 }
+
+impl crate::aggregate_scalar::ScalarStateAllocator for HostAggregateAllocator {
+    fn scalar_allocation_error(
+        &self,
+        _operation: &str,
+    ) -> crate::aggregate_scalar::ScalarStateError {
+        crate::aggregate_scalar::ScalarStateError::Kernel(self.take_failure())
+    }
+}

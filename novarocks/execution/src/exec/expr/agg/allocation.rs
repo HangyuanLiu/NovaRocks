@@ -37,6 +37,17 @@ pub(crate) struct AggregateAllocator {
     tracker: Arc<MemTracker>,
 }
 
+impl novarocks_functions::aggregate_scalar::ScalarStateAllocator for AggregateAllocator {
+    fn scalar_allocation_error(
+        &self,
+        operation: &str,
+    ) -> novarocks_functions::aggregate_scalar::ScalarStateError {
+        novarocks_functions::aggregate_scalar::ScalarStateError::Legacy(
+            self.allocation_error(operation),
+        )
+    }
+}
+
 impl AggregateAllocator {
     pub(crate) fn new(tracker: Arc<MemTracker>) -> Self {
         Self { tracker }

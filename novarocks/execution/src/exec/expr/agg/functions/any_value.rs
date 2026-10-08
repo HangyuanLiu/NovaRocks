@@ -25,28 +25,15 @@ use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    TrackedAggScalarValue, build_scalar_array, tracked_scalar_from_array, tracked_scalar_to_output,
-};
+use super::common::build_scalar_array;
+
+#[cfg(test)]
+use super::common::TrackedAggScalarValue;
 
 pub(super) struct AnyValueAgg;
 
-#[derive(Debug)]
-struct AnyValueState {
-    allocator: AggregateAllocator,
-    has_value: bool,
-    value: Option<TrackedAggScalarValue>,
-}
-
-impl AnyValueState {
-    fn new(tracker: Arc<MemTracker>) -> Self {
-        Self {
-            allocator: AggregateAllocator::new(tracker),
-            has_value: false,
-            value: None,
-        }
-    }
-}
+type AnyValueState =
+    novarocks_functions::builtin::aggregate_any_value_core::AnyValueState<AggregateAllocator>;
 
 impl AggregateFunction for AnyValueAgg {
     fn build_spec_from_type(
@@ -101,7 +88,7 @@ impl AggregateFunction for AnyValueAgg {
         unsafe {
             std::ptr::write(
                 ptr as *mut AnyValueState,
-                AnyValueState::new(process_mem_tracker()),
+                AnyValueState::new(AggregateAllocator::new(process_mem_tracker())),
             );
         }
     }
@@ -116,7 +103,7 @@ impl AggregateFunction for AnyValueAgg {
             .ok_or_else(|| "allocation-tracked any_value requires a memory tracker".to_string())?;
         unsafe {
             ptr.cast::<AnyValueState>()
-                .write(AnyValueState::new(tracker))
+                .write(AnyValueState::new(AggregateAllocator::new(tracker)))
         };
         Ok(())
     }
@@ -147,14 +134,13 @@ impl AggregateFunction for AnyValueAgg {
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut AnyValueState) };
-            if state.has_value {
-                continue;
-            }
-            let value = tracked_scalar_from_array(array, row, &state.allocator)?;
-            if value.is_some() {
-                state.has_value = true;
-                state.value = value;
-            }
+            state
+                .update_from_array(
+                    array,
+                    row,
+                    &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+                )
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -180,17 +166,13 @@ impl AggregateFunction for AnyValueAgg {
         let mut values = Vec::with_capacity(group_states.len());
         for &base in group_states {
             let state = unsafe { &*((base as *mut u8).add(offset) as *const AnyValueState) };
-            if state.has_value {
-                values.push(
-                    state
-                        .value
-                        .as_ref()
-                        .map(tracked_scalar_to_output)
-                        .transpose()?,
-                );
-            } else {
-                values.push(None);
-            }
+            values.push(
+                state
+                    .output(&mut novarocks_functions::aggregate_scalar::ScalarWork::new(
+                        None,
+                    ))
+                    .map_err(|error| error.to_string())?,
+            );
         }
         build_scalar_array(&spec.output_type, values)
     }

@@ -36,6 +36,9 @@ mod binding_control_tests;
 
 mod abs;
 mod abs_owner;
+mod aggregate_any_value;
+pub mod aggregate_any_value_core;
+mod aggregate_any_value_owner;
 pub mod aggregate_basic;
 pub mod aggregate_distinct_numeric;
 mod aggregate_distinct_numeric_kernel;
