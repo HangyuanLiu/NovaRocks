@@ -530,6 +530,11 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
         {
             Ok(artifacts) => artifacts,
             Err(error) => {
+                // The coordinator has sealed its reader and stopped producing
+                // CPU jobs. This dedicated background phase cannot publish
+                // physical convergence while a cancelled CPU waiter left an
+                // actual input or unclaimed output alive.
+                phase.root_result_capacity().wait_result_activities_exited();
                 let error = Self::failure(error.to_string());
                 return Err(Self::abort_pending_session(pending, error));
             }

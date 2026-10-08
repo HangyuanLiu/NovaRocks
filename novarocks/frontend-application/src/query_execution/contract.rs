@@ -205,8 +205,8 @@ pub enum DistributedQueryIntent {
 /// unrelated prepared/native artifacts or replace its cancellation/completion
 /// capabilities.
 pub struct DistributedQueryRequest {
-    result_window: Option<novarocks_workload_control::ResultWindowAlias>,
-    result_scope: Option<novarocks_workload_control::WorkScope>,
+    result_capacity:
+        Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
     cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
     payload: DistributedQueryPayload,
     topology: novarocks_query_application::api::BackendTopologySnapshot,
@@ -251,12 +251,7 @@ impl RestartableReadExecution {
         execution: &QueryExecutionContext,
     ) -> DistributedQueryRequest {
         DistributedQueryRequest {
-            result_window: execution
-                .result_capacity()
-                .map(|binding| binding.window_alias()),
-            result_scope: execution
-                .result_capacity()
-                .map(|binding| binding.scope().clone()),
+            result_capacity: execution.result_capacity().cloned(),
             cow_match: None,
             payload: DistributedQueryPayload::RestartableRead(Arc::clone(self)),
             topology: execution.topology().clone(),
@@ -303,7 +298,7 @@ impl DistributedQueryRequest {
                 "distributed request result window belongs to a foreign scope",
             ));
         }
-        if self.result_window.is_some() {
+        if self.result_capacity.is_some() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "distributed request already owns its result window",
@@ -315,8 +310,7 @@ impl DistributedQueryRequest {
                 error.to_string(),
             )
         })?;
-        self.result_scope = Some(scope.clone());
-        self.result_window = Some(window);
+        self.result_capacity = Some(novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(scope, window).map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error.to_string()))?);
         Ok(self)
     }
 
@@ -386,8 +380,7 @@ impl DistributedQueryRequest {
             } => (description, artifacts, options),
         };
         DistributedQueryRequestParts {
-            result_window: self.result_window,
-            result_scope: self.result_scope,
+            result_capacity: self.result_capacity,
             cow_match: self.cow_match,
             description,
             artifacts,
@@ -406,8 +399,8 @@ impl DistributedQueryRequest {
 /// Consuming frontend handoff. There is deliberately no constructor,
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
-    pub(crate) result_window: Option<novarocks_workload_control::ResultWindowAlias>,
-    pub(crate) result_scope: Option<novarocks_workload_control::WorkScope>,
+    pub(crate) result_capacity:
+        Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
     pub(crate) cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
     pub description: Arc<FrozenExecutionDescription>,
     pub artifacts: PreparedDistributedQuery,
@@ -461,12 +454,7 @@ pub(crate) fn build_request_from_finalized_execution(
         }
     };
     Ok(DistributedQueryRequest {
-        result_window: execution
-            .result_capacity()
-            .map(|binding| binding.window_alias()),
-        result_scope: execution
-            .result_capacity()
-            .map(|binding| binding.scope().clone()),
+        result_capacity: execution.result_capacity().cloned(),
         cow_match: None,
         payload,
         topology: execution.topology().clone(),

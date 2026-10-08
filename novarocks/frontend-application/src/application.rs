@@ -1681,6 +1681,7 @@ impl FrontendApplicationHost {
                 self.backend_topology_port(),
                 self.data_runtime.clone(),
                 self.execution_runtime_owner.lifecycle_diagnostics(),
+                self.execution_runtime_owner.internal_result_cpu(),
             )
             .map_err(FrontendApplicationError::server)?,
         );

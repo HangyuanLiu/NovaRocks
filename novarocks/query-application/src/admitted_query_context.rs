@@ -146,7 +146,32 @@ impl StatementAdmissionContext {
 pub struct QueryResultCapacityBinding {
     scope: WorkScope,
     window: ResultWindowAlias,
+    activity: std::sync::Arc<ResultCapacityActivity>,
 }
+
+#[derive(Default)]
+struct ResultCapacityActivity {
+    count: std::sync::Mutex<usize>,
+    exited: std::sync::Condvar,
+}
+
+/// Actual execution ownership, independent of a cancelled waiter. Drop this
+/// only after the input or unclaimed output it guards has actually exited.
+pub struct ResultCapacityActivityLease {
+    activity: std::sync::Arc<ResultCapacityActivity>,
+    window: Option<ResultWindowAlias>,
+}
+impl Drop for ResultCapacityActivityLease {
+    fn drop(&mut self) {
+        drop(self.window.take());
+        let mut count = self.activity.count.lock().expect("result activity lock");
+        *count = count.checked_sub(1).expect("one result activity exit");
+        if *count == 0 {
+            self.activity.exited.notify_all();
+        }
+    }
+}
+
 impl QueryResultCapacityBinding {
     pub fn try_new(scope: &WorkScope, window: ResultWindowAlias) -> Result<Self, WorkError> {
         if !window.is_for_scope(scope) || window.class() == ResultWindowClass::Closing {
@@ -156,6 +181,7 @@ impl QueryResultCapacityBinding {
         Ok(Self {
             scope: scope.clone(),
             window,
+            activity: std::sync::Arc::new(ResultCapacityActivity::default()),
         })
     }
     pub fn scope(&self) -> &WorkScope {
@@ -168,10 +194,40 @@ impl QueryResultCapacityBinding {
         self.window.class()
     }
 
+    /// Register before dispatch, so cancellation cannot race registration.
+    /// This creates no allowance and reuses the original physical window.
+    pub fn begin_result_activity(&self) -> Result<ResultCapacityActivityLease, WorkError> {
+        self.scope.check()?;
+        let mut count = self.activity.count.lock().expect("result activity lock");
+        *count = count.checked_add(1).expect("bounded result activities");
+        Ok(ResultCapacityActivityLease {
+            activity: std::sync::Arc::clone(&self.activity),
+            window: Some(self.window.clone()),
+        })
+    }
+
+    /// A background phase calls this after closing its producer. It waits for
+    /// actual input/unclaimed-output destruction, never for cancellation.
+    /// Foreground coordinator cancellation must not call this blocking fence.
+    pub fn wait_result_activities_exited(&self) {
+        let mut count = self.activity.count.lock().expect("result activity lock");
+        while *count != 0 {
+            count = self
+                .activity
+                .exited
+                .wait(count)
+                .expect("result activity lock");
+        }
+    }
+
     /// A nested stage keeps its parent's whole envelope, with exact child
     /// attribution. No result-capacity admission is performed here.
     pub fn for_child(&self, child: &WorkScope) -> Result<Self, WorkError> {
-        Self::try_new(child, self.window.for_child(child)?)
+        Ok(Self {
+            scope: child.clone(),
+            window: self.window.for_child(child)?,
+            activity: std::sync::Arc::clone(&self.activity),
+        })
     }
 }
 

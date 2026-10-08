@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::internal_result::{InternalDomainSlot, InternalDomainState};
 use super::root_result_relay::{RelayedRootAnswer, RelayedRootPolls};
 use crate::native::fragment_transport::{
     FinalTaskInfoRead, NativeTaskResultTransport, RootResultOutcome, TaskReadGrace,
@@ -36,6 +37,9 @@ use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptRese
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryRequest, PreReadyTopologyOutcome,
+};
+use crate::query_execution::internal_result_cpu::{
+    InternalResultCpu, InternalResultCpuJob, InternalResultValue, require_internal_result_capacity,
 };
 use crate::query_execution::lifecycle_diagnostics::{
     FrontendLifecycleDiagnostics, QueryLifecycleConvergenceSnapshot,
@@ -50,6 +54,7 @@ use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAI
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::task_execution::sources::AttemptEstablishFacts;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
 };
@@ -294,6 +299,7 @@ pub struct FrontendDistributedQueryCoordinator {
     registry: Arc<FrontendQueryRegistry>,
     lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     data_runtime: FrontendDataRuntime,
+    internal_result_cpu: Option<InternalResultCpu>,
     /// Every bound the task protocol runs one attempt with, frozen at startup.
     ///
     /// Held rather than read per attempt so a deployment's bounds cannot change
@@ -324,6 +330,7 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: novarocks_query_application::api::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
         lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
+        internal_result_cpu: InternalResultCpu,
     ) -> Result<Self, DistributedQueryError> {
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
@@ -340,6 +347,7 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             lifecycle_diagnostics,
             data_runtime,
+            internal_result_cpu: Some(internal_result_cpu),
             coordination_budgets,
             transport_budget,
             result_fetch_byte_limit,
@@ -405,6 +413,7 @@ impl FrontendDistributedQueryCoordinator {
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            internal_result_cpu: None,
             task_update_retry_policy:
                 novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -469,6 +478,7 @@ impl FrontendDistributedQueryCoordinator {
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            internal_result_cpu: None,
             task_update_retry_policy:
                 novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -543,7 +553,10 @@ impl FrontendDistributedQueryCoordinator {
         let mut parts = request.into_parts();
         let delivery = ProductionRootDelivery::bind(
             parts.description.row_carrier(),
-            parts.result_window.take(),
+            parts
+                .result_capacity
+                .as_ref()
+                .map(|binding| binding.window_alias()),
         )
         .map_err(|error| failed(error.to_string()))?;
         if let ProductionRootDelivery::Relayed { kind, .. } = &delivery {
@@ -579,10 +592,44 @@ impl FrontendDistributedQueryCoordinator {
         }
         let write_stack_session = parts.write_stack_session.clone();
         let intent = parts.completion.intent();
+        let internal_capacity = if matches!(
+            &delivery,
+            ProductionRootDelivery::Relayed {
+                kind: novarocks_result_contract::RootOutputKind::InternalFacts(_),
+                ..
+            }
+        ) {
+            let binding = parts
+                .result_capacity
+                .as_ref()
+                .ok_or_else(|| failed("Internal root has no admitted runtime binding"))?;
+            require_internal_result_capacity(binding.scope(), &binding.window_alias())
+                .map_err(failed)?;
+            if self.internal_result_cpu.is_none() {
+                return Err(failed("Internal root has no process-owned CPU runtime"));
+            }
+            Some(binding.clone())
+        } else {
+            None
+        };
         let write_decoder = parts
             .write_root_decode_contract
-            .clone()
-            .map(crate::query_execution::write_result::RootWriteResultDecoder::new);
+            .as_ref()
+            .map(|contract| match internal_capacity.as_ref() {
+                Some(binding) => {
+                    crate::query_execution::write_result::RootWriteResultDecoder::new_with_capacity(
+                        contract.clone(),
+                        binding,
+                    )
+                }
+                None => Ok(
+                    crate::query_execution::write_result::RootWriteResultDecoder::new(
+                        contract.clone(),
+                    ),
+                ),
+            })
+            .transpose()
+            .map_err(failed)?;
         // Statistics collection enters only with its Core-owned typed program.
         // It never falls through to client-result construction.
         if intent == DistributedQueryIntent::Statistics && parts.statistics_program.is_none() {
@@ -717,7 +764,12 @@ impl FrontendDistributedQueryCoordinator {
         let statistics_decoder = parts
             .statistics_program
             .as_ref()
-            .map(|program| program.result_decoder());
+            .map(|program| match internal_capacity.as_ref() {
+                Some(binding) => program.result_decoder_with_capacity(binding),
+                None => Ok(program.result_decoder()),
+            })
+            .transpose()
+            .map_err(failed)?;
         let remaining_budget = statement_deadline.saturating_duration_since(Instant::now());
         if remaining_budget.is_zero() {
             return Err(failed(
@@ -758,6 +810,7 @@ impl FrontendDistributedQueryCoordinator {
         };
         let handoff = RoundHandoff {
             delivery,
+            internal_capacity,
             query_id,
             execution_id,
             statement_deadline,
@@ -801,6 +854,7 @@ impl FrontendDistributedQueryCoordinator {
         let execution_started = Instant::now();
         let RoundHandoff {
             delivery,
+            internal_capacity,
             query_id,
             execution_id,
             statement_deadline,
@@ -1002,6 +1056,37 @@ impl FrontendDistributedQueryCoordinator {
                 as Arc<dyn novarocks_query_application::api::BoundedRootReadPort>),
         };
         let mut relayed_end = None;
+        let mut internal_domain = if let Some(binding) = internal_capacity.as_ref() {
+            Some(
+                InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
+                    let state = match intent {
+                        DistributedQueryIntent::Statistics => InternalDomainState::Statistics(
+                            statistics_decoder
+                                .take()
+                                .ok_or("Internal statistics decoder missing")?,
+                        ),
+                        DistributedQueryIntent::Write => InternalDomainState::Write(
+                            write_decoder
+                                .take()
+                                .ok_or("Internal write decoder missing")?,
+                        ),
+                        DistributedQueryIntent::CowMatch => InternalDomainState::Cow(
+                            cow_match.take().ok_or("Internal COW consumer missing")?,
+                        ),
+                        _ => return Err("Internal root intent has no domain state".into()),
+                    };
+                    Ok(InternalDomainSlot::Collecting {
+                        state,
+                        receipt: None,
+                    })
+                })
+                .map_err(failed)?,
+            )
+        } else {
+            None
+        };
+        let mut pending_internal: Option<InternalResultCpuJob<Result<InternalDomainSlot, String>>> =
+            None;
 
         let root_status_source = if matches!(
             intent,
@@ -1172,6 +1257,10 @@ impl FrontendDistributedQueryCoordinator {
                 intent,
                 DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
             ) && round.accepted_root_success_sealed()
+                && pending_internal.is_none()
+                && internal_domain
+                    .as_ref()
+                    .is_none_or(|domain| domain.value().end().is_some())
             {
                 if let Err(error) = &advanced {
                     tracing::warn!(%error, "Task failure after the accepted root seal belongs to cleanup");
@@ -1310,6 +1399,69 @@ impl FrontendDistributedQueryCoordinator {
                 ));
             }
 
+            // Control, cancellation and split failure are observed before
+            // claiming CPU progress. A pending codec never blocks this loop.
+            let mut cpu_answer = None;
+            let mut claimed_internal = false;
+            if let Some(claimed) = pending_internal
+                .as_mut()
+                .and_then(InternalResultCpuJob::try_take)
+            {
+                pending_internal = None;
+                claimed_internal = true;
+                moved = true;
+                let domain = match claimed.and_then(|value| value.try_transform(|result, _| result))
+                {
+                    Ok(domain) => domain,
+                    Err(error) => {
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            QueryFailureCause::FrontendExecution,
+                            error,
+                        ));
+                    }
+                };
+                if let Some(packet_sequence) = domain.value().receipt() {
+                    let consumed = round
+                        .consume_root_result_packet(packet_sequence, false)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| {
+                            root_result_polls
+                                .as_ref()
+                                .ok_or("CPU receipt lost its reader".to_owned())?
+                                .acknowledge(packet_sequence)
+                        });
+                    if let Err(error) = consumed {
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            QueryFailureCause::FrontendExecution,
+                            error,
+                        ));
+                    }
+                    root_batch_count = root_batch_count.saturating_add(1);
+                    last_root_poll = RootResultPoll::Packet(packet_sequence);
+                } else if let Some(end) = domain.value().end() {
+                    relayed_end = Some(end);
+                    root_row_count = end.output_rows;
+                    cpu_answer = Some(RootPollAnswer::Legacy(Ok(RootResultOutcome::EndOfStream {
+                        packet_sequence: end.sequence.get() - 1,
+                    })));
+                }
+                internal_domain = Some(domain);
+            }
+
             // The polls run until this loop has observed the end of the
             // result stream, and that fact alone stops them. Not the root
             // task leaving its created state: delivering the end of stream is
@@ -1361,84 +1513,103 @@ impl FrontendDistributedQueryCoordinator {
             // One answer per turn. Consuming it makes the turn non-idle, so
             // the loop comes straight back for the next one instead of
             // parking on the wake the poller raised.
-            if let Some(answer) = root_result_polls
-                .as_mut()
-                .and_then(RootResultPolls::take_next)
-            {
+            if let Some(answer) = cpu_answer.or_else(|| {
+                if pending_internal.is_some() || claimed_internal {
+                    None
+                } else {
+                    root_result_polls
+                        .as_mut()
+                        .and_then(RootResultPolls::take_next)
+                }
+            }) {
                 let answer = match answer {
                     RootPollAnswer::Legacy(answer) => answer,
                     RootPollAnswer::Relayed(RelayedRootAnswer::Data(reply)) => {
-                        let novarocks_query_application::api::RootReplyView::Data {
-                            sequence,
-                            body,
-                            ..
-                        } = reply.outcome()
-                        else {
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                "relayed data owner has no data",
-                            ));
-                        };
-                        let applied = if let Some(decoder) = statistics_decoder.as_mut() {
-                            decoder.apply_relay_body(body)
-                        } else if let Some(decoder) = write_decoder.as_mut() {
-                            decoder.apply_relay_body(body)
-                        } else if let Some(consumer) = cow_match.as_mut() {
-                            consumer.push_body(body)
-                        } else {
-                            Err("relayed data has no typed internal consumer".into())
-                        };
-                        if let Err(error) = applied {
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                error,
-                            ));
-                        }
-                        // No body alias escapes the typed decoder. Drop backing before
-                        // recording local consumption and issuing its exact receipt.
-                        drop(reply);
-                        let packet_sequence = sequence.get() - 1;
-                        let consumed = round
-                            .consume_root_result_packet(packet_sequence, false)
-                            .map_err(|error| error.to_string())
-                            .and_then(|()| {
-                                root_result_polls
-                                    .as_ref()
-                                    .expect("answer retains its reader")
-                                    .acknowledge(packet_sequence)
+                        let input = internal_domain
+                            .take()
+                            .ok_or_else(|| {
+                                "relayed data has no admitted Internal consumer".to_owned()
+                            })
+                            .and_then(|domain| {
+                                domain
+                                    .transform(|domain, _| (domain, reply))
+                                    .track_actual_exit(
+                                        internal_capacity
+                                            .as_ref()
+                                            .expect("Internal slot requires its binding"),
+                                    )
                             });
-                        if let Err(error) = consumed {
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                error,
-                            ));
-                        }
-                        root_batch_count = root_batch_count.saturating_add(1);
-                        last_root_poll = RootResultPoll::Packet(packet_sequence);
+                        let input = match input {
+                            Ok(input) => input,
+                            Err(error) => {
+                                break Err(self.fail_task_round_with_root_reader(
+                                    &mut relayed_reader,
+                                    &mut root_result_polls,
+                                    root_task,
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::FrontendExecution,
+                                    error,
+                                ));
+                            }
+                        };
+                        pending_internal = Some(
+                            self.internal_result_cpu
+                                .as_ref()
+                                .expect("Internal admission validates its CPU runtime")
+                                .submit(
+                                    input,
+                                    cancellation.clone(),
+                                    &self.data_runtime,
+                                    Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                                    |(domain, reply), _| domain.apply_body(reply),
+                                ),
+                        );
+                        // The actual CPU completion, never enqueue, owns ACK.
                         continue;
                     }
                     RootPollAnswer::Relayed(RelayedRootAnswer::End(end)) => {
+                        if let Some(binding) = internal_capacity.as_ref() {
+                            let input = internal_domain
+                                .take()
+                                .ok_or_else(|| "Internal EOF has no serial domain state".to_owned())
+                                .and_then(|domain| {
+                                    domain
+                                        .transform(|domain, _| (domain, end))
+                                        .track_actual_exit(binding)
+                                });
+                            let input = match input {
+                                Ok(input) => input,
+                                Err(error) => {
+                                    break Err(self.fail_task_round_with_root_reader(
+                                        &mut relayed_reader,
+                                        &mut root_result_polls,
+                                        root_task,
+                                        query_id,
+                                        &mut round,
+                                        &split_delivery,
+                                        classification,
+                                        QueryFailureCause::FrontendExecution,
+                                        error,
+                                    ));
+                                }
+                            };
+                            pending_internal = Some(
+                                self.internal_result_cpu
+                                    .as_ref()
+                                    .expect("Internal admission validates its CPU runtime")
+                                    .submit(
+                                        input,
+                                        cancellation.clone(),
+                                        &self.data_runtime,
+                                        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                                        |(domain, end), _| domain.finish_eof(end),
+                                    ),
+                            );
+                            continue;
+                        }
                         let checked = if let Some(decoder) = statistics_decoder.as_ref() {
                             decoder.check_relay_end(end.output_rows)
                         } else if let Some(decoder) = write_decoder.as_ref() {
@@ -1880,7 +2051,7 @@ impl FrontendDistributedQueryCoordinator {
                 Instant::now(),
             );
 
-            if synchronous_root_completion_ready(&round) {
+            if synchronous_root_completion_ready(&round) && pending_internal.is_none() {
                 match write_completion.as_mut() {
                     // A write's completion is not the read's. Every declared
                     // writer must reach a success-compatible terminal and the
@@ -1904,6 +2075,70 @@ impl FrontendDistributedQueryCoordinator {
                                     "distributed write reached a non-committable terminal: {verdict}"
                                 ),
                             ));
+                        }
+                    }
+                    None if intent == DistributedQueryIntent::Statistics
+                        && internal_capacity.is_some() =>
+                    {
+                        if statistics_tasks_are_terminal(&round) {
+                            if let Some(error) = statistics_all_success_error(&round) {
+                                break Err(self.fail_task_round_with_root_reader(
+                                    &mut relayed_reader,
+                                    &mut root_result_polls,
+                                    root_task,
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::FrontendExecution,
+                                    error.to_string(),
+                                ));
+                            }
+                            if internal_domain
+                                .as_ref()
+                                .is_some_and(|domain| domain.value().statistics_finished())
+                            {
+                                break Ok(());
+                            }
+                            let input = internal_domain
+                                .take()
+                                .ok_or_else(|| {
+                                    "Statistics finalization lost its EOF state".to_owned()
+                                })
+                                .and_then(|domain| {
+                                    domain.track_actual_exit(
+                                        internal_capacity.as_ref().expect("Internal binding"),
+                                    )
+                                });
+                            let input = match input {
+                                Ok(input) => input,
+                                Err(error) => {
+                                    break Err(self.fail_task_round_with_root_reader(
+                                        &mut relayed_reader,
+                                        &mut root_result_polls,
+                                        root_task,
+                                        query_id,
+                                        &mut round,
+                                        &split_delivery,
+                                        classification,
+                                        QueryFailureCause::FrontendExecution,
+                                        error,
+                                    ));
+                                }
+                            };
+                            pending_internal = Some(
+                                self.internal_result_cpu
+                                    .as_ref()
+                                    .expect("Internal CPU runtime")
+                                    .submit(
+                                        input,
+                                        cancellation.clone(),
+                                        &self.data_runtime,
+                                        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                                        |domain, _| domain.finish_statistics(),
+                                    ),
+                            );
+                            moved = true;
                         }
                     }
                     None if intent == DistributedQueryIntent::Statistics
@@ -1989,6 +2224,7 @@ impl FrontendDistributedQueryCoordinator {
             port.seal(sealed)
                 .map_err(|error| failed(error.to_string()))?;
         }
+        drop(pending_internal.take());
         outcome?;
 
         // A write cannot stop its Worker producers until the Root stream has
@@ -2003,12 +2239,7 @@ impl FrontendDistributedQueryCoordinator {
                         "distributed write execution has no write completion tracker",
                     )
                 })?;
-                let decoder = write_decoder.take().ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "distributed write execution lost its Root decoder",
-                    )
-                })?;
+
                 let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
                 observe_write_statuses(&round, tracker);
                 let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
@@ -2019,7 +2250,16 @@ impl FrontendDistributedQueryCoordinator {
                     execution_started,
                     None,
                 );
-                let prepared = decoder.finish().map_err(|error| {
+                let prepared = match internal_domain.take() {
+                    Some(domain) => domain.hand_off(|domain, _| domain.into_write()),
+                    None => write_decoder
+                        .take()
+                        .ok_or_else(|| {
+                            "distributed write execution lost its Root decoder".to_owned()
+                        })
+                        .and_then(|decoder| decoder.finish()),
+                }
+                .map_err(|error| {
                     emit_distributed_write_phase_marker(
                         intent,
                         execution_id,
@@ -2169,6 +2409,13 @@ impl FrontendDistributedQueryCoordinator {
                 if !batches.is_empty() {
                     return Err(failed("COW match retained unbounded result batches"));
                 }
+                if let Some(domain) = internal_domain.take() {
+                    cow_selection = Some(
+                        domain
+                            .hand_off(|domain, _| domain.into_cow())
+                            .map_err(failed)?,
+                    );
+                }
                 completion.cow_match(
                     cow_selection
                         .take()
@@ -2253,6 +2500,13 @@ impl FrontendDistributedQueryCoordinator {
             DistributedQueryIntent::Statistics => {
                 if let Some(error) = statistics_all_success_error(&round) {
                     return Err(error);
+                }
+                if let Some(domain) = internal_domain.take() {
+                    return completion.statistics(
+                        domain
+                            .hand_off(|domain, _| domain.into_statistics())
+                            .map_err(failed)?,
+                    );
                 }
                 let mut decoder = statistics_decoder.take().ok_or_else(|| {
                     DistributedQueryError::new(
@@ -4146,6 +4400,7 @@ impl TaskRoundWaitWitness {
 /// and budgeted exactly once before its task graph becomes the lifecycle owner.
 struct RoundHandoff<'a> {
     delivery: ProductionRootDelivery,
+    internal_capacity: Option<QueryResultCapacityBinding>,
     query_id: QueryId,
     execution_id: QueryExecutionId,
     statement_deadline: Instant,

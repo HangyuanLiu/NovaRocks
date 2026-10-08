@@ -130,6 +130,8 @@ impl InternalResultCpuOwner {
 pub(crate) struct InternalResultValue<T> {
     value: T,
     window: ResultWindowAlias,
+    activity:
+        Option<novarocks_query_application::admitted_query_context::ResultCapacityActivityLease>,
 }
 impl<T> InternalResultValue<T> {
     /// Check coverage before invoking a constructor that may grow the graph.
@@ -140,7 +142,29 @@ impl<T> InternalResultValue<T> {
     ) -> Result<Self, String> {
         require_internal_result_capacity(scope, &window)?;
         let value = produce(&window)?;
-        Ok(Self { value, window })
+        Ok(Self {
+            value,
+            window,
+            activity: None,
+        })
+    }
+
+    pub(crate) fn track_actual_exit(
+        mut self,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Self, String> {
+        if self.activity.is_some()
+            || !self.window.is_for_scope(binding.scope())
+            || !self.window.shares_capacity_with(&binding.window_alias())
+        {
+            return Err("internal CPU activity differs from its input admission".into());
+        }
+        self.activity = Some(
+            binding
+                .begin_result_activity()
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(self)
     }
 
     pub(crate) fn value(&self) -> &T {
@@ -150,6 +174,38 @@ impl<T> InternalResultValue<T> {
         &self.window
     }
 
+    pub(crate) fn try_transform<R>(
+        self,
+        transform: impl FnOnce(T, &ResultWindowAlias) -> Result<R, String>,
+    ) -> Result<InternalResultValue<R>, String> {
+        let Self {
+            value,
+            window,
+            activity,
+        } = self;
+        let value = transform(value, &window)?;
+        Ok(InternalResultValue {
+            value,
+            window,
+            activity,
+        })
+    }
+
+    /// Final closed handoff only: the callback must return payloads whose
+    /// actual backing was already guarded by the first-party domain factory.
+    /// The full allowance remains held throughout the callback itself.
+    pub(crate) fn hand_off<R>(self, handoff: impl FnOnce(T, &ResultWindowAlias) -> R) -> R {
+        let Self {
+            value,
+            window,
+            activity,
+        } = self;
+        let output = handoff(value, &window);
+        drop(window);
+        drop(activity);
+        output
+    }
+
     /// A closed application transformation keeps the same whole allowance.
     /// The closure must retain the supplied alias in any payload it hands to
     /// a provider or separately clonable backing before returning that graph.
@@ -157,9 +213,17 @@ impl<T> InternalResultValue<T> {
         self,
         transform: impl FnOnce(T, &ResultWindowAlias) -> R,
     ) -> InternalResultValue<R> {
-        let Self { value, window } = self;
+        let Self {
+            value,
+            window,
+            activity,
+        } = self;
         let value = transform(value, &window);
-        InternalResultValue { value, window }
+        InternalResultValue {
+            value,
+            window,
+            activity,
+        }
     }
 }
 
@@ -173,7 +237,14 @@ pub(crate) struct InternalResultCpuJob<T> {
 impl<T> InternalResultCpuJob<T> {
     pub(crate) fn try_take(&mut self) -> Option<Result<InternalResultValue<T>, String>> {
         match self.completion.try_recv() {
-            Ok(value) => Some(value),
+            Ok(mut value) => {
+                // A claimed receipt proves CPU execution has exited. The
+                // serial consumer keeps the payload/window, not a CPU lease.
+                if let Ok(value) = &mut value {
+                    value.activity.take();
+                }
+                Some(value)
+            }
             Err(oneshot::error::TryRecvError::Empty) => None,
             Err(oneshot::error::TryRecvError::Closed) => Some(Err(
                 "internal result CPU forwarder exited without its outcome".into(),
@@ -536,6 +607,7 @@ mod tests {
                 ResultWindowClass::Internal,
             )
             .unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
         let mut owner = InternalResultCpuOwner::try_new().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let (entered, started) = mpsc::channel();
@@ -544,6 +616,8 @@ mod tests {
             InternalResultValue::try_produce(&root.owner.scope(), window.retain_alias(), |_| {
                 Ok(vec![1])
             })
+            .unwrap()
+            .track_actual_exit(&binding)
             .unwrap();
         let cancellation = QueryCancellationSource::new();
         let mut job = owner.runtime().submit(
@@ -572,12 +646,21 @@ mod tests {
         });
         assert!(take(&mut job).await.is_err());
         drop(job);
+        let (fence_done, exited) = mpsc::channel();
+        let fence = std::thread::spawn(move || {
+            binding.wait_result_activities_exited();
+            drop(binding);
+            fence_done.send(()).unwrap();
+        });
+        assert!(matches!(exited.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
         release.send(()).unwrap();
         owner
             .shutdown_until(Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
+        exited.recv_timeout(Duration::from_secs(5)).unwrap();
+        fence.join().unwrap();
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 }

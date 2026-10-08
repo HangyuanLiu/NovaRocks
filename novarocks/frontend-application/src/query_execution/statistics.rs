@@ -530,6 +530,18 @@ pub struct StatisticsRootResultDecoder {
 }
 
 impl StatisticsRootResultDecoder {
+    #[cfg(test)]
+    pub(crate) fn for_test_with_capacity(
+        expected: impl IntoIterator<Item = StatisticsArtifactIdentity>,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Self {
+        let retention =
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(binding)
+                .unwrap();
+        let mut decoder = Self::new(expected);
+        decoder.retention = Some(retention);
+        decoder
+    }
     fn new(expected: impl IntoIterator<Item = StatisticsArtifactIdentity>) -> Self {
         Self {
             relayed_record_count: 0,
