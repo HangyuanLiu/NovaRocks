@@ -60,9 +60,9 @@ use arrow::datatypes::{
 use novarocks_result_contract::RootProfileV1;
 use novarocks_result_render::{RenderTurn, RenderTurnStatus};
 use novarocks_spi::connector::{
-    ConnectorRowMutationSourceArray, ConnectorRowMutationSourceBatch,
-    ConnectorRowMutationSourceBuilder, MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,
-    MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
+    ConnectorPayloadRetentionGuard, ConnectorRowMutationSourceArray,
+    ConnectorRowMutationSourceBatch, ConnectorRowMutationSourceBuilder,
+    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
 };
 
 pub const COW_SELECTION_HEADER_BYTES: usize = 32;
@@ -962,6 +962,22 @@ impl CowSelectionDecoder {
         schema: &SchemaRef,
         record: &[u8],
     ) -> Result<ConnectorRowMutationSourceBatch, CowSelectionCodecError> {
+        Self::decode_batch_owned_inner(schema, record, None)
+    }
+
+    pub fn decode_batch_owned_with_guard(
+        schema: &SchemaRef,
+        record: &[u8],
+        guard: ConnectorPayloadRetentionGuard,
+    ) -> Result<ConnectorRowMutationSourceBatch, CowSelectionCodecError> {
+        Self::decode_batch_owned_inner(schema, record, Some(guard))
+    }
+
+    fn decode_batch_owned_inner(
+        schema: &SchemaRef,
+        record: &[u8],
+        guard: Option<ConnectorPayloadRetentionGuard>,
+    ) -> Result<ConnectorRowMutationSourceBatch, CowSelectionCodecError> {
         let header = CowSelectionRecordHeader::parse(record)?;
         header.validate_record_bytes(record.len())?;
         if header.kind != CowSelectionRecordKind::Batch {
@@ -986,8 +1002,13 @@ impl CowSelectionDecoder {
             buffer: 0,
             position: 0,
         };
-        let mut owner = ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))
-            .map_err(|_| CowSelectionCodecError::SourceLimit)?;
+        let mut owner = match guard {
+            Some(guard) => {
+                ConnectorRowMutationSourceBuilder::try_new_with_guard(Arc::clone(schema), guard)
+            }
+            None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema)),
+        }
+        .map_err(|_| CowSelectionCodecError::SourceLimit)?;
         let rows = usize::try_from(header.rows).map_err(|_| malformed)?;
         let mut columns = owner
             .children(schema.fields().len())
@@ -1019,6 +1040,7 @@ fn source_error(error: novarocks_spi::connector::ConnectorError) -> CowSelection
 pub struct CowSelectionStreamDecoder {
     schema: Option<SchemaRef>,
     batches: usize,
+    retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 impl CowSelectionStreamDecoder {
@@ -1064,6 +1086,23 @@ impl CowSelectionStreamDecoder {
         &mut self,
         record: &[u8],
     ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowSelectionCodecError> {
+        self.apply_owned_record_inner(record, None)
+    }
+
+    /// Caller admission already covers schema decoding and source growth.
+    pub fn apply_owned_record_with_guard(
+        &mut self,
+        record: &[u8],
+        guard: ConnectorPayloadRetentionGuard,
+    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowSelectionCodecError> {
+        self.apply_owned_record_inner(record, Some(guard))
+    }
+
+    fn apply_owned_record_inner(
+        &mut self,
+        record: &[u8],
+        guard: Option<ConnectorPayloadRetentionGuard>,
+    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowSelectionCodecError> {
         let header = CowSelectionRecordHeader::parse(record)?;
         if record.len() > MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES {
             return Err(CowSelectionCodecError::SourceLimit);
@@ -1077,6 +1116,7 @@ impl CowSelectionStreamDecoder {
                 ConnectorRowMutationSourceBuilder::try_new(Arc::clone(&schema))
                     .map_err(|_| CowSelectionCodecError::SourceLimit)?;
                 self.schema = Some(schema);
+                self.retention = guard;
                 Ok(None)
             }
             (CowSelectionRecordKind::Schema, Some(_)) => {
@@ -1087,7 +1127,18 @@ impl CowSelectionStreamDecoder {
                 if self.batches >= MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES {
                     return Err(CowSelectionCodecError::BatchLimit);
                 }
-                let batch = CowSelectionDecoder::decode_batch_owned(schema, record)?;
+                let guard = match (guard, self.retention.clone()) {
+                    (Some(batch), Some(schema)) => {
+                        Some(ConnectorPayloadRetentionGuard::new((schema, batch)))
+                    }
+                    (batch, schema) => batch.or(schema),
+                };
+                let batch = match guard {
+                    Some(guard) => {
+                        CowSelectionDecoder::decode_batch_owned_with_guard(schema, record, guard)?
+                    }
+                    None => CowSelectionDecoder::decode_batch_owned(schema, record)?,
+                };
                 self.batches += 1;
                 Ok(Some(batch))
             }
@@ -1098,6 +1149,11 @@ impl CowSelectionStreamDecoder {
     /// the consumer applies its own frozen layout.
     pub fn finish(self) -> Option<SchemaRef> {
         self.schema
+    }
+
+    /// Retain the decoded schema owner through an empty selection handoff.
+    pub fn finish_with_guard(self) -> (Option<SchemaRef>, Option<ConnectorPayloadRetentionGuard>) {
+        (self.schema, self.retention)
     }
 }
 
@@ -1699,5 +1755,52 @@ mod owned_source_tests {
             CowSelectionCodecError::SourceLimit
         );
         assert_eq!(decoder.batches, 0);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use arrow::array::Int32Array;
+
+    #[test]
+    fn guarded_owned_codec_keeps_last_arrow_slice_after_decoder_and_receipt_exit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3, 4]))]).unwrap();
+        let mut encoder =
+            CowSelectionEncoder::try_new(&batch, CowSelectionTotals::default(), usize::MAX)
+                .unwrap();
+        let mut stream = Vec::new();
+        let mut output = [0_u8; 8192];
+        loop {
+            let turn = encoder.step(&mut output);
+            stream.extend_from_slice(&output[..turn.emitted_bytes]);
+            if turn.status == RenderTurnStatus::InputComplete {
+                break;
+            }
+        }
+        let holder = Arc::new(());
+        let weak = Arc::downgrade(&holder);
+        let guard = ConnectorPayloadRetentionGuard::new(holder);
+        let mut decoder = CowSelectionStreamDecoder::new();
+        let split = CowSelectionRecordHeader::parse(&stream)
+            .unwrap()
+            .record_bytes() as usize;
+        decoder
+            .apply_owned_record_with_guard(&stream[..split], guard.clone())
+            .unwrap();
+        let source = decoder
+            .apply_owned_record_with_guard(&stream[split..], guard)
+            .unwrap()
+            .unwrap();
+        let alias = source.batch().column(0).to_data().buffers()[0].slice_with_length(4, 4);
+        drop(source);
+        drop(decoder);
+        drop(stream);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(alias.as_slice(), 4_i32.to_ne_bytes());
+        drop(alias);
+        assert!(weak.upgrade().is_none());
     }
 }

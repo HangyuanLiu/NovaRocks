@@ -904,6 +904,7 @@ pub struct ConnectorRowMutationSelection {
     digest: [u8; 32],
     // Present only when the private construction owner supplied every batch.
     source_ownership: Option<std::sync::Arc<[usize]>>,
+    retention: Vec<crate::connector::ConnectorPayloadRetentionGuard>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -986,14 +987,32 @@ impl ConnectorRowMutationSelection {
                 ));
             }
         }
+        let mut retention = Vec::with_capacity(sources.len());
         let mut ownership = Vec::with_capacity(sources.len());
         let mut batches = Vec::with_capacity(sources.len());
         for source in sources {
             ownership.push(source.source_bytes());
-            batches.push(source.into_batch());
+            let (batch, guard) = source.into_parts();
+            batches.push(batch);
+            retention.extend(guard);
         }
         let mut selection = Self::try_new(schema, batches, max_rows, max_bytes)?;
         selection.source_ownership = Some(ownership.into());
+        selection.retention = retention;
+        Ok(selection)
+    }
+
+    /// Retain the selection's schema and index containers even when no source
+    /// batch exists. Sources still require safe-factory provenance.
+    pub fn try_new_owned_with_guard(
+        schema: SchemaRef,
+        sources: Vec<ConnectorRowMutationSourceBatch>,
+        max_rows: u64,
+        max_bytes: u64,
+        guard: crate::connector::ConnectorPayloadRetentionGuard,
+    ) -> Result<Self, ConnectorError> {
+        let mut selection = Self::try_new_owned(schema, sources, max_rows, max_bytes)?;
+        selection.retention.push(guard);
         Ok(selection)
     }
 
@@ -1073,6 +1092,7 @@ impl ConnectorRowMutationSelection {
             max_bytes,
             digest,
             source_ownership: None,
+            retention: Vec::new(),
         })
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {

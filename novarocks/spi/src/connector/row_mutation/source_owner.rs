@@ -21,11 +21,14 @@
 //! immutable schema. The opaque receipts cannot be detached from their batch.
 
 use std::mem::size_of;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use arrow::array::{ArrayData, ArrayRef, RecordBatch, RecordBatchOptions, make_array};
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+
+use crate::connector::ConnectorPayloadRetentionGuard;
 
 use super::{ConnectorError, ConnectorErrorKind, ConnectorRowConversionFootprint};
 
@@ -42,7 +45,9 @@ const NODE_CONSTRUCTION_BYTES: usize = 2048;
 const BUFFER_HEADER_BYTES: usize = 256;
 
 #[derive(Debug)]
-struct SourceIdentity;
+struct SourceIdentity {
+    _retention: Option<ConnectorPayloadRetentionGuard>,
+}
 
 #[derive(Debug)]
 pub struct ConnectorRowMutationSourceBuilder {
@@ -50,6 +55,7 @@ pub struct ConnectorRowMutationSourceBuilder {
     identity: Arc<SourceIdentity>,
     charged: usize,
     nodes: usize,
+    retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 #[derive(Debug)]
@@ -78,6 +84,7 @@ pub struct ConnectorRowMutationSourceChildren {
 pub struct ConnectorRowMutationSourceBatch {
     batch: RecordBatch,
     source_bytes: usize,
+    retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 impl ConnectorRowMutationSourceBatch {
@@ -89,8 +96,8 @@ impl ConnectorRowMutationSourceBatch {
         self.source_bytes
     }
 
-    pub(super) fn into_batch(self) -> RecordBatch {
-        self.batch
+    pub(super) fn into_parts(self) -> (RecordBatch, Option<ConnectorPayloadRetentionGuard>) {
+        (self.batch, self.retention)
     }
 }
 
@@ -107,6 +114,22 @@ impl ConnectorRowMutationSourceChildren {
 
 impl ConnectorRowMutationSourceBuilder {
     pub fn try_new(schema: SchemaRef) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(schema, None)
+    }
+
+    /// The caller supplies the actual admitted holder before any construction.
+    /// This factory still cannot adopt arbitrary Arrow allocations.
+    pub fn try_new_with_guard(
+        schema: SchemaRef,
+        guard: ConnectorPayloadRetentionGuard,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(schema, Some(guard))
+    }
+
+    fn try_new_inner(
+        schema: SchemaRef,
+        retention: Option<ConnectorPayloadRetentionGuard>,
+    ) -> Result<Self, ConnectorError> {
         if schema.fields().len() > MAX_NODES {
             return Err(exhausted());
         }
@@ -125,9 +148,12 @@ impl ConnectorRowMutationSourceBuilder {
         let charged = checked_add(checked_mul(footprint.schema_bytes, 13)?, 512)?;
         Ok(Self {
             schema,
-            identity: Arc::new(SourceIdentity),
+            identity: Arc::new(SourceIdentity {
+                _retention: retention.clone(),
+            }),
             charged,
             nodes: 0,
+            retention,
         })
     }
 
@@ -165,9 +191,14 @@ impl ConnectorRowMutationSourceBuilder {
     ) -> Result<ConnectorRowMutationSourceBuffer, ConnectorError> {
         let capacity = bytes.len().checked_add(63).ok_or_else(exhausted)? & !63;
         self.reserve(checked_add(capacity, BUFFER_HEADER_BYTES)?)?;
+        let original = Buffer::from_slice_ref(bytes);
+        let buffer = match &self.retention {
+            Some(guard) => retain_buffer(original, guard.clone()),
+            None => original,
+        };
         Ok(ConnectorRowMutationSourceBuffer {
             identity: Arc::clone(&self.identity),
-            buffer: Buffer::from_slice_ref(bytes),
+            buffer,
         })
     }
 
@@ -406,8 +437,29 @@ impl ConnectorRowMutationSourceBuilder {
         Ok(ConnectorRowMutationSourceBatch {
             batch,
             source_bytes: self.charged,
+            retention: self.retention,
         })
     }
+}
+
+fn retain_buffer(original: Buffer, guard: ConnectorPayloadRetentionGuard) -> Buffer {
+    let pointer = NonNull::new(original.as_ptr() as *mut u8).unwrap();
+    let len = original.len();
+    let owner = Arc::new(RetainedBuffer {
+        _original: original,
+        _guard: guard,
+    });
+    // SAFETY: owner holds the immutable original allocation for every byte
+    // of this view, including across Buffer clone/slice/to_data. The original
+    // capacity stays in the source receipt: the custom Arrow view reports len,
+    // which must never replace that receipt.
+    unsafe { Buffer::from_custom_allocation(pointer, len, owner) }
+}
+
+// Field order releases the physical allocation before its capacity holder.
+struct RetainedBuffer {
+    _original: Buffer,
+    _guard: ConnectorPayloadRetentionGuard,
 }
 
 fn exhausted() -> ConnectorError {
@@ -1049,5 +1101,130 @@ mod tests {
             ConnectorErrorKind::ResourceExhausted
         );
         assert_eq!(owner.reserved_bytes(), before);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::connector::ConnectorRowMutationSelection;
+    use arrow::array::{Array, Int32Array, NullArray};
+    use arrow::datatypes::{Field, Schema};
+
+    #[test]
+    fn source_buffer_slice_retains_actual_holder_and_original_capacity_receipt() {
+        let holder = Arc::new(());
+        let weak = Arc::downgrade(&holder);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_guard(
+            schema.clone(),
+            ConnectorPayloadRetentionGuard::new(holder),
+        )
+        .unwrap();
+        let before = builder.reserved_bytes();
+        let array = builder
+            .copy_data(0, &Int32Array::from(vec![7, 8, 9]).to_data())
+            .unwrap();
+        // The copied 12-byte values still own the rounded 64-byte allocation.
+        assert!(builder.reserved_bytes() >= before + 64 + BUFFER_HEADER_BYTES);
+        let mut columns = builder.children(1).unwrap();
+        columns.push(array).unwrap();
+        let source = builder.finish(3, columns).unwrap();
+        let original_receipt = source.source_bytes();
+        let alias = source.batch().column(0).to_data().buffers()[0].slice_with_length(4, 4);
+        let selection =
+            ConnectorRowMutationSelection::try_new_owned(schema, vec![source], 3, 65536).unwrap();
+        assert_eq!(
+            selection.source_ownership.as_ref().unwrap()[0],
+            original_receipt
+        );
+        drop(selection);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(alias.as_slice(), 8_i32.to_ne_bytes());
+        drop(alias);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn null_and_empty_selection_clones_retain_schema_and_index_holder() {
+        for empty in [false, true] {
+            let holder = Arc::new(());
+            let weak = Arc::downgrade(&holder);
+            let guard = ConnectorPayloadRetentionGuard::new(holder);
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Null, true)]));
+            let sources = if empty {
+                vec![]
+            } else {
+                let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_guard(
+                    schema.clone(),
+                    guard.clone(),
+                )
+                .unwrap();
+                let array = builder.copy_data(0, &NullArray::new(1).to_data()).unwrap();
+                let mut columns = builder.children(1).unwrap();
+                columns.push(array).unwrap();
+                vec![builder.finish(1, columns).unwrap()]
+            };
+            let selection = ConnectorRowMutationSelection::try_new_owned_with_guard(
+                schema, sources, 1, 65536, guard,
+            )
+            .unwrap();
+            let alias = selection.clone();
+            drop(selection);
+            assert!(weak.upgrade().is_some());
+            alias.validate().unwrap();
+            drop(alias);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn guarded_source_refuses_excess_before_copy_and_drops_payload_before_holder() {
+        let schema = Arc::new(Schema::empty());
+        let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_guard(
+            schema,
+            ConnectorPayloadRetentionGuard::new(()),
+        )
+        .unwrap();
+        let before = builder.reserved_bytes();
+        let excess = vec![0; MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES];
+        assert_eq!(
+            builder.copy_buffer(&excess).unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(builder.reserved_bytes(), before);
+
+        #[derive(Debug)]
+        struct DropProbe {
+            data: Vec<u8>,
+            events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.events.lock().unwrap().push("payload");
+            }
+        }
+        struct Holder(Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("holder");
+            }
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let payload = Arc::new(DropProbe {
+            data: vec![1, 2, 3],
+            events: events.clone(),
+        });
+        let pointer = NonNull::new(payload.data.as_ptr() as *mut u8).unwrap();
+        // SAFETY: this immutable owner retains all three bytes.
+        let original = unsafe { Buffer::from_custom_allocation(pointer, 3, payload) };
+        let alias = retain_buffer(
+            original,
+            ConnectorPayloadRetentionGuard::new(Holder(events.clone())),
+        )
+        .slice(1);
+        assert!(events.lock().unwrap().is_empty());
+        drop(alias);
+        assert_eq!(*events.lock().unwrap(), ["payload", "holder"]);
     }
 }
