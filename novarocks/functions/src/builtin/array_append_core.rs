@@ -113,6 +113,46 @@ impl ArrayAppendInputs {
             .downcast_ref()
             .expect("original List admission")
     }
+    /// Exact sources passed to the original two-source MutableArrayData constructor.
+    pub fn constructor_sources(&self) -> [&dyn Array; 2] {
+        [self.values.as_ref(), self.targets.as_ref()]
+    }
+    fn row_action(&self, rows: AppendRows) -> AppendRowAction {
+        let list = self.list();
+        if list.is_null(rows.list) {
+            return AppendRowAction::NullParent;
+        }
+        let offsets = list.value_offsets();
+        AppendRowAction::Copy {
+            start: offsets[rows.list] as usize,
+            end: offsets[rows.list + 1] as usize,
+            target: rows.target,
+        }
+    }
+    /// Produce the actual extension plan through the same original row author.
+    /// This method allocates nothing and leaves plan scratch ownership to its caller.
+    pub fn extensions_observed<E>(
+        &self,
+        selection: crate::Selection<'_>,
+        mut rows: impl FnMut(usize, usize) -> Result<AppendRows, E>,
+        mut emit: impl FnMut(usize, usize, usize) -> Result<(), E>,
+        observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
+    ) -> Result<(), AppendFailure<E>> {
+        for (ordinal, row) in selection.iter().enumerate() {
+            observe(observer, CollectionObservation::Step)?;
+            let rows = rows(ordinal, row).map_err(AppendFailure::Control)?;
+            match self.row_action(rows) {
+                AppendRowAction::NullParent => {}
+                AppendRowAction::Copy { start, end, target } => {
+                    if end > start {
+                        emit(0, start, end - start).map_err(AppendFailure::Control)?;
+                    }
+                    emit(1, target, 1).map_err(AppendFailure::Control)?;
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn legacy_rows(&self, row: usize) -> AppendRows {
         AppendRows {
             list: row_index(row, self.list().len()),
@@ -120,29 +160,48 @@ impl ArrayAppendInputs {
         }
     }
 }
+enum AppendRowAction {
+    NullParent,
+    Copy {
+        start: usize,
+        end: usize,
+        target: usize,
+    },
+}
 #[derive(Clone, Copy)]
 pub struct AppendRows {
     pub list: usize,
     pub target: usize,
 }
+/// Legacy projection: no plan allocation, no preflight and original copy ordering.
+/// Pure selected callers use the guarded entry point below.
 pub fn append_observed<E>(
     inputs: &ArrayAppendInputs,
     selection: crate::Selection<'_>,
+    rows: impl FnMut(usize, usize) -> Result<AppendRows, E>,
+    before_extend: impl FnMut(&dyn Array, usize, usize, i64) -> Result<(), E>,
+    observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
+) -> Result<ArrayRef, AppendFailure<E>> {
+    append_observed_guarded(inputs, selection, rows, |_| Ok(()), before_extend, observer)
+}
+pub fn append_observed_guarded<E>(
+    inputs: &ArrayAppendInputs,
+    selection: crate::Selection<'_>,
     mut rows: impl FnMut(usize, usize) -> Result<AppendRows, E>,
+    mut before_construct: impl FnMut(&ArrayAppendInputs) -> Result<(), E>,
     mut before_extend: impl FnMut(&dyn Array, usize, usize, i64) -> Result<(), E>,
     observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, AppendFailure<E>> {
-    let list = inputs.list();
     let values = &inputs.values;
     let targets = &inputs.targets;
     let output_field = inputs.output_field.clone();
+    before_construct(inputs).map_err(AppendFailure::Control)?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let values_data = values.to_data();
     let targets_data = targets.to_data();
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let mut mutable = MutableArrayData::new(vec![&values_data, &targets_data], false, 0);
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let list_offsets = list.value_offsets();
     let mut out_offsets = Vec::with_capacity(selection.len() + 1);
     out_offsets.push(0_i32);
     let mut current: i64 = 0;
@@ -151,14 +210,14 @@ pub fn append_observed<E>(
     for (ordinal, row) in selection.iter().enumerate() {
         observe(observer, CollectionObservation::Step)?;
         let rows = rows(ordinal, row).map_err(AppendFailure::Control)?;
-        let list_row = rows.list;
-        if list.is_null(list_row) {
-            null_builder.append_null();
-            out_offsets.push(current as i32);
-            continue;
-        }
-        let start = list_offsets[list_row] as usize;
-        let end = list_offsets[list_row + 1] as usize;
+        let (start, end, target_row) = match inputs.row_action(rows) {
+            AppendRowAction::NullParent => {
+                null_builder.append_null();
+                out_offsets.push(current as i32);
+                continue;
+            }
+            AppendRowAction::Copy { start, end, target } => (start, end, target),
+        };
         if end > start {
             before_extend(values.as_ref(), start, end - start, current)
                 .map_err(AppendFailure::Control)?;
@@ -167,7 +226,6 @@ pub fn append_observed<E>(
             observe(observer, CollectionObservation::OpaqueBoundary)?;
             current += (end - start) as i64;
         }
-        let target_row = rows.target;
         before_extend(targets.as_ref(), target_row, 1, current).map_err(AppendFailure::Control)?;
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         mutable.extend(1, target_row, target_row + 1);

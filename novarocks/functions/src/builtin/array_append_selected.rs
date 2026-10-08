@@ -18,14 +18,14 @@
 //! Exact selected addressing for the ONE original array append core.
 use super::{
     array_append_core::{
-        AppendFailure, AppendOutputFacts, AppendRows, ArrayAppendInputs, append_observed,
+        AppendFailure, AppendOutputFacts, AppendRows, ArrayAppendInputs, append_observed_guarded,
     },
     array_literal_core::CollectionObservation,
-    collection_selected::copy_error,
+    collection_selected::{copy_error, reserve},
 };
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallContract,
-    ScalarCallInput, SelectedValues,
+    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
+    ScalarCallContract, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
     selected_copy,
@@ -117,40 +117,60 @@ pub(super) fn evaluate<'a>(
             &mut observer,
         )
         .map_err(failure)?;
-        let values = append_observed(
+        let values = append_observed_guarded(
             &inputs,
             selection,
-            |ordinal, row| {
-                let list_row = list.value_row(ordinal, row);
-                let target_row = target.value_row(ordinal, row);
-                if list_row >= list.array().len() || target_row >= target.array().len() {
-                    return Err(internal(
-                        "array_append mapping is outside its checked carriers",
-                    ));
-                }
-                Ok(AppendRows {
-                    list: list_row,
-                    target: target_row,
-                })
-            },
-            |source, start, len, current| {
-                let current =
-                    usize::try_from(current).map_err(|_| KernelFailure::ResourceExhausted)?;
-                let capacity = current
-                    .checked_add(len)
+            |ordinal, row| checked_rows(*list, *target, ordinal, row),
+            |inputs| {
+                let slots = selection
+                    .len()
+                    .checked_mul(2)
                     .ok_or(KernelFailure::ResourceExhausted)?;
-                i32::try_from(capacity).map_err(|_| KernelFailure::ResourceExhausted)?;
-                // This checks the actual single extension. Combined recursive multi-source
-                // payload representability remains the explicit shared-copy obligation.
-                selected_copy::preflight_extend(source, start, len, 0, capacity, |boundary| {
-                    if boundary {
-                        work.borrow_mut().flush()
-                    } else {
-                        work.borrow_mut().step()
-                    }
-                })
+                let mut plan = reserve::<selected_copy::ExtendSegment>(slots, &work)?;
+                let mut count = 0_usize;
+                let mut plan_observer = |event| match event {
+                    CollectionObservation::Step => work.borrow_mut().step(),
+                    CollectionObservation::OpaqueBoundary => work.borrow_mut().flush(),
+                };
+                inputs
+                    .extensions_observed(
+                        selection,
+                        |ordinal, row| checked_rows(*list, *target, ordinal, row),
+                        |source, start, len| {
+                            work.borrow_mut().step()?;
+                            count = count
+                                .checked_add(len)
+                                .ok_or(KernelFailure::ResourceExhausted)?;
+                            i32::try_from(count).map_err(|_| KernelFailure::ResourceExhausted)?;
+                            plan.push(selected_copy::ExtendSegment {
+                                source,
+                                start,
+                                len,
+                                repeats: 1,
+                                nulls: 0,
+                            });
+                            Ok(())
+                        },
+                        &mut plan_observer,
+                    )
+                    .map_err(failure)?;
+                // Complete actual sources, including unselected dictionary/view backing,
+                // are checked before the original constructor can make a copy.
+                selected_copy::preflight_extend_multi(
+                    &inputs.constructor_sources(),
+                    &plan,
+                    0,
+                    |boundary| {
+                        if boundary {
+                            work.borrow_mut().flush()
+                        } else {
+                            work.borrow_mut().step()
+                        }
+                    },
+                )
                 .map_err(copy_error)
             },
+            |_, _, _, _| Ok(()), // the whole real plan was checked before construction
             &mut observer,
         )
         .map_err(failure)?;
@@ -159,6 +179,25 @@ pub(super) fn evaluate<'a>(
     })();
     work.into_inner().finish_result(result)
 }
+fn checked_rows(
+    list: EvaluatedArgument<'_>,
+    target: EvaluatedArgument<'_>,
+    ordinal: usize,
+    row: usize,
+) -> Result<AppendRows, KernelFailure> {
+    let list_row = list.value_row(ordinal, row);
+    let target_row = target.value_row(ordinal, row);
+    if list_row >= list.array().len() || target_row >= target.array().len() {
+        return Err(internal(
+            "array_append mapping is outside its checked carriers",
+        ));
+    }
+    Ok(AppendRows {
+        list: list_row,
+        target: target_row,
+    })
+}
+
 fn failure(error: AppendFailure<KernelFailure>) -> KernelFailure {
     match error {
         AppendFailure::Control(cause) => cause,

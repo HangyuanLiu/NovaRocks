@@ -327,3 +327,6 @@ fn array_append_every_actual_compile_callback_preserves_three_causes_and_named_r
         }
     }
 }
+
+#[path = "array_append_multi_tests.rs"]
+mod multi;

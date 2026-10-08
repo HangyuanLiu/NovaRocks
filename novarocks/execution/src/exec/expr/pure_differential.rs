@@ -1662,3 +1662,7 @@ mod numeric_binary_shared_tests;
 
 mod round_expanded_tests;
 mod round_disagreement_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_array_append_multi_tests.rs"]
+mod array_append_multi_tests;
