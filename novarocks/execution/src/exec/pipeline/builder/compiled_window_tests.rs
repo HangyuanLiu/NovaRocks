@@ -848,7 +848,7 @@ fn sum_over_fails_the_query_only_for_a_frame_whose_result_overflows_bigint() {
             dop,
         );
         let error = try_run(&program).unwrap_err();
-        assert!(error.contains("SUM result overflows BIGINT"), "{error}");
+        assert!(error.contains("sum result overflows BIGINT"), "{error}");
     }
     // The same rows one at a time: no frame overflows.
     let current = Shape {

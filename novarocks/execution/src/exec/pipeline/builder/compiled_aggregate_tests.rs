@@ -743,7 +743,7 @@ fn two_phase_bigint_sum_overflow_fails_only_the_final_value() {
         Ok(_) => panic!("SUM over BIGINT range must fail"),
         Err(error) => error,
     };
-    assert!(error.contains("SUM result overflows BIGINT"), "{error}");
+    assert!(error.contains("sum result overflows BIGINT"), "{error}");
     // Without the overflowing group every value is exact.
     let rows = [
         (Some(1), Some(i64::MAX)),
