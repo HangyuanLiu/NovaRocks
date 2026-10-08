@@ -97,6 +97,7 @@ mod crc32_owner;
 mod date;
 mod date_owner;
 mod dround;
+pub mod dround_core;
 mod dround_owner;
 mod makedate;
 mod makedate_owner;

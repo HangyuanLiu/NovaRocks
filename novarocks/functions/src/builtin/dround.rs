@@ -17,12 +17,13 @@
 
 //! Exact selected DROUND computation. Arrow allocation still requires host MEM admission.
 
+use super::dround_core::{DroundComputation, compute_dround};
+use crate::math_numeric::NumericArrayView;
 use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array,
-    builder::Float64Builder,
     types::{Decimal128Type, validate_decimal_precision_and_scale},
 };
 use arrow_schema::DataType;
@@ -32,7 +33,6 @@ use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelEvaluationControl,
     KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
-    kernel_input::EvaluationCheckpoints,
 };
 
 /// Frozen by the exact owner; binary DROUND deliberately truncates.
@@ -50,68 +50,37 @@ impl DroundOp {
     }
 }
 
-enum NumericInput<'a> {
-    Int8(&'a Int8Array),
-    Int16(&'a Int16Array),
-    Int32(&'a Int32Array),
-    Int64(&'a Int64Array),
-    Float32(&'a Float32Array),
-    Float64(&'a Float64Array),
-    Decimal128(&'a Decimal128Array, i8),
-}
-impl<'a> NumericInput<'a> {
-    fn checked(array: &'a ArrayRef, data_type: &DataType) -> Result<Self, KernelFailure> {
-        if array.data_type() != data_type {
-            return Err(internal("dround carrier differs from its checked argument"));
-        }
-        macro_rules! downcast {
-            ($array:ty, $variant:ident) => {
-                array
-                    .as_any()
-                    .downcast_ref::<$array>()
-                    .map(Self::$variant)
-                    .ok_or_else(|| internal("dround selected carrier cannot be downcast"))
-            };
-        }
-        match data_type {
-            DataType::Int8 => downcast!(Int8Array, Int8),
-            DataType::Int16 => downcast!(Int16Array, Int16),
-            DataType::Int32 => downcast!(Int32Array, Int32),
-            DataType::Int64 => downcast!(Int64Array, Int64),
-            DataType::Float32 => downcast!(Float32Array, Float32),
-            DataType::Float64 => downcast!(Float64Array, Float64),
-            DataType::Decimal128(precision, scale) => {
-                validate_decimal_precision_and_scale::<Decimal128Type>(*precision, *scale)
-                    .map_err(|_| invalid("dround selected decimal parameters are invalid"))?;
-                array
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .map(|array| Self::Decimal128(array, *scale))
-                    .ok_or_else(|| internal("dround selected decimal cannot be downcast"))
-            }
-            _ => Err(invalid("dround input is not an installed numeric profile")),
-        }
+fn checked_numeric_view<'a>(
+    array: &'a ArrayRef,
+    data_type: &DataType,
+) -> Result<NumericArrayView<'a>, KernelFailure> {
+    if array.data_type() != data_type {
+        return Err(internal("dround carrier differs from its checked argument"));
     }
-    fn value(&self, row: usize) -> f64 {
-        match self {
-            Self::Int8(array) => array.value(row) as f64,
-            Self::Int16(array) => array.value(row) as f64,
-            Self::Int32(array) => array.value(row) as f64,
-            Self::Int64(array) => array.value(row) as f64,
-            Self::Float32(array) => array.value(row) as f64,
-            Self::Float64(array) => array.value(row),
-            Self::Decimal128(array, scale) => {
-                // Keep the original i128->f64 conversion before scaling,
-                // including its precision loss and negative-scale behavior.
-                (array.value(row) as f64) / 10_f64.powi(*scale as i32)
-            }
+    match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64 => {}
+        DataType::Decimal128(precision, scale) => {
+            validate_decimal_precision_and_scale::<Decimal128Type>(*precision, *scale)
+                .map_err(|_| invalid("dround selected decimal parameters are invalid"))?
         }
+        _ => return Err(invalid("dround input is not an installed numeric profile")),
     }
+    NumericArrayView::new(array).map_err(|_| {
+        if matches!(data_type, DataType::Decimal128(..)) {
+            internal("dround selected decimal cannot be downcast")
+        } else {
+            internal("dround selected carrier cannot be downcast")
+        }
+    })
 }
-
 struct NumericValue<'a> {
     argument: EvaluatedArgument<'a>,
-    view: NumericInput<'a>,
+    view: NumericArrayView<'a>,
     nullable: bool,
 }
 impl<'a> NumericValue<'a> {
@@ -122,7 +91,7 @@ impl<'a> NumericValue<'a> {
         if value_type.logical_type != ValueLogicalType::Physical {
             return Err(invalid("dround input is not an exact installed profile"));
         }
-        let view = NumericInput::checked(argument.array(), &value_type.data_type)?;
+        let view = checked_numeric_view(argument.array(), &value_type.data_type)?;
         Ok(Self {
             argument,
             view,
@@ -143,7 +112,7 @@ impl<'a> NumericValue<'a> {
             }
             Ok(None)
         } else {
-            Ok(Some(self.view.value(row)))
+            Ok(self.view.value_f64(row))
         }
     }
 }
@@ -244,36 +213,31 @@ pub(super) fn evaluate_dround<'a>(
     };
     let selection = input.selection();
     output_capacity(selection.len())?;
-    let mut builder = Float64Builder::with_capacity(selection.len());
-    let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        let x = value.value(ordinal, batch_row)?;
-        let output = match &digits {
-            None => x.map(f64::round),
-            Some(digits) => match (x, digits.value(ordinal, batch_row)?) {
-                (Some(x), Some(digits)) => {
-                    // Int32->Int64 makes negation safe. Preserve the original
-                    // magnitude->Int32 wrap, including the Int32::MIN case.
-                    if digits >= 0 {
-                        let factor = 10_f64.powi(digits as i32);
-                        Some((x * factor).trunc() / factor)
-                    } else {
-                        let factor = 10_f64.powi((-digits) as i32);
-                        Some((x / factor).trunc() * factor)
-                    }
-                }
-                _ => None,
-            },
+    let computation = match op {
+        DroundOp::Round => DroundComputation::Round,
+        DroundOp::TruncateDigits => DroundComputation::TruncateDigits,
+    };
+    let values = compute_dround(
+        computation,
+        selection,
+        Some(&target.data_type),
+        Some(control),
+        |ordinal, batch_row| {
+            let x = value.value(ordinal, batch_row)?;
+            let digits = digits
+                .as_ref()
+                .map(|digits| digits.value(ordinal, batch_row))
+                .transpose()?
+                .flatten();
+            Ok((x, digits))
+        },
+    )
+    .map_err(|error| match error {
+        crate::math_numeric::MathNumericError::Kernel(error) => error,
+        crate::math_numeric::MathNumericError::Legacy(error) => {
+            KernelFailure::Operational(crate::KernelDiagnostic::new(&error))
         }
-        .filter(|value| value.is_finite());
-        match output {
-            Some(value) => builder.append_value(value),
-            None => builder.append_null(),
-        }
-    }
-    let values = Arc::new(builder.finish()) as ArrayRef;
-    work.finish()?;
+    })?;
     SelectedValues::try_new(selection, &target.data_type, values, Box::default())
         .map_err(|_| internal("dround compact output violates its selected contract"))
 }

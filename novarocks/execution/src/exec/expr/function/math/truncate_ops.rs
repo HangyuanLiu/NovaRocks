@@ -14,72 +14,52 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{NumericArrayView, cast_output, value_at_f64, value_at_i64};
-use super::unary_ops::eval_unary_f64;
+
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Float64Array};
+use novarocks_functions::builtin::dround_core::{DroundComputation, evaluate_legacy_dround};
 use std::sync::Arc;
-
-fn finite_or_null(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
-}
-
-fn eval_truncate_impl(
+fn evaluate(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
+    unary: DroundComputation,
 ) -> Result<ArrayRef, String> {
-    if args.len() == 1 {
-        return eval_unary_f64(arena, expr, args, chunk, |v| v.trunc());
-    }
     let left = arena.eval(args[0], chunk)?;
-    let right = arena.eval(args[1], chunk)?;
-    let left_view = NumericArrayView::new(&left)?;
-    let right_view = NumericArrayView::new(&right)?;
-    let len = chunk.len();
-    let mut values = Vec::with_capacity(len);
-    for row in 0..len {
-        let v = value_at_f64(&left_view, row, len);
-        let d = value_at_i64(&right_view, row, len);
-        let out = match (v, d) {
-            (Some(x), Some(dec)) => {
-                if dec >= 0 {
-                    let factor = 10_f64.powi(dec as i32);
-                    finite_or_null((x * factor).trunc() / factor)
-                } else {
-                    let factor = 10_f64.powi((-dec) as i32);
-                    finite_or_null((x / factor).trunc() * factor)
-                }
-            }
-            _ => None,
-        };
-        values.push(out);
-    }
-    let out = Arc::new(Float64Array::from(values)) as ArrayRef;
-    cast_output(out, arena.data_type(expr))
+    let (op, right) = if args.len() == 1 {
+        (unary, None)
+    } else {
+        (
+            DroundComputation::TruncateDigits,
+            Some(arena.eval(args[1], chunk)?),
+        )
+    };
+    evaluate_legacy_dround(
+        op,
+        &left,
+        right.as_ref(),
+        chunk.len(),
+        arena.data_type(expr),
+    )
+    .map_err(|error| error.to_string())
 }
-
 pub fn eval_truncate(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_truncate_impl(arena, expr, args, chunk)
+    evaluate(arena, expr, args, chunk, DroundComputation::Truncate)
 }
-
 pub fn eval_dround(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if args.len() == 1 {
-        return eval_unary_f64(arena, expr, args, chunk, |v| v.round());
-    }
-    eval_truncate_impl(arena, expr, args, chunk)
+    evaluate(arena, expr, args, chunk, DroundComputation::Round)
 }
 
 #[cfg(test)]
