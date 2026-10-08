@@ -84,3 +84,7 @@ all-targets 首错是 `tests/rest_catalog_test.rs:31` 的未声明 `iceberg_test
 超界场景固定单库 65,537 个 table，另设单个忽略 pageSize 的 terminal response 返回 65,537 项，保证整批失败；保留 65,536 项 exact-bound 对照。名字超界独立注入累计 16 MiB+1 字节，token 注入 4,097 字节与 `a→b→a`，页数注入连续 1,025 页。OpenDAL List 实际 body 注入 16 MiB+1，并核对 endpoint 请求次数为 1。期限场景在第一个列表响应前延迟超过实际 request deadline，并注入显式 stop；失败后复用全部 8 位置，DROP 失败场景核对首次删除前 mutation=0。
 
 以上 N/M、路径与注入方式供 main 在 P09 前冻结；当前只已执行本地 TCP/mockito/Memory OpenDAL 单元反例，没有执行大 catalog jemalloc 测量或真实 1FE+3BE SQL。CL 不设字节通过门，若列表峰值成为 FE 内存主要来源则按 D15 返回设计重审，不能事后放宽 cap。
+
+主agent集成：原模块commit `576eec30f` 已 cherry-pick 为 `41481781a`。上述8份原始日志
+逐字节复制到主worktree `logs/mem-1-m07/p06s/`（沿用原basename与SHA256），不只依赖/tmp。
+coverage/profile按D15/D16整合；集成workspace与CL/native测量待完成，没有把模块证据升级成终态。

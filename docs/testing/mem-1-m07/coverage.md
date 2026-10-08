@@ -20,7 +20,7 @@ P00 历史审查基线：`eb35251de575e071ad3657d0ce0fc1fc95d1a91a`。原始表�
 
 原 P00 记录的 SDK / vendor 调整范围属于历史约束。revision 6 的 P06 只使用 SDK 公开参数或 NovaRocks 调用前后检查，不新增或扩大第三方补丁；Paimon 既有 vendor 补丁限定在 ADR-0138 范围。源头尚未受界时保持现有 FE 保护。
 
-## P06 逐源交接（revision 6）
+## P06/P06s 逐源交接（revision 7）
 
 依据 approved plan/spec revision 6 的 P06 与 §5.6，核对本地检查点
 `603bf9678`、`eb3b008f3`、`60c52341f`、`5c8a9b64f`、`9eb733363`。
@@ -52,18 +52,21 @@ collector 界，旧/新 tail 拷贝与 incoming row 共存先检查 workspace。
 | SHOW MATERIALIZED VIEWS / information_schema MV：FE analysis_adapter / information_schema，MV bounded inventory/readiness | local ClientRows / virtual source → builder/result | 一个 read snapshot 单记录分页、16 MiB thin identity/4 MiB page；逐项 fresh lookup 保留 installed/reason；SHOW 排序 thin targets 后直接 append，无完整 domain row Vec；info_schema row Vec/workspace 先检查，compare/filter 借用，全部投影列合计后 exact-capacity Arrow build | SHOW dependency 单快照核对 exact downstream/CAS 与 canonical occurrences、逐记录接管 4 MiB collector，再用完整 bounded thin inventory 分类；16 MiB inventory/4 MiB collector/额外 decode/raw 归 workspace，borrowed sort/render；任何页/关闭失败拒绝，保留 mv:。生产 Local whole-window funding/实际 capacity 包络尚未验收。证据 evidence/p06-mv-bounded-source.md；C6 |
 | SHOW VIEWS：`query-application/src/view_service.rs:188`；Iceberg `catalog_control/views.rs` | local ClientRows → SHOW rows/helper | local registry 在逐名称 clone 前计数/计字节；external request 携带 listing bound。registry 原事实归 view owner；names/rows/result 各到最后引用退出 | external SDK 峰值见后表；SHOW rows/helper 共存、protocol tail 需 P07/P08；C6 |
 
-### Connector listing 的公开接口边界
+### Connector listing 的公开接口边界（revision 7 D15/D16）
 
-Hive/Hadoop 的 view listing 实际沿 SDK 默认 `FeatureUnsupported`；没有全量 view 枚举路径，
-不能将 Unsupported 伪造为空列表。REST/Hive 接缝裁决见 `evidence/p06-sdk-listing-boundary.md`，
-该记录不改变能力或 accepted spec。
+当前SDK内部response/deserialization缓冲为D15受信端点例外，不要求所有第三方分配在构造前逐字节授权。
+NovaRocks自有副本继续在增长前受V1条目/名字/collector界。Hive/Hadoop的view listing保持SDK
+FeatureUnsupported，不制造空列表。先前裁决审查 `evidence/p06-sdk-listing-boundary.md` 保留为历史；
+当前实现/定向收据见 [P06s](evidence/p06s-external-listing.md)，measurement/1FE+3BE尚未完成。
 
-| source → consumer | 已落实的自有 retained 界 / 最后退出 | 公开接口限制与未闭合项 |
+| source → consumer | 自有保护、调用准入与最后退出 | SDK例外与剩余验证 |
 |---|---|---|
-| REST tables：`connector/iceberg/src/catalog/rest.rs:138,165` → SHOW/system facts/document discovery | 请求 page_entries，经 `ConnectorListingCollector::accept_page` 逐页检查后 retain，token/页数错误在下一页前拒绝；临时 SDK 页/names 退出，最终 Vec 跟 SQL consumer 到最后引用退出 | SDK 已先 receive/deserialize 一页，未证明响应字节上限。`5d54685ee` 已修复忽略 pageSize 的 server：无 continuation 的最终页按累计总条数/名称字节界接受；带 continuation 的超请求页在下次读取前拒绝。document discovery 仍在 table loads 前独立检查页/总界；HTTP mock 9 项通过，生产 SQL 验收待 P09 |
-| REST namespace/view、Hive namespace/table：`connector/iceberg/src/catalog/delegate.rs:98,132` → metadata/SHOW/system facts | SDK 返回后在 push 自有 collector 前检查条数/名称量，拒绝完整列表；临时 SDK Vec 退出，保留 Vec 随 consumer 最后引用退出 | SDK 无对应公开分页/limit 时完整 list 已在内部形成；没有反序列化事前 bounded 证据。自有 retain 受界不证明 SDK 峰值闭合；需公开配置/准入证据或明确拒绝不可支持规模 |
-| Hadoop：`connector/iceberg/src/{fs_io,hadoop_catalog}.rs` / `catalog/hadoop.rs` → metadata/SHOW/system facts | 公开 lister 流中先借用过滤/去重，再检查名称与 String/Vec old+new workspace，保留排序与完整探测。namespace marker/层级/表回退共用 remaining workspace；root 输出 bound 与内部 V1 table source bound 分开。普通 delegate/admitted read 都使用 exact binding 重建有界 FileIO。listing 错误投影复制前限 message ≤4 KiB，保持 limit/cancel/deadline typed kind，不 render SDK source chain | 1176 lib tests PASS；custom FileIO 无 binding 的公共构造不能证明 source owner，listing 事前 Unsupported；new_with_binding 的 listing 按 binding 重建 IO，repo 内生产全同形，外部自定义装饰器行为可能变化。page limit 只约束请求，远端 body/XML 未闭合；evidence/p06-hadoop-stream-source.md |
-| Paimon：`connector/paimon/src/{catalog,catalog_listing,io}.rs` → role metadata → SHOW/system facts | 每次调用用公开 FileIO read-only decorator：在 yielded FileStatus 进入 SDK Vec 前累计检查 32 MiB source workspace；全部物理条目、path capacity、SDK statuses/dirs/names 的 old+new 与嵌套 schema fallback 共用预算。具体 host 显式绑定 bounded FS；URI 构造和 fresh schema HEAD 的 <2MiB auxiliary 在同一 workspace 内。clone 共享 admitted inventory，metadata probe 不增长 scan cache。保持原过滤、探测与排序，取消/deadline 原 typed 错误；超界整批拒绝 | FS 144 / Paimon 55 lib tests PASS，包含 SDK oracle、drop/N+1 poll、nested/cancel/deadline、fresh stat/cache 与独立 row/workspace 边界。OpenDAL page receive/XML decode 仍未闭合；不能声称所有反序列化受界。未扩大 ADR-0138 vendor 修改范围；evidence/p06-fs-paimon-source.md、evidence/p06-paimon-sdk-source.md |
+| REST tables/namespaces/views：`connector/iceberg/src/catalog/rest.rs` → SHOW/system facts/document discovery | 自有单页循环；每页借用V1检查后才copy，累计条目/名字/token/page界，重复token提前拒绝；一个generation共享8位置，覆盖完整loop及实际ctx绝对deadline/stop，SDK future退出后还位。temporary页退出，retained Vec到consumer最后引用退出 | REST公开connect5s/read30s、无整体clienttimeout；server忽略pageSize的terminal页仅整页在剩余界内接受，带continuation超请求页拒绝；SDK body/deserialize属D15，不能称事前硬字节界。组件反例已过，真实SQL/CL/P09待验收 |
+| HMS namespaces/tables：`connector/iceberg/src/catalog/hive.rs` → metadata/SHOW/system facts | get_all_*调用经同一generation8位置与ctx deadline/stop；SDK返回项先借用V1核对再retain，失败整个结果拒绝，future先退出后还位 | 不新增HMS patch；保持framed选项及volo默认16MiB frame，pilota按声明长度预分配缺口仍为D15已知风险。view Unsupported；CL测量与P10上游跟踪待完成 |
+| Hadoop：`connector/iceberg/src/{fs_io,hadoop_catalog}.rs` / `catalog/hadoop.rs` → metadata/SHOW/system facts | 原有borrowed过滤/去重、name/String/Vec old+new workspace界；new_with_binding用exact IO。新增generation8 gate/context期限、raw lister typed List overflow保留ResourceExhausted；能力到完整列表future退出 | 公开lister与远端List body16MiB cap已接；XML/SDK内部缓冲属D15。无binding的custom FileIO原Unsupported保持；历史source收据 evidence/p06-hadoop-stream-source.md，最新见P06s |
+| Paimon：`connector/paimon/src/{catalog,catalog_listing,resources,role_binding}.rs` → role metadata → SHOW/system facts | 原有FileIO decorator在SDK Vec前核对32MiB source workspace；新共享generation8位置与实际ctx SDK run_until/deadline，SDK+bounded retain退出再还位；存在性判断列表失败准确返回错误，不推断false | FS/HMS内部SDK增长属D15；OpenDAL List body cap同下行。只读provider及ADR-0138 patch范围保持。组件drop/N+1/deadline/存在性反例通过；CL/真实外部fixture待验收 |
+| 全endpoint OpenDAL `Operation::List`：`fs/src/{access,list_body_limit}.rs` | 公共HttpFetch/HttpClientLayer在Timeout/ConcurrentLimit/Retry之下数实际body≤16MiB，超界chunk在SDK read_all/XML前拒绝；typed cause为非temporary，Retry不重试。凭证client独立，非List不受此cap | cap是输入界，不证明transport chunk/XML/SDK事前allocator硬界。公开接缝与Operation扩展钉住反例已过；CL高水位/1FE+3BE仍未测 |
+| ADD FILES / 未锚定CTAS清理：`connector/iceberg/src/catalog_control/{add_files,unanchored_ctas_cleanup}.rs` | ADD FILES streaming lister，全部物理entry/name/workspace先计，合法file≤4096；整批超界不提交截断结果。CTAS streaming≤256删除batch，整体V1 discovery界，marker/root最后删除；首次删除前typed列表错误准确返回，删除后仍CommitUnknown并保留marker重试 | 枚举与删除效果语义反例已过；真实native业务效果待P09。SDK内部D15例外不免除NovaRocks自有增长前边界 |
 
 ### 后续收敛要求
 
@@ -75,7 +78,7 @@ Hive/Hadoop 的 view listing 实际沿 SDK 默认 `FeatureUnsupported`；没有�
 3. SPI listing 接口已改变，收敛点需 workspace 全量验证；C6 定向结果与 P07/P09 原生
    1FE+3BE 功能/取消/业务效果收据分开，source review/all-in-one smoke 不替代产品验收。
 
-## Native 与真实 holder（revision 6）
+## Native 与真实 holder（revision 6；Membership 补齐见 2026-10-08 收据）
 
 自有 payload 以最后 backing alias 退出为准；第三方内部按公开配置、库外准入和公开退出事件。
 配置结构算术见 [transport-envelope-v1.md](transport-envelope-v1.md)，系数与测量门尚未完成。
@@ -106,3 +109,8 @@ Hive/Hadoop 的 view listing 实际沿 SDK 默认 `FeatureUnsupported`；没有�
 | nested | 当前 recursive String 全值物化；MySQL map 保持插入顺序 | 有限 depth/elements/count/emit cursor；保留顺序和NULL，不把 HTTP map排序规则搬到客户端 |
 
 这张表没有接受新的客户端语义，也没有修改 golden；冲突必须在准确可达输入上重现后裁决。
+
+2026-10-08 FE Membership incoming已接同一个process admission：独立96 physical/32 bootstrap，
+12288个stream到response body public exit；role/domain/class启动前核对，peer live quota等实际IO退出。
+FE FD含accept拒绝瞬时socket共710；handshake总量160。定向与完整Native/Frontend库通过，
+见 [Membership收据](evidence/p07-membership-ingress.md)。不构成Native cluster/测量或P08切换。

@@ -202,5 +202,28 @@
     "frontend_native_additional_bytes": 3221225472,
     "frontend_declared_result_envelope_bytes": 17179869184
   },
-  "original_p00_source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a"
+  "original_p00_source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a",
+  "external_sdk_listing": {
+    "accounting_revision": 7,
+    "internal_response_bytes": "TRUSTED_ENDPOINT_EXCEPTION_NOT_STRUCTURALLY_BOUNDED",
+    "per_catalog_listing_concurrency": 8,
+    "rest_connect_timeout_ms": 5000,
+    "rest_read_timeout_ms": 30000,
+    "rest_overall_client_timeout_ms": null,
+    "object_store_list_response_body_bytes": 16777216,
+    "object_store_body_limit_operation": "List",
+    "object_store_body_limit_retryable": false,
+    "native_owned_copies": "ConnectorListingBound::V1; checked before growth; whole-batch refusal",
+    "deadline_authority": "ConnectorRequestContext absolute deadline and stop; permit retained until SDK future returns or is dropped",
+    "enforcement_status": "IMPLEMENTED_C6S_COMPONENTS_PASS;INTEGRATED_WORKSPACE_AND_NATIVE_CL_PENDING",
+    "measurement_status": "NOT_RUN",
+    "rest_page_entries": 256,
+    "maximum_listing_entries": 65536,
+    "maximum_listing_pages": 1024,
+    "single_name_bytes": 65536,
+    "retained_names_bytes": 16777216,
+    "token_bytes": 4096,
+    "add_files_maximum_legal_files": 4096,
+    "ctas_delete_batch_entries": 256
+  }
 }

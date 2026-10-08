@@ -4,6 +4,20 @@
 
 本目录记录已批准的 spec / plan 第 5 版的本地实施与验收。P00/P01/P02/P03 本地检查点已保存，P04 正在执行；这里的目标参数或源码审查不代表产品已经实现或通过验收。
 
+## 第 7 版续接（2026-10-08）
+
+accepted spec与本次获批plan revision7在 `codex/mem-1-m07-v7-resume` 本地继续，代码从fork
+`c313bc1bb`（与用户给定`92fe1f718`同code tree）续接。P07 SET整窗/compiler实际退出已保存，
+FE Membership共享有限准入已补齐（[收据](evidence/p07-membership-ingress.md)）。P06s独立
+worktree检查点已集成（[收据](evidence/p06s-external-listing.md)）：D15 trusted endpoint例外、
+REST单页公开接口、generation8 gate/ctx期限、FS List16MiB非retry及维护streaming边界。
+
+P06s组件1492PASS/1既有ignored，Frontend错误传播3PASS，vendor lib58PASS；vendor
+all-targets clippy保留既有integration缺test-utils/async调用失败，未扩大SDK补丁掩盖。
+当前集成workspace、剩余P07生产用途/实际Local aliases/Internal执行owner、P08唯一切换、
+P00b测量、P09原生1FE+3BE/性能与P10仍OPEN。c_*仍null，旧FE/BE保护保留，无push/PR/归档。
+以下v5/v6记录按历史解释，不冒称当前完整验收。
+
 ## 第 6 版（2026-10-06）
 
 spec 与 plan 已改为第 6 版并获批：计量边界改为 NovaRocks 自有对象；撤回十个第三方 vendor patch，Native 传输只用上游公开配置与库外准入（ADR-0168）。执行在同一分支继续，先合入 main（`f008e2682`），再剥离 v5 的传输计费。R1 已删除的模块：`native_transport_capacity`、`native_response`、`native_task_executor`、`native_channel_worker_capacity` 及专测补丁的集成测试；保留并迁移的 D12 行为：Data/Control 独立 listener 与拒绝不失败的 accept 循环、端点方法分类、按 peer process/endpoint/lane 的单飞有界 channel 缓存、调用方进程签名与连接封印。R2 待补：每 lane 的 FE 连接数与 stream 位置持有到 body 退出、DNS 在自有阻塞闭包中解析、FD 上限、lane 指标与 NIG-1 交接口径。下文第 5 版记录保留为历史。
