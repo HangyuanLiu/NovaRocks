@@ -14,90 +14,47 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-//! Selected binary numeric computation for exact installed builtin owners.
+//! Selected binary f64 contracts and addresses delegate to the ONE original core.
 //! Arrow builder allocation still requires formal host memory admission.
-
-use std::sync::Arc;
-
-use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    builder::Float64Builder,
-};
-use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
-
+pub(super) use super::numeric_binary_core::NumericBinaryOp;
+use super::numeric_binary_core::evaluate_binary_rows;
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
+    math_numeric::NumericArrayView,
 };
-
-/// Chosen by the exact immutable preparation owner, never from runtime names.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NumericBinaryOp {
-    Atan2,
-    Fmod,
-    Pow,
-}
-impl NumericBinaryOp {
-    fn apply(self, left: f64, right: f64) -> f64 {
-        match self {
-            Self::Atan2 => left.atan2(right),
-            Self::Fmod => left % right,
-            Self::Pow => left.powf(right),
-        }
+use arrow_array::{Array, ArrayRef, builder::Float64Builder};
+#[cfg(test)]
+use arrow_array::{Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_schema::DataType;
+use novarocks_type_contract::ValueLogicalType;
+use std::sync::Arc;
+fn checked_view<'a>(
+    array: &'a ArrayRef,
+    data_type: &DataType,
+) -> Result<NumericArrayView<'a>, KernelFailure> {
+    if array.data_type() != data_type {
+        return Err(internal(
+            "binary numeric carrier differs from its checked argument",
+        ));
     }
-}
-
-enum NumericInput<'a> {
-    Int8(&'a Int8Array),
-    Int16(&'a Int16Array),
-    Int32(&'a Int32Array),
-    Int64(&'a Int64Array),
-    Float32(&'a Float32Array),
-    Float64(&'a Float64Array),
-}
-impl<'a> NumericInput<'a> {
-    fn checked(array: &'a ArrayRef, data_type: &DataType) -> Result<Self, KernelFailure> {
-        if array.data_type() != data_type {
-            return Err(internal(
-                "binary numeric carrier differs from its checked argument",
-            ));
-        }
-        macro_rules! downcast {
-            ($array:ty, $variant:ident) => {
-                array
-                    .as_any()
-                    .downcast_ref::<$array>()
-                    .map(Self::$variant)
-                    .ok_or_else(|| internal("binary numeric selected carrier cannot be downcast"))
-            };
-        }
-        match data_type {
-            DataType::Int8 => downcast!(Int8Array, Int8),
-            DataType::Int16 => downcast!(Int16Array, Int16),
-            DataType::Int32 => downcast!(Int32Array, Int32),
-            DataType::Int64 => downcast!(Int64Array, Int64),
-            DataType::Float32 => downcast!(Float32Array, Float32),
-            DataType::Float64 => downcast!(Float64Array, Float64),
-            _ => Err(invalid(
-                "binary numeric input is not an installed numeric profile",
-            )),
-        }
+    if !matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+    ) {
+        return Err(invalid(
+            "binary numeric input is not an installed numeric profile",
+        ));
     }
-    fn value(&self, row: usize) -> f64 {
-        match self {
-            Self::Int8(array) => array.value(row) as f64,
-            Self::Int16(array) => array.value(row) as f64,
-            Self::Int32(array) => array.value(row) as f64,
-            Self::Int64(array) => array.value(row) as f64,
-            Self::Float32(array) => array.value(row) as f64,
-            Self::Float64(array) => array.value(row),
-        }
-    }
+    NumericArrayView::new(array)
+        .map_err(|_| internal("binary numeric selected carrier cannot be downcast"))
 }
-
 pub(super) fn evaluate_numeric_binary<'a>(
     op: NumericBinaryOp,
     input: ScalarCallInput<'_, 'a>,
@@ -127,49 +84,48 @@ pub(super) fn evaluate_numeric_binary<'a>(
     }
     let left_array = left.array();
     let right_array = right.array();
-    let left_view = NumericInput::checked(left_array, &left_type.data_type)?;
-    let right_view = NumericInput::checked(right_array, &right_type.data_type)?;
+    let left_view = checked_view(left_array, &left_type.data_type)?;
+    let right_view = checked_view(right_array, &right_type.data_type)?;
     let selection = input.selection();
     output_capacity(selection.len())?;
     let mut builder = Float64Builder::with_capacity(selection.len());
     let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        // Each argument owns its mapping: scalar row zero, checked constant
-        // pool ordinal, original column row or compact selected ordinal.
-        let left_row = left.value_row(ordinal, batch_row);
-        let right_row = right.value_row(ordinal, batch_row);
-        if left_row >= left_array.len() || right_row >= right_array.len() {
-            return Err(internal(
-                "binary numeric selected row is outside its checked carrier",
-            ));
-        }
-        let left_null = left_array.is_null(left_row);
-        let right_null = right_array.is_null(right_row);
-        if (left_null && !left_type.nullable) || (right_null && !right_type.nullable) {
-            return Err(internal(
-                "binary numeric non-null input contains selected SQL NULL",
-            ));
-        }
-        if left_null || right_null {
-            builder.append_null();
-        } else {
-            // Preserve raw-input formula order: NaN^0 and atan2(Inf, Inf)
-            // produce finite answers; pre-sanitizing inputs changes behavior.
-            let value = op.apply(left_view.value(left_row), right_view.value(right_row));
-            if value.is_finite() {
-                builder.append_value(value);
-            } else {
-                builder.append_null();
+    evaluate_binary_rows(
+        op,
+        &left_view,
+        &right_view,
+        selection.iter(),
+        |ordinal, batch_row| {
+            let left_row = left.value_row(ordinal, batch_row);
+            let right_row = right.value_row(ordinal, batch_row);
+            if left_row >= left_array.len() || right_row >= right_array.len() {
+                return Err(internal(
+                    "binary numeric selected row is outside its checked carrier",
+                ));
             }
-        }
-    }
+            if (left_array.is_null(left_row) && !left_type.nullable)
+                || (right_array.is_null(right_row) && !right_type.nullable)
+            {
+                return Err(internal(
+                    "binary numeric non-null input contains selected SQL NULL",
+                ));
+            }
+            Ok((left_row, right_row))
+        },
+        |value| {
+            match value {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            };
+            Ok(())
+        },
+        || work.step(),
+    )?;
     let values = Arc::new(builder.finish()) as ArrayRef;
     work.finish()?;
     SelectedValues::try_new(selection, &target.data_type, values, Box::default())
         .map_err(|_| internal("binary numeric compact output violates its selected contract"))
 }
-
 /// Rust allocation representability only; this does not authorize memory.
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     let values = rows
@@ -186,7 +142,6 @@ fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +689,55 @@ mod tests {
                 control.calls().iter().filter(|units| **units == 0).count(),
                 4
             );
+        }
+    }
+
+    #[test]
+    fn shared_binary_every_actual_callback_preserves_all_seven_causes_and_failed_latch() {
+        let left: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
+        let right: ArrayRef = Arc::new(Int64Array::from(vec![0]));
+        let arguments = [
+            EvaluatedArgument::Scalar(&left),
+            EvaluatedArgument::Scalar(&right),
+        ];
+        let types = [
+            FunctionValueType::new(DataType::Float64, false),
+            FunctionValueType::new(DataType::Int64, false),
+        ];
+        let selection = Selection::all(513);
+        for name in ["atan2", "fmod", "pow", "fpow", "dpow", "power"] {
+            let mut baseline = instance(name, &types);
+            let control = Control::default();
+            baseline.evaluate(selection, &arguments, &control).unwrap();
+            for cause in [
+                KernelFailure::Cancelled,
+                KernelFailure::DeadlineExceeded,
+                KernelFailure::ResourceExhausted,
+                crate::kernel_control::invalid("original invalid"),
+                crate::kernel_control::internal("original internal"),
+                KernelFailure::Operational(crate::kernel_control::KernelDiagnostic::new(
+                    "original operational",
+                )),
+                KernelFailure::InstanceFailed,
+            ] {
+                for at in 0..control.calls().len() {
+                    let mut kernel = instance(name, &types);
+                    let refusal = Control::refusing(at, cause.clone());
+                    assert_eq!(
+                        kernel
+                            .evaluate(selection, &arguments, &refusal)
+                            .unwrap_err(),
+                        cause
+                    );
+                    assert_eq!(refusal.calls().len(), at + 1);
+                    assert_eq!(
+                        kernel
+                            .evaluate(selection, &arguments, &Control::default())
+                            .unwrap_err(),
+                        KernelFailure::InstanceFailed
+                    );
+                }
+            }
         }
     }
 }

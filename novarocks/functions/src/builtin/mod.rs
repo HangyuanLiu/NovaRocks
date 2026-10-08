@@ -118,6 +118,7 @@ mod murmur;
 pub mod nullif;
 mod nullif_owner;
 mod numeric_binary;
+pub mod numeric_binary_core;
 mod numeric_binary_owner;
 pub mod numeric_elementary;
 mod numeric_elementary_owner;

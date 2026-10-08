@@ -14,40 +14,52 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{NumericArrayView, cast_output, value_at_f64};
+use super::common::{NumericArrayView, cast_output};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Float64Array};
+use novarocks_functions::builtin::numeric_binary_core::{NumericBinaryOp, evaluate_binary_rows};
 use std::sync::Arc;
 
-fn finite_or_null(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
-}
-
-fn eval_binary_f64<F>(
+fn eval_binary_f64(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-    func: F,
-) -> Result<ArrayRef, String>
-where
-    F: Fn(f64, f64) -> f64,
-{
+    operation: NumericBinaryOp,
+) -> Result<ArrayRef, String> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_view = NumericArrayView::new(&left)?;
     let right_view = NumericArrayView::new(&right)?;
     let len = chunk.len();
     let mut values = Vec::with_capacity(len);
-    for row in 0..len {
-        let l = value_at_f64(&left_view, row, len);
-        let r = value_at_f64(&right_view, row, len);
-        values.push(match (l, r) {
-            (Some(a), Some(b)) => finite_or_null(func(a, b)),
-            _ => None,
-        });
-    }
+    evaluate_binary_rows(
+        operation,
+        &left_view,
+        &right_view,
+        0..len,
+        |_, row| {
+            Ok((
+                if left_view.len() == 1 && len > 1 {
+                    0
+                } else {
+                    row
+                },
+                if right_view.len() == 1 && len > 1 {
+                    0
+                } else {
+                    row
+                },
+            ))
+        },
+        |out| {
+            values.push(out);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .map_err(|error| error.to_string())?;
     let out = Arc::new(Float64Array::from(values)) as ArrayRef;
     cast_output(out, arena.data_type(expr))
 }
@@ -58,7 +70,7 @@ pub fn eval_atan2(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_binary_f64(arena, expr, args, chunk, |a, b| a.atan2(b))
+    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Atan2)
 }
 
 pub fn eval_fmod(
@@ -67,7 +79,7 @@ pub fn eval_fmod(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_binary_f64(arena, expr, args, chunk, |a, b| a % b)
+    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Fmod)
 }
 
 pub fn eval_pow(
@@ -76,7 +88,7 @@ pub fn eval_pow(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_binary_f64(arena, expr, args, chunk, |a, b| a.powf(b))
+    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Pow)
 }
 
 #[cfg(test)]
