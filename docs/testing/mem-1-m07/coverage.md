@@ -227,3 +227,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 首次clean63bb/v2 installed-root native失败（4.757s）：准确BE1/stage1/task1 typed零ACK定位成功，stage2/task2非root拒绝无法满足strict trailers-only；后者实为相同execution的第二个真实task，未猜root。失败仍resume/join，原1048580B row/独立schema/hash正常，4精确PID已退出；FinalAck场景未执行。收据 `p09-installed-root-native-fail-20261009.json`，不转换为PASS。
 - 根因是 `native_ingress.rs` 的OwnedResponseBody只poll_frame，未转发inner.is_end_stream/size_hint；内层Tonic空status response被默认false掩盖，Hyper产生empty EOS DATA，违反gRPC拒绝应在status HEADERS上结束的结构。真实Hyper+h2 duplex回归旧码0PASS/1FAIL，修正后Native lib720PASS/0FAIL；收据 `p09-empty-grpc-refusal-focused-20261009.json`。
 - 最小修法仅转发两个inner facts，ownership仍由实际Drop/last DATA alias退出，不主动释放permit、不改变status/容量/deadline/owner分类；strict probe保留。原生复跑待执行，跨共享Native响应包装器修正触发一次C0里程碑。两个待裁决语义与其它P09/P00b/P10/final仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09：P09 zero ACK native PASS / final ACK 探针假设修订
+
+- 干净 c2b658f0778ddcdddc977be9a0ee34c89030c5ca 原生1FE+3BE v2矩阵整体FAIL（5.760s）；ZeroAck场景精确PASS，非root UnknownRoot/status5零DATA、两次ACK0不退休、原独立normal wire oracle均通过，空拒绝响应修正取得实际验证。FinalAck在Data1后因测试要求Data2附End而FAIL，实际生产契约支持独立End。剩余3场景未执行。8精确PID均退出；失败仍resume/join保存wire。v2 Data2在断言前未保存，不补造字段；收据 p09-installed-root-native-v2-fail-20261009.json。
+- 保留v1/v2输入及失败收据，v3显式冻结fetch1/fetch2/fetch-end3，再replay1/ACK3/ACK3/Retired1；仅两Data严格匹配且实际End3/rows1后推进proof=3。逻辑退休按operation判断，每次解码先保存outcome/End观察再断言。原S+8与全部容量/5s链期限/100ms wait/20s actor不变；生产代码、profile和deadline未改。
+- runner112 PASS/0 FAIL/2既有ignored；首次v3缺end变量编译错误保留，修复并补wanted3/consumed0实际生产decoder覆盖；独立只读复核无剩余阻止项。收据 p09-installed-root-v3-focused-20261009.json。v3 native和共享Native包装器C0待执行；两项语义裁决与其它P09/P00b/P10/final仍OPEN，无push/PR/归档。

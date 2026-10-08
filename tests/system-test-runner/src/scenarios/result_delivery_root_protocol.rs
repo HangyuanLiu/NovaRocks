@@ -393,11 +393,17 @@ pub(super) fn probe_candidate(
         RootReadOutcome::Retired => ("retired", None, 0, None),
         RootReadOutcome::AwaitTerminalControl => ("await_terminal_control", None, 0, None),
     };
+    let end = match &reply.outcome {
+        RootReadOutcome::Data(data) => data.end_after_data(),
+        RootReadOutcome::End(end) => Some(*end),
+        _ => None,
+    };
     let observation = serde_json::json!({
         "backend_index": backend, "actual_grpc_port": port,
         "response_frame_bytes": frame.len(), "body_bytes": body_bytes,
         "body_sha256": body_sha256, "outcome": outcome, "sequence": sequence,
         "accepted_consumed_sequence": reply.accepted_consumed,
+        "end": end.map(|end| serde_json::json!({"sequence": end.sequence.get(), "output_rows": end.output_rows})),
         "grpc_status": 0, "identity": identity_observation(reply.root_task),
         "request_identity": identity_observation(expected.root_task())
     });

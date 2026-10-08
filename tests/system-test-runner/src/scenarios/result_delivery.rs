@@ -733,7 +733,7 @@ fn installed_root_protocol(
     use novarocks_execution_contract::root_result::RootReadOutcome;
     use sha2::{Digest, Sha256};
     let freeze: InstalledProtocolManifest = serde_json::from_str(include_str!(
-        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
+        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v3.json"
     ))?;
     let retention_digest = format!(
         "{:x}",
@@ -742,7 +742,7 @@ fn installed_root_protocol(
         ))
     );
     ensure!(
-        freeze.schema_version == 2
+        freeze.schema_version == 3
             && freeze.topology == "1FE+3BE"
             && !freeze.scope.is_empty()
             && freeze.retention_input_sha256 == retention_digest
@@ -750,13 +750,13 @@ fn installed_root_protocol(
             && freeze.max_wait_millis == 100
             && freeze.correction_of.len() == 3
             && freeze.correction_of["path"]
-                == "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json"
+                == "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
             && !freeze.correction_of["reason"].is_empty()
             && freeze.correction_of["sha256"]
                 == format!(
                     "{:x}",
                     Sha256::digest(include_bytes!(
-                        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json"
+                        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
                     ))
                 )
             && freeze.max_identity_candidates == 8
@@ -776,7 +776,8 @@ fn installed_root_protocol(
                     "ack0",
                     "ack0",
                     "fetch1",
-                    "fetch2-end3",
+                    "fetch2",
+                    "fetch-end3",
                     "replay1",
                     "ack3",
                     "ack3",
@@ -825,6 +826,7 @@ fn installed_root_protocol(
     }
     let task = installed.context("no actual task identity routes to the held installed root")?;
     let mut proven = 0;
+    let mut delivered_data = 0u8;
     let count = if mode == RootProtocolMode::ZeroAck {
         2
     } else {
@@ -838,7 +840,8 @@ fn installed_root_protocol(
         let (wanted, consumed) = match operation.as_str() {
             "ack0" => (None, 0),
             "fetch1" | "replay1" => (Some(1), 0),
-            "fetch2-end3" => (Some(2), 0),
+            "fetch2" => (Some(2), 0),
+            "fetch-end3" => (Some(3), 0),
             "ack3" => (None, proven),
             "retired1" => (Some(1), proven),
             _ => anyhow::bail!("unknown frozen root operation"),
@@ -863,13 +866,15 @@ fn installed_root_protocol(
                     && digest == freeze.data1_sha256
                     && reply.accepted_consumed == 0
             }
-            (RootReadOutcome::Data(data), "fetch2-end3") => {
-                let end = data
-                    .end_after_data()
-                    .context("frozen final Data has no End")?;
-                let matches = data.sequence().get() == 2
+            (RootReadOutcome::Data(data), "fetch2") => {
+                data.sequence().get() == 2
+                    && data.end_after_data().is_none()
                     && data.body().len() == freeze.data2_bytes
                     && format!("{:x}", Sha256::digest(data.body())) == freeze.data2_sha256
+                    && reply.accepted_consumed == 0
+            }
+            (RootReadOutcome::End(end), "fetch-end3") => {
+                let matches = delivered_data == 3
                     && end.sequence.get() == freeze.end_sequence
                     && end.output_rows == freeze.output_rows
                     && reply.accepted_consumed == 0;
@@ -880,6 +885,12 @@ fn installed_root_protocol(
             }
             _ => false,
         };
+        if matches && operation == "fetch1" {
+            delivered_data |= 1;
+        }
+        if matches && operation == "fetch2" {
+            delivered_data |= 2;
+        }
         observation["operation"] = serde_json::json!(operation);
         observation["matches"] = serde_json::json!(matches);
         observation["proven_delivered_consumed"] = serde_json::json!(proven);
@@ -912,7 +923,7 @@ fn installed_root_protocol(
             .json()?;
         let census = root_census(rows.as_array().context("invalid installed-root census")?)?
             .context("installed-root census unavailable")?;
-        let retired = index >= 5;
+        let retired = matches!(operation.as_str(), "ack3" | "retired1");
         ensure!(
             census["channels"] == 1
                 && census["terminal_task_records"] == 1
@@ -942,7 +953,7 @@ mod census_tests {
     #[test]
     fn frozen_installed_root_requests_pass_the_production_decoder() {
         let freeze: super::InstalledProtocolManifest = serde_json::from_str(include_str!(
-            "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
+            "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v3.json"
         ))
         .unwrap();
         let task = super::foreign_root_task();
@@ -950,6 +961,7 @@ mod census_tests {
             (None, 0),
             (Some(1), 0),
             (Some(2), 0),
+            (Some(3), 0),
             (None, 3),
             (Some(1), 3),
         ] {
