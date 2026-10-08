@@ -43,6 +43,7 @@ pub struct MysqlStream {
 pub struct AsyncMysqlStream {
     stream: AsyncTcpStream,
     timeout: Duration,
+    receive_buffer_bytes: Option<u32>,
 }
 
 pub struct MysqlPacket {
@@ -257,6 +258,21 @@ impl AsyncMysqlStream {
         sql: &str,
         read_delay: Duration,
     ) -> TextResultObservation {
+        self.observe_text_query_with_metadata_pause(sql, read_delay, None)
+            .await
+    }
+
+    /// Stops socket reads exactly after validated metadata. The same absolute
+    /// query budget covers the pause, subsequent row reads and terminal EOF.
+    pub async fn observe_text_query_with_metadata_pause(
+        &mut self,
+        sql: &str,
+        read_delay: Duration,
+        pause: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ) -> TextResultObservation {
         let started = std::time::Instant::now();
         let mut observation = TextResultObservation::default();
         let mut digest = Sha256::new();
@@ -310,6 +326,12 @@ impl AsyncMysqlStream {
                 .await?;
             validate_observation_eof(&end)?;
             metadata_digest.update(&end);
+            if let Some((ready, resume)) = pause {
+                ready
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("metadata observer exited"))?;
+                resume.await.context("metadata read pause canceled")?;
+            }
             let mut scratch = vec![0u8; 65536];
             let mut row_bytes = 0u64;
             let mut continuation = false;
@@ -429,6 +451,43 @@ impl AsyncMysqlStream {
         timeout: Duration,
         max_packet_bytes: u32,
     ) -> Result<Self> {
+        Self::connect_settings(user, port, timeout, max_packet_bytes, None).await
+    }
+
+    /// Fix the client receive window before connect, without modifying any
+    /// server profile. Record the OS-applied buffer instead of assuming it.
+    pub async fn connect_with_receive_buffer(
+        user: &str,
+        port: u16,
+        timeout: Duration,
+        max_packet_bytes: u32,
+        receive_buffer_bytes: u32,
+    ) -> Result<Self> {
+        ensure!(
+            (1024..=65536).contains(&receive_buffer_bytes),
+            "invalid probe receive buffer"
+        );
+        Self::connect_settings(
+            user,
+            port,
+            timeout,
+            max_packet_bytes,
+            Some(receive_buffer_bytes),
+        )
+        .await
+    }
+
+    pub fn receive_buffer_bytes(&self) -> Option<u32> {
+        self.receive_buffer_bytes
+    }
+
+    async fn connect_settings(
+        user: &str,
+        port: u16,
+        timeout: Duration,
+        max_packet_bytes: u32,
+        receive_buffer_bytes: Option<u32>,
+    ) -> Result<Self> {
         ensure!(
             (1..=1 << 30).contains(&max_packet_bytes),
             "invalid client packet allowance"
@@ -441,9 +500,20 @@ impl AsyncMysqlStream {
         const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 
         let address = SocketAddr::from(([127, 0, 0, 1], port));
-        let mut stream = async_timeout(timeout, AsyncTcpStream::connect(address))
-            .await
-            .context("time out connecting raw async public MySQL client")??;
+        let (mut stream, receive_buffer_bytes) = if let Some(bytes) = receive_buffer_bytes {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            socket.set_recv_buffer_size(bytes)?;
+            let actual = socket.recv_buffer_size()?;
+            let stream = async_timeout(timeout, socket.connect(address))
+                .await
+                .context("time out connecting bounded receive-window client")??;
+            (stream, Some(actual))
+        } else {
+            let stream = async_timeout(timeout, AsyncTcpStream::connect(address))
+                .await
+                .context("time out connecting raw async public MySQL client")??;
+            (stream, None)
+        };
 
         let (_, handshake) = read_wire_packet_async(&mut stream, timeout)
             .await
@@ -486,7 +556,11 @@ impl AsyncMysqlStream {
             auth_result.first().copied() == Some(0),
             "unexpected raw async MySQL authentication response: {auth_result:?}"
         );
-        Ok(Self { stream, timeout })
+        Ok(Self {
+            stream,
+            timeout,
+            receive_buffer_bytes,
+        })
     }
 
     pub async fn send_query(&mut self, sql: &str) -> Result<()> {
@@ -830,6 +904,72 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
+    #[tokio::test]
+    async fn metadata_pause_resumes_or_expires_within_the_original_query_budget() {
+        for resume_reads in [true, false] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let budget = Duration::from_secs(2);
+                read_wire_packet_async(&mut peer, budget).await.unwrap();
+                for (sequence, payload) in [
+                    (1, vec![1]),
+                    (2, column_definition()),
+                    (3, vec![0xfe, 0, 0, 0, 0]),
+                    (4, vec![1, b'7']),
+                    (5, vec![0xfe, 0, 0, 0, 0]),
+                ] {
+                    write_packet_async(&mut peer, sequence, &payload, budget)
+                        .await
+                        .unwrap();
+                }
+            });
+            let (ready, metadata) = tokio::sync::oneshot::channel();
+            let (resume, resume_read) = tokio::sync::oneshot::channel();
+            let job = tokio::spawn(async move {
+                AsyncMysqlStream {
+                    stream: client,
+                    timeout: Duration::from_millis(200),
+                    receive_buffer_bytes: None,
+                }
+                .observe_text_query_with_metadata_pause(
+                    "SELECT 7",
+                    Duration::ZERO,
+                    Some((ready, resume_read)),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), metadata)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!job.is_finished());
+            if resume_reads {
+                resume.send(()).unwrap();
+            }
+            let observation = tokio::time::timeout(Duration::from_secs(2), job)
+                .await
+                .unwrap()
+                .unwrap();
+            peer.await.unwrap();
+            if resume_reads {
+                assert_eq!(observation.error, None);
+                assert_eq!((observation.rows, observation.packets), (1, 5));
+            } else {
+                assert_eq!(
+                    observation.error.as_deref(),
+                    Some("absolute query deadline exceeded")
+                );
+                assert_eq!((observation.rows, observation.packets), (0, 3));
+            }
+        }
+    }
+
     fn column_definition() -> Vec<u8> {
         // Six length-encoded strings, followed by the exact fixed 12 bytes.
         let mut column = b"\x03def\x00\x00\x00\x01v\x00".to_vec();
@@ -889,6 +1029,7 @@ mod tests {
         let observation = AsyncMysqlStream {
             stream: client,
             timeout: Duration::from_secs(2),
+            receive_buffer_bytes: None,
         }
         .observe_text_query("SELECT 7", Duration::ZERO)
         .await;
@@ -954,6 +1095,7 @@ mod tests {
         let observation = AsyncMysqlStream {
             stream: client,
             timeout: Duration::from_secs(2),
+            receive_buffer_bytes: None,
         }
         .observe_text_query("SELECT ''", Duration::ZERO)
         .await;
@@ -1013,6 +1155,7 @@ mod tests {
         let observation = AsyncMysqlStream {
             stream: client,
             timeout: Duration::from_secs(5),
+            receive_buffer_bytes: None,
         }
         .observe_text_query("SELECT large_value", Duration::ZERO)
         .await;
@@ -1040,6 +1183,7 @@ mod tests {
         let observation = AsyncMysqlStream {
             stream: client,
             timeout: Duration::from_secs(2),
+            receive_buffer_bytes: None,
         }
         .observe_text_query("SELECT 1", Duration::ZERO)
         .await;

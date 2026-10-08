@@ -469,6 +469,59 @@ pub struct TaskExecutionRegistry {
 }
 
 impl TaskExecutionRegistry {
+    /// Bounded, nonblocking census of existing context-owned roots. Each
+    /// context and channel costs one scan position, including empty retained
+    /// contexts. Exceeding the observation bound invalidates the whole scrape;
+    /// it changes no admission, lifecycle or configured ownership limit.
+    /// Physical counters are independent atomic samples within each channel.
+    pub fn try_root_ownership_snapshot(
+        &self,
+    ) -> Result<
+        Option<crate::root_result_channel::RootOwnershipSnapshot>,
+        crate::root_result_channel::RootOwnershipSnapshotError,
+    > {
+        use crate::root_result_channel::{RootOwnershipSnapshot, RootOwnershipSnapshotError};
+        const SCAN_POSITIONS: usize = 1024;
+        let Some(state) = self
+            .state
+            .try_lock()
+            .map_err(|_| RootOwnershipSnapshotError::RegistryPoisoned)?
+        else {
+            return Ok(None);
+        };
+        let mut remaining = SCAN_POSITIONS;
+        let mut snapshot = RootOwnershipSnapshot::default();
+        for entry in state.contexts.values() {
+            let Some(next) = remaining.checked_sub(1) else {
+                return Ok(None);
+            };
+            remaining = next;
+            for (identity, root) in &entry.roots {
+                let Some(next) = remaining.checked_sub(1) else {
+                    return Ok(None);
+                };
+                remaining = next;
+                let Some(mut channel) = root.try_ownership_snapshot()? else {
+                    return Ok(None);
+                };
+                channel.terminal_task_records = usize::from(
+                    entry
+                        .tasks
+                        .get(identity)
+                        .is_some_and(TaskEntry::is_terminal_record),
+                );
+                if snapshot.try_add(channel).is_none() {
+                    return Ok(None);
+                }
+            }
+        }
+        // Released roots have already passed physical_idle under this fence;
+        // they contain no producer, segment, read/send or metadata subreservation.
+        // Their fixed core backing and any unrelated Arc tail can still live
+        // after removal. A zero census is not their last-owner exit receipt.
+        Ok(Some(snapshot))
+    }
+
     /// Reports the existing charge ledger, including canceled jobs until their exit.
     pub fn preparation_snapshot(&self) -> TaskPreparationSnapshot {
         let state = self.state.lock().expect(REGISTRY_LOCK);

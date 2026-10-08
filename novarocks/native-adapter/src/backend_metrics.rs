@@ -46,6 +46,8 @@ pub struct BackendMetricsRegistry {
     task_preparation: Option<std::sync::Arc<novarocks_worker::TaskExecutionRegistry>>,
     task_preparation_gauges: IntGaugeVec,
     preparation_snapshot_available: IntGauge,
+    root_ownership_gauges: IntGaugeVec,
+    root_snapshot_available: IntGauge,
     scrape_lock: std::sync::Mutex<()>,
 }
 
@@ -367,6 +369,20 @@ impl BackendMetricsRegistry {
         registry
             .register(Box::new(preparation_snapshot_available.clone()))
             .map_err(|error| format!("register preparation snapshot availability: {error}"))?;
+        let root_ownership_gauges = IntGaugeVec::new(
+            Opts::new("novarocks_backend_root_ownership", "Bounded census of context-owned root channels. Logical state is lock-consistent per channel; physical owner counters are independent samples. Released channels and other Arc tails are excluded; zero is not a last-owner exit receipt."),
+            &["resource"],
+        ).map_err(|error| format!("construct root ownership metrics: {error}"))?;
+        registry
+            .register(Box::new(root_ownership_gauges.clone()))
+            .map_err(|error| format!("register root ownership metrics: {error}"))?;
+        let root_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_root_ownership_snapshot_available",
+            "Whether this scrape completed the bounded nonblocking Worker root census. Busy locks or insufficient scan coverage are unavailable, never zero usage.",
+        )).map_err(|error| format!("construct root snapshot availability: {error}"))?;
+        registry
+            .register(Box::new(root_snapshot_available.clone()))
+            .map_err(|error| format!("register root snapshot availability: {error}"))?;
         let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone())
                 as Box<dyn prometheus::core::Collector>,
@@ -429,6 +445,8 @@ impl BackendMetricsRegistry {
             task_preparation: None,
             task_preparation_gauges,
             preparation_snapshot_available,
+            root_ownership_gauges,
+            root_snapshot_available,
             scrape_lock: std::sync::Mutex::new(()),
         })
     }
@@ -576,6 +594,36 @@ impl BackendMetricsRegistry {
                     .set(i64::try_from(limit).unwrap_or(i64::MAX));
             }
         }
+        let roots = self
+            .task_preparation
+            .as_ref()
+            .map(|owner| owner.try_root_ownership_snapshot())
+            .transpose()
+            .map_err(|error| format!("sample Worker root ownership: {error}"))?
+            .flatten();
+        self.root_snapshot_available.set(i64::from(roots.is_some()));
+        if let Some(snapshot) = roots {
+            for (resource, used) in [
+                ("channels", snapshot.channels),
+                ("terminal_task_records", snapshot.terminal_task_records),
+                ("producers_running", snapshot.producers_running),
+                ("producers_exited", snapshot.producers_exited),
+                ("ends_published", snapshot.ends_published),
+                ("ends_acknowledged", snapshot.ends_acknowledged),
+                ("sealed", snapshot.sealed),
+                ("data_positions", snapshot.data_positions),
+                ("payload_bytes", snapshot.payload_bytes),
+                ("segments", snapshot.segments),
+                ("deliveries", snapshot.deliveries),
+                ("retained_reservations", snapshot.retained_reservations),
+                ("metadata_holders", snapshot.metadata_holders),
+                ("metadata_bytes", snapshot.metadata_bytes),
+            ] {
+                self.root_ownership_gauges
+                    .with_label_values(&[resource])
+                    .set(i64::try_from(used).unwrap_or(i64::MAX));
+            }
+        }
         let _query_resource_scrape_guard = self.native_query_resources.as_ref().map(|_| {
             NATIVE_QUERY_RESOURCE_SCRAPE_LOCK
                 .lock()
@@ -618,6 +666,9 @@ impl BackendMetricsRegistry {
             // This scrape has no exact ledger. Previously sampled values must
             // not appear as current values, and unavailable is not zero usage.
             families.retain(|family| family.get_name() != "novarocks_backend_task_preparation");
+        }
+        if roots.is_none() {
+            families.retain(|family| family.get_name() != "novarocks_backend_root_ownership");
         }
         Ok(families)
     }
@@ -1540,6 +1591,58 @@ mod tests {
             Arc::new(UnusedPreparationHost),
             crate::task_execution_observation::backend_task_execution_ports(),
         )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn root_ownership_scrape_omits_stale_or_absent_samples_in_both_formats() {
+        let absent = BackendMetricsRegistry::new().unwrap();
+        let absent_text = render_metrics(&absent).unwrap();
+        assert!(absent_text.contains("novarocks_backend_root_ownership_snapshot_available 0"));
+        assert!(!absent_text.contains("novarocks_backend_root_ownership{"));
+        let owner = preparation_owner();
+        let backend = BackendMetricsRegistry::new()
+            .unwrap()
+            .with_task_preparation(Arc::clone(&owner));
+        for (render, is_text) in [
+            (
+                render_metrics as fn(&BackendMetricsRegistry) -> Result<String, String>,
+                true,
+            ),
+            (render_metrics_json, false),
+        ] {
+            let text = render(&backend).unwrap();
+            assert!(text.contains("novarocks_backend_root_ownership"));
+            owner.with_registry_lock_for_test(|| {
+                let text = render(&backend).unwrap();
+                if is_text {
+                    assert!(text.contains("novarocks_backend_root_ownership_snapshot_available 0"));
+                    assert!(!text.contains("novarocks_backend_root_ownership{"));
+                } else {
+                    let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert!(
+                        !rows
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|row| row["tags"]["metric"] == "novarocks_backend_root_ownership")
+                    );
+                    assert!(
+                        rows.as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|row| row["tags"]["metric"]
+                                == "novarocks_backend_root_ownership_snapshot_available"
+                                && row["value"].as_f64() == Some(0.0))
+                    );
+                }
+            });
+        }
+        assert!(
+            render_metrics(&backend)
+                .unwrap()
+                .contains("novarocks_backend_root_ownership_snapshot_available 1")
+        );
     }
 
     fn assert_preparation_unavailable(prometheus: &str, json: &str) {

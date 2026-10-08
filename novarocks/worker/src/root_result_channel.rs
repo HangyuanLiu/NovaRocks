@@ -22,7 +22,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 
 use bytes::Bytes;
 use novarocks_execution::runtime::fragment::io::{
@@ -43,6 +43,71 @@ use tokio::sync::Notify;
 
 use crate::result_buffer::{ResultBufferKey, ResultRetainedBudget};
 use crate::{TaskStatusSource, WorkerResultRetainedLimits};
+
+/// Read-only root ownership observations. Logical fields share the channel
+/// lock; physical fields are independent atomic samples, not a settlement
+/// receipt or a count of third-party allocations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RootOwnershipSnapshot {
+    pub channels: usize,
+    pub terminal_task_records: usize,
+    pub producers_running: usize,
+    pub producers_exited: usize,
+    pub ends_published: usize,
+    pub ends_acknowledged: usize,
+    pub sealed: usize,
+    pub data_positions: usize,
+    pub payload_bytes: usize,
+    pub segments: usize,
+    pub deliveries: usize,
+    pub retained_reservations: usize,
+    pub metadata_holders: usize,
+    pub metadata_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootOwnershipSnapshotError {
+    RegistryPoisoned,
+    ChannelPoisoned,
+}
+
+impl std::fmt::Display for RootOwnershipSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::RegistryPoisoned => "root ownership registry mutex poisoned",
+            Self::ChannelPoisoned => "root ownership channel mutex poisoned",
+        })
+    }
+}
+impl std::error::Error for RootOwnershipSnapshotError {}
+
+impl RootOwnershipSnapshot {
+    pub(crate) fn try_add(&mut self, other: Self) -> Option<()> {
+        self.channels = self.channels.checked_add(other.channels)?;
+        self.terminal_task_records = self
+            .terminal_task_records
+            .checked_add(other.terminal_task_records)?;
+        self.producers_running = self
+            .producers_running
+            .checked_add(other.producers_running)?;
+        self.producers_exited = self.producers_exited.checked_add(other.producers_exited)?;
+        self.ends_published = self.ends_published.checked_add(other.ends_published)?;
+        self.ends_acknowledged = self
+            .ends_acknowledged
+            .checked_add(other.ends_acknowledged)?;
+        self.sealed = self.sealed.checked_add(other.sealed)?;
+        self.data_positions = self.data_positions.checked_add(other.data_positions)?;
+        self.payload_bytes = self.payload_bytes.checked_add(other.payload_bytes)?;
+        self.segments = self.segments.checked_add(other.segments)?;
+        self.deliveries = self.deliveries.checked_add(other.deliveries)?;
+        self.retained_reservations = self
+            .retained_reservations
+            .checked_add(other.retained_reservations)?;
+        self.metadata_holders = self.metadata_holders.checked_add(other.metadata_holders)?;
+        self.metadata_bytes = self.metadata_bytes.checked_add(other.metadata_bytes)?;
+        Some(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootChannelError {
@@ -720,6 +785,40 @@ impl RootResultChannel {
     pub fn snapshot(&self) -> RetainedStreamSnapshot {
         self.state.lock().unwrap().stream.snapshot()
     }
+    /// Never waits for a producer/read fence and never creates a payload alias.
+    /// A busy lock is unavailable, rather than a zero or stale ownership fact.
+    pub fn try_ownership_snapshot(
+        &self,
+    ) -> Result<Option<RootOwnershipSnapshot>, RootOwnershipSnapshotError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(RootOwnershipSnapshotError::ChannelPoisoned);
+            }
+        };
+        let stream = state.stream.snapshot();
+        Ok(Some(RootOwnershipSnapshot {
+            channels: 1,
+            terminal_task_records: 0, // The registry owns this independent fact.
+            producers_running: usize::from(state.producer_started && !state.producer_exited),
+            producers_exited: usize::from(state.producer_exited),
+            ends_published: usize::from(stream.end_sequence.is_some()),
+            ends_acknowledged: usize::from(
+                stream
+                    .end_sequence
+                    .is_some_and(|end| stream.consumed_through >= end),
+            ),
+            sealed: usize::from(stream.sealed),
+            data_positions: stream.data_positions,
+            payload_bytes: stream.payload_bytes,
+            segments: self.physical.segments.load(Ordering::Acquire),
+            deliveries: self.physical.deliveries.load(Ordering::Acquire),
+            retained_reservations: self.physical.retained_reservations.load(Ordering::Acquire),
+            metadata_holders: self.physical.fixed_metadata_holders.load(Ordering::Acquire),
+            metadata_bytes: self.physical.fixed_metadata_bytes.load(Ordering::Acquire),
+        }))
+    }
     pub fn physical_idle(&self) -> bool {
         let state = self.state.lock().unwrap();
         (!state.producer_started || state.producer_exited)
@@ -1063,6 +1162,98 @@ mod tests {
     };
     use std::num::NonZeroUsize;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn ownership_snapshot_distinguishes_ack_from_last_alias_and_producer_exit() {
+        let (channel, _) = channel(facts());
+        channel.mark_context_owned().unwrap();
+        let producer = channel.start_producer().unwrap();
+        channel.request_finish().unwrap();
+        publish(&channel, b"abc", true);
+        let offered = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
+        let alias = data(&offered).body().clone();
+        let before = channel.try_ownership_snapshot().unwrap().unwrap();
+        assert_eq!(
+            (
+                before.channels,
+                before.producers_running,
+                before.producers_exited
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            (
+                before.ends_published,
+                before.ends_acknowledged,
+                before.data_positions
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!((before.segments, before.deliveries), (1, 1));
+        drop(offered);
+        drop(producer);
+        // End has sequence 2; ACK-only retires logical Data and End together.
+        let ack = channel.read(&read(&channel, None, 2)).await.unwrap();
+        drop(ack);
+        let acknowledged = channel.try_ownership_snapshot().unwrap().unwrap();
+        assert_eq!(
+            (
+                acknowledged.producers_running,
+                acknowledged.producers_exited
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            (
+                acknowledged.ends_acknowledged,
+                acknowledged.data_positions,
+                acknowledged.payload_bytes
+            ),
+            (1, 0, 0)
+        );
+        // The original offered body alias also keeps its read/delivery guard.
+        assert_eq!((acknowledged.segments, acknowledged.deliveries), (1, 1));
+        channel.close(RootRetentionClose::ContextReleased);
+        assert_eq!(channel.try_ownership_snapshot().unwrap().unwrap().sealed, 1);
+        assert!(!channel.physical_idle());
+        drop(alias);
+        let exited = channel.try_ownership_snapshot().unwrap().unwrap();
+        assert_eq!((exited.segments, exited.deliveries), (0, 0));
+        assert!(channel.physical_idle());
+    }
+
+    #[test]
+    fn ownership_snapshot_busy_poison_and_overflow_are_not_zero_usage() {
+        let (channel, _) = channel(facts());
+        let guard = channel.state.lock().unwrap();
+        assert_eq!(channel.try_ownership_snapshot().unwrap(), None);
+        drop(guard);
+        let poison = Arc::clone(&channel);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.state.lock().unwrap();
+                panic!("poison actual root channel");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(
+            channel.try_ownership_snapshot(),
+            Err(RootOwnershipSnapshotError::ChannelPoisoned)
+        );
+        let mut saturated = RootOwnershipSnapshot {
+            segments: usize::MAX,
+            ..Default::default()
+        };
+        assert!(
+            saturated
+                .try_add(RootOwnershipSnapshot {
+                    segments: 1,
+                    ..Default::default()
+                })
+                .is_none()
+        );
+    }
 
     fn task() -> TaskIdentity {
         TaskIdentity::new(

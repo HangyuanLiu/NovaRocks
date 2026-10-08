@@ -341,7 +341,7 @@ fn required_count(value: &Value, key: &str) -> Result<u64> {
         .with_context(|| format!("missing or invalid owner counter {key}"))
 }
 
-fn metric(rows: &[Value], name: &str, labels: &[(&str, &str)]) -> Result<u64> {
+pub(super) fn metric(rows: &[Value], name: &str, labels: &[(&str, &str)]) -> Result<u64> {
     let mut matched = rows.iter().filter(|row| {
         row["tags"]["metric"] == name
             && labels

@@ -18,7 +18,7 @@
 use super::result_delivery_baseline::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation};
 use crate::scenario::{Scenario, ScenarioContext};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_proto_models::{novarocks as proto, result as result_proto};
 use prost::Message;
@@ -58,6 +58,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         )),
         Box::new(WireBoundary("result-delivery/large-row-cross-u24")),
         Box::new(RootReadRefusal),
+        Box::new(ContextRootRetention),
     ]
 }
 
@@ -366,5 +367,294 @@ impl Scenario for WireBoundary {
         await_idle(context, "wire-boundary", "after", epoch)?;
         context.action("observed two consecutive idle FE governance/window and BE reservation/ingress snapshots after writer exit");
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionManifest {
+    schema_version: u32,
+    topology: String,
+    scope: String,
+    sql: String,
+    segment_bytes: u64,
+    native_row_bytes: u64,
+    client_receive_buffer_bytes: u32,
+    max_applied_receive_buffer_bytes: u32,
+    mysql_client_max_packet_bytes: u32,
+    query_observation_ms: u64,
+    metadata_wait_ms: u64,
+    held_phase_ms: u64,
+    phase_sample_interval_ms: u64,
+    phase_max_samples: usize,
+    expected_columns: u64,
+    expected_rows: u64,
+    expected_row_payload_bytes: u64,
+    expected_packets: u64,
+    expected_schema: Vec<TextColumnObservation>,
+    expected_row_sha256: String,
+}
+
+const ROOT_RESOURCES: [&str; 14] = [
+    "channels",
+    "terminal_task_records",
+    "producers_running",
+    "producers_exited",
+    "ends_published",
+    "ends_acknowledged",
+    "sealed",
+    "data_positions",
+    "payload_bytes",
+    "segments",
+    "deliveries",
+    "retained_reservations",
+    "metadata_holders",
+    "metadata_bytes",
+];
+
+fn root_census(rows: &[serde_json::Value]) -> Result<Option<BTreeMap<String, u64>>> {
+    use super::result_delivery_baseline::metric;
+    let available = metric(
+        rows,
+        "novarocks_backend_root_ownership_snapshot_available",
+        &[],
+    )?;
+    ensure!(available <= 1, "invalid root census availability");
+    if available == 0 {
+        ensure!(
+            !rows
+                .iter()
+                .any(|row| row["tags"]["metric"] == "novarocks_backend_root_ownership"),
+            "unavailable root census published stale ownership"
+        );
+        return Ok(None);
+    }
+    ROOT_RESOURCES
+        .iter()
+        .map(|name| {
+            Ok((
+                (*name).to_owned(),
+                metric(
+                    rows,
+                    "novarocks_backend_root_ownership",
+                    &[("resource", name)],
+                )?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()
+        .map(Some)
+}
+
+struct ContextRootRetention;
+
+impl Scenario for ContextRootRetention {
+    fn name(&self) -> &'static str {
+        "result-delivery/producer-exit-context-retention"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        ensure!(
+            context.handle().be_count() == 3,
+            "root retention requires native 1FE+3BE"
+        );
+        let manifest: RetentionManifest = serde_json::from_str(include_str!(
+            "../../../../docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json"
+        ))?;
+        ensure!(
+            manifest.schema_version == 1
+                && manifest.topology == "1FE+3BE"
+                && !manifest.scope.is_empty()
+                && manifest.segment_bytes == 1048576
+                && manifest.native_row_bytes == manifest.expected_row_payload_bytes + 4
+                && manifest.native_row_bytes > manifest.segment_bytes
+                && manifest.native_row_bytes <= 2 * manifest.segment_bytes
+                && manifest.query_observation_ms == 20000
+                && manifest.held_phase_ms == 5000
+                && manifest.metadata_wait_ms == 5000
+                && manifest.phase_sample_interval_ms == 100
+                && manifest.phase_max_samples == 51,
+            "unsupported root retention freeze"
+        );
+        let epoch = Instant::now();
+        await_idle(context, "root-retention", "before", epoch)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let mut stream = runtime.block_on(AsyncMysqlStream::connect_with_receive_buffer(
+            context.mysql_user(),
+            context.mysql_port(),
+            Duration::from_millis(manifest.query_observation_ms),
+            manifest.mysql_client_max_packet_bytes,
+            manifest.client_receive_buffer_bytes,
+        ))?;
+        let applied = stream
+            .receive_buffer_bytes()
+            .context("missing applied client receive buffer")?;
+        ensure!(
+            applied > 0 && applied <= manifest.max_applied_receive_buffer_bytes,
+            "OS client receive window exceeds frozen probe bound"
+        );
+        let (ready, metadata_ready) = tokio::sync::oneshot::channel();
+        let (resume, resume_read) = tokio::sync::oneshot::channel();
+        let sql = manifest.sql.clone();
+        let job = runtime.spawn(async move {
+            stream
+                .observe_text_query_with_metadata_pause(
+                    &sql,
+                    Duration::ZERO,
+                    Some((ready, resume_read)),
+                )
+                .await
+        });
+        let mut samples = Vec::new();
+        let held = (|| -> Result<()> {
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_millis(manifest.metadata_wait_ms),
+                        metadata_ready,
+                    )
+                    .await
+                })
+                .context("root retention metadata deadline")??;
+            let deadline = Instant::now() + Duration::from_millis(manifest.held_phase_ms);
+            let ports: Vec<_> = context
+                .handle()
+                .runtime()
+                .be
+                .iter()
+                .map(|be| be.http)
+                .collect();
+            let mut consecutive = 0;
+            loop {
+                context.remaining("held root census")?;
+                ensure!(
+                    Instant::now() < deadline && samples.len() < manifest.phase_max_samples,
+                    "root producer never retired with two context-held Data positions and End"
+                );
+                ensure!(
+                    !job.is_finished(),
+                    "client actor exited before held-root observation"
+                );
+                let mut roots = Vec::new();
+                for port in &ports {
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_secs(1)),
+                        )
+                        .build()?;
+                    let rows: serde_json::Value = client
+                        .get(format!("http://127.0.0.1:{port}/metrics?type=json"))
+                        .send()?
+                        .error_for_status()?
+                        .json()?;
+                    roots.push(root_census(
+                        rows.as_array()
+                            .context("invalid root census metric array")?,
+                    )?);
+                }
+                let occupied: Vec<_> = roots
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .filter(|root| root["channels"] != 0)
+                    .collect();
+                let matches = roots.iter().all(Option::is_some)
+                    && occupied.len() == 1
+                    && occupied[0]["channels"] == 1
+                    && occupied[0]["terminal_task_records"] == 1
+                    && occupied[0]["producers_running"] == 0
+                    && occupied[0]["producers_exited"] == 1
+                    && occupied[0]["ends_published"] == 1
+                    && occupied[0]["ends_acknowledged"] == 0
+                    && occupied[0]["sealed"] == 0
+                    && occupied[0]["data_positions"] == 2
+                    && occupied[0]["payload_bytes"] == manifest.native_row_bytes
+                    && occupied[0]["segments"] == 2
+                    && occupied[0]["metadata_bytes"] > 0;
+                samples.push(
+                    serde_json::json!({"elapsed_micros":epoch.elapsed().as_micros(),
+                    "applied_receive_buffer_bytes":applied,"roots":roots,"matches":matches}),
+                );
+                std::fs::write(
+                    context
+                        .scenario_root()
+                        .join("root-context-held-census.json"),
+                    serde_json::to_vec_pretty(&samples)?,
+                )?;
+                ensure!(
+                    Instant::now() < deadline,
+                    "held root census exceeded absolute phase deadline"
+                );
+                consecutive = if matches { consecutive + 1 } else { 0 };
+                if consecutive == 2 {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(manifest.phase_sample_interval_ms));
+            }
+        })();
+        // Resume even a failed probe, then join and preserve the real wire
+        // outcome before returning its failure. No background actor is hidden.
+        let _ = resume.send(());
+        let observation = runtime.block_on(job).context("join paused root client")?;
+        std::fs::write(
+            context
+                .scenario_root()
+                .join("root-context-retention-wire.json"),
+            serde_json::to_vec_pretty(&observation)?,
+        )?;
+        held?;
+        ensure!(
+            observation.error.is_none()
+                && observation.columns == manifest.expected_columns
+                && observation.schema == manifest.expected_schema
+                && observation.rows == manifest.expected_rows
+                && observation.row_payload_bytes == manifest.expected_row_payload_bytes
+                && observation.packets == manifest.expected_packets
+                && observation.row_sha256 == manifest.expected_row_sha256,
+            "resumed client bytes differ from independent frozen oracle"
+        );
+        await_idle(context, "root-retention", "after", epoch)?;
+        context.record_phase_observation(
+            "producer-retired-context-held-root",
+            1,
+            1,
+            1,
+            "public-mysql-native-root",
+            1,
+            "passed",
+            BTreeMap::from([
+                ("rows", observation.rows),
+                ("held_data_positions", 2),
+                ("census_samples", u64::try_from(samples.len())?),
+            ]),
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+    #[test]
+    fn census_missing_partial_duplicate_stale_and_invalid_samples_are_refused() {
+        use serde_json::json;
+        let available = json!({"tags":{"metric":"novarocks_backend_root_ownership_snapshot_available"},"value":1});
+        assert!(root_census(&[]).is_err());
+        assert!(root_census(&[available.clone()]).is_err());
+        let mut rows = vec![available.clone()];
+        rows.extend(ROOT_RESOURCES.iter().map(|name| json!({"tags":{"metric":"novarocks_backend_root_ownership","resource":name},"value":0})));
+        assert!(root_census(&rows).unwrap().is_some());
+        rows.push(rows[1].clone());
+        assert!(root_census(&rows).is_err());
+        rows.pop();
+        rows[0]["value"] = json!(0);
+        assert!(root_census(&rows).is_err());
+        assert_eq!(root_census(&rows[..1]).unwrap(), None);
+        rows[0] = available;
+        rows[1]["value"] = json!(-1);
+        assert!(root_census(&rows).is_err());
     }
 }

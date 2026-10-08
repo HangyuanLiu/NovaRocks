@@ -178,3 +178,11 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 
 - 干净源码/runner `27899ebd98c008e80b06dd3bdcea0faf4e953d7a`，实际产品仍为已通过C0的 `7607dae64053ab853c47d827deb64eebddb29030`；两者间只有tests/docs/evidence，产品源码未变。原生1FE+3BE的七项请求精确status为9/3/3/3/3/3/3，随后真实Native SUM健康查询的schema/行字节/独立hash正确；前后公开owner连续两次归零，4 PID真实退出。
 - 收据 `p09-root-refusal-native-pass-20261009.json` 保留原始probe/hash/实际二进制身份。只关闭 authenticated plaintext/IP 请求profile/kind/sequence/foreign-process拒绝，不冒充 installed-root ACK/replay/生产退休/context留存/ClosingRow、非法回复或全C9验收。其余门、两个待裁决决定与goal保持OPEN，无push/PR/归档。
+
+
+### 2026-10-09：P09 context-owned root 直接观测与冻结场景
+
+- Worker 新增只读固定 1024 个 context/root 扫描位置的 census，registry/root 均 try_lock，不 clone payload、不触发 callback；busy/覆盖不足/聚合溢出使整份观测 unavailable，poison 明确错误。Backend role-local 指标使用固定 resource labels，不可用时省略 ownership family，历史 Gauge 不冒充新快照。逻辑字段在各 root 锁下一致，物理计数为独立 atomic 样本。
+- 观测 producer guard exit、task 退休记录、Data/End/ACK/seal 与原 segment/read/send/reservation/metadata holders。范围只到 context 当前持有的 root；移出 context 的固定 core backing、其它 Arc tail、线程/allocator dealloc 不在此 census，归零不证明全部 physical backing 最后退出。
+- 新 `result-delivery/producer-exit-context-retention` 已在首次 native 执行前冻结：一个 1MiB 字符串形成 S+8 Native 行字节；校验 metadata 后停止读行，连续两次要求一个 context-held root 的 W=2、End 已发布但未ACK、producer guard exited、task 已退休，恢复后检查独立 frozen schema/row bytes/packet/digest。客户端 connect 前申请4KiB SO_RCVBUF并记录OS应用值，不外推真实TCP window/第三方容量，不修改server profile。
+- Worker lib322、Backend metrics16、system runner98 PASS/0 FAIL/2既有ignored；前两次 alias counter 预期及第3次 test fixture scan coverage 错误均保留日志并修正。独立只读审查和 Python literal oracle 一致。收据 `p09-root-context-retention-focused-20261009.json`；原生尚未执行。P09其它门/P00b/P10/final及两个待裁决决定仍OPEN，goal active，无push/PR/归档。

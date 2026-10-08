@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 context-owned root census and pre-frozen retention probe",
+  "outcome": "focused-passed-native-pending",
+  "source_parent": "a8e611e20249cefc39e7c37d08145c5f40baad4a",
+  "source_dirty": true,
+  "tests": {
+    "worker_lib": {
+      "passed": 322,
+      "failed": 0
+    },
+    "backend_metrics": {
+      "passed": 16,
+      "failed": 0
+    },
+    "system_runner_all_targets": {
+      "passed": 98,
+      "failed": 0,
+      "ignored": 2
+    }
+  },
+  "input": {
+    "path": "docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json",
+    "sha256": "3f8813c8c8205ba724ad8c3dc6eeecae4562681244e46d12910de360a1c45752"
+  },
+  "scope": "Read-only bounded nonblocking context-owned census; independent atomic physical samples. Excludes released fixed core backing/other Arc tails and does not prove thread or allocator dealloc. Existing server caps, admission and deadlines unchanged. Native execution pending.",
+  "historical_failures": [
+    "v1/v2 expected delivery counter zero after ACK, but the original body alias legitimately retains its delivery guard; assertion corrected to 1 until last alias exits.",
+    "v3 scan bound test failed to create its 1025th vacant fence under the existing fixture limit 1024; test-only fixture capacity set to 2048 and Accepted verified, production limits unchanged."
+  ],
+  "independent_review": "p07_integration_audit read-only reviewed locks/bounds/stale samples/producer evidence/paused actor/deadlines and recomputed literal wire hash; no blocker under stated scope.",
+  "raw_logs": [
+    {
+      "path": "logs/mem-1-m07/p09-root-ownership-focused-20261009.log",
+      "sha256": "8583523a767cff0fe82401181a356cfd989ebc1678aa3d4411430cd5fb0f95dc"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-ownership-focused-v2-20261009.log",
+      "sha256": "80460b7e2c33d010c79cba9b3ea2ede72a632697b1c3b975ae86761d2b04bdb1"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-ownership-focused-v3-20261009.log",
+      "sha256": "ece2b1d200a9ab2c9eaae65e799265b39e6b33cb46af5e5e6ff9486bf0c7350c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-ownership-focused-v4-20261009.log",
+      "sha256": "5b5dca20757a9a562056073a57bd83f60b0ae4a7db7812628508e24f22da5f5e"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-ownership-worker-lib-20261009.log",
+      "sha256": "920969941af6434e0a9294c693acd31e3d26c0822d55f482ed524e84aa121199"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-ownership-metrics-focused-20261009.log",
+      "sha256": "7049c4f277f456792bd67e767ce2be23774102539cc9746ddd09f0109ac4dcd1"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-retention-runner-tests-20261009.log",
+      "sha256": "909f9b1b15faf33dac8080626e5e9cd85d93e57cc18e8a7bd1e96cbe7faf9629"
+    }
+  ]
+}

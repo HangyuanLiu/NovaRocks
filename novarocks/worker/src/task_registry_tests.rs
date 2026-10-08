@@ -602,6 +602,88 @@ fn finish_bounded_root(
     assert_eq!(fixture.registry.advance_deadlines().tasks_retired, 1);
 }
 
+#[test]
+fn root_ownership_snapshot_refuses_incomplete_scan_coverage() {
+    let fixture = Fixture::with_config(TestTaskHost::default(), |config| {
+        config.retained_context_capacity = 2048;
+    });
+    // Vacant quiesce fences are genuine existing context entries; they must
+    // count toward bounded work even though they contain no root channel.
+    for index in 0..1024 {
+        let context = fixture.context(execution(32_000 + index));
+        let receipt = fixture
+            .registry
+            .quiesce_query_context(&QuiesceQueryContext::new(
+                TaskOperationId::new_v7(),
+                context,
+            ));
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+    }
+    assert!(
+        fixture
+            .registry
+            .try_root_ownership_snapshot()
+            .unwrap()
+            .is_some()
+    );
+    let extra = fixture.context(execution(33_024));
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(TaskOperationId::new_v7(), extra));
+    assert_eq!(
+        fixture.registry.try_root_ownership_snapshot().unwrap(),
+        None
+    );
+}
+
+#[test]
+fn root_ownership_snapshot_observes_retired_task_context_and_busy_registry() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    assert_eq!(
+        fixture
+            .registry
+            .try_root_ownership_snapshot()
+            .unwrap()
+            .unwrap()
+            .channels,
+        0
+    );
+    let execution = execution(31_010);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, _) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    let snapshot = fixture
+        .registry
+        .try_root_ownership_snapshot()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            snapshot.channels,
+            snapshot.terminal_task_records,
+            snapshot.producers_exited
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        (
+            snapshot.ends_published,
+            snapshot.ends_acknowledged,
+            snapshot.segments
+        ),
+        (1, 0, 1)
+    );
+    fixture.registry.with_registry_lock_for_test(|| {
+        assert_eq!(
+            fixture.registry.try_root_ownership_snapshot().unwrap(),
+            None
+        );
+    });
+}
+
 #[tokio::test]
 async fn context_owned_root_survives_task_retirement_and_request_horizon() {
     use crate::root_result_channel::ContextRootRoute;
