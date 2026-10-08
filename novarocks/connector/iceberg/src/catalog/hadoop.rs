@@ -119,6 +119,10 @@ fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
+    fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
+        Arc::clone(&self.delegate.listing)
+    }
+
     fn implementation_name(&self) -> &'static str {
         "hadoop"
     }
@@ -152,18 +156,29 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         binding: crate::access_binding::IcebergReadBinding,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        let namespaces = self
-            .client
-            .list_namespaces_for_read(binding, bound)
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "filesystem catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(&context, async {
+                let namespaces = self
+                    .client
+                    .list_namespaces_for_read(binding, bound)
+                    .await
+                    .map_err(|error| map_bounded_read_error(&error))?;
+                Ok(super::delegate::sorted_unique(
+                    namespaces
+                        .into_iter()
+                        .flat_map(|ident| ident.inner())
+                        .filter(|name| !name.starts_with('.'))
+                        .collect(),
+                ))
+            })
             .await
-            .map_err(|error| map_bounded_read_error(&error))?;
-        Ok(super::delegate::sorted_unique(
-            namespaces
-                .into_iter()
-                .flat_map(|ident| ident.inner())
-                .filter(|name| !name.starts_with('.'))
-                .collect(),
-        ))
     }
 
     async fn namespace_exists(
@@ -201,15 +216,26 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         binding: crate::access_binding::IcebergReadBinding,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        let ident = super::delegate::namespace_ident(&namespace)?;
-        let tables = self
-            .client
-            .list_tables_for_read(&ident, binding, bound)
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "filesystem catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(&context, async {
+                let ident = super::delegate::namespace_ident(&namespace)?;
+                let tables = self
+                    .client
+                    .list_tables_for_read(&ident, binding, bound)
+                    .await
+                    .map_err(|error| map_bounded_read_error(&error))?;
+                Ok(super::delegate::sorted_unique(
+                    tables.into_iter().map(|ident| ident.name).collect(),
+                ))
+            })
             .await
-            .map_err(|error| map_bounded_read_error(&error))?;
-        Ok(super::delegate::sorted_unique(
-            tables.into_iter().map(|ident| ident.name).collect(),
-        ))
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {

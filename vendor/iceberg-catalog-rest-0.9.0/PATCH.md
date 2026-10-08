@@ -161,6 +161,15 @@ bump. Line references are into `src/` of this directory.
   `Cargo.toml` additionally registers the `staged_create_probe` integration
   test that exercises the staged path against a live REST fixture.
 
+- Added single-page REST protocol methods `list_tables_page` (originally
+  introduced in #1056), `list_namespaces_page` and `list_views_page`. Each
+  sends `pageSize` and replays opaque `pageToken`, returning exactly one
+  response and its continuation without accumulating pages. Namespace pages
+  preserve the optional `parent` filter. NovaRocks owns pagination and refusal
+  of repeated tokens. This is a protocol extension, with no response-body cap,
+  allocation accounting or exit hook inside the SDK. Delete these patches
+  and use upstream when it exposes equivalent single-page or streaming APIs.
+
 ## Validation
 
 Diff base: upstream `iceberg-catalog-rest` 0.9.0 and 0.9.1 ship a

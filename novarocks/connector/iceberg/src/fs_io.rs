@@ -346,20 +346,25 @@ impl Storage for IcebergFsStorage {
             .await;
         self.check_read_active("list_directories")?;
         let mut entries = result.map_err(|error| {
-            // Keep the SDK error as its own source rather than formatting an
-            // arbitrary remote response into another Nova-owned String.
+            // Preserve typed List overflow through the Iceberg error source
+            // without retaining or rendering opaque SDK diagnostics.
             Error::new(
                 ErrorKind::Unexpected,
                 "fs directory traversal could not start",
             )
-            .with_source(error)
+            .with_source(novarocks_spi::connector::ConnectorError::from(
+                novarocks_fs::map_object_store_listing_error(error),
+            ))
         })?;
         let prefix = relative_path.trim_start_matches('/');
         while let Some(entry) = entries.next().await {
             self.check_read_active("list_directories")?;
             let entry = entry.map_err(|error| {
-                Error::new(ErrorKind::Unexpected, "fs directory traversal failed")
-                    .with_source(error)
+                Error::new(ErrorKind::Unexpected, "fs directory traversal failed").with_source(
+                    novarocks_spi::connector::ConnectorError::from(
+                        novarocks_fs::map_object_store_listing_error(error),
+                    ),
+                )
             })?;
             let listed = entry.path().trim_start_matches('/');
             if let Some(relative) = listed.strip_prefix(prefix) {

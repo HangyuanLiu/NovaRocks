@@ -343,13 +343,14 @@ pub(crate) fn list_views(
     runtime: &IcebergMetadataContext,
     namespace: &str,
     bound: novarocks_spi::connector::ConnectorListingBound,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, ConnectorError> {
     let catalog = Arc::clone(runtime.novarocks_catalog());
     let name = crate::catalog::CatalogNamespaceName::new(namespace);
-    bridge(
-        runtime,
-        async move { catalog.list_views(name, bound).await },
-    )
+    let context = context.clone();
+    bridge(runtime, async move {
+        catalog.list_views_for_request(name, context, bound).await
+    })
 }
 
 fn map_view_error(ident: &TableIdent, action: &str, error: impl std::fmt::Display) -> String {
@@ -468,16 +469,21 @@ impl ConnectorViewMetadata for IcebergMetadata {
         request: ConnectorListViewsRequest,
     ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
         ensure_request(self, &request.namespace.instance_id, &request.context)?;
-        list_views(self.runtime(), &request.namespace.namespace, request.bound)?
-            .into_iter()
-            .map(|view| {
-                Ok(ConnectorViewIdentity {
-                    instance_id: self.descriptor().instance_id.clone(),
-                    namespace: request.namespace.namespace.clone(),
-                    view: view.into(),
-                })
+        list_views(
+            self.runtime(),
+            &request.namespace.namespace,
+            request.bound,
+            &request.context,
+        )?
+        .into_iter()
+        .map(|view| {
+            Ok(ConnectorViewIdentity {
+                instance_id: self.descriptor().instance_id.clone(),
+                namespace: request.namespace.namespace.clone(),
+                view: view.into(),
             })
-            .collect()
+        })
+        .collect()
     }
 }
 
@@ -614,6 +620,13 @@ mod tests {
             &runtime,
             "db",
             novarocks_spi::connector::ConnectorListingBound::V1,
+            &novarocks_spi::connector::ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                1024,
+                4096,
+            )
+            .unwrap(),
         )
         .expect_err("an enumeration must not be answered with an empty list");
         assert_eq!(listed.kind(), ConnectorErrorKind::Unsupported);

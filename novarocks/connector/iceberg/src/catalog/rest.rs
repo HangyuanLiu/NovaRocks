@@ -88,8 +88,92 @@ impl NovaRocksRestCatalog {
     }
 }
 
+fn preflight_rest_page<'a>(
+    collector: &ConnectorListingCollector<String>,
+    names: impl IntoIterator<Item = &'a str>,
+    next: Option<&str>,
+    seen: &std::collections::HashSet<String>,
+) -> Result<(), ConnectorError> {
+    let bound = collector.bound();
+    let exhausted = |field, limit| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!("connector listing refused: it exceeds the {field} bound of {limit}"),
+        )
+    };
+    if collector.pages() >= bound.pages || (next.is_some() && collector.pages() + 1 >= bound.pages)
+    {
+        return Err(exhausted("pages", bound.pages));
+    }
+    if let Some(token) = next {
+        if token.is_empty() || seen.contains(token) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg REST catalog returned an empty or repeated continuation token",
+            ));
+        }
+        if token.len() > bound.continuation_token_bytes {
+            return Err(exhausted(
+                "continuation_token_bytes",
+                bound.continuation_token_bytes,
+            ));
+        }
+    }
+    let mut page_budget = ConnectorListingBudget::new(ConnectorListingBound {
+        entries: bound.entries - collector.len(),
+        total_name_bytes: bound.total_name_bytes - collector.total_name_bytes(),
+        ..bound
+    })?;
+    page_budget.admit_names(names)?;
+    if next.is_some() && page_budget.entries() > bound.page_entries {
+        return Err(exhausted("page_entries", bound.page_entries));
+    }
+    Ok(())
+}
+
+/// Admit a REST response before retaining any of its names or following its
+/// token. Non-paging servers may return a larger final response within the
+/// whole-listing bound; continuing oversized pages remain invalid.
+fn accept_rest_page(
+    collector: &mut ConnectorListingCollector<String>,
+    names: Vec<String>,
+    next: Option<String>,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<(), ConnectorError> {
+    if next.as_ref().is_some_and(|token| seen.contains(token)) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg REST catalog repeated a continuation token",
+        ));
+    }
+    let bound = collector.bound();
+    ConnectorListingBudget::new(ConnectorListingBound {
+        entries: bound.entries - collector.len(),
+        total_name_bytes: bound.total_name_bytes - collector.total_name_bytes(),
+        ..bound
+    })?
+    .admit_names(names.iter().map(String::as_str))?;
+
+    if names.len() > bound.page_entries && next.is_none() {
+        collector.accept_page(Vec::new(), None)?;
+        for name in names {
+            collector.push(name)?;
+        }
+    } else {
+        collector.accept_page(names, next)?;
+    }
+    if let Some(token) = collector.continuation_token() {
+        seen.insert(token.to_string());
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksRestCatalog {
+    fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
+        Arc::clone(&self.delegate.listing)
+    }
+
     fn implementation_name(&self) -> &'static str {
         "rest"
     }
@@ -117,13 +201,90 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }
     }
 
-    /// The vendored REST client has no public paged namespace listing, so the
-    /// complete listing it returns is checked against the bound.
     async fn list_namespaces(
         &self,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_namespaces(bound).await
+        let mut collector = ConnectorListingCollector::new(bound)?;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = self
+                .client
+                .list_namespaces_page(None, collector.continuation_token(), bound.page_entries)
+                .await
+                .map_err(|error| super::error::map_read_error(&error))?;
+            preflight_rest_page(
+                &collector,
+                page.namespaces
+                    .iter()
+                    .flat_map(|ident| ident.as_ref().iter().map(String::as_str)),
+                page.next_page_token.as_deref(),
+                &seen,
+            )?;
+            let names = page
+                .namespaces
+                .iter()
+                .flat_map(|ident| ident.as_ref().iter().map(|name| name.to_owned()))
+                .collect();
+            accept_rest_page(&mut collector, names, page.next_page_token, &mut seen)?;
+            if collector.continuation_token().is_none() {
+                break;
+            }
+        }
+        Ok(super::delegate::sorted_unique(
+            collector
+                .finish()?
+                .into_iter()
+                .filter(|name| !name.starts_with('.'))
+                .collect(),
+        ))
+    }
+
+    async fn list_namespaces_for_read(
+        &self,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "external catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(context, self.list_namespaces(bound))
+            .await
+    }
+
+    async fn list_tables_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "external catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(context, self.list_tables(namespace, bound))
+            .await
+    }
+
+    async fn list_views_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.delegate
+            .listing
+            .run(&context, self.list_views(namespace, bound))
+            .await
     }
 
     async fn namespace_exists(
@@ -141,40 +302,38 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         namespace: CatalogNamespaceName,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
+        let ident = super::delegate::namespace_ident(&namespace)?;
         let mut collector = ConnectorListingCollector::new(bound)?;
+        let mut seen = std::collections::HashSet::new();
         loop {
             let page = self
-                .list_tables_page(
-                    namespace.clone(),
-                    collector.continuation_token().map(Arc::from),
-                    bound.page_entries,
-                )
-                .await?;
-            ConnectorListingBudget::new(ConnectorListingBound {
-                entries: bound.entries - collector.len(),
-                total_name_bytes: bound.total_name_bytes - collector.total_name_bytes(),
-                ..bound
-            })?
-            .admit_names(page.tables.iter().map(|table| table.name.as_ref()))?;
-            let oversized_final =
-                page.tables.len() > bound.page_entries && page.next_page_token.is_none();
-            let names = page
-                .tables
-                .into_iter()
-                .map(|table| table.name.to_string())
-                .collect();
-            if oversized_final {
-                // The response is a complete tail, not a compliant source page.
-                // Keep page accounting and whole-listing limits without relaxing
-                // the paged collector's contract for other providers.
-                collector.accept_page(Vec::new(), None)?;
-                for name in names {
-                    collector.push(name)?;
-                }
-            } else {
-                collector
-                    .accept_page(names, page.next_page_token.map(|token| token.to_string()))?;
+                .client
+                .list_tables_page(&ident, collector.continuation_token(), bound.page_entries)
+                .await
+                .map_err(|error| super::error::map_read_error(&error))?;
+            // The SDK owns this response. Validate every borrowed name and the
+            // continuation before allocating any NovaRocks-owned page vector.
+            preflight_rest_page(
+                &collector,
+                page.identifiers.iter().map(|table| table.name.as_str()),
+                page.next_page_token.as_deref(),
+                &seen,
+            )?;
+            let mut identifiers = std::collections::HashSet::with_capacity(page.identifiers.len());
+            if page.identifiers.iter().any(|table| {
+                table.namespace() != &ident || !identifiers.insert(table.name.as_str())
+            }) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg REST catalog returned a duplicate or out-of-scope table identifier",
+                ));
             }
+            let names = page
+                .identifiers
+                .iter()
+                .map(|table| table.name.to_owned())
+                .collect();
+            accept_rest_page(&mut collector, names, page.next_page_token, &mut seen)?;
             if collector.continuation_token().is_none() {
                 break;
             }
@@ -208,11 +367,26 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }
         ConnectorListingBudget::new(ConnectorListingBound::V1)?
             .admit_names(page.identifiers.iter().map(|table| table.name.as_str()))?;
+        if let Some(token) = page.next_page_token.as_deref() {
+            if token.is_empty() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg REST catalog returned an empty continuation token",
+                ));
+            }
+            if token.len() > ConnectorListingBound::V1.continuation_token_bytes {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "connector listing refused: continuation_token_bytes bound exceeded",
+                ));
+            }
+        }
+
         let mut seen = std::collections::HashSet::with_capacity(page.identifiers.len());
         if page
             .identifiers
             .iter()
-            .any(|table| table.namespace() != &ident || !seen.insert(table.clone()))
+            .any(|table| table.namespace() != &ident || !seen.insert(table.name.as_str()))
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -227,6 +401,22 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 .collect(),
             next_page_token: page.next_page_token.map(Arc::from),
         })
+    }
+
+    async fn list_tables_page_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        page_token: Option<Arc<str>>,
+        page_size: usize,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<CatalogTablePage, ConnectorError> {
+        self.delegate
+            .listing
+            .run(
+                &context,
+                self.list_tables_page(namespace, page_token, page_size),
+            )
+            .await
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -264,14 +454,50 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.delegate.view_exists(&view).await
     }
 
-    /// The vendored REST client has no public paged view listing, so the
-    /// complete listing it returns is checked against the bound.
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_views(&namespace, bound).await
+        let ident = super::delegate::namespace_ident(&namespace)?;
+        let mut collector = ConnectorListingCollector::new(bound)?;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = self
+                .client
+                .list_views_page(&ident, collector.continuation_token(), bound.page_entries)
+                .await
+                .map_err(|error| super::error::map_read_error(&error))?;
+            if page
+                .identifiers
+                .iter()
+                .any(|view| view.namespace() != &ident)
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg REST catalog returned an out-of-scope view identifier",
+                ));
+            }
+            preflight_rest_page(
+                &collector,
+                page.identifiers.iter().map(|view| view.name.as_str()),
+                page.next_page_token.as_deref(),
+                &seen,
+            )?;
+            accept_rest_page(
+                &mut collector,
+                page.identifiers
+                    .iter()
+                    .map(|view| view.name.to_owned())
+                    .collect(),
+                page.next_page_token,
+                &mut seen,
+            )?;
+            if collector.continuation_token().is_none() {
+                break;
+            }
+        }
+        Ok(super::delegate::sorted_unique(collector.finish()?))
     }
 
     async fn load_view(
@@ -552,6 +778,10 @@ mod tests {
                 .into_iter()
                 .map(|page| page.into_iter().map(str::to_string).collect())
                 .collect();
+            Self::start_response(move |target| list_tables_body(&pages, target))
+        }
+
+        fn start_response(response_body: impl Fn(&str) -> String + Send + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind paged REST catalog");
             listener
                 .set_nonblocking(true)
@@ -587,7 +817,7 @@ mod tests {
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
                                     .push(target.clone());
-                                list_tables_body(&pages, &target)
+                                response_body(&target)
                             };
                             let response = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -834,6 +1064,203 @@ mod tests {
             assert_eq!(
                 server.list_requests(),
                 [page_request(2, None), page_request(2, Some("p1"))]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn namespaces_and_views_own_the_page_loop_and_replay_tokens() {
+        for views in [false, true] {
+            let server = PagedTablesServer::start_response(move |target| {
+                let second = target.contains("pageToken=p1");
+                let name = if second { "two" } else { "one" };
+                let items = if views {
+                    format!(r#""identifiers":[{{"namespace":["db"],"name":"{name}"}}]"#)
+                } else {
+                    format!(r#""namespaces":[["{name}"]]"#)
+                };
+                let next = if second {
+                    ""
+                } else {
+                    r#", "next-page-token":"p1""#
+                };
+                format!("{{{items}{next}}}")
+            });
+            let catalog = server.catalog().await;
+            let bound = ConnectorListingBound {
+                page_entries: 1,
+                ..ConnectorListingBound::V1
+            };
+            let names = if views {
+                catalog
+                    .list_views(CatalogNamespaceName::new("db"), bound)
+                    .await
+            } else {
+                catalog.list_namespaces(bound).await
+            }
+            .unwrap();
+            assert_eq!(names, ["one", "two"]);
+            let path = if views {
+                "/v1/namespaces/db/views"
+            } else {
+                "/v1/namespaces"
+            };
+            assert_eq!(
+                server.list_requests(),
+                [
+                    format!("{path}?pageSize=1"),
+                    format!("{path}?pageSize=1&pageToken=p1")
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn all_rest_listings_refuse_cyclic_tokens_before_a_fourth_request() {
+        for kind in ["tables", "views", "namespaces"] {
+            let server = PagedTablesServer::start_response(move |target| {
+                let token = if target.contains("pageToken=a") {
+                    "b"
+                } else {
+                    "a"
+                };
+                let items = if kind == "namespaces" {
+                    r#""namespaces":[["db"]]"#
+                } else {
+                    r#""identifiers":[{"namespace":["db"],"name":"t"}]"#
+                };
+                format!(r#"{{{items},"next-page-token":"{token}"}}"#)
+            });
+            let catalog = server.catalog().await;
+            let bound = ConnectorListingBound::V1;
+            let error = match kind {
+                "namespaces" => catalog.list_namespaces(bound).await,
+                "views" => {
+                    catalog
+                        .list_views(CatalogNamespaceName::new("db"), bound)
+                        .await
+                }
+                _ => {
+                    catalog
+                        .list_tables(CatalogNamespaceName::new("db"), bound)
+                        .await
+                }
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData, "{error}");
+            assert_eq!(server.list_requests().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn unpaged_namespace_and_view_responses_are_refused_as_a_whole() {
+        for views in [false, true] {
+            let server = PagedTablesServer::start_response(move |_| {
+                if views {
+                    r#"{"identifiers":[{"namespace":["db"],"name":"one"},{"namespace":["db"],"name":"two"}]}"#.into()
+                } else {
+                    r#"{"namespaces":[["one"],["two"]]}"#.into()
+                }
+            });
+            let catalog = server.catalog().await;
+            let bound = ConnectorListingBound {
+                entries: 1,
+                page_entries: 1,
+                ..ConnectorListingBound::V1
+            };
+            let error = if views {
+                catalog
+                    .list_views(CatalogNamespaceName::new("db"), bound)
+                    .await
+            } else {
+                catalog.list_namespaces(bound).await
+            }
+            .unwrap_err();
+            assert_refused(error, "entries");
+            assert_eq!(server.list_requests().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn namespaces_and_views_check_token_and_page_limits_before_following() {
+        for views in [false, true] {
+            for (bound, expected) in [
+                (
+                    ConnectorListingBound {
+                        continuation_token_bytes: 1,
+                        ..ConnectorListingBound::V1
+                    },
+                    "continuation_token_bytes",
+                ),
+                (
+                    ConnectorListingBound {
+                        pages: 1,
+                        ..ConnectorListingBound::V1
+                    },
+                    "pages",
+                ),
+            ] {
+                let server = PagedTablesServer::start_response(move |_| {
+                    if views {
+                        r#"{"identifiers":[{"namespace":["db"],"name":"v"}],"next-page-token":"token"}"#.into()
+                    } else {
+                        r#"{"namespaces":[["db"]],"next-page-token":"token"}"#.into()
+                    }
+                });
+                let catalog = server.catalog().await;
+                let error = if views {
+                    catalog
+                        .list_views(CatalogNamespaceName::new("db"), bound)
+                        .await
+                } else {
+                    catalog.list_namespaces(bound).await
+                }
+                .unwrap_err();
+                assert_refused(error, expected);
+                assert_eq!(server.list_requests().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_deadline_and_stop_refuse_real_rest_calls_without_empty_success() {
+        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+        use std::time::Instant;
+        for cancelled in [false, true] {
+            let server = PagedTablesServer::start_response(|_| {
+                std::thread::sleep(Duration::from_millis(40));
+                r#"{"identifiers":[]}"#.into()
+            });
+            let catalog = server.catalog().await;
+            let stop = ConnectorStopOwner::new();
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_millis(10),
+                stop.view(),
+                1024,
+                4096,
+            )
+            .unwrap();
+            if cancelled {
+                stop.request_stop();
+            }
+            let error = catalog
+                .list_views_for_request(
+                    CatalogNamespaceName::new("db"),
+                    context,
+                    ConnectorListingBound::V1,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if cancelled {
+                    ConnectorErrorKind::Cancelled
+                } else {
+                    ConnectorErrorKind::DeadlineExceeded
+                }
+            );
+            assert_eq!(
+                catalog.delegate.listing.available_positions(),
+                super::super::listing_admission::LISTING_CONCURRENCY
             );
         }
     }

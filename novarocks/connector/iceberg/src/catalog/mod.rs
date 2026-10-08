@@ -60,6 +60,7 @@ pub(crate) mod error;
 pub(crate) mod factory;
 pub(crate) mod hadoop;
 pub(crate) mod hive;
+pub(crate) mod listing_admission;
 pub(crate) mod rest;
 
 use std::fmt::Debug;
@@ -386,6 +387,10 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         None
     }
 
+    /// The one admission domain shared by this catalog generation's listings,
+    /// including maintenance object listings.
+    fn listing_admission(&self) -> Arc<listing_admission::ListingAdmission>;
+
     // ---- A. Reads -------------------------------------------------------
     //
     // Every enumeration is bounded at its source by the caller's
@@ -483,6 +488,30 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     /// Enumerate views. See [`NovaRocksCatalog::view_exists`] on why this is
     /// not allowed to answer with an empty vector when it cannot answer.
+    async fn list_views_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.list_views(namespace, bound).await
+    }
+
+    async fn list_tables_page_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        page_token: Option<Arc<str>>,
+        page_size: usize,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<CatalogTablePage, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.list_tables_page(namespace, page_token, page_size)
+            .await
+    }
+
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,

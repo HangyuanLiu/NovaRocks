@@ -3944,6 +3944,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "futures",
+ "http",
  "libc",
  "novarocks-secret",
  "novarocks-spi",

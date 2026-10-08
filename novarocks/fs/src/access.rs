@@ -36,6 +36,9 @@ use opendal::raw::{
 use opendal::{Buffer, Metadata, Operator};
 use url::{Host, Url};
 
+use crate::list_body_limit::{
+    ListBodyLimitFetch, OBJECT_STORE_LIST_BODY_LIMIT_BYTES, is_list_body_limit_exceeded,
+};
 use crate::storage_authority::{StorageAuthority, StorageAuthorityId};
 use crate::{FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult, SecretValue};
 
@@ -2319,7 +2322,7 @@ fn build_object_store_operator(
         // predicate reads it.
         operator = operator.layer(CredentialDenialLayer { denial });
     }
-    if is_local_endpoint(&endpoint.endpoint) {
+    let inner_client = if is_local_endpoint(&endpoint.endpoint) {
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -2330,8 +2333,16 @@ fn build_object_store_operator(
                     error,
                 )
             })?;
-        operator = operator.layer(HttpClientLayer::new(opendal::raw::HttpClient::with(client)));
-    }
+        opendal::raw::HttpClient::with(client)
+    } else {
+        opendal::raw::HttpClient::new()
+            .map_err(|error| map_opendal_error("initialize object store HTTP client", error))?
+    };
+    // Install for every endpoint, before the timeout/concurrency/retry layers.
+    // Credential acquisition uses the authority's independent reqwest path.
+    operator = operator.layer(HttpClientLayer::new(opendal::raw::HttpClient::with(
+        ListBodyLimitFetch::new(inner_client, OBJECT_STORE_LIST_BODY_LIMIT_BYTES),
+    )));
     let mut timeout = TimeoutLayer::new();
     timeout = timeout.with_timeout(Duration::from_millis(endpoint.timeout_ms));
     timeout = timeout.with_io_timeout(Duration::from_millis(endpoint.io_timeout_ms));
@@ -2826,7 +2837,7 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
 }
 
 fn map_opendal_error(operation: &str, error: opendal::Error) -> FileError {
-    let kind = file_error_kind_for_opendal(error.kind());
+    let kind = classify_opendal_error(&error);
     FileError::with_source(kind, operation, error)
 }
 
@@ -2835,8 +2846,12 @@ fn map_opendal_error(operation: &str, error: opendal::Error) -> FileError {
 /// context Vecs/Strings and may invoke arbitrary source Display. Preserve the
 /// classification and bounded operation, without retaining/rendering that
 /// opaque source. Generic file operations retain their existing cause chain.
+pub fn map_object_store_listing_error(error: opendal::Error) -> FileError {
+    map_bounded_listing_opendal_error("list object-store entries", error)
+}
+
 fn map_bounded_listing_opendal_error(operation: &str, error: opendal::Error) -> FileError {
-    bounded_listing_failure(file_error_kind_for_opendal(error.kind()), operation)
+    bounded_listing_failure(classify_opendal_error(&error), operation)
 }
 
 fn bounded_listing_failure(kind: FileErrorKind, message: &str) -> FileError {
@@ -2853,13 +2868,21 @@ fn map_stream_error(operation: &str, error: std::io::Error) -> FileError {
     let kind = error
         .get_ref()
         .and_then(|source| source.downcast_ref::<opendal::Error>())
-        .map(|source| file_error_kind_for_opendal(source.kind()))
+        .map(classify_opendal_error)
         .unwrap_or_else(|| match error.kind() {
             std::io::ErrorKind::NotFound => FileErrorKind::NotFound,
             std::io::ErrorKind::PermissionDenied => FileErrorKind::Permission,
             _ => FileErrorKind::Transient,
         });
     FileError::with_source(kind, operation, error)
+}
+
+fn classify_opendal_error(error: &opendal::Error) -> FileErrorKind {
+    if is_list_body_limit_exceeded(error) {
+        FileErrorKind::ResourceExhausted
+    } else {
+        file_error_kind_for_opendal(error.kind())
+    }
 }
 
 fn file_error_kind_for_opendal(kind: opendal::ErrorKind) -> FileErrorKind {
@@ -2946,6 +2969,26 @@ fn ensure_non_empty_path(original: &str, scheme: &str, path: &str) -> FileResult
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn list_body_limit_error_remains_resource_exhausted_in_all_fs_mappings() {
+        fn overflow() -> opendal::Error {
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "bounded list body")
+                .set_source(crate::list_body_limit::ListBodyLimitExceeded)
+        }
+        assert_eq!(
+            map_opendal_error("list", overflow()).kind(),
+            FileErrorKind::ResourceExhausted
+        );
+        assert_eq!(
+            map_bounded_listing_opendal_error("list", overflow()).kind(),
+            FileErrorKind::ResourceExhausted
+        );
+        assert_eq!(
+            map_stream_error("list", std::io::Error::other(overflow())).kind(),
+            FileErrorKind::ResourceExhausted
+        );
+    }
+
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

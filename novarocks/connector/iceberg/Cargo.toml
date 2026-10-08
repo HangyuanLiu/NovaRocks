@@ -44,6 +44,7 @@ ordered-float = "4"
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 prost.workspace = true
 rand.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -62,7 +63,6 @@ novarocks-spi.workspace = true
 novarocks-types.workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["rustls-tls"] }
 tempfile.workspace = true
 
 [build-dependencies]

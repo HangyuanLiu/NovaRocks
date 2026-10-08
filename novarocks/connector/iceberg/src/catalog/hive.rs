@@ -59,6 +59,10 @@ impl NovaRocksHiveCatalog {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHiveCatalog {
+    fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
+        Arc::clone(&self.delegate.listing)
+    }
+
     fn implementation_name(&self) -> &'static str {
         "hive"
     }
@@ -82,6 +86,53 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         self.delegate.list_namespaces(bound).await
+    }
+
+    async fn list_namespaces_for_read(
+        &self,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "external catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(context, self.list_namespaces(bound))
+            .await
+    }
+
+    async fn list_tables_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "external catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(context, self.list_tables(namespace, bound))
+            .await
+    }
+
+    async fn list_views_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.delegate
+            .listing
+            .run(&context, self.list_views(namespace, bound))
+            .await
     }
 
     async fn namespace_exists(

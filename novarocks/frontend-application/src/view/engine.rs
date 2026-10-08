@@ -578,6 +578,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn show_views_listing_errors_preserve_connector_error_text() {
+        use crate::catalog_application::statement::external_listing_tests::{
+            FailurePoint, ListingFixture, error_kinds,
+        };
+
+        for kind in error_kinds() {
+            let fixture = ListingFixture::new(FailurePoint::Views, kind);
+            let engine = FrontendViewEngine::new(ViewExecutionKernel::new(
+                Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
+                fixture.catalog_service.clone(),
+                None,
+                fixture.registry.clone(),
+                Arc::new(EmptyViewService),
+            ));
+            let result = engine.list_external_views(
+                "catalog",
+                "db",
+                &crate::connector::test_request_context(),
+            );
+            assert_eq!(result.err(), Some(fixture.expected_error()), "{kind:?}");
+            assert_eq!(fixture.calls(), vec!["views"]);
+        }
+    }
+
     fn parse_query(sql: &str) -> Query {
         let statements = novarocks_parser::parse(sql).expect("parse query");
         let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {

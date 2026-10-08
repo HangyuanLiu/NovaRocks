@@ -339,6 +339,7 @@ mod tests {
             inner: sdk(Arc::clone(&host), control.clone()),
             host_io: super::super::CatalogListingHost::Fixture(host),
             control,
+            listing_admission: super::super::ListingAdmission::default(),
         }
     }
     fn cost(seed: &Seed) -> usize {

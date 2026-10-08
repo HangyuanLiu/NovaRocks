@@ -65,6 +65,10 @@ impl AdmissionCatalogSpy {
 
 #[async_trait]
 impl NovaRocksCatalog for AdmissionCatalogSpy {
+    fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
+        Arc::new(Default::default())
+    }
+
     fn implementation_name(&self) -> &'static str {
         self.inner.implementation_name()
     }

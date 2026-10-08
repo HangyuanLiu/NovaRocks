@@ -53,14 +53,14 @@ use novarocks_spi::connector::{
     ConnectorEnvelopeHeader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
     ConnectorExecutionResources, ConnectorFieldPath, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
-    ConnectorListingBound, ConnectorMetadata, ConnectorNamespaceIdentity,
-    ConnectorNamespaceRequest, ConnectorPinnedFileSet, ConnectorProviderBinding,
-    ConnectorProviderId, ConnectorReadRelationPayload, ConnectorReadSplitCategory,
-    ConnectorReadSplitPayload, ConnectorReadWireDecoder, ConnectorReadWireEncoder,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorTableDefinitionFacts,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTablePlanningFacts, ConnectorTableRequest, ProviderBindingEpoch,
+    ConnectorMetadata, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
+    ConnectorPinnedFileSet, ConnectorProviderBinding, ConnectorProviderId,
+    ConnectorReadRelationPayload, ConnectorReadSplitCategory, ConnectorReadSplitPayload,
+    ConnectorReadWireDecoder, ConnectorReadWireEncoder, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorTableDefinitionFacts, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
+    ConnectorTableRequest, ProviderBindingEpoch,
 };
 use novarocks_spi::connector::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
@@ -640,6 +640,7 @@ struct PaimonGenericControl {
     warehouse: Arc<str>,
     access: Arc<dyn PaimonRoleFileIoFactory>,
     async_runtime: PaimonAsyncRuntime,
+    listing_admission: crate::catalog::listing_admission::ListingAdmission,
 }
 
 impl PaimonGenericControl {
@@ -653,6 +654,7 @@ impl PaimonGenericControl {
             .access
             .bind_file_io(&self.properties, &self.warehouse, request)?;
         PaimonFileSystemCatalog::try_new(&self.warehouse, host_io, resources)
+            .map(|catalog| catalog.with_listing_admission(self.listing_admission.clone()))
     }
 
     fn prepare_read(
@@ -708,34 +710,23 @@ impl ConnectorMetadata for PaimonGenericControl {
 
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.namespace.instance_id)?;
-        // Existence is answered from a database listing, which observes the
-        // production listing bound like any other enumeration.
-        Ok(self
-            .list_namespaces(ConnectorListNamespacesRequest {
-                instance_id: request.namespace.instance_id.clone(),
-                bound: ConnectorListingBound::V1,
-                context: request.context,
-            })?
-            .iter()
-            .any(|value| value.namespace == request.namespace.namespace))
+        let resources = PaimonRequestControl::from_request(&request.context);
+        let catalog = self.catalog(&request.context)?;
+        let namespace = request.namespace.namespace;
+        self.async_runtime.block_on(&resources, async move {
+            catalog.namespace_exists(&namespace).await
+        })?
     }
 
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.table.instance_id)?;
         let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
-        let namespace = request.table.namespace.clone();
-        // Existence is answered from a table listing, which observes the
-        // production listing bound like any other enumeration.
-        let entries = self.async_runtime.block_on(&resources, async move {
+        self.async_runtime.block_on(&resources, async move {
             catalog
-                .list_tables(&namespace, ConnectorListingBound::V1)
+                .table_exists(&request.table.namespace, &request.table.table)
                 .await
-        })??;
-        Ok(entries
-            .entries()
-            .iter()
-            .any(|name| name == request.table.table.as_ref()))
+        })?
     }
 
     fn list_tables(
@@ -882,6 +873,7 @@ impl ConnectorControlRoleBindingFactory for PaimonControlRoleBindingFactory {
                 warehouse: Arc::clone(&warehouse),
                 access: Arc::clone(&access),
                 async_runtime: async_runtime.clone(),
+                listing_admission: crate::catalog::listing_admission::ListingAdmission::default(),
             });
             let control = ConnectorControlBinding::try_new(
                 descriptor.clone(),

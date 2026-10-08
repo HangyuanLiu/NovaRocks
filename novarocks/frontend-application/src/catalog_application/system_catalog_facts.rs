@@ -169,6 +169,46 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
 mod tests {
     use super::*;
 
+    #[test]
+    fn external_information_schema_listing_errors_preserve_connector_error_text() {
+        use crate::catalog_application::statement::external_listing_tests::{
+            FailurePoint, ListingFixture, error_kinds,
+        };
+
+        for kind in error_kinds() {
+            for (point, include_tables, expected_calls) in [
+                (FailurePoint::Namespaces, false, vec!["namespaces"]),
+                (FailurePoint::Namespaces, true, vec!["namespaces"]),
+                (FailurePoint::Tables, true, vec!["namespaces", "tables:a"]),
+                (
+                    FailurePoint::SecondNamespaceTables,
+                    true,
+                    vec!["namespaces", "tables:a", "tables:b"],
+                ),
+            ] {
+                let fixture = ListingFixture::new(point, kind);
+                let facts = FrontendSystemCatalogFacts::new(
+                    fixture.catalog_service.clone(),
+                    fixture.registry.clone(),
+                );
+                let result = facts.external_system_catalog_facts(
+                    &crate::connector::test_request_context(),
+                    "catalog",
+                    include_tables,
+                );
+                // The FE port has a String error boundary. Compare its complete
+                // text, including the connector classification, rather than
+                // claiming that this boundary retains ConnectorError itself.
+                assert_eq!(
+                    result.err(),
+                    Some(fixture.expected_error()),
+                    "{point:?}, {kind:?}"
+                );
+                assert_eq!(fixture.calls(), expected_calls);
+            }
+        }
+    }
+
     fn bound() -> ConnectorListingBound {
         ConnectorListingBound {
             entries: 5,

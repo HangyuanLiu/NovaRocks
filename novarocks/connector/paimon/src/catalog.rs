@@ -31,6 +31,10 @@ use crate::sdk_control::PaimonSdkReadControl;
 #[path = "catalog_listing.rs"]
 mod listing;
 
+#[path = "listing_admission.rs"]
+pub(crate) mod listing_admission;
+use listing_admission::ListingAdmission;
+
 /// FE-owned catalog entries. The vector owns its elements until materialized or dropped.
 pub struct PaimonCatalogEntries {
     entries: Vec<String>,
@@ -62,6 +66,7 @@ pub struct PaimonFileSystemCatalog {
     inner: FileSystemCatalog,
     host_io: CatalogListingHost,
     control: PaimonRequestControl,
+    listing_admission: ListingAdmission,
 }
 
 /// Production retains the concrete admitted host so a catalog listing can
@@ -116,7 +121,13 @@ impl PaimonFileSystemCatalog {
             inner,
             host_io: CatalogListingHost::Host(host_io),
             control,
+            listing_admission: ListingAdmission::default(),
         })
+    }
+
+    pub(crate) fn with_listing_admission(mut self, admission: ListingAdmission) -> Self {
+        self.listing_admission = admission;
+        self
     }
 
     pub fn warehouse(&self) -> &str {
@@ -131,8 +142,13 @@ impl PaimonFileSystemCatalog {
     ) -> Result<PaimonCatalogEntries, ConnectorError> {
         bound.validate()?;
         self.control.checkpoint()?;
+        let _permit = self.listing_admission.acquire(&self.control).await?;
         let inner = self.listing_catalog(bound, None)?;
-        let entries = inner.list_databases_plain().await.map_err(map_sdk_error)?;
+        let entries = self
+            .control
+            .until(inner.list_databases_plain())
+            .await?
+            .map_err(map_sdk_error)?;
         self.retain_listing(entries, bound)
     }
 
@@ -145,12 +161,30 @@ impl PaimonFileSystemCatalog {
     ) -> Result<PaimonCatalogEntries, ConnectorError> {
         bound.validate()?;
         self.control.checkpoint()?;
+        let _permit = self.listing_admission.acquire(&self.control).await?;
         let inner = self.listing_catalog(bound, Some(database))?;
-        let entries = inner
-            .list_tables_plain(database)
-            .await
+        let entries = self
+            .control
+            .until(inner.list_tables_plain(database))
+            .await?
             .map_err(map_sdk_error)?;
         self.retain_listing(entries, bound)
+    }
+
+    pub(crate) async fn namespace_exists(&self, namespace: &str) -> Result<bool, ConnectorError> {
+        let entries = self.list_databases(ConnectorListingBound::V1).await?;
+        Ok(entries.entries().iter().any(|name| name == namespace))
+    }
+
+    pub(crate) async fn table_exists(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<bool, ConnectorError> {
+        let entries = self
+            .list_tables(namespace, ConnectorListingBound::V1)
+            .await?;
+        Ok(entries.entries().iter().any(|name| name == table))
     }
 
     /// Load and freeze one table. Snapshot discovery happens exactly once in
@@ -361,6 +395,7 @@ mod tests {
             inner,
             host_io: CatalogListingHost::Fixture(host_io),
             control,
+            listing_admission: ListingAdmission::default(),
         }
     }
 
@@ -502,5 +537,148 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+    }
+    #[derive(Debug)]
+    struct RefusedListingIo;
+    #[async_trait::async_trait]
+    impl ReadOnlyFileIO for RefusedListingIo {
+        async fn stat(&self, _path: &str) -> paimon::Result<FileStatus> {
+            unreachable!("existence listing does not use stat")
+        }
+        async fn exists(&self, _path: &str) -> paimon::Result<bool> {
+            Ok(true)
+        }
+        async fn read(
+            &self,
+            _path: &str,
+            _range: Range<u64>,
+            _known_size: Option<u64>,
+        ) -> paimon::Result<Bytes> {
+            unreachable!("listing failure precedes read")
+        }
+        async fn list(&self, _path: &str, _recursive: bool) -> paimon::Result<FileStatusStream> {
+            Err(paimon::Error::UnexpectedError {
+                message: "listing refused".to_owned(),
+                source: Some(Box::new(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "external listing limit exceeded",
+                ))),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn existence_propagates_listing_failure_instead_of_false() {
+        let mut catalog = catalog(
+            Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+            0,
+        );
+        catalog.host_io = CatalogListingHost::Fixture(Arc::new(RefusedListingIo));
+        assert_eq!(
+            catalog.namespace_exists("db").await.unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(
+            catalog
+                .table_exists("db", "table")
+                .await
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[derive(Debug)]
+    struct PendingListingIo(Arc<std::sync::atomic::AtomicUsize>, bool);
+    #[async_trait::async_trait]
+    impl ReadOnlyFileIO for PendingListingIo {
+        async fn stat(&self, _path: &str) -> paimon::Result<FileStatus> {
+            unreachable!()
+        }
+        async fn exists(&self, _path: &str) -> paimon::Result<bool> {
+            Ok(true)
+        }
+        async fn read(
+            &self,
+            _path: &str,
+            _range: Range<u64>,
+            _known_size: Option<u64>,
+        ) -> paimon::Result<Bytes> {
+            unreachable!()
+        }
+        async fn list(&self, _path: &str, _recursive: bool) -> paimon::Result<FileStatusStream> {
+            struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let guard = Guard(self.0.clone());
+            if self.1 {
+                Ok(Box::pin(futures::stream::unfold(
+                    guard,
+                    |guard| async move {
+                        let item =
+                            futures::future::pending::<Option<paimon::Result<FileStatus>>>().await;
+                        item.map(|item| (item, guard))
+                    },
+                )))
+            } else {
+                let _guard = guard;
+                futures::future::pending().await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_catalog_listing_deadline_drops_source_and_returns_admission() {
+        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let mut catalog = catalog(stop.clone(), 0);
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        catalog.host_io =
+            CatalogListingHost::Fixture(Arc::new(PendingListingIo(drops.clone(), false)));
+        catalog.control =
+            PaimonRequestControl::new(stop.view(), Instant::now() + Duration::from_millis(20));
+        assert_eq!(
+            catalog
+                .list_databases(ConnectorListingBound::V1)
+                .await
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::DeadlineExceeded
+        );
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Reuse the same gate after the pending SDK operation has been dropped.
+        let fresh =
+            PaimonRequestControl::new(stop.view(), Instant::now() + Duration::from_secs(10));
+        let mut permits = Vec::new();
+        for _ in 0..listing_admission::LISTING_CONCURRENCY {
+            permits.push(catalog.listing_admission.acquire(&fresh).await.unwrap());
+        }
+    }
+    #[tokio::test]
+    async fn pending_catalog_stream_stop_drops_source_and_returns_admission() {
+        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let mut catalog = catalog(stop.clone(), 0);
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        catalog.host_io =
+            CatalogListingHost::Fixture(Arc::new(PendingListingIo(drops.clone(), true)));
+        let wait = catalog.list_databases(ConnectorListingBound::V1);
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        stop.request_stop();
+        assert_eq!(
+            wait.await.unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let fresh = PaimonRequestControl::new(
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let mut permits = Vec::new();
+        for _ in 0..listing_admission::LISTING_CONCURRENCY {
+            permits.push(catalog.listing_admission.acquire(&fresh).await.unwrap());
+        }
     }
 }

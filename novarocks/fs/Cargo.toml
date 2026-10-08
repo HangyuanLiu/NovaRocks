@@ -34,6 +34,7 @@ async-trait.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
 futures.workspace = true
+http.workspace = true
 libc.workspace = true
 opendal = { workspace = true, features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 orc-rust = { version = "0.8.0", default-features = false }

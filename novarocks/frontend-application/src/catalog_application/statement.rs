@@ -1925,3 +1925,345 @@ mod column_path_tests {
         let _ = AddPosition::Before("col_b".to_string());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod external_listing_tests {
+    use std::sync::{Arc, Mutex};
+
+    use novarocks_catalog_application::{
+        CatalogAdmission, CatalogApplicationError, CatalogApplicationPort, CatalogCreateCommand,
+        CatalogDropCommand, CatalogRuntimeObservation,
+    };
+    use novarocks_spi::connector::*;
+
+    use super::{CatalogDropContext, execute_drop_database_statement};
+    use crate::catalog_application::query_catalog::{
+        CatalogServiceSource, QueryCatalogService, new_query_catalog_service,
+    };
+    use crate::query_execution::compiler::TestConnectorControlRegistry;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FailurePoint {
+        NamespaceExists,
+        Namespaces,
+        Tables,
+        SecondNamespaceTables,
+        Views,
+    }
+
+    pub(crate) fn error_kinds() -> [ConnectorErrorKind; 3] {
+        [
+            ConnectorErrorKind::DeadlineExceeded,
+            ConnectorErrorKind::Cancelled,
+            ConnectorErrorKind::ResourceExhausted,
+        ]
+    }
+
+    pub(crate) struct ListingFixture {
+        pub(crate) registry: Arc<TestConnectorControlRegistry>,
+        pub(crate) catalog_service: Arc<QueryCatalogService>,
+        provider: Arc<ListingProvider>,
+    }
+
+    impl ListingFixture {
+        pub(crate) fn new(failure: FailurePoint, kind: ConnectorErrorKind) -> Self {
+            let provider = Arc::new(ListingProvider {
+                descriptor: ConnectorInstanceDescriptor {
+                    provider_id: ConnectorProviderId::parse("paimon").unwrap(),
+                    instance_id: ConnectorInstanceId::parse("catalog").unwrap(),
+                },
+                incarnation: ProviderBindingEpoch::new(),
+                failure,
+                kind,
+                calls: Mutex::new(Vec::new()),
+            });
+            let binding = ConnectorControlBinding::try_new(
+                provider.descriptor.clone(),
+                provider.incarnation,
+                provider.clone(),
+                provider.clone(),
+                provider.clone(),
+                Some(provider.clone()),
+            )
+            .unwrap()
+            .try_with_view_metadata(Some(provider.clone()))
+            .unwrap();
+            let registry = Arc::new(TestConnectorControlRegistry::default());
+            registry.register(binding).unwrap();
+            Self {
+                registry,
+                catalog_service: Arc::new(new_query_catalog_service()),
+                provider,
+            }
+        }
+
+        pub(crate) fn expected_error(&self) -> String {
+            self.provider.error().to_string()
+        }
+
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.provider.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl CatalogApplicationPort for ListingFixture {
+        fn create_catalog(
+            &self,
+            _: CatalogCreateCommand,
+        ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+            unreachable!("listing must not create a catalog")
+        }
+
+        fn drop_catalog(&self, _: CatalogDropCommand) -> Result<(), CatalogApplicationError> {
+            unreachable!("listing must not drop a catalog")
+        }
+
+        fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission {
+            assert_eq!(instance_id, &self.provider.descriptor.instance_id);
+            CatalogAdmission::Ready(CatalogRuntimeObservation {
+                attachment_id: uuid::Uuid::nil(),
+                instance_id: instance_id.clone(),
+                provider_id: self.provider.descriptor.provider_id.clone(),
+                generation: 1,
+            })
+        }
+    }
+
+    impl crate::catalog_application::resolver::CatalogAdmission for ListingFixture {
+        fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+            Some(self)
+        }
+    }
+
+    impl CatalogServiceSource for ListingFixture {
+        fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+            &self.catalog_service
+        }
+    }
+
+    impl CatalogDropContext for ListingFixture {
+        fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+            self.registry.as_ref()
+        }
+
+        fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort {
+            unreachable!("the non-Iceberg fixture does not consult MV readiness")
+        }
+
+        fn mv_storage_observation(&self) -> &dyn MvStorageObservationPort {
+            unreachable!("the non-Iceberg fixture does not consult MV storage")
+        }
+    }
+
+    struct ListingProvider {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        failure: FailurePoint,
+        kind: ConnectorErrorKind,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ListingProvider {
+        fn error(&self) -> ConnectorError {
+            ConnectorError::new(
+                self.kind,
+                format!("injected {:?} listing failure", self.failure),
+            )
+        }
+
+        fn call(&self, name: impl Into<String>) {
+            self.calls.lock().unwrap().push(name.into());
+        }
+    }
+
+    impl ConnectorMetadata for ListingProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
+            self.call("namespace_exists");
+            if self.failure == FailurePoint::NamespaceExists {
+                Err(self.error())
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn list_namespaces(
+            &self,
+            request: ConnectorListNamespacesRequest,
+        ) -> Result<Vec<ConnectorNamespaceIdentity>, ConnectorError> {
+            self.call("namespaces");
+            if self.failure == FailurePoint::Namespaces {
+                return Err(self.error());
+            }
+            Ok(["a", "b"]
+                .into_iter()
+                .map(|namespace| ConnectorNamespaceIdentity {
+                    instance_id: request.instance_id.clone(),
+                    namespace: Arc::from(namespace),
+                })
+                .collect())
+        }
+
+        fn list_tables(
+            &self,
+            request: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            self.call(format!("tables:{}", request.namespace.namespace));
+            if self.failure == FailurePoint::Tables
+                || (self.failure == FailurePoint::SecondNamespaceTables
+                    && request.namespace.namespace.as_ref() == "b")
+            {
+                return Err(self.error());
+            }
+            Ok(vec![ConnectorTableIdentity {
+                instance_id: request.namespace.instance_id,
+                namespace: request.namespace.namespace,
+                table: Arc::from("existing_table"),
+            }])
+        }
+
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            unreachable!("listing must not resolve a table")
+        }
+
+        fn load_table(
+            &self,
+            _: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            unreachable!("listing must not load a table")
+        }
+    }
+
+    impl ConnectorViewMetadata for ListingProvider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+
+        fn list_views(
+            &self,
+            _: ConnectorListViewsRequest,
+        ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
+            self.call("views");
+            if self.failure == FailurePoint::Views {
+                Err(self.error())
+            } else {
+                unreachable!("the FORCE preflight must fail before a successful view listing")
+            }
+        }
+
+        fn view_exists(&self, _: ConnectorViewRequest) -> Result<bool, ConnectorError> {
+            unreachable!("listing must not resolve a view")
+        }
+
+        fn load_view(
+            &self,
+            _: ConnectorViewRequest,
+        ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+            unreachable!("listing must not load a view")
+        }
+    }
+
+    impl ConnectorScanPlanning for ListingProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+
+        fn begin_scan(
+            &self,
+            _: &ConnectorTableHandle,
+            _: ConnectorBeginScanRequest,
+        ) -> Result<ConnectorScan, ConnectorError> {
+            unreachable!("listing must not begin a scan")
+        }
+
+        fn plan_splits(
+            &self,
+            _: &ConnectorScanHandle,
+            _: ConnectorSplitPlanningRequest,
+        ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+            unreachable!("listing must not plan splits")
+        }
+    }
+
+    impl ConnectorExecutionDistribution for ListingProvider {
+        fn declaration(
+            &self,
+            _: &ConnectorRequestContext,
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            unreachable!("listing must not distribute a connector")
+        }
+    }
+
+    impl ConnectorCatalogMutation for ListingProvider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+
+        fn execute(
+            &self,
+            _: ConnectorCatalogMutationRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
+            self.call("mutation");
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "unexpected destructive mutation",
+            ))
+        }
+
+        fn reconcile(
+            &self,
+            _: ConnectorCatalogMutationReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
+            unreachable!("listing must not reconcile a mutation")
+        }
+    }
+
+    #[test]
+    fn drop_database_force_listing_errors_precede_every_destructive_mutation() {
+        for kind in error_kinds() {
+            for (point, calls) in [
+                (FailurePoint::NamespaceExists, vec!["namespace_exists"]),
+                (FailurePoint::Tables, vec!["namespace_exists", "tables:db"]),
+                (
+                    FailurePoint::Views,
+                    vec!["namespace_exists", "tables:db", "views"],
+                ),
+            ] {
+                let fixture = ListingFixture::new(point, kind);
+                let result = execute_drop_database_statement(
+                    &fixture,
+                    &novarocks_sql::semantic::ObjectName {
+                        parts: vec!["catalog".into(), "db".into()],
+                    },
+                    None,
+                    false,
+                    true,
+                    &crate::connector::test_request_context(),
+                );
+                assert_eq!(
+                    result.err(),
+                    Some(fixture.expected_error()),
+                    "{point:?}, {kind:?}"
+                );
+                assert_eq!(
+                    fixture.calls(),
+                    calls,
+                    "no child or namespace deletion may precede completed listings"
+                );
+            }
+        }
+    }
+}

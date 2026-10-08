@@ -226,6 +226,15 @@ mod tests {
                 Arc::new(TokioFileIoRuntime::new(runtime.clone())),
                 Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
             )
+            .for_request(
+                novarocks_spi::connector::ConnectorRequestContext::try_new(
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                    1024,
+                    4096,
+                )
+                .unwrap(),
+            )
         };
         let namespace = || CatalogNamespaceName::new("db");
         let exact = ConnectorListingBound {

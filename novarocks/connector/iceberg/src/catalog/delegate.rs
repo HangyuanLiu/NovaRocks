@@ -80,11 +80,15 @@ pub(super) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
 #[derive(Debug)]
 pub(super) struct CatalogDelegate {
     client: Arc<dyn Catalog>,
+    pub(super) listing: Arc<super::listing_admission::ListingAdmission>,
 }
 
 impl CatalogDelegate {
     pub(super) fn new(client: Arc<dyn Catalog>) -> Self {
-        Self { client }
+        Self {
+            client,
+            listing: Default::default(),
+        }
     }
 
     pub(super) fn client(&self) -> &Arc<dyn Catalog> {
