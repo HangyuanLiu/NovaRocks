@@ -25,3 +25,7 @@
 初始 root cargo test -p opensrv-mysql --lib 由于 patched dependency 不是 workspace member 而未启动。独立 manifest 在线解析停在 registry index，停止后 offline 初次解析尝试未缓存 cc 1.6.0；使用 workspace Cargo.lock 作为临时独立测试锁种子、offline 解析准确 vendor dev dependencies 后 lib 150 PASS。临时 vendor Cargo.lock 不提交；root Cargo.lock 未改。失败/中止日志保留为 p07-terminal-vendor-final.log、p07-terminal-vendor-standalone.log、p07-terminal-vendor-offline.log。本切片无禁用测试、版本调整或期限放宽。
 
 共享 opensrv seam/FE 准入 API 的同 HEAD workspace convergence 待下一干净检查点单独记录，不从 9a7f316e6 推断新代码。下一工作为 FrozenRootOutput、有限 Internal CPU/collector 和完整领域矩阵；P08/P00b/P09/P10 继续 OPEN。
+
+## 同 HEAD workspace 收敛
+
+干净 HEAD `6a4c691d43d5f6063d908a0e1a8a009eb5d8965c`，dev cargo-only 完整脚本 PASS，369 秒，12293 passed / 0 failed / 7 existing ignored。机器收据 `p07-terminal-convergence-20261008.json`，原日志 `logs/ci-full/20261008-143328`。包含全部 guards、组件、Server owner/binary 与两种 allocator build/check；不含 SQL、原生、性能或传输测量，不代替 P08 后最终同 HEAD 验收。
