@@ -1,0 +1,169 @@
+From: NovaRocks fixture maintainers
+Subject: [PATCH 3/3] Treat explicit null storage-table as an ordinary view
+
+Base-Commit: ccb8bc435062171e64bc8b7e5f56e6aed9c5b934
+Contract: https://github.com/apache/iceberg/blob/f14886bb4c54d3e292df85161a0250fbb9ae6d12/format/view-spec.md
+
+Local contract correction: missing and null storage-table both mean ordinary view.
+Serialize non-null pointers only; malformed non-null identifiers remain errors.
+Map invalid request bodies to HTTP 400 at the fixture servlet boundary; preserve real reader I/O failures.
+
+diff --git a/core/src/main/java/org/apache/iceberg/view/ViewVersionParser.java b/core/src/main/java/org/apache/iceberg/view/ViewVersionParser.java
+index 5055a6a..42613a9 100644
+--- a/core/src/main/java/org/apache/iceberg/view/ViewVersionParser.java
++++ b/core/src/main/java/org/apache/iceberg/view/ViewVersionParser.java
+@@ -120,7 +120,7 @@ public class ViewVersionParser {
+         .defaultCatalog(defaultCatalog)
+         .representations(representations.build());
+ 
+-    if (node.has(STORAGE_TABLE)) {
++    if (node.hasNonNull(STORAGE_TABLE)) {
+       JsonNode storageTableNode = node.get(STORAGE_TABLE);
+       Namespace storageNamespace =
+           Namespace.of(JsonUtil.getStringArray(JsonUtil.get(NAMESPACE, storageTableNode)));
+diff --git a/core/src/test/java/org/apache/iceberg/view/TestViewVersionParser.java b/core/src/test/java/org/apache/iceberg/view/TestViewVersionParser.java
+index dad384e..0a9dcf5 100644
+--- a/core/src/test/java/org/apache/iceberg/view/TestViewVersionParser.java
++++ b/core/src/test/java/org/apache/iceberg/view/TestViewVersionParser.java
+@@ -195,6 +195,30 @@ public class TestViewVersionParser {
+     assertThat(parsed.storageTable().name()).isEqualTo("event_agg_mv__storage");
+   }
+ 
++  @Test
++  public void explicitNullStorageTableIsAnOrdinaryView() {
++    String json =
++        "{\"version-id\":1,\"timestamp-ms\":12345,\"schema-id\":1,"
++            + "\"summary\":{},\"default-namespace\":[],\"representations\":[],"
++            + "\"storage-table\":null}";
++    ViewVersion parsed = ViewVersionParser.fromJson(json);
++    assertThat(parsed.storageTable()).isNull();
++    assertThat(ViewVersionParser.toJson(parsed)).doesNotContain("storage-table");
++  }
++
++  @Test
++  public void invalidStorageTableShapeIsRejected() {
++    String prefix =
++        "{\"version-id\":1,\"timestamp-ms\":12345,\"schema-id\":1,"
++            + "\"summary\":{},\"default-namespace\":[],\"representations\":[],"
++            + "\"storage-table\":";
++    assertThatThrownBy(() -> ViewVersionParser.fromJson(prefix + "{\"namespace\":[]}}"))
++        .isInstanceOf(IllegalArgumentException.class);
++    assertThatThrownBy(
++            () -> ViewVersionParser.fromJson(prefix + "{\"namespace\":\"ns\",\"name\":\"s\"}}"))
++        .isInstanceOf(IllegalArgumentException.class);
++  }
++
+   @Test
+   public void missingDefaultCatalog() {
+     assertThatThrownBy(
+
+diff --git a/core/src/test/java/org/apache/iceberg/rest/RESTCatalogServlet.java b/core/src/test/java/org/apache/iceberg/rest/RESTCatalogServlet.java
+--- a/core/src/test/java/org/apache/iceberg/rest/RESTCatalogServlet.java
++++ b/core/src/test/java/org/apache/iceberg/rest/RESTCatalogServlet.java
+@@ -20,6 +20,7 @@
+ 
+ import static java.lang.String.format;
+ 
++import com.fasterxml.jackson.core.JsonProcessingException;
+ import jakarta.servlet.http.HttpServlet;
+ import jakarta.servlet.http.HttpServletRequest;
+ import jakarta.servlet.http.HttpServletResponse;
+@@ -177,8 +178,17 @@
+       Route route = routeContext.first();
+       Object requestBody = null;
+       if (route.requestClass() != null) {
+-        requestBody =
+-            RESTObjectMapper.mapper().readValue(request.getReader(), route.requestClass());
++        try {
++          requestBody =
++              RESTObjectMapper.mapper().readValue(request.getReader(), route.requestClass());
++        } catch (JsonProcessingException | IllegalArgumentException e) {
++          return new ServletRequestContext(
++              ErrorResponse.builder()
++                  .responseCode(400)
++                  .withType("BadRequestException")
++                  .withMessage("Invalid request body")
++                  .build());
++        }
+       } else if (route == Route.TOKENS) {
+         try (Reader reader = new InputStreamReader(request.getInputStream())) {
+           requestBody = RESTUtil.decodeFormData(CharStreams.toString(reader));
+diff --git a/core/src/test/java/org/apache/iceberg/rest/TestRESTCatalogServlet.java b/core/src/test/java/org/apache/iceberg/rest/TestRESTCatalogServlet.java
+new file mode 100644
+--- /dev/null
++++ b/core/src/test/java/org/apache/iceberg/rest/TestRESTCatalogServlet.java
+@@ -0,0 +1,74 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.iceberg.rest;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import jakarta.servlet.http.HttpServletRequest;
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.StringReader;
++import java.util.Arrays;
++import org.junit.jupiter.api.Test;
++
++public class TestRESTCatalogServlet {
++  private HttpServletRequest request(String body) throws IOException {
++    HttpServletRequest request = mock(HttpServletRequest.class);
++    when(request.getMethod()).thenReturn("POST");
++    when(request.getRequestURI()).thenReturn("/v1/namespaces/ns/views");
++    when(request.getReader()).thenReturn(new BufferedReader(new StringReader(body)));
++    return request;
++  }
++
++  @Test
++  public void invalidStorageTableRequestIsBadRequest() throws IOException {
++    for (String pointer :
++        Arrays.asList("{\"namespace\":[]}", "{\"namespace\":\"ns\",\"name\":\"s\"}")) {
++      String body =
++          "{\"name\":\"view\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[]},"
++              + "\"view-version\":{\"version-id\":1,\"timestamp-ms\":1,\"schema-id\":0,"
++              + "\"summary\":{},\"representations\":[],\"default-namespace\":[],\"storage-table\":"
++              + pointer
++              + "},\"properties\":{}}";
++      RESTCatalogServlet.ServletRequestContext context =
++          RESTCatalogServlet.ServletRequestContext.from(request(body));
++      assertThat(context.error()).isPresent();
++      assertThat(context.error().get().code()).isEqualTo(400);
++    }
++  }
++
++  @Test
++  public void malformedJsonIsBadRequest() throws IOException {
++    RESTCatalogServlet.ServletRequestContext context =
++        RESTCatalogServlet.ServletRequestContext.from(request("{"));
++    assertThat(context.error()).isPresent();
++    assertThat(context.error().get().code()).isEqualTo(400);
++  }
++
++  @Test
++  public void readerFailureRemainsAnIOException() throws IOException {
++    HttpServletRequest request = request("{}");
++    when(request.getReader()).thenThrow(new IOException("read failed"));
++    assertThatThrownBy(() -> RESTCatalogServlet.ServletRequestContext.from(request))
++        .isInstanceOf(IOException.class);
++  }
++}

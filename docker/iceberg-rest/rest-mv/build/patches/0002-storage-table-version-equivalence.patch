@@ -1,0 +1,74 @@
+From: NovaRocks fixture maintainers
+Subject: [PATCH 2/3] Include storage-table in view version equivalence
+
+Base-Commit: ccb8bc435062171e64bc8b7e5f56e6aed9c5b934
+Contract: https://github.com/apache/iceberg/blob/f14886bb4c54d3e292df85161a0250fbb9ae6d12/format/view-spec.md
+
+Local contract correction: changing only the storage-table pointer changes view semantics.
+The PoC omits this field from sameViewVersion; retain both pointer versions.
+
+diff --git a/core/src/main/java/org/apache/iceberg/view/ViewMetadata.java b/core/src/main/java/org/apache/iceberg/view/ViewMetadata.java
+index 506eef7..dccc7a5 100644
+--- a/core/src/main/java/org/apache/iceberg/view/ViewMetadata.java
++++ b/core/src/main/java/org/apache/iceberg/view/ViewMetadata.java
+@@ -359,7 +359,8 @@ public interface ViewMetadata extends Serializable {
+           && Objects.equals(one.representations(), two.representations())
+           && Objects.equals(one.defaultCatalog(), two.defaultCatalog())
+           && Objects.equals(one.defaultNamespace(), two.defaultNamespace())
+-          && one.schemaId() == two.schemaId();
++          && one.schemaId() == two.schemaId()
++          && Objects.equals(one.storageTable(), two.storageTable());
+     }
+ 
+     public Builder addSchema(Schema schema) {
+diff --git a/core/src/test/java/org/apache/iceberg/view/TestViewMetadata.java b/core/src/test/java/org/apache/iceberg/view/TestViewMetadata.java
+index e7fd6dc..015db95 100644
+--- a/core/src/test/java/org/apache/iceberg/view/TestViewMetadata.java
++++ b/core/src/test/java/org/apache/iceberg/view/TestViewMetadata.java
+@@ -27,6 +27,7 @@ import java.util.UUID;
+ import org.apache.iceberg.MetadataUpdate;
+ import org.apache.iceberg.Schema;
+ import org.apache.iceberg.catalog.Namespace;
++import org.apache.iceberg.catalog.TableIdentifier;
+ import org.apache.iceberg.exceptions.ValidationException;
+ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+@@ -58,6 +59,38 @@ public class TestViewMetadata {
+         .build();
+   }
+ 
++  @Test
++  public void storageTableParticipatesInVersionEquivalence() {
++    ViewVersion template = newViewVersion(1, "select 1 as count");
++    ViewVersion first =
++        ImmutableViewVersion.builder()
++            .from(template)
++            .storageTable(TableIdentifier.of("ns", "storage_one"))
++            .build();
++    ViewMetadata original =
++        ViewMetadata.builder()
++            .setLocation("location")
++            .addSchema(new Schema(Types.NestedField.required(1, "count", Types.LongType.get())))
++            .addVersion(first)
++            .setCurrentVersionId(1)
++            .build();
++    ViewVersion second =
++        ImmutableViewVersion.builder()
++            .from(first)
++            .storageTable(TableIdentifier.of("ns", "storage_two"))
++            .build();
++    ViewMetadata updated =
++        ViewMetadata.buildFrom(original)
++            .addVersion(second)
++            .setCurrentVersionId(-1)
++            .build();
++
++    assertThat(updated.currentVersionId()).isEqualTo(2);
++    assertThat(updated.versions()).hasSize(2);
++    assertThat(updated.version(1).storageTable()).isEqualTo(first.storageTable());
++    assertThat(updated.version(2).storageTable()).isEqualTo(second.storageTable());
++  }
++
+   @Test
+   public void testExpiration() {
+     // purposely use versions and timestamps that do not match to check that version ID is used

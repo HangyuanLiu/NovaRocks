@@ -70,6 +70,18 @@ def digest(value: Any) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def rest_services(record: dict[str, Any]) -> list[str]:
+    return [service for service in ("rest", "rest-mv") if service in record["images"]]
+
+
+def server_warehouse_root(record: dict[str, Any]) -> str:
+    return record["server_warehouse"].rsplit("/", 1)[0] + "/"
+
+
+def server_warehouse(record: dict[str, Any], service: str) -> str:
+    return server_warehouse_root(record) + service
+
+
 def controlled_environment(source: dict[str, str] | None = None) -> dict[str, str]:
     source = os.environ if source is None else source
     return {key: value for key, value in source.items() if key in ENVIRONMENT_KEYS}
@@ -377,9 +389,9 @@ class Docker:
         self.validate_resources(record)
         self.tag(record)
         if parent:
-            self.compose(record, ["create", "rest", "spark", "mc"])
+            self.compose(record, ["create", *record["images"]])
             record["object_store_container"] = self.attach(parent, record)
-            self.compose(record, ["up", "-d", "rest", "spark", "mc"])
+            self.compose(record, ["up", "-d", *record["images"]])
         else:
             self.compose(record, ["up", "-d", "minio", "mc-init"])
         deadline = time.monotonic() + self.timeout
@@ -657,13 +669,17 @@ class RuntimeOwner:
         if not records:
             return {}
         os_record, cat = records["object_store"], records["catalog"]
-        return {
+        endpoints = {
             "minio_endpoint": f"http://127.0.0.1:{os_record['ports']['minio']}",
             "minio_console": f"http://127.0.0.1:{os_record['ports']['minio_console']}",
             "rest_uri": f"http://127.0.0.1:{cat['ports']['rest']}",
             "spark_ui": f"http://127.0.0.1:{cat['ports']['spark']}",
             "container_minio_endpoint": "http://minio:9000", "container_rest_uri": "http://rest:8181",
         }
+        if "rest-mv" in cat["images"]:
+            endpoints.update(rest_mv_uri=f"http://127.0.0.1:{cat['ports']['rest_mv']}",
+                             container_rest_mv_uri="http://rest-mv:8181")
+        return endpoints
 
     def initial(self, entry: Path, worktree: str, config: dict[str, Any]) -> dict[str, Any]:
         current = current_publication(entry)
@@ -703,13 +719,14 @@ class RuntimeOwner:
             if not receipt or not receipt.get("alias"):
                 raise RuntimeFailure("FixturePrerequisiteMissing", logical)
             images[service] = {"image_id": self.backend.image_id(receipt["alias"]), "receipt": receipt}
-        spark = bom.get("derived_images", {}).get("iceberg-spark")
-        if not spark or not spark.get("image_id"):
-            raise RuntimeFailure("FixturePrerequisiteMissing", "iceberg-spark")
-        # Inspect the exact ID, never a mutable derived alias.
-        if self.backend.image_id(spark["image_id"]) != spark["image_id"]:
-            raise RuntimeFailure("RuntimeIdentityMismatch", "Spark image receipt mismatch")
-        images["spark"] = {"image_id": spark["image_id"], "receipt": spark}
+        for service, logical in (("spark", "iceberg-spark"), ("rest-mv", "rest-mv")):
+            receipt = bom.get("derived_images", {}).get(logical)
+            if not receipt or not receipt.get("image_id"):
+                raise RuntimeFailure("FixturePrerequisiteMissing", logical)
+            # Inspect the exact ID, never a mutable derived alias.
+            if self.backend.image_id(receipt["image_id"]) != receipt["image_id"]:
+                raise RuntimeFailure("RuntimeIdentityMismatch", f"{logical} image receipt mismatch")
+            images[service] = {"image_id": receipt["image_id"], "receipt": receipt}
         return images
 
     def new_definition(self, kind: str, images: dict[str, Any], config: dict[str, Any],
@@ -723,7 +740,7 @@ class RuntimeOwner:
             template = self.templates[kind].read_text()
         except (KeyError, OSError) as error:
             raise RuntimeFailure("RuntimeDefinitionMissing", str(error)) from error
-        selected = ("minio", "mc") if kind == "os" else ("rest", "spark", "mc")
+        selected = ("minio", "mc") if kind == "os" else ("rest", "rest-mv", "spark", "mc")
         key = digest({"protocol": PROTOCOL, "kind": kind,
                       "images": {name: images[name]["image_id"] for name in selected},
                       "model": hashlib.sha256(template.encode()).hexdigest(),
@@ -741,7 +758,9 @@ class RuntimeOwner:
             return existing
         identity, kind = definition["id"], definition["kind"]
         with self.lock("ports"):
-            ports = self.allocate(["minio", "minio_console"] if kind == "os" else ["rest", "spark"])
+            services = rest_services(definition)
+            ports = self.allocate(["minio", "minio_console"] if kind == "os" else
+                                  [service.replace("-", "_") for service in services] + ["spark"])
             project = f"nr-fx-{self.namespace}-{identity}"
             directory = self.record_path(identity).parent
             record = {"schema": PROTOCOL, "protocol": PROTOCOL, "id": identity,
@@ -757,12 +776,19 @@ class RuntimeOwner:
                 record["images"]["mc-init"] = copy.deepcopy(record["images"]["mc"])
             for service, image in record["images"].items():
                 image["tag"] = f"novarocks/fixture-runtime:{self.namespace}-{identity}-{service}"
-            record["required_services"] = ["minio", "mc-init"] if kind == "os" else ["rest", "spark"]
-            record["volumes"] = [project + ("_minio-data" if kind == "os" else "_rest-catalog")]
-            record["service_ports"] = ({"minio": {"9000/tcp": ports["minio"], "9001/tcp": ports["minio_console"]}}
-                                       if kind == "os" else {"rest": {"8181/tcp": ports["rest"]}, "spark": {"4040/tcp": ports["spark"]}})
-            record["health_urls"] = ([f"http://127.0.0.1:{ports['minio']}/minio/health/live"]
-                                     if kind == "os" else [f"http://127.0.0.1:{ports['rest']}/v1/config"])
+            if kind == "os":
+                record["required_services"] = ["minio", "mc-init"]
+                record["volumes"] = [project + "_minio-data"]
+                record["service_ports"] = {"minio": {"9000/tcp": ports["minio"], "9001/tcp": ports["minio_console"]}}
+                record["health_urls"] = [f"http://127.0.0.1:{ports['minio']}/minio/health/live"]
+            else:
+                record["required_services"] = services + ["spark"]
+                record["volumes"] = [project + "_" + service + "-catalog" for service in services]
+                record["service_ports"] = {service: {"8181/tcp": ports[service.replace("-", "_")]}
+                                           for service in services}
+                record["service_ports"]["spark"] = {"4040/tcp": ports["spark"]}
+                record["health_urls"] = [f"http://127.0.0.1:{ports[service.replace('-', '_')]}/v1/config"
+                                         for service in services]
             record["server_warehouse"] = f"s3://warehouse/{identity}/rest" if kind == "cat" else None
             self.save_record(record)
         self.hook("bind.ports_reserved", runtime=identity)
@@ -777,7 +803,8 @@ class RuntimeOwner:
             values[service.upper().replace("-", "_") + "_IMAGE"] = image["tag"]
         values.update({"NOVA_ENV_" + name.upper() + "_PORT": port for name, port in record["ports"].items()})
         if record["server_warehouse"]:
-            values["NOVA_ENV_REST_SERVER_WAREHOUSE_URI"] = record["server_warehouse"]
+            for service in rest_services(record):
+                values["NOVA_ENV_" + service.upper().replace("-", "_") + "_SERVER_WAREHOUSE_URI"] = server_warehouse(record, service)
         directory = self.record_path(record["id"]).parent
         definition = directory / "compose.yml"
         env = directory / "compose.env"
@@ -950,7 +977,7 @@ class RuntimeOwner:
                 raise RuntimeFailure("ExternalAttachmentsPresent", identity)
             self.backend.stop(record)
             self.hook("delete.stopped", runtime=identity)
-            self.backend.purge(parent, [record["server_warehouse"]])
+            self.backend.purge(parent, [server_warehouse_root(record)])
             self.hook("delete.purged", runtime=identity)
             container = self.backend.container(parent, "minio")
             if container:

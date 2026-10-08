@@ -112,6 +112,8 @@ const MAX_COMMAND_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 pub struct IsolatedIcebergRestEndpoints {
     pub rest_uri: String,
     pub rest_warehouse: String,
+    pub rest_mv_uri: String,
+    pub rest_mv_warehouse: String,
     pub minio_endpoint: String,
     pub compose_project: String,
 }
@@ -147,6 +149,8 @@ impl fmt::Debug for IsolatedIcebergRestEndpoints {
             .debug_struct("IsolatedIcebergRestEndpoints")
             .field("rest_uri", &self.rest_uri)
             .field("rest_warehouse", &self.rest_warehouse)
+            .field("rest_mv_uri", &self.rest_mv_uri)
+            .field("rest_mv_warehouse", &self.rest_mv_warehouse)
             .field("minio_endpoint", &self.minio_endpoint)
             .field("compose_project", &self.compose_project)
             .finish()
@@ -339,6 +343,8 @@ impl IsolatedIcebergRestFixture {
             endpoints: IsolatedIcebergRestEndpoints {
                 rest_uri: String::new(),
                 rest_warehouse: String::new(),
+                rest_mv_uri: String::new(),
+                rest_mv_warehouse: String::new(),
                 minio_endpoint: String::new(),
                 compose_project: String::new(),
             },
@@ -471,7 +477,7 @@ impl IsolatedIcebergRestFixture {
     pub fn runtime_identity(&self) -> Result<IsolatedIcebergRestRuntimeIdentity> {
         self.assert_owned_paths()?;
         ensure!(self.active, "isolated provider runtime is no longer active");
-        let mut images = ["minio", "rest", "spark"]
+        let mut images = ["minio", "rest", "rest-mv", "spark"]
             .into_iter()
             .map(|service| {
                 Ok((
@@ -717,6 +723,8 @@ impl IsolatedIcebergRestFixture {
         ensure!(
             !manifest.iceberg_rest.uri.trim().is_empty()
                 && !manifest.iceberg_rest.warehouse.trim().is_empty()
+                && !manifest.iceberg_rest_mv.uri.trim().is_empty()
+                && !manifest.iceberg_rest_mv.warehouse.trim().is_empty()
                 && !manifest.minio.endpoint.trim().is_empty()
                 && !manifest.minio.access_key_id.trim().is_empty()
                 && !manifest.minio.secret_access_key.trim().is_empty(),
@@ -725,6 +733,8 @@ impl IsolatedIcebergRestFixture {
         let endpoints = IsolatedIcebergRestEndpoints {
             rest_uri: manifest.iceberg_rest.uri,
             rest_warehouse: manifest.iceberg_rest.warehouse,
+            rest_mv_uri: manifest.iceberg_rest_mv.uri,
+            rest_mv_warehouse: manifest.iceberg_rest_mv.warehouse,
             minio_endpoint: manifest.minio.endpoint,
             compose_project: manifest.compose_project,
         };
@@ -1843,6 +1853,7 @@ struct Manifest {
     runtime_dir: String,
     minio: ManifestMinio,
     iceberg_rest: ManifestIcebergRest,
+    iceberg_rest_mv: ManifestIcebergRest,
 }
 
 #[derive(Deserialize)]
@@ -2235,6 +2246,7 @@ mod tests {
             },
             "minio": {"endpoint":"http://127.0.0.1:38000", "access_key_id":"test-key", "secret_access_key":"test-secret"},
             "iceberg_rest": {"uri":"http://127.0.0.1:38001", "warehouse":"s3://warehouse/test/rest"},
+            "iceberg_rest_mv": {"uri":"http://127.0.0.1:38002", "warehouse":"s3://warehouse/test/rest-mv"},
         });
         let fixture = IsolatedIcebergRestFixture {
             repo_root,
@@ -2246,6 +2258,8 @@ mod tests {
             endpoints: IsolatedIcebergRestEndpoints {
                 rest_uri: String::new(),
                 rest_warehouse: String::new(),
+                rest_mv_uri: String::new(),
+                rest_mv_warehouse: String::new(),
                 minio_endpoint: String::new(),
                 compose_project: String::new(),
             },
@@ -2260,6 +2274,31 @@ mod tests {
             active: false,
         };
         (temp, fixture, manifest)
+    }
+
+    #[test]
+    fn manifest_requires_both_rest_catalog_endpoint_pairs() {
+        let (_temp, fixture, value) = manifest_fixture();
+        let manifest_path = Path::new(value["runtime_dir"].as_str().unwrap()).join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let (endpoints, identity) = fixture.read_endpoints().expect("complete endpoint facts");
+        assert_eq!(endpoints.rest_uri, "http://127.0.0.1:38001");
+        assert_eq!(endpoints.rest_warehouse, "s3://warehouse/test/rest");
+        assert_eq!(endpoints.rest_mv_uri, "http://127.0.0.1:38002");
+        assert_eq!(endpoints.rest_mv_warehouse, "s3://warehouse/test/rest-mv");
+        assert_eq!(identity.access_key_id, "test-key");
+        for catalog in ["iceberg_rest", "iceberg_rest_mv"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(catalog);
+            assert!(serde_json::from_value::<Manifest>(missing).is_err());
+            for field in ["uri", "warehouse"] {
+                let mut blank = value.clone();
+                blank[catalog][field] = serde_json::json!(" ");
+                fs::write(&manifest_path, serde_json::to_vec(&blank).unwrap()).unwrap();
+                let error = fixture.read_endpoints().unwrap_err();
+                assert!(error.to_string().contains("endpoint facts"), "{error}");
+            }
+        }
     }
 
     #[test]
