@@ -201,6 +201,7 @@ mod tests {
                 "PruneTableFunctionColumns",
                 "PruneUkFkJoin",
                 "PruneUnionColumns",
+                "PruneValuesColumns",
                 "PruneWindowColumns",
                 "PushDownApplyAggFilter",
                 "PushDownApplyFilter",

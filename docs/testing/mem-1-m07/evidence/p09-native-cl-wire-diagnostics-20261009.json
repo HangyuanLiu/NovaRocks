@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "stage": "P09 CL native wire diagnostics after nullable-literal compaction",
+  "outcome": "FAILED",
+  "source_revision": "0e932624e0760b79bfc038d9c51a19193d63d16d",
+  "source_dirty": false,
+  "primary_binary": "target/debug/novarocks",
+  "input_freeze": {
+    "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v1.json",
+    "sha256": "b161c0ec87caf7eacb72fe2da7bd6d4fb3da2e7e1cb965ab87407cc1714185a2"
+  },
+  "raw_evidence": {
+    "path": "logs/mem-1-m07/p09-native-cl-protocol-v5-20261009/catalog-mem-1-m07-sdk-listing/scenario-evidence.json",
+    "sha256": "3d602996b0cb88529f9147aeee76890544a504e10e630ea00d2bfb15b1927252"
+  },
+  "completed_phase": {
+    "artifact": {
+      "path": "logs/mem-1-m07/p09-native-cl-protocol-v5-20261009/catalog-mem-1-m07-sdk-listing/listing-phase-001.json",
+      "sha256": "1f1bb9bf5eab726708543a167d7c143062574ad7ca3698d00de08319a48e03b2"
+    },
+    "observations": {
+      "after": {
+        "active": 705986560,
+        "allocated": 420902152,
+        "resident": 733528064
+      },
+      "before": {
+        "active": 32587776,
+        "allocated": 20548872,
+        "resident": 42041344
+      },
+      "phase": "lake-discovery",
+      "process_launch_identities": [
+        {
+          "pid": 16465,
+          "process_start_token": "macos:1791480701:969729",
+          "role": "fe"
+        },
+        {
+          "pid": 16511,
+          "process_start_token": "macos:1791480709:214614",
+          "role": "be-0"
+        },
+        {
+          "pid": 16512,
+          "process_start_token": "macos:1791480709:269162",
+          "role": "be-1"
+        },
+        {
+          "pid": 16513,
+          "process_start_token": "macos:1791480709:329282",
+          "role": "be-2"
+        }
+      ],
+      "result": {
+        "provider": {
+          "active_listing_requests": 0,
+          "destructive_mutations": 0,
+          "emitted_entries": 16416,
+          "emitted_name_bytes": 246080,
+          "namespace_pages": 1,
+          "peak_listing_requests": 1,
+          "table_loads": 16384,
+          "table_pages": 128,
+          "view_pages": 0
+        }
+      },
+      "sampled_peak": {
+        "active": 716701696,
+        "allocated": 699067880,
+        "resident": 733691904
+      },
+      "samples": 92
+    }
+  },
+  "failure": "native wire v1 expanded expressions in fragment 1 exceed 262144 messages",
+  "classification": "Nullable literal compaction passed the physical arena limit. The wire preflight conservatively charges eight messages per literal. Required-column tagging exists for VALUES, but its phase-two column pruning was absent; this query needs catalog/schema and has row-invariant catalog values. No wire limit or frozen workload has been changed.",
+  "memory_exit_classification": "Provider completion counters are not proof of caller/SDK exit or metadata-cache reclamation. Whole lake phase includes 16384 table loads. Attribution and drain remain open.",
+  "native_pids_after_cleanup_absent": [
+    16465,
+    16511,
+    16512,
+    16513
+  ],
+  "not_executed": [
+    "successful information_schema clients1/8/16",
+    "SHOW VIEWS",
+    "DROP boundaries and normal DROP",
+    "deadline/stop/permit reuse",
+    "OpenDAL overflow",
+    "real cross-provider CL acceptance"
+  ],
+  "local_only": true
+}
