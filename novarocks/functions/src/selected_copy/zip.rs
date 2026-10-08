@@ -30,7 +30,7 @@ use arrow_data::ArrayData;
 use arrow_schema::DataType;
 
 // Arrow 58.2 MutableBuffer rounds every requested capacity to 64 bytes.
-fn rounded_capacity(bytes: usize) -> Result<usize, CopyError> {
+pub(super) fn rounded_capacity(bytes: usize) -> Result<usize, CopyError> {
     let blocks = add(bytes / 64, usize::from(!bytes.is_multiple_of(64)))?;
     buffer_extent(blocks, 64)?;
     mul(blocks, 64)

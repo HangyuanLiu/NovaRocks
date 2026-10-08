@@ -26,7 +26,7 @@ use crate::KernelFailure;
 use arrow_array::types::{ByteArrayType, Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, GenericByteArray, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, RunArray, StructArray, UnionArray,
+    MapArray, OffsetSizeTrait, RunArray, StructArray, UnionArray, make_array,
 };
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, UnionMode};
@@ -89,6 +89,11 @@ fn buffer_extent(elements: usize, width: usize) -> Result<(), CopyError> {
     // Rust allocations cannot be larger than isize::MAX even if usize fits.
     limit(mul(elements, width)?, isize::MAX as usize)
 }
+fn mutable_buffer_extent(elements: usize, width: usize) -> Result<(), CopyError> {
+    zip::rounded_capacity(mul(elements, width)?)?;
+    Ok(())
+}
+
 fn offset_max(large: bool) -> usize {
     if large {
         usize::try_from(i64::MAX).unwrap_or(usize::MAX)
@@ -99,6 +104,7 @@ fn offset_max(large: bool) -> usize {
 
 #[derive(Clone)]
 struct Block {
+    source: usize,
     ranges: Vec<Range<usize>>,
     repeats: usize,
 }
@@ -106,6 +112,7 @@ struct Block {
 struct Selection {
     blocks: Vec<Block>,
     nulls: usize,
+    null_ops: usize,
 }
 impl Selection {
     fn len(&self, work: &mut CopyObservation<'_>) -> Result<usize, CopyError> {
@@ -118,12 +125,19 @@ impl Selection {
             add(total, mul(one, block.repeats)?)
         })
     }
-    fn check(&self, source_len: usize, work: &mut CopyObservation<'_>) -> Result<(), CopyError> {
+    fn check(
+        &self,
+        sources: &[&dyn Array],
+        work: &mut CopyObservation<'_>,
+    ) -> Result<(), CopyError> {
         for block in &self.blocks {
             work.step()?;
             for range in &block.ranges {
                 work.step()?;
-                if range.start > range.end || range.end > source_len {
+                let source = sources.get(block.source).ok_or(CopyError::Invalid(
+                    "mutable copy source index is outside its constructor sources",
+                ))?;
+                if range.start > range.end || range.end > source.len() {
                     return Err(CopyError::Invalid(
                         "constant broadcast selected range is outside its source",
                     ));
@@ -136,6 +150,7 @@ impl Selection {
         &self,
         work: &mut CopyObservation<'_>,
         mut map: impl FnMut(
+            usize,
             &Range<usize>,
             &mut Vec<Range<usize>>,
             &mut CopyObservation<'_>,
@@ -148,15 +163,20 @@ impl Selection {
                 let mut ranges = Vec::new();
                 for range in &block.ranges {
                     work.step()?;
-                    map(range, &mut ranges, work)?;
+                    map(block.source, range, &mut ranges, work)?;
                 }
                 Ok(Block {
+                    source: block.source,
                     ranges,
                     repeats: block.repeats,
                 })
             })
             .collect::<Result<Vec<_>, CopyError>>()
-            .map(|blocks| Self { blocks, nulls: 0 })
+            .map(|blocks| Self {
+                blocks,
+                nulls: 0,
+                null_ops: 0,
+            })
     }
 }
 
@@ -196,10 +216,12 @@ pub fn preflight_broadcast(
         work.step()?;
         let selection = Selection {
             blocks: vec![Block {
+                source: 0,
                 ranges: std::iter::once(start..add(start, 1)?).collect(),
                 repeats: rows,
             }],
             nulls: 0,
+            null_ops: 0,
         };
         preflight(
             source,
@@ -225,27 +247,32 @@ fn mutable_capacity(
     capacity: usize,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
+    mutable_capacity_many(&[data], capacity, work)
+}
+fn mutable_capacity_many(
+    sources: &[&ArrayData],
+    capacity: usize,
+    work: &mut CopyObservation<'_>,
+) -> Result<(), CopyError> {
     work.step()?;
     // This models actual constructor children even when no source row will be
     // extended. Dictionary constructors validate the whole retained dictionary
     // length against the key carrier, including their off-by-one library limit.
+    let data = *sources.first().ok_or(CopyError::Invalid(
+        "mutable copy requires constructor sources",
+    ))?;
     let ty = data.data_type();
-    let child = |index: usize| {
-        data.child_data().get(index).ok_or(CopyError::Invalid(
-            "constant mutable-copy source has missing child data",
-        ))
-    };
-    buffer_extent(add(capacity, 1)?, 8)?;
+    mutable_buffer_extent(add(capacity, 1)?, 8)?;
     if let Some(width) = ty.primitive_width() {
-        return buffer_extent(capacity, width);
+        return mutable_buffer_extent(capacity, width);
     }
     match ty {
-        DataType::FixedSizeBinary(width) => buffer_extent(
+        DataType::FixedSizeBinary(width) => mutable_buffer_extent(
             capacity,
             usize::try_from(*width).map_err(|_| CopyError::Extent)?,
         ),
-        DataType::FixedSizeList(_, width) => mutable_capacity(
-            child(0)?,
+        DataType::FixedSizeList(_, width) => mutable_capacity_many(
+            &data_children(sources, 0, work)?,
             mul(
                 capacity,
                 usize::try_from(*width).map_err(|_| CopyError::Extent)?,
@@ -256,10 +283,12 @@ fn mutable_capacity(
         | DataType::LargeList(_)
         | DataType::ListView(_)
         | DataType::LargeListView(_)
-        | DataType::Map(_, _) => mutable_capacity(child(0)?, capacity, work),
+        | DataType::Map(_, _) => {
+            mutable_capacity_many(&data_children(sources, 0, work)?, capacity, work)
+        }
         DataType::Struct(_) | DataType::Union(_, _) | DataType::RunEndEncoded(_, _) => {
-            for child in data.child_data() {
-                mutable_capacity(child, capacity, work)?;
+            for index in 0..data.child_data().len() {
+                mutable_capacity_many(&data_children(sources, index, work)?, capacity, work)?;
             }
             Ok(())
         }
@@ -279,16 +308,79 @@ fn mutable_capacity(
                     ));
                 }
             };
-            limit(child(0)?.len(), maximum)?;
-            // Single-source MutableArrayData retains values without constructing
-            // a mutable values array. Only the dictionary key buffer expands.
-            buffer_extent(capacity, key.primitive_width().ok_or(CopyError::Extent)?)
+            let dictionaries = data_children(sources, 0, work)?;
+            let mut concat = false;
+            for pair in dictionaries.windows(2) {
+                work.step()?;
+                work.boundary()?;
+                let same = pair[0].ptr_eq(pair[1]);
+                work.boundary()?;
+                concat |= !same;
+            }
+            let mut cumulative = 0;
+            for dictionary in &dictionaries {
+                work.step()?;
+                let end = add(if concat { cumulative } else { 0 }, dictionary.len())?;
+                // Arrow validates offset + len, including an unused dictionary.
+                limit(end, maximum)?;
+                if concat {
+                    cumulative = end;
+                }
+            }
+            if concat {
+                mutable_capacity_many(&dictionaries, cumulative, work)?;
+                // The constructor copies complete domains before any selected extend.
+                // Use the same visitor, not a dictionary value decoder.
+                let mut arrays = Vec::new();
+                let mut blocks = Vec::new();
+                for (source, dictionary) in dictionaries.iter().enumerate() {
+                    work.step()?;
+                    work.boundary()?;
+                    arrays.push(make_array((*dictionary).clone()));
+                    work.boundary()?;
+                    blocks.push(Block {
+                        source,
+                        ranges: vec![0..dictionary.len()],
+                        repeats: 1,
+                    });
+                }
+                let mut refs = Vec::new();
+                for array in &arrays {
+                    work.step()?;
+                    refs.push(array.as_ref());
+                }
+                visit(
+                    &refs,
+                    &Selection {
+                        blocks,
+                        nulls: 0,
+                        null_ops: 0,
+                    },
+                    CopyMode::Extend,
+                    work,
+                )?;
+            }
+            // Same backing retains the original domain; different backing was
+            // checked above along the actual full-domain concatenation path.
+            mutable_buffer_extent(capacity, key.primitive_width().ok_or(CopyError::Extent)?)
         }
         DataType::Utf8View | DataType::BinaryView => {
-            // The constructor stores the variadic buffer count in u32 even if
-            // this copy is empty; a single source never adds a buffer offset.
-            limit(data.buffers().len().saturating_sub(1), u32::MAX as usize)?;
-            buffer_extent(capacity, 16)
+            // The actual constructor appends every source variadic buffer,
+            // even for an empty selected copy, and uses cumulative u32 offsets.
+            let mut buffers = 0;
+            for data in sources {
+                work.step()?;
+                buffers = add(
+                    buffers,
+                    data.buffers()
+                        .len()
+                        .checked_sub(1)
+                        .ok_or(CopyError::Invalid("view source has no view record buffer"))?,
+                )?;
+                limit(buffers, u32::MAX as usize)?;
+            }
+            mutable_buffer_extent(buffers, std::mem::size_of::<arrow_buffer::Buffer>())?;
+            mutable_buffer_extent(capacity, 16)
         }
         DataType::Utf8
         | DataType::LargeUtf8
@@ -300,20 +392,61 @@ fn mutable_capacity(
     }
 }
 
+fn data_children<'a>(
+    sources: &[&'a ArrayData],
+    index: usize,
+    work: &mut CopyObservation<'_>,
+) -> Result<Vec<&'a ArrayData>, CopyError> {
+    buffer_extent(sources.len(), std::mem::size_of::<&ArrayData>())?;
+    let mut children = Vec::new();
+    for data in sources {
+        work.step()?;
+        children.push(data.child_data().get(index).ok_or(CopyError::Invalid(
+            "constant mutable-copy source has missing child data",
+        ))?);
+    }
+    Ok(children)
+}
+
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T, CopyError> {
     array.as_any().downcast_ref().ok_or(CopyError::Invalid(
         "constant source array differs from its checked carrier",
     ))
 }
 
+// Existing entry points project a single actual source into the same visitor.
 fn preflight(
     array: &dyn Array,
     selection: &Selection,
     mode: CopyMode,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
+    visit(&[array], selection, mode, work)
+}
+fn child_sources<'a>(
+    sources: &[&'a dyn Array],
+    work: &mut CopyObservation<'_>,
+    mut child: impl FnMut(&'a dyn Array) -> Result<&'a dyn Array, CopyError>,
+) -> Result<Vec<&'a dyn Array>, CopyError> {
+    buffer_extent(sources.len(), std::mem::size_of::<&dyn Array>())?;
+    let mut children = Vec::new();
+    for source in sources {
+        work.step()?;
+        children.push(child(*source)?);
+    }
+    Ok(children)
+}
+fn visit(
+    sources: &[&dyn Array],
+    selection: &Selection,
+    mode: CopyMode,
+    work: &mut CopyObservation<'_>,
+) -> Result<(), CopyError> {
     work.step()?;
-    selection.check(array.len(), work)?;
+    let array = *sources.first().ok_or(CopyError::Invalid(
+        "mutable copy requires constructor sources",
+    ))?;
+    selection.check(sources, work)?;
     let rows = selection.len(work)?;
     if mode.is_take()
         && matches!(array.data_type(), DataType::RunEndEncoded(..))
@@ -335,44 +468,55 @@ fn preflight(
     // widths, so eight bytes conservatively bounds their index buffers.
     buffer_extent(rows, 8)?;
     buffer_extent(add(rows, 1)?, 8)?;
+    if mode == CopyMode::Extend {
+        interleave_bitmap_extent(rows)?;
+    }
     if let Some(width) = array.data_type().primitive_width() {
-        return buffer_extent(rows, width);
+        return if mode == CopyMode::Extend {
+            mutable_buffer_extent(rows, width)
+        } else {
+            buffer_extent(rows, width)
+        };
     }
     match array.data_type() {
         DataType::Null | DataType::Boolean => Ok(()),
-        DataType::FixedSizeBinary(width) => buffer_extent(
+        DataType::FixedSizeBinary(width) => mutable_buffer_extent(
             rows,
             usize::try_from(*width).map_err(|_| CopyError::Extent)?,
         ),
         DataType::Utf8 => {
-            bytes::<arrow_array::types::Utf8Type>(array, selection, mode, false, work)
+            bytes::<arrow_array::types::Utf8Type>(sources, selection, mode, false, work)
         }
         DataType::LargeUtf8 => {
-            bytes::<arrow_array::types::LargeUtf8Type>(array, selection, mode, true, work)
+            bytes::<arrow_array::types::LargeUtf8Type>(sources, selection, mode, true, work)
         }
         DataType::Binary => {
-            bytes::<arrow_array::types::BinaryType>(array, selection, mode, false, work)
+            bytes::<arrow_array::types::BinaryType>(sources, selection, mode, false, work)
         }
         DataType::LargeBinary => {
-            bytes::<arrow_array::types::LargeBinaryType>(array, selection, mode, true, work)
+            bytes::<arrow_array::types::LargeBinaryType>(sources, selection, mode, true, work)
         }
-        DataType::Utf8View | DataType::BinaryView => buffer_extent(rows, 16),
+        DataType::Utf8View | DataType::BinaryView => mutable_buffer_extent(rows, 16),
         // take_dict and single-source MutableArrayData retain the dictionary
         // values unchanged; only keys expand, never its encoded value domain.
         DataType::Dictionary(key, _) => {
-            buffer_extent(rows, key.primitive_width().ok_or(CopyError::Extent)?)
+            mutable_buffer_extent(rows, key.primitive_width().ok_or(CopyError::Extent)?)
         }
         DataType::Struct(_) => {
-            let array: &StructArray = downcast(array)?;
-            for child in array.columns() {
-                preflight(child.as_ref(), selection, mode, work)?;
+            let first: &StructArray = downcast(array)?;
+            for field in 0..first.num_columns() {
+                let children = child_sources(sources, work, |source| {
+                    let source: &StructArray = downcast(source)?;
+                    Ok(source.column(field).as_ref())
+                })?;
+                visit(&children, selection, mode, work)?;
             }
             Ok(())
         }
         DataType::FixedSizeList(_, width) => {
-            let array: &FixedSizeListArray = downcast(array)?;
+            let _array: &FixedSizeListArray = downcast(array)?;
             let width = usize::try_from(*width).map_err(|_| CopyError::Extent)?;
-            let mut child = selection.map_ranges(work, |range, output, _work| {
+            let mut child = selection.map_ranges(work, |_, range, output, _work| {
                 let range = mul(range.start, width)?..mul(range.end, width)?;
                 if mode.is_take() {
                     limit(range.end, u32::MAX as usize)?;
@@ -381,6 +525,7 @@ fn preflight(
                 Ok(())
             })?;
             child.nulls = mul(selection.nulls, width)?;
+            child.null_ops = if width != 0 { selection.null_ops } else { 0 };
             // Fixed-list take copies children even under a NULL parent.
             let child_mode = if mode.is_take() {
                 CopyMode::Take {
@@ -389,14 +534,20 @@ fn preflight(
             } else {
                 mode
             };
-            preflight(array.values().as_ref(), &child, child_mode, work)
+            let children = child_sources(sources, work, |source| {
+                let source: &FixedSizeListArray = downcast(source)?;
+                Ok(source.values().as_ref())
+            })?;
+            visit(&children, &child, child_mode, work)
         }
-        DataType::List(_) => list::<i32>(array, selection, mode, false, work),
-        DataType::LargeList(_) => list::<i64>(array, selection, mode, true, work),
+        DataType::List(_) => list::<i32>(sources, selection, mode, false, work),
+        DataType::LargeList(_) => list::<i64>(sources, selection, mode, true, work),
         DataType::Map(_, _) => {
             let array: &MapArray = downcast(array)?;
-            let child =
-                offset_selection(array, array.value_offsets(), selection, mode, false, work)?;
+            let child = offset_selection::<i32>(sources, selection, mode, false, work, |source| {
+                let source: &MapArray = downcast(source)?;
+                Ok(source.value_offsets())
+            })?;
             if mode.is_take() {
                 let average = array.entries().len().checked_div(array.len()).unwrap_or(0);
                 work.boundary()?;
@@ -404,19 +555,28 @@ fn preflight(
                 work.boundary()?;
                 mutable_capacity(&data, mul(average, rows)?, work)?;
             }
-            preflight(array.entries(), &child, CopyMode::Extend, work)
+            let children = child_sources(sources, work, |source| {
+                let source: &MapArray = downcast(source)?;
+                Ok(source.entries() as &dyn Array)
+            })?;
+            visit(&children, &child, CopyMode::Extend, work)
         }
-        DataType::ListView(_) => list_view::<i32>(array, selection, mode, false, work),
-        DataType::LargeListView(_) => list_view::<i64>(array, selection, mode, true, work),
+        DataType::ListView(_) => list_view::<i32>(sources, selection, mode, false, work),
+        DataType::LargeListView(_) => list_view::<i64>(sources, selection, mode, true, work),
         DataType::Union(fields, union_mode) => {
-            let array: &UnionArray = downcast(array)?;
+            let _array: &UnionArray = downcast(array)?;
             if *union_mode == UnionMode::Sparse {
                 for (id, _) in fields.iter() {
-                    preflight(array.child(id).as_ref(), selection, mode, work)?;
+                    let children = child_sources(sources, work, |source| {
+                        let source: &UnionArray = downcast(source)?;
+                        Ok(source.child(id).as_ref())
+                    })?;
+                    visit(&children, selection, mode, work)?;
                 }
             } else {
                 for (child_index, (id, _)) in fields.iter().enumerate() {
-                    let mut child = selection.map_ranges(work, |range, output, work| {
+                    let mut child = selection.map_ranges(work, |source, range, output, work| {
+                        let array: &UnionArray = downcast(sources[source])?;
                         for row in range.clone() {
                             work.step()?;
                             if array.type_id(row) == id {
@@ -431,6 +591,7 @@ fn preflight(
                     // both the offset bound and the child's recursive extent.
                     if mode == CopyMode::Extend && child_index == 0 {
                         child.nulls = selection.nulls;
+                        child.null_ops = selection.null_ops;
                     }
                     // Both take and MutableArrayData write signed i32 offsets.
                     limit(child.len(work)?, i32::MAX as usize)?;
@@ -441,15 +602,19 @@ fn preflight(
                     } else {
                         mode
                     };
-                    preflight(array.child(id).as_ref(), &child, child_mode, work)?;
+                    let children = child_sources(sources, work, |source| {
+                        let source: &UnionArray = downcast(source)?;
+                        Ok(source.child(id).as_ref())
+                    })?;
+                    visit(&children, &child, child_mode, work)?;
                 }
             }
             Ok(())
         }
         DataType::RunEndEncoded(run_ends, _) => match run_ends.data_type() {
-            DataType::Int16 => run::<Int16Type>(array, selection, mode, i16::MAX as usize, work),
-            DataType::Int32 => run::<Int32Type>(array, selection, mode, i32::MAX as usize, work),
-            DataType::Int64 => run::<Int64Type>(array, selection, mode, offset_max(true), work),
+            DataType::Int16 => run::<Int16Type>(sources, selection, mode, i16::MAX as usize, work),
+            DataType::Int32 => run::<Int32Type>(sources, selection, mode, i32::MAX as usize, work),
+            DataType::Int64 => run::<Int64Type>(sources, selection, mode, offset_max(true), work),
             _ => Err(CopyError::Invalid(
                 "constant run-end index carrier is invalid",
             )),
@@ -459,16 +624,16 @@ fn preflight(
 }
 
 fn bytes<T: ByteArrayType>(
-    array: &dyn Array,
+    sources: &[&dyn Array],
     selection: &Selection,
     mode: CopyMode,
     large: bool,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
-    let array: &GenericByteArray<T> = downcast(array)?;
     let mut total = 0;
     for block in &selection.blocks {
         work.step()?;
+        let array: &GenericByteArray<T> = downcast(sources[block.source])?;
         let mut one = 0;
         for range in &block.ranges {
             work.step()?;
@@ -484,21 +649,27 @@ fn bytes<T: ByteArrayType>(
         total = add(total, mul(one, block.repeats)?)?;
     }
     limit(total, offset_max(large))?;
-    buffer_extent(total, 1)
+    if mode == CopyMode::Extend {
+        mutable_buffer_extent(total, 1)
+    } else {
+        buffer_extent(total, 1)
+    }
 }
 
 fn offset_value<O: OffsetSizeTrait>(value: O) -> Result<usize, CopyError> {
     value.to_usize().ok_or(CopyError::Extent)
 }
 fn offset_selection<O: OffsetSizeTrait>(
-    array: &dyn Array,
-    offsets: &[O],
+    sources: &[&dyn Array],
     selection: &Selection,
     mode: CopyMode,
     large: bool,
     work: &mut CopyObservation<'_>,
+    mut offsets: impl for<'a> FnMut(&'a dyn Array) -> Result<&'a [O], CopyError>,
 ) -> Result<Selection, CopyError> {
-    let child = selection.map_ranges(work, |range, output, work| {
+    let child = selection.map_ranges(work, |source, range, output, work| {
+        let array = sources[source];
+        let offsets = offsets(array)?;
         if mode == CopyMode::Extend {
             output.push(offset_value(offsets[range.start])?..offset_value(offsets[range.end])?);
         } else {
@@ -517,14 +688,17 @@ fn offset_selection<O: OffsetSizeTrait>(
     Ok(child)
 }
 fn list<O: OffsetSizeTrait>(
-    array: &dyn Array,
+    sources: &[&dyn Array],
     selection: &Selection,
     mode: CopyMode,
     large: bool,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
-    let array: &GenericListArray<O> = downcast(array)?;
-    let child = offset_selection(array, array.value_offsets(), selection, mode, large, work)?;
+    let array: &GenericListArray<O> = downcast(sources[0])?;
+    let child = offset_selection::<O>(sources, selection, mode, large, work, |source| {
+        let source: &GenericListArray<O> = downcast(source)?;
+        Ok(source.value_offsets())
+    })?;
     if mode.is_take() {
         // The real take_list reserves a source-average capacity before extending
         // selected ranges. Its integer multiplication must also be checked.
@@ -535,21 +709,26 @@ fn list<O: OffsetSizeTrait>(
         let capacity = mul(average, selection.len(work)?)?;
         mutable_capacity(&data, capacity, work)?;
     }
-    preflight(array.values().as_ref(), &child, CopyMode::Extend, work)
+    let children = child_sources(sources, work, |source| {
+        let source: &GenericListArray<O> = downcast(source)?;
+        Ok(source.values().as_ref())
+    })?;
+    visit(&children, &child, CopyMode::Extend, work)
 }
 fn list_view<O: OffsetSizeTrait>(
-    array: &dyn Array,
+    sources: &[&dyn Array],
     selection: &Selection,
     mode: CopyMode,
     large: bool,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
-    let array: &GenericListViewArray<O> = downcast(array)?;
+    let _array: &GenericListViewArray<O> = downcast(sources[0])?;
     if mode.is_take() {
         // take_list_view retains the original child backing and copies views.
         return buffer_extent(selection.len(work)?, if large { 16 } else { 8 });
     }
-    let child = selection.map_ranges(work, |range, output, work| {
+    let child = selection.map_ranges(work, |source, range, output, work| {
+        let array: &GenericListViewArray<O> = downcast(sources[source])?;
         for row in range.clone() {
             work.step()?;
             let start = offset_value(array.value_offsets()[row])?;
@@ -559,7 +738,11 @@ fn list_view<O: OffsetSizeTrait>(
         Ok(())
     })?;
     limit(child.len(work)?, offset_max(large))?;
-    preflight(array.values().as_ref(), &child, CopyMode::Extend, work)
+    let children = child_sources(sources, work, |source| {
+        let source: &GenericListViewArray<O> = downcast(source)?;
+        Ok(source.values().as_ref())
+    })?;
+    visit(&children, &child, CopyMode::Extend, work)
 }
 
 fn remove_first(ranges: &mut Vec<Range<usize>>) {
@@ -571,18 +754,18 @@ fn remove_first(ranges: &mut Vec<Range<usize>>) {
     }
 }
 fn run<R: RunEndIndexType>(
-    array: &dyn Array,
+    sources: &[&dyn Array],
     selection: &Selection,
     mode: CopyMode,
     maximum: usize,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
-    let array: &RunArray<R> = downcast(array)?;
     limit(selection.len(work)?, maximum)?;
     let mut output = Vec::new();
     let mut previous = None;
     for block in &selection.blocks {
         work.step()?;
+        let array: &RunArray<R> = downcast(sources[block.source])?;
         if block.repeats == 0 {
             continue;
         }
@@ -616,6 +799,7 @@ fn run<R: RunEndIndexType>(
         }
         if mode == CopyMode::Extend {
             output.push(Block {
+                source: block.source,
                 ranges,
                 repeats: block.repeats,
             });
@@ -628,10 +812,11 @@ fn run<R: RunEndIndexType>(
             initial.push(range.clone());
             work.step()?;
         }
-        if previous == Some(first) {
+        if previous == Some((block.source, first)) {
             remove_first(&mut initial);
         }
         output.push(Block {
+            source: block.source,
             ranges: initial,
             repeats: 1,
         });
@@ -640,17 +825,31 @@ fn run<R: RunEndIndexType>(
                 remove_first(&mut ranges);
             }
             output.push(Block {
+                source: block.source,
                 ranges,
                 repeats: block.repeats - 1,
             });
         }
-        previous = Some(last);
+        previous = Some((block.source, last));
     }
-    preflight(
-        array.values().as_ref(),
+    let children = child_sources(sources, work, |source| {
+        let source: &RunArray<R> = downcast(source)?;
+        Ok(source.values().as_ref())
+    })?;
+    visit(
+        &children,
         &Selection {
             blocks: output,
-            nulls: 0,
+            nulls: if mode == CopyMode::Extend {
+                selection.null_ops
+            } else {
+                0
+            },
+            null_ops: if mode == CopyMode::Extend {
+                selection.null_ops
+            } else {
+                0
+            },
         },
         mode,
         work,
@@ -681,8 +880,13 @@ pub fn preflight_take(
     preflight(
         array,
         &Selection {
-            blocks: vec![Block { ranges, repeats: 1 }],
+            blocks: vec![Block {
+                source: 0,
+                ranges,
+                repeats: 1,
+            }],
             nulls,
+            null_ops: usize::from(nulls != 0),
         },
         CopyMode::Take {
             index_maximum: usize::MAX,
@@ -720,10 +924,12 @@ pub fn preflight_extend(
         mutable_capacity(&data, capacity, &mut work)?;
         let selection = Selection {
             blocks: vec![Block {
+                source: 0,
                 ranges: std::iter::once(start..end).collect(),
                 repeats: 1,
             }],
             nulls,
+            null_ops: usize::from(nulls != 0),
         };
         preflight(source, &selection, CopyMode::Extend, &mut work)
     })();
@@ -733,6 +939,104 @@ pub fn preflight_extend(
     work.boundary()?;
     result
 }
+
+/// One exact source extension, optionally repeated, followed by one NULL padding
+/// operation per repetition. Order is the actual MutableArrayData call order.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtendSegment {
+    pub source: usize,
+    pub start: usize,
+    pub len: usize,
+    pub repeats: usize,
+    pub nulls: usize,
+}
+/// Preflight the actual multi-source constructor and its ordered extension plan.
+/// Constructor capacity is the real hint, not a bound or allocation grant.
+/// All sources participate in dictionary/view setup even for an empty plan.
+/// The caller owns formal scopes for these temporary headers and the library
+/// copy; representability/control checks do not authorize physical allocations.
+pub fn preflight_extend_multi(
+    sources: &[&dyn Array],
+    segments: &[ExtendSegment],
+    constructor_capacity: usize,
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+) -> Result<(), CopyError> {
+    let mut work = CopyObservation(&mut observe);
+    work.boundary()?;
+    let result = (|| {
+        let first = *sources.first().ok_or(CopyError::Invalid(
+            "mutable copy requires constructor sources",
+        ))?;
+        buffer_extent(sources.len(), std::mem::size_of::<ArrayData>())?;
+        buffer_extent(segments.len(), std::mem::size_of::<Block>())?;
+        let mut data = Vec::new();
+        for source in sources {
+            work.step()?;
+            let equal = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                first.data_type(),
+                source.data_type(),
+                || (work.0)(false),
+            )
+            .map_err(CopyError::Control)?;
+            if !equal {
+                return Err(CopyError::Invalid(
+                    "mutable copy sources differ from their complete carrier",
+                ));
+            }
+            work.boundary()?;
+            data.push(source.to_data());
+            work.boundary()?;
+        }
+        let mut refs = Vec::new();
+        for item in &data {
+            work.step()?;
+            refs.push(item);
+        }
+        mutable_capacity_many(&refs, constructor_capacity, &mut work)?;
+        let mut blocks = Vec::new();
+        let mut nulls = 0;
+        let mut null_ops = 0;
+        for segment in segments {
+            work.step()?;
+            let source = sources.get(segment.source).ok_or(CopyError::Invalid(
+                "mutable copy source index is outside its constructor sources",
+            ))?;
+            let end = add(segment.start, segment.len)?;
+            if segment.start > source.len() || end > source.len() {
+                return Err(CopyError::Invalid(
+                    "mutable copy range or padding exceeds its source or capacity",
+                ));
+            }
+            nulls = add(nulls, mul(segment.nulls, segment.repeats)?)?;
+            if segment.nulls != 0 {
+                null_ops = add(null_ops, segment.repeats)?;
+            }
+            blocks.push(Block {
+                source: segment.source,
+                ranges: vec![segment.start..end],
+                repeats: segment.repeats,
+            });
+        }
+        visit(
+            sources,
+            &Selection {
+                blocks,
+                nulls,
+                null_ops,
+            },
+            CopyMode::Extend,
+            &mut work,
+        )
+    })();
+    if matches!(&result, Err(CopyError::Control(_))) {
+        return result;
+    }
+    work.boundary()?;
+    result
+}
+#[cfg(test)]
+#[path = "selected_copy/preflight_extend_multi_tests.rs"]
+mod preflight_extend_multi_tests;
 
 // Arrow's MutableBuffer rounds bitmap reservations to 64-byte alignment.
 // This is a format/layout check, not an allocation grant or byte invoice.
