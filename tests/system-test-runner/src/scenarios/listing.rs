@@ -250,10 +250,14 @@ fn allocator(client: &reqwest::blocking::Client, port: u16) -> Result<AllocatorR
 }
 
 fn measure(
-    context: &ScenarioContext,
+    context: &mut ScenarioContext,
     phase: &'static str,
     operation: impl FnOnce() -> Result<Value>,
 ) -> Result<Value> {
+    let sequence = context.actions().len();
+    context.action(format!(
+        "measure controlled CL phase {phase} sequence={sequence}"
+    ));
     let identities = context.recheck_live_process_launch_identities()?;
     let port = context.fe_http_port();
     let client = reqwest::blocking::Client::builder()
@@ -292,7 +296,12 @@ fn measure(
         serde_json::to_value(&identities)? == serde_json::to_value(&after_identities)?,
         "listing target process identity changed"
     );
-    Ok(
-        json!({"phase":phase,"before":before,"sampled_peak":peak,"after":after,"samples":samples,"process_launch_identities":identities,"result":result}),
-    )
+    let measurement = json!({"phase":phase,"before":before,"sampled_peak":peak,"after":after,"samples":samples,"process_launch_identities":identities,"result":result});
+    std::fs::write(
+        context
+            .scenario_root()
+            .join(format!("listing-phase-{sequence:03}.json")),
+        serde_json::to_vec_pretty(&measurement)?,
+    )?;
+    Ok(measurement)
 }

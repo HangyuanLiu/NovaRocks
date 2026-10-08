@@ -260,9 +260,9 @@ async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Res
             .map_err(|_| anyhow::anyhow!("listing fixture lock poisoned"))?
             .audit
             .table_loads += 1;
-        return Ok(axum::Json(json!({"metadata-location":format!("s3://cl-fixture/{namespace}/{name}/metadata/00000.json"), "metadata": {
+        return Ok(axum::Json(json!({"metadata-location":format!("s3://cl-fixture/warehouse/{namespace}/{name}/metadata/00000.json"), "metadata": {
             "format-version":2,"table-uuid":format!("00000000-0000-7000-8000-{:012x}", namespace_index * MEMBERS + member_index),
-            "location":format!("s3://cl-fixture/{namespace}/{name}"),"last-sequence-number":0,"last-updated-ms":1700000000000_u64,
+            "location":format!("s3://cl-fixture/warehouse/{namespace}/{name}"),"last-sequence-number":0,"last-updated-ms":1700000000000_u64,
             "last-column-id":1,"current-schema-id":0,"schemas":[{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","required":false,"type":"long"}]}],
             "default-spec-id":0,"partition-specs":[{"spec-id":0,"fields":[]}],"last-partition-id":999,
             "default-sort-order-id":0,"sort-orders":[{"order-id":0,"fields":[]}],"properties":{},"snapshots":[],"snapshot-log":[],"metadata-log":[]
@@ -308,7 +308,20 @@ async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Res
         Duration::from_millis(15)
     };
     tokio::time::sleep(delay).await;
-    let (names, continuation) = listing_page(mode, kind, token)?;
+    let requested = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .find_map(|q| q.strip_prefix("pageSize="));
+    let page_size = requested
+        .map(str::parse::<usize>)
+        .transpose()?
+        .unwrap_or(PAGE_SIZE);
+    ensure!(
+        (1..=PAGE_SIZE).contains(&page_size),
+        "page request outside fixture support"
+    );
+    let (names, continuation) = listing_page(mode, kind, token, page_size)?;
     let mut facts = state
         .facts
         .lock()
@@ -341,6 +354,7 @@ fn listing_page(
     mode: ListingMode,
     kind: &str,
     token: &str,
+    page_size: usize,
 ) -> Result<(Vec<String>, Option<String>)> {
     if mode == ListingMode::Empty {
         return Ok((Vec::new(), None));
@@ -409,7 +423,7 @@ fn listing_page(
     let end = if mode == ListingMode::TerminalOverflow && kind != "namespaces" {
         total
     } else {
-        (start + PAGE_SIZE).min(total)
+        (start + page_size).min(total)
     };
     let names = (start..end)
         .map(|n| {
@@ -457,20 +471,42 @@ mod tests {
             .unwrap();
         assert_eq!(table["metadata"]["format-version"], 2);
         assert_eq!(fixture.snapshot().unwrap().table_loads, 1);
+        let page: Value = client
+            .get(format!(
+                "{}/v1/namespaces/cl_ns_0000/tables?pageSize=128",
+                fixture.endpoint()
+            ))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(page["identifiers"].as_array().unwrap().len(), 128);
+        assert_eq!(page["next-page-token"], "128");
     }
     #[test]
     fn controlled_listing_pages_preserve_frozen_boundaries() {
-        let (first, token) = listing_page(ListingMode::Normal, "tables", "").unwrap();
+        let (first, token) = listing_page(ListingMode::Normal, "tables", "", PAGE_SIZE).unwrap();
         assert_eq!(first.len(), PAGE_SIZE);
-        let (last, end) = listing_page(ListingMode::Normal, "tables", &token.unwrap()).unwrap();
+        let (last, end) =
+            listing_page(ListingMode::Normal, "tables", &token.unwrap(), PAGE_SIZE).unwrap();
         assert_eq!(last.len(), PAGE_SIZE);
         assert!(end.is_none());
-        let (terminal, end) = listing_page(ListingMode::TerminalOverflow, "tables", "").unwrap();
+        let (terminal, end) =
+            listing_page(ListingMode::TerminalOverflow, "tables", "", PAGE_SIZE).unwrap();
         assert_eq!(terminal.len(), 65537);
         assert!(end.is_none());
-        let (names, token) = listing_page(ListingMode::NameOverflow, "tables", "").unwrap();
+        let (names, token) =
+            listing_page(ListingMode::NameOverflow, "tables", "", PAGE_SIZE).unwrap();
         assert!(names.iter().all(|name| name.len() == 65536));
-        let (last, _) = listing_page(ListingMode::NameOverflow, "tables", &token.unwrap()).unwrap();
+        let (last, _) = listing_page(
+            ListingMode::NameOverflow,
+            "tables",
+            &token.unwrap(),
+            PAGE_SIZE,
+        )
+        .unwrap();
         assert_eq!(
             names.iter().map(String::len).sum::<usize>() + last[0].len(),
             16777217
