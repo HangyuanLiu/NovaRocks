@@ -148,6 +148,24 @@ pub fn to_i128_values(
     }
 }
 
+/// Original NULL-propagating evaluated-value loop for unary and binary bitwise calls.
+/// The read adapter retains the caller's exact row domain and carrier validation.
+pub fn map_values_observed<I, T, E>(
+    selection: Selection<'_>,
+    mut read_value: impl FnMut(usize, usize) -> Result<Option<I>, E>,
+    func: impl Fn(I) -> T,
+    observe: &mut dyn FnMut(BitArrayObservation) -> Result<(), E>,
+) -> Result<Vec<Option<T>>, E> {
+    observe(BitArrayObservation::OpaqueBoundary)?;
+    let mut out = Vec::with_capacity(selection.len());
+    observe(BitArrayObservation::OpaqueBoundary)?;
+    for (ordinal, row) in selection.iter().enumerate() {
+        observe(BitArrayObservation::Step)?;
+        out.push(read_value(ordinal, row)?.map(&func));
+    }
+    Ok(out)
+}
+
 mod count_domain {
     pub trait Sealed {}
     impl Sealed for i64 {}

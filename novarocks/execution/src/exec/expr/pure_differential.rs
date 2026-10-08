@@ -1636,5 +1636,8 @@ mod array_tests;
 #[path = "pure_differential_shift_shared_tests.rs"]
 mod shift_shared_tests;
 
+#[path = "pure_differential_bitwise_shared_tests.rs"]
+mod bitwise_shared_tests;
+
 #[path = "pure_differential_collection_construct_access_tests.rs"]
 mod collection_construct_access_tests;

@@ -18,11 +18,8 @@
 //! Exact selected bitwise computation for the installed integer domains.
 //! Arrow builder allocation still requires formal host memory admission.
 
-use std::sync::Arc;
-
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, PrimitiveArray,
-    builder::{FixedSizeBinaryBuilder, PrimitiveBuilder},
     types::{ArrowPrimitiveType, Int8Type, Int16Type, Int32Type, Int64Type},
 };
 use arrow_schema::DataType;
@@ -182,7 +179,7 @@ fn primitive<'a, T: ArrowPrimitiveType>(
     control: &dyn KernelEvaluationControl,
 ) -> Result<ArrayRef, KernelFailure>
 where
-    T::Native: Into<i64> + TryFrom<i64>,
+    T::Native: Into<i64>,
 {
     let downcast = |argument: EvaluatedArgument<'a>| {
         argument
@@ -195,26 +192,34 @@ where
     let right = arguments.right.map(downcast).transpose()?;
     let selection = input.selection();
     output_capacity(selection.len(), std::mem::size_of::<T::Native>())?;
-    let mut builder = PrimitiveBuilder::<T>::with_capacity(selection.len());
+    output_capacity(selection.len(), std::mem::size_of::<Option<i64>>())?;
     let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        let value = match arguments.selected_pair(ordinal, batch_row)? {
-            Some((left_row, right_row)) => {
-                let right = match (right, right_row) {
-                    (Some(values), Some(row)) => values.value(row).into(),
-                    (None, None) => 0,
-                    _ => return Err(internal("bitwise right primitive mapping is inconsistent")),
-                };
-                // Keep signed extension to BIGINT and Arrow's checked output
-                // conversion. No new unsigned or mixed-width body is exposed.
-                T::Native::try_from(operation.apply_i64(left.value(left_row).into(), right)).ok()
-            }
-            None => None,
-        };
-        builder.append_option(value);
-    }
-    let values = Arc::new(builder.finish()) as ArrayRef;
+    let mut observe = |event| match event {
+        crate::bit_array::BitArrayObservation::Step => work.step(),
+        crate::bit_array::BitArrayObservation::OpaqueBoundary => work.flush(),
+    };
+    let values = crate::bit_array::map_values_observed(
+        selection,
+        |ordinal, batch_row| {
+            let Some((left_row, right_row)) = arguments.selected_pair(ordinal, batch_row)? else {
+                return Ok(None);
+            };
+            let right = match (right, right_row) {
+                (Some(values), Some(row)) => values.value(row).into(),
+                (None, None) => 0,
+                _ => return Err(internal("bitwise right primitive mapping is inconsistent")),
+            };
+            Ok(Some((left.value(left_row).into(), right)))
+        },
+        |(left, right)| operation.apply_i64(left, right),
+        &mut observe,
+    )?;
+    let values = crate::bit_array::finish_i64_observed(
+        values,
+        Some(&input.contract().result_type().data_type),
+        &mut observe,
+    )?
+    .map_err(|error| internal(&error.legacy_message("bitwise")))?;
     work.finish()?;
     Ok(values)
 }
@@ -241,36 +246,41 @@ fn largeint<'a>(
     }
     let selection = input.selection();
     output_capacity(selection.len(), 16)?;
-    let mut builder = FixedSizeBinaryBuilder::with_capacity(selection.len(), 16);
+    output_capacity(selection.len(), std::mem::size_of::<Option<i128>>())?;
     let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        match arguments.selected_pair(ordinal, batch_row)? {
-            Some((left_row, right_row)) => {
-                let right = match (right, right_row) {
-                    (Some(values), Some(row)) => largeint_value(values, row)?,
-                    (None, None) => 0,
-                    _ => return Err(internal("bitwise right LargeInt mapping is inconsistent")),
-                };
-                let value = operation.apply_i128(largeint_value(left, left_row)?, right);
-                builder
-                    .append_value(value.to_be_bytes())
-                    .map_err(|_| internal("bitwise LargeInt output has an incorrect byte width"))?;
-            }
-            None => builder.append_null(),
-        }
-    }
-    let values = Arc::new(builder.finish()) as ArrayRef;
+    let mut observe = |event| match event {
+        crate::bit_array::BitArrayObservation::Step => work.step(),
+        crate::bit_array::BitArrayObservation::OpaqueBoundary => work.flush(),
+    };
+    let values = crate::bit_array::map_values_observed(
+        selection,
+        |ordinal, batch_row| {
+            let Some((left_row, right_row)) = arguments.selected_pair(ordinal, batch_row)? else {
+                return Ok(None);
+            };
+            let right = match (right, right_row) {
+                (Some(values), Some(row)) => largeint_value(values, row)?,
+                (None, None) => 0,
+                _ => return Err(internal("bitwise right LargeInt mapping is inconsistent")),
+            };
+            Ok(Some((largeint_value(left, left_row)?, right)))
+        },
+        |(left, right)| operation.apply_i128(left, right),
+        &mut observe,
+    )?;
+    let values = crate::bit_array::cast_largeint_output_observed(
+        &values,
+        Some(&input.contract().result_type().data_type),
+        &mut observe,
+    )?
+    .map_err(|error| internal(&error.legacy_message("bitwise")))?;
     work.finish()?;
     Ok(values)
 }
 
 fn largeint_value(values: &FixedSizeBinaryArray, row: usize) -> Result<i128, KernelFailure> {
-    let bytes: [u8; 16] = values
-        .value(row)
-        .try_into()
-        .map_err(|_| internal("bitwise LargeInt value has an incorrect byte width"))?;
-    Ok(i128::from_be_bytes(bytes))
+    crate::largeint::i128_from_be_bytes(values.value(row))
+        .map_err(|_| internal("bitwise LargeInt value has an incorrect byte width"))
 }
 
 /// Allocation representability only; it does not authorize host memory.
@@ -293,3 +303,7 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
 #[cfg(test)]
 #[path = "bitwise_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bitwise_shared_core_tests.rs"]
+mod shared_core_tests;

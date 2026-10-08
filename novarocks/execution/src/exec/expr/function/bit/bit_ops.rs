@@ -27,6 +27,7 @@ use novarocks_functions::{
     bit_numeric::{BitwiseOp, ShiftOp},
 };
 use novarocks_types::largeint;
+#[cfg(test)]
 use std::sync::Arc;
 
 fn to_i64_array(array: &ArrayRef, fn_name: &str, arg_idx: usize) -> Result<Int64Array, String> {
@@ -39,14 +40,6 @@ fn to_i128_values(
     arg_idx: usize,
 ) -> Result<Vec<Option<i128>>, String> {
     novarocks_functions::bit_array::to_i128_values(array, arg_idx)
-        .map_err(|error| error.legacy_message(fn_name))
-}
-fn cast_output(
-    out: ArrayRef,
-    output_type: Option<&DataType>,
-    fn_name: &str,
-) -> Result<ArrayRef, String> {
-    novarocks_functions::bit_array::cast_output(out, output_type)
         .map_err(|error| error.legacy_message(fn_name))
 }
 fn cast_largeint_output(
@@ -88,17 +81,16 @@ where
     let array = arena.eval(args[0], chunk)?;
     let values = to_i64_array(&array, fn_name, 0)?;
 
-    let mut out = Vec::with_capacity(values.len());
-    for row in Selection::all(values.len()).iter() {
-        if values.is_null(row) {
-            out.push(None);
-        } else {
-            out.push(Some(func(values.value(row))));
-        }
-    }
-
-    let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    cast_output(out, arena.data_type(expr), fn_name)
+    let out = novarocks_functions::bit_array::map_values_observed(
+        Selection::all(values.len()),
+        |_, row| Ok::<_, String>((!values.is_null(row)).then(|| values.value(row))),
+        func,
+        &mut |_| Ok(()),
+    )?;
+    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
+        Ok::<(), String>(())
+    })?
+    .map_err(|error| error.legacy_message(fn_name))
 }
 
 fn eval_unary_i128<F>(
@@ -114,7 +106,12 @@ where
 {
     let array = arena.eval(args[0], chunk)?;
     let values = to_i128_values(&array, fn_name, 0)?;
-    let out: Vec<Option<i128>> = values.into_iter().map(|v| v.map(&func)).collect();
+    let out = novarocks_functions::bit_array::map_values_observed(
+        Selection::all(values.len()),
+        |_, row| Ok::<_, String>(values[row]),
+        func,
+        &mut |_| Ok(()),
+    )?;
     cast_largeint_output(&out, arena.data_type(expr), fn_name)
 }
 
@@ -134,17 +131,22 @@ where
     let left = to_i64_array(&left, fn_name, 0)?;
     let right = to_i64_array(&right, fn_name, 1)?;
 
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in Selection::all(chunk.len()).iter() {
-        if left.is_null(row) || right.is_null(row) {
-            out.push(None);
-        } else {
-            out.push(Some(func(left.value(row), right.value(row))));
-        }
-    }
-
-    let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    cast_output(out, arena.data_type(expr), fn_name)
+    let out = novarocks_functions::bit_array::map_values_observed(
+        Selection::all(chunk.len()),
+        |_, row| {
+            Ok::<_, String>(if left.is_null(row) || right.is_null(row) {
+                None
+            } else {
+                Some((left.value(row), right.value(row)))
+            })
+        },
+        |(left, right)| func(left, right),
+        &mut |_| Ok(()),
+    )?;
+    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
+        Ok::<(), String>(())
+    })?
+    .map_err(|error| error.legacy_message(fn_name))
 }
 
 fn eval_binary_i128<F>(
@@ -163,14 +165,17 @@ where
     let left = to_i128_values(&left, fn_name, 0)?;
     let right = to_i128_values(&right, fn_name, 1)?;
 
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in Selection::all(chunk.len()).iter() {
-        out.push(match (left[row], right[row]) {
-            (Some(l), Some(r)) => Some(func(l, r)),
-            _ => None,
-        });
-    }
-
+    let out = novarocks_functions::bit_array::map_values_observed(
+        Selection::all(chunk.len()),
+        |_, row| {
+            Ok::<_, String>(match (left[row], right[row]) {
+                (Some(left), Some(right)) => Some((left, right)),
+                _ => None,
+            })
+        },
+        |(left, right)| func(left, right),
+        &mut |_| Ok(()),
+    )?;
     cast_largeint_output(&out, arena.data_type(expr), fn_name)
 }
 
