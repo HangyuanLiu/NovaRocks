@@ -16,9 +16,10 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{
-    Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int64Array, UInt64Array,
-};
+use arrow::array::{Array, ArrayRef, Int64Array};
+#[cfg(test)]
+use arrow::array::{Decimal128Array, FixedSizeBinaryArray, UInt64Array};
+#[cfg(test)]
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use novarocks_functions::{
@@ -29,114 +30,32 @@ use novarocks_types::largeint;
 use std::sync::Arc;
 
 fn to_i64_array(array: &ArrayRef, fn_name: &str, arg_idx: usize) -> Result<Int64Array, String> {
-    let casted = cast(array, &DataType::Int64).map_err(|e| {
-        format!(
-            "{}: failed to cast arg{} to BIGINT: {}",
-            fn_name, arg_idx, e
-        )
-    })?;
-    casted
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .cloned()
-        .ok_or_else(|| format!("{}: arg{} is not BIGINT", fn_name, arg_idx))
+    novarocks_functions::bit_array::to_i64_array(array, arg_idx)
+        .map_err(|error| error.legacy_message(fn_name))
 }
-
 fn to_i128_values(
     array: &ArrayRef,
     fn_name: &str,
     arg_idx: usize,
 ) -> Result<Vec<Option<i128>>, String> {
-    match array.data_type() {
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| format!("{}: arg{} is not LARGEINT", fn_name, arg_idx))?;
-            let mut out = Vec::with_capacity(arr.len());
-            for row in 0..arr.len() {
-                if arr.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(largeint::i128_from_be_bytes(arr.value(row))?));
-                }
-            }
-            Ok(out)
-        }
-        DataType::UInt64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| format!("{}: arg{} is not UINT64", fn_name, arg_idx))?;
-            let mut out = Vec::with_capacity(arr.len());
-            for row in 0..arr.len() {
-                if arr.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(arr.value(row) as i128));
-                }
-            }
-            Ok(out)
-        }
-        DataType::Decimal128(_, scale) if *scale == 0 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| format!("{}: arg{} is not DECIMAL128", fn_name, arg_idx))?;
-            let mut out = Vec::with_capacity(arr.len());
-            for row in 0..arr.len() {
-                if arr.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(arr.value(row)));
-                }
-            }
-            Ok(out)
-        }
-        DataType::Null => Ok(vec![None; array.len()]),
-        _ => {
-            let casted = to_i64_array(array, fn_name, arg_idx)?;
-            let mut out = Vec::with_capacity(casted.len());
-            for row in 0..casted.len() {
-                if casted.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(casted.value(row) as i128));
-                }
-            }
-            Ok(out)
-        }
-    }
+    novarocks_functions::bit_array::to_i128_values(array, arg_idx)
+        .map_err(|error| error.legacy_message(fn_name))
 }
-
 fn cast_output(
     out: ArrayRef,
     output_type: Option<&DataType>,
     fn_name: &str,
 ) -> Result<ArrayRef, String> {
-    let Some(target) = output_type else {
-        return Ok(out);
-    };
-    if out.data_type() == target {
-        return Ok(out);
-    }
-    cast(&out, target).map_err(|e| format!("{}: failed to cast output: {}", fn_name, e))
+    novarocks_functions::bit_array::cast_output(out, output_type)
+        .map_err(|error| error.legacy_message(fn_name))
 }
-
 fn cast_largeint_output(
     values: &[Option<i128>],
     output_type: Option<&DataType>,
     fn_name: &str,
 ) -> Result<ArrayRef, String> {
-    match output_type {
-        None => largeint::array_from_i128(values),
-        Some(t) if largeint::is_largeint_data_type(t) => largeint::array_from_i128(values),
-        Some(t) => {
-            let out_i64: Vec<Option<i64>> = values.iter().map(|v| v.map(|x| x as i64)).collect();
-            let out = Arc::new(Int64Array::from(out_i64)) as ArrayRef;
-            cast_output(out, Some(t), fn_name)
-        }
-    }
+    novarocks_functions::bit_array::cast_largeint_output(values, output_type)
+        .map_err(|error| error.legacy_message(fn_name))
 }
 
 fn use_largeint_path(arena: &ExprArena, expr: ExprId, args: &[ExprId]) -> bool {
@@ -271,17 +190,24 @@ where
     let left = to_i64_array(&left, fn_name, 0)?;
     let right = to_i64_array(&right, fn_name, 1)?;
 
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in Selection::all(chunk.len()).iter() {
-        if left.is_null(row) || right.is_null(row) {
-            out.push(None);
-        } else {
-            out.push(Some(func(left.value(row), right.value(row) as u32)));
-        }
-    }
-
-    let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    cast_output(out, arena.data_type(expr), fn_name)
+    let out = novarocks_functions::bit_array::shift_values_observed(
+        Selection::all(chunk.len()),
+        |_, row| {
+            Ok::<_, std::convert::Infallible>(if left.is_null(row) || right.is_null(row) {
+                None
+            } else {
+                Some((left.value(row), right.value(row)))
+            })
+        },
+        func,
+        &mut |_| Ok::<_, std::convert::Infallible>(()),
+    )
+    .unwrap_or_else(|never| match never {});
+    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .unwrap_or_else(|never| match never {})
+    .map_err(|error| error.legacy_message(fn_name))
 }
 
 fn eval_shift_i128<F>(
@@ -300,14 +226,18 @@ where
     let left = to_i128_values(&left, fn_name, 0)?;
     let right = to_i128_values(&right, fn_name, 1)?;
 
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in Selection::all(chunk.len()).iter() {
-        out.push(match (left[row], right[row]) {
-            (Some(l), Some(r)) => Some(func(l, r as u32)),
-            _ => None,
-        });
-    }
-
+    let out = novarocks_functions::bit_array::shift_values_observed(
+        Selection::all(chunk.len()),
+        |_, row| {
+            Ok::<_, std::convert::Infallible>(match (left[row], right[row]) {
+                (Some(l), Some(r)) => Some((l, r)),
+                _ => None,
+            })
+        },
+        func,
+        &mut |_| Ok::<_, std::convert::Infallible>(()),
+    )
+    .unwrap_or_else(|never| match never {});
     cast_largeint_output(&out, arena.data_type(expr), fn_name)
 }
 
@@ -1045,3 +975,7 @@ mod legacy_bitwise_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_shift_raw_contract_tests.rs"]
+mod legacy_shift_raw_contract_tests;

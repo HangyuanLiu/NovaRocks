@@ -18,15 +18,18 @@
 //! Selected shifts preserve the original widened arithmetic and safe narrowing.
 //! Arrow builder allocation still requires formal host memory admission.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, Int64Array, PrimitiveArray,
-    builder::{FixedSizeBinaryBuilder, PrimitiveBuilder},
     types::{ArrowPrimitiveType, Int8Type, Int16Type, Int32Type, Int64Type},
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
+
+#[cfg(test)]
+use arrow_array::builder::FixedSizeBinaryBuilder;
 
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelEvaluationControl,
@@ -163,25 +166,35 @@ where
         .ok_or_else(|| internal("shift selected primitive carrier cannot be downcast"))?;
     let selection = input.selection();
     output_capacity(selection.len(), std::mem::size_of::<T::Native>())?;
-    let mut builder = PrimitiveBuilder::<T>::with_capacity(selection.len());
+    // The original loop allocates a BIGINT intermediate before Arrow safe
+    // narrowing. Representability is checked for both real carriers.
+    output_capacity(selection.len(), std::mem::size_of::<Option<i64>>())?;
     let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        let value = match arguments.selected_pair(ordinal, batch_row)? {
-            Some((left_row, right_row)) => {
-                let shifted = operation.apply_i64(
-                    values.value(left_row).into(),
-                    arguments.counts.value(right_row),
-                );
-                // Arrow's safe cast back to the source width returns NULL on
-                // overflow. Native narrow wrapping would change this contract.
-                T::Native::try_from(shifted).ok()
-            }
-            None => None,
-        };
-        builder.append_option(value);
-    }
-    let values = Arc::new(builder.finish()) as ArrayRef;
+    let mut observe = |event| match event {
+        crate::bit_array::BitArrayObservation::Step => work.step(),
+        crate::bit_array::BitArrayObservation::OpaqueBoundary => work.flush(),
+    };
+    let values = crate::bit_array::shift_values_observed(
+        selection,
+        |ordinal, batch_row| {
+            Ok(arguments
+                .selected_pair(ordinal, batch_row)?
+                .map(|(left_row, right_row)| {
+                    (
+                        values.value(left_row).into(),
+                        arguments.counts.value(right_row),
+                    )
+                }))
+        },
+        |value, count| operation.apply_i64(value, i64::from(count)),
+        &mut observe,
+    )?;
+    let values = crate::bit_array::finish_i64_observed(
+        values,
+        Some(&input.contract().result_type().data_type),
+        &mut observe,
+    )?
+    .map_err(|error| internal(&error.legacy_message("shift")))?;
     work.finish()?;
     Ok(values)
 }
@@ -205,28 +218,33 @@ fn largeint(
     }
     let selection = input.selection();
     output_capacity(selection.len(), 16)?;
-    let mut builder = FixedSizeBinaryBuilder::with_capacity(selection.len(), 16);
+    output_capacity(selection.len(), std::mem::size_of::<Option<i128>>())?;
     let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        match arguments.selected_pair(ordinal, batch_row)? {
-            Some((left_row, right_row)) => {
-                let bytes: [u8; 16] = values
-                    .value(left_row)
-                    .try_into()
-                    .map_err(|_| internal("shift LargeInt value has an incorrect byte width"))?;
-                let value = operation.apply_i128(
-                    i128::from_be_bytes(bytes),
-                    arguments.counts.value(right_row),
-                );
-                builder
-                    .append_value(value.to_be_bytes())
-                    .map_err(|_| internal("shift LargeInt output has an incorrect byte width"))?;
-            }
-            None => builder.append_null(),
-        }
-    }
-    let values = Arc::new(builder.finish()) as ArrayRef;
+    let mut observe = |event| match event {
+        crate::bit_array::BitArrayObservation::Step => work.step(),
+        crate::bit_array::BitArrayObservation::OpaqueBoundary => work.flush(),
+    };
+    let values = crate::bit_array::shift_values_observed(
+        selection,
+        |ordinal, batch_row| {
+            arguments
+                .selected_pair(ordinal, batch_row)?
+                .map(|(left_row, right_row)| {
+                    crate::largeint::value_at(values, left_row)
+                        .map(|value| (value, arguments.counts.value(right_row)))
+                        .map_err(|_| internal("shift LargeInt value has an incorrect byte width"))
+                })
+                .transpose()
+        },
+        |value, count| operation.apply_i128(value, i64::from(count)),
+        &mut observe,
+    )?;
+    let values = crate::bit_array::cast_largeint_output_observed(
+        &values,
+        Some(&input.contract().result_type().data_type),
+        &mut observe,
+    )?
+    .map_err(|_| internal("shift LargeInt output has an incorrect byte width"))?;
     work.finish()?;
     Ok(values)
 }
@@ -251,3 +269,7 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
 #[cfg(test)]
 #[path = "bit_shift_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bit_shift_shared_core_tests.rs"]
+mod shared_core_tests;

@@ -1615,3 +1615,6 @@ mod null_or_empty_tests;
 #[cfg(test)]
 #[path = "pure_differential/array_tests.rs"]
 mod array_tests;
+
+#[path = "pure_differential_shift_shared_tests.rs"]
+mod shift_shared_tests;

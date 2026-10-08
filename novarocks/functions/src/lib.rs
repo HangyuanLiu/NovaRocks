@@ -41,6 +41,7 @@ mod aggregate_state_column;
 pub mod aggregate_types;
 mod arithmetic;
 mod binding;
+pub mod bit_array;
 pub mod bit_numeric;
 pub mod builtin;
 pub mod calendar_julian;
