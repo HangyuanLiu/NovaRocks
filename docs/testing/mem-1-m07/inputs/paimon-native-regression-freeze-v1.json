@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "frozen_before_execution": true,
+  "purpose": "Current Paimon external Spark oracle and native read contract regression; prerequisite for real-provider CL, not large-cardinality CL acceptance.",
+  "topology": "1FE+3BE",
+  "run_id": "mem-1-m07-p09-paimon-20261009",
+  "fixture_definition": [
+    {
+      "path": "docker/paimon-read/fixture.py",
+      "sha256": "0b75be54c32c3777f494f03f2f6b81689a516621c882b81519cfac4639f1414d"
+    },
+    {
+      "path": "docker/paimon-read/requirements.txt",
+      "sha256": "385219112b38acb8498c6df80aa49ba2bff554e37dc6ce5b22164a94df7e6756"
+    }
+  ],
+  "input_lock": {
+    "path": "docker/fixture-inputs/lock.json",
+    "sha256": "a64be4b432bfcb835224996a778d985eb507d30c2e9baf2031e06e186b56b857"
+  },
+  "bom_verify": {
+    "outcome": "passed",
+    "log": {
+      "path": "logs/mem-1-m07/p09-real-provider-input-readiness-20261009.log",
+      "sha256": "e1c1af09ee2f617bd909384c2f1c2ac946b29a5997b1dacef656b6e61e1a7bda"
+    }
+  },
+  "local_python": {
+    "pyarrow": "23.0.1",
+    "fastavro": "1.12.1"
+  },
+  "hms_image_id": "sha256:13141e78e650347b9c78eb39e8bd86653fc1735ad50ec616c4289f435a20de42",
+  "scenarios": [
+    "connector/paimon-read-data",
+    "connector/paimon-snapshot-and-schema",
+    "connector/paimon-merge-filter-correctness",
+    "connector/paimon-cancel-and-budget",
+    "connector/paimon-unsupported-and-binding",
+    "connector/iceberg-paimon-read"
+  ],
+  "timeout_seconds_per_scenario": 600,
+  "cleanup": "Paimon manifest/inventory exact prefix cleanup before canonical task-private REST cleanup. No shared fixture mutation, no provisioning/download/build."
+}
