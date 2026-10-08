@@ -1644,3 +1644,9 @@ mod collection_construct_access_tests;
 
 #[path = "pure_differential_array_element_access_tests.rs"]
 mod array_element_access_tests;
+
+#[path = "pure_differential/unixtime_tests.rs"]
+mod unixtime_tests;
+
+#[path = "pure_differential/time_slice_tests.rs"]
+mod time_slice_tests;
