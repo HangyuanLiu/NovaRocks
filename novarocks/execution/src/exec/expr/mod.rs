@@ -1340,3 +1340,10 @@ mod legacy_array_difference_baseline_tests;
 
 #[cfg(test)]
 mod numeric_unary_original_nonnull_sql_baseline_tests;
+
+#[cfg(test)]
+#[path = "legacy_decimal_float_cast_baseline_tests.rs"]
+mod legacy_decimal_float_cast_baseline_tests;
+#[cfg(test)]
+#[path = "cast_decimal_float_oracle_tests.rs"]
+mod cast_decimal_float_oracle_tests;
