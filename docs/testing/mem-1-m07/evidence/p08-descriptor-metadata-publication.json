@@ -1,0 +1,30 @@
+{
+  "status": "P08_PARTIAL_NATIVE_METADATA_PUBLICATION_FIX",
+  "previous_native_head": "1be0259318684444788b794be397a41e21094428",
+  "previous_smoke": {
+    "samples": 22,
+    "failed": 14,
+    "remaining_cause": "root input field metadata origins are missing",
+    "artifact": "logs/mem-1-m07/p08-joint-budget-native-dev-smoke-20261008"
+  },
+  "change": "Exchange validates received logical domains then derives canonical receiver fields from exact descriptor owners; table function retains those owners; generate_series uses the Native layout decoder. Unknown original carriers still refuse. Static diagnostics identify the inspection failure category.",
+  "checks": {
+    "execution_serial": 1549,
+    "actual_exchange_registry_regression": 1,
+    "native_adapter_serial": 715
+  },
+  "logs_sha256": {
+    "p08-descriptor-publication-execution.log": "ff1e189bc543afc3f155c7156bd978f07bc17fc74e40f22b60efa3ec817af437",
+    "p08-exchange-registry-owner-regression-v2.log": "78dbe42ced1dfd1fd29b6660c550e542f66e5838049e4452240a702bce158bf0",
+    "p08-descriptor-publication-native.log": "bc1dd865ee12e9d78fcf78ece528ac7d30ee52e7640820da04976a7fe45a6b11",
+    "p08-joint-budget-native-dev-smoke-driver.log": "2eb8242fa21f3d5e32faa31fdd57b241aa3d57c23f6949506d3012d9740bba91",
+    "p08-backing-diagnostic-dev-smoke-driver.log": "3f1eb3b9d84e30cf1ffe4199c444ed5686396ae92c911ce38a7b2fe769f41219",
+    "p08-backing-diagnostic-v3-dev-smoke-driver.log": "ce579cc0aa6487523319ed07605c7bdc34fe3a874720ae86e22913aa1da95065"
+  },
+  "remaining": [
+    "clean native smoke re-run",
+    "finite independent root ingress",
+    "FE legacy retirement",
+    "P00b/P09/P10 and final same-HEAD convergence"
+  ]
+}

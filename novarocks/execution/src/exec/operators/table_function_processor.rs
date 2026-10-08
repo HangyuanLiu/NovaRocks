@@ -36,7 +36,7 @@ use arrow::array::{
     new_empty_array,
 };
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::DataType;
 use arrow_data::transform::MutableArrayData;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -649,40 +649,21 @@ impl TableFunctionProcessorOperator {
             }
         }
 
-        let mut fields = Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
-        for (idx, slot_id) in self.output_chunk_schema.slot_ids().iter().enumerate() {
-            let base_field = self
-                .output_chunk_schema
-                .slot(*slot_id)
-                .ok_or_else(|| format!("table function output slot {} missing", slot_id))?
-                .field();
-            let dt = output_columns
-                .get(idx)
-                .ok_or_else(|| "table function output column missing".to_string())?
-                .data_type()
-                .clone();
-            fields.push(Field::new(base_field.name(), dt, base_field.is_nullable()));
-        }
-        Chunk::try_new_with_columns(
-            Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?),
-            output_columns,
-        )
-        .map_err(|e| format!("table function build batch failed: {e}"))
+        // Chunk alignment derives carrier/nullability facts from the exact
+        // output field owners. Rebuilding equal Fields here loses provenance.
+        Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), output_columns)
+            .map_err(|e| format!("table function build batch failed: {e}"))
     }
 
     fn empty_output_chunk(&self) -> Result<Chunk, String> {
-        let mut fields = Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
-        let mut columns = Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
-        for slot in self.output_chunk_schema.slots() {
-            let field = slot.field().clone();
-            columns.push(new_empty_array(field.data_type()));
-            fields.push(field);
-        }
-        Chunk::try_new_with_columns(
-            Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?),
-            columns,
-        )
-        .map_err(|e| format!("table function build empty batch failed: {e}"))
+        let columns = self
+            .output_chunk_schema
+            .slots()
+            .iter()
+            .map(|slot| new_empty_array(slot.data_type()))
+            .collect();
+        Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), columns)
+            .map_err(|e| format!("table function build empty batch failed: {e}"))
     }
 
     fn int_like_arg_to_i128(

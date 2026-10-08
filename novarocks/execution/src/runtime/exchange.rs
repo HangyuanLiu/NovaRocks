@@ -1557,7 +1557,6 @@ fn materialize_chunk_for_wire_meta(
     };
 
     let mut slots = Vec::with_capacity(batch.num_columns());
-    let mut out_fields = Vec::with_capacity(batch.num_columns());
     let mut columns = Vec::with_capacity(batch.num_columns());
     let mut any_materialized = false;
     for (idx, slot_id) in wire_meta.slot_ids_by_index.iter().enumerate() {
@@ -1660,13 +1659,30 @@ fn materialize_chunk_for_wire_meta(
         } else {
             expected_slot.slot_id()
         };
-        slots.push(expected_slot.with_field_and_slot_id(output_slot_id, out_field.clone())?);
-        out_fields.push(Arc::new(out_field));
+        if expected_slot.metadata_origins().is_some() {
+            // Native descriptors own the receiver's metadata. Validate the
+            // received logical domains before replacing wire-only fields,
+            // then derive only from those exact immutable descriptor owners.
+            // No receipt is issued for a decoded IPC HashMap or equal Field.
+            validate_root_result_wire_domains(field, expected_slot.field())?;
+            let slot = expected_slot
+                .reconcile_to_carrier(out_column.data_type(), out_nullable)?
+                .with_slot_id(output_slot_id)?;
+            out_column =
+                crate::exec::chunk::type_compatibility::retag_column(&out_column, slot.data_type())
+                    .map_err(|error| {
+                        format!("exchange descriptor metadata publication failed: {error:?}")
+                    })?;
+            slots.push(slot);
+            any_materialized = true;
+        } else {
+            slots.push(expected_slot.with_field_and_slot_id(output_slot_id, out_field.clone())?);
+        }
         columns.push(out_column);
     }
     let chunk_schema = Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?);
     let new_batch = if any_materialized {
-        RecordBatch::try_new(Arc::new(Schema::new(out_fields)), columns)
+        RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
             .map_err(|e| format!("exchange materialize batch to descriptor failed: {e}"))?
     } else {
         batch.clone()
@@ -2974,6 +2990,86 @@ mod tests {
         assert_eq!(decoded[0].batch.schema().field(0).name(), "file");
         assert_eq!(decoded[0].batch.schema().field(1).name(), "row_id");
         assert_eq!(decoded[0].batch.schema().field(2).name(), "value");
+    }
+
+    #[test]
+    fn native_exchange_publication_retains_descriptor_metadata_ownership() {
+        use crate::exec::chunk::{RootArrayStorageLimits, borrowed_root_chunk_storage};
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let owner = ArrowMetadataOwner::try_new(
+            Vec::new(),
+            MetadataOwnerLimits {
+                entries: 0,
+                construction_bytes: 0,
+            },
+        )
+        .unwrap()
+        .into_field("value".into(), DataType::Int64, false);
+        let expected = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    SlotId::new(73),
+                    Arc::clone(owner.field()),
+                    FieldMetadataOrigins::try_new(vec![owner], 1).unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "wire_value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
+        )
+        .unwrap();
+        let unknown = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            source.schema().as_ref(),
+            &[SlotId::new(5)],
+        )
+        .unwrap();
+        let original = Chunk::new_with_chunk_schema(source, unknown);
+        let limits = RootArrayStorageLimits {
+            bytes: 96 * 1024 * 1024,
+            nodes: 65536,
+            depth: 64,
+        };
+        assert!(borrowed_root_chunk_storage(&original, limits).is_err());
+        let payload = encode_chunks(&[original], true).unwrap();
+        let key = ExchangeKey {
+            finst_id_hi: 91_735,
+            finst_id_lo: 91_736,
+            node_id: 73,
+        };
+        let registry = ExecutionExchangeRegistry::default();
+        registry
+            .register_expected_chunk_schema(key, 1, Arc::clone(&expected))
+            .unwrap();
+        let decoded = registry
+            .decode_chunks_for_sender(key, ExchangeSenderIdentity::local(3, 1), &payload)
+            .unwrap();
+        assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(73)]);
+        assert_eq!(
+            decoded[0]
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+        assert!(borrowed_root_chunk_storage(&decoded[0], limits).is_ok());
+        assert!(Arc::ptr_eq(
+            decoded[0].chunk_schema().slots()[0].field_ref(),
+            expected.slots()[0].field_ref()
+        ));
     }
 
     #[test]

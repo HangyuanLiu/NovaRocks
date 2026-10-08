@@ -690,20 +690,44 @@ impl RootResultSession for NativeRootResultSession {
         } else {
             NativeResultSupportGeometry::V1.root_original_input_backing_capacity_bytes as usize
         };
-        if borrowed_root_chunk_storage(
+        if let Err(error) = borrowed_root_chunk_storage(
             &input.chunk,
             RootArrayStorageLimits {
                 bytes: cap,
                 nodes: 2 * RootProfileV1::SCHEMA_TYPE_NODES,
                 depth: RootProfileV1::MAX_DEPTH,
             },
-        )
-        .is_err()
-        {
+        ) {
+            let schema = input.chunk.chunk_schema();
+            let unknown_metadata = if schema.field_metadata_origins().is_none() {
+                "root input field metadata origins are missing"
+            } else if schema.schema_metadata_origin().is_none() {
+                "root input schema metadata origin is missing"
+            } else if schema
+                .schema_metadata_origin()
+                .unwrap()
+                .backing_bytes_for(&input.chunk.batch.schema())
+                .is_none()
+            {
+                "root input actual schema differs from its metadata owner"
+            } else {
+                "root input nested metadata ownership is unknown"
+            };
             drop(input);
-            return Err(io_error(
-                "root original input backing is unproven or exceeds its profile",
-            ));
+            return Err(io_error(match error {
+                novarocks_execution::exec::chunk::RootArrayStorageError::UnsupportedCarrier => {
+                    "root input inspection refused an unsupported carrier"
+                }
+                novarocks_execution::exec::chunk::RootArrayStorageError::UnknownMetadataOwner => {
+                    unknown_metadata
+                }
+                novarocks_execution::exec::chunk::RootArrayStorageError::CapacityExceeded => {
+                    "root input backing exceeds its frozen capacity"
+                }
+                novarocks_execution::exec::chunk::RootArrayStorageError::WorkExceeded => {
+                    "root input structural work exceeds its frozen profile"
+                }
+            }));
         }
         let mut state = self.state();
         if state.sealed

@@ -400,19 +400,13 @@ fn int64_chunk_schema(
     slots: &[(SlotId, &str)],
     source_path: FieldPath,
 ) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
-    let slots = slots
+    let columns = slots
         .iter()
-        .map(|(slot_id, name)| {
-            ChunkSlotSchema::try_new_with_field(
-                *slot_id,
-                Field::new(*name, DataType::Int64, false),
-                None,
-                None,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>();
-    let slots = NativeFragmentDecodeError::map_invalid(source_path.clone(), slots)?;
-    NativeFragmentDecodeError::map_invalid(source_path, ChunkSchema::try_new(slots)).map(Arc::new)
+        .map(|(slot, name)| bigint_output_column(slot.as_u32(), name, false))
+        .collect::<Vec<_>>();
+    decode_output_layout(&columns, source_path)
+        .map(|layout| layout.chunk_schema())
+        .map_err(NativeFragmentDecodeError::from)
 }
 
 fn generate_series_param_slots(output_column_id: u32) -> Result<[SlotId; 3], String> {
