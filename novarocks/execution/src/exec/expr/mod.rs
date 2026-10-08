@@ -1206,3 +1206,6 @@ mod tests {
         assert!(arr.is_null(2));
     }
 }
+
+#[cfg(test)]
+mod legacy_calendar_parts_baseline_tests;
