@@ -1670,3 +1670,7 @@ mod array_append_multi_tests;
 #[cfg(test)]
 #[path = "pure_differential_map_size_tests.rs"]
 mod map_size_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_map_keys_values_tests.rs"]
+mod map_keys_values_tests;
