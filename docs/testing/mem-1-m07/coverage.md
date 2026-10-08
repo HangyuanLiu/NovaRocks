@@ -138,3 +138,5 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 2026-10-09 statistics完整7/7原生1FE+3BE PASS，含真实Spark及Trino483 Puffin互通；actual63f16c67e，4PID退出，任务私有canonical shared fixture清理0。见 `evidence/p09-statistics-complete-native-pass-20261009.json`。不是大provider CL、release性能或最终同HEAD验收。
 
 2026-10-09 additional native coverage：statistics7/63步、MV七suite33/537步、真实HMS1/6步已PASS；前台rewrite接线补齐后actual70dc18f8a完整Iceberg27/compatibility20/resilience13（60/536步）及membership/ingress11场景PASS，全部记录PID退出、私有fixture cleanup0。普通64承载/writer决定、real大provider CL、result-delivery新case、transport/CM/P00b/final仍OPEN；历史63 C0不能当作70dc全量。详见对应20261009 JSON收据。
+
+2026-10-09 clean856e28f52前台rewrite C0全量PASS：12266/0fail/7ignored，524s，收据evidence/p09-foreground-rewrite-c0-pass-20261009.json。此次cargo-only不含native，不是final；MV rename六case原始输入已freeze v1，等待串行旧main/候选对照。

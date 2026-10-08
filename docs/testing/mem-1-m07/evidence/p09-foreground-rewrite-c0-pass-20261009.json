@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 foreground rewrite Internal routing C0 convergence checkpoint",
+  "source_revision": "856e28f52f0c97e816835e44df77576bcb32d7c9",
+  "source_dirty": false,
+  "outcome": "passed",
+  "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 NOVA_CI_CARGO_PROFILE=dev tools/ci/local-full-ci.sh --cargo-only",
+  "duration_seconds": 524,
+  "totals": {
+    "cargo-test-component.log": {
+      "passed": 12084,
+      "failed": 0,
+      "ignored": 7,
+      "harness_count": 182
+    },
+    "cargo-test-server-owner.log": {
+      "passed": 178,
+      "failed": 0,
+      "ignored": 0,
+      "harness_count": 3
+    },
+    "cargo-test-server-smoke.log": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "harness_count": 1
+    }
+  },
+  "passed": 12266,
+  "failed": 0,
+  "ignored": 7,
+  "server_binary": {
+    "path": "target/debug/novarocks",
+    "sha256": "ea35836d891eabd0f96834708ea8c1c53bf0dbca9595f43bdccf159263d30418"
+  },
+  "scope": "Complete cargo-only architecture/dependency guards, format, all-targets, System allocator, Clippy, build, error manifest, component, server owner and binary smoke. No native run or final M07 acceptance is claimed.",
+  "raw_artifacts": [
+    {
+      "path": "logs/ci-full/20261009-052300/application-domain-dependency-boundary-test.log",
+      "sha256": "7e1f93ebf3d1d9a814a3c61155b1e0a200ee2e6f90229d2c0eb5b43628921b00"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/application-domain-dependency-boundary.log",
+      "sha256": "ca81667ce52af5b5f9b8613a652355d8ba757eb31c2c90b61f26117f4b766d4b"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-build.log",
+      "sha256": "04daf844d67a35812d686c10879555fb6a487629cd1ff2d8bb1f7cfa88e94629"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-check-all-targets.log",
+      "sha256": "f71dce590935da60fed68ffe3b12df22ccd604acd79266ed414977f55d9e4a76"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-check-server-system-allocator.log",
+      "sha256": "49718bf36337f3bdbcb9817e4d324867930498b18bdc9ce7d898a33e593f0515"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-clippy.log",
+      "sha256": "f2e81267c23b792d2666fee92b2d9267611b3e7fc7228474d6021985a672ed71"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-deny.log",
+      "sha256": "27c3bc20f1e5f2017989973ebd4c82e6c8abc983a78af8e4a6412ca01f08df1f"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-fmt.log",
+      "sha256": "25293c8809a4971b7ad97551d7900c3289770c2e95b4372b44fe03db1359093a"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-metadata.log",
+      "sha256": "ec4da745550adc6bbcb642201fd6ca3a0f758ad57c83be8e652eee7e10e5bba8"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-test-component.log",
+      "sha256": "b73f16362b5c3c46c20113dc6e7941e3d9593771758ad42210ec9d7f33c7c763"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-test-server-owner.log",
+      "sha256": "6e8b64862db7353bbc510c68da7d9cf05053bcd90a987ffb682a966461ef72d5"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/cargo-test-server-smoke.log",
+      "sha256": "b160fdf8774f228a7bf15bfdbd12254d483c064142309f74bcc28c84a95ed838"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/connector-role-binding-boundary-test.log",
+      "sha256": "c4a85d5ea6058bda3dd76731973593eaaa3752a2a7552f5fc5083b4fa99d8c8a"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/connector-role-binding-boundary.log",
+      "sha256": "048e8e08d57aff46ecf298be6177a2dc535d88718bc0892eff8be90c74dff749"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/datasketches-source-test.log",
+      "sha256": "0986d4b1602aa389a50a669a7bb291e0d84d720bc4dc5005104770c6998315e5"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/datasketches-source.log",
+      "sha256": "8118501ffb6fd327ab4ce9c13bc60804360552646120b48ff2dd76beeb879ffb"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/error-manifest-check.log",
+      "sha256": "3f073a8244d329dfc80ee7f711716f5b20d728d3064221115ebd6d5337efd183"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/generated-artifact-hygiene.log",
+      "sha256": "ab4ae276af81cd6a4f1ce4bff4d6b3a6532242e692ad715e37f4b7c7a6a97f33"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/isolated-fixture-current-link.log",
+      "sha256": "57e23265a77ca8c230df9ecbe8799284c782e1a53002cc7afd5cf3ead7bf8ff8"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/legacy-branding-test.log",
+      "sha256": "9689a9cc4e2ada9cef5b690109f044ad56315d64eb4275c1ee22b1ba908ede09"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/legacy-branding.log",
+      "sha256": "8073cfe9f0f5606237c7b9276449e5ad0fdd6c552d93b2dadc214f4b94b3fa23"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/local-program-dependency-boundary-test.log",
+      "sha256": "412b01ae025160d23b7d990e8d8646c08880ba9726327abcb269afca49b47c14"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/local-program-dependency-boundary.log",
+      "sha256": "25f001b325e31dc2f99a8948c179800aa271e81f64dc5c70eba2300ebb5c0835"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/memory-dependency-boundary-test.log",
+      "sha256": "6531f455590a0167913a5ddad2f0f20940dedf924a2a7989f260205a697c74a3"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/memory-dependency-boundary.log",
+      "sha256": "5d6f7c470c0a6e8f4e87c7f26b72aa3626a126f213a302a72d29a1a808395991"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/native-trust-dependency-boundary-test.log",
+      "sha256": "b0646c129ac077cddb2744fe4138b6481182fbe09c997c0e957975c86ee24aa0"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/native-trust-dependency-boundary.log",
+      "sha256": "86ab6b328e65a3b3d721ac2457d55c8816a691c79ac22cc8afa83bf8f011305d"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/native-wire-dependency-boundary-test.log",
+      "sha256": "432116548d78562baed81388fb7e143da65801aaacf86e9f163493efebd2e2a3"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/native-wire-dependency-boundary.log",
+      "sha256": "49206e456a02a375f0f07f7e311c1a452d3ea4ae41491d3611c91b6ea2892a76"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/ncp8-statistics-boundary-test.log",
+      "sha256": "b9e7c475f341dec57a4ecb0c7332e7164b34f037c4efba43f63316e1a2622148"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/ncp8-statistics-boundary.log",
+      "sha256": "416f80f5d8cb6ddb21988728ff589dd22535f5dae88c50c11b7cc3f1a4f9b2b5"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/physical-plan-dependency-boundary-test.log",
+      "sha256": "34fbffee3ca1de3e9afdfac07c956a86c661447291b98af1e2c26f5f26a820ec"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/physical-plan-dependency-boundary.log",
+      "sha256": "72b4953a0519ee0760d34ef381c8da2d9c13c29277ff1dcc34354ef27cc823d7"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/shared-benchmark-environment.log",
+      "sha256": "a95002777cfb7c039f522074c68e841849395ea20a4b2d157770e3daa8cf6a33"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/shared-benchmark-fixture-contract.log",
+      "sha256": "84ee141f6f42fe10ac9ee4490b389a1aff8ee768cd78dcb7901c931a056b5ce9"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/shared-benchmark-fixture-lifecycle.log",
+      "sha256": "b8a4e0f21f8947aedef5d34702d1aa24c59c371caef591ad3f41099fff192dbd"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/spi-dependency-boundary-test.log",
+      "sha256": "78080eb31c0cc02a1cb80ef1c47c860f1548bb43d7d691f8a05de1205947ab71"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/spi-dependency-boundary.log",
+      "sha256": "e7a45113da2d557f9d582a95e41a67298b1aabb0b5ca9d2043c97965958dbb3d"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/sql-helper-env-file.log",
+      "sha256": "c053937101feaef468bef9432d3d99f7459bfef4faffafd08b1b1babb4fb02d9"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/state-store-dependency-boundary-test.log",
+      "sha256": "8bd19b5f371ad4cbaff9700759e42bf38198fe2fbdfac5ddf51eea2c20e9ea15"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/state-store-dependency-boundary.log",
+      "sha256": "fc74536e0d6e210ace130f7806d36314dcc74909dc60a3c3b981ee296efa4655"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/summary.md",
+      "sha256": "2b97669872e457f242f087c4f03c99a603405124c088ecdc281487a07f3cb430"
+    },
+    {
+      "path": "logs/ci-full/20261009-052300/system-scenarios-stage-test.log",
+      "sha256": "2cfa94d698d66eae7eadcec39ad74eb09714e275d258a89f5c4cd98effc14900"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-foreground-rewrite-c0-driver-20261009.log",
+      "sha256": "996bd1001ff8d34c947b33cf5a5618d284d7cddf6dabbd62e51db87fd6bcea3c"
+    }
+  ]
+}
