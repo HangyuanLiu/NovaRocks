@@ -16,10 +16,20 @@
 // under the License.
 //! Each actual generic declaration is tested across the original full castable shape domain.
 use super::*;
-use crate::exec::expr::legacy_array_match_baseline_tests::list;
 use arrow::array::*;
 use arrow::datatypes::*;
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{NullBuffer, OffsetBuffer};
+
+// The original fixed List<T> binder authors this canonical field. Raw
+// metadata witnesses stay in the independent original-v1 fixture module.
+fn list(values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayRef {
+    Arc::new(ListArray::new(
+        Arc::new(Field::new("item", values.data_type().clone(), true)),
+        OffsetBuffer::new(offsets.into()),
+        values,
+        valid.map(NullBuffer::from),
+    ))
+}
 #[test]
 fn pure_differential_array_match_both_real_overloads_all_primitive_castable_shapes() {
     let arrays: Vec<ArrayRef> = vec![

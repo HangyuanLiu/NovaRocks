@@ -282,3 +282,7 @@ pub mod to_base64_shared;
 pub mod aes_primitive;
 pub mod aes_rows;
 pub mod bytes_output;
+
+pub mod array_match_core;
+mod array_match_owner;
+mod array_match_selected;

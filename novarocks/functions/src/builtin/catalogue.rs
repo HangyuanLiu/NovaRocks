@@ -2618,6 +2618,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::map_size_owner::operation(name) => {
                         Some(super::map_size_owner::effects())
                     }
+                    name if super::array_match_owner::operation(name).is_some() => {
+                        Some(super::array_match_owner::effects())
+                    }
                     name if super::collection_cardinality_owner::operation(name).is_some() => {
                         Some(super::collection_cardinality_owner::effects())
                     }
@@ -2950,6 +2953,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::map_size_owner::operation(name) => {
                 super::map_size_owner::definition(name, declaration, resolver)?
+            }
+            name if super::array_match_owner::operation(name).is_some() => {
+                super::array_match_owner::definition(name, declaration, resolver)?
             }
             name if super::collection_cardinality_owner::operation(name).is_some() => {
                 super::collection_cardinality_owner::definition(name, declaration, resolver)?
