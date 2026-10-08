@@ -1330,3 +1330,6 @@ mod cast_date_float_oracle_tests;
 mod legacy_float_date_cast_baseline_tests;
 #[cfg(test)]
 mod cast_float_date_oracle_tests;
+
+#[cfg(test)]
+mod legacy_parse_url_baseline_tests;

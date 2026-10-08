@@ -1737,3 +1737,6 @@ mod array_repeat_encoded_tests;
 mod aggregate_count_original_diff_tests;
 
 pub(crate) mod aggregate_count_generic_diff_tests;
+
+#[path = "pure_differential_parse_url_tests.rs"]
+mod parse_url_tests;
