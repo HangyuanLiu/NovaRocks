@@ -674,6 +674,7 @@ async fn run_logical_execution(
                 stage,
                 schema.clone(),
                 config.rows.delivery_capacity,
+                description.row_carrier(),
             )
         }
         (Some(schema), RecoveryMode::RestartAttemptBeforeVisibility) => {
@@ -695,6 +696,7 @@ async fn run_logical_execution(
                         config.rows.replacement_reservation_valid_for,
                         schema.clone(),
                         config.rows.delivery_capacity,
+                        description.row_carrier(),
                     )
                 }
                 Err(error) => Err(error),

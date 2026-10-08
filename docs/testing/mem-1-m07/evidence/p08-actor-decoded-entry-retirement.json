@@ -1,0 +1,36 @@
+{
+  "status": "PASS_COMPONENT_ACTOR_DECODED_ENTRY_RETIRED_P08_PARTIAL",
+  "base_revision": "0a19e9097",
+  "changes": [
+    "Removed DeliverResultBatch, deliver_result_batch and the bare legacy final Worker ACK observer.",
+    "Row constructors require an explicit carrier. Stream installation refuses absent carrier; completion configuration carries no guessed row default.",
+    "Migrated 11 data-delivery fixtures to retained V1 ClientRows bodies and original Client-window aliases, including cancellation, writer failure, stale/gapped/overflow sequence, durable ACK watermark, post-End refusal and EOF order.",
+    "Migrated EOF observations to V1 RootResultEnd with root row count, keeping actual receipt and Finished requirements. Removed generic runtime schema copy."
+  ],
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-actor-segment-query-tests-v4.log",
+      "sha256": "9f00d943f6435b427c6ba71d77c5185e87c6bd3773635192f0a8bd63146d84e7",
+      "result": [
+        "test result: ok. 500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-actor-segment-frontend-check.log",
+      "sha256": "822f857fce1ca29baee35a89538c812aa427d0e41d930277ae9e9642eb5df921",
+      "result": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.87s"
+      ]
+    }
+  ],
+  "retained_failures": [
+    "p08-actor-segment-retirement-tests-v1.log: two fixture migration compile errors",
+    "p08-actor-segment-retirement-tests-v2.log: duplicate constructor argument",
+    "p08-actor-segment-retirement-tests-v3.log: 12 old bare-ACK fixtures correctly rejected without V1 root row count"
+  ],
+  "remaining": [
+    "Decoded delivery/result enum/MySQL API retirement",
+    "Result-specific LRA stages, wait queue, observations and config",
+    "Clean C0/native convergence, P00b/P09/P10 and final same-HEAD evidence"
+  ]
+}
