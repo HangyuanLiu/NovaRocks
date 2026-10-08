@@ -34,6 +34,8 @@ mod legacy_calendar_duration_baseline_tests;
 #[cfg(test)]
 mod legacy_calendar_unix_baseline_tests;
 #[cfg(test)]
+mod legacy_calendar_convert_tz_baseline_tests;
+#[cfg(test)]
 mod legacy_calendar_month_baseline_tests;
 #[cfg(test)]
 mod legacy_conditional_baseline_tests;

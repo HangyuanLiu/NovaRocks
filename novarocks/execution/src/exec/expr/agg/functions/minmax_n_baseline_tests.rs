@@ -411,3 +411,36 @@ fn legacy_n_nested_and_binary_single_output_exists_but_original_codec_refuses() 
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[test]
+fn legacy_n_usize_limit_wire_truncation_is_preserved_without_new_overflow_rejection() {
+    for name in ["min_n", "max_n"] {
+        for (limit, expected) in [
+            (1i64 << 32, Vec::<Option<i64>>::new()),
+            (
+                (1i64 << 32) + 1,
+                vec![Some(if name == "min_n" { 1 } else { 3 })],
+            ),
+        ] {
+            let tracker = MemTracker::new_root("legacy-n-wide-limit");
+            let mut source = LegacyState::new(name, DataType::Int64, tracker.clone());
+            source
+                .update(ints(vec![Some(3), Some(1), Some(2)]), limits(limit, 3))
+                .unwrap();
+            assert_eq!(int_output(&mut source), vec![Some(1), Some(2), Some(3)]);
+            let partial = source.output(true).unwrap();
+            let bytes = partial
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0);
+            assert_eq!(&bytes[..4], &(limit as u32).to_le_bytes());
+            let mut destination = LegacyState::new(name, DataType::Int64, tracker.clone());
+            destination.merge(partial).unwrap();
+            assert_eq!(int_output(&mut destination), expected);
+            drop(source);
+            drop(destination);
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+}
