@@ -259,3 +259,7 @@ mod tests {
         assert_eq!(out_arr.value(0), 10);
     }
 }
+
+#[cfg(test)]
+#[path = "any_value_baseline_tests.rs"]
+mod baseline_tests;
