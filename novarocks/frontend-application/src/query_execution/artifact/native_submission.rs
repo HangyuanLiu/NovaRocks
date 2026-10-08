@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use super::{ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
+use super::{FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
 use crate::native::fragment_encoder::frozen::FragmentArtifact;
 use crate::query_execution::assembly::{CteMulticastConsumer, RouterSubmissionEdge};
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
@@ -87,7 +87,6 @@ pub struct NativeSubmissionEncodingView<'a> {
     schedule: &'a SchedulingPlan,
     options: &'a QueryOptions,
     root_fetch: RootFetchMetadata,
-    expected_output: ExpectedOutputSchema,
 }
 
 impl<'a> NativeSubmissionEncodingView<'a> {
@@ -105,7 +104,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         schedule: &'a SchedulingPlan,
         options: &'a QueryOptions,
         root_fetch: RootFetchMetadata,
-        expected_output: ExpectedOutputSchema,
     ) -> Result<Self, DistributedQueryError> {
         validate_keys(&keys, root)?;
         Ok(Self {
@@ -118,7 +116,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             schedule,
             options,
             root_fetch,
-            expected_output,
         })
     }
 
@@ -210,7 +207,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             execution_id: self.execution_id,
             submissions,
             root_fetch: self.root_fetch.clone(),
-            expected_output: self.expected_output.clone(),
         })
     }
 }
@@ -384,7 +380,6 @@ pub struct NativeSubmissionAttachment {
     execution_id: QueryExecutionId,
     submissions: Vec<ValidatedNativeSubmission>,
     root_fetch: RootFetchMetadata,
-    expected_output: ExpectedOutputSchema,
 }
 
 impl NativeSubmissionAttachment {
@@ -392,14 +387,8 @@ impl NativeSubmissionAttachment {
         self.handoff_id == handoff_id && self.execution_id == execution_id
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<ValidatedNativeSubmission>,
-        RootFetchMetadata,
-        ExpectedOutputSchema,
-    ) {
-        (self.submissions, self.root_fetch, self.expected_output)
+    pub(crate) fn into_parts(self) -> (Vec<ValidatedNativeSubmission>, RootFetchMetadata) {
+        (self.submissions, self.root_fetch)
     }
 }
 

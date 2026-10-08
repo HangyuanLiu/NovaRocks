@@ -17,11 +17,9 @@
 
 //! Native task-result transport and submission DTO.
 //!
-//! [`TaskResultTransport`] addresses the root
-//! result by exact [`TaskIdentity`], so the backend can fence the poll against
-//! the exact task, the exact process, and result responsibility before it
-//! touches a buffer, and it carries the packet sequence back so a frontend can
-//! prove that no packet was lost on the way to it.
+//! Task observation reads and the bounded V1 root relay address the exact
+//! task and process frozen by this attempt. Root bodies stay encoded until
+//! their admitted domain owner consumes them.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -29,29 +27,21 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::runtime::exchange::{
-    TypedRootResultDecodeBounds, preflight_typed_root_result_decode,
-};
 use novarocks_execution::task_execution::domain::DomainVersion;
 use novarocks_execution::task_execution::operation::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
-    FinalTaskInfo, MaxWait, OperationOutcome, ResultByteLimit, ResultPacketSequence, TaskIdentity,
-    TaskOperationId,
+    FinalTaskInfo, OperationOutcome, TaskIdentity, TaskOperationId,
 };
 use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
-use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
 use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind},
     coordination::{AttemptFailureClass, RootResultFetchFailure},
 };
 use novarocks_task_codec::operation::{
-    MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, decode_operation_outcome, encode_fetch_dynamic_filters,
-    encode_fetch_task_result, encode_get_final_task_info,
+    decode_operation_outcome, encode_fetch_dynamic_filters, encode_get_final_task_info,
 };
 use novarocks_task_codec::status::decode_final_task_info;
 use novarocks_types::identity::BackendProcessId;
@@ -60,171 +50,6 @@ use crate::runtime_filter::feedback::TaskRuntimeFilterFeedback;
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::Client;
-
-/// Opaque data-plane batch returned by a fragment dispatcher.
-///
-/// The execution-layer `Chunk` remains owned by core. Role crates may route
-/// this value through the query-execution contract but cannot inspect or
-/// manufacture execution batches.
-pub struct FetchedQueryBatch {
-    chunk: Chunk,
-}
-
-impl FetchedQueryBatch {
-    pub fn new(chunk: Chunk) -> Self {
-        Self { chunk }
-    }
-
-    pub fn into_chunk(self) -> Chunk {
-        self.chunk
-    }
-}
-
-/// Borrowed opaque view of the root fetch schema.
-#[derive(Clone, Copy)]
-pub struct ExpectedOutputSchemaView<'a> {
-    schema: &'a ChunkSchemaRef,
-}
-
-impl<'a> ExpectedOutputSchemaView<'a> {
-    pub const fn new(schema: &'a ChunkSchemaRef) -> Self {
-        Self { schema }
-    }
-
-    pub const fn chunk_schema(self) -> &'a ChunkSchemaRef {
-        self.schema
-    }
-}
-
-/// Decode one typed root-result payload into the opaque dispatcher value.
-///
-/// Native transports live in role crates, while Core retains the execution
-/// batch representation and the canonical wire-to-chunk conversion.  This
-/// keeps that conversion available without exposing `Chunk` construction to a
-/// transport owner.
-pub fn decode_fetched_query_batch(
-    payload: &[u8],
-    expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-) -> Result<FetchedQueryBatch, String> {
-    let mut chunks = novarocks_execution::runtime::exchange::decode_root_result_chunks(
-        payload,
-        expected_output_schema.map(|view| view.chunk_schema()),
-    )?;
-    if chunks.len() != 1 {
-        return Err(format!(
-            "typed root result decoded {} chunks, expected 1",
-            chunks.len()
-        ));
-    }
-    Ok(FetchedQueryBatch::new(chunks.remove(0)))
-}
-
-/// Move-only ownership of one validated but not yet decoded root-result packet.
-///
-/// Construction performs the complete metadata-only IPC preflight. Keeping the
-/// payload opaque ensures the transport can return it without allocating an
-/// Arrow `RecordBatch`, while the later result pump can retain the raw bytes,
-/// reserve decode capacity from the trusted bounds, and consume this value
-/// exactly once to decode.
-pub struct RawRootResultPacket {
-    packet_sequence: ResultPacketSequence,
-    payload: Bytes,
-    payload_bytes: u64,
-    decode_bounds: TypedRootResultDecodeBounds,
-}
-
-impl RawRootResultPacket {
-    fn try_new(
-        packet_sequence: ResultPacketSequence,
-        payload: Bytes,
-        payload_limit: ResultByteLimit,
-    ) -> Result<Self, String> {
-        let payload_bytes = u64::try_from(payload.len())
-            .map_err(|_| "root result payload length does not fit u64".to_string())?;
-        let decode_bounds = preflight_typed_root_result_decode(&payload, payload_limit)?;
-        Ok(Self {
-            packet_sequence,
-            payload,
-            payload_bytes,
-            decode_bounds,
-        })
-    }
-
-    pub const fn packet_sequence(&self) -> ResultPacketSequence {
-        self.packet_sequence
-    }
-
-    /// Logical protobuf payload bytes used by result-credit accounting.
-    ///
-    /// The opaque receive buffer may retain transport allocator slack. That
-    /// process overhead remains bounded by the Native message cap and the
-    /// process-wide result-fetch concurrency supervisor; it is not presented
-    /// as exact query-owned Arrow or payload backing.
-    pub const fn payload_bytes(&self) -> u64 {
-        self.payload_bytes
-    }
-
-    pub const fn decode_bounds(&self) -> TypedRootResultDecodeBounds {
-        self.decode_bounds
-    }
-
-    /// Consume the sole raw owner and allocate the decoded Arrow batch.
-    pub fn decode(
-        self,
-        expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-    ) -> Result<FetchedQueryBatch, String> {
-        decode_fetched_query_batch(&self.payload, expected_output_schema)
-    }
-}
-
-/// One answer from the root result data plane.
-///
-/// The end of the stream carries its own packet sequence. That is what lets a
-/// frontend distinguish "the stream ended after
-/// everything I received" from "the stream ended after packets I never saw",
-/// which the backend cannot tell it: it drops each packet as it hands it over.
-#[allow(
-    dead_code,
-    reason = "The production cutover routes the coordinator's result loop onto this face."
-)]
-pub enum RootResultOutcome {
-    /// One result packet.
-    Ready(RawRootResultPacket),
-    /// Nothing available within this poll's wait.
-    NotReady,
-    /// The exact root has revoked output and awaits its control-plane cause.
-    AwaitTerminalControl,
-    /// EOS arrived at this sequence but still needs the frontend's final ACK.
-    EndOfStreamPending { packet_sequence: u64 },
-    /// The stream ended and the backend accepted the final packet ACK.
-    EndOfStream { packet_sequence: u64 },
-    /// The poll was refused, or the root's execution failed.
-    Failed(String),
-}
-
-impl fmt::Debug for RootResultOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ready(packet) => formatter
-                .debug_struct("Ready")
-                .field("packet_sequence", &packet.packet_sequence())
-                .field("payload_bytes", &packet.payload_bytes())
-                .field("decode_bounds", &packet.decode_bounds())
-                .finish_non_exhaustive(),
-            Self::NotReady => formatter.write_str("NotReady"),
-            Self::AwaitTerminalControl => formatter.write_str("AwaitTerminalControl"),
-            Self::EndOfStreamPending { packet_sequence } => formatter
-                .debug_struct("EndOfStreamPending")
-                .field("packet_sequence", packet_sequence)
-                .finish(),
-            Self::EndOfStream { packet_sequence } => formatter
-                .debug_struct("EndOfStream")
-                .field("packet_sequence", packet_sequence)
-                .finish(),
-            Self::Failed(detail) => formatter.debug_tuple("Failed").field(detail).finish(),
-        }
-    }
-}
 
 /// What a final task info read answered.
 ///
@@ -334,24 +159,15 @@ impl fmt::Display for DynamicFilterReadError {
     }
 }
 
-/// The task protocol's three observation reads over the data plane.
+/// The task protocol's terminal-info and dynamic-filter observations.
 ///
-/// All three are addressed by exact [`TaskIdentity`]; none creates a task,
+/// Both are addressed by exact [`TaskIdentity`]; none creates a task,
 /// advances a status, or renews a lease.
 #[allow(
     dead_code,
     reason = "The production cutover routes the coordinator's result loop onto this face."
 )]
 pub trait TaskResultTransport: Send + Sync + 'static {
-    /// Polls the root task's result stream.
-    fn fetch_root_result(
-        &self,
-        root_task: TaskIdentity,
-        max_wait: MaxWait,
-        acknowledged: Option<ResultPacketSequence>,
-        max_result_bytes: ResultByteLimit,
-    ) -> Pin<Box<dyn Future<Output = Result<RootResultOutcome, String>> + Send + 'static>>;
-
     /// Reads one terminal task's bounded final info.
     fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String>;
 
@@ -427,66 +243,6 @@ impl NativeTaskResultTransport {
         })?;
         let address = self.endpoints[&process].to_string();
         Ok((client, address))
-    }
-
-    fn fetch_root_result_for_pump(
-        &self,
-        root_task: TaskIdentity,
-        max_wait: MaxWait,
-        acknowledged: Option<ResultPacketSequence>,
-        max_result_bytes: ResultByteLimit,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<RootResultOutcome, NativeRootResultFetchError>>
-                + Send
-                + 'static,
-        >,
-    > {
-        let route = self
-            .client_of(root_task)
-            .map(|(client, address)| (client.clone(), address))
-            .map_err(NativeRootResultFetchError::contract);
-        let validation = validate_native_result_byte_limit(max_result_bytes)
-            .map_err(NativeRootResultFetchError::contract);
-        let grace = self.grace;
-        let data_runtime = self.data_runtime.clone();
-        Box::pin(async move {
-            let (client, address) = route?;
-            validation?;
-            let _fetch_permit = data_runtime
-                .acquire_result_fetch()
-                .await
-                .map_err(NativeRootResultFetchError::resource_governance)?;
-            let request =
-                encode_fetch_task_result(root_task, max_wait, acknowledged, max_result_bytes);
-            let wait = max_wait.get();
-            let deadline = grace.deadline_for(wait);
-            let expires_at = tokio::time::Instant::now() + deadline;
-            let mut grpc = tokio::time::timeout_at(
-                expires_at,
-                client.grpc_with_channel_error(NativeRpcMethod::FetchTaskResult),
-            )
-            .await
-            .map_err(|_| {
-                NativeRootResultFetchError::infrastructure(format!(
-                    "{address}: root result poll for task {root_task} could not acquire a \
-                         channel within {deadline:?}"
-                ))
-            })?
-            .map_err(|error| NativeRootResultFetchError::infrastructure(error.to_string()))?;
-            let response = tokio::time::timeout_at(expires_at, grpc.fetch_task_result(request))
-                .await
-                .map_err(|_| {
-                    NativeRootResultFetchError::infrastructure(format!(
-                        "{address}: root result poll for task {root_task} did not answer within \
-                         {deadline:?}; it was asked to wait at most {wait:?}"
-                    ))
-                })?
-                .map(tonic::Response::into_inner)
-                .map_err(classify_fetch_task_result_rpc_status)?;
-            classify_root_result_response(&address, response, acknowledged, max_result_bytes)
-                .map_err(NativeRootResultFetchError::contract)
-        })
     }
 }
 
@@ -645,18 +401,6 @@ impl fmt::Display for NativeRootResultFetchError {
 impl std::error::Error for NativeRootResultFetchError {}
 
 impl TaskResultTransport for NativeTaskResultTransport {
-    fn fetch_root_result(
-        &self,
-        root_task: TaskIdentity,
-        max_wait: MaxWait,
-        acknowledged: Option<ResultPacketSequence>,
-        max_result_bytes: ResultByteLimit,
-    ) -> Pin<Box<dyn Future<Output = Result<RootResultOutcome, String>> + Send + 'static>> {
-        let fetch =
-            self.fetch_root_result_for_pump(root_task, max_wait, acknowledged, max_result_bytes);
-        Box::pin(async move { fetch.await.map_err(|error| error.to_string()) })
-    }
-
     fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
         let (client, address) = self.client_of(identity)?;
         let request = encode_get_final_task_info(identity);
@@ -924,155 +668,6 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
     }
 }
 
-fn validate_native_result_byte_limit(limit: ResultByteLimit) -> Result<(), String> {
-    if limit.get() > MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
-        return Err(format!(
-            "root result byte limit {} exceeds the Native payload limit {}",
-            limit.get(),
-            MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
-        ));
-    }
-    Ok(())
-}
-
-fn classify_root_result_response(
-    address: &str,
-    response: novarocks_proto_models::novarocks::FetchResultResponse,
-    acknowledged: Option<ResultPacketSequence>,
-    max_result_bytes: ResultByteLimit,
-) -> Result<RootResultOutcome, String> {
-    validate_result_payload_size(address, response.result_arrow_ipc.len(), max_result_bytes)?;
-    let status = FetchStatus::try_from(response.status).map_err(|_| {
-        format!(
-            "{address}: root result poll returned unknown status {}",
-            response.status
-        )
-    })?;
-    match status {
-        FetchStatus::Ready => {
-            // The sequence orders the whole stream, so a value that is not a
-            // sequence is refused rather than mapped onto one.
-            let packet_sequence = u64::try_from(response.packet_seq).map_err(|_| {
-                format!(
-                    "{address}: root result packet sequence {} is not a sequence",
-                    response.packet_seq
-                )
-            })?;
-            if response.eos {
-                if !response.result_arrow_ipc.is_empty() {
-                    return Err(format!(
-                        "{address}: root result READY end marker carries {} unexpected payload bytes",
-                        response.result_arrow_ipc.len()
-                    ));
-                }
-                return Ok(RootResultOutcome::EndOfStreamPending { packet_sequence });
-            }
-            if response.result_arrow_ipc.is_empty() {
-                return Err(format!("{address}: root result READY carries no payload"));
-            }
-            RawRootResultPacket::try_new(
-                ResultPacketSequence::new(packet_sequence),
-                response.result_arrow_ipc,
-                max_result_bytes,
-            )
-            .map(RootResultOutcome::Ready)
-            .map_err(|error| format!("{address}: {error}"))
-        }
-        FetchStatus::NotReady => {
-            require_empty_root_result_payload(address, "NOT_READY", &response)?;
-            if response.packet_seq != 0 || response.eos {
-                return Err(format!(
-                    "{address}: root result NOT_READY carries terminal fields packet_seq={} eos={}",
-                    response.packet_seq, response.eos
-                ));
-            }
-            Ok(RootResultOutcome::NotReady)
-        }
-        FetchStatus::AwaitTerminalControl => {
-            require_empty_root_result_payload(address, "AWAIT_TERMINAL_CONTROL", &response)?;
-            if response.packet_seq != 0 || response.eos || !response.message.is_empty() {
-                return Err(format!(
-                    "{address}: root result AWAIT_TERMINAL_CONTROL carries payload or terminal facts"
-                ));
-            }
-            Ok(RootResultOutcome::AwaitTerminalControl)
-        }
-        FetchStatus::Error => {
-            require_empty_root_result_payload(address, "ERROR", &response)?;
-            if response.packet_seq != 0 || response.eos {
-                return Err(format!(
-                    "{address}: root result ERROR carries terminal fields packet_seq={} eos={}",
-                    response.packet_seq, response.eos
-                ));
-            }
-            Ok(RootResultOutcome::Failed(response.message))
-        }
-        FetchStatus::Eof => {
-            require_empty_root_result_payload(address, "EOF", &response)?;
-            if !response.eos {
-                return Err(format!(
-                    "{address}: root result EOF is missing its eos marker"
-                ));
-            }
-            let acknowledged = acknowledged.ok_or_else(|| {
-                format!(
-                    "{address}: root result poll answered EOF before any packet acknowledgement"
-                )
-            })?;
-            let packet_sequence = u64::try_from(response.packet_seq).map_err(|_| {
-                format!(
-                    "{address}: root result EOF packet sequence {} is not a sequence",
-                    response.packet_seq
-                )
-            })?;
-            if packet_sequence != acknowledged.get() {
-                return Err(format!(
-                    "{address}: root result EOF sequence {packet_sequence} does not match acknowledged {}",
-                    acknowledged.get()
-                ));
-            }
-            Ok(RootResultOutcome::EndOfStream { packet_sequence })
-        }
-        FetchStatus::ResultStatusUnspecified => Err(format!(
-            "{address}: root result poll returned an unspecified status"
-        )),
-    }
-}
-
-fn require_empty_root_result_payload(
-    address: &str,
-    status: &str,
-    response: &novarocks_proto_models::novarocks::FetchResultResponse,
-) -> Result<(), String> {
-    if response.result_arrow_ipc.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{address}: root result {status} carries {} unexpected payload bytes",
-            response.result_arrow_ipc.len()
-        ))
-    }
-}
-
-fn validate_result_payload_size(
-    address: &str,
-    payload_bytes: usize,
-    limit: ResultByteLimit,
-) -> Result<(), String> {
-    let payload_bytes = u64::try_from(payload_bytes)
-        .map_err(|_| format!("{address}: root result payload length is not representable"))?;
-    if payload_bytes > limit.get() {
-        // Tonic has already applied the process-wide 64 MiB decoded-message
-        // ceiling. This check prevents Arrow decode and enforces the request
-        // credit, but it is not a per-request allocation reserve.
-        return Err(format!(
-            "{address}: root result payload has {payload_bytes} bytes, exceeding the requested limit {}",
-            limit.get()
-        ));
-    }
-    Ok(())
-}
-
 /// Classifies one dynamic filter read failure by type.
 ///
 /// A status that leaves the read unfinished is `Unavailable`, and the next turn
@@ -1095,94 +690,9 @@ fn classify_dynamic_filter_status(address: &str, status: &tonic::Status) -> Dyna
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow::{datatypes::Schema, record_batch::RecordBatch};
-    use bytes::Bytes;
-    use novarocks_execution::{
-        exec::chunk::{Chunk, ChunkSchema},
-        runtime::exchange::encode_chunks,
-        task_execution::{ResultByteLimit, ResultPacketSequence},
-    };
-    use novarocks_proto_models::novarocks::{FetchResultResponse, fetch_result_response::Status};
     use novarocks_query_application::coordination::AttemptFailureClass;
-    use novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
 
-    use super::{
-        NativeRootResultFetchError, RootResultOutcome, classify_fetch_task_result_rpc_status,
-        classify_root_result_response, decode_fetched_query_batch,
-        validate_native_result_byte_limit, validate_result_payload_size,
-    };
-
-    fn typed_empty_result_payload() -> Vec<u8> {
-        let chunk = Chunk::new_with_chunk_schema(
-            RecordBatch::new_empty(Arc::new(Schema::empty())),
-            Arc::new(ChunkSchema::empty()),
-        );
-        encode_chunks(&[chunk], true).expect("encode typed root result")
-    }
-
-    fn ready_response(payload: impl Into<Bytes>) -> FetchResultResponse {
-        FetchResultResponse {
-            status: Status::Ready as i32,
-            result_arrow_ipc: payload.into(),
-            packet_seq: 7,
-            ..FetchResultResponse::default()
-        }
-    }
-
-    #[test]
-    fn opaque_fetch_decode_requires_exactly_one_chunk() {
-        let Err(error) = decode_fetched_query_batch(&[], None) else {
-            panic!("empty payload is not a batch");
-        };
-        assert!(error.contains("greater than zero"), "actual: {error}");
-    }
-
-    #[test]
-    fn ready_response_returns_preflighted_raw_packet_without_arrow_decode() {
-        let payload = typed_empty_result_payload();
-        let limit = ResultByteLimit::new(u64::try_from(payload.len()).unwrap()).unwrap();
-        let outcome =
-            classify_root_result_response("backend", ready_response(payload.clone()), None, limit)
-                .expect("current writer output passes transport preflight");
-        let RootResultOutcome::Ready(packet) = outcome else {
-            panic!("READY data must remain a raw packet");
-        };
-
-        assert_eq!(packet.packet_sequence().get(), 7);
-        assert_eq!(
-            packet.payload_bytes(),
-            u64::try_from(payload.len()).unwrap()
-        );
-        assert!(packet.decode_bounds().decode_operation_upper_bound() > 0);
-    }
-
-    #[test]
-    fn ready_response_rejects_malformed_ipc_during_metadata_preflight() {
-        let malformed = Bytes::from_static(b"not-an-nrx1-packet");
-        let limit = ResultByteLimit::new(u64::try_from(malformed.len()).unwrap()).unwrap();
-        let error =
-            classify_root_result_response("backend", ready_response(malformed), None, limit)
-                .expect_err("malformed READY data must fail before Arrow decode");
-
-        assert!(error.contains("missing NRX1 envelope"), "actual: {error}");
-    }
-
-    #[test]
-    fn raw_packet_is_consumed_by_one_explicit_decode() {
-        let payload = typed_empty_result_payload();
-        let limit = ResultByteLimit::new(u64::try_from(payload.len()).unwrap()).unwrap();
-        let RootResultOutcome::Ready(packet) =
-            classify_root_result_response("backend", ready_response(payload), None, limit)
-                .expect("current writer output passes transport preflight")
-        else {
-            panic!("READY data must remain a raw packet");
-        };
-
-        let batch = packet.decode(None).expect("explicit packet decode");
-        assert_eq!(batch.into_chunk().len(), 0);
-    }
+    use super::{NativeRootResultFetchError, classify_fetch_task_result_rpc_status};
 
     #[test]
     fn query_adapter_classifies_native_transport_failures_without_guessing() {
@@ -1318,98 +828,5 @@ mod tests {
         let status = tonic::Status::new(tonic::Code::ResourceExhausted, "full");
         let detail = classify_fetch_task_result_rpc_status(status).detail;
         assert!(!detail.contains("caused by"), "{detail}");
-    }
-
-    #[test]
-    fn terminal_result_responses_require_empty_payload_and_exact_ack() {
-        let limit = ResultByteLimit::new(1024).unwrap();
-        let mut pending = ready_response(Bytes::from_static(b"unexpected"));
-        pending.eos = true;
-        let error = classify_root_result_response("backend", pending, None, limit)
-            .expect_err("an EOS marker cannot discard a data payload");
-        assert!(error.contains("unexpected payload bytes"), "{error}");
-
-        let acknowledged = super::ResultPacketSequence::new(7);
-        let eof = FetchResultResponse {
-            status: Status::Eof as i32,
-            packet_seq: 8,
-            eos: true,
-            ..FetchResultResponse::default()
-        };
-        let error = classify_root_result_response("backend", eof, Some(acknowledged), limit)
-            .expect_err("EOF must echo the exact acknowledged sequence");
-        assert!(error.contains("does not match acknowledged 7"), "{error}");
-
-        let eof = FetchResultResponse {
-            status: Status::Eof as i32,
-            packet_seq: 7,
-            eos: true,
-            ..FetchResultResponse::default()
-        };
-        let outcome = classify_root_result_response("backend", eof, Some(acknowledged), limit)
-            .expect("exact terminal acknowledgement");
-        assert!(matches!(
-            outcome,
-            RootResultOutcome::EndOfStream { packet_sequence: 7 }
-        ));
-    }
-
-    #[test]
-    fn native_result_limit_must_fit_the_global_decode_envelope() {
-        let limit = ResultByteLimit::new(MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES + 1)
-            .expect("the oversized limit is still positive");
-        assert!(validate_native_result_byte_limit(limit).is_err());
-    }
-
-    #[test]
-    fn response_payload_is_checked_before_arrow_decode() {
-        let limit = ResultByteLimit::new(3).expect("positive limit");
-        let error = validate_result_payload_size("backend", 4, limit)
-            .expect_err("the payload exceeds its request credit");
-        assert!(error.contains("exceeding the requested limit 3"));
-    }
-    #[test]
-    fn terminal_control_wait_is_distinct_and_cannot_carry_payload_or_ack_facts() {
-        let response = FetchResultResponse {
-            status: Status::AwaitTerminalControl as i32,
-            ..Default::default()
-        };
-        assert!(matches!(
-            classify_root_result_response(
-                "be",
-                response.clone(),
-                Some(ResultPacketSequence::new(7)),
-                ResultByteLimit::new(1024).unwrap()
-            )
-            .unwrap(),
-            RootResultOutcome::AwaitTerminalControl
-        ));
-        for bad in [
-            FetchResultResponse {
-                packet_seq: 1,
-                ..response.clone()
-            },
-            FetchResultResponse {
-                eos: true,
-                ..response.clone()
-            },
-            FetchResultResponse {
-                message: "not an originating cause".to_string(),
-                ..response.clone()
-            },
-            FetchResultResponse {
-                result_arrow_ipc: Bytes::from_static(b"payload"),
-                ..response.clone()
-            },
-            FetchResultResponse {
-                status: 99,
-                ..response
-            },
-        ] {
-            assert!(
-                classify_root_result_response("be", bad, None, ResultByteLimit::new(1024).unwrap())
-                    .is_err()
-            );
-        }
     }
 }

@@ -1348,7 +1348,7 @@ impl ProductionManifestAttemptProjection {
                 .map_err(projection_failure)?,
         )
         .map_err(projection_message)?;
-        let (submissions, root_fetch, _expected_output) = task_prepared
+        let (submissions, root_fetch) = task_prepared
             .seal_task_submission(submission)
             .map_err(projection_failure)?
             .into_parts();

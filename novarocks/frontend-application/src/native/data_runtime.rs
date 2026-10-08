@@ -13,15 +13,10 @@ use novarocks_proto_codec::native_rpc::FrontendNativeLane;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio::runtime::Handle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::transport_supervisor::NativeTransportSupervisor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_native_adapter::FrontendNativeTransport;
-
-/// Process-wide root-result I/O concurrency. Long polls are parked async, but
-/// their channels and response buffers still consume finite process capacity.
-const MAX_CONCURRENT_RESULT_FETCHES: usize = 16;
 
 /// Exact peer generation and physical lane. Methods in one manifest lane
 /// share its connections; other lanes and replacement processes cannot alias
@@ -238,7 +233,6 @@ pub(crate) struct FrontendDataRuntime {
     channels: Arc<Mutex<ChannelPools>>,
     dial_gates: Arc<[tokio::sync::Mutex<()>; 4]>,
     task_transport_supervisor: NativeTransportSupervisor,
-    result_fetch_permits: Arc<Semaphore>,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
 }
 
@@ -283,7 +277,6 @@ impl FrontendDataRuntime {
             task_transport_supervisor: NativeTransportSupervisor::from_transport(
                 task_transport_budget,
             )?,
-            result_fetch_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RESULT_FETCHES)),
             connector_blocking_io,
         })
     }
@@ -327,13 +320,6 @@ impl FrontendDataRuntime {
 
     pub(crate) fn task_transport_supervisor(&self) -> &NativeTransportSupervisor {
         &self.task_transport_supervisor
-    }
-
-    pub(crate) async fn acquire_result_fetch(&self) -> Result<OwnedSemaphorePermit, String> {
-        Arc::clone(&self.result_fetch_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| "frontend result-fetch supervisor is closed".to_owned())
     }
 
     pub(crate) fn connector_blocking_io(&self) -> &ConnectorBlockingIoSupervisor {
@@ -566,29 +552,6 @@ mod tests {
             data_runtime.block_on(async { 11_u8 }).expect("block_on"),
             11
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cloned_role_runtime_shares_one_result_fetch_limit() {
-        let runtime = data_runtime(tokio::runtime::Handle::current());
-        let mut permits = Vec::new();
-        for _ in 0..super::MAX_CONCURRENT_RESULT_FETCHES {
-            permits.push(runtime.acquire_result_fetch().await.expect("fetch permit"));
-        }
-
-        let waiting_runtime = runtime.clone();
-        let mut waiting = Box::pin(waiting_runtime.acquire_result_fetch());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
-                .await
-                .is_err(),
-            "a clone must not create a separate result-fetch pool"
-        );
-        permits.pop();
-        let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
-            .await
-            .expect("released process capacity wakes the waiter")
-            .expect("fetch permit after release");
     }
 
     #[test]

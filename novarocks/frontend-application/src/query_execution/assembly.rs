@@ -20,17 +20,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+#[cfg(test)]
 use arrow::array::{ArrayRef, RecordBatchOptions};
+#[cfg(test)]
 use arrow::datatypes::{DataType, Schema};
+#[cfg(test)]
 use arrow::record_batch::RecordBatch;
 
 use crate::query_execution::artifact::FragmentId;
+#[cfg(test)]
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::schedule::SchedulingPlan;
+#[cfg(test)]
 use novarocks_execution::exec::chunk::Chunk;
 use tracing::debug;
 
+#[cfg(test)]
 fn validate_source_domain(
     field: &arrow::datatypes::Field,
     expected: Option<novarocks_types::logical::LogicalType>,
@@ -62,6 +68,7 @@ fn validate_source_domain(
 // Check borrowed facts before metadata retagging can replace their identity.
 // Missing source markers may acquire the declared fact; existing facts may not
 // be reinterpreted. Physical compatibility remains the separate existing check.
+#[cfg(test)]
 fn validate_source_field_tree(
     source: &arrow::datatypes::Field,
     expected: &arrow::datatypes::Field,
@@ -70,6 +77,7 @@ fn validate_source_field_tree(
     validate_source_type_domains(source.data_type(), expected.data_type())
 }
 
+#[cfg(test)]
 fn declared_nested_domain(
     field: &arrow::datatypes::Field,
 ) -> Result<Option<novarocks_types::logical::LogicalType>, String> {
@@ -92,6 +100,7 @@ fn declared_nested_domain(
     })
 }
 
+#[cfg(test)]
 fn validate_source_type_domains(source: &DataType, expected: &DataType) -> Result<(), String> {
     match (source, expected) {
         (DataType::Struct(source), DataType::Struct(expected)) => {
@@ -111,6 +120,7 @@ fn validate_source_type_domains(source: &DataType, expected: &DataType) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_source_cache_tree(
     source: &novarocks_execution::exec::chunk::ChunkFieldSchema,
     expected_domain: Option<novarocks_types::logical::LogicalType>,
@@ -150,6 +160,7 @@ fn validate_source_cache_tree(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
     output_columns: &[PlanOutputColumn],
@@ -160,6 +171,7 @@ pub(crate) fn align_fetch_chunks_to_output_columns(
         .collect()
 }
 
+#[cfg(test)]
 fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
     output_columns: &[PlanOutputColumn],
@@ -272,6 +284,7 @@ fn align_fetch_chunk_to_output_columns(
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
+#[cfg(test)]
 fn align_typed_root_array(
     idx: usize,
     array: ArrayRef,
@@ -321,6 +334,7 @@ fn align_typed_root_array(
 /// ResultBufferSink::accepts_encoded_column explicitly retains Int32 string
 /// dictionaries (Utf8 or LargeUtf8). This is a result-boundary carrier rule;
 /// it neither broadens generic type compatibility nor hydrates the column.
+#[cfg(test)]
 fn result_string_dictionary_carrier(expected: &DataType, actual: &DataType) -> bool {
     match (expected, actual) {
         (DataType::Utf8, DataType::Dictionary(key, value)) => {
@@ -334,6 +348,7 @@ fn result_string_dictionary_carrier(expected: &DataType, actual: &DataType) -> b
     }
 }
 
+#[cfg(test)]
 fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType) -> bool {
     matches!(
         (expected, actual),
@@ -760,6 +775,7 @@ mod tests {
 
     use arrow::array::{Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    #[cfg(test)]
     use arrow::record_batch::RecordBatch;
     use novarocks_spi::connector::ConnectorWriteRouteId;
 

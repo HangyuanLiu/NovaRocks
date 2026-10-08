@@ -45,23 +45,26 @@ use std::sync::Arc;
 use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
 use sha2::{Digest, Sha256};
 
-use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::runtime_filter_view::RuntimeFilterDeploymentFactsView;
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+#[cfg(test)]
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
+#[cfg(test)]
 use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 #[cfg(test)]
 use novarocks_types::QueryId;
-use novarocks_types::{BackendProcessId, SlotId, UniqueId};
+#[cfg(test)]
+use novarocks_types::SlotId;
+use novarocks_types::{BackendProcessId, UniqueId};
 
 pub type FragmentId = u32;
 
@@ -1165,11 +1168,10 @@ impl TaskExecutionPreparedQuery {
                 "native submission attachment does not belong to this task execution handoff",
             ));
         }
-        let (submissions, root_fetch, expected_output) = attachment.into_parts();
+        let (submissions, root_fetch) = attachment.into_parts();
         Ok(TaskExecutionSubmission {
             submissions,
             root_fetch,
-            expected_output,
         })
     }
 }
@@ -1184,18 +1186,11 @@ impl TaskExecutionPreparedQuery {
 pub struct TaskExecutionSubmission {
     submissions: Vec<ValidatedNativeSubmission>,
     root_fetch: RootFetchMetadata,
-    expected_output: ExpectedOutputSchema,
 }
 
 impl TaskExecutionSubmission {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<ValidatedNativeSubmission>,
-        RootFetchMetadata,
-        ExpectedOutputSchema,
-    ) {
-        (self.submissions, self.root_fetch, self.expected_output)
+    pub(crate) fn into_parts(self) -> (Vec<ValidatedNativeSubmission>, RootFetchMetadata) {
+        (self.submissions, self.root_fetch)
     }
 }
 
@@ -1756,25 +1751,20 @@ impl RootFetchMetadata {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
-pub struct ExpectedOutputSchema {
+struct ExpectedOutputSchema {
     output_columns: Vec<PlanOutputColumn>,
     chunk_schema: ChunkSchemaRef,
 }
 
+#[cfg(test)]
 impl ExpectedOutputSchema {
-    pub fn fetch_view(&self) -> ExpectedOutputSchemaView<'_> {
-        ExpectedOutputSchemaView::new(&self.chunk_schema)
-    }
-
+    #[cfg(test)]
     pub fn into_query_result(
         self,
-        batches: Vec<FetchedQueryBatch>,
+        chunks: Vec<novarocks_execution::exec::chunk::Chunk>,
     ) -> Result<QueryResult, DistributedQueryError> {
-        let chunks = batches
-            .into_iter()
-            .map(FetchedQueryBatch::into_chunk)
-            .collect();
         let chunks = crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
             chunks,
             &self.output_columns,
@@ -1841,7 +1831,7 @@ fn native_submission_encoding_view<'a>(
         finst_id: schedule.root_finst_id,
         uses_result_buffer: plan_root.role().uses_result_buffer(),
     };
-    let expected_output = build_expected_output_schema(plan_root.output_columns())?;
+    validate_root_output_columns(plan_root.output_columns())?;
     NativeSubmissionEncodingView::new(
         handoff_id,
         execution_id,
@@ -1852,14 +1842,22 @@ fn native_submission_encoding_view<'a>(
         schedule,
         options,
         root_fetch,
-        expected_output,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+fn validate_root_output_columns(outputs: &[PlanOutputColumn]) -> Result<(), DistributedQueryError> {
+    u32::try_from(outputs.len()).map_err(|_| contract_error("too many root output columns"))?;
+    for output in outputs {
+        output.validate_domain().map_err(contract_error)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn build_expected_output_schema(
     output_columns: &[PlanOutputColumn],
 ) -> Result<ExpectedOutputSchema, DistributedQueryError> {
+    validate_root_output_columns(output_columns)?;
     let output_columns = output_columns.to_vec();
     let chunk_schema = if output_columns.is_empty() {
         Arc::new(ChunkSchema::empty())
@@ -1891,6 +1889,17 @@ fn build_expected_output_schema(
 
 #[cfg(test)]
 mod tests {
+    fn test_decode_root_chunk(
+        payload: &[u8],
+        schema: Option<&novarocks_execution::exec::chunk::ChunkSchemaRef>,
+    ) -> Result<novarocks_execution::exec::chunk::Chunk, String> {
+        let mut chunks =
+            novarocks_execution::runtime::exchange::decode_root_result_chunks(payload, schema)?;
+        if chunks.len() != 1 {
+            return Err("test payload must contain exactly one chunk".into());
+        }
+        Ok(chunks.remove(0))
+    }
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -2192,14 +2201,11 @@ mod tests {
                         .logical_type(),
                     marker
                 );
-                let decoded = crate::native::fragment_transport::decode_fetched_query_batch(
-                    &payload,
-                    Some(expected.fetch_view()),
-                )
-                .unwrap();
+                let decoded =
+                    test_decode_root_chunk(&payload, Some(&expected.chunk_schema)).unwrap();
                 let aligned =
                     crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
-                        vec![decoded.into_chunk()],
+                        vec![decoded],
                         &outputs,
                     )
                     .unwrap();
@@ -2219,12 +2225,10 @@ mod tests {
                 );
                 // An independently wire-derived cache may be empty. The exact
                 // output domain supplies the missing fact without trusting a name.
-                let wire_cached =
-                    crate::native::fragment_transport::decode_fetched_query_batch(&payload, None)
-                        .unwrap();
+                let wire_cached = test_decode_root_chunk(&payload, None).unwrap();
                 let rebuilt =
                     crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
-                        vec![wire_cached.into_chunk()],
+                        vec![wire_cached],
                         &outputs,
                     )
                     .unwrap();
@@ -2234,11 +2238,8 @@ mod tests {
                         .logical_type(),
                     marker
                 );
-                let decoded = crate::native::fragment_transport::decode_fetched_query_batch(
-                    &payload,
-                    Some(expected.fetch_view()),
-                )
-                .unwrap();
+                let decoded =
+                    test_decode_root_chunk(&payload, Some(&expected.chunk_schema)).unwrap();
                 let result = expected.into_query_result(vec![decoded]).unwrap();
                 assert_eq!(result.columns[0].logical_type(), logical.as_ref());
                 assert_eq!(result.batches[0].schema().field(0).name(), "declared_value");
@@ -2372,12 +2373,9 @@ mod tests {
                     },
                 ];
                 let expected = super::build_expected_output_schema(&outputs).unwrap();
-                let fetched = crate::native::fragment_transport::decode_fetched_query_batch(
-                    &payload,
-                    Some(expected.fetch_view()),
-                )
-                .unwrap();
-                let chunk = fetched.into_chunk();
+                let fetched =
+                    test_decode_root_chunk(&payload, Some(&expected.chunk_schema)).unwrap();
+                let chunk = fetched;
                 let original = Arc::clone(chunk.batch.column(0));
                 let backing = original.to_data();
                 let aligned =
@@ -2404,11 +2402,7 @@ mod tests {
                         .logical_type(),
                     marker
                 );
-                let result = expected
-                    .into_query_result(vec![
-                        crate::native::fragment_transport::FetchedQueryBatch::new(aligned),
-                    ])
-                    .unwrap();
+                let result = expected.into_query_result(vec![aligned]).unwrap();
                 assert_eq!(result.columns[0].data_type(), &DataType::Utf8);
                 assert_eq!(
                     result.columns[0].logical_type(),

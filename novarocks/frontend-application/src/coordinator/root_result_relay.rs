@@ -469,7 +469,7 @@ mod tests {
         let RelayedRootAnswer::Data(delivery) = next(&mut relay).await else {
             panic!("data");
         };
-        let mut polls = Some(RootResultPolls::Relayed(relay));
+        let mut polls = Some(RootResultPolls(relay));
         let mut reader = Some(port.clone() as Arc<dyn BoundedRootReadPort>);
         close_failed_root_reads(&mut reader, &mut polls, root);
         assert!(port.sealed.load(Ordering::Acquire));

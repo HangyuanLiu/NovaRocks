@@ -39,7 +39,6 @@ use novarocks_spi::connector::{
     MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
 };
 
-use crate::native::fragment_transport::FetchedQueryBatch;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_native_adapter::root_cow_selection_codec::{
     COW_SELECTION_MAX_RECORD_BYTES, CowSelectionCodecError, CowSelectionRecordHeader,
@@ -325,12 +324,6 @@ impl BoundedRowMutationMatchCollector {
         Ok(())
     }
 
-    /// Core owns the opaque native fetched batch.  The coordinator can use
-    /// this method without exposing or manufacturing execution-layer chunks.
-    pub fn push_fetched(&mut self, batch: FetchedQueryBatch) -> Result<(), ConnectorError> {
-        self.push(batch.into_chunk().batch)
-    }
-
     pub fn finish(self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
         self.check_control()?;
         let schema = self.schema.ok_or_else(|| {
@@ -535,15 +528,6 @@ impl RelayedCowSelectionCollector {
         })
     }
 
-    pub fn push_decoded(&mut self, batch: FetchedQueryBatch) -> Result<usize, ConnectorError> {
-        let input = batch.into_chunk().batch;
-        self.collector.check_next_batch(input.num_rows() as u64)?;
-        let batch = cast_to_signed_selection(&self.schema, &input).map_err(invalid_match)?;
-        let rows = batch.num_rows();
-        self.collector.push(batch)?;
-        Ok(rows)
-    }
-
     pub fn check_end(&self, output_rows: u64) -> Result<(), ConnectorError> {
         self.assembly.finish().map_err(invalid_match)?;
         if self.collector.row_count() != output_rows {
@@ -690,12 +674,6 @@ impl CowMatchRootConsumer {
         consumer.collector.collector.retention = Some(guard.clone());
         consumer.collector.retention = Some(guard);
         Ok(consumer)
-    }
-
-    pub(crate) fn push_decoded(&mut self, batch: FetchedQueryBatch) -> Result<usize, String> {
-        self.collector
-            .push_decoded(batch)
-            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn push_body(&mut self, body: &[u8]) -> Result<(), String> {

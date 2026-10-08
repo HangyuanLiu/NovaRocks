@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 use super::internal_result::{InternalDomainSlot, InternalDomainState};
 use super::root_result_relay::{RelayedRootAnswer, RelayedRootPolls};
 use crate::native::fragment_transport::{
-    FinalTaskInfoRead, NativeTaskResultTransport, RootResultOutcome, TaskReadGrace,
-    TaskResultTransport,
+    FinalTaskInfoRead, NativeTaskResultTransport, TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
     RuntimeFilterDeploymentReadyDistributedQuery, ValidatedNativeSubmission,
@@ -99,12 +98,8 @@ use crate::task_execution::round::{TaskRound, TurnReport};
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
-    AbortCause, FinalTaskInfo, MaxWait, OperationKind, ResultByteLimit, ResultPacketSequence,
-    TaskIdentity, TaskState, TerminationDetail,
+    AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity, TaskState, TerminationDetail,
 };
-
-#[cfg(test)]
-const TEST_RESULT_FETCH_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> Result<QueryId, DistributedQueryError>;
@@ -881,7 +876,7 @@ impl FrontendDistributedQueryCoordinator {
             let view = prepared.native_submission_view()?;
             encode_native_submission(&view).map_err(failed)?
         };
-        let (submissions, root_fetch, expected_output) = prepared
+        let (submissions, root_fetch) = prepared
             .seal_task_submission(submission_attachment)?
             .into_parts();
         if !root_fetch.uses_result_buffer() {
@@ -1160,18 +1155,12 @@ impl FrontendDistributedQueryCoordinator {
         // prove a replacement, taken from the task protocol's own establish
         // cap rather than a second number invented here.
         let establish_wait = MaxWait::default_for(OperationKind::UpdateQueryContext).get();
-        let mut batches = Vec::new();
         // Recorded rather than inferred, exactly as the old path recorded it: a
         // write commits on the strength of this fact.
         let mut observed_result_eof = false;
         let mut last_root_poll = RootResultPoll::default();
         let mut root_batch_count = 0_u64;
         let mut root_row_count = 0_u64;
-        let mut cow_selection = None;
-        // Taken before the loop because the polls run beside it: the schema
-        // is shared, immutable and only read, while `expected_output` itself
-        // is consumed by this attempt's answer.
-        let root_output_schema = Arc::clone(expected_output.fetch_view().chunk_schema());
         let mut root_result_polls: Option<RootResultPolls> = None;
         let mut wait_witness = TaskRoundWaitWitness::new(
             task_round_wait_facts(
@@ -1228,7 +1217,7 @@ impl FrontendDistributedQueryCoordinator {
                 let waiting_on = task_round_wait_facts(
                     &round,
                     root_task,
-                    batches.len(),
+                    usize::try_from(root_batch_count).unwrap_or(usize::MAX),
                     last_root_poll,
                     write_completion.as_mut(),
                 );
@@ -1350,7 +1339,7 @@ impl FrontendDistributedQueryCoordinator {
                 let waiting_on = task_round_wait_facts(
                     &round,
                     root_task,
-                    batches.len(),
+                    usize::try_from(root_batch_count).unwrap_or(usize::MAX),
                     last_root_poll,
                     write_completion.as_mut(),
                 );
@@ -1448,9 +1437,9 @@ impl FrontendDistributedQueryCoordinator {
                 } else if let Some(end) = domain.value().end() {
                     relayed_end = Some(end);
                     root_row_count = end.output_rows;
-                    cpu_answer = Some(RootPollAnswer::Legacy(Ok(RootResultOutcome::EndOfStream {
+                    cpu_answer = Some(RootPollAnswer::Control(RootPollControl::EndOfStream {
                         packet_sequence: end.sequence.get() - 1,
-                    })));
+                    }));
                 }
                 internal_domain = Some(domain);
             }
@@ -1514,7 +1503,7 @@ impl FrontendDistributedQueryCoordinator {
                 }
             }) {
                 let answer = match answer {
-                    RootPollAnswer::Legacy(answer) => answer,
+                    RootPollAnswer::Control(answer) => answer,
                     RootPollAnswer::Relayed(RelayedRootAnswer::Data(reply)) => {
                         let input = internal_domain
                             .take()
@@ -1601,39 +1590,17 @@ impl FrontendDistributedQueryCoordinator {
                             );
                             continue;
                         }
-                        let checked = if let Some(decoder) = statistics_decoder.as_ref() {
-                            decoder.check_relay_end(end.output_rows)
-                        } else if let Some(decoder) = write_decoder.as_ref() {
-                            decoder.check_relay_end(end.output_rows)
-                        } else if let Some(consumer) = cow_match.as_ref() {
-                            consumer.check_end(end.output_rows)
-                        } else {
-                            Ok(())
-                        };
-                        if let Err(error) = checked {
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                error,
-                            ));
-                        }
                         relayed_end = Some(end);
                         root_row_count = end.output_rows;
-                        Ok(RootResultOutcome::EndOfStream {
+                        RootPollControl::EndOfStream {
                             packet_sequence: end.sequence.get() - 1,
-                        })
+                        }
                     }
                     RootPollAnswer::Relayed(RelayedRootAnswer::NotReady) => {
-                        Ok(RootResultOutcome::NotReady)
+                        RootPollControl::NotReady
                     }
                     RootPollAnswer::Relayed(RelayedRootAnswer::AwaitTerminalControl) => {
-                        Ok(RootResultOutcome::AwaitTerminalControl)
+                        RootPollControl::AwaitTerminalControl
                     }
                     RootPollAnswer::Relayed(RelayedRootAnswer::FetchFailure(error)) => {
                         use novarocks_query_application::coordination::AttemptFailureClass as C;
@@ -1670,169 +1637,7 @@ impl FrontendDistributedQueryCoordinator {
                     }
                 };
                 match answer {
-                    Ok(RootResultOutcome::Ready(packet)) => {
-                        let packet_sequence = packet.packet_sequence().get();
-                        if let Err(error) = round.consume_root_result_packet(packet_sequence, false)
-                        {
-                            emit_distributed_write_phase_marker(
-                                intent,
-                                execution_id,
-                                "root_failure",
-                                execution_started,
-                                Some((root_batch_count, root_row_count)),
-                            );
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                format!("root result packet was refused: {error}"),
-                            ));
-                        }
-                        let batch = match packet.decode(Some(
-                            crate::native::fragment_transport::ExpectedOutputSchemaView::new(
-                                &root_output_schema,
-                            ),
-                        )) {
-                            Ok(batch) => batch,
-                            Err(error) => {
-                                break Err(self.fail_task_round_with_root_reader(&mut relayed_reader, &mut root_result_polls, root_task,
-                                    query_id,
-                                    &mut round,
-                                    &split_delivery,
-                                    classification,
-                                    QueryFailureCause::RemoteTransportObservation,
-                                    format!(
-                                        "root result packet for task {root_task} decode failed: {error}"
-                                    ),
-                                ));
-                            }
-                        };
-                        root_batch_count = root_batch_count.saturating_add(1);
-                        let mut batch_rows = 0;
-                        if let Some(decoder) = statistics_decoder.as_mut() {
-                            let chunk = batch.into_chunk();
-                            batch_rows = chunk.len();
-                            if let Err(error) = decoder.apply_chunk(&chunk) {
-                                emit_distributed_write_phase_marker(
-                                    intent,
-                                    execution_id,
-                                    "root_failure",
-                                    execution_started,
-                                    Some((root_batch_count, root_row_count)),
-                                );
-                                break Err(self.fail_task_round_with_root_reader(
-                                    &mut relayed_reader,
-                                    &mut root_result_polls,
-                                    root_task,
-                                    query_id,
-                                    &mut round,
-                                    &split_delivery,
-                                    classification,
-                                    QueryFailureCause::FrontendExecution,
-                                    error,
-                                ));
-                            }
-                        } else if let Some(decoder) = write_decoder.as_mut() {
-                            let chunk = batch.into_chunk();
-                            batch_rows = chunk.len();
-                            if let Err(error) = decoder.apply_chunk(&chunk) {
-                                emit_distributed_write_phase_marker(
-                                    intent,
-                                    execution_id,
-                                    "root_failure",
-                                    execution_started,
-                                    Some((root_batch_count, root_row_count)),
-                                );
-                                break Err(self.fail_task_round_with_root_reader(
-                                    &mut relayed_reader,
-                                    &mut root_result_polls,
-                                    root_task,
-                                    query_id,
-                                    &mut round,
-                                    &split_delivery,
-                                    classification,
-                                    QueryFailureCause::FrontendExecution,
-                                    error,
-                                ));
-                            }
-                        } else if let Some(consumer) = cow_match.as_mut() {
-                            batch_rows = match consumer.push_decoded(batch) {
-                                Ok(rows) => rows,
-                                Err(error) => {
-                                    break Err(self.fail_task_round_with_root_reader(
-                                        &mut relayed_reader,
-                                        &mut root_result_polls,
-                                        root_task,
-                                        query_id,
-                                        &mut round,
-                                        &split_delivery,
-                                        classification,
-                                        QueryFailureCause::FrontendExecution,
-                                        error,
-                                    ));
-                                }
-                            };
-                        } else {
-                            batches.push(batch);
-                        }
-                        root_row_count = root_row_count
-                            .saturating_add(u64::try_from(batch_rows).unwrap_or(u64::MAX));
-                        if root_batch_count == 1 {
-                            emit_distributed_write_phase_marker(
-                                intent,
-                                execution_id,
-                                "root_first_packet",
-                                execution_started,
-                                Some((root_batch_count, root_row_count)),
-                            );
-                        }
-                        if let Err(error) = root_result_polls
-                            .as_ref()
-                            .expect("a root result answer requires its poll owner")
-                            .acknowledge(packet_sequence)
-                        {
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                error,
-                            ));
-                        }
-                        last_root_poll = RootResultPoll::Packet(packet_sequence);
-                        moved = true;
-                    }
-                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
-                        if let Err(error) = root_result_polls
-                            .as_ref()
-                            .expect("a root result answer requires its poll owner")
-                            .acknowledge(packet_sequence)
-                        {
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                error,
-                            ));
-                        }
-                        last_root_poll = RootResultPoll::Packet(packet_sequence);
-                        moved = true;
-                    }
-                    Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
+                    RootPollControl::EndOfStream { packet_sequence } => {
                         let required_terminals = if let Some(tracker) = write_completion.as_ref() {
                             tracker.writers().copied().collect::<Vec<_>>()
                         } else if intent == DistributedQueryIntent::Statistics {
@@ -1872,68 +1677,6 @@ impl FrontendDistributedQueryCoordinator {
                                 format!("root result end of stream was refused: {error}"),
                             ));
                         }
-                        if let Some(decoder) = statistics_decoder.as_mut()
-                            && let Err(error) = decoder.observe_root_eof()
-                        {
-                            emit_distributed_write_phase_marker(
-                                intent,
-                                execution_id,
-                                "root_failure",
-                                execution_started,
-                                Some((root_batch_count, root_row_count)),
-                            );
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                error,
-                            ));
-                        }
-                        if let Some(decoder) = write_decoder.as_mut()
-                            && let Err(error) = decoder.observe_root_eof()
-                        {
-                            emit_distributed_write_phase_marker(
-                                intent,
-                                execution_id,
-                                "root_failure",
-                                execution_started,
-                                Some((root_batch_count, root_row_count)),
-                            );
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                error,
-                            ));
-                        }
-                        if let Some(consumer) = cow_match.take() {
-                            match consumer.finish() {
-                                Ok(selection) => cow_selection = Some(selection),
-                                Err(error) => {
-                                    break Err(self.fail_task_round_with_root_reader(
-                                        &mut relayed_reader,
-                                        &mut root_result_polls,
-                                        root_task,
-                                        query_id,
-                                        &mut round,
-                                        &split_delivery,
-                                        classification,
-                                        QueryFailureCause::FrontendExecution,
-                                        error,
-                                    ));
-                                }
-                            }
-                        }
                         emit_distributed_write_phase_marker(
                             intent,
                             execution_id,
@@ -1945,7 +1688,7 @@ impl FrontendDistributedQueryCoordinator {
                         last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
                         moved = true;
                     }
-                    Ok(RootResultOutcome::AwaitTerminalControl) => {
+                    RootPollControl::AwaitTerminalControl => {
                         if let Err(error) = suspend_root_result_for_terminal_control(
                             &mut round,
                             root_task,
@@ -1968,7 +1711,7 @@ impl FrontendDistributedQueryCoordinator {
                         last_root_poll = RootResultPoll::AwaitTerminalControl;
                         moved = true;
                     }
-                    Ok(RootResultOutcome::NotReady) => {
+                    RootPollControl::NotReady => {
                         // Deliberately not progress. The poller is already
                         // asking again, so a turn that claimed this moved
                         // something would keep the loop spinning through
@@ -1976,56 +1719,6 @@ impl FrontendDistributedQueryCoordinator {
                         // poller, an acknowledgement or a status event wakes
                         // it.
                         last_root_poll = RootResultPoll::NotReady;
-                    }
-                    Ok(RootResultOutcome::Failed(detail)) => {
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "root_failure",
-                            execution_started,
-                            Some((root_batch_count, root_row_count)),
-                        );
-                        // A refused or failed poll is also how a read ends
-                        // when the task it names has already gone. If this
-                        // attempt has a failure of its own, that failure is
-                        // the cause and this answer is the reaction to it, so
-                        // it is the one reported.
-                        let detail = round.failure_cause().map_or(detail, |cause| {
-                            format!("task execution terminated: {cause:?}")
-                        });
-                        break Err(self.fail_task_round_with_root_reader(
-                            &mut relayed_reader,
-                            &mut root_result_polls,
-                            root_task,
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            QueryFailureCause::BackendLocalFailure,
-                            detail,
-                        ));
-                    }
-                    Err(detail) => {
-                        let (cause, detail) = round.failure_cause().map_or(
-                            (QueryFailureCause::RemoteTransportObservation, detail),
-                            |task_failure| {
-                                (
-                                    QueryFailureCause::BackendLocalFailure,
-                                    format!("task execution terminated: {task_failure:?}"),
-                                )
-                            },
-                        );
-                        break Err(self.fail_task_round_with_root_reader(
-                            &mut relayed_reader,
-                            &mut root_result_polls,
-                            root_task,
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            cause,
-                            detail,
-                        ));
                     }
                 }
             }
@@ -2035,7 +1728,7 @@ impl FrontendDistributedQueryCoordinator {
                 task_round_wait_facts(
                     &round,
                     root_task,
-                    batches.len(),
+                    usize::try_from(root_batch_count).unwrap_or(usize::MAX),
                     last_root_poll,
                     write_completion.as_mut(),
                 ),
@@ -2241,25 +1934,23 @@ impl FrontendDistributedQueryCoordinator {
                     execution_started,
                     None,
                 );
-                let prepared = match internal_domain.take() {
-                    Some(domain) => domain.hand_off(|domain, _| domain.into_write()),
-                    None => write_decoder
-                        .take()
-                        .ok_or_else(|| {
-                            "distributed write execution lost its Root decoder".to_owned()
-                        })
-                        .and_then(|decoder| decoder.finish()),
-                }
-                .map_err(|error| {
-                    emit_distributed_write_phase_marker(
-                        intent,
-                        execution_id,
-                        "root_failure",
-                        execution_started,
-                        Some((root_batch_count, root_row_count)),
-                    );
-                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-                })?;
+                let prepared = internal_domain
+                    .take()
+                    .ok_or_else(|| "distributed write lost its admitted Internal domain".to_owned())
+                    .and_then(|domain| domain.hand_off(|domain, _| domain.into_write()))
+                    .map_err(|error| {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_failure",
+                            execution_started,
+                            Some((root_batch_count, root_row_count)),
+                        );
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            error,
+                        )
+                    })?;
                 emit_distributed_write_phase_marker(
                     intent,
                     execution_id,
@@ -2396,26 +2087,16 @@ impl FrontendDistributedQueryCoordinator {
         }
 
         let outcome = (|| match intent {
-            DistributedQueryIntent::CowMatch => {
-                if !batches.is_empty() {
-                    return Err(failed("COW match retained unbounded result batches"));
-                }
-                if let Some(domain) = internal_domain.take() {
-                    cow_selection = Some(
-                        domain
-                            .hand_off(|domain, _| domain.into_cow())
-                            .map_err(failed)?,
-                    );
-                }
-                completion.cow_match(
-                    cow_selection
-                        .take()
-                        .ok_or_else(|| failed("COW match lost its validated selection"))?,
-                )
-            }
-            DistributedQueryIntent::Result => {
-                completion.result(expected_output.into_query_result(batches)?)
-            }
+            DistributedQueryIntent::CowMatch => completion.cow_match(
+                internal_domain
+                    .take()
+                    .ok_or_else(|| failed("COW match lost its admitted Internal domain"))?
+                    .hand_off(|domain, _| domain.into_cow())
+                    .map_err(failed)?,
+            ),
+            DistributedQueryIntent::Result => Err(failed(
+                "generic row results require the admitted client relay owner",
+            )),
             DistributedQueryIntent::Write => {
                 let session = write_stack_session.ok_or_else(|| {
                     DistributedQueryError::new(
@@ -2432,16 +2113,10 @@ impl FrontendDistributedQueryCoordinator {
                 completion.write_session_outcome(session, prepared_set)
             }
             DistributedQueryIntent::Profile => {
-                let output_rows = match &delivery {
-                    ProductionRootDelivery::Relayed { .. } => {
-                        if !batches.is_empty() || relayed_end.is_none() {
-                            return Err(failed(
-                                "CountOnly profile retained row batches or lost its End",
-                            ));
-                        }
-                        root_row_count
-                    }
-                };
+                if relayed_end.is_none() {
+                    return Err(failed("CountOnly profile lost its End"));
+                }
+                let output_rows = root_row_count;
                 let mut builder = ProfileTerminalBuilder::new();
                 let graph = round.execution().graph();
                 for info in &final_task_info.collected {
@@ -2489,26 +2164,13 @@ impl FrontendDistributedQueryCoordinator {
                 if let Some(error) = statistics_all_success_error(&round) {
                     return Err(error);
                 }
-                if let Some(domain) = internal_domain.take() {
-                    return completion.statistics(
-                        domain
-                            .hand_off(|domain, _| domain.into_statistics())
-                            .map_err(failed)?,
-                    );
-                }
-                let mut decoder = statistics_decoder.take().ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "statistics execution lost its Root decoder",
-                    )
-                })?;
-                decoder.observe_execution_success().map_err(|error| {
-                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-                })?;
-                let artifacts = decoder.finish().map_err(|error| {
-                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-                })?;
-                completion.statistics(artifacts)
+                completion.statistics(
+                    internal_domain
+                        .take()
+                        .ok_or_else(|| failed("statistics lost its admitted Internal domain"))?
+                        .hand_off(|domain, _| domain.into_statistics())
+                        .map_err(failed)?,
+                )
             }
         })();
         if let Err(error) = &outcome {
@@ -3178,16 +2840,12 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        QueryIdSource, ResultByteLimit, ResultPacketSequence, StatisticsTaskCompletionFact,
-        TEST_RESULT_FETCH_BYTE_LIMIT, UniqueQueryIdSource, distributed_write_phase_marker,
-        fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
-        statistics_all_success_failure_message,
+        QueryIdSource, StatisticsTaskCompletionFact, UniqueQueryIdSource,
+        distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
+        pre_ready_topology_validation_error, statistics_all_success_failure_message,
     };
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
-    };
-    use crate::native::fragment_transport::{
-        DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, RootResultOutcome,
     };
     use crate::query_execution::completion::{
         LogicalQueryReservation, PreReadyRetryBoundary, PreparedDistributedAttempt,
@@ -3678,66 +3336,141 @@ mod tests {
         );
     }
 
-    /// A root result transport whose every poll answers only when this test
-    /// says so, so that "a poll is in flight" is a state the test holds
-    /// rather than one it races.
+    /// Holds each real V1 read until the test releases it. The coordinator
+    /// must keep turning while this transport owner has not answered.
     struct ScriptedRootResult {
-        /// One answer per poll, in the order they are given.
-        answers: Mutex<std::collections::VecDeque<RootResultOutcome>>,
-        /// Received once per poll before it answers.
+        answers: Mutex<
+            std::collections::VecDeque<novarocks_execution_contract::root_result::RootReadOutcome>,
+        >,
         releases: Mutex<std::sync::mpsc::Receiver<()>>,
         polls: AtomicUsize,
-        acknowledgements: Mutex<Vec<Option<ResultPacketSequence>>>,
+        acknowledgements: Mutex<Vec<u64>>,
     }
-
-    impl super::TaskResultTransport for ScriptedRootResult {
-        fn fetch_root_result(
+    impl novarocks_query_application::api::BoundedRootReadPort for ScriptedRootResult {
+        fn read(
             &self,
-            _root_task: TaskIdentity,
-            _max_wait: MaxWait,
-            acknowledged: Option<ResultPacketSequence>,
-            _max_result_bytes: ResultByteLimit,
+            request: novarocks_execution_contract::root_result::RootResultRead,
+            window: novarocks_workload_control::ResultWindowAlias,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<RootResultOutcome, String>>
-                    + Send
-                    + 'static,
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_query_application::api::RetainedRootReply,
+                            novarocks_query_application::coordination::RootResultFetchFailure,
+                        >,
+                    > + Send,
             >,
         > {
             self.polls.fetch_add(1, Ordering::SeqCst);
             self.acknowledgements
                 .lock()
-                .expect("scripted acknowledgement lock")
-                .push(acknowledged);
+                .unwrap()
+                .push(request.consumed());
             let answer = self
                 .releases
                 .lock()
-                .expect("scripted release lock")
+                .unwrap()
                 .recv()
                 .map_err(|_| "the test stopped releasing polls".to_owned())
                 .and_then(|()| {
                     self.answers
                         .lock()
-                        .expect("scripted answer lock")
+                        .unwrap()
                         .pop_front()
                         .ok_or_else(|| "the script ran out of answers".to_owned())
                 });
-            Box::pin(async move { answer })
+            Box::pin(async move {
+                let result = answer.and_then(|outcome| {
+                    novarocks_query_application::api::RetainedRootReply::try_new(
+                        novarocks_execution_contract::root_result::RootResultReply {
+                            root_task: request.root_task(),
+                            profile: request.profile(),
+                            kind: request.kind(),
+                            accepted_consumed: request.consumed(),
+                            outcome,
+                        },
+                        window,
+                        1024,
+                    )
+                    .map_err(|error| error.to_string())
+                });
+                result.map_err(|error| novarocks_query_application::coordination::RootResultFetchFailure::new(
+                    novarocks_query_application::coordination::AttemptFailureClass::ContractViolation,
+                    novarocks_query_application::api::QueryExecutionError::new(
+                        novarocks_query_application::api::QueryExecutionErrorKind::InvalidRequest, error,
+                    ),
+                ))
+            })
         }
-
-        fn final_task_info(&self, _identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
-            Err("this transport answers only root result polls".to_owned())
-        }
-
-        fn dynamic_filters(
+        fn seal(
             &self,
-            _identity: TaskIdentity,
-            _acknowledged: Option<DomainVersion>,
-        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
-            Err(DynamicFilterReadError::Refused(
-                "this transport answers only root result polls".to_owned(),
-            ))
+            _proof: novarocks_execution_contract::root_lifetime::RootReadSealed,
+        ) -> Result<(), novarocks_query_application::api::QueryExecutionError> {
+            Ok(())
         }
+    }
+    fn test_root_kind() -> novarocks_result_contract::RootOutputKind {
+        novarocks_result_contract::RootOutputKind::InternalFacts(
+            novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+        )
+    }
+    fn test_root_data() -> novarocks_execution_contract::root_result::RootReadOutcome {
+        novarocks_execution_contract::root_result::RootReadOutcome::Data(
+            novarocks_execution_contract::root_result::RootResultData::try_new(
+                test_root_kind(),
+                std::num::NonZeroU64::MIN,
+                bytes::Bytes::from_static(b"record"),
+                None,
+            )
+            .unwrap(),
+        )
+    }
+    fn test_root_window() -> (
+        novarocks_workload_control::WorkloadControl,
+        novarocks_workload_control::RootWork,
+        novarocks_workload_control::ResultWindowGrant,
+    ) {
+        use novarocks_workload_control::*;
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 12,
+                per_scope_bytes: 1 << 18,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let window = capacity
+            .try_acquire(&work.owner.scope(), ResultWindowClass::Internal)
+            .unwrap();
+        (control, work, window)
+    }
+    fn start_test_polls(
+        port: Arc<ScriptedRootResult>,
+        root: TaskIdentity,
+        window: &novarocks_workload_control::ResultWindowGrant,
+        wake: Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+        runtime: &tokio::runtime::Runtime,
+    ) -> super::RootResultPolls {
+        super::RootResultPolls(
+            super::RelayedRootPolls::start(
+                port,
+                root,
+                test_root_kind(),
+                window.retain_alias(),
+                Instant::now() + Duration::from_secs(60),
+                wake,
+                crate::native::data_runtime::FrontendDataRuntime::new(runtime.handle().clone()),
+            )
+            .unwrap(),
+        )
     }
 
     fn root_task_for_test() -> TaskIdentity {
@@ -3753,15 +3486,14 @@ mod tests {
         )
     }
 
-    /// Waits for the poller to answer, bounded, so a failure is a failure
-    /// rather than a hang.
+    /// Returns immediately while a read is held by the transport owner.
     fn answer_within(
         polls: &mut super::RootResultPolls,
         budget: Duration,
-    ) -> Option<Result<RootResultOutcome, String>> {
+    ) -> Option<super::RelayedRootAnswer> {
         let deadline = Instant::now() + budget;
         loop {
-            if let Some(answer) = polls.take() {
+            if let Some(super::RootPollAnswer::Relayed(answer)) = polls.take_next() {
                 return Some(answer);
             }
             if Instant::now() >= deadline {
@@ -3770,30 +3502,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-
-    /// The defect this pins: one root result poll asks a backend to hold its
-    /// answer for up to `MAX_ROOT_RESULT_WAIT`, while the attempt owner must
-    /// keep turning its task state machine. When the owner waited out a poll
-    /// it dispatched nothing, so every decision made elsewhere meanwhile
-    /// waited for the poll instead of for its own facts. A distributed
-    /// `SELECT` opens its producers' exchange edges
-    /// exactly there: each edge-open decision cost one whole poll wait, and
-    /// the cost was invisible as anything but latency. Measured on a 1FE+3BE
-    /// cluster, every statement of the `filter` suite took ~0.85 s of which
-    /// ~0.05 s was work, and the suite took 92 s against its baseline's 4 s.
-    ///
-    /// Answers must therefore reach the loop without the loop waiting for
-    /// one. A following poll must also wait for the owner to accept the exact
-    /// prior sequence; enqueueing an answer is not an acknowledgement.
     #[test]
     fn root_result_polls_answer_a_loop_that_never_waits_for_one() {
+        use super::RelayedRootAnswer;
+        use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultEnd};
+        let (_control, _work, window) = test_root_window();
         let (release, releases) = std::sync::mpsc::channel();
         let transport = Arc::new(ScriptedRootResult {
             answers: Mutex::new(
                 [
-                    RootResultOutcome::NotReady,
-                    RootResultOutcome::EndOfStreamPending { packet_sequence: 7 },
-                    RootResultOutcome::EndOfStream { packet_sequence: 7 },
+                    RootReadOutcome::NotReady,
+                    test_root_data(),
+                    RootReadOutcome::End(RootResultEnd {
+                        sequence: std::num::NonZeroU64::new(2).unwrap(),
+                        output_rows: 1,
+                    }),
                 ]
                 .into_iter()
                 .collect(),
@@ -3806,112 +3529,63 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("root result poll runtime");
-        let mut polls = super::RootResultPolls::start(
-            Arc::clone(&transport) as Arc<dyn super::TaskResultTransport>,
+            .unwrap();
+        let mut polls = start_test_polls(
+            transport.clone(),
             root_task_for_test(),
-            Instant::now() + Duration::from_secs(60),
-            ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
-                .expect("the test result byte limit is nonzero"),
-            Arc::clone(&wake) as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
-            crate::native::data_runtime::FrontendDataRuntime::new(runtime.handle().clone()),
-        )
-        .expect("the poller starts");
-
-        // A poll is in flight and this test is holding its answer. Taking
-        // from the poller answers immediately anyway, and that is the whole
-        // property: the loop is free to turn its state machine.
+            &window,
+            wake.clone(),
+            &runtime,
+        );
+        assert!(polls.take_next().is_none());
+        assert_eq!(wake.count(), 0);
+        release.send(()).unwrap();
+        assert!(matches!(
+            answer_within(&mut polls, Duration::from_secs(10)),
+            Some(RelayedRootAnswer::NotReady)
+        ));
+        assert!(wake.count() >= 1);
+        release.send(()).unwrap();
+        let Some(RelayedRootAnswer::Data(reply)) =
+            answer_within(&mut polls, Duration::from_secs(10))
+        else {
+            panic!("second read must deliver the real V1 data owner");
+        };
+        assert_eq!(transport.polls.load(Ordering::SeqCst), 2);
+        assert!(polls.take_next().is_none(), "enqueue is not consumption");
+        drop(reply);
+        // TaskRound records zero-based packet positions; the relay sends V1
+        // sequence one only after this actual domain receipt.
+        polls.acknowledge(0).unwrap();
+        release.send(()).unwrap();
         assert!(
-            polls.take().is_none(),
-            "a poll in flight must not hand the loop an answer"
+            matches!(answer_within(&mut polls, Duration::from_secs(10)), Some(RelayedRootAnswer::End(end)) if end.sequence.get() == 2)
         );
-        assert_eq!(wake.count(), 0, "nothing has been answered yet");
-
-        // The first answer says nothing is ready. It still wakes the loop,
-        // and the poller asks again on its own.
-        release
-            .send(())
-            .expect("the poller is waiting for a release");
-        let first = answer_within(&mut polls, Duration::from_secs(10))
-            .expect("the first answer reaches the loop");
-        assert!(
-            matches!(first, Ok(RootResultOutcome::NotReady)),
-            "actual: {first:?}"
-        );
-        assert!(wake.count() >= 1, "an answer wakes the loop");
-
-        release.send(()).expect("the poller polls again by itself");
-        let second = answer_within(&mut polls, Duration::from_secs(10))
-            .expect("the second answer reaches the loop");
-        assert!(
-            matches!(
-                second,
-                Ok(RootResultOutcome::EndOfStreamPending { packet_sequence: 7 })
-            ),
-            "actual: {second:?}"
-        );
-        assert_eq!(
-            transport.polls.load(Ordering::SeqCst),
-            2,
-            "the next poll must wait until the owner accepts pending EOS"
-        );
-        polls
-            .acknowledge(7)
-            .expect("the attempt owner acknowledges pending EOS");
-        release
-            .send(())
-            .expect("the accepted EOS acknowledgement starts the final poll");
-        let third = answer_within(&mut polls, Duration::from_secs(10))
-            .expect("the final answer reaches the loop");
-        assert!(
-            matches!(
-                third,
-                Ok(RootResultOutcome::EndOfStream { packet_sequence: 7 })
-            ),
-            "actual: {third:?}"
-        );
-
-        // Nothing is polled after the end of the stream. The poller has let
-        // go of the transport, which is what says it stopped rather than
-        // merely paused.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Arc::strong_count(&transport) > 1 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            Arc::strong_count(&transport),
-            1,
-            "the poller must stop itself once the read is over"
-        );
-        assert_eq!(
-            transport.polls.load(Ordering::SeqCst),
-            3,
-            "exactly the three polls this test released"
-        );
-        assert_eq!(
-            *transport
-                .acknowledgements
-                .lock()
-                .expect("scripted acknowledgement lock"),
-            vec![None, None, Some(ResultPacketSequence::new(7))]
-        );
+        drop(release);
+        drop(runtime);
+        assert_eq!(Arc::strong_count(&transport), 1);
+        assert_eq!(transport.polls.load(Ordering::SeqCst), 3);
+        assert_eq!(*transport.acknowledgements.lock().unwrap(), vec![0, 0, 1]);
     }
     fn synchronous_await_fixture(
-        pending_eos: bool,
+        accepted_data: bool,
     ) -> (
         crate::task_execution::round::TaskRound,
         crate::task_execution::status_intake::StatusIntakeHandle,
         Arc<crate::task_execution::clock::ManualClock>,
         Arc<ScriptedRootResult>,
     ) {
+        use super::RelayedRootAnswer;
+        use novarocks_execution_contract::root_result::RootReadOutcome;
+        let (_control, _work, window) = test_root_window();
         let (mut round, statuses, clock) =
             crate::task_execution::tests::synchronous_root_control_round();
         let (release, releases) = std::sync::mpsc::channel();
         let mut answers = std::collections::VecDeque::new();
-        if pending_eos {
-            answers.push_back(RootResultOutcome::EndOfStreamPending { packet_sequence: 7 });
+        if accepted_data {
+            answers.push_back(test_root_data());
         }
-        answers.push_back(RootResultOutcome::AwaitTerminalControl);
+        answers.push_back(RootReadOutcome::AwaitTerminalControl);
         let transport = Arc::new(ScriptedRootResult {
             answers: Mutex::new(answers),
             releases: Mutex::new(releases),
@@ -3924,61 +3598,53 @@ mod tests {
             .build()
             .unwrap();
         let root = round.root_task();
-        let mut polls = Some(
-            super::RootResultPolls::start(
-                transport.clone(),
-                root,
-                Instant::now() + Duration::from_secs(60),
-                ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT).unwrap(),
-                wake,
-                crate::native::data_runtime::FrontendDataRuntime::new(runtime.handle().clone()),
-            )
-            .unwrap(),
-        );
+        let mut polls = Some(start_test_polls(
+            transport.clone(),
+            root,
+            &window,
+            wake,
+            &runtime,
+        ));
         release.send(()).unwrap();
-        if pending_eos {
-            assert!(matches!(
-                answer_within(polls.as_mut().unwrap(), Duration::from_secs(10)),
-                Some(Ok(RootResultOutcome::EndOfStreamPending {
-                    packet_sequence: 7
-                }))
-            ));
-            polls.as_ref().unwrap().acknowledge(7).unwrap();
+        if accepted_data {
+            let Some(RelayedRootAnswer::Data(reply)) =
+                answer_within(polls.as_mut().unwrap(), Duration::from_secs(10))
+            else {
+                panic!("real V1 data");
+            };
+            drop(reply);
+            round.consume_root_result_packet(0, false).unwrap();
+            polls.as_ref().unwrap().acknowledge(0).unwrap();
             release.send(()).unwrap();
         }
         assert!(matches!(
             answer_within(polls.as_mut().unwrap(), Duration::from_secs(10)),
-            Some(Ok(RootResultOutcome::AwaitTerminalControl))
+            Some(RelayedRootAnswer::AwaitTerminalControl)
         ));
-        // The same production bridge is called by the synchronous match arm.
         super::suspend_root_result_for_terminal_control(&mut round, root, &mut polls).unwrap();
         assert!(polls.is_none());
         assert!(round.execution().result_terminal_control_required());
         assert!(!round.execution().root_end_of_stream_observed());
         assert!(!super::synchronous_root_completion_ready(&round));
         assert!(!round.root_success_sealed());
-        drop(release); // An incorrect extra fetch fails rather than blocking runtime shutdown.
-        drop(runtime); // Joins the stopped producer; no timing-based quiet window.
+        drop(release);
+        drop(runtime);
         assert_eq!(Arc::strong_count(&transport), 1);
         assert_eq!(
             transport.polls.load(Ordering::SeqCst),
-            1 + usize::from(pending_eos)
+            1 + usize::from(accepted_data)
         );
         assert_eq!(
             *transport.acknowledgements.lock().unwrap(),
-            if pending_eos {
-                vec![None, Some(ResultPacketSequence::new(7))]
-            } else {
-                vec![None]
-            }
+            if accepted_data { vec![0, 1] } else { vec![0] }
         );
         (round, statuses, clock, transport)
     }
 
     #[test]
-    fn synchronous_await_stops_fetch_and_ack_for_first_or_pending_eos_response() {
-        for pending_eos in [false, true] {
-            let (mut round, _, _, transport) = synchronous_await_fixture(pending_eos);
+    fn synchronous_await_stops_fetch_and_ack_before_or_after_consumed_data() {
+        for accepted_data in [false, true] {
+            let (mut round, _, _, transport) = synchronous_await_fixture(accepted_data);
             let root = round.root_task();
             let mut stopped = None;
             super::suspend_root_result_for_terminal_control(&mut round, root, &mut stopped)
@@ -3988,7 +3654,7 @@ mod tests {
             assert!(!round.execution().root_end_of_stream_observed());
             assert_eq!(
                 transport.polls.load(Ordering::SeqCst),
-                1 + usize::from(pending_eos)
+                1 + usize::from(accepted_data)
             );
         }
     }
@@ -3997,8 +3663,8 @@ mod tests {
     fn synchronous_await_preserves_root_cursor_and_waits_for_child_originator() {
         use crate::task_execution::status_intake::StatusEvent;
         use novarocks_execution::task_execution::{TaskOutputFacts, TaskStatus, TaskStatusVersion};
-        for pending_eos in [false, true] {
-            let (mut round, statuses, clock, transport) = synchronous_await_fixture(pending_eos);
+        for accepted_data in [false, true] {
+            let (mut round, statuses, clock, transport) = synchronous_await_fixture(accepted_data);
             let root = round.root_task();
             let peer = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
             clock.advance(Duration::from_secs(10));
@@ -4079,7 +3745,7 @@ mod tests {
             assert!(!round.root_success_sealed());
             assert_eq!(
                 transport.polls.load(Ordering::SeqCst),
-                1 + usize::from(pending_eos)
+                1 + usize::from(accepted_data)
             );
         }
     }
@@ -4088,10 +3754,10 @@ mod tests {
     fn synchronous_await_deadline_is_not_renewed_by_finished_root_or_registration() {
         use crate::task_execution::status_intake::StatusEvent;
         use novarocks_execution::task_execution::{TaskOutputFacts, TaskStatus, TaskStatusVersion};
-        for pending_eos in [false, true] {
+        for accepted_data in [false, true] {
             for finished in [false, true] {
                 let (mut round, statuses, clock, transport) =
-                    synchronous_await_fixture(pending_eos);
+                    synchronous_await_fixture(accepted_data);
                 let root = round.root_task();
                 if finished {
                     for (version, state, output) in [
@@ -4129,7 +3795,7 @@ mod tests {
                 assert!(!round.root_success_sealed());
                 assert_eq!(
                     transport.polls.load(Ordering::SeqCst),
-                    1 + usize::from(pending_eos)
+                    1 + usize::from(accepted_data)
                 );
             }
         }
@@ -4532,18 +4198,6 @@ fn judge_pre_ready_task_round_failure(
         .then_some(classified)
 }
 
-/// The wait one root result poll asks for, bounded by the statement deadline.
-fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
-    let remaining = deadline.saturating_duration_since(now);
-    let wait = remaining
-        .min(MAX_ROOT_RESULT_WAIT)
-        .max(Duration::from_millis(1));
-    // `wait` is already clamped into (0, MAX_ROOT_RESULT_WAIT], which is far
-    // inside what `MaxWait` represents, so the fallback is unreachable rather
-    // than a silent widening of a wait the deadline had bounded.
-    MaxWait::new(wait).unwrap_or_else(|_| MaxWait::default_for(OperationKind::GetFinalTaskInfo))
-}
-
 /// The synchronous consumer shares TaskRound's exact-root terminal-control
 /// requirement with the asynchronous result pump. It owns no second deadline.
 fn suspend_root_result_for_terminal_control(
@@ -4624,26 +4278,17 @@ pub(super) fn close_failed_root_reads(
     }
 }
 
+enum RootPollControl {
+    EndOfStream { packet_sequence: u64 },
+    NotReady,
+    AwaitTerminalControl,
+}
 enum RootPollAnswer {
-    Legacy(Result<RootResultOutcome, String>),
+    Control(RootPollControl),
     Relayed(RelayedRootAnswer),
 }
-pub(super) enum RootResultPolls {
-    Legacy(LegacyRootResultPolls),
-    Relayed(RelayedRootPolls),
-}
+pub(super) struct RootResultPolls(pub(super) RelayedRootPolls);
 impl RootResultPolls {
-    fn start(
-        transport: Arc<dyn TaskResultTransport>,
-        root: TaskIdentity,
-        deadline: Instant,
-        limit: ResultByteLimit,
-        wake: Arc<dyn StatusIntakeWake>,
-        runtime: FrontendDataRuntime,
-    ) -> Result<Self, String> {
-        LegacyRootResultPolls::start(transport, root, deadline, limit, wake, runtime)
-            .map(Self::Legacy)
-    }
     fn start_for_delivery(
         delivery: &ProductionRootDelivery,
         port: Option<&Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
@@ -4652,147 +4297,28 @@ impl RootResultPolls {
         wake: Arc<dyn StatusIntakeWake>,
         runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
-        match delivery {
-            ProductionRootDelivery::Relayed { kind, window, .. } => RelayedRootPolls::start(
-                port.cloned().ok_or("relayed root has no bounded reader")?,
-                root,
-                *kind,
-                window.clone(),
-                deadline,
-                wake,
-                runtime,
-            )
-            .map(Self::Relayed),
-        }
+        let ProductionRootDelivery::Relayed { kind, window, .. } = delivery;
+        RelayedRootPolls::start(
+            port.cloned().ok_or("relayed root has no bounded reader")?,
+            root,
+            *kind,
+            window.clone(),
+            deadline,
+            wake,
+            runtime,
+        )
+        .map(Self)
     }
     fn take_next(&mut self) -> Option<RootPollAnswer> {
-        match self {
-            Self::Legacy(polls) => polls.take().map(RootPollAnswer::Legacy),
-            Self::Relayed(polls) => polls.take().map(RootPollAnswer::Relayed),
-        }
-    }
-    #[cfg(test)]
-    fn take(&mut self) -> Option<Result<RootResultOutcome, String>> {
-        match self.take_next()? {
-            RootPollAnswer::Legacy(answer) => Some(answer),
-            RootPollAnswer::Relayed(_) => panic!("legacy test requested a relayed answer"),
-        }
+        self.0.take().map(RootPollAnswer::Relayed)
     }
     fn acknowledge(&self, sequence: u64) -> Result<(), String> {
-        match self {
-            Self::Legacy(polls) => polls.acknowledge(sequence),
-            Self::Relayed(polls) => polls.acknowledge(
-                sequence
-                    .checked_add(1)
-                    .and_then(std::num::NonZeroU64::new)
-                    .ok_or("root receipt sequence overflow")?,
-            ),
-        }
-    }
-}
-
-pub(super) struct LegacyRootResultPolls {
-    answers: tokio::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
-    acknowledgements: tokio::sync::mpsc::Sender<ResultPacketSequence>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl LegacyRootResultPolls {
-    /// Starts polling `root_task`.
-    ///
-    /// The caller has observed this task's Installed status, so the result
-    /// plane can route the poll to its live result buffer.
-    fn start(
-        transport: Arc<dyn TaskResultTransport>,
-        root_task: TaskIdentity,
-        statement_deadline: Instant,
-        max_result_bytes: ResultByteLimit,
-        wake: Arc<dyn StatusIntakeWake>,
-        data_runtime: FrontendDataRuntime,
-    ) -> Result<Self, String> {
-        // Both queues are one item wide because the root stream is ordered.
-        // A following fetch cannot carry an ACK until the attempt owner has
-        // taken and accepted the preceding packet.
-        let (sender, answers) = tokio::sync::mpsc::channel(1);
-        let (acknowledgements, mut acknowledged_packets) = tokio::sync::mpsc::channel(1);
-        let task = data_runtime.spawn(async move {
-            let mut acknowledged = None;
-            loop {
-                let now = Instant::now();
-                if now >= statement_deadline {
-                    break;
-                }
-                let answer = transport
-                    .fetch_root_result(
-                        root_task,
-                        max_root_result_wait(now, statement_deadline),
-                        acknowledged,
-                        max_result_bytes,
-                    )
-                    .await;
-                let (last, expected_acknowledgement) = match &answer {
-                    Ok(RootResultOutcome::Ready(packet)) => {
-                        (false, Some(packet.packet_sequence()))
-                    }
-                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
-                        (false, Some(ResultPacketSequence::new(*packet_sequence)))
-                    }
-                    Ok(RootResultOutcome::NotReady) => (false, None),
-                    Ok(RootResultOutcome::AwaitTerminalControl)
-                    | Ok(RootResultOutcome::EndOfStream { .. })
-                    | Ok(RootResultOutcome::Failed(_))
-                    | Err(_) => (true, None),
-                };
-                if sender.send(answer).await.is_err() {
-                    break;
-                }
-                wake.wake();
-                if let Some(expected) = expected_acknowledgement {
-                    match acknowledged_packets.recv().await {
-                        Some(actual) if actual == expected => acknowledged = Some(actual),
-                        Some(actual) => {
-                            let _ = sender
-                                .send(Err(format!(
-                                    "root result acknowledgement {actual:?} does not match pending {expected:?}"
-                                )))
-                                .await;
-                            wake.wake();
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-                if last {
-                    break;
-                }
-            }
-        });
-        Ok(Self {
-            answers,
-            acknowledgements,
-            task,
-        })
-    }
-
-    /// The next answer, if one has arrived.
-    ///
-    /// A disconnected poller answers `None` for the rest of the attempt: it
-    /// stops only after a terminal answer this loop already folded, or at the
-    /// statement deadline the loop checks itself.
-    fn take(&mut self) -> Option<Result<RootResultOutcome, String>> {
-        self.answers.try_recv().ok()
-    }
-
-    fn acknowledge(&self, packet_sequence: u64) -> Result<(), String> {
-        self.acknowledgements
-            .try_send(ResultPacketSequence::new(packet_sequence))
-            .map_err(|error| format!("root result acknowledgement could not be queued: {error}"))
-    }
-}
-
-impl Drop for LegacyRootResultPolls {
-    fn drop(&mut self) {
-        self.task.abort();
+        self.0.acknowledge(
+            sequence
+                .checked_add(1)
+                .and_then(std::num::NonZeroU64::new)
+                .ok_or("root receipt sequence overflow")?,
+        )
     }
 }
 
