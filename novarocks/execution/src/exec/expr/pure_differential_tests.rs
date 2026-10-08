@@ -814,10 +814,6 @@ fn column_argument(data_type: DataType) -> DiffArgument {
 
 #[test]
 fn pure_differential_reports_missing_owners_for_the_census() {
-    let unit = constant(
-        FunctionValueType::new(DataType::Utf8, false),
-        Arc::new(StringArray::from(vec!["day"])),
-    );
     let scalar_census: Vec<(&str, Vec<DiffArgument>)> = vec![
         (
             "ifnull",
@@ -827,10 +823,6 @@ fn pure_differential_reports_missing_owners_for_the_census() {
             ],
         ),
         ("murmur_hash3_32", vec![column_argument(DataType::Utf8)]),
-        (
-            "date_trunc",
-            vec![DiffArgument::Constant(unit), column_argument(timestamp())],
-        ),
         (
             "days_add",
             vec![

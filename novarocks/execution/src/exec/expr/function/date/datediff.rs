@@ -19,6 +19,9 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use chrono::{Datelike, NaiveDateTime, Timelike};
+use novarocks_functions::builtin::calendar_extended_shared::{
+    CalendarDurationUnit, CalendarOperation, calendar_duration_difference, evaluate_legacy_calendar,
+};
 use novarocks_functions::calendar_period_numeric::{months_diff_starrocks, years_diff_starrocks};
 use std::sync::Arc;
 
@@ -152,14 +155,15 @@ fn months_diff_v2(lhs: NaiveDateTime, rhs: NaiveDateTime) -> i64 {
 
 #[inline]
 fn eval_diff_value(lhs: NaiveDateTime, rhs: NaiveDateTime, unit: DiffUnit) -> i64 {
-    let diff = lhs - rhs;
     match unit {
-        DiffUnit::Milliseconds => diff.num_milliseconds(),
-        DiffUnit::Seconds => diff.num_seconds(),
-        DiffUnit::Minutes => diff.num_minutes(),
-        DiffUnit::Hours => diff.num_hours(),
-        DiffUnit::Days => diff.num_days(),
-        DiffUnit::Weeks => diff.num_weeks(),
+        DiffUnit::Milliseconds => {
+            calendar_duration_difference(lhs, rhs, CalendarDurationUnit::Milliseconds)
+        }
+        DiffUnit::Seconds => calendar_duration_difference(lhs, rhs, CalendarDurationUnit::Seconds),
+        DiffUnit::Minutes => calendar_duration_difference(lhs, rhs, CalendarDurationUnit::Minutes),
+        DiffUnit::Hours => calendar_duration_difference(lhs, rhs, CalendarDurationUnit::Hours),
+        DiffUnit::Days => calendar_duration_difference(lhs, rhs, CalendarDurationUnit::Days),
+        DiffUnit::Weeks => calendar_duration_difference(lhs, rhs, CalendarDurationUnit::Weeks),
         DiffUnit::Months => months_diff_starrocks(lhs, rhs),
         DiffUnit::Years => years_diff_starrocks(lhs, rhs),
         DiffUnit::Quarters => months_diff_starrocks(lhs, rhs) / 3,
@@ -184,6 +188,23 @@ fn eval_diff_unit(
         out.push(v);
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+}
+
+fn eval_shared_duration(
+    arena: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+    operation: CalendarOperation,
+) -> Result<ArrayRef, String> {
+    let left = arena.eval(args[0], chunk)?;
+    let right = arena.eval(args[1], chunk)?;
+    let rows = left.len();
+    evaluate_legacy_calendar(
+        operation,
+        &[left, right],
+        &arrow::datatypes::DataType::Int64,
+        rows,
+    )
 }
 
 pub fn eval_datediff(
@@ -265,7 +286,7 @@ pub fn eval_seconds_diff(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Seconds)
+    eval_shared_duration(arena, args, chunk, CalendarOperation::SecondsDiff)
 }
 
 pub fn eval_milliseconds_diff(
@@ -283,7 +304,7 @@ pub fn eval_minutes_diff(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Minutes)
+    eval_shared_duration(arena, args, chunk, CalendarOperation::MinutesDiff)
 }
 
 pub fn eval_hours_diff(
@@ -292,7 +313,7 @@ pub fn eval_hours_diff(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Hours)
+    eval_shared_duration(arena, args, chunk, CalendarOperation::HoursDiff)
 }
 
 pub fn eval_weeks_diff(
@@ -301,7 +322,7 @@ pub fn eval_weeks_diff(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Weeks)
+    eval_shared_duration(arena, args, chunk, CalendarOperation::WeeksDiff)
 }
 
 pub fn eval_months_diff(

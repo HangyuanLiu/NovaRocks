@@ -53,13 +53,20 @@ fn eval_to_datetime_inner(
 
     if args.len() == 1 {
         let arr = arena.eval(args[0], chunk)?;
-        if let Ok(dts) = extract_datetime_array(&arr) {
-            let mut out = Vec::with_capacity(dts.len());
-            for dt in dts {
-                let v = dt.and_then(|d| to_timestamp_value(d, &output_type).ok());
-                out.push(v);
-            }
-            return Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef);
+        if matches!(
+            arr.data_type(),
+            DataType::Date32
+                | DataType::Timestamp(_, _)
+                | DataType::Utf8
+                | DataType::FixedSizeBinary(16)
+        ) {
+            let rows = arr.len();
+            return novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
+                novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::Timestamp,
+                &[arr],
+                &output_type,
+                rows,
+            );
         }
 
         let values = extract_i64_array(&arr, "to_datetime")?;

@@ -928,28 +928,41 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Date)
             .with_argument_coercion(),
     );
-    for name in [
-        "to_date",
+    // Keep the existing to_date profiles independent of the finite constructor family.
+    for argument in [TypeSpec::Utf8, TypeSpec::Int64, TypeSpec::Datetime] {
+        add(m, "to_date", Signature::new(vec![argument], TypeSpec::Date));
+    }
+    // Match the actual native date helper argument shapes and supported carriers.
+    add(
+        m,
         "str_to_date",
-        "from_days",
-        "last_day",
-        "next_day",
-    ] {
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Date),
+    );
+    for argument in [TypeSpec::Int32, TypeSpec::Int64] {
         add(
             m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Date),
+            "from_days",
+            Signature::new(vec![argument], TypeSpec::Date),
+        );
+    }
+    for argument in [TypeSpec::Date, TypeSpec::Datetime, TypeSpec::Utf8] {
+        add(
+            m,
+            "last_day",
+            Signature::new(vec![argument.clone()], TypeSpec::Date),
         );
         add(
             m,
-            name,
-            Signature::new(vec![TypeSpec::Int64], TypeSpec::Date),
+            "last_day",
+            Signature::new(vec![argument.clone(), TypeSpec::Utf8], TypeSpec::Date),
         );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Datetime], TypeSpec::Date),
-        );
+        for name in ["next_day", "previous_day"] {
+            add(
+                m,
+                name,
+                Signature::new(vec![argument.clone(), TypeSpec::Utf8], TypeSpec::Date),
+            );
+        }
     }
     // `date(x)` extracts a Date from a Datetime or Date.
     add(

@@ -2488,8 +2488,8 @@ pub(super) fn scalar_definition_parts(
         overloads
             .into_iter()
             .zip(signatures)
-            .map(|(identity, signature)| FunctionOverloadDeclaration {
-                effects: match name {
+            .map(|(identity, signature)| {
+                let effects = match name {
                     name if super::window_ranking_owner::operation(name).is_some() => {
                         Some(super::window_ranking_owner::effects())
                     }
@@ -2597,6 +2597,12 @@ pub(super) fn scalar_definition_parts(
                     name if super::calendar_diff_owner::operation(name).is_some() => {
                         Some(super::calendar_diff_owner::effects())
                     }
+                    name if super::calendar_extended_owner::operation(name).is_some() => {
+                        Some(super::calendar_extended_owner::effects(
+                            super::calendar_extended_owner::operation(name)
+                                .expect("matched operation"),
+                        ))
+                    }
                     name if super::calendar_parts_owner::operation(name).is_some() => {
                         Some(super::calendar_parts_owner::effects())
                     }
@@ -2627,19 +2633,25 @@ pub(super) fn scalar_definition_parts(
                         Some(super::numeric_unary_owner::effects())
                     }
                     _ => None,
-                },
-                semantics: builtin_scalar_semantics(name),
-                identity,
-                argument_pattern: signature.clone().into_boxed_str(),
-                result_pattern: match result_domain {
-                    Some(domain) => format!(
-                        "{signature};root={}",
-                        domain.metadata_value().expect("declared semantic root")
-                    )
-                    .into_boxed_str(),
-                    None => signature.clone().into_boxed_str(),
-                },
-                aggregate: None,
+                };
+                FunctionOverloadDeclaration {
+                    semantics: effects
+                        .as_ref()
+                        .map(FunctionSemantics::from_effects)
+                        .unwrap_or_else(|| builtin_scalar_semantics(name)),
+                    effects,
+                    identity,
+                    argument_pattern: signature.clone().into_boxed_str(),
+                    result_pattern: match result_domain {
+                        Some(domain) => format!(
+                            "{signature};root={}",
+                            domain.metadata_value().expect("declared semantic root")
+                        )
+                        .into_boxed_str(),
+                        None => signature.clone().into_boxed_str(),
+                    },
+                    aggregate: None,
+                }
             }),
     )
     .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
@@ -2852,6 +2864,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::calendar_diff_owner::operation(name).is_some() => {
                 super::calendar_diff_owner::definition(name, declaration, resolver)?
+            }
+            name if super::calendar_extended_owner::operation(name).is_some() => {
+                super::calendar_extended_owner::definition(name, declaration, resolver)?
             }
             name if super::calendar_parts_owner::operation(name).is_some() => {
                 super::calendar_parts_owner::definition(name, declaration, resolver)?

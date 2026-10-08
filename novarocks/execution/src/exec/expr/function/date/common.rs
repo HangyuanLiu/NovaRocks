@@ -15,16 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
-use novarocks_types::largeint;
-
-use novarocks_functions::calendar_numeric::numeric_datetime_literal_to_naive;
 
 pub use novarocks_functions::calendar_julian::{BC_EPOCH_JULIAN, julian_from_date};
 pub use novarocks_functions::datetime_value::{
@@ -226,149 +221,11 @@ pub fn extract_i64_array(array: &ArrayRef, func_name: &str) -> Result<Vec<Option
 }
 
 pub fn extract_datetime_array(array: &ArrayRef) -> Result<Vec<Option<NaiveDateTime>>, String> {
-    match array.data_type() {
-        DataType::Date32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-            let mut out = Vec::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    out.push(None);
-                } else {
-                    let date = date32_to_naive(arr.value(i));
-                    out.push(date.map(|d| d.and_hms_opt(0, 0, 0).unwrap()));
-                }
-            }
-            Ok(out)
-        }
-        DataType::Timestamp(unit, _) => {
-            let mut out = Vec::with_capacity(array.len());
-            match unit {
-                TimeUnit::Second => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
-                    for i in 0..arr.len() {
-                        if arr.is_null(i) {
-                            out.push(None);
-                        } else {
-                            out.push(timestamp_to_naive(unit, arr.value(i)));
-                        }
-                    }
-                }
-                TimeUnit::Millisecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMillisecondArray".to_string()
-                        })?;
-                    for i in 0..arr.len() {
-                        if arr.is_null(i) {
-                            out.push(None);
-                        } else {
-                            out.push(timestamp_to_naive(unit, arr.value(i)));
-                        }
-                    }
-                }
-                TimeUnit::Microsecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMicrosecondArray".to_string()
-                        })?;
-                    for i in 0..arr.len() {
-                        if arr.is_null(i) {
-                            out.push(None);
-                        } else {
-                            out.push(timestamp_to_naive(unit, arr.value(i)));
-                        }
-                    }
-                }
-                TimeUnit::Nanosecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampNanosecondArray".to_string()
-                        })?;
-                    for i in 0..arr.len() {
-                        if arr.is_null(i) {
-                            out.push(None);
-                        } else {
-                            out.push(timestamp_to_naive(unit, arr.value(i)));
-                        }
-                    }
-                }
-            }
-            Ok(out)
-        }
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let arr = largeint::as_fixed_size_binary_array(array, "datetime LARGEINT input")?;
-            let mut out = Vec::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    out.push(None);
-                } else {
-                    let value = largeint::value_at(arr, i)?;
-                    out.push(
-                        i64::try_from(value)
-                            .ok()
-                            .and_then(numeric_datetime_literal_to_naive),
-                    );
-                }
-            }
-            Ok(out)
-        }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            let mut out = Vec::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    out.push(None);
-                } else {
-                    let s = arr.value(i);
-                    let dt = parse_datetime(s)
-                        .or_else(|| parse_date(s).map(|d| d.and_hms_opt(0, 0, 0).unwrap()));
-                    out.push(dt);
-                }
-            }
-            Ok(out)
-        }
-        other => Err(format!("unsupported datetime input type: {:?}", other)),
-    }
+    novarocks_functions::builtin::calendar_extended_shared::legacy_extract_datetimes(array)
 }
 
 pub fn extract_date_array(array: &ArrayRef) -> Result<Vec<Option<NaiveDate>>, String> {
-    match array.data_type() {
-        DataType::Date32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-            let mut out = Vec::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    out.push(None);
-                } else {
-                    out.push(date32_to_naive(arr.value(i)));
-                }
-            }
-            Ok(out)
-        }
-        DataType::Timestamp(_, _) | DataType::Utf8 => {
-            let dts = extract_datetime_array(array)?;
-            Ok(dts.into_iter().map(|dt| dt.map(|d| d.date())).collect())
-        }
-        other => Err(format!("unsupported date input type: {:?}", other)),
-    }
+    novarocks_functions::builtin::calendar_extended_shared::legacy_extract_dates(array)
 }
 
 pub fn datetime_from_local_now() -> NaiveDateTime {
@@ -388,17 +245,7 @@ pub fn time_from_utc_now() -> NaiveTime {
 }
 
 pub fn date_from_julian(julian: i32) -> Option<NaiveDate> {
-    // Inverse of julian day number to date
-    let a = julian + 32044;
-    let b = (4 * a + 3) / 146097;
-    let c = a - (146097 * b) / 4;
-    let d = (4 * c + 3) / 1461;
-    let e = c - (1461 * d) / 4;
-    let m = (5 * e + 2) / 153;
-    let day = e - (153 * m + 2) / 5 + 1;
-    let month = m + 3 - 12 * (m / 10);
-    let year = 100 * b + d - 4800 + (m / 10);
-    NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+    novarocks_functions::builtin::calendar_extended_shared::calendar_date_from_julian(julian)
 }
 
 pub fn time_to_seconds(time: NaiveTime) -> i64 {
@@ -416,56 +263,11 @@ pub fn seconds_to_time(seconds: i64) -> NaiveTime {
     NaiveTime::from_hms_opt(h, m, s).unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap())
 }
 
-const DATE_UNIX_EPOCH_JULIAN: i64 = 2_440_588;
-const USECS_PER_DAY_I64: i64 = 86_400_000_000;
-const TIMESTAMP_BITS: u32 = 40;
-const TIMESTAMP_TIME_MASK: u64 = (1_u64 << TIMESTAMP_BITS) - 1;
-
-fn is_starrocks_datetime_encodable(unix_micros: i64) -> bool {
-    let days_since_epoch = unix_micros.div_euclid(USECS_PER_DAY_I64);
-    let micros_of_day = unix_micros.rem_euclid(USECS_PER_DAY_I64);
-    if !(0..USECS_PER_DAY_I64).contains(&micros_of_day) {
-        return false;
-    }
-
-    let Some(julian_day) = DATE_UNIX_EPOCH_JULIAN.checked_add(days_since_epoch) else {
-        return false;
-    };
-    if julian_day < 0 {
-        return false;
-    }
-
-    let Ok(julian_u64) = u64::try_from(julian_day) else {
-        return false;
-    };
-    let Ok(micros_u64) = u64::try_from(micros_of_day) else {
-        return false;
-    };
-    let encoded = (julian_u64 << TIMESTAMP_BITS) | (micros_u64 & TIMESTAMP_TIME_MASK);
-    i64::try_from(encoded).is_ok()
-}
-
 pub fn to_timestamp_value(dt: NaiveDateTime, output_type: &DataType) -> Result<i64, String> {
-    let year = dt.date().year();
-    if !(0..=9999).contains(&year) {
-        return Err("timestamp out of StarRocks DATETIME year range".to_string());
-    }
-
-    let micros = dt.and_utc().timestamp_micros();
-    if !is_starrocks_datetime_encodable(micros) {
-        return Err("timestamp out of StarRocks DATETIME encoding range".to_string());
-    }
-
-    match output_type {
-        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(micros),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(dt.and_utc().timestamp_millis()),
-        DataType::Timestamp(TimeUnit::Second, _) => Ok(dt.and_utc().timestamp()),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => dt
-            .and_utc()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| "timestamp out of range".to_string()),
-        _ => Err("expected timestamp output type".to_string()),
-    }
+    novarocks_functions::builtin::calendar_extended_shared::legacy_to_timestamp_value(
+        dt,
+        output_type,
+    )
 }
 
 pub fn format_datetime_with_pattern(dt: NaiveDateTime, pattern: &str) -> String {
@@ -477,36 +279,7 @@ pub fn parse_datetime_with_pattern(s: &str, pattern: &str) -> Option<NaiveDateTi
 }
 
 pub fn mysql_format_to_chrono(fmt: &str) -> String {
-    // Basic mapping for common MySQL format tokens
-    let mut out = String::new();
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            if let Some(n) = chars.next() {
-                match n {
-                    'Y' => out.push_str("%Y"),
-                    'y' => out.push_str("%y"),
-                    'm' => out.push_str("%m"),
-                    'c' => out.push_str("%m"),
-                    'd' => out.push_str("%d"),
-                    'e' => out.push_str("%d"),
-                    'H' => out.push_str("%H"),
-                    'h' | 'I' => out.push_str("%I"),
-                    'i' => out.push_str("%M"),
-                    's' | 'S' => out.push_str("%S"),
-                    'f' => out.push_str("%f"),
-                    'T' => out.push_str("%H:%M:%S"),
-                    _ => {
-                        out.push('%');
-                        out.push(n);
-                    }
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    novarocks_functions::builtin::calendar_extended_shared::legacy_mysql_format_to_chrono(fmt)
 }
 
 pub fn convert_tz_fixed(

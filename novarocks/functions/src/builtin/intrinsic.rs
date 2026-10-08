@@ -1022,7 +1022,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("ndv", BuiltinDisposition::AggregateBoundary),
     ("negative", BuiltinDisposition::LoweredOnly),
-    ("next_day", BuiltinDisposition::Unavailable),
+    (
+        "next_day",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
     (
         "now",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -1088,6 +1091,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     (
         "power",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "previous_day",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "quarter",
@@ -1478,7 +1485,7 @@ mod tests {
             .iter()
             .map(|(name, _)| *name)
             .collect::<BTreeSet<_>>();
-        assert_eq!(entries.len(), 417);
+        assert_eq!(entries.len(), 418);
         assert_eq!(names.len(), entries.len());
         assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
         for &(name, disposition) in entries {

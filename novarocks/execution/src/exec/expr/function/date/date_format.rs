@@ -14,46 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{extract_datetime_array, mysql_format_to_chrono};
+use super::common::extract_datetime_array;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 use chrono::{Datelike, NaiveDateTime};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-fn format_mysql_datetime(dt: NaiveDateTime, mysql_fmt: &str) -> String {
-    let mut out = String::new();
-    let mut chars = mysql_fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        let Some(spec) = chars.next() else {
-            out.push('%');
-            break;
-        };
-        match spec {
-            'Y' => out.push_str(&dt.format("%Y").to_string()),
-            'y' => out.push_str(&dt.format("%y").to_string()),
-            'm' | 'c' => out.push_str(&dt.format("%m").to_string()),
-            'd' | 'e' => out.push_str(&dt.format("%d").to_string()),
-            'H' => out.push_str(&dt.format("%H").to_string()),
-            'h' | 'I' => out.push_str(&dt.format("%I").to_string()),
-            'i' => out.push_str(&dt.format("%M").to_string()),
-            's' | 'S' => out.push_str(&dt.format("%S").to_string()),
-            // MySQL `%f` is always microseconds (6 digits).
-            'f' => out.push_str(&format!("{:06}", dt.and_utc().timestamp_subsec_micros())),
-            'T' => out.push_str(&dt.format("%H:%M:%S").to_string()),
-            other => {
-                out.push('%');
-                out.push(other);
-            }
-        }
-    }
-    out
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JodaFormatToken {
@@ -162,27 +129,19 @@ fn eval_date_format_inner(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let date_arr = arena.eval(args[0], chunk)?;
-    let fmt_arr = arena.eval(args[1], chunk)?;
-    let fmt_arr = fmt_arr
+    let date = arena.eval(args[0], chunk)?;
+    let format = arena.eval(args[1], chunk)?;
+    format
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "date_format expects string format".to_string())?;
-    let dts = extract_datetime_array(&date_arr)?;
-    let mut out = Vec::with_capacity(dts.len());
-    for (i, dt) in dts.into_iter().enumerate() {
-        if fmt_arr.is_null(i) {
-            out.push(None);
-            continue;
-        }
-        let fmt = mysql_format_to_chrono(fmt_arr.value(i)).replace("%f", "%6f");
-        let v = dt.and_then(|d| {
-            let s = d.format(&fmt).to_string();
-            (s.len() <= 128).then_some(s)
-        });
-        out.push(v);
-    }
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    let rows = date.len();
+    novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
+        novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::DateFormat,
+        &[date, format],
+        &arrow::datatypes::DataType::Utf8,
+        rows,
+    )
 }
 
 pub fn eval_date_format(

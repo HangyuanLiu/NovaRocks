@@ -1505,3 +1505,7 @@ mod tests;
 #[cfg(test)]
 #[path = "pure_differential_a1_tests.rs"]
 mod a1_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_s1_tests.rs"]
+mod s1_tests;
