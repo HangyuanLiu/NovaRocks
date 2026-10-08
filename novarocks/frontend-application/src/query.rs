@@ -1792,13 +1792,7 @@ impl FrontendQuerySession {
             ParsedStatement::ExplainQuery(_) => Some(FrontendQueryPurpose::LocalRows),
             _ => None,
         };
-        let window_class = preparation_purpose
-            .map(FrontendQueryPurpose::window_class)
-            .unwrap_or(if work_class == WorkClass::Query {
-                ResultWindowClass::Internal
-            } else {
-                ResultWindowClass::Local
-            });
+        let window_class = typed_statement_result_window_class(&parsed_statement);
         let mut statement = if work_class == WorkClass::Query {
             self.service
                 .query_control
@@ -2791,6 +2785,22 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+/// Work classification selects statement admission; the output purpose
+/// independently selects its result capacity. A foreground MV refresh is a
+/// management command whose distributed write still produces InternalFacts.
+fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWindowClass {
+    match statement {
+        ParsedStatement::Dml(_)
+        | ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Refresh(_)) => {
+            ResultWindowClass::Internal
+        }
+        ParsedStatement::ExplainQuery(explain) if explain.format == ast::ExplainFormat::Analyze => {
+            ResultWindowClass::Internal
+        }
+        _ => ResultWindowClass::Local,
+    }
+}
+
 async fn consume_governed_scalar_stream(
     execution: &mut novarocks_query_application::api::ExecutionHandle,
     mut stream: novarocks_query_application::api::QueryResultStream,
@@ -3066,6 +3076,38 @@ mod tests {
 
     fn default_query_options() -> QueryOptions {
         QueryOptions::from_proto(novarocks_proto_models::novarocks::QueryOptions::default())
+    }
+
+    #[test]
+    fn typed_command_result_capacity_follows_output_purpose() {
+        let refresh = parse_single_statement("REFRESH MATERIALIZED VIEW mv")
+            .expect("parse foreground MV refresh");
+        assert_eq!(typed_statement_work_class(&refresh), WorkClass::Management);
+        assert_eq!(
+            typed_statement_result_window_class(&refresh),
+            ResultWindowClass::Internal
+        );
+
+        for sql in ["INSERT INTO target VALUES (1)", "EXPLAIN ANALYZE SELECT 1"] {
+            let statement = parse_single_statement(sql).expect("parse internal output command");
+            assert_eq!(
+                typed_statement_result_window_class(&statement),
+                ResultWindowClass::Internal,
+                "{sql}"
+            );
+        }
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "SHOW MATERIALIZED VIEWS",
+            "CREATE DATABASE result_capacity_test",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse local output command");
+            assert_eq!(
+                typed_statement_result_window_class(&statement),
+                ResultWindowClass::Local,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
