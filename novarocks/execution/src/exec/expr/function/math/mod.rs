@@ -59,3 +59,6 @@ pub use vector_ops::{eval_cosine_similarity, eval_cosine_similarity_norm, eval_l
 
 #[cfg(test)]
 mod legacy_elementary_raw_contract_tests;
+
+#[cfg(test)]
+mod legacy_numeric_unary_raw_contract_tests;

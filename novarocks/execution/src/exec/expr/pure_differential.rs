@@ -1551,3 +1551,7 @@ mod s1_parts_tests;
 #[cfg(test)]
 #[path = "pure_differential_count_distinct_tests.rs"]
 mod count_distinct_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_numeric_unary_tests.rs"]
+mod numeric_unary_tests;
