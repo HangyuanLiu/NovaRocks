@@ -869,3 +869,141 @@ pub fn build_scalar_array(
         other => Err(format!("unsupported scalar output type: {:?}", other).into()),
     }
 }
+
+pub fn compare_tracked_scalar_values<A: ScalarStateAllocator>(
+    left: &TrackedAggScalarValue<A>,
+    right: &TrackedAggScalarValue<A>,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<std::cmp::Ordering, ScalarStateError> {
+    work.step()?;
+    match (left, right) {
+        (TrackedAggScalarValue::Bool(left), TrackedAggScalarValue::Bool(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Int64(left), TrackedAggScalarValue::Int64(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Float64(left), TrackedAggScalarValue::Float64(right)) => left
+            .partial_cmp(right)
+            .ok_or_else(|| "float comparison is not ordered".to_string().into()),
+        (TrackedAggScalarValue::Utf8(left), TrackedAggScalarValue::Utf8(right))
+        | (TrackedAggScalarValue::Binary(left), TrackedAggScalarValue::Binary(right)) => {
+            for _ in left.iter().zip(right) {
+                work.step()?;
+            }
+            work.flush()?;
+            let ordering = left.as_slice().cmp(right.as_slice());
+            work.flush()?;
+            Ok(ordering)
+        }
+        (TrackedAggScalarValue::Date32(left), TrackedAggScalarValue::Date32(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Timestamp(left), TrackedAggScalarValue::Timestamp(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Decimal128(left), TrackedAggScalarValue::Decimal128(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Decimal256(left), TrackedAggScalarValue::Decimal256(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Struct(left), TrackedAggScalarValue::Struct(right))
+        | (TrackedAggScalarValue::List(left), TrackedAggScalarValue::List(right)) => {
+            compare_tracked_optional_slices(left, right, work)
+        }
+        (TrackedAggScalarValue::Map(left), TrackedAggScalarValue::Map(right)) => {
+            for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right) {
+                work.step()?;
+                let ordering = compare_tracked_optional_values(left_key, right_key, work)?;
+                if !ordering.is_eq() {
+                    return Ok(ordering);
+                }
+                let ordering = compare_tracked_optional_values(left_value, right_value, work)?;
+                if !ordering.is_eq() {
+                    return Ok(ordering);
+                }
+            }
+            Ok(left.len().cmp(&right.len()))
+        }
+        _ => Err("tracked scalar comparison type mismatch".to_string().into()),
+    }
+}
+
+fn compare_tracked_optional_slices<A: ScalarStateAllocator>(
+    left: &[Option<TrackedAggScalarValue<A>>],
+    right: &[Option<TrackedAggScalarValue<A>>],
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<std::cmp::Ordering, ScalarStateError> {
+    work.step()?;
+    for (left, right) in left.iter().zip(right) {
+        work.step()?;
+        let ordering = compare_tracked_optional_values(left, right, work)?;
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(left.len().cmp(&right.len()))
+}
+
+fn compare_tracked_optional_values<A: ScalarStateAllocator>(
+    left: &Option<TrackedAggScalarValue<A>>,
+    right: &Option<TrackedAggScalarValue<A>>,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<std::cmp::Ordering, ScalarStateError> {
+    work.step()?;
+    match (left, right) {
+        (None, None) => Ok(std::cmp::Ordering::Equal),
+        (None, Some(_)) => Ok(std::cmp::Ordering::Less),
+        (Some(_), None) => Ok(std::cmp::Ordering::Greater),
+        (Some(left), Some(right)) => compare_tracked_scalar_values(left, right, work),
+    }
+}
+
+pub fn tracked_scalar_heap_capacity<A: ScalarStateAllocator>(
+    value: &TrackedAggScalarValue<A>,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<usize, ScalarStateError> {
+    work.step()?;
+    let mut bytes = match value {
+        TrackedAggScalarValue::Utf8(values) | TrackedAggScalarValue::Binary(values) => {
+            values.capacity()
+        }
+        TrackedAggScalarValue::Struct(values) | TrackedAggScalarValue::List(values) => values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Option<TrackedAggScalarValue<A>>>())
+            .ok_or(crate::KernelFailure::ResourceExhausted)?,
+        TrackedAggScalarValue::Map(values) => values
+            .capacity()
+            .checked_mul(std::mem::size_of::<(
+                Option<TrackedAggScalarValue<A>>,
+                Option<TrackedAggScalarValue<A>>,
+            )>())
+            .ok_or(crate::KernelFailure::ResourceExhausted)?,
+        _ => 0,
+    };
+    match value {
+        TrackedAggScalarValue::Struct(values) | TrackedAggScalarValue::List(values) => {
+            for value in values {
+                work.step()?;
+                if let Some(value) = value {
+                    bytes = bytes
+                        .checked_add(tracked_scalar_heap_capacity(value, work)?)
+                        .ok_or(crate::KernelFailure::ResourceExhausted)?;
+                }
+            }
+        }
+        TrackedAggScalarValue::Map(values) => {
+            for (key, value) in values {
+                work.step()?;
+                for value in [key, value].into_iter().flatten() {
+                    bytes = bytes
+                        .checked_add(tracked_scalar_heap_capacity(value, work)?)
+                        .ok_or(crate::KernelFailure::ResourceExhausted)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(bytes)
+}

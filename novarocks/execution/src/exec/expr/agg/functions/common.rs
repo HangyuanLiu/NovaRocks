@@ -315,51 +315,12 @@ pub(super) fn compare_tracked_scalar_values(
     left: &TrackedAggScalarValue,
     right: &TrackedAggScalarValue,
 ) -> Result<Ordering, String> {
-    match (left, right) {
-        (TrackedAggScalarValue::Bool(left), TrackedAggScalarValue::Bool(right)) => {
-            Ok(left.cmp(right))
-        }
-        (TrackedAggScalarValue::Int64(left), TrackedAggScalarValue::Int64(right)) => {
-            Ok(left.cmp(right))
-        }
-        (TrackedAggScalarValue::Float64(left), TrackedAggScalarValue::Float64(right)) => left
-            .partial_cmp(right)
-            .ok_or_else(|| "float comparison is not ordered".to_string()),
-        (TrackedAggScalarValue::Utf8(left), TrackedAggScalarValue::Utf8(right))
-        | (TrackedAggScalarValue::Binary(left), TrackedAggScalarValue::Binary(right)) => {
-            Ok(left.as_slice().cmp(right.as_slice()))
-        }
-        (TrackedAggScalarValue::Date32(left), TrackedAggScalarValue::Date32(right)) => {
-            Ok(left.cmp(right))
-        }
-        (TrackedAggScalarValue::Timestamp(left), TrackedAggScalarValue::Timestamp(right)) => {
-            Ok(left.cmp(right))
-        }
-        (TrackedAggScalarValue::Decimal128(left), TrackedAggScalarValue::Decimal128(right)) => {
-            Ok(left.cmp(right))
-        }
-        (TrackedAggScalarValue::Decimal256(left), TrackedAggScalarValue::Decimal256(right)) => {
-            Ok(left.cmp(right))
-        }
-        (TrackedAggScalarValue::Struct(left), TrackedAggScalarValue::Struct(right))
-        | (TrackedAggScalarValue::List(left), TrackedAggScalarValue::List(right)) => {
-            compare_tracked_optional_slices(left, right)
-        }
-        (TrackedAggScalarValue::Map(left), TrackedAggScalarValue::Map(right)) => {
-            for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right) {
-                let ordering = compare_tracked_optional_values(left_key, right_key)?;
-                if !ordering.is_eq() {
-                    return Ok(ordering);
-                }
-                let ordering = compare_tracked_optional_values(left_value, right_value)?;
-                if !ordering.is_eq() {
-                    return Ok(ordering);
-                }
-            }
-            Ok(left.len().cmp(&right.len()))
-        }
-        _ => Err("tracked scalar comparison type mismatch".to_string()),
-    }
+    novarocks_functions::aggregate_scalar::compare_tracked_scalar_values(
+        left,
+        right,
+        &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(super) fn tracked_key_fingerprint(
@@ -541,31 +502,6 @@ fn encode_tracked_optional_value(
         output.push(0);
     }
     Ok(())
-}
-
-fn compare_tracked_optional_slices(
-    left: &[Option<TrackedAggScalarValue>],
-    right: &[Option<TrackedAggScalarValue>],
-) -> Result<Ordering, String> {
-    for (left, right) in left.iter().zip(right) {
-        let ordering = compare_tracked_optional_values(left, right)?;
-        if !ordering.is_eq() {
-            return Ok(ordering);
-        }
-    }
-    Ok(left.len().cmp(&right.len()))
-}
-
-fn compare_tracked_optional_values(
-    left: &Option<TrackedAggScalarValue>,
-    right: &Option<TrackedAggScalarValue>,
-) -> Result<Ordering, String> {
-    match (left, right) {
-        (None, None) => Ok(Ordering::Equal),
-        (None, Some(_)) => Ok(Ordering::Less),
-        (Some(_), None) => Ok(Ordering::Greater),
-        (Some(left), Some(right)) => compare_tracked_scalar_values(left, right),
-    }
 }
 
 /// Heap bytes owned by a scalar value, excluding the inline enum body.

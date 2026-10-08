@@ -1442,7 +1442,12 @@ pub(crate) fn compare_value(
             render(pure, pure_row)
         )
     };
-    match (legacy.is_null(legacy_row), pure.is_null(pure_row)) {
+    // NullArray has no physical validity bitmap; its carrier still denotes
+    // SQL NULL at every row, including empty/all-NULL aggregate results.
+    match (
+        legacy.data_type() == &DataType::Null || legacy.is_null(legacy_row),
+        pure.data_type() == &DataType::Null || pure.is_null(pure_row),
+    ) {
         (true, true) => return Ok(true),
         (true, false) | (false, true) => return Err(differ()),
         (false, false) => {}
@@ -1531,3 +1536,6 @@ mod any_value_tests;
 
 #[path = "pure_differential_nullif_tests.rs"]
 mod nullif_tests;
+
+#[path = "pure_differential/by_tests.rs"]
+mod by_tests;

@@ -978,3 +978,14 @@ fn pure_differential_bit_family_matches_v1_every_integer_profile() {
         }
     }
 }
+
+#[test]
+fn pure_differential_null_carrier_comparison_counts_logical_sql_null() {
+    let nulls = arrow::array::new_null_array(&DataType::Null, 2);
+    assert_eq!(
+        super::compare_value(&nulls, 0, &nulls, 1, FloatComparison::Exact),
+        Ok(true)
+    );
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1)]));
+    assert!(super::compare_value(&nulls, 0, &values, 0, FloatComparison::Exact).is_err());
+}

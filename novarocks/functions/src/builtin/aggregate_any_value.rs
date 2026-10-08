@@ -244,7 +244,7 @@ impl PreparedAggregateKernel for AnyValueKernel {
         self.build(states, control)
     }
 }
-fn supported(
+pub(super) fn supported(
     ty: &DataType,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {

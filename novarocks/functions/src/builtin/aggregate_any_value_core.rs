@@ -63,7 +63,7 @@ impl<A: ScalarStateAllocator> AnyValueState<A> {
         }
         let value = scalar::tracked_scalar_from_array(array, row, &self.allocator, work)?;
         if let Some(value) = value {
-            let retained = scalar_heap_capacity(&value, work)?;
+            let retained = scalar::tracked_scalar_heap_capacity(&value, work)?;
             self.has_value = true;
             self.value = Some(value);
             self.retained = retained;
@@ -83,51 +83,4 @@ impl<A: ScalarStateAllocator> AnyValueState<A> {
             Ok(None)
         }
     }
-}
-fn scalar_heap_capacity<A: ScalarStateAllocator>(
-    value: &TrackedAggScalarValue<A>,
-    work: &mut ScalarWork<'_, '_>,
-) -> Result<usize, ScalarStateError> {
-    work.step()?;
-    let mut bytes = match value {
-        TrackedAggScalarValue::Utf8(values) | TrackedAggScalarValue::Binary(values) => {
-            values.capacity()
-        }
-        TrackedAggScalarValue::Struct(values) | TrackedAggScalarValue::List(values) => values
-            .capacity()
-            .checked_mul(std::mem::size_of::<Option<TrackedAggScalarValue<A>>>())
-            .ok_or(crate::KernelFailure::ResourceExhausted)?,
-        TrackedAggScalarValue::Map(values) => values
-            .capacity()
-            .checked_mul(std::mem::size_of::<(
-                Option<TrackedAggScalarValue<A>>,
-                Option<TrackedAggScalarValue<A>>,
-            )>())
-            .ok_or(crate::KernelFailure::ResourceExhausted)?,
-        _ => 0,
-    };
-    match value {
-        TrackedAggScalarValue::Struct(values) | TrackedAggScalarValue::List(values) => {
-            for value in values {
-                work.step()?;
-                if let Some(value) = value {
-                    bytes = bytes
-                        .checked_add(scalar_heap_capacity(value, work)?)
-                        .ok_or(crate::KernelFailure::ResourceExhausted)?;
-                }
-            }
-        }
-        TrackedAggScalarValue::Map(values) => {
-            for (key, value) in values {
-                work.step()?;
-                for value in [key, value].into_iter().flatten() {
-                    bytes = bytes
-                        .checked_add(scalar_heap_capacity(value, work)?)
-                        .ok_or(crate::KernelFailure::ResourceExhausted)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(bytes)
 }
