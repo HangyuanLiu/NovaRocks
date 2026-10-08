@@ -2970,14 +2970,25 @@ fn execute_exact_cow_match_query(
     novarocks_spi::connector::ConnectorRowMutationSelection,
     crate::dml::error::DmlExecutionError,
 > {
+    let capacity = execution.result_capacity().ok_or_else(|| {
+        crate::dml::error::DmlExecutionError::from(
+            "COW match has no admitted Internal result window".to_string(),
+        )
+    })?;
+    crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+        capacity.scope(),
+        &capacity.window_alias(),
+    )?;
     let (schema, _) = cow_selection_layout(preparation)?;
-    let consumer = crate::query_execution::row_mutation::CowMatchRootConsumer::try_new(
-        connector_context.clone(),
-        schema,
-        preparation.match_contract().clone(),
-        preparation.intent().clone(),
-    )
-    .map_err(|error| error.to_string())?;
+    let consumer =
+        crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_with_capacity(
+            connector_context.clone(),
+            schema,
+            preparation.match_contract().clone(),
+            preparation.intent().clone(),
+            capacity,
+        )
+        .map_err(|error| error.to_string())?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);

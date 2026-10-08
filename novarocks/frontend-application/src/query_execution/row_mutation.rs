@@ -32,10 +32,11 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorMutationMatchContract, ConnectorRequestContext,
-    ConnectorRowConversionFootprint, ConnectorRowMutationEffect, ConnectorRowMutationIntent,
-    ConnectorRowMutationSelection, ConnectorRowMutationSourceBatch,
-    ConnectorRowMutationSourceBuilder, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
+    ConnectorError, ConnectorErrorKind, ConnectorMutationMatchContract,
+    ConnectorPayloadRetentionGuard, ConnectorRequestContext, ConnectorRowConversionFootprint,
+    ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationSelection,
+    ConnectorRowMutationSourceBatch, ConnectorRowMutationSourceBuilder,
+    MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
 };
 
 use crate::native::fragment_transport::FetchedQueryBatch;
@@ -71,6 +72,7 @@ pub struct BoundedRowMutationMatchCollector {
     byte_count: u64,
     schema: Option<SchemaRef>,
     batches: Vec<CollectedCowBatch>,
+    retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 enum CollectedCowBatch {
@@ -173,6 +175,7 @@ impl BoundedRowMutationMatchCollector {
             byte_count: schema_bytes,
             schema,
             batches: Vec::new(),
+            retention: None,
         })
     }
 
@@ -352,12 +355,21 @@ impl BoundedRowMutationMatchCollector {
                     }
                 })
                 .collect();
-            ConnectorRowMutationSelection::try_new_owned(
-                schema,
-                sources,
-                self.max_rows,
-                self.max_bytes,
-            )
+            match self.retention {
+                Some(guard) => ConnectorRowMutationSelection::try_new_owned_with_guard(
+                    schema,
+                    sources,
+                    self.max_rows,
+                    self.max_bytes,
+                    guard,
+                ),
+                None => ConnectorRowMutationSelection::try_new_owned(
+                    schema,
+                    sources,
+                    self.max_rows,
+                    self.max_bytes,
+                ),
+            }
         } else {
             let batches = self
                 .batches
@@ -367,7 +379,16 @@ impl BoundedRowMutationMatchCollector {
                     CollectedCowBatch::Owned(_) => unreachable!("collector rejects mixed carriers"),
                 })
                 .collect();
-            ConnectorRowMutationSelection::try_new(schema, batches, self.max_rows, self.max_bytes)
+            let selection = ConnectorRowMutationSelection::try_new(
+                schema,
+                batches,
+                self.max_rows,
+                self.max_bytes,
+            )?;
+            Ok(match self.retention {
+                Some(guard) => selection.retain_carrier(guard),
+                None => selection,
+            })
         }
     }
 
@@ -424,10 +445,17 @@ fn cast_owned_to_signed_selection(
     source: &ConnectorRowMutationSourceBatch,
     retained_selection: usize,
     assembly_bytes: usize,
+    retention: Option<&ConnectorPayloadRetentionGuard>,
 ) -> Result<ConnectorRowMutationSourceBatch, ConnectorError> {
     let input = source.batch();
     // Check the target's closed source profile before the cast can allocate.
-    let mut owner = ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?;
+    let mut owner = match retention {
+        Some(guard) => ConnectorRowMutationSourceBuilder::try_new_with_guard(
+            Arc::clone(schema),
+            guard.clone(),
+        )?,
+        None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?,
+    };
     let observed_input = ConnectorRowConversionFootprint::retained_batch_bytes(input)?;
     let source_scratch = source.source_bytes().saturating_sub(observed_input);
     // 32 MiB validator + 8 MiB bookkeeping coexist while collecting. The
@@ -479,6 +507,7 @@ pub struct RelayedCowSelectionCollector {
     decoder: CowSelectionStreamDecoder,
     schema: SchemaRef,
     collector: BoundedRowMutationMatchCollector,
+    retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 impl RelayedCowSelectionCollector {
@@ -502,6 +531,7 @@ impl RelayedCowSelectionCollector {
             decoder: CowSelectionStreamDecoder::new(),
             schema,
             collector,
+            retention: None,
         })
     }
 
@@ -541,6 +571,7 @@ impl RelayedCowSelectionCollector {
             decoder,
             schema,
             collector,
+            retention,
         } = self;
         // Keep the collector's own error kind (cancellation, deadline,
         // budget) rather than flattening it through the assembly sink.
@@ -556,7 +587,11 @@ impl RelayedCowSelectionCollector {
                     message
                 })?;
             }
-            let Some(batch) = decoder.apply_owned_record(record).map_err(|error| {
+            let decoded = match retention.as_ref() {
+                Some(guard) => decoder.apply_owned_record_with_guard(record, guard.clone()),
+                None => decoder.apply_owned_record(record),
+            };
+            let Some(batch) = decoded.map_err(|error| {
                 let message = format!("decode relayed COW selection record: {error}");
                 if matches!(
                     error,
@@ -588,6 +623,7 @@ impl RelayedCowSelectionCollector {
                 &batch,
                 collector.byte_count() as usize,
                 record.len(),
+                retention.as_ref(),
             )
             .map_err(|error| {
                 let message = error.to_string();
@@ -609,6 +645,9 @@ impl RelayedCowSelectionCollector {
     /// The stream's End: no record may remain unfinished.
     pub fn finish(self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
         self.assembly.finish().map_err(invalid_match)?;
+        // Schema-only streams retain the decoder's holder until the whole
+        // selection has its own holder, including its empty indices.
+        let _decoder_schema = self.decoder.finish_with_guard();
         self.collector.finish()
     }
 }
@@ -631,6 +670,26 @@ impl CowMatchRootConsumer {
             collector: RelayedCowSelectionCollector::try_new(context, None, schema)?,
             validator: RowMutationMatchValidator::try_new(contract, intent)?,
         })
+    }
+
+    pub(crate) fn try_new_with_capacity(
+        context: ConnectorRequestContext,
+        schema: SchemaRef,
+        contract: ConnectorMutationMatchContract,
+        intent: ConnectorRowMutationIntent,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Self, ConnectorError> {
+        let window = binding.window_alias();
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            binding.scope(),
+            &window,
+        )
+        .map_err(invalid_match)?;
+        let guard = ConnectorPayloadRetentionGuard::new(window);
+        let mut consumer = Self::try_new(context, schema, contract, intent)?;
+        consumer.collector.collector.retention = Some(guard.clone());
+        consumer.collector.retention = Some(guard);
+        Ok(consumer)
     }
 
     pub(crate) fn push_decoded(&mut self, batch: FetchedQueryBatch) -> Result<usize, String> {
@@ -1349,6 +1408,125 @@ mod tests {
             ConnectorErrorKind::ResourceExhausted
         );
         assert_eq!(relayed.byte_count(), retained_before_refusal);
+    }
+
+    #[test]
+    fn admitted_cow_window_reaches_empty_selection_and_last_arrow_alias() {
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+            WorkloadConfig, WorkloadControl,
+        };
+        for empty in [false, true] {
+            let control = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 1024 * 1024,
+                    control_bytes: 1024,
+                    per_scope_bytes: 1024 * 1024 - 1024,
+                },
+            )
+            .unwrap();
+            let capacity = control
+                .configure_result_capacity(ResultCapacityConfig::V1)
+                .unwrap();
+            control.mark_ready().unwrap();
+            let (root, window) = control
+                .root_admission()
+                .try_begin_root_with_result(
+                    WorkRequest::new(WorkClass::Management),
+                    ResultWindowClass::Internal,
+                )
+                .unwrap();
+            let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+                &root.owner.scope(), window.retain_alias(),
+            ).unwrap();
+            let mut consumer = CowMatchRootConsumer::try_new_with_capacity(
+                context(
+                    Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                    COW_SELECTION_BYTES as usize,
+                ),
+                selection_schema(),
+                contract(),
+                ConnectorRowMutationIntent::Merge {
+                    effects: vec![ConnectorRowMutationEffect::Replace],
+                },
+                &binding,
+            )
+            .unwrap();
+            if !empty {
+                let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+                consumer.push_body(&stream).unwrap();
+            }
+            consumer.check_end(if empty { 0 } else { 1 }).unwrap();
+            let selection = consumer.finish().unwrap();
+            let cloned = selection.clone();
+            // RecordBatch's actual buffer clone is an independent last owner.
+            let array = (!empty).then(|| selection.batches()[0].column(0).clone());
+            drop(selection);
+            drop(binding);
+            drop(window);
+            root.owner.complete();
+            root.business.release();
+            assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            drop(cloned);
+            if empty {
+                assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            } else {
+                assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+                drop(array);
+                assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn cow_factory_refuses_local_window_before_collector_growth() {
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+            WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(), window.retain_alias(),
+        ).unwrap();
+        assert!(
+            CowMatchRootConsumer::try_new_with_capacity(
+                context(
+                    Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                    COW_SELECTION_BYTES as usize
+                ),
+                selection_schema(),
+                contract(),
+                ConnectorRowMutationIntent::Merge {
+                    effects: vec![ConnectorRowMutationEffect::Replace]
+                },
+                &binding,
+            )
+            .is_err()
+        );
+        drop(binding);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
     }
 
     #[test]

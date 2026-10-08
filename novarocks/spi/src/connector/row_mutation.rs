@@ -1016,6 +1016,17 @@ impl ConnectorRowMutationSelection {
         Ok(selection)
     }
 
+    /// Keep the admitted carrier holder through whole-selection clones.
+    /// This does not establish owned-source eligibility for legacy batches;
+    /// their raw Arrow aliases remain protected by the transitional owner.
+    pub fn retain_carrier(
+        mut self,
+        guard: crate::connector::ConnectorPayloadRetentionGuard,
+    ) -> Self {
+        self.retention.push(guard);
+        self
+    }
+
     /// Only constructor-owned sources qualify for production bounded ingress.
     pub fn has_owned_sources(&self) -> bool {
         self.source_ownership.is_some()

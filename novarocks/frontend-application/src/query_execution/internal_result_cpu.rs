@@ -39,6 +39,25 @@ use std::sync::Arc;
 // decoder/collector construction. Nested stages reuse it, never acquire again.
 const INTERNAL_PEAK_BYTES: u64 = (2 * 336 + 256 + 32 + 32 + 8 + 8) * 1024 * 1024;
 
+/// Coverage check for closed first-party factories which embed the supplied
+/// alias into their actual payload backing before handing it off.
+pub(crate) fn require_internal_result_capacity(
+    scope: &WorkScope,
+    window: &ResultWindowAlias,
+) -> Result<(), String> {
+    if !window.is_for_scope(scope) {
+        return Err("internal result CPU window belongs to a foreign scope".into());
+    }
+    scope.check().map_err(|error| error.to_string())?;
+    if window.class() != ResultWindowClass::Internal {
+        return Err("internal result CPU requires an admitted Internal window".into());
+    }
+    window
+        .check_backing_total(INTERNAL_PEAK_BYTES)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub(crate) struct InternalResultCpuOwner {
     workers: QueryBlockingExecutorOwner,
     runtime: InternalResultCpu,
@@ -89,16 +108,7 @@ impl<T> InternalResultValue<T> {
         window: ResultWindowAlias,
         produce: impl FnOnce(&ResultWindowAlias) -> Result<T, String>,
     ) -> Result<Self, String> {
-        if !window.is_for_scope(scope) {
-            return Err("internal result CPU window belongs to a foreign scope".into());
-        }
-        scope.check().map_err(|error| error.to_string())?;
-        if window.class() != ResultWindowClass::Internal {
-            return Err("internal result CPU requires an admitted Internal window".into());
-        }
-        window
-            .check_backing_total(INTERNAL_PEAK_BYTES)
-            .map_err(|error| error.to_string())?;
+        require_internal_result_capacity(scope, &window)?;
         let value = produce(&window)?;
         Ok(Self { value, window })
     }
