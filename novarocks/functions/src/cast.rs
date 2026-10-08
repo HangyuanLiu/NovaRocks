@@ -27,10 +27,11 @@ use crate::{
     ScopedExpressionEffects,
 };
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_cast::cast::{cast_num_to_bool, num_cast};
 use arrow_schema::{DataType, TimeUnit};
@@ -158,6 +159,9 @@ impl UnsignedWidth {
 /// Successful-NULL obligations of exact primitive carrier casts. This is a
 /// static semantic fact, not an installed runtime capability whitelist.
 pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
+    if source == &DataType::Binary && target == &DataType::Utf8 {
+        return true;
+    }
     // These original arena branches reject invalid/nonfinite literals even with false ALLOW.
     if target == &DataType::Date32 && matches!(source, DataType::Float32 | DataType::Float64) {
         return false;
@@ -310,6 +314,8 @@ impl DecimalTextSource {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    /// Original Arrow safe Binary-to-Utf8 conversion, including invalid -> NULL.
+    BinaryText,
     LargeIntText,
     DateFloat {
         target: Target,
@@ -393,6 +399,20 @@ impl PreparedCastRecipe {
             work.step()?;
             if operation != CastOperation::Carrier || !physical {
                 return Err(CastPrepareError::Unsupported);
+            }
+            if source.data_type == DataType::Binary && result.data_type == DataType::Utf8 {
+                work.step()?;
+                if !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::BinaryText,
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
             }
             if result.data_type == DataType::Utf8
                 && matches!(
@@ -620,7 +640,10 @@ impl PreparedCastRecipe {
             }
             CastBody::FloatDate { .. } => true,
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
-            CastBody::LargeIntText | CastBody::Identity | CastBody::Text { .. } => false,
+            CastBody::BinaryText
+            | CastBody::LargeIntText
+            | CastBody::Identity
+            | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {
                 (source.is_float()
                     && matches!(target, Target::Signed(_) | Target::Unsigned(_))
@@ -654,6 +677,37 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if self.body == CastBody::BinaryText {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| array.as_any().is::<BinaryArray>(),
+                )?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                let input = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| internal("checked binary text has a foreign carrier"))?;
+                // Observe the actual selected byte extent without decoding it twice.
+                // The Arrow validation and owned result copy remain opaque work.
+                for _ in input.value(row) {
+                    work.step()?;
+                }
+                work.flush()?;
+                let text = crate::binary_text::value_text(argument.array(), row)
+                    .map_err(|error| internal(&error))?;
+                work.flush()?;
+                return Ok(text.map(CastRowResult::Text).unwrap_or(CastRowResult::Null));
+            }
             if self.body == CastBody::LargeIntText {
                 let row = self.checked_row_with_shape(
                     argument,
@@ -1292,3 +1346,7 @@ mod date_float_tests;
 #[cfg(test)]
 #[path = "cast_float_date_tests.rs"]
 mod float_date_tests;
+
+#[cfg(test)]
+#[path = "cast_binary_text_tests.rs"]
+mod binary_text_tests;

@@ -1323,7 +1323,9 @@ fn evaluate_cast<'a>(
     // An unzoned primitive rendering fits within 64 bytes, including the
     // widest Chrono year and nanosecond fraction. Check Arrow's i32 offset
     // extent before producing text. This is not a host memory grant.
-    if ty == &DataType::Utf8 {
+    let variable_binary_text =
+        ty == &DataType::Utf8 && recipe.source_type().data_type == DataType::Binary;
+    if ty == &DataType::Utf8 && !variable_binary_text {
         selection
             .len()
             .checked_mul(64)
@@ -1405,6 +1407,7 @@ fn evaluate_cast<'a>(
         .map_err(|_| KernelFailure::ResourceExhausted)?;
     work.flush()?;
     let mut inherited = child.errors().iter().peekable();
+    let mut binary_text_bytes = 0_usize;
     for (ordinal, row) in selection.iter().enumerate() {
         let value = if inherited
             .peek()
@@ -1424,7 +1427,15 @@ fn evaluate_cast<'a>(
         };
         match (&mut output, value) {
             (Output::Boolean(v), R::Boolean(n)) => v.push(Some(n)),
-            (Output::Text(v), R::Text(n)) => v.push(Some(n)),
+            (Output::Text(v), R::Text(n)) => {
+                if variable_binary_text {
+                    binary_text_bytes = binary_text_bytes
+                        .checked_add(n.len())
+                        .filter(|bytes| *bytes <= i32::MAX as usize)
+                        .ok_or(KernelFailure::ResourceExhausted)?;
+                }
+                v.push(Some(n));
+            }
             (Output::Text(v), R::Null) => v.push(None),
             (Output::I8(v), R::Signed(n)) => v.push(Some(
                 i8::try_from(n).map_err(|_| internal("cast returned an out-of-range Int8"))?,

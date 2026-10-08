@@ -1096,6 +1096,7 @@ pub fn cast_scalar_with_special_rules(
             }
             cast(array.as_ref(), target_type).map_err(|e| e.to_string())
         }
+        (DataType::Binary, DataType::Utf8) => novarocks_functions::binary_text::cast_array(array),
         _ => cast(array.as_ref(), target_type).map_err(|e| e.to_string()),
     }
 }

@@ -2648,3 +2648,5 @@ pub mod legacy_decimal;
 pub mod legacy_literal;
 mod native_negate;
 pub use native_negate::*;
+
+pub mod binary_text;
