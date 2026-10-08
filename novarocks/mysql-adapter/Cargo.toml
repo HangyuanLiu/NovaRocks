@@ -10,7 +10,6 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 arrow.workspace = true
-chrono.workspace = true
 libc.workspace = true
 mysql_common = "0.32"
 novarocks-query-application.workspace = true

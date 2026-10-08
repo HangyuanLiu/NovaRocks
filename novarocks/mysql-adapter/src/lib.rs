@@ -29,9 +29,6 @@ mod query_application_shim;
 mod relay_metadata;
 mod relay_result_writer;
 mod result_encoding;
-mod result_value;
-mod result_writer;
-mod row_encoding;
 mod terminal;
 
 use novarocks_query_application::session_error::QueryServiceErrorKind;
@@ -43,8 +40,7 @@ pub use disconnect_watcher::{ClientDisconnectWatcher, spawn_disconnect_watcher};
 pub use error_mapping::error_kind_for_domain_code;
 pub use governed_result_writer::{
     MysqlStatementWriteOutcome, write_governed_query_result, write_governed_query_result_one,
-    write_query_result, write_query_result_one, write_streaming_query_result,
-    write_streaming_query_result_one,
+    write_streaming_query_result, write_streaming_query_result_one,
 };
 pub use listener::{
     serve_tcp_until_drain_then_shutdown, serve_tcp_until_shutdown,
@@ -59,15 +55,7 @@ pub use query_application_shim::{
     serve_query_application_mysql_until_drain_then_shutdown,
     serve_query_application_mysql_until_shutdown,
 };
-pub use result_encoding::mysql_column_for_result_field;
-pub use result_value::MysqlResultValue;
-pub use result_writer::{
-    MysqlBatchWriteError, MysqlResultFinishError, MysqlResultStartError, finish_result,
-    finish_result_error, finish_result_one, finish_streaming_result, finish_streaming_result_one,
-    mysql_columns_for_result_fields, start_cancellable_result, start_streaming_result,
-    write_cancellable_batch, write_record_batches, write_record_batches_one, write_streaming_batch,
-};
-pub use row_encoding::{array_value_to_mysql_value, build_mysql_row};
+pub use result_encoding::{mysql_column_for_result_field, mysql_columns_for_result_fields};
 pub use terminal::{
     mysql_error_kind, write_governed_init_error, write_governed_init_ok,
     write_governed_terminal_error, write_governed_terminal_ok, write_governed_terminal_ok_one,

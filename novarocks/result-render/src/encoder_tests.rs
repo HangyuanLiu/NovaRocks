@@ -122,3 +122,64 @@ fn actual_scratch_capacity_layout() {
     );
     assert!(capacity < 2 * 1024 * 1024);
 }
+
+fn single_cell_body(array: ArrayRef, native_type: N, name: &str) -> Vec<u8> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            name,
+            array.data_type().clone(),
+            false,
+        )])),
+        vec![array],
+    )
+    .unwrap();
+    let schema = ClientRenderSchema::try_new(
+        vec![RenderColumn {
+            source_ordinal: 0,
+            source_slot: None,
+            name: name.into(),
+            field: RenderField {
+                native_type,
+                presentation: P::ScalarText,
+                nullable: false,
+            },
+        }],
+        1,
+    )
+    .unwrap();
+    let mut encoder = ArrowMysqlTextEncoder::try_new(Arc::new(schema), batch).unwrap();
+    let mut body = Vec::new();
+    for _ in 0..1024 {
+        let mut segment = [0; 4096];
+        let turn = encoder.step(&mut segment).unwrap();
+        body.extend_from_slice(&segment[..turn.emitted_bytes]);
+        if turn.status == RenderTurnStatus::InputComplete {
+            return body;
+        }
+    }
+    panic!("tiny fixture did not finish within bounded turns");
+}
+
+#[test]
+fn date32_zero_sentinel_uses_mysql_zero_date_in_the_production_encoder() {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let sentinel = chrono::NaiveDate::from_ymd_opt(-1, 11, 30).unwrap();
+    let days = sentinel.signed_duration_since(epoch).num_days() as i32;
+    let body = single_cell_body(Arc::new(Date32Array::from(vec![days])), N::Date, "d");
+    assert_eq!(body, b"\x0b\0\0\0\x0a0000-00-00");
+}
+
+#[test]
+fn plain_binary_names_do_not_infer_opaque_domains() {
+    for name in ["hll", "bitmap", "object", "percentile"] {
+        let body = single_cell_body(
+            Arc::new(BinaryArray::from(vec![b"external state".as_slice()])),
+            N::Binary,
+            name,
+        );
+        let mut expected = 15u32.to_le_bytes().to_vec();
+        expected.push(14);
+        expected.extend_from_slice(b"external state");
+        assert_eq!(body, expected);
+    }
+}

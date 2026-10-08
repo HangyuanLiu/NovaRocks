@@ -20,7 +20,7 @@
 use std::io;
 
 use novarocks_query_application::api::{
-    QueryExecutionError, QueryExecutionErrorKind, QueryResult, ResultFailureView,
+    QueryExecutionError, QueryExecutionErrorKind, ResultFailureView,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::protocol_delivery::{
@@ -32,30 +32,6 @@ use tokio::io::AsyncWrite;
 pub enum MysqlStatementWriteOutcome<'writer, W: AsyncWrite + Unpin> {
     Continue(QueryResultWriter<'writer, W>),
     Terminated,
-}
-
-/// Delivers an already-materialized immediate Query Application result.
-///
-/// This result has no governed delivery owner, but the MySQL adapter still
-/// owns its schema, rows, and terminal wire transitions.
-pub async fn write_query_result<W: AsyncWrite + Unpin>(
-    result: QueryResult,
-    results: QueryResultWriter<'_, W>,
-) -> io::Result<()> {
-    write_query_result_one(result, results)
-        .await?
-        .no_more_results()
-        .await
-}
-
-/// Writes one materialized result and returns the writer for the next
-/// negotiated result on this exact connection.
-pub async fn write_query_result_one<'writer, W: AsyncWrite + Unpin>(
-    result: QueryResult,
-    results: QueryResultWriter<'writer, W>,
-) -> io::Result<QueryResultWriter<'writer, W>> {
-    let batches = result.batches.iter().collect::<Vec<_>>();
-    crate::write_record_batches_one(&result.columns, &batches, results).await
 }
 
 pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(

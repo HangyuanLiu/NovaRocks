@@ -260,33 +260,21 @@ impl FrozenResourceValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionResourceRequirements {
     minimum_memory_bytes: FrozenResourceValue,
-    result_credit_bytes: FrozenResourceValue,
 }
 
 impl ExecutionResourceRequirements {
-    pub const fn new(
-        minimum_memory_bytes: FrozenResourceValue,
-        result_credit_bytes: FrozenResourceValue,
-    ) -> Self {
+    pub const fn new(minimum_memory_bytes: FrozenResourceValue) -> Self {
         Self {
             minimum_memory_bytes,
-            result_credit_bytes,
         }
     }
 
     pub const fn unknown(reason: FrozenEstimateUnknownReason) -> Self {
-        Self::new(
-            FrozenResourceValue::Unknown(reason),
-            FrozenResourceValue::Unknown(reason),
-        )
+        Self::new(FrozenResourceValue::Unknown(reason))
     }
 
     pub const fn minimum_memory_bytes(self) -> FrozenResourceValue {
         self.minimum_memory_bytes
-    }
-
-    pub const fn result_credit_bytes(self) -> FrozenResourceValue {
-        self.result_credit_bytes
     }
 }
 

@@ -303,6 +303,8 @@ impl<W> Drop for ClosingDelivery<W> {
 /// The adapter owns wire framing, while these values retain every application
 /// lifetime that must remain live until the terminal protocol outcome.
 pub enum QuerySessionOutput {
+    /// Application-local command output. Protocol adapters must refuse this
+    /// until the application wraps it with the original governed owner.
     Query(QueryResult),
     GovernedQuery(GovernedImmediateStatementResult),
     StreamingQuery(StreamingStatementResult),

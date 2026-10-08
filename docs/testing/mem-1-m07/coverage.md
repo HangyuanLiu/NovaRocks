@@ -2,6 +2,12 @@
 
 P00 历史审查基线：`eb35251de575e071ad3657d0ce0fc1fc95d1a91a`。原始表保留当时事实与待安装保护；P06 新实现与未闭合项见“P06 逐源交接”；没有把 source review 当成容量或产品验收。路径相对仓库根。
 
+## P08 当前切换增量（2026-10-08）
+
+FE 已切到 count-only WorkloadControl；协议与 supervisor 不携带 LRA。ResultCredit/decoded delivery/unfrozen carrier/raw MySQL Arrow writer、行复制 API 及未消费的 result-credit description 字段已删除。ClientRows 中继与 Local 固定窗口 writer 为唯一行发送入口，未经原 owner 包装的 application-local QueryResult 在 metadata 之前被拒绝。日期 sentinel、opaque 名称、IPC domain 与 dictionary/null 回归已迁到 production bounded encoder；旧 binary-value/Arrow writer 接口专属测试随接口退役。
+
+`2366cfc92` 的 clean C0 与原生 1FE+3BE 十项通过见 `evidence/p08-counted-carrier-convergence-20261008.json`；本次 raw writer 删除之后还须补 clean C0/native。P00b/P09/P10 的性能、集中 root、多 FE 与传输测量门仍未完成。下列原始表继续仅代表 P00 历史基线。
+
 ## 应用结果
 
 | source / 当前接点 | 目标用途 / 接收 owner | 增长前保护与最后释放 | 验证面 |

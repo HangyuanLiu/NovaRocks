@@ -1889,6 +1889,81 @@ fn build_expected_output_schema(
 
 #[cfg(test)]
 mod tests {
+    /// These tiny one-column fixtures exercise the production bounded encoder
+    /// after IPC projection, with the exact domain supplied by the test plan.
+    fn render_test_cells(
+        result: &novarocks_query_application::api::QueryResult,
+        domain: novarocks_physical_plan::ResultValueDomain,
+    ) -> Vec<Option<Vec<u8>>> {
+        use novarocks_physical_plan::ResultValueDomain as D;
+        use novarocks_result_contract::{
+            ClientRenderSchema, NativeRenderType as N, OpaqueRenderType as O, RenderColumn,
+            RenderField, RenderPresentation as P,
+        };
+        use novarocks_result_render::{
+            ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurnStatus,
+        };
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.batches.len(), 1);
+        let field = &result.columns[0];
+        let (native_type, presentation) = match domain {
+            D::Hll => (N::Opaque(O::Hll), P::OpaqueNull),
+            D::Bitmap => (N::Opaque(O::Bitmap), P::OpaqueNull),
+            D::Object => (N::Opaque(O::Object), P::OpaqueNull),
+            D::Percentile => (N::Opaque(O::Percentile), P::OpaqueNull),
+            D::Variant => (N::Variant, P::VariantSerializedBytes),
+            D::Json => (N::Json, P::JsonText),
+            D::Plain => match field.data_type() {
+                arrow::datatypes::DataType::Binary | arrow::datatypes::DataType::LargeBinary => {
+                    (N::Binary, P::ScalarText)
+                }
+                _ => (N::String, P::ScalarText),
+            },
+        };
+        let schema = ClientRenderSchema::try_new(
+            vec![RenderColumn {
+                source_ordinal: 0,
+                source_slot: None,
+                name: field.name().into(),
+                field: RenderField {
+                    native_type,
+                    presentation,
+                    nullable: field.nullable(),
+                },
+            }],
+            1,
+        )
+        .unwrap();
+        let mut encoder =
+            ArrowMysqlTextEncoder::try_new(Arc::new(schema), result.batches[0].clone()).unwrap();
+        let mut body = Vec::new();
+        for _ in 0..1024 {
+            let mut segment = [0; 4096];
+            let turn = encoder.step(&mut segment).unwrap();
+            body.extend_from_slice(&segment[..turn.emitted_bytes]);
+            if turn.status == RenderTurnStatus::InputComplete {
+                break;
+            }
+        }
+        let mut cells = Vec::new();
+        let mut at = 0;
+        while at < body.len() {
+            let length = u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+            at += 4;
+            let payload = &body[at..at + length];
+            at += length;
+            cells.push(if payload == [0xfb] {
+                None
+            } else {
+                assert!(payload[0] < 0xfb, "fixture requires a short scalar cell");
+                assert_eq!(payload.len(), usize::from(payload[0]) + 1);
+                Some(payload[1..].to_vec())
+            });
+        }
+        assert_eq!(cells.len(), result.row_count());
+        cells
+    }
+
     fn test_decode_root_chunk(
         payload: &[u8],
         schema: Option<&novarocks_execution::exec::chunk::ChunkSchemaRef>,
@@ -2109,7 +2184,6 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-        use novarocks_mysql_adapter::{MysqlResultValue, build_mysql_row};
         use novarocks_physical_plan::ResultValueDomain as D;
         use novarocks_types::logical::{
             LogicalType as L, field_with_logical_type, logical_type_of_field,
@@ -2247,10 +2321,10 @@ mod tests {
                     logical_type_of_field(result.batches[0].schema().field(0)),
                     marker
                 );
-                let row = build_mysql_row(&result.batches[0], &result.columns, 0).unwrap();
-                match &row[0] {
-                    MysqlResultValue::Null if opaque => {}
-                    MysqlResultValue::Bytes(bytes) if !opaque => assert_eq!(bytes, raw),
+                let rows = render_test_cells(&result, domain);
+                match &rows[0] {
+                    None if opaque => {}
+                    Some(bytes) if !opaque => assert_eq!(bytes, raw),
                     other => panic!("unexpected rendered value for {domain:?}: {other:?}"),
                 }
             }
@@ -2313,7 +2387,6 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Int32Type, Schema};
         use arrow::record_batch::RecordBatch;
         use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-        use novarocks_mysql_adapter::{MysqlResultValue, build_mysql_row};
         use novarocks_physical_plan::ResultValueDomain as D;
         use novarocks_types::logical::{LogicalType, logical_type_of_field};
         fn shared_buffers(before: &ArrayData, after: &ArrayData) {
@@ -2431,12 +2504,10 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 {
-                    let cell = build_mysql_row(&result.batches[0], &result.columns, row)
-                        .unwrap()
-                        .remove(0);
+                    let cell = render_test_cells(&result, domain)[row].clone();
                     match (cell, literal) {
-                        (MysqlResultValue::Null, None) => {}
-                        (MysqlResultValue::Bytes(actual), Some(expected)) => {
+                        (None, None) => {}
+                        (Some(actual), Some(expected)) => {
                             assert_eq!(actual, expected)
                         }
                         other => panic!("unexpected dictionary cell: {other:?}"),

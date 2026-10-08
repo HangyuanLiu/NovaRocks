@@ -52,9 +52,10 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
     more_results: bool,
 ) -> io::Result<crate::MysqlStatementWriteOutcome<'writer, W>> {
     match statement {
-        StatementResult::Query(result) => crate::write_query_result_one(result, results)
-            .await
-            .map(crate::MysqlStatementWriteOutcome::Continue),
+        StatementResult::Query(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MySQL query result has no original governed owner",
+        )),
         StatementResult::GovernedQuery(result) => {
             crate::local_result_writer::write_local_result_one(result, results, more_results).await
         }
@@ -563,7 +564,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
             }
         };
         let outcome = match statement {
-            StatementResult::Query(result) => crate::write_query_result(result, results).await,
+            StatementResult::Query(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MySQL query result has no original governed owner",
+            )),
             StatementResult::GovernedQuery(result) => {
                 crate::write_governed_query_result(result, results).await
             }
@@ -589,6 +593,135 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    struct RawResultFactory;
+    struct RawResultSession;
+    impl QuerySessionFactory for RawResultFactory {
+        fn open_session(
+            &self,
+            _: QuerySessionOpenRequest,
+        ) -> Result<Arc<dyn QuerySession>, QueryServiceError> {
+            Ok(Arc::new(RawResultSession))
+        }
+        fn cancel_all(&self, _: QueryCancellationReason) {}
+    }
+    #[async_trait::async_trait]
+    impl QuerySession for RawResultSession {
+        async fn init_database(
+            &self,
+            _: &str,
+        ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
+        {
+            Ok(
+                novarocks_query_application::session::QuerySessionStatement::output_owned(
+                    StatementResult::Ok,
+                ),
+            )
+        }
+        async fn execute_statement(
+            &self,
+            _: &str,
+        ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
+        {
+            Ok(
+                novarocks_query_application::session::QuerySessionStatement::output_owned(
+                    StatementResult::Query(
+                        novarocks_query_application::api::build_string_query_result(
+                            "raw",
+                            vec!["must not be published".to_string()],
+                        )
+                        .unwrap(),
+                    ),
+                ),
+            )
+        }
+        async fn execute_batch(
+            &self,
+            sql: &str,
+        ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
+        {
+            self.execute_statement(sql).await
+        }
+        fn cancel_current(&self, _: QueryCancellationReason) {}
+        fn close(&self) {}
+    }
+
+    #[tokio::test]
+    async fn raw_result_without_original_owner_is_refused_before_metadata_in_both_protocol_modes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        async fn send(stream: &mut TcpStream, sequence: u8, body: &[u8]) {
+            let mut header = (body.len() as u32).to_le_bytes();
+            header[3] = sequence;
+            stream.write_all(&header).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+        async fn read(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            header[3] = 0;
+            let length = u32::from_le_bytes(header) as usize;
+            assert!(length < 4096);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            body
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for negotiated in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, write) = stream.into_split();
+                    opensrv_mysql::AsyncMysqlIntermediary::run_with_options(
+                        QueryApplicationMysqlShim::new(
+                            "root".into(),
+                            ClientConnectionToken::new(91, 1).unwrap(),
+                            Arc::new(RawResultFactory),
+                            Arc::new(OnceLock::new()),
+                            ClientDisconnectWatcher::inactive(),
+                            "test".into(),
+                        ),
+                        read,
+                        write,
+                        &crate::MYSQL_INTERMEDIARY_OPTIONS,
+                    )
+                    .await
+                });
+                let mut client = TcpStream::connect(address).await.unwrap();
+                assert_eq!(read(&mut client).await[0], 10);
+                let mut flags = CapabilityFlags::CLIENT_PROTOCOL_41
+                    | CapabilityFlags::CLIENT_SECURE_CONNECTION
+                    | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+                if negotiated {
+                    flags |= CapabilityFlags::CLIENT_MULTI_STATEMENTS
+                        | CapabilityFlags::CLIENT_MULTI_RESULTS;
+                }
+                let mut auth = Vec::new();
+                auth.extend_from_slice(&flags.bits().to_le_bytes());
+                auth.extend_from_slice(&(64_u32 * 1024 * 1024).to_le_bytes());
+                auth.push(33);
+                auth.extend_from_slice(&[0; 23]);
+                auth.extend_from_slice(b"root\0");
+                auth.push(0);
+                auth.extend_from_slice(b"mysql_native_password\0");
+                send(&mut client, 1, &auth).await;
+                assert_eq!(read(&mut client).await[0], 0);
+                send(&mut client, 0, b"\x03SELECT raw_result").await;
+                let mut first = [0; 1];
+                assert_eq!(
+                    client.read(&mut first).await.unwrap(),
+                    0,
+                    "raw schema/data must never reach the socket"
+                );
+                let error = server.await.unwrap().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("original governed owner"));
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     struct CancellationProbeFactory {
         cancelled: Arc<AtomicBool>,

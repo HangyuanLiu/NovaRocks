@@ -1,0 +1,59 @@
+{
+  "status": "PASS_COMPONENT_RAW_ARROW_WRITER_RETIRED_P08_PARTIAL",
+  "base_revision": "03ceccd52e639892819536fbc2ed24d2e46a9c26",
+  "changes": [
+    "Deleted raw Arrow MySQL writer, cancellable/streaming Arrow writer APIs, old row Vec/cell cloning functions and obsolete MysqlResultValue implementation. Bounded metadata projection remains.",
+    "Raw application-local QueryResult remains internal command staging and is wrapped by real FE sessions. Both MySQL protocol modes now refuse it before schema publication when no original governed owner exists. Socket regression verifies no result bytes escape.",
+    "Moved exact IPC domain/dictionary/null rendering fixtures to production bounded encoder. Retained zero-date sentinel and opaque-name regressions there. Retired old-interface-specific tests.",
+    "Removed unused result_credit_bytes frozen-description hint and unused direct chrono dependency from the MySQL adapter. BE generic memory protections unchanged."
+  ],
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-raw-writer-render-tests.log",
+      "sha256": "437b4fa6a9483eca486cad0717f4b7a76ed198b7f8092f3a4cdeda066f6a5d94",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.23s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-raw-writer-mysql-tests-v2.log",
+      "sha256": "89310946817b9ae35a3674f33db2d51acb2abefbad41226f470af00541abd091",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.76s",
+        "test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-raw-writer-frontend-tests-v1.log",
+      "sha256": "282d47b3f74d69fbb10626f9ae6eee1cfc2cfe76a123413770aa1453b0d91442",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.08s",
+        "test result: ok. 1449 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.12s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-raw-writer-query-tests.log",
+      "sha256": "745626e32dc1fb814c84e2fb27a90134485118cb5a3f032720a13007eff7809e",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.60s",
+        "test result: ok. 483 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-raw-writer-final-check.log",
+      "sha256": "4c7ee589fe9fadfc7553ae2c259e8476efb7f3a6c72a9494d1c41f6babbbbde6",
+      "result": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.08s"
+      ]
+    }
+  ],
+  "failures_resolved": [
+    "Test encoder field corrected to emitted_bytes; socket test builder corrected to Vec<String>. Initial compile logs retained."
+  ],
+  "remaining": [
+    "Clean C0/native validation for this deletion",
+    "P00b valid baseline/transport coefficients",
+    "P09/P10 final same-HEAD evidence"
+  ]
+}
