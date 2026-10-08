@@ -70,7 +70,12 @@ enum InputEncoder {
 impl InputEncoder {
     fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, ()> {
         match self {
-            Self::Client(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::Client(encoder) => encoder.step(output).map_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    "Root client encoding failed under its frozen schema"
+                );
+            }),
             Self::WriteCommit(encoder) => encoder.step(output).map_err(|_| ()),
             Self::CowSelection(encoder) => Ok(encoder.step(output)),
             Self::ScalarLeaf(encoder) => encoder.step(output).map_err(|_| ()),
@@ -557,7 +562,15 @@ impl NativeRootResultSession {
                         })
                         .map(|encoder| InputEncoder::ScalarLeaf(Box::new(encoder)))
                 }
-                .map_err(|_| "scalar input differs from its frozen root value")?;
+                .map_err(|error| {
+                    tracing::warn!(?error, "Scalar root encoding refused its input");
+                    match error {
+                        crate::root_scalar_leaf_codec::NativeScalarLeafError::Leaf(
+                            novarocks_result_contract::ScalarLeafError::ValueLimit,
+                        ) => "scalar value exceeds frozen 64 KiB record bound",
+                        _ => "scalar input differs from its frozen root value",
+                    }
+                })?;
                 if rows == 1 {
                     *scalar_rows = 1;
                 }
