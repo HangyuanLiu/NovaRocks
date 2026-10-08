@@ -2503,6 +2503,7 @@ pub(super) fn scalar_definition_parts(
                         Some(super::window_offset_owner::effects())
                     }
                     "abs" => Some(super::abs_owner::effects()),
+                    "nullif" => Some(super::nullif_owner::effects()),
                     name if super::control_owner::operation(name).is_some() => {
                         Some(super::control_owner::effects(
                             super::control_owner::operation(name)
@@ -2780,6 +2781,7 @@ pub fn contribute_builtin_functions(
                 super::window_offset_owner::definition(name, declaration, resolver)?
             }
             "abs" => super::abs_owner::definition(declaration, resolver)?,
+            "nullif" => super::nullif_owner::definition(&name, declaration, resolver)?,
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }

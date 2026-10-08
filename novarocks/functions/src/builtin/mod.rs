@@ -88,6 +88,8 @@ mod dround_owner;
 mod makedate;
 mod makedate_owner;
 mod murmur;
+pub mod nullif;
+mod nullif_owner;
 mod numeric_binary;
 mod numeric_binary_owner;
 pub mod numeric_elementary;

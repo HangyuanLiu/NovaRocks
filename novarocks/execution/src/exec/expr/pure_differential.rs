@@ -1528,3 +1528,6 @@ mod regexp_extract_tests;
 
 #[path = "pure_differential/any_value_tests.rs"]
 mod any_value_tests;
+
+#[path = "pure_differential_nullif_tests.rs"]
+mod nullif_tests;
