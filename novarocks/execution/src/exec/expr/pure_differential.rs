@@ -667,7 +667,7 @@ pub(crate) fn run_scalar_differential(
     let legacy_kind = legacy_name
         .as_ref()
         .ok()
-        .and_then(|legacy_name| lookup_function(legacy_name));
+        .and_then(|legacy_name| scalar_legacy_implementation(legacy_name));
     let legacy_status = match (&legacy_name, legacy_kind) {
         (Ok(_), Some(_)) => LegacyStatus::Available,
         (Ok(legacy_name), None) => {
@@ -768,7 +768,7 @@ pub(crate) fn scalar_pure_owner_status(
     let bound = resolve_like_sql(catalog, name, CatalogKind::Scalar, arguments)?;
     let legacy = legacy_wire_name(&bound.function_id)
         .ok()
-        .and_then(|legacy| lookup_function(&legacy).map(|_| ()))
+        .and_then(|legacy| scalar_legacy_implementation(&legacy).map(|_| ()))
         .map_or_else(
             || LegacyStatus::Unavailable("no legacy function kind".into()),
             |_| LegacyStatus::Available,
@@ -1009,9 +1009,23 @@ fn prepare_scalar(
 // Scalar evaluation and comparison
 // ---------------------------------------------------------------------------
 
+// Mirrors the native adapter's actual node producer. Array literals are
+// lowered to ArrayExpr, while ordinary scalar calls use their registered kind.
+#[derive(Clone, Copy)]
+enum ScalarLegacyImplementation {
+    Function(LegacyKind),
+    ArrayLiteral,
+}
+fn scalar_legacy_implementation(name: &str) -> Option<ScalarLegacyImplementation> {
+    if name == "__array_literal" {
+        Some(ScalarLegacyImplementation::ArrayLiteral)
+    } else {
+        lookup_function(name).map(ScalarLegacyImplementation::Function)
+    }
+}
 struct ScalarCall<'a> {
     spec: &'a ScalarDiffSpec,
-    legacy_kind: LegacyKind,
+    legacy_kind: ScalarLegacyImplementation,
     result_type: &'a FunctionValueType,
     rows: usize,
 }
@@ -1160,13 +1174,16 @@ impl ScalarCall<'_> {
             .map_err(|error| format!("harness batch failed: {error}"))?;
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slots)?;
         let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
-        let call = arena.push_typed(
-            ExprNode::FunctionCall {
-                kind: self.legacy_kind,
+        let node = match self.legacy_kind {
+            ScalarLegacyImplementation::Function(kind) => ExprNode::FunctionCall {
+                kind,
                 args: arguments,
             },
-            self.result_type.data_type.clone(),
-        );
+            ScalarLegacyImplementation::ArrayLiteral => ExprNode::ArrayExpr {
+                elements: arguments,
+            },
+        };
+        let call = arena.push_typed(node, self.result_type.data_type.clone());
         arena.eval(call, &chunk)
     }
 }
@@ -1618,3 +1635,6 @@ mod array_tests;
 
 #[path = "pure_differential_shift_shared_tests.rs"]
 mod shift_shared_tests;
+
+#[path = "pure_differential_collection_construct_access_tests.rs"]
+mod collection_construct_access_tests;
