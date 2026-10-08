@@ -1264,3 +1264,7 @@ mod legacy_collection_construct_access_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_array_element_access_baseline_tests.rs"]
 mod legacy_array_element_access_baseline_tests;
+
+#[cfg(test)]
+#[path = "legacy_map_null_result_baseline_tests.rs"]
+mod legacy_map_null_result_baseline_tests;

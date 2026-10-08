@@ -2579,6 +2579,7 @@ pub(super) fn scalar_definition_parts(
                     }
                     "md5sum" => Some(super::md5sum_owner::effects()),
                     "split" => Some(super::string_split_owner::effects()),
+                    "__map_element_at" => Some(super::map_element_at_owner::effects()),
                     name if super::string_md5_owner::operation(name).is_some() => {
                         Some(super::string_md5_owner::effects())
                     }
@@ -2702,6 +2703,7 @@ pub(super) fn dynamic_definition_parts(
             value: error.to_string().into(),
         })?;
     let pure_effects = match name {
+        "__array_literal" => Some(super::array_literal_owner::effects()),
         "md5sum_numeric" => Some(super::md5sum_numeric_owner::effects()),
         "null_or_empty" => Some(super::string_null_or_empty_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
@@ -2756,6 +2758,9 @@ pub fn contribute_builtin_functions(
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {
+            "__array_literal" => {
+                super::array_literal_owner::definition(name, declaration, resolver)?
+            }
             "md5sum_numeric" => {
                 super::md5sum_numeric_owner::definition(name, declaration, resolver)?
             }
@@ -2883,6 +2888,9 @@ pub fn contribute_builtin_functions(
             }
             "md5sum" => super::md5sum_owner::definition(&name, declaration, resolver)?,
             "split" => super::string_split_owner::definition(&name, declaration, resolver)?,
+            "__map_element_at" => {
+                super::map_element_at_owner::definition(&name, declaration, resolver)?
+            }
             name if super::string_md5_owner::operation(name).is_some() => {
                 super::string_md5_owner::definition(name, declaration, resolver)?
             }

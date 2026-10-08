@@ -20,7 +20,7 @@ use arrow::array::{
     Int64Array, MapArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::compute::cast;
+
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow_buffer::OffsetBuffer;
 use std::cmp::Ordering;
@@ -29,21 +29,15 @@ use std::sync::Arc;
 use novarocks_types::largeint;
 
 pub(super) fn row_index(row: usize, len: usize) -> usize {
-    if len == 1 { 0 } else { row }
+    novarocks_functions::builtin::map_lookup_core::row_index(row, len)
 }
-
 pub(super) fn cast_output(
     out: ArrayRef,
     output_type: Option<&DataType>,
     fn_name: &str,
 ) -> Result<ArrayRef, String> {
-    let Some(target) = output_type else {
-        return Ok(out);
-    };
-    if out.data_type() == target {
-        return Ok(out);
-    }
-    cast(&out, target).map_err(|e| format!("{}: failed to cast output: {}", fn_name, e))
+    novarocks_functions::builtin::map_lookup_core::cast_output(out, output_type)
+        .map_err(|cause| format!("{fn_name}: failed to cast output: {cause}"))
 }
 
 pub(super) fn compare_key_to_target(
@@ -62,134 +56,9 @@ pub(super) fn compare_keys_at(
     targets: &ArrayRef,
     target_idx: usize,
 ) -> Result<bool, String> {
-    if keys.is_null(key_idx) || targets.is_null(target_idx) {
-        return Ok(false);
-    }
-    if keys.data_type() != targets.data_type() {
-        return Err(format!(
-            "map key type mismatch: {:?} vs {:?}",
-            keys.data_type(),
-            targets.data_type()
-        ));
-    }
-
-    match keys.data_type() {
-        DataType::Int8 => {
-            let l = keys.as_any().downcast_ref::<Int8Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int8Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Int16 => {
-            let l = keys.as_any().downcast_ref::<Int16Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int16Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Int32 => {
-            let l = keys.as_any().downcast_ref::<Int32Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int32Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Int64 => {
-            let l = keys.as_any().downcast_ref::<Int64Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int64Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Float32 => {
-            let l = keys.as_any().downcast_ref::<Float32Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Float32Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Float64 => {
-            let l = keys.as_any().downcast_ref::<Float64Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Float64Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Boolean => {
-            let l = keys.as_any().downcast_ref::<BooleanArray>().unwrap();
-            let r = targets.as_any().downcast_ref::<BooleanArray>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Utf8 => {
-            let l = keys.as_any().downcast_ref::<StringArray>().unwrap();
-            let r = targets.as_any().downcast_ref::<StringArray>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Date32 => {
-            let l = keys.as_any().downcast_ref::<Date32Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Date32Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Decimal128(_, _) => {
-            let l = keys.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Decimal256(_, _) => {
-            let l = keys.as_any().downcast_ref::<Decimal256Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Decimal256Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast key to FixedSizeBinaryArray".to_string())?;
-            let r = targets
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast target to FixedSizeBinaryArray".to_string())?;
-            let lv = largeint::i128_from_be_bytes(l.value(key_idx))
-                .map_err(|e| format!("map key LARGEINT decode failed: {}", e))?;
-            let rv = largeint::i128_from_be_bytes(r.value(target_idx))
-                .map_err(|e| format!("map key LARGEINT decode failed: {}", e))?;
-            Ok(lv == rv)
-        }
-        other => Err(format!("map key compare unsupported type: {:?}", other)),
-    }
+    novarocks_functions::builtin::map_lookup_core::compare_keys_at(
+        keys, key_idx, targets, target_idx,
+    )
 }
 
 pub(super) fn output_list_field(

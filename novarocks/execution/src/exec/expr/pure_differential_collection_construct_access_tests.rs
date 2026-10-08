@@ -63,6 +63,22 @@ fn flat_profiles() -> Vec<FunctionValueType> {
     ] {
         p.push(FunctionValueType::new(DataType::Timestamp(u, None), true))
     }
+    for precision in [9u8, 18, 38] {
+        for scale in [-2i8, 0, 2, precision as i8] {
+            p.push(FunctionValueType::new(
+                DataType::Decimal128(precision, scale),
+                true,
+            ));
+        }
+    }
+    for precision in [40u8, 60, 76] {
+        for scale in [-2i8, 0, 2, 6] {
+            p.push(FunctionValueType::new(
+                DataType::Decimal256(precision, scale),
+                true,
+            ));
+        }
+    }
     p.push(
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
@@ -193,7 +209,13 @@ fn lookup_fixture(
             .flat_map(|r| [Some(r as u32), None, Some(r as u32)])
             .collect::<Vec<_>>(),
     );
-    let keys = take(key.as_ref(), &indices, None).unwrap();
+    let keys: ArrayRef = if key.data_type() == &DataType::Null {
+        Arc::new(arrow::array::NullArray::new(ROWS * 3))
+    } else {
+        let keys = take(key.as_ref(), &indices, None).unwrap();
+        let nulls = NullBuffer::union(keys.nulls(), indices.nulls());
+        arrow::array::make_array(keys.to_data().into_builder().nulls(nulls).build().unwrap())
+    };
     let value_indices = UInt32Array::from_iter_values((0..ROWS * 3).map(|r| (r % ROWS) as u32));
     let vals = take(vals.as_ref(), &value_indices, None).unwrap();
     (
@@ -308,6 +330,7 @@ fn pure_differential_map_element_at_every_flat_and_nested_value_domain_null_keys
     let kt = FunctionValueType::new(DataType::Int32, true);
     for (t, a) in flat_profiles()
         .into_iter()
+        .filter(|t| t.data_type != DataType::Null)
         .map(|t| {
             let a = values(&t, ROWS, 78);
             (t, a)
@@ -357,7 +380,10 @@ fn pure_differential_map_element_at_original_unsupported_key_errors_at_required_
 #[test]
 fn pure_differential_map_element_at_empty_entries_and_constant_probe_are_real_nullable_profiles() {
     let kt = FunctionValueType::new(DataType::Int32, true);
-    for vt in flat_profiles() {
+    for vt in flat_profiles()
+        .into_iter()
+        .filter(|t| t.data_type != DataType::Null)
+    {
         let m = map(
             new_empty_array(&kt.data_type),
             &kt,
@@ -376,4 +402,61 @@ fn pure_differential_map_element_at_empty_entries_and_constant_probe_are_real_nu
         );
         assert!(s.null_results >= ROWS);
     }
+}
+
+#[test]
+fn pure_differential_map_element_at_real_independent_map_key_nullability_and_logical_key_profiles()
+{
+    let vt = FunctionValueType::new(DataType::Int32, true);
+    for logical in [ValueLogicalType::Physical, ValueLogicalType::LargeInt] {
+        for map_nullable in [false, true] {
+            for key_nullable in [false, true] {
+                let kt = FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    key_nullable,
+                    logical,
+                )
+                .unwrap();
+                let key = values(&kt, ROWS, 87);
+                let vals = values(&vt, ROWS, 88);
+                let m = map(
+                    key.clone(),
+                    &kt,
+                    vals,
+                    &vt,
+                    (0..=ROWS).map(|r| r as i32).collect(),
+                    map_nullable.then(|| (0..ROWS).map(|r| r % 17 != 0).collect()),
+                );
+                let mt = FunctionValueType::new(m.data_type().clone(), map_nullable);
+                let s = assert_scalar_matches_v1(
+                    ScalarDiffSpec::new("__map_element_at")
+                        .typed_column(mt, m)
+                        .typed_column(kt, key)
+                        .sparse_selections(7, 89),
+                );
+                assert_eq!(s.attributed_row_errors, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn pure_differential_map_null_result_retains_original_failing_branch_as_named_admission_refusal() {
+    let kt = FunctionValueType::new(DataType::Int32, true);
+    let vt = FunctionValueType::new(DataType::Null, true);
+    let m = map(
+        Arc::new(Int32Array::from(vec![1])),
+        &kt,
+        Arc::new(arrow::array::NullArray::new(1)),
+        &vt,
+        vec![0, 1],
+        None,
+    );
+    let failure = super::run_scalar_differential(
+        &ScalarDiffSpec::new("__map_element_at")
+            .column(m)
+            .column(Arc::new(Int32Array::from(vec![2]))),
+    )
+    .unwrap_err();
+    match failure {super::DifferentialFailure::Specialization(message)=>assert!(message.contains("__map_element_at has no installed Null result profile: original nullable-index overlay panics")),other=>panic!("unexpected complete-profile refusal: {other:?}")}
 }
