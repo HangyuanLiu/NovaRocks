@@ -30,6 +30,8 @@ mod in_pred;
 #[cfg(test)]
 mod legacy_calendar_add_baseline_tests;
 #[cfg(test)]
+mod legacy_regexp_extract_baseline_tests;
+#[cfg(test)]
 mod legacy_regexp_replace_baseline_tests;
 mod literal;
 #[cfg(test)]
