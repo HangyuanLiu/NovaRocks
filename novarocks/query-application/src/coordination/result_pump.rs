@@ -2717,7 +2717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_relayed_segment_on_a_decoded_batch_result_is_refused() {
+    async fn a_client_segment_on_a_count_only_result_is_refused() {
         let (
             Harness {
                 control: _control,
@@ -2729,7 +2729,23 @@ mod tests {
                 root,
             },
             window,
-        ) = relay_harness_with(33, crate::api::ResultRowCarrier::DecodedBatches).await;
+        ) = relay_harness_with(
+            33,
+            crate::api::ResultRowCarrier::relayed(
+                novarocks_result_contract::RootOutputKind::CountOnly,
+                None,
+            )
+            .unwrap(),
+        )
+        .await;
+        // Keep the native root and admitted window valid; only the stream's
+        // frozen consumer purpose conflicts with the ClientRows delivery.
+        drop(window);
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(&scope, ResultWindowClass::Client)
+            .unwrap();
         let (status_sender, statuses) = accepted_root_status_projection(root);
         status_sender.publish(running(root)).unwrap();
         let port = ScriptedRootPort::new(vec![rows_data(1, &[1, 0, 0, 0, b'a'], None)]);
@@ -2752,9 +2768,9 @@ mod tests {
             matches!(error, ResultPumpFailure::Concluded(_)),
             "unexpected error: {error:?}"
         );
-        // No segment reaches the decoded-batch consumer; it sees the reason.
+        // A ClientRows segment cannot reach a CountOnly consumer.
         let Err(consumer) = stream.next().await else {
-            panic!("the decoded-batch consumer must see the refusal");
+            panic!("the CountOnly consumer must see the refusal");
         };
         assert!(
             consumer.to_string().contains("row carrier"),

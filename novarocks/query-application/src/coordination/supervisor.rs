@@ -644,6 +644,21 @@ async fn run_logical_execution(
             return fail_uninstalled_start(pending_owner, reply, registry_error(error));
         }
     };
+    let row_carrier = if result_schema.is_some() {
+        match description.row_carrier() {
+            Ok(carrier) => Some(carrier),
+            Err(error) => {
+                drop(stage);
+                return fail_uninstalled_start(
+                    pending_owner,
+                    reply,
+                    QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, error),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let max_establish_authorizations = config.max_establish_authorizations_per_context;
     let actor_config = match (&result_schema, description.recovery()) {
         (None, RecoveryMode::NoRecovery) => LogicalExecutionActorConfig::no_recovery_completion(
@@ -667,7 +682,7 @@ async fn run_logical_execution(
                 stage,
                 schema.clone(),
                 config.rows.delivery_capacity,
-                description.row_carrier(),
+                row_carrier.expect("row output carrier was validated"),
             )
         }
         (Some(schema), RecoveryMode::RestartAttemptBeforeVisibility) => {
@@ -689,7 +704,7 @@ async fn run_logical_execution(
                         config.rows.replacement_reservation_valid_for,
                         schema.clone(),
                         config.rows.delivery_capacity,
-                        description.row_carrier(),
+                        row_carrier.expect("row output carrier was validated"),
                     )
                 }
                 Err(error) => Err(error),
@@ -700,12 +715,10 @@ async fn run_logical_execution(
         }
     };
     let actor_config = match actor_config {
-        Ok(actor_config) => actor_config
-            .with_result_row_carrier(description.row_carrier())
-            .with_abort_query_context_effect_port(
-                session.abort_effect_port(),
-                max_establish_authorizations,
-            ),
+        Ok(actor_config) => actor_config.with_abort_query_context_effect_port(
+            session.abort_effect_port(),
+            max_establish_authorizations,
+        ),
         Err(error) => {
             let _ = reply.send(Err(actor_error(error)));
             return Ok(());

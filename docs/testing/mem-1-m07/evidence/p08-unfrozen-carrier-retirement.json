@@ -1,0 +1,41 @@
+{
+  "status": "PASS_COMPONENT_UNFROZEN_CARRIER_RETIRED_P08_PARTIAL",
+  "base_revision": "0bfd958a53b87298a32ea512c0887d8cb52cb983",
+  "changes": [
+    "Deleted DecodedBatches carrier and unused ResultSchema Arrow projection. All row streams require frozen relayed kind/profile.",
+    "Unfrozen result sinks fail at description construction; completion-only plans with no result port have no manufactured carrier. Row carrier requests on those plans explicitly fail.",
+    "Supervisor validates row carrier before actor construction; production coordinator/launcher propagate missing-purpose refusal. No decoded fallback.",
+    "Preserved output/scan substitution, completion-only and wrong consumer-purpose coverage on real root segments."
+  ],
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-frozen-carrier-query-tests-v2.log",
+      "sha256": "6491d3e4943e15c90eac56f1be3a2eefe18429c6ea2ce00a06795ed4a49067d4",
+      "result": [
+        "test result: ok. 483 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-frozen-carrier-mysql-tests.log",
+      "sha256": "add82d6d8df01c57217818e96456ff500df9f7f98b7e27cc44844ebb8f5ecc67",
+      "result": [
+        "test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-frozen-carrier-frontend-tests.log",
+      "sha256": "764b95c238fcc91edadb566b6831d31cf33d386a8fb494996ee4be6fb96798f3",
+      "result": [
+        "test result: ok. 1449 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.00s"
+      ]
+    }
+  ],
+  "failures_resolved": [
+    "First wrong-consumer test was preempted by an Internal window bound to a ClientRows native frontier. Corrected fixture to keep native identity/window valid and isolate the consumer carrier mismatch. Initial failure log retained."
+  ],
+  "remaining": [
+    "Clean C0 and native validation",
+    "P00b measured transport coefficients/valid old-main baseline",
+    "P09/P10 and final same-HEAD evidence"
+  ]
+}

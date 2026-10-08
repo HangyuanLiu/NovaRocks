@@ -1010,7 +1010,17 @@ mod tests {
                 false,
                 None,
             )]),
-            ResultRowCarrier::DecodedBatches,
+            ResultRowCarrier::relayed(
+                novarocks_result_contract::RootOutputKind::ClientRows,
+                Some(
+                    novarocks_result_contract::ClientRowProfile::try_new(
+                        novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
+                        novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
             1,
         )
         .unwrap();

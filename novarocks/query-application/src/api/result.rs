@@ -248,15 +248,6 @@ impl ResultSchema {
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
-
-    pub fn arrow_schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::new(
-            self.fields
-                .iter()
-                .map(|field| Field::new(field.name(), field.data_type().clone(), field.nullable()))
-                .collect::<Vec<_>>(),
-        ))
-    }
 }
 
 pub enum ExecutionOutput {
@@ -309,8 +300,6 @@ impl Drop for DeliverySignal {
 /// chooses its framing before it writes any metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultRowCarrier {
-    /// Rows arrive as decoded Arrow batches.
-    DecodedBatches,
     /// Rows arrive as Backend-encoded root items of this output kind, in
     /// order; ClientRows items carry this frozen row profile.
     Relayed {

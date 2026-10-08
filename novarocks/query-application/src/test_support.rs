@@ -141,7 +141,7 @@ impl ResultStreamTestProducer {
     > {
         let workload = WorkloadControl::try_new(WorkloadConfig::default(), resource_config)
             .expect("test result workload config must be valid");
-        let capacity = matches!(carrier, crate::api::ResultRowCarrier::Relayed { .. }).then(|| {
+        let capacity = Some({
             workload
                 .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
                 .expect("test result capacity")

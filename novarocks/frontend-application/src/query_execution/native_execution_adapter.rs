@@ -929,7 +929,12 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
                 ))
             });
         }
-        let delivery = match ProductionRootDelivery::bind(description.row_carrier(), result_window)
+        let delivery = match description
+            .row_carrier()
+            .map_err(|error| {
+                QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, error)
+            })
+            .and_then(|carrier| ProductionRootDelivery::bind(carrier, result_window))
         {
             Ok(delivery) => delivery,
             Err(error) => return Box::pin(async move { Err(error) }),
@@ -1006,10 +1011,6 @@ impl ProductionRootDelivery {
         use novarocks_result_contract::RootOutputKind as K;
         use novarocks_workload_control::ResultWindowClass as W;
         match carrier {
-            C::DecodedBatches => Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
-                "distributed execution requires a frozen bounded root output",
-            )),
             C::Relayed { kind, client_rows } => {
                 C::relayed(kind, client_rows)?;
                 let window = window.ok_or_else(|| {
@@ -2898,7 +2899,6 @@ mod tests {
             .unwrap();
         let scope = root.owner.scope();
         let profile = ClientRowProfile::try_new(P::SEGMENT_BYTES, P::ROW_PAYLOAD_BYTES).unwrap();
-        assert!(ProductionRootDelivery::bind(C::DecodedBatches, None).is_err());
         for kind in [
             K::ClientRows,
             K::InternalFacts(InternalResultDomain::ScalarValueV1),

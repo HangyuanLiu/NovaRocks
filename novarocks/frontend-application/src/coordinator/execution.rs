@@ -540,7 +540,7 @@ impl FrontendDistributedQueryCoordinator {
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let parts = request.into_parts();
         let delivery = ProductionRootDelivery::bind(
-            parts.description.row_carrier(),
+            parts.description.row_carrier().map_err(failed)?,
             parts
                 .result_capacity
                 .as_ref()

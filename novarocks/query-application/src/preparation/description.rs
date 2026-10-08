@@ -39,7 +39,7 @@ impl OutputContract {
     /// legacy carrier only for plans whose sink has not yet been migrated.
     fn row_carrier_from_plan(
         plan: &novarocks_physical_plan::PhysicalPlan,
-    ) -> Result<crate::api::ResultRowCarrier, String> {
+    ) -> Result<Option<crate::api::ResultRowCarrier>, String> {
         use novarocks_physical_plan::FragmentSink;
         use novarocks_result_contract::{ClientRowProfile, RootOutputKind, RootProfileV1};
         let sink = plan
@@ -63,9 +63,13 @@ impl OutputContract {
                     None
                 };
                 crate::api::ResultRowCarrier::relayed(contract.kind(), profile)
+                    .map(Some)
                     .map_err(|error| error.to_string())
             }
-            Some(FragmentSink::Result) | None => Ok(crate::api::ResultRowCarrier::DecodedBatches),
+            Some(FragmentSink::Result) => {
+                Err("completed result sink has no frozen root purpose".into())
+            }
+            None => Ok(None),
             _ => Err("completed result port does not name a result sink".into()),
         }
     }
@@ -294,7 +298,7 @@ pub struct FrozenExecutionDescription {
     kind: QueryExecutionKind,
     scan_identities: Arc<[crate::api::PlanScanIdentity]>,
     output: OutputContract,
-    row_carrier: crate::api::ResultRowCarrier,
+    row_carrier: Option<crate::api::ResultRowCarrier>,
     effect: ExecutionEffect,
     recovery: RecoveryMode,
     residuals: Arc<[ResidualResponsibility]>,
@@ -320,6 +324,9 @@ impl FrozenExecutionDescription {
         let plan = candidate.plan().version();
         let expected_output = OutputContract::from_completed_plan(kind, candidate.plan())?;
         let row_carrier = OutputContract::row_carrier_from_plan(candidate.plan())?;
+        if matches!(output, OutputContract::Rows(_)) && row_carrier.is_none() {
+            return Err("row output requires a frozen root result sink".into());
+        }
         if output.fields() != expected_output.fields()
             || matches!(output, OutputContract::CompletionOnly)
                 != matches!(expected_output, OutputContract::CompletionOnly)
@@ -411,8 +418,9 @@ impl FrozenExecutionDescription {
             _ => None,
         }
     }
-    pub const fn row_carrier(&self) -> crate::api::ResultRowCarrier {
+    pub fn row_carrier(&self) -> Result<crate::api::ResultRowCarrier, String> {
         self.row_carrier
+            .ok_or_else(|| "execution has no root row carrier".into())
     }
     pub const fn effect(&self) -> ExecutionEffect {
         self.effect
@@ -471,9 +479,15 @@ mod tests {
         };
         let completed = crate::completed_plan_fixture::completed_values_plan([42; 16]).await;
         let plan = completed.candidate().plan();
+        assert!(
+            OutputContract::row_carrier_from_plan(plan)
+                .unwrap_err()
+                .contains("frozen root purpose")
+        );
+        let completion = crate::completed_plan_fixture::completed_noop_plan([43; 16]);
         assert_eq!(
-            OutputContract::row_carrier_from_plan(plan).unwrap(),
-            crate::api::ResultRowCarrier::DecodedBatches
+            OutputContract::row_carrier_from_plan(completion.candidate().plan()).unwrap(),
+            None
         );
         for output in [
             FrozenRootOutput::CountOnly,
@@ -487,7 +501,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 OutputContract::row_carrier_from_plan(&plan).unwrap(),
-                crate::api::ResultRowCarrier::relayed(kind, None).unwrap()
+                Some(crate::api::ResultRowCarrier::relayed(kind, None).unwrap())
             );
         }
     }
@@ -525,6 +539,28 @@ mod tests {
             .await
             .candidate()
             .clone();
+        let raw_output =
+            OutputContract::from_completed_plan(QueryExecutionKind::Read, candidate.plan())
+                .unwrap();
+        let raw_error = FrozenExecutionDescription::for_completed_plan(
+            QueryExecutionKind::Read,
+            candidate.clone(),
+            Vec::new(),
+            raw_output,
+            ExecutionEffect::None,
+            RecoveryMode::NoRecovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .unwrap_err();
+        assert!(raw_error.contains("frozen root purpose"), "{raw_error}");
+        let render = novarocks_sql::compiler::client_render_schema(candidate.plan(), 0).unwrap();
+        let candidate = candidate
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
+                render,
+            ))
+            .unwrap();
         let output =
             OutputContract::from_completed_plan(QueryExecutionKind::Read, candidate.plan())
                 .expect("values plan has a row result");
