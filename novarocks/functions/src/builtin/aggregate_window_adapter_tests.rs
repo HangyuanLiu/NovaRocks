@@ -732,7 +732,7 @@ fn unsupported_aggregate_over_shapes_are_refused_by_name() {
         refusal(min.try_window(Some(ties), false, false, &control)),
         "aggregate OVER frame exclusion is unsupported"
     );
-    // SUM, MIN and MAX install the window ABI; AVG installs no pure owner.
+    // The scalar aggregate and OVER path share each exact installed owner.
     let catalog = &sum.catalog;
     for name in ["sum", "min", "max", "avg"] {
         let fixture = Fixture::new(name, nullable(&values), DecimalOverflowPolicy::ReportError);
@@ -742,13 +742,10 @@ fn unsupported_aggregate_over_shapes_are_refused_by_name() {
             &fixture.selected.overload,
             &control,
         );
-        match name {
-            "avg" => assert!(installed.is_err()),
-            _ => assert_eq!(
-                installed.unwrap().implementation().abi,
-                PureKernelAbi::AggregateWindowV1
-            ),
-        }
+        assert_eq!(
+            installed.unwrap().implementation().abi,
+            PureKernelAbi::AggregateWindowV1
+        );
     }
 }
 

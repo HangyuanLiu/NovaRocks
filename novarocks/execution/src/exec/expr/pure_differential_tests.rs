@@ -860,15 +860,8 @@ fn pure_differential_reports_missing_owners_for_the_census() {
         );
         inventory.push(failure.to_string());
     }
-    let aggregate_census: Vec<(&str, Vec<DataType>)> = vec![
-        ("avg", vec![DataType::Int64]),
-        ("count_if", vec![DataType::Boolean]),
-        ("bool_or", vec![DataType::Boolean]),
-        ("group_concat", vec![DataType::Utf8, DataType::Utf8]),
-        ("var_pop", vec![DataType::Float64]),
-        ("covar_pop", vec![DataType::Float64, DataType::Float64]),
-        ("corr", vec![DataType::Float64, DataType::Float64]),
-    ];
+    let aggregate_census: Vec<(&str, Vec<DataType>)> =
+        vec![("group_concat", vec![DataType::Utf8, DataType::Utf8])];
     for (name, types) in aggregate_census {
         let mut spec = AggregateDiffSpec::new(name);
         spec.arguments = types.into_iter().map(column_argument).collect();
@@ -915,7 +908,7 @@ fn pure_differential_owner_inventory_covers_the_builtin_catalogue() {
     assert!(
         installed_named("avg", CatalogKind::Aggregate)
             .iter()
-            .all(|installed| !*installed)
+            .all(|installed| *installed)
     );
     let mut missing = std::collections::BTreeMap::<String, usize>::new();
     for row in inventory.iter().filter(|row| !row.installed) {

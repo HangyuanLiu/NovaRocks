@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder, Float64Builder, StringBuilder};
+use arrow::array::{ArrayRef, BinaryArray};
 use arrow::datatypes::DataType;
 
 use crate::exec::node::aggregate::AggFunction;
@@ -179,63 +179,28 @@ impl AggregateFunction for VarStdAgg {
     }
     fn update_batch(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        match input {
-            AggInputView::Int(view) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if let Some(v) = view.value_at(row) {
-                        update_state(base, offset, v as f64);
-                    }
-                }
-                Ok(())
-            }
-            AggInputView::Float(view) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if let Some(v) = view.value_at(row) {
-                        update_state(base, offset, v);
-                    }
-                }
-                Ok(())
-            }
-            _ => Err("variance/stddev update input type mismatch".to_string()),
+        if !matches!(input, AggInputView::Int(_) | AggInputView::Float(_)) {
+            return Err("variance/stddev update input type mismatch".to_owned());
         }
+        super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
 
     fn merge_batch(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        match input {
-            AggInputView::Binary(arr) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let bytes = arr.value(row);
-                    let (mean, m2, count) = parse_binary_state(bytes)?;
-                    merge_state(base, offset, mean, m2, count);
-                }
-                Ok(())
-            }
-            AggInputView::Utf8(view) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    let Some(s) = view.value_at(row) else {
-                        continue;
-                    };
-                    let (mean, m2, count) = parse_utf8_state(&s)?;
-                    merge_state(base, offset, mean, m2, count);
-                }
-                Ok(())
-            }
-            _ => Err("variance/stddev merge input type mismatch".to_string()),
+        if !matches!(input, AggInputView::Binary(_) | AggInputView::Utf8(_)) {
+            return Err("variance/stddev merge input type mismatch".to_owned());
         }
+        super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
 
     fn build_array(
@@ -245,159 +210,14 @@ impl AggregateFunction for VarStdAgg {
         group_states: &[AggStatePtr],
         output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        if output_intermediate {
-            match &spec.intermediate_type {
-                DataType::Binary => build_intermediate_binary_array(offset, group_states),
-                DataType::Utf8 => build_intermediate_utf8_array(offset, group_states),
-                other => Err(format!(
-                    "variance/stddev intermediate output type unsupported: {:?}",
-                    other
-                )),
-            }
-        } else {
-            build_final_array(spec, offset, group_states)
+        if output_intermediate
+            && !matches!(spec.intermediate_type, DataType::Binary | DataType::Utf8)
+        {
+            return Err(format!(
+                "variance/stddev intermediate output type unsupported: {:?}",
+                spec.intermediate_type
+            ));
         }
+        super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
-}
-
-fn update_state(base: AggStatePtr, offset: usize, v: f64) {
-    let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut DevFromAveState) };
-    let temp = state.count + 1;
-    let delta = v - state.mean;
-    let r = delta / (temp as f64);
-    state.mean += r;
-    state.m2 += (state.count as f64) * delta * r;
-    state.count = temp;
-}
-
-fn merge_state(base: AggStatePtr, offset: usize, mean: f64, m2: f64, count: i64) {
-    if count <= 0 {
-        return;
-    }
-    let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut DevFromAveState) };
-    if state.count == 0 {
-        state.mean = mean;
-        state.m2 = m2;
-        state.count = count;
-        return;
-    }
-    let delta = state.mean - mean;
-    let count_state = state.count as f64;
-    let count_in = count as f64;
-    let sum_count = count_state + count_in;
-    state.mean = mean + delta * (count_state / sum_count);
-    state.m2 = m2 + state.m2 + (delta * delta) * (count_in * count_state / sum_count);
-    state.count += count;
-}
-
-fn parse_binary_state(bytes: &[u8]) -> Result<(f64, f64, i64), String> {
-    if bytes.len() != 24 {
-        return Err(format!(
-            "variance/stddev intermediate binary size mismatch: expected 24, got {}",
-            bytes.len()
-        ));
-    }
-    let mean = f64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let m2 = f64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let count = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    Ok((mean, m2, count))
-}
-
-fn parse_utf8_state(s: &str) -> Result<(f64, f64, i64), String> {
-    let mut it = s.split(',');
-    let mean = it
-        .next()
-        .ok_or_else(|| "variance/stddev intermediate utf8 missing mean".to_string())?
-        .parse::<f64>()
-        .map_err(|e| e.to_string())?;
-    let m2 = it
-        .next()
-        .ok_or_else(|| "variance/stddev intermediate utf8 missing m2".to_string())?
-        .parse::<f64>()
-        .map_err(|e| e.to_string())?;
-    let count = it
-        .next()
-        .ok_or_else(|| "variance/stddev intermediate utf8 missing count".to_string())?
-        .parse::<i64>()
-        .map_err(|e| e.to_string())?;
-    Ok((mean, m2, count))
-}
-
-fn build_intermediate_binary_array(
-    offset: usize,
-    group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
-    let mut builder = BinaryBuilder::new();
-    for &base in group_states {
-        let state = unsafe { &*((base as *mut u8).add(offset) as *const DevFromAveState) };
-        if state.count == 0 {
-            builder.append_null();
-            continue;
-        }
-        let mut buf = [0u8; 24];
-        buf[..8].copy_from_slice(&state.mean.to_le_bytes());
-        buf[8..16].copy_from_slice(&state.m2.to_le_bytes());
-        buf[16..].copy_from_slice(&state.count.to_le_bytes());
-        builder.append_value(buf);
-    }
-    Ok(std::sync::Arc::new(builder.finish()))
-}
-
-fn build_intermediate_utf8_array(
-    offset: usize,
-    group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
-    let mut builder = StringBuilder::new();
-    for &base in group_states {
-        let state = unsafe { &*((base as *mut u8).add(offset) as *const DevFromAveState) };
-        if state.count == 0 {
-            builder.append_null();
-        } else {
-            builder.append_value(format!("{},{},{}", state.mean, state.m2, state.count));
-        }
-    }
-    Ok(std::sync::Arc::new(builder.finish()))
-}
-
-fn build_final_array(
-    spec: &AggSpec,
-    offset: usize,
-    group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
-    let mut builder = Float64Builder::new();
-    for &base in group_states {
-        let state = unsafe { &*((base as *mut u8).add(offset) as *const DevFromAveState) };
-        match spec.kind {
-            AggKind::VariancePop => {
-                if state.count == 0 {
-                    builder.append_null();
-                } else {
-                    builder.append_value(state.m2 / (state.count as f64));
-                }
-            }
-            AggKind::VarianceSamp => {
-                if state.count <= 1 {
-                    builder.append_null();
-                } else {
-                    builder.append_value(state.m2 / ((state.count - 1) as f64));
-                }
-            }
-            AggKind::StddevPop => {
-                if state.count == 0 {
-                    builder.append_null();
-                } else {
-                    builder.append_value((state.m2 / (state.count as f64)).sqrt());
-                }
-            }
-            AggKind::StddevSamp => {
-                if state.count <= 1 {
-                    builder.append_null();
-                } else {
-                    builder.append_value((state.m2 / ((state.count - 1) as f64)).sqrt());
-                }
-            }
-            _ => return Err("variance/stddev output kind mismatch".to_string()),
-        }
-    }
-    Ok(std::sync::Arc::new(builder.finish()))
 }

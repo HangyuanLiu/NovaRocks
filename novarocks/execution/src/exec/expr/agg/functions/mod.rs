@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::array::ArrayRef;
+mod aggregate_basic_adapter;
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     AggregateImplementationIdentity, AggregateStateFormatIdentity, FunctionKind,

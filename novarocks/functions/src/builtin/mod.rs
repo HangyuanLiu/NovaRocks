@@ -36,6 +36,8 @@ mod binding_control_tests;
 
 mod abs;
 mod abs_owner;
+pub mod aggregate_basic;
+mod aggregate_basic_owner;
 mod aggregate_count;
 mod aggregate_count_owner;
 mod aggregate_count_window;

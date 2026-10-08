@@ -1501,3 +1501,7 @@ pub(crate) fn render(array: &ArrayRef, row: usize) -> String {
 #[cfg(test)]
 #[path = "pure_differential_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pure_differential_a1_tests.rs"]
+mod a1_tests;
