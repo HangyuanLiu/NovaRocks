@@ -1,0 +1,252 @@
+{
+  "source_revision": "9695b3965fed7996448e79fc4ac156762622b931",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "server_sha256": "37081b671d1a293b3053b88bd839c7c145f0c443a20588e1cc849ef9de969eed",
+  "runner_sha256": "c4bbbf1d172f248bb44caf9c2d907f1d8e48109b12f47831c534bcec3a68fcb1",
+  "input_sha256": "3f8813c8c8205ba724ad8c3dc6eeecae4562681244e46d12910de360a1c45752",
+  "exit_code": 0,
+  "duration_seconds": 4.939,
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 native producer exit with context-held W2 Data and End",
+  "outcome": "passed",
+  "actual_server_build_identity": "9695b3965fed7996448e79fc4ac156762622b931",
+  "native_compatibility_id": "de762440531d58152ef997c580f1c38d4bdadb13f7b7acbd36bdfcc4a1912923",
+  "scope": "Direct context-held census of producer guard exit and terminal task record with W2 Data plus End unacknowledged; normal client wire drain and public owner convergence. Excludes released backing Arc tails, thread/allocator dealloc, ACK-only RPC and ClosingRow full pools.",
+  "held_samples": [
+    {
+      "applied_receive_buffer_bytes": 4096,
+      "elapsed_micros": 179985,
+      "matches": false,
+      "roots": [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    },
+    {
+      "applied_receive_buffer_bytes": 4096,
+      "elapsed_micros": 298393,
+      "matches": true,
+      "roots": [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 1,
+          "data_positions": 2,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 1,
+          "metadata_bytes": 4215,
+          "metadata_holders": 0,
+          "payload_bytes": 1048584,
+          "producers_exited": 1,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 2,
+          "terminal_task_records": 1
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    },
+    {
+      "applied_receive_buffer_bytes": 4096,
+      "elapsed_micros": 431988,
+      "matches": true,
+      "roots": [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 1,
+          "data_positions": 2,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 1,
+          "metadata_bytes": 4215,
+          "metadata_holders": 0,
+          "payload_bytes": 1048584,
+          "producers_exited": 1,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 2,
+          "terminal_task_records": 1
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    }
+  ],
+  "wire": {
+    "rows": 1,
+    "row_payload_bytes": 1048580,
+    "wire_bytes": 1048640,
+    "packets": 5,
+    "columns": 1,
+    "schema": [
+      {
+        "name": "payload",
+        "mysql_type": 253
+      }
+    ],
+    "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+    "wire_prefix_sha256": "ebbaa292c9a7a161de303b213233dbc0a0fbbdb17588546af94aa4233bdf7aaa",
+    "first_payload_chunk_micros": 294875,
+    "first_row_micros": 354689,
+    "elapsed_micros": 354705,
+    "row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+    "error": null
+  },
+  "process_exit_checks": [
+    {
+      "pid": 98485,
+      "gone": true
+    },
+    {
+      "pid": 98486,
+      "gone": true
+    },
+    {
+      "pid": 98487,
+      "gone": true
+    },
+    {
+      "pid": 98488,
+      "gone": true
+    }
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-root-context-retention-native-20261009/driver.log",
+      "sha256": "d7e6e29b67ec5ee8db2d49ffc74fd137966d533238bbb54aba09e7a2633df959"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-context-retention-native-20261009/driver-status.json",
+      "sha256": "02bcd3e3a6ec28a73b6e6490912ed73898efc559d0d9e6a5fe563d95cd653c29"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-context-retention-native-20261009/result-delivery-producer-exit-context-retention/owner-barrier-root-retention-after.json",
+      "sha256": "c06af3a9f73bc6020d3df002c8aca4de81bc0a57425ebec6532cb13880c10d95"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-context-retention-native-20261009/result-delivery-producer-exit-context-retention/owner-barrier-root-retention-before.json",
+      "sha256": "e02a32866ac9bff691339aced87fbd3c448f9b19b4e95fc8182fbe8e21f30f4d"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-context-retention-native-20261009/result-delivery-producer-exit-context-retention/root-context-held-census.json",
+      "sha256": "c8ab3c758fd10088c9498d093f17249fb7da7c2b2ccebcac2932cecae634c891"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-context-retention-native-20261009/result-delivery-producer-exit-context-retention/root-context-retention-wire.json",
+      "sha256": "2e19f2a883e6d6a7ceb51abaacf3445efddf24571010a6c59d66790debb141c8"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-context-retention-native-20261009/result-delivery-producer-exit-context-retention/scenario-evidence.json",
+      "sha256": "64c261dd47d0434a6c4b0ad25081e4dffc0ca11aa8e1af620f4badf650040986"
+    }
+  ]
+}

@@ -186,3 +186,10 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 - 观测 producer guard exit、task 退休记录、Data/End/ACK/seal 与原 segment/read/send/reservation/metadata holders。范围只到 context 当前持有的 root；移出 context 的固定 core backing、其它 Arc tail、线程/allocator dealloc 不在此 census，归零不证明全部 physical backing 最后退出。
 - 新 `result-delivery/producer-exit-context-retention` 已在首次 native 执行前冻结：一个 1MiB 字符串形成 S+8 Native 行字节；校验 metadata 后停止读行，连续两次要求一个 context-held root 的 W=2、End 已发布但未ACK、producer guard exited、task 已退休，恢复后检查独立 frozen schema/row bytes/packet/digest。客户端 connect 前申请4KiB SO_RCVBUF并记录OS应用值，不外推真实TCP window/第三方容量，不修改server profile。
 - Worker lib322、Backend metrics16、system runner98 PASS/0 FAIL/2既有ignored；前两次 alias counter 预期及第3次 test fixture scan coverage 错误均保留日志并修正。独立只读审查和 Python literal oracle 一致。收据 `p09-root-context-retention-focused-20261009.json`；原生尚未执行。P09其它门/P00b/P10/final及两个待裁决决定仍OPEN，goal active，无push/PR/归档。
+
+
+### 2026-10-09：P09 producer-exit/context-retention 原生与 C0 PASS
+
+- 干净 `9695b3965fed7996448e79fc4ac156762622b931`、实际相同 build identity，原生1FE+3BE新场景 PASS（4.939s）。三次census中最后两次连续命中：仅BE1持一个root，task退休记录1、producer guard exited1/running0、Data positions2/physical segments2、payload1048584B、End已发布但未ACK、sealed0。恢复后MySQL一行1048580B/5packets，严格schema与独立SHA256一致；前后公开owner barrier通过，4个精确PID均退出。
+- 相同干净源码的dev cargo-only C0 PASS（563s），12280 PASS/0 FAIL/7既有ignored；守卫、fmt、all-targets、System allocator、Clippy、build、error manifest、component、Server owner、binary smoke通过。C0有一处新增test-only from_ref建议，拟作窄清理；无产品语义失败。原始目录 `logs/ci-full/20261009-065102`。
+- 收据 `p09-root-context-retention-native-pass-20261009.json` 与 `p09-root-context-retention-c0-pass-20261009.json` 保留准确source/binary身份、采样与全部raw hashes。只证明context-held阶段与正常wire/公开owner收敛；归零不证明移出context的fixed backing/Arc tail/allocator最后退出。ACK-only、ClosingRow具体容量/partial矩阵、real跨provider CL、transport/P00b/P10/final及两个待裁决决定仍OPEN，goal active，无push/PR/归档。
