@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "outcome": "diagnostic expected-value correction required; not a passing baseline",
+  "runs": [
+    {
+      "label": "candidate",
+      "status": {
+        "source_revision": "58d972d2d71e26601047d88f83204f9ae602b09b",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+        "launch_profile": "fault-scenario",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "slow_root.sql",
+            "exit_code": 1,
+            "duration_seconds": 30.496
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "log": {
+        "path": "logs/mem-1-m07/p09-slow-root-candidate-20261009/decimal.log",
+        "sha256": "49ff52ebf0c9ad4f928b1c7da7b94837a43687bdcc3d872e5823b77cffddd820"
+      },
+      "classification": "actual server write-deadline failure"
+    },
+    {
+      "label": "old-main",
+      "status": {
+        "source_revision": "58d972d2d71e26601047d88f83204f9ae602b09b",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/mem-1-m07-main-baseline/NovaRocks/target/release/novarocks",
+        "server_sha256": "5c5bdea5490f209cc0140c1b1e73a30f6ce32c48052673e5fee23ea1300f5756",
+        "launch_profile": "performance",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "slow_root.sql",
+            "exit_code": 1,
+            "duration_seconds": 35.274
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "log": {
+        "path": "logs/mem-1-m07/p09-slow-root-old-main-20261009/decimal.log",
+        "sha256": "ca79ce53fae59db678a9d5e823cc05c1c9d72a285da166f10fc962c13cb5bbe5"
+      },
+      "classification": "query completed; incorrect diagnostic golden refused"
+    }
+  ],
+  "all_8_pids_absent": true,
+  "pids": [
+    98102,
+    98103,
+    98104,
+    98105,
+    98251,
+    98252,
+    98253,
+    98254
+  ],
+  "v2": {
+    "path": "docs/testing/mem-1-m07/inputs/slow-root-write-deadline-diagnostic-v2.json",
+    "sha256": "e4c4556ce8d4361bd755a1e8ade77b0bb3c53cabf6ca721641c5a3fdc092ba1c"
+  },
+  "local_only": true
+}
