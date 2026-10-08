@@ -1246,4 +1246,10 @@ mod cast_decimal_text_oracle_tests;
 mod legacy_time_text_baseline_tests;
 
 #[cfg(test)]
+mod legacy_largeint_text_baseline_tests;
+
+#[cfg(test)]
+mod cast_largeint_text_oracle_tests;
+
+#[cfg(test)]
 mod legacy_timestampadd_baseline_tests;

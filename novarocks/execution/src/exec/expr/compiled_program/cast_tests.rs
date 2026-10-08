@@ -1090,3 +1090,6 @@ mod cast_temporal_carrier_tests;
 
 #[path = "cast_decimal_text_tests.rs"]
 mod decimal_text_profile_tests;
+
+#[path = "cast_largeint_text_tests.rs"]
+mod largeint_text_profile_tests;

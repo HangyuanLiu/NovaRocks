@@ -67,6 +67,7 @@ mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
 pub mod largeint;
+pub mod largeint_text;
 pub mod math_numeric;
 pub mod pattern_memo;
 mod pure_catalogue;

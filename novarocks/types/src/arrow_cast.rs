@@ -1903,17 +1903,7 @@ fn cast_utf8_to_largeint_binary(child_array: &ArrayRef) -> Result<ArrayRef, Stri
 }
 
 fn cast_largeint_binary_to_utf8(child_array: &ArrayRef) -> Result<ArrayRef, String> {
-    let arr = largeint::as_fixed_size_binary_array(child_array, "cast LARGEINT to VARCHAR")?;
-    let mut builder = StringBuilder::new();
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            builder.append_null();
-            continue;
-        }
-        let value = largeint::value_at(arr, row)?;
-        builder.append_value(value.to_string());
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    novarocks_functions::largeint_text::cast_array(child_array)
 }
 
 #[cfg(test)]

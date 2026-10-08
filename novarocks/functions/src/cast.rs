@@ -27,10 +27,10 @@ use crate::{
     ScopedExpressionEffects,
 };
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_cast::cast::{cast_num_to_bool, num_cast};
 use arrow_schema::{DataType, TimeUnit};
@@ -306,6 +306,7 @@ impl DecimalTextSource {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    LargeIntText,
     DecimalText {
         source: DecimalTextSource,
         scale: i8,
@@ -411,6 +412,22 @@ impl PreparedCastRecipe {
                         allow_throw_exception,
                     });
                 }
+            }
+            if source.data_type == DataType::FixedSizeBinary(16)
+                && result.data_type == DataType::Utf8
+            {
+                work.step()?;
+                if source.nullable && !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::LargeIntText,
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
             }
             let source_kind =
                 Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
@@ -554,7 +571,7 @@ impl PreparedCastRecipe {
                 matches!(self.result.data_type, DataType::Date32 | DataType::Utf8)
             }
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
-            CastBody::Identity | CastBody::Text { .. } => false,
+            CastBody::LargeIntText | CastBody::Identity | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {
                 (source.is_float()
                     && matches!(target, Target::Signed(_) | Target::Unsigned(_))
@@ -588,6 +605,32 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if self.body == CastBody::LargeIntText {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| array.as_any().is::<FixedSizeBinaryArray>(),
+                )?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                let source = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .ok_or_else(|| internal("checked LARGEINT text has a foreign carrier"))?;
+                work.flush()?;
+                let text = crate::largeint_text::value_text(source, row)
+                    .map_err(|error| internal(&error))?;
+                work.flush()?;
+                return Ok(CastRowResult::Text(text));
+            }
             if let CastBody::DecimalText { source, scale } = self.body {
                 let row = self.checked_row_with_shape(
                     argument,
@@ -1109,3 +1152,7 @@ mod temporal_carrier_tests;
 #[cfg(test)]
 #[path = "cast_decimal_text_tests.rs"]
 mod decimal_text_tests;
+
+#[cfg(test)]
+#[path = "cast_largeint_text_tests.rs"]
+mod largeint_text_tests;
