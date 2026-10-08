@@ -42,6 +42,8 @@ use crate::{
 pub(super) fn operation(name: &str) -> Option<CalendarExtendedOp> {
     match name {
         "date_trunc" => Some(CalendarExtendedOp::Trunc),
+        "unix_timestamp" => Some(CalendarExtendedOp::UnixTimestamp),
+        "to_datetime_ntz" => Some(CalendarExtendedOp::EpochNtz),
         "timestampdiff" => Some(CalendarExtendedOp::TimestampDiff),
         "date_add" | "adddate" | "days_add" => Some(CalendarExtendedOp::DaysShift(1)),
         "date_sub" | "subdate" | "days_sub" => Some(CalendarExtendedOp::DaysShift(-1)),
@@ -344,6 +346,14 @@ impl PureScalarImplementation for CalendarExtendedOwner {
                     FunctionBindingError::Control(error) => compile_failure(error),
                     _ => invalid("extended calendar preparation has a stale selected binding"),
                 })?;
+            if self.operation == CalendarExtendedOp::UnixTimestamp
+                && contract.selected().argument_types.is_empty()
+            {
+                return Err(invalid(&format!(
+                    "{} rejects the zero-argument clock form: an explicit statement-time contract is required",
+                    self.declaration.function_id().as_str()
+                )));
+            }
             if matches!(self.operation, CalendarExtendedOp::MonthsShift(_))
                 && contract.result_type().data_type == arrow_schema::DataType::Date32
             {

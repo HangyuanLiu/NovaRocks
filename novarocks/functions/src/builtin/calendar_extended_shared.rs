@@ -83,6 +83,8 @@ impl<'call, 'batch> CalendarInput<'call, 'batch> {
 #[derive(Clone, Copy, Debug)]
 pub enum CalendarOperation {
     Trunc,
+    UnixTimestamp,
+    EpochNtz,
     TimestampDiff,
     DaysShift(i64),
     MonthsShift(i32),
@@ -103,6 +105,8 @@ impl CalendarOperation {
     fn operation(self) -> CalendarExtendedOp {
         match self {
             Self::Trunc => CalendarExtendedOp::Trunc,
+            Self::UnixTimestamp => CalendarExtendedOp::UnixTimestamp,
+            Self::EpochNtz => CalendarExtendedOp::EpochNtz,
             Self::TimestampDiff => CalendarExtendedOp::TimestampDiff,
             Self::DaysShift(factor) => CalendarExtendedOp::DaysShift(factor),
             Self::MonthsShift(factor) => CalendarExtendedOp::MonthsShift(factor),
@@ -204,6 +208,7 @@ pub fn evaluate_legacy_calendar(
     let carrier = if matches!(
         operation,
         CalendarOperation::Timestamp
+            | CalendarOperation::EpochNtz
             | CalendarOperation::MonthsShift(_)
             | CalendarOperation::DurationShift(_)
     ) || (matches!(
@@ -608,4 +613,20 @@ pub fn legacy_add_months_to_datetime(
     months: i32,
 ) -> chrono::NaiveDateTime {
     super::calendar_month::add_months_to_datetime(date, months)
+}
+
+/// The original argument-form Unix projection, also used by the existing clock shell.
+pub fn calendar_unix_seconds(date: chrono::NaiveDateTime) -> i64 {
+    date.and_utc().timestamp()
+}
+/// The original epoch scale split shared by NTZ and legacy timezone-aware shells.
+pub fn legacy_split_epoch_value(value: i64, scale: i64) -> Option<(i64, u32)> {
+    super::calendar_epoch_ntz::split_epoch_value(value, scale)
+}
+/// Pure UTC construction; any timezone projection remains explicit in its caller.
+pub fn legacy_epoch_utc_datetime(
+    seconds: i64,
+    micros: u32,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    super::calendar_epoch_ntz::epoch_utc_datetime(seconds, micros)
 }

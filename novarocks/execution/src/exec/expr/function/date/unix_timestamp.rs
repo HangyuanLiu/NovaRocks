@@ -14,10 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{datetime_from_local_now, extract_datetime_array};
+use super::common::datetime_from_local_now;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::DataType;
+use novarocks_functions::builtin::calendar_extended_shared::{
+    CalendarOperation, calendar_unix_seconds, evaluate_legacy_calendar,
+};
 use std::sync::Arc;
 
 pub fn eval_unix_timestamp(
@@ -26,17 +30,17 @@ pub fn eval_unix_timestamp(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let len = chunk.len();
-    let mut out = Vec::with_capacity(len);
     if args.is_empty() {
-        let now = datetime_from_local_now().and_utc().timestamp();
-        out.extend(std::iter::repeat_n(Some(now), len));
-    } else {
-        let arr = arena.eval(args[0], chunk)?;
-        let dts = extract_datetime_array(&arr)?;
-        for dt in dts {
-            out.push(dt.map(|d| d.and_utc().timestamp()));
-        }
+        // Preserve the existing clock source; no pure owner admits this form yet.
+        let now = calendar_unix_seconds(datetime_from_local_now());
+        return Ok(Arc::new(Int64Array::from(vec![Some(now); chunk.len()])) as ArrayRef);
     }
-    Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+    let source = arena.eval(args[0], chunk)?;
+    let rows = source.len();
+    evaluate_legacy_calendar(
+        CalendarOperation::UnixTimestamp,
+        &[source],
+        &DataType::Int64,
+        rows,
+    )
 }

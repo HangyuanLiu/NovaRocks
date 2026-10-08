@@ -63,6 +63,7 @@ mod bit_shift_owner;
 mod bitwise;
 mod bitwise_owner;
 mod calendar_duration;
+mod calendar_epoch_ntz;
 mod calendar_day_number;
 mod calendar_day_number_owner;
 mod calendar_diff;

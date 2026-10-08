@@ -995,3 +995,105 @@ fn pure_differential_s1_duration_date32_declared_carrier_drift_is_refused_by_nam
         );
     }
 }
+#[test]
+fn pure_differential_s1_unix_timestamp_argument_only_all_declared_temporal_profiles() {
+    for source in temporal_sources(0xE101) {
+        assert_scalar_matches_v1(ScalarDiffSpec::new("unix_timestamp").column(source));
+    }
+}
+#[test]
+fn pure_differential_s1_unix_timestamp_argument_profiles_have_nonnull_and_constant_coverage() {
+    for source in [
+        Arc::new(Date32Array::from(vec![0; 8])) as ArrayRef,
+        Arc::new(TimestampMicrosecondArray::from(vec![-1; 8])),
+        Arc::new(StringArray::from(vec!["1969-12-31 23:59:59.999999"; 8])),
+    ] {
+        assert_scalar_matches_v1(ScalarDiffSpec::new("unix_timestamp").typed_column(
+            FunctionValueType::new(source.data_type().clone(), false),
+            Arc::clone(&source),
+        ));
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("unix_timestamp")
+                .constant_rows(8)
+                .constant_array(source.slice(0, 1)),
+        );
+    }
+}
+#[test]
+fn pure_differential_s1_epoch_ntz_both_declared_int64_profiles_and_scales() {
+    let value: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(i64::MIN),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(i64::MAX),
+        None,
+        Some(253_402_300_800),
+        Some(-62_167_219_201),
+    ]));
+    assert_scalar_matches_v1(ScalarDiffSpec::new("to_datetime_ntz").column(Arc::clone(&value)));
+    for scale in [-1, 0, 1, 3, 6, 9, i64::MIN, i64::MAX] {
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("to_datetime_ntz")
+                .column(Arc::clone(&value))
+                .constant_array(Arc::new(Int64Array::from(vec![scale]))),
+        );
+    }
+    assert_scalar_matches_v1(ScalarDiffSpec::new("to_datetime_ntz").column(value).column(
+        Arc::new(Int64Array::from(vec![
+            Some(0),
+            Some(3),
+            Some(6),
+            None,
+            Some(6),
+            Some(0),
+            Some(3),
+            Some(6),
+        ])),
+    ));
+}
+#[test]
+fn pure_differential_s1_epoch_ntz_profiles_have_nonnull_and_constant_coverage() {
+    let value: ArrayRef = Arc::new(Int64Array::from(vec![-1; 8]));
+    let scale: ArrayRef = Arc::new(Int64Array::from(vec![6; 8]));
+    assert_scalar_matches_v1(ScalarDiffSpec::new("to_datetime_ntz").typed_column(
+        FunctionValueType::new(DataType::Int64, false),
+        Arc::clone(&value),
+    ));
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("to_datetime_ntz")
+            .typed_column(
+                FunctionValueType::new(DataType::Int64, false),
+                Arc::clone(&value),
+            )
+            .typed_column(
+                FunctionValueType::new(DataType::Int64, false),
+                Arc::clone(&scale),
+            ),
+    );
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("to_datetime_ntz")
+            .constant_rows(8)
+            .constant_array(value.slice(0, 1)),
+    );
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("to_datetime_ntz")
+            .constant_rows(8)
+            .constant_array(value.slice(0, 1))
+            .constant_array(scale.slice(0, 1)),
+    );
+}
+
+#[test]
+fn pure_differential_s1_unix_zero_argument_clock_form_is_explicitly_refused() {
+    let failure = run_scalar_differential(&ScalarDiffSpec::new("unix_timestamp").constant_rows(2))
+        .expect_err("the clock form requires its explicit statement-time contract");
+    let DifferentialFailure::Specialization(message) = failure else {
+        panic!("expected zero-argument preparation refusal, got {failure}");
+    };
+    assert!(message.contains("unix_timestamp"), "{message}");
+    assert!(
+        message.contains("explicit statement-time contract is required"),
+        "{message}"
+    );
+}

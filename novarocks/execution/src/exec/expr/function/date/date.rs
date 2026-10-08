@@ -22,7 +22,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Date32Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, Utc};
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -120,24 +120,13 @@ fn eval_to_datetime_inner(
 }
 
 fn split_epoch_value(value: i64, scale: i64) -> Option<(i64, u32)> {
-    match scale {
-        0 => Some((value, 0)),
-        3 => {
-            let secs = value.div_euclid(1_000);
-            let micros = (value.rem_euclid(1_000) as u32) * 1_000;
-            Some((secs, micros))
-        }
-        6 => {
-            let secs = value.div_euclid(1_000_000);
-            let micros = value.rem_euclid(1_000_000) as u32;
-            Some((secs, micros))
-        }
-        _ => None,
-    }
+    novarocks_functions::builtin::calendar_extended_shared::legacy_split_epoch_value(value, scale)
 }
 
 fn epoch_to_datetime(seconds: i64, micros: u32, timezone_aware: bool) -> Option<NaiveDateTime> {
-    let dt_utc = DateTime::<Utc>::from_timestamp(seconds, micros * 1_000)?;
+    let dt_utc = novarocks_functions::builtin::calendar_extended_shared::legacy_epoch_utc_datetime(
+        seconds, micros,
+    )?;
     if timezone_aware {
         Some(dt_utc.with_timezone(&Local).naive_local())
     } else {
@@ -673,7 +662,54 @@ pub fn eval_to_datetime_ntz(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_to_datetime_inner(arena, expr, args, chunk, false)
+    use novarocks_functions::builtin::calendar_extended_shared::{
+        CalendarOperation, evaluate_legacy_calendar,
+    };
+    let output_type = arena
+        .data_type(expr)
+        .cloned()
+        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
+    let source = arena.eval(args[0], chunk)?;
+    if args.len() == 1
+        && matches!(
+            source.data_type(),
+            DataType::Date32
+                | DataType::Timestamp(_, _)
+                | DataType::Utf8
+                | DataType::FixedSizeBinary(16)
+        )
+    {
+        let rows = source.len();
+        return evaluate_legacy_calendar(
+            CalendarOperation::Timestamp,
+            &[source],
+            &output_type,
+            rows,
+        );
+    }
+    if args.len() == 1 {
+        let values = extract_i64_array(&source, "to_datetime")?;
+        let rows = values.len();
+        let source: ArrayRef = Arc::new(arrow::array::Int64Array::from(values));
+        return evaluate_legacy_calendar(
+            CalendarOperation::EpochNtz,
+            &[source],
+            &output_type,
+            rows,
+        );
+    }
+    let scale = arena.eval(args[1], chunk)?;
+    let values = extract_i64_array(&source, "to_datetime")?;
+    let scales = extract_i64_array(&scale, "to_datetime")?;
+    let rows = values.len();
+    let source: ArrayRef = Arc::new(arrow::array::Int64Array::from(values));
+    let scale: ArrayRef = Arc::new(arrow::array::Int64Array::from(scales));
+    evaluate_legacy_calendar(
+        CalendarOperation::EpochNtz,
+        &[source, scale],
+        &output_type,
+        rows,
+    )
 }
 
 pub fn eval_timestamp(

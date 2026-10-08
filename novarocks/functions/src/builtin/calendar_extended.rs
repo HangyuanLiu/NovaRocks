@@ -38,6 +38,8 @@ use std::{alloc::Layout, sync::Arc};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CalendarExtendedOp {
     Trunc,
+    UnixTimestamp,
+    EpochNtz,
     TimestampDiff,
     DaysShift(i64),
     MonthsShift(i32),
@@ -383,6 +385,9 @@ pub(super) fn evaluate_calendar_input<'a>(
     if let CalendarExtendedOp::DurationShift(operation) = op {
         return super::calendar_duration::evaluate_duration_shift(operation, input, control);
     }
+    if op == CalendarExtendedOp::EpochNtz {
+        return super::calendar_epoch_ntz::evaluate_epoch_ntz(input, control);
+    }
     if let CalendarExtendedOp::Parse(operation) = op {
         return super::calendar_extended_parse::evaluate_calendar_parse(operation, input, control);
     }
@@ -400,7 +405,10 @@ pub(super) fn evaluate_calendar_input<'a>(
                 "extended calendar requires its nullable Physical result",
             ));
         }
-        let arity = if op == CalendarExtendedOp::Timestamp {
+        let arity = if matches!(
+            op,
+            CalendarExtendedOp::Timestamp | CalendarExtendedOp::UnixTimestamp
+        ) {
             1
         } else {
             2
@@ -481,6 +489,11 @@ pub(super) fn evaluate_calendar_input<'a>(
             && target.data_type != DataType::Timestamp(TimeUnit::Microsecond, None)
         {
             return Err(invalid("timestamp requires microsecond output"));
+        }
+        if op == CalendarExtendedOp::UnixTimestamp && target.data_type != DataType::Int64 {
+            return Err(invalid(
+                "unix_timestamp argument form requires its exact Int64 result",
+            ));
         }
         let selection = input.selection();
         output_capacity(selection.len())?;
@@ -566,7 +579,11 @@ pub(super) fn evaluate_calendar_input<'a>(
                     work.flush()?;
                     value
                 } else {
-                    left.and_then(|date| timestamp_value_for_type(date, &target.data_type).ok())
+                    if op == CalendarExtendedOp::UnixTimestamp {
+                        left.map(super::calendar_extended_shared::calendar_unix_seconds)
+                    } else {
+                        left.and_then(|date| timestamp_value_for_type(date, &target.data_type).ok())
+                    }
                 }
             };
             values.push(value);
