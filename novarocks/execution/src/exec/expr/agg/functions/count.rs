@@ -16,6 +16,7 @@
 // under the License.
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
+use novarocks_functions::builtin::aggregate_count_core as count_core;
 
 use crate::exec::node::aggregate::AggFunction;
 
@@ -79,7 +80,7 @@ impl AggregateFunction for CountAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut i64, 0);
+            std::ptr::write(ptr as *mut i64, count_core::initial_state());
         }
     }
 
@@ -100,39 +101,23 @@ impl AggregateFunction for CountAgg {
     ) -> Result<(), String> {
         match input {
             AggInputView::None => {
-                for &base in state_ptrs {
-                    let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                    *slot += 1;
-                }
+                unsafe { count_core::update_legacy_batch(true, None, offset, state_ptrs) };
                 Ok(())
             }
             AggInputView::Any(array) => {
-                if spec.count_all {
-                    for &base in state_ptrs {
-                        let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                        *slot += 1;
-                    }
-                    return Ok(());
-                }
-                if array.null_count() == 0 {
-                    for &base in state_ptrs {
-                        let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                        *slot += 1;
-                    }
-                } else {
-                    for (row, &base) in state_ptrs.iter().enumerate() {
-                        if !array.is_null(row) {
-                            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                            *slot += 1;
-                        }
-                    }
-                }
+                unsafe {
+                    count_core::update_legacy_batch(
+                        spec.count_all,
+                        Some(array.as_ref()),
+                        offset,
+                        state_ptrs,
+                    )
+                };
                 Ok(())
             }
             _ => Err("count batch input type mismatch".to_string()),
         }
     }
-
     fn merge_batch(
         &self,
         _spec: &AggSpec,
@@ -140,83 +125,15 @@ impl AggregateFunction for CountAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        match input {
-            AggInputView::Int(view) => match view {
-                IntArrayView::Int64(arr) => {
-                    let vals = arr.values();
-                    if arr.null_count() == 0 {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                            *slot += vals[row];
-                        }
-                    } else {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            if !arr.is_null(row) {
-                                let slot =
-                                    unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                                *slot += vals[row];
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                IntArrayView::Int32(arr) => {
-                    let vals = arr.values();
-                    if arr.null_count() == 0 {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                            *slot += vals[row] as i64;
-                        }
-                    } else {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            if !arr.is_null(row) {
-                                let slot =
-                                    unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                                *slot += vals[row] as i64;
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                IntArrayView::Int16(arr) => {
-                    let vals = arr.values();
-                    if arr.null_count() == 0 {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                            *slot += vals[row] as i64;
-                        }
-                    } else {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            if !arr.is_null(row) {
-                                let slot =
-                                    unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                                *slot += vals[row] as i64;
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                IntArrayView::Int8(arr) => {
-                    let vals = arr.values();
-                    if arr.null_count() == 0 {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                            *slot += vals[row] as i64;
-                        }
-                    } else {
-                        for (row, &base) in state_ptrs.iter().enumerate() {
-                            if !arr.is_null(row) {
-                                let slot =
-                                    unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                                *slot += vals[row] as i64;
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-            },
-            _ => Err("count merge batch input type mismatch".to_string()),
-        }
+        let source = match input {
+            AggInputView::Int(IntArrayView::Int64(a)) => count_core::CountMergeArray::Int64(a),
+            AggInputView::Int(IntArrayView::Int32(a)) => count_core::CountMergeArray::Int32(a),
+            AggInputView::Int(IntArrayView::Int16(a)) => count_core::CountMergeArray::Int16(a),
+            AggInputView::Int(IntArrayView::Int8(a)) => count_core::CountMergeArray::Int8(a),
+            _ => return Err("count merge batch input type mismatch".to_string()),
+        };
+        unsafe { count_core::merge_legacy_batch(source, offset, state_ptrs) };
+        Ok(())
     }
 
     fn build_array(
@@ -226,12 +143,13 @@ impl AggregateFunction for CountAgg {
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        let mut builder = Int64Builder::new();
-        for &base in group_states {
-            let value = unsafe { *((base as *mut u8).add(offset) as *const i64) };
-            builder.append_value(value);
-        }
-        Ok(Arc::new(builder.finish()))
+        let values = group_states
+            .iter()
+            .map(|&base| Ok(unsafe { *((base as *mut u8).add(offset) as *const i64) }));
+        let result = count_core::build_state_array_observed(values, &mut |_| {
+            Ok::<_, std::convert::Infallible>(())
+        });
+        Ok(result.unwrap_or_else(|never| match never {}))
     }
 }
 

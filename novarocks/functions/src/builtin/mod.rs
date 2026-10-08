@@ -52,6 +52,7 @@ mod aggregate_concat;
 pub mod aggregate_concat_core;
 mod aggregate_concat_owner;
 mod aggregate_count;
+pub mod aggregate_count_core;
 pub mod aggregate_count_distinct_core;
 mod aggregate_count_distinct_kernel;
 mod aggregate_count_distinct_owner;

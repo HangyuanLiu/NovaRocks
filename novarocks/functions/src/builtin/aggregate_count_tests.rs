@@ -429,7 +429,7 @@ fn aggregate_count_independent_count_star_nullable_encoded_and_selected_addresse
             &[EvaluatedArgument::Column(&dictionary)],
             Selection::all(5)
         ),
-        2
+        4
     );
     let pool = ConstantPool::try_new(
         Arc::new(ty(true).try_to_field("original-count-source").unwrap()),
@@ -752,43 +752,58 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
 }
 
 #[test]
-fn aggregate_count_checked_overflow_has_no_state_mutation_and_invocation_latches() {
+fn aggregate_count_original_overflow_panics_in_debug_and_wraps_in_release() {
     let fixture = Fixture::new(&[], DecimalOverflowPolicy::OutputNull);
     let kernel = fixture.kernel(AggregateKernelPhase::Single);
     let ctrl = RuntimeControl::default();
-    let input =
-        SelectedAggregateUpdateInput::try_new(&kernel.contract, Selection::all(1), &[], &[], &ctrl)
-            .unwrap();
-    let mut call = AggregateUpdateInvocation::try_new(&kernel, input, &ctrl).unwrap();
     let mut state = i64::MAX;
-    assert!(matches!(
-        call.update_next(&mut state, &ctrl),
-        Err(KernelFailure::Operational(_))
-    ));
-    assert_eq!(state, i64::MAX);
-    let callbacks = ctrl.trace.lock().unwrap().len();
-    assert!(matches!(
-        call.update_next(&mut state, &ctrl),
-        Err(KernelFailure::InstanceFailed)
-    ));
-    assert_eq!(ctrl.trace.lock().unwrap().len(), callbacks);
+    // The invocation is destroyed inside the unwinding scope. A panic is not
+    // a KernelFailure and must never be used to revive its partially run turn.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let input = SelectedAggregateUpdateInput::try_new(
+            &kernel.contract,
+            Selection::all(1),
+            &[],
+            &[],
+            &ctrl,
+        )
+        .unwrap();
+        let mut call = AggregateUpdateInvocation::try_new(&kernel, input, &ctrl).unwrap();
+        call.update_next(&mut state, &ctrl).unwrap();
+    }));
+    assert_eq!(result.is_err(), cfg!(debug_assertions));
+    assert_eq!(
+        state,
+        if cfg!(debug_assertions) {
+            i64::MAX
+        } else {
+            i64::MIN
+        }
+    );
     let fixture = Fixture::new(&[ty(true)], DecimalOverflowPolicy::OutputNull);
     let kernel = fixture.kernel(AggregateKernelPhase::Final);
     let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(-1)]));
-    let input = SelectedAggregateMergeInput::try_new(
-        &kernel.contract,
-        Selection::all(1),
-        EvaluatedArgument::Column(&values),
-        &ctrl,
-    )
-    .unwrap();
-    let prepared = kernel.prepare_merge(input, &ctrl).unwrap();
     let mut state = i64::MIN;
-    assert!(matches!(
-        kernel.merge_row(&mut state, &prepared, 0, &ctrl),
-        Err(KernelFailure::Operational(_))
-    ));
-    assert_eq!(state, i64::MIN);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let input = SelectedAggregateMergeInput::try_new(
+            &kernel.contract,
+            Selection::all(1),
+            EvaluatedArgument::Column(&values),
+            &ctrl,
+        )
+        .unwrap();
+        let prepared = kernel.prepare_merge(input, &ctrl).unwrap();
+        kernel.merge_row(&mut state, &prepared, 0, &ctrl).unwrap();
+    }));
+    assert_eq!(result.is_err(), cfg!(debug_assertions));
+    assert_eq!(
+        state,
+        if cfg!(debug_assertions) {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    );
 }
 
 fn causes() -> [KernelFailure; 7] {
@@ -940,7 +955,7 @@ fn aggregate_count_emission_layout_and_dishonest_extent_are_rejected_before_grow
 }
 
 #[test]
-fn aggregate_count_update_merge_create_actual_prefixes_and_overflow_ordinary_tail() {
+fn aggregate_count_update_merge_create_actual_prefixes_preserve_seven_causes() {
     let star =
         Fixture::new(&[], DecimalOverflowPolicy::OutputNull).kernel(AggregateKernelPhase::Single);
     let fixture = Fixture::new(&[ty(true)], DecimalOverflowPolicy::OutputNull);
@@ -959,7 +974,7 @@ fn aggregate_count_update_merge_create_actual_prefixes_and_overflow_ordinary_tai
     )
     .unwrap();
     let merge_input = merge.prepare_merge(input, &setup).unwrap();
-    for action in 0..4 {
+    for action in 0..3 {
         let operation = |control: &RuntimeControl| -> Result<(), KernelFailure> {
             match action {
                 0 => star.create_state(control).map(|_| ()),
@@ -971,14 +986,11 @@ fn aggregate_count_update_merge_create_actual_prefixes_and_overflow_ordinary_tai
                     let mut state = 3;
                     merge.merge_row(&mut state, &merge_input, 0, control)
                 }
-                _ => {
-                    let mut state = i64::MAX;
-                    star.update_row(&mut state, &update, 0, control)
-                }
+                _ => unreachable!("the original overflow has its independent panic/wrap fixture"),
             }
         };
         let base = RuntimeControl::default();
-        assert_eq!(operation(&base).is_ok(), action != 3);
+        assert!(operation(&base).is_ok());
         let trace = base.trace.lock().unwrap().clone();
         assert!(trace.last().is_some_and(|units| *units > 0));
         for stop in 0..trace.len() {

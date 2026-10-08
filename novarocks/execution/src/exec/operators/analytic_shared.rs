@@ -1508,32 +1508,29 @@ fn compute_count(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
+    use novarocks_functions::builtin::aggregate_count_core as core;
     let value = args.first().cloned();
-
     let mut b = Int64Builder::with_capacity(total_rows);
-
-    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+    for (part_idx, (start, end)) in window_ctx.partitions().iter().enumerate() {
         let frames = window_ctx.frames(part_idx)?;
-        let mut prefix_non_null: Vec<i64> = Vec::new();
-        if let Some(v) = value.as_ref() {
-            prefix_non_null = vec![0; (*p_end - *p_start) + 1];
-            for (i, row) in (*p_start..*p_end).enumerate() {
-                prefix_non_null[i + 1] = prefix_non_null[i] + if v.is_null(row) { 0 } else { 1 };
-            }
-        }
-        for (row, (frame_start, frame_end)) in (*p_start..*p_end).zip(frames.iter().copied()) {
-            let cnt = if value.is_none() {
-                (frame_end as i64) - (frame_start as i64)
-            } else {
-                let s = frame_start - *p_start;
-                let e = frame_end - *p_start;
-                prefix_non_null[e] - prefix_non_null[s]
-            };
-            let _ = row;
-            b.append_value(cnt);
-        }
+        let source = |row| core::CountValue {
+            array: value.as_ref().unwrap().as_ref(),
+            row,
+        };
+        let source = value.as_ref().map(|_| &source as _);
+        let result = core::window_partition_observed(
+            source,
+            *start,
+            *end,
+            frames.iter().copied(),
+            &mut |n| {
+                b.append_value(n);
+                Ok::<_, std::convert::Infallible>(())
+            },
+            &mut |_| Ok::<_, std::convert::Infallible>(()),
+        );
+        result.unwrap_or_else(|never| match never {});
     }
-
     Ok(Arc::new(b.finish()))
 }
 

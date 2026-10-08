@@ -19,14 +19,14 @@
 //! Frames belong to the original partition owner; host memory grants are external.
 
 use super::aggregate_count::CountKernel;
+use super::aggregate_count_core::{self as core, CountObservation, CountValue};
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
     AggregateKernelPhase, KernelEvaluationControl, KernelFailure, PreparedAggregateKernel,
-    PreparedWindowKernel, SelectedAggregateUpdateInput, SelectedValues, Selection,
-    WindowCallContract, WindowKernelPartition, WindowPartitionInput,
+    PreparedWindowKernel, SelectedValues, Selection, WindowCallContract, WindowKernelPartition,
+    WindowPartitionInput,
 };
-use arrow_schema::DataType;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, WindowFrameExclusion,
 };
@@ -59,24 +59,6 @@ pub(super) fn prepare(
             return Err(invalid(
                 "COUNT OVER requires its exact Single non-DISTINCT aggregate without function ORDER",
             ));
-        }
-        for source in aggregate.contract.logical_argument_types() {
-            // The original analytic COUNT uses physical Array::is_null. These
-            // roots differ from the aggregate's logical NULL contribution rule.
-            // Children of ordinary List/Struct do not change their root NULL rule.
-            let unsupported = matches!(
-                source.data_type,
-                DataType::Null
-                    | DataType::Dictionary(_, _)
-                    | DataType::Union(_, _)
-                    | DataType::RunEndEncoded(_, _)
-            );
-            work.step().map_err(compile_failure)?;
-            if unsupported {
-                return Err(invalid(
-                    "COUNT OVER encoded or bare Null physical NULL profile is unsupported",
-                ));
-            }
         }
         let unsupported = contract
             .options()
@@ -173,7 +155,7 @@ impl PreparedWindowKernel for PreparedCountWindow {
         input: WindowPartitionInput<'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Box<dyn WindowKernelPartition + 'a>, KernelFailure> {
-        observed(control, |work, control| {
+        observed(control, |work, _control| {
             let exact = std::ptr::eq(input.full_input().contract(), self.contract.as_ref());
             work.step()?;
             if !exact {
@@ -184,43 +166,32 @@ impl PreparedWindowKernel for PreparedCountWindow {
             let full = input.full_input();
             let rows = full.partition_rows();
             self.partition_retained_upper_bound(rows)?;
-            let prefix_rows = rows
-                .checked_add(1)
-                .ok_or(KernelFailure::ResourceExhausted)?;
-            // Both actual temporary and retained requests are checked before the
-            // first reserve. Box conversion remains an observed opaque operation.
-            Layout::array::<i64>(prefix_rows).map_err(|_| KernelFailure::ResourceExhausted)?;
-            let mut prefix = reserve(prefix_rows, work)?;
+            // The value core owns the original physical-root prefix arithmetic;
+            // the host supplies exact partition-relative evaluated addresses.
             let mut counts = reserve(rows, work)?;
-            work.flush()?;
-            let update = SelectedAggregateUpdateInput::try_new(
-                self.aggregate.contract(),
-                Selection::all(rows),
-                full.logical_arguments(),
-                &[],
-                control,
+            let argument = full.logical_arguments().first();
+            let source = |row| {
+                let argument = argument.expect("COUNT expression source is present");
+                CountValue {
+                    array: argument.array().as_ref(),
+                    row: argument.value_row(row, row),
+                }
+            };
+            let source = argument.map(|_| &source as &dyn Fn(usize) -> CountValue<'a>);
+            core::window_partition_observed(
+                source,
+                0,
+                rows,
+                input.frames().iter().map(|frame| (frame.start, frame.end)),
+                &mut |value| {
+                    counts.push(value);
+                    Ok(())
+                },
+                &mut |observation| match observation {
+                    CountObservation::Step => work.step(),
+                    CountObservation::OpaqueBoundary => work.flush(),
+                },
             )?;
-            let prepared = self.aggregate.prepare_update(update, control)?;
-            let mut state = self.aggregate.create_state(control)?;
-            prefix.push(state);
-            work.step()?;
-            for row in 0..rows {
-                work.flush()?;
-                self.aggregate
-                    .update_row(&mut state, &prepared, row, control)?;
-                prefix.push(state);
-                work.step()?;
-            }
-            for frame in input.frames() {
-                let value = prefix[frame.end].checked_sub(prefix[frame.start]);
-                work.step()?;
-                let value = value
-                    .filter(|value| *value >= 0)
-                    .ok_or_else(|| internal("COUNT OVER prefix differs from its admitted frame"))?;
-                counts.push(value);
-                work.step()?;
-            }
-            drop(prefix);
             work.flush()?;
             let counts = counts.into_boxed_slice();
             work.flush()?;

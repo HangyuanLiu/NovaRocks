@@ -18,12 +18,12 @@
 //! Exact four-phase non-DISTINCT COUNT lifecycle. Inline state has no heap.
 //! Allocation Layout checks describe requests; host memory grants remain external.
 
+use super::aggregate_count_core::{self as core, CountNullRule, CountObservation, CountValue};
 use crate::kernel_control::{internal, invalid};
-use crate::kernel_input::{EvaluationCheckpoints, logical_is_null};
+use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
-    AggregateCallContract, AggregateStateMemoryPolicy, KernelDiagnostic, KernelEvaluationControl,
-    KernelFailure, PreparedAggregateKernel, SelectedAggregateMergeInput,
-    SelectedAggregateUpdateInput,
+    AggregateCallContract, AggregateStateMemoryPolicy, KernelEvaluationControl, KernelFailure,
+    PreparedAggregateKernel, SelectedAggregateMergeInput, SelectedAggregateUpdateInput,
 };
 use arrow_array::{Array, ArrayRef, Int64Array};
 use std::{alloc::Layout, sync::Arc};
@@ -59,13 +59,10 @@ fn increment(
     contribution: i64,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
-    let next = state.checked_add(contribution);
-    work.step()?;
-    let next = next
-        .ok_or_else(|| KernelFailure::Operational(KernelDiagnostic::new("COUNT state overflow")))?;
-    // Publish only after the arithmetic and its original observation succeed.
-    *state = next;
-    Ok(())
+    core::add_observed(state, contribution, &mut |observation| match observation {
+        CountObservation::Step => work.step(),
+        CountObservation::OpaqueBoundary => work.flush(),
+    })
 }
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     Layout::array::<i64>(rows).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -87,7 +84,7 @@ impl PreparedAggregateKernel for CountKernel {
     fn create_state(&self, control: &dyn KernelEvaluationControl) -> Result<i64, KernelFailure> {
         observed(control, |work| {
             work.step()?;
-            Ok(0)
+            Ok(core::initial_state())
         })
     }
     fn prepare_update<'batch>(
@@ -124,8 +121,15 @@ impl PreparedAggregateKernel for CountKernel {
                 row.ok_or_else(|| invalid("COUNT selected update ordinal is out of bounds"))?;
             if let Some(argument) = prepared.logical_arguments().first() {
                 let address = argument.value_row(ordinal, row);
-                let null = logical_is_null(argument.array().as_ref(), address, 1, work)?;
-                if null {
+                let contributes = core::contributes(
+                    CountValue {
+                        array: argument.array().as_ref(),
+                        row: address,
+                    },
+                    CountNullRule::AggregateRootFast,
+                );
+                work.step()?;
+                if !contributes {
                     return Ok(());
                 }
             }
@@ -213,34 +217,29 @@ fn build<'state, I: ExactSizeIterator<Item = &'state i64>>(
     observed(control, |work| {
         let rows = states.len();
         output_capacity(rows)?;
-        work.flush()?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(rows)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        work.flush()?;
-        for state in states {
-            let within = values.len() < rows;
-            work.step()?;
-            if !within {
-                return Err(internal(
-                    "COUNT emission iterator exceeds its admitted extent",
-                ));
-            }
-            values.push(*state);
-            work.step()?;
-        }
-        // The host supplies an exact iterator; reject a dishonest extent before
-        // Arrow construction rather than accepting a different output shape.
-        let exact = values.len() == rows;
-        work.step()?;
-        if !exact {
-            return Err(internal("COUNT emission iterator changed its exact extent"));
-        }
-        work.flush()?;
-        let output = Arc::new(Int64Array::from(values)) as ArrayRef;
-        work.flush()?;
-        Ok(output)
+        let emitted = std::cell::Cell::new(0usize);
+        let values = states
+            .map(|state| {
+                let ordinal = emitted.get();
+                if ordinal >= rows {
+                    return Err(internal(
+                        "COUNT emission iterator exceeds its admitted extent",
+                    ));
+                }
+                emitted.set(ordinal + 1);
+                Ok(*state)
+            })
+            .chain(
+                std::iter::once_with(|| {
+                    (emitted.get() != rows)
+                        .then(|| Err(internal("COUNT emission iterator changed its exact extent")))
+                })
+                .flatten(),
+            );
+        core::build_state_array_observed(values, &mut |observation| match observation {
+            CountObservation::Step => work.step(),
+            CountObservation::OpaqueBoundary => work.flush(),
+        })
     })
 }
 

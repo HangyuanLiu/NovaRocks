@@ -548,8 +548,7 @@ fn original_nested_metadata_and_child_encoded_nulls_preserve_root_contribution_a
 }
 
 #[test]
-fn encoded_and_bare_null_roots_are_explicitly_refused_instead_of_changing_original_physical_counts()
-{
+fn encoded_and_bare_null_roots_keep_original_physical_counts_and_generic_profiles() {
     let dictionary: ArrayRef = Arc::new(
         DictionaryArray::<Int8Type>::try_new(
             arrow_array::Int8Array::from(vec![Some(0), Some(1), None, Some(1), Some(0)]),
@@ -576,12 +575,28 @@ fn encoded_and_bare_null_roots_are_explicitly_refused_instead_of_changing_origin
         FunctionValueType::new(run, true),
     ] {
         let fixture = Fixture::new(Some(source), DecimalOverflowPolicy::OutputNull);
-        assert!(matches!(
-            fixture.prepare(false, &CompileControl::default()),
-            Err(FunctionSpecializationFailure::Kernel(
-                KernelFailure::InvalidProgram(_)
-            ))
-        ));
+        assert!(fixture.prepare(false, &CompileControl::default()).is_ok());
+    }
+    for (values, expected) in [(dictionary, 4), (null, 5)] {
+        let fixture = Fixture::new(Some(ty(&values, true)), DecimalOverflowPolicy::OutputNull);
+        let prepared = fixture.prepare(false, &CompileControl::default()).unwrap();
+        let args = [EvaluatedArgument::Column(&values)];
+        let peers = [WindowRowRange { start: 0, end: 5 }];
+        let frames = [WindowRowRange { start: 0, end: 5 }; 5];
+        let mut partition = WindowEvaluationPartition::begin(
+            prepared.clone(),
+            geometry(&prepared, &args, &peers, &frames),
+            &Control::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            ints(
+                &partition
+                    .evaluate(Selection::all(5), 5, &Control::default())
+                    .unwrap()
+            ),
+            vec![expected; 5]
+        );
     }
 }
 
@@ -594,10 +609,7 @@ fn compile_callbacks_keep_original_three_causes_on_success_and_ordinary_refusal_
         let fixture = Fixture::new(source, DecimalOverflowPolicy::OutputNull);
         let baseline = CompileControl::default();
         let result = fixture.prepare(false, &baseline);
-        assert_eq!(
-            result.is_ok(),
-            matches!(&fixture.arguments[0], FunctionArgument::Value { value_type, .. } if value_type.data_type == DataType::Int32)
-        );
+        assert!(result.is_ok());
         let trace = baseline.trace.lock().unwrap().clone();
         assert!(trace.len() > 2);
         for at in 0..trace.len() {

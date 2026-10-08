@@ -2012,3 +2012,7 @@ mod tests {
         assert_eq!(completion.stopped_fact().unwrap().conclusion(), Err(first));
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_count_host_panic_tests.rs"]
+mod original_count_host_panic_tests;
