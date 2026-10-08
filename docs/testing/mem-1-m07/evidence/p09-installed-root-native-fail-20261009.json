@@ -1,0 +1,98 @@
+{
+  "source_revision": "63bb7563f9b9d86d4143bb091366dd62225026f9",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "server_sha256": "3bbe247de66dbc4bd8a66f0038192854f7fc6b5daedbb5c9239cc6b9becae05d",
+  "runner_sha256": "52bfebcac9f28fc914ec138f5d408d4e22b56be96a852be05a692b4766a18874",
+  "input_sha256": "3f8813c8c8205ba724ad8c3dc6eeecae4562681244e46d12910de360a1c45752",
+  "protocol_input_sha256": "fffb058f2b1be06821b01727dafec5dc665a6c68b479504727033102ba583a58",
+  "exit_code": 1,
+  "duration_seconds": 4.757,
+  "task": "MEM-1-M07",
+  "outcome": "native-failed",
+  "scope": "First zero-ACK scene failed during exact non-root candidate refusal; final-ACK scene was not executed. First real-root zero-ACK discovery succeeded. Failed probe resumed/joined original client; full original row/schema/digest succeeded. Four exact process PIDs gone. Not installed-root ACK/replay acceptance.",
+  "root_cause": "NativeIngress OwnedResponseBody omitted is_end_stream and size_hint forwarding. Tonic empty status body appeared non-EOS to Hyper, causing empty EOS DATA after initial status headers. Real Hyper+h2 duplex regression fails before fix; strict helper is retained.",
+  "pids_gone": true,
+  "pids": [
+    33883,
+    33884,
+    33885,
+    33886
+  ],
+  "wire": {
+    "rows": 1,
+    "row_payload_bytes": 1048580,
+    "wire_bytes": 1048640,
+    "packets": 5,
+    "columns": 1,
+    "schema": [
+      {
+        "name": "payload",
+        "mysql_type": 253
+      }
+    ],
+    "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+    "wire_prefix_sha256": "ebbaa292c9a7a161de303b213233dbc0a0fbbdb17588546af94aa4233bdf7aaa",
+    "first_payload_chunk_micros": 289231,
+    "first_row_micros": 342212,
+    "elapsed_micros": 342232,
+    "row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+    "error": null
+  },
+  "initial_probe": [
+    {
+      "accepted_consumed_sequence": 0,
+      "actual_grpc_port": 64993,
+      "backend_index": 1,
+      "body_bytes": 0,
+      "body_sha256": null,
+      "grpc_status": 0,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11de1-3623-7653-a02f-cc3c3f363706",
+        "query_hi": -4709662189451991414,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "operation": "discover-exact-root-by-zero-ack",
+      "outcome": "ack_only",
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11de1-3623-7653-a02f-cc3c3f363706",
+        "query_hi": -4709662189451991414,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "response_frame_bytes": 58,
+      "sequence": null
+    }
+  ],
+  "raw_files": [
+    {
+      "path": "logs/mem-1-m07/p09-installed-root-native-v1-20261009/driver-status.json",
+      "sha256": "c109a9e0c5914d76869328800a270b3025a94f58b99c59dfb1e17e947f491a7f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-installed-root-native-v1-20261009/driver.log",
+      "sha256": "fd80e1b96bcf2280106def571cc71f0fff811d93252e53d1a4f1530aeaff20d8"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-installed-root-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/installed-root-protocol.json",
+      "sha256": "d0f2e5d46b4ea25a2bafd24545825948b011f727fb2cf0eea39c3edf7c88567e"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-installed-root-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/root-context-held-census.json",
+      "sha256": "68532dda204ce41a5b6650bbd0ac78e51ec4e2af47f8163c6eafaeafe895e8ab"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-installed-root-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/root-context-retention-wire.json",
+      "sha256": "2559c1a8ec433ffc4a3695c5a3c42031658a554cb83e0bb0761b146e38cfa67d"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-installed-root-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/runtime/33882_1791502658231351000/be_1.log",
+      "sha256": "5ca9dca54bacfc7da218810baf20af8ba73f480988343841b13e3f07c5be68d9"
+    }
+  ]
+}

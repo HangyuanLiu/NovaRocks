@@ -796,6 +796,15 @@ impl HttpBody for OwnedResponseBody {
             Poll::Pending => Poll::Pending,
         }
     }
+    // Preserve the inner protocol's empty/trailers-only response. Ownership
+    // still exits through Drop; inspecting these facts releases no permit.
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().get_ref().is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.as_ref().get_ref().size_hint()
+    }
 }
 
 /// The h2 writer may retain a DATA `Bytes` after the response Body ends. The
@@ -1086,6 +1095,68 @@ mod tests {
         assert!(
             second.is_none(),
             "an over-limit body must not resume reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_empty_grpc_refusal_ends_in_headers_without_data() {
+        let inner = tower::service_fn(|_request: Request<Body>| async {
+            Ok::<_, Infallible>(Status::not_found("unknown context root").into_http())
+        });
+        let ingress = NativeIngressService::new(
+            inner,
+            NativeIngressConfig::default(),
+            "test",
+            false,
+            NativeEndpointDomain::BackendData,
+        );
+        let capacity = ingress.root_result.running.available_permits();
+        let running = Arc::clone(&ingress.root_result.running);
+        let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+            let ingress = ingress.clone();
+            async move { ingress.oneshot(request.map(Body::new)).await }
+        });
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(server_io), service)
+                .await
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let request = Request::builder()
+            .method("POST")
+            .uri(NativeRpcMethod::FetchRootResult.contract().path)
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = response.headers().get("grpc-status").unwrap().clone();
+        let mut body = response.into_body();
+        let ended_in_headers = body.is_end_stream();
+        let data = tokio::time::timeout(Duration::from_secs(2), body.data())
+            .await
+            .unwrap();
+        drop(body);
+        drop(client);
+        driver.abort();
+        server.abort();
+        let _ = driver.await;
+        let _ = server.await;
+        assert_eq!(status, "5");
+        assert!(
+            ended_in_headers,
+            "empty gRPC refusal lost HEADERS END_STREAM through the owner wrapper"
+        );
+        assert!(data.is_none(), "empty gRPC refusal emitted a DATA frame");
+        assert_eq!(
+            running.available_permits(),
+            capacity,
+            "actual empty response exit must release its ingress permit"
         );
     }
 

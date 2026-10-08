@@ -124,3 +124,10 @@ P04 本地出站HPACK表上限已完成切片；[收据](evidence/p04-h2-send-he
 - runner all-target111 PASS/0 FAIL/2既有ignored；10个helper负例覆盖实际身份/候选与response结构。独立只读复核重算native prefix与Data1/Data2摘要，并修正content-type/status位置宽松点。生产配置/容量/deadline未改；P09其它门/两个裁决/P00b/P10/final仍OPEN，无push/PR/归档。
 
 P09 installed-root pre-native接入修正：此前request builder的wait=0违反生产RootResultRead正值契约，v1未执行native、原输入保留。v2明确冻结100ms request wait并附v1 SHA/correction；原S+8/全部操作/容量/5s链期限/20s actor不变，生产配置不变。新增实际冻结请求经过生产decode_read与zero拒绝反例，runner112 PASS/0 FAIL/2既有ignored。native待执行。
+
+
+### 2026-10-09：P09 native空拒绝响应缺口与修正
+
+- 首次clean63bb/v2 installed-root native失败（4.757s）：准确BE1/stage1/task1 typed零ACK定位成功，stage2/task2非root拒绝无法满足strict trailers-only；后者实为相同execution的第二个真实task，未猜root。失败仍resume/join，原1048580B row/独立schema/hash正常，4精确PID已退出；FinalAck场景未执行。收据 `p09-installed-root-native-fail-20261009.json`，不转换为PASS。
+- 根因是 `native_ingress.rs` 的OwnedResponseBody只poll_frame，未转发inner.is_end_stream/size_hint；内层Tonic空status response被默认false掩盖，Hyper产生empty EOS DATA，违反gRPC拒绝应在status HEADERS上结束的结构。真实Hyper+h2 duplex回归旧码0PASS/1FAIL，修正后Native lib720PASS/0FAIL；收据 `p09-empty-grpc-refusal-focused-20261009.json`。
+- 最小修法仅转发两个inner facts，ownership仍由实际Drop/last DATA alias退出，不主动释放permit、不改变status/容量/deadline/owner分类；strict probe保留。原生复跑待执行，跨共享Native响应包装器修正触发一次C0里程碑。两个待裁决语义与其它P09/P00b/P10/final仍OPEN，无push/PR/归档。
