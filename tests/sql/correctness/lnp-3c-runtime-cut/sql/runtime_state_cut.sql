@@ -41,10 +41,25 @@ INSERT INTO lnp_3c_${suite_uuid0}.ns_${uuid0}.orders VALUES (2, 20);
 INSERT INTO lnp_3c_${suite_uuid0}.ns_${uuid0}.orders VALUES (3, 30);
 
 -- query 5
--- @restart_fe_after_step=true
+-- ANALYZE submits a process-local background job. Observe fresh task
+-- admission before a separate terminal observation orders the FE restart.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @skip_result_check=true
 ANALYZE TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
+
+-- query 5a
+-- Wait through the public status surface; only read-only observations retry.
+-- The restart follows successful publication, never bare job submission.
+-- @retry_count=60
+-- @retry_interval_ms=1000
+-- @result_rows_where=catalog=lnp_3c_${suite_uuid0}
+-- @result_rows_where=namespace=ns_${uuid0}
+-- @result_rows_where=table=orders
+-- @result_rows_count=1
+-- @result_rows_expect=state=SUCCEEDED
+-- @restart_fe_after_step=true
+-- @skip_result_check=true
+SHOW ANALYZE JOBS;
 
 -- query 6
 -- The previous FE incarnation cannot recover a terminal statistics job.
