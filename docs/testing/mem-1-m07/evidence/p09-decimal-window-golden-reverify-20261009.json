@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "stage": "P09 checked-in Decimal window golden verification",
+  "matrix": {
+    "source_revision": "2cb3d9cbaadca2fcb78e9948a4045359f7a65e1d",
+    "source_dirty": false,
+    "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+    "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "launch_profile": "fault-scenario",
+    "results": [
+      {
+        "suite": "decimal",
+        "sql_glob": "test_decimal256_window_functions.sql",
+        "exit_code": 0,
+        "duration_seconds": 1.019
+      }
+    ],
+    "fixture_startup_exit_code": 0,
+    "fixture_cleanup_exit_code": 0
+  },
+  "actual_product_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "passed_steps": 7,
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-decimal-window-golden-reverify-20261009/decimal.log",
+      "sha256": "09013988e7775f7ce93707b4eb91188bd859e67134addf2127c61a2fdf14f8b3"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-decimal-window-golden-reverify-20261009/matrix-status.json",
+      "sha256": "e6f36122c86ffb2e25a270e093efd9020a520473620d417cf3ac8dcd1d655347"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-decimal-window-golden-reverify-20261009/cleanup.log",
+      "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+    }
+  ],
+  "pids": [
+    7230,
+    7231,
+    7232,
+    7248
+  ],
+  "all_pids_absent": true,
+  "golden": {
+    "path": "tests/sql/correctness/decimal/result/test_decimal256_window_functions.result",
+    "sha256": "0ff381b094a6596809c4d194f2b364d5dcd58992b784b78402c0c628fcbb9912"
+  },
+  "local_only": true
+}
