@@ -234,3 +234,7 @@ impl AggregateFunction for CountAgg {
         Ok(Arc::new(builder.finish()))
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_count_original_baseline_tests.rs"]
+mod original_count_baseline_tests;

@@ -1731,3 +1731,9 @@ mod array_repeat_tests;
 #[cfg(test)]
 #[path = "pure_differential_array_repeat_encoded_tests.rs"]
 mod array_repeat_encoded_tests;
+
+#[cfg(test)]
+#[path = "pure_differential/aggregate_count_original_diff_tests.rs"]
+mod aggregate_count_original_diff_tests;
+
+pub(crate) mod aggregate_count_generic_diff_tests;

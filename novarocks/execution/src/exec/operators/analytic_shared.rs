@@ -3705,3 +3705,15 @@ mod tests {
         assert_eq!(actual, vec![10, 10, 10]);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_analytic_count_baseline_tests.rs"]
+mod original_count_baseline_tests;
+
+#[cfg(test)]
+#[path = "analytic_count_original_diff_tests.rs"]
+mod original_count_window_diff_tests;
+
+#[cfg(test)]
+#[path = "analytic_count_generic_diff_tests.rs"]
+mod original_count_generic_window_diff_tests;
