@@ -15,29 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Selected numeric unary computation for exact installed builtin owners.
-//! Arrow builder allocation still requires formal host memory admission.
-
-use std::sync::Arc;
-
+//! ONE original unary computation for both selected owners and v1 shells.
+//! Original Arrow cast/output allocation retains formal host scope obligations.
+use crate::math_numeric::{
+    MathNumericError, MathNumericObservation, NumericArrayView, cast_output_observed,
+};
+use crate::{
+    EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelDiagnostic,
+    KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues, Selection,
+    kernel_control::{internal, invalid},
+    kernel_input::EvaluationCheckpoints,
+};
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array,
-    builder::{Float64Builder, Int64Builder},
+    Int32Array, Int64Array, UInt64Array,
     types::{Decimal128Type, validate_decimal_precision_and_scale},
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-
-use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
-    kernel_control::{internal, invalid},
-    kernel_input::EvaluationCheckpoints,
-};
-
+use std::sync::Arc;
 /// Frozen by the exact preparation owner, never reselected from a SQL name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NumericUnaryOp {
+pub enum NumericUnaryOp {
     Acos,
     Asin,
     Atan,
@@ -91,71 +90,184 @@ impl NumericUnaryOp {
     }
 }
 
-enum NumericInput<'a> {
-    Int8(&'a Int8Array),
-    Int16(&'a Int16Array),
-    Int32(&'a Int32Array),
-    Int64(&'a Int64Array),
-    Float32(&'a Float32Array),
-    Float64(&'a Float64Array),
-    Decimal128(&'a Decimal128Array, i8),
+enum UnaryArgument<'a> {
+    Selected(EvaluatedArgument<'a>, &'a FunctionValueType),
+    Legacy {
+        array: &'a ArrayRef,
+        batch_rows: usize,
+    },
 }
-impl<'a> NumericInput<'a> {
-    fn checked(array: &'a ArrayRef, data_type: &DataType) -> Result<Self, KernelFailure> {
-        if array.data_type() != data_type {
-            return Err(internal(
-                "numeric unary carrier differs from its checked argument",
+impl<'a> UnaryArgument<'a> {
+    fn array(&self) -> &'a ArrayRef {
+        match self {
+            Self::Selected(arg, _) => arg.array(),
+            Self::Legacy { array, .. } => array,
+        }
+    }
+    fn row(&self, ordinal: usize, batch_row: usize) -> usize {
+        match self {
+            Self::Selected(arg, _) => arg.value_row(ordinal, batch_row),
+            Self::Legacy { array, batch_rows } if array.len() == 1 && *batch_rows > 1 => 0,
+            Self::Legacy { .. } => batch_row,
+        }
+    }
+    fn check_row(&self, row: usize) -> Result<(), KernelFailure> {
+        if let Self::Selected(_, source) = self {
+            if row >= self.array().len() {
+                return Err(internal(
+                    "numeric unary selected row is outside its checked carrier",
+                ));
+            }
+            if !source.nullable && self.array().is_null(row) {
+                return Err(internal(
+                    "numeric unary non-null input contains selected SQL NULL",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+enum UnaryOperation<F> {
+    Transform(F),
+    Positive,
+}
+fn checked_view<'a>(
+    array: &'a ArrayRef,
+    source: &FunctionValueType,
+) -> Result<NumericArrayView<'a>, KernelFailure> {
+    if array.data_type() != &source.data_type {
+        return Err(internal(
+            "numeric unary carrier differs from its checked argument",
+        ));
+    }
+    match &source.data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64 => {}
+        DataType::Decimal128(precision, scale) => {
+            validate_decimal_precision_and_scale::<Decimal128Type>(*precision, *scale)
+                .map_err(|_| invalid("numeric unary selected decimal parameters are invalid"))?
+        }
+        _ => {
+            return Err(invalid(
+                "numeric unary input is not an installed numeric profile",
             ));
         }
-        macro_rules! downcast {
-            ($array:ty, $variant:ident) => {
-                array
-                    .as_any()
-                    .downcast_ref::<$array>()
-                    .map(Self::$variant)
-                    .ok_or_else(|| internal("numeric unary selected carrier cannot be downcast"))
-            };
-        }
-        match data_type {
-            DataType::Int8 => downcast!(Int8Array, Int8),
-            DataType::Int16 => downcast!(Int16Array, Int16),
-            DataType::Int32 => downcast!(Int32Array, Int32),
-            DataType::Int64 => downcast!(Int64Array, Int64),
-            DataType::Float32 => downcast!(Float32Array, Float32),
-            DataType::Float64 => downcast!(Float64Array, Float64),
-            DataType::Decimal128(precision, scale) => {
-                validate_decimal_precision_and_scale::<Decimal128Type>(*precision, *scale)
-                    .map_err(|_| {
-                        invalid("numeric unary selected decimal parameters are invalid")
-                    })?;
-                array
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .map(|array| Self::Decimal128(array, *scale))
-                    .ok_or_else(|| internal("numeric unary selected decimal cannot be downcast"))
-            }
-            _ => Err(invalid(
-                "numeric unary input is not an installed numeric profile",
-            )),
-        }
     }
-    fn value(&self, row: usize) -> f64 {
-        match self {
-            Self::Int8(array) => array.value(row) as f64,
-            Self::Int16(array) => array.value(row) as f64,
-            Self::Int32(array) => array.value(row) as f64,
-            Self::Int64(array) => array.value(row) as f64,
-            Self::Float32(array) => array.value(row) as f64,
-            Self::Float64(array) => array.value(row),
-            Self::Decimal128(array, scale) => {
-                // Keep the original i128->f64 conversion before scaling,
-                // including its precision loss and negative-scale behavior.
-                (array.value(row) as f64) / 10_f64.powi(*scale as i32)
-            }
+    NumericArrayView::new(array).map_err(|_| {
+        if matches!(source.data_type, DataType::Decimal128(..)) {
+            internal("numeric unary selected decimal cannot be downcast")
+        } else {
+            internal("numeric unary selected carrier cannot be downcast")
         }
-    }
+    })
 }
-
+fn compute_unary<F: Fn(f64) -> f64>(
+    operation: UnaryOperation<F>,
+    argument: UnaryArgument<'_>,
+    view: Option<NumericArrayView<'_>>,
+    selection: Selection<'_>,
+    target: Option<&DataType>,
+    target_nullable: Option<bool>,
+    control: Option<&dyn KernelEvaluationControl>,
+) -> Result<ArrayRef, MathNumericError> {
+    if matches!(argument, UnaryArgument::Selected(..)) {
+        output_capacity(selection.len())?;
+    }
+    let mut work = control.map(EvaluationCheckpoints::new);
+    let out = match operation {
+        UnaryOperation::Transform(func) => {
+            let view = view.expect("numeric view is checked before the shared transform");
+            let mut values = Vec::with_capacity(selection.len());
+            for (ordinal, batch_row) in selection.iter().enumerate() {
+                if let Some(work) = &mut work {
+                    work.step()?;
+                }
+                let row = argument.row(ordinal, batch_row);
+                argument.check_row(row)?;
+                // Original read converts signed integers / decimals before
+                // arithmetic, and filters only AFTER the original operation.
+                let value = view.value_f64(row).and_then(|value| {
+                    let value = func(value);
+                    value.is_finite().then_some(value)
+                });
+                values.push(value);
+            }
+            if let Some(work) = &mut work {
+                work.flush()?;
+            }
+            let out = Arc::new(Float64Array::from(values)) as ArrayRef;
+            if let Some(work) = &mut work {
+                work.flush()?;
+            }
+            out
+        }
+        UnaryOperation::Positive => {
+            match &argument {
+                // Original POSITIVE preserves its actual source and length,
+                // rather than reading through f64 before Arrow conversion.
+                UnaryArgument::Legacy { array, .. } => Arc::clone(array),
+                UnaryArgument::Selected(_, _) => {
+                    let mut identity = selection.len() == argument.array().len();
+                    for (ordinal, batch_row) in selection.iter().enumerate() {
+                        if let Some(work) = &mut work {
+                            work.step()?;
+                        }
+                        let row = argument.row(ordinal, batch_row);
+                        argument.check_row(row)?;
+                        identity &= row == ordinal;
+                    }
+                    if identity {
+                        Arc::clone(argument.array())
+                    } else {
+                        let mut addresses = Vec::with_capacity(selection.len());
+                        for (ordinal, batch_row) in selection.iter().enumerate() {
+                            if let Some(work) = &mut work {
+                                work.step()?;
+                            }
+                            addresses.push(argument.row(ordinal, batch_row) as u64);
+                        }
+                        if let Some(work) = &mut work {
+                            work.flush()?;
+                        }
+                        let addresses = UInt64Array::from(addresses);
+                        let out =
+                            arrow_select::take::take(argument.array().as_ref(), &addresses, None)
+                                .map_err(|error| {
+                                MathNumericError::Legacy(format!(
+                                    "numeric unary selected gather failed: {error}"
+                                ))
+                            })?;
+                        if let Some(work) = &mut work {
+                            work.flush()?;
+                        }
+                        out
+                    }
+                }
+            }
+        }
+    };
+    let out = cast_output_observed(out, target, &mut |observation| {
+        if let Some(work) = &mut work {
+            match observation {
+                MathNumericObservation::Step => work.step(),
+                MathNumericObservation::OpaqueBoundary => work.flush(),
+            }
+        } else {
+            Ok(())
+        }
+    })?;
+    if target_nullable == Some(false) && out.null_count() != 0 {
+        return Err(internal("numeric unary successful NULL contradicts its result type").into());
+    }
+    if let Some(work) = work {
+        work.finish()?;
+    }
+    Ok(out)
+}
 pub(super) fn evaluate_numeric_unary<'a>(
     op: NumericUnaryOp,
     input: ScalarCallInput<'_, 'a>,
@@ -183,86 +295,76 @@ pub(super) fn evaluate_numeric_unary<'a>(
             "numeric unary logical or result type differs from its exact profile",
         ));
     }
-    let array = argument.array();
-    let view = NumericInput::checked(array, &source.data_type)?;
-    let selection = input.selection();
-    output_capacity(selection.len())?;
-    let mut output = if op.returns_integer() {
-        NumericOutput::Integer(Int64Builder::with_capacity(selection.len()))
+    let view = checked_view(argument.array(), source)?;
+    let operation = if op == NumericUnaryOp::Positive {
+        UnaryOperation::Positive
     } else {
-        NumericOutput::Float(Float64Builder::with_capacity(selection.len()))
+        UnaryOperation::Transform(move |value| op.apply(value))
     };
-    let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        let row = argument.value_row(ordinal, batch_row);
-        if row >= array.len() {
-            return Err(internal(
-                "numeric unary selected row is outside its checked carrier",
-            ));
+    let values = compute_unary(
+        operation,
+        UnaryArgument::Selected(*argument, source),
+        Some(view),
+        input.selection(),
+        Some(&target.data_type),
+        Some(target.nullable),
+        Some(control),
+    )
+    .map_err(|error| match error {
+        MathNumericError::Kernel(error) => error,
+        MathNumericError::Legacy(message) => {
+            KernelFailure::Operational(KernelDiagnostic::new(&message))
         }
-        if array.is_null(row) {
-            if !source.nullable {
-                return Err(internal(
-                    "numeric unary non-null input contains selected SQL NULL",
-                ));
-            }
-            output.append(None, target.nullable)?;
-        } else {
-            // Filter after the operation: atan(Inf) and exp(-Inf) have finite
-            // answers. Positive is equivalent to the old direct safe cast for
-            // these seven exact profiles, with non-finite results sanitized.
-            let value = op.apply(view.value(row));
-            output.append(value.is_finite().then_some(value), target.nullable)?;
-        }
-    }
-    let values = output.finish();
-    work.finish()?;
-    SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+    })?;
+    SelectedValues::try_new(input.selection(), &target.data_type, values, Box::default())
         .map_err(|_| internal("numeric unary compact output violates its selected contract"))
 }
-
-enum NumericOutput {
-    Integer(Int64Builder),
-    Float(Float64Builder),
+/// v1 already evaluated its child and supplies actual carrier / batch facts.
+pub fn evaluate_legacy_numeric_unary(
+    op: NumericUnaryOp,
+    array: &ArrayRef,
+    batch_rows: usize,
+    target: Option<&DataType>,
+) -> Result<ArrayRef, MathNumericError> {
+    let operation = if op == NumericUnaryOp::Positive {
+        UnaryOperation::Positive
+    } else {
+        UnaryOperation::Transform(move |value| op.apply(value))
+    };
+    let view = if op == NumericUnaryOp::Positive {
+        None
+    } else {
+        Some(NumericArrayView::new(array).map_err(MathNumericError::Legacy)?)
+    };
+    compute_unary(
+        operation,
+        UnaryArgument::Legacy { array, batch_rows },
+        view,
+        Selection::all(batch_rows),
+        target,
+        None,
+        None,
+    )
 }
-impl NumericOutput {
-    fn append(&mut self, value: Option<f64>, nullable: bool) -> Result<(), KernelFailure> {
-        match self {
-            Self::Integer(builder) => {
-                // The same scalar conversion used by the locked Arrow safe
-                // Float64->Int64 cast; Rust saturating `as` is not equivalent.
-                let value = value.and_then(arrow_cast::num_cast::<f64, i64>);
-                match value {
-                    Some(value) => builder.append_value(value),
-                    None if nullable => builder.append_null(),
-                    None => {
-                        return Err(internal(
-                            "numeric unary successful NULL contradicts its result type",
-                        ));
-                    }
-                }
-            }
-            Self::Float(builder) => match value {
-                Some(value) => builder.append_value(value),
-                None if nullable => builder.append_null(),
-                None => {
-                    return Err(internal(
-                        "numeric unary successful NULL contradicts its result type",
-                    ));
-                }
-            },
-        }
-        Ok(())
-    }
-    fn finish(self) -> ArrayRef {
-        match self {
-            Self::Integer(mut builder) => Arc::new(builder.finish()),
-            Self::Float(mut builder) => Arc::new(builder.finish()),
-        }
-    }
+/// The original generic unary entry is also used by ROUND/TRUNCATE shells.
+/// Their arithmetic closures and operation selection remain with those owners.
+pub fn evaluate_legacy_unary_f64<F: Fn(f64) -> f64>(
+    array: &ArrayRef,
+    batch_rows: usize,
+    target: Option<&DataType>,
+    func: F,
+) -> Result<ArrayRef, MathNumericError> {
+    let view = NumericArrayView::new(array).map_err(MathNumericError::Legacy)?;
+    compute_unary(
+        UnaryOperation::Transform(func),
+        UnaryArgument::Legacy { array, batch_rows },
+        Some(view),
+        Selection::all(batch_rows),
+        target,
+        None,
+        None,
+    )
 }
-
 /// Check Rust allocation representability, never an application capacity grant.
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     let values = rows

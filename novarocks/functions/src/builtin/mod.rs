@@ -109,7 +109,7 @@ pub mod numeric_elementary;
 mod numeric_elementary_owner;
 mod numeric_mod;
 mod numeric_mod_owner;
-mod numeric_unary;
+pub mod numeric_unary;
 mod numeric_unary_owner;
 mod rand;
 mod rand_owner;

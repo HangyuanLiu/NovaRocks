@@ -63,6 +63,7 @@ mod higher_order_call;
 mod higher_order_kernel;
 mod kernel_control;
 mod kernel_input;
+pub mod math_numeric;
 mod lambda_rows;
 pub mod largeint;
 pub mod pattern_memo;

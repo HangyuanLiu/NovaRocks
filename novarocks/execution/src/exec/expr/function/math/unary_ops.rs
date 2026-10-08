@@ -14,219 +14,193 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{NumericArrayView, cast_output, value_at_f64};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Float64Array};
+use novarocks_functions::builtin::numeric_unary::{self, NumericUnaryOp};
 use std::sync::Arc;
-
-fn finite_or_null(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
-}
-
-pub(super) fn eval_unary_f64<F>(
+pub(super) fn eval_unary_f64<F: Fn(f64) -> f64>(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, String>
-where
-    F: Fn(f64) -> f64,
-{
+) -> Result<ArrayRef, String> {
     let array = arena.eval(args[0], chunk)?;
-    let view = NumericArrayView::new(&array)?;
-    let len = chunk.len();
-    let mut values = Vec::with_capacity(len);
-    for row in 0..len {
-        let v = value_at_f64(&view, row, len);
-        values.push(v.and_then(|x| finite_or_null(func(x))));
-    }
-    let out = Arc::new(Float64Array::from(values)) as ArrayRef;
-    cast_output(out, arena.data_type(expr))
+    numeric_unary::evaluate_legacy_unary_f64(&array, chunk.len(), arena.data_type(expr), func)
+        .map_err(|error| error.to_string())
 }
-
+fn eval_unary(
+    arena: &ExprArena,
+    expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+    op: NumericUnaryOp,
+) -> Result<ArrayRef, String> {
+    let array = arena.eval(args[0], chunk)?;
+    numeric_unary::evaluate_legacy_numeric_unary(op, &array, chunk.len(), arena.data_type(expr))
+        .map_err(|error| error.to_string())
+}
 pub fn eval_acos(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.acos())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Acos)
 }
-
 pub fn eval_asin(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.asin())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Asin)
 }
-
 pub fn eval_atan(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.atan())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Atan)
 }
-
 pub fn eval_ceil(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.ceil())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Ceil)
 }
-
 pub fn eval_cos(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.cos())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cos)
 }
-
 pub fn eval_cbrt(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.cbrt())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cbrt)
 }
-
 pub fn eval_cot(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| 1.0 / v.tan())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cot)
 }
-
 pub fn eval_degress(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.to_degrees())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Degrees)
 }
-
 pub fn eval_dlog1(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| (1.0 + v).ln())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Dlog1)
 }
-
 pub fn eval_exp(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.exp())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Exp)
 }
-
 pub fn eval_floor(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.floor())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Floor)
 }
-
 pub fn eval_ln(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.ln())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Ln)
 }
-
 pub fn eval_log10(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.log10())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Log10)
 }
-
 pub fn eval_log2(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.log2())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Log2)
 }
-
 pub fn eval_radians(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.to_radians())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Radians)
 }
-
 pub fn eval_positive(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let out = arena.eval(args[0], chunk)?;
-    cast_output(out, arena.data_type(expr))
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Positive)
 }
-
 pub fn eval_sin(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.sin())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Sin)
 }
-
 pub fn eval_sqrt(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.sqrt())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Sqrt)
 }
-
 pub fn eval_square(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v * v)
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Square)
 }
-
 pub fn eval_tan(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_unary_f64(arena, expr, args, chunk, |v| v.tan())
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Tan)
 }
-
 #[cfg(test)]
 mod legacy_contract_tests {
     use super::*;
