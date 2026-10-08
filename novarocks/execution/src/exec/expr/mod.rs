@@ -1271,3 +1271,7 @@ mod legacy_map_null_result_baseline_tests;
 
 #[cfg(test)]
 mod legacy_time_slice_baseline_tests;
+
+#[cfg(test)]
+#[path="legacy_array_append_baseline_tests.rs"]
+mod legacy_array_append_baseline_tests;

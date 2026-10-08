@@ -1650,3 +1650,6 @@ mod unixtime_tests;
 
 #[path = "pure_differential/time_slice_tests.rs"]
 mod time_slice_tests;
+
+#[path="pure_differential_array_append_tests.rs"]
+mod array_append_tests;
