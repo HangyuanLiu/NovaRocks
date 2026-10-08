@@ -1232,3 +1232,9 @@ mod legacy_decimal_text_baseline_tests;
 
 #[cfg(test)]
 mod legacy_decimal_text_arena_baseline_tests;
+
+#[cfg(test)]
+mod legacy_split_baseline_tests;
+
+#[cfg(test)]
+mod legacy_null_or_empty_baseline_tests;

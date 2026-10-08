@@ -1603,3 +1603,11 @@ mod concat_tests;
 #[cfg(test)]
 #[path = "pure_differential_md5_family_tests.rs"]
 mod md5_family_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_split_tests.rs"]
+mod split_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_null_or_empty_tests.rs"]
+mod null_or_empty_tests;

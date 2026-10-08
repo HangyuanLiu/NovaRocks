@@ -1792,3 +1792,7 @@ mod tests {
         assert!(values.is_null(2));
     }
 }
+
+#[cfg(test)]
+#[path = "../../legacy_array_agg_baseline_tests.rs"]
+mod legacy_array_agg_baseline_tests;
