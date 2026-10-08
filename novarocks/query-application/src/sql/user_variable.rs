@@ -31,6 +31,12 @@ use novarocks_result_contract::{
 };
 
 use crate::api::QueryResult;
+
+mod borrowed;
+pub use borrowed::{
+    borrowed_scalar_record_to_user_variable_literal,
+    local_mv_scalar_result_to_user_variable_literal,
+};
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::semantic::Literal;
 
@@ -541,13 +547,237 @@ fn single_quoted_user_variable_sql(value: &str) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatch;
 
     use crate::api::{QueryResult, ResultField};
 
     use super::query_result_to_user_variable_literal;
+
+    #[test]
+    fn borrowed_record_keeps_existing_leaf_literals_and_absent_null_semantics() {
+        use novarocks_result_contract::{
+            BorrowedScalarLeaf as V, BorrowedScalarRecord, ScalarField, ScalarLeafCursor,
+            ScalarRecord, ScalarSchema, ScalarValueType as T,
+        };
+        for (ty, value) in [
+            (
+                T::SignedInteger(32),
+                V::SignedInteger {
+                    bits: 32,
+                    value: -7,
+                },
+            ),
+            (T::Boolean, V::Boolean(true)),
+            (T::Date, V::Date(0)),
+            (T::Float64, V::Float64(2.5f64.to_bits())),
+            (T::Float64, V::Float64(f64::NAN.to_bits())),
+            (
+                T::Decimal {
+                    bits: 128,
+                    precision: 18,
+                    scale: 4,
+                },
+                V::Decimal128 {
+                    coefficient: 12345,
+                    precision: 18,
+                    scale: 4,
+                },
+            ),
+            (T::String, V::String("a'b\\c")),
+            (T::Json, V::Json("{\"v\":1}")),
+            (T::Binary, V::Binary(&[0xff, b'\''])),
+            (T::SignedInteger(64), V::NoRows),
+            (T::SignedInteger(64), V::Null),
+        ] {
+            let schema = ScalarSchema::try_new(ScalarField {
+                nullable: true,
+                value_type: ty,
+            })
+            .unwrap();
+            let cursor = ScalarLeafCursor::try_new(&schema, value).unwrap();
+            let mut bytes = vec![0; cursor.encoded_len()];
+            cursor.copy_range(0, &mut bytes).unwrap();
+            let borrowed = BorrowedScalarRecord::try_decode(&schema, &bytes).unwrap();
+            let owned = ScalarRecord::decode_owned(&schema, &bytes).unwrap();
+            assert_eq!(
+                super::borrowed_scalar_record_to_user_variable_literal(&borrowed),
+                super::scalar_record_to_user_variable_literal(&schema, &owned)
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_map_retains_order_and_nested_binary_latin1_semantics() {
+        use novarocks_result_contract::{
+            BorrowedScalarLeaf as V, BorrowedScalarRecord, ScalarField, ScalarRecord,
+            ScalarRecordWriter, ScalarSchema, ScalarValueType as T,
+        };
+        let key = ScalarField {
+            nullable: false,
+            value_type: T::String,
+        };
+        let value = ScalarField {
+            nullable: true,
+            value_type: T::Binary,
+        };
+        let schema = ScalarSchema::try_new(ScalarField {
+            nullable: false,
+            value_type: T::Map {
+                key: Box::new(key.clone()),
+                value: Box::new(value.clone()),
+            },
+        })
+        .unwrap();
+        let mut bytes = Vec::with_capacity(64 * 1024);
+        let mut writer = ScalarRecordWriter::new(&schema, &mut bytes).unwrap();
+        writer.count(1).unwrap();
+        writer.presence(&key, false).unwrap();
+        writer.leaf(&key, V::String("key")).unwrap();
+        writer.presence(&value, false).unwrap();
+        writer.leaf(&value, V::Binary(&[0xff, b'\''])).unwrap();
+        writer.finish(&schema).unwrap();
+        let borrowed = BorrowedScalarRecord::try_decode(&schema, &bytes).unwrap();
+        let owned = ScalarRecord::decode_owned(&schema, &bytes).unwrap();
+        let actual = super::borrowed_scalar_record_to_user_variable_literal(&borrowed).unwrap();
+        assert_eq!(actual, "map('key', 'ÿ''')");
+        assert_eq!(
+            Ok(actual),
+            super::scalar_record_to_user_variable_literal(&schema, &owned)
+        );
+    }
+
+    #[test]
+    fn local_mv_scalar_source_counts_the_header_before_formatting() {
+        for len in [65_512, 65_513] {
+            let result = QueryResult {
+                columns: vec![ResultField::new("TABLE_NAME", DataType::Utf8, false, None)],
+                batches: vec![
+                    RecordBatch::try_from_iter(vec![(
+                        "TABLE_NAME",
+                        Arc::new(StringArray::from(vec!["x".repeat(len)])) as ArrayRef,
+                    )])
+                    .unwrap(),
+                ],
+            };
+            let output = super::local_mv_scalar_result_to_user_variable_literal(&result);
+            if len == 65_512 {
+                assert_eq!(output.unwrap().len(), len + 2);
+            } else {
+                assert_eq!(
+                    output.unwrap_err(),
+                    "scalar value exceeds its admitted profile"
+                );
+            }
+        }
+        let unsupported = QueryResult {
+            columns: vec![ResultField::new("outside", DataType::Int64, false, None)],
+            batches: vec![
+                RecordBatch::try_from_iter(vec![(
+                    "outside",
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                )])
+                .unwrap(),
+            ],
+        };
+        assert_eq!(
+            super::local_mv_scalar_result_to_user_variable_literal(&unsupported).unwrap_err(),
+            "local MV scalar field is outside its closed source contract"
+        );
+    }
+
+    #[test]
+    fn borrowed_nested_record_converts_without_materializing_an_owned_child_tree() {
+        use novarocks_result_contract::{
+            BorrowedScalarRecord, ScalarField, ScalarLeafError, ScalarRecord, ScalarRecordWriter,
+            ScalarSchema, ScalarValueType,
+        };
+        let item = ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::SignedInteger(64),
+        };
+        let schema = ScalarSchema::try_new(ScalarField {
+            nullable: false,
+            value_type: ScalarValueType::List(Box::new(item.clone())),
+        })
+        .unwrap();
+        for count in [3_000, 25_000] {
+            let mut bytes = Vec::with_capacity(64 * 1024);
+            let mut writer = ScalarRecordWriter::new(&schema, &mut bytes).unwrap();
+            writer.count(count).unwrap();
+            for _ in 0..count {
+                writer.presence(&item, true).unwrap();
+            }
+            writer.finish(&schema).unwrap();
+            assert_eq!(
+                ScalarRecord::decode_owned(&schema, &bytes),
+                Err(ScalarLeafError::ValueLimit)
+            );
+            let record = BorrowedScalarRecord::try_decode(&schema, &bytes).unwrap();
+            let result = super::borrowed_scalar_record_to_user_variable_literal(&record);
+            if count == 3_000 {
+                assert_eq!(
+                    result.unwrap(),
+                    format!("[{}NULL]", "NULL, ".repeat(count - 1))
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "scalar SQL literal exceeds its assignment scratch bound"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_nested_struct_preserves_exact_escaping_order_nulls_and_fixed_leaves() {
+        use novarocks_result_contract::{
+            BorrowedScalarLeaf as V, BorrowedScalarRecord, NamedScalarField, ScalarField,
+            ScalarRecordWriter, ScalarSchema, ScalarValueType as T,
+        };
+        let text = ScalarField {
+            nullable: true,
+            value_type: T::String,
+        };
+        let list = ScalarField {
+            nullable: false,
+            value_type: T::List(Box::new(text.clone())),
+        };
+        let boolean = ScalarField {
+            nullable: false,
+            value_type: T::Boolean,
+        };
+        let schema = ScalarSchema::try_new(ScalarField {
+            nullable: false,
+            value_type: T::Struct(vec![
+                NamedScalarField {
+                    name: "items".into(),
+                    field: list.clone(),
+                },
+                NamedScalarField {
+                    name: "enabled".into(),
+                    field: boolean.clone(),
+                },
+            ]),
+        })
+        .unwrap();
+        let mut bytes = Vec::with_capacity(64 * 1024);
+        let mut writer = ScalarRecordWriter::new(&schema, &mut bytes).unwrap();
+        writer.presence(&list, false).unwrap();
+        writer.count(2).unwrap();
+        writer.presence(&text, false).unwrap();
+        writer.leaf(&text, V::String("a'b\\c")).unwrap();
+        writer.presence(&text, true).unwrap();
+        writer.presence(&boolean, false).unwrap();
+        writer.leaf(&boolean, V::Boolean(true)).unwrap();
+        writer.finish(&schema).unwrap();
+        let record = BorrowedScalarRecord::try_decode(&schema, &bytes).unwrap();
+        assert_eq!(
+            super::borrowed_scalar_record_to_user_variable_literal(&record).unwrap(),
+            "row(['a''b\\\\c', NULL], TRUE)"
+        );
+    }
 
     #[test]
     fn converts_text_values_to_escaped_sql_literals() {

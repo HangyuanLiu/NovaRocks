@@ -56,7 +56,9 @@
     "local_view_snapshot_bytes": 131072,
     "variables": 64,
     "local_views": 64,
-    "single_value_bytes": 65536
+    "single_value_bytes": 65536,
+    "scalar_record_bytes": 65536,
+    "scalar_record_header_bytes": 24
   },
   "transport_support": {
     "authenticated_live_frontends_per_backend": 2,

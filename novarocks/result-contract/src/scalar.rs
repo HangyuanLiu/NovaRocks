@@ -25,6 +25,10 @@ use crate::{RootContractError, RootProfileV1};
 /// of one another. These are ceilings, never runtime funding authorities.
 pub struct ScalarProfileV1;
 impl ScalarProfileV1 {
+    /// The complete typed record, including its header and all nested metadata.
+    pub const RECORD_BYTES: usize = 64 * 1024;
+    pub const RECORD_PAYLOAD_BYTES: usize = Self::RECORD_BYTES - crate::SCALAR_LEAF_HEADER_BYTES;
+    /// A staged SQL/session value has its own unchanged source ceiling.
     pub const SINGLE_VALUE_BYTES: usize = 64 * 1024;
     pub const CHILD_BYTES: usize = 128 * 1024;
     pub const ASSIGNMENT_SCRATCH_BYTES: usize = 128 * 1024;

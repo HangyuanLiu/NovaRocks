@@ -20,7 +20,7 @@
 //! The whole typed record -- every nested child with its presence, length and
 //! count bytes -- is written into one record buffer whose capacity the caller
 //! prepaid ([`NativeScalarContainerEncoder::scratch_capacity_bytes`]). The
-//! 64 KiB payload ceiling is checked before each append, so an oversized value
+//! 64 KiB complete-record ceiling is checked before each append, so an oversized value
 //! is refused before its next byte is written and the buffer never grows. The
 //! walk visits at most one node per payload byte, so its work is bounded by
 //! the same ceiling. Turns then copy the finished record into root segments.

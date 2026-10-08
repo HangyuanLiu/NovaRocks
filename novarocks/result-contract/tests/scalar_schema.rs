@@ -439,6 +439,11 @@ fn scalar_ceiling_constants_match_the_frozen_p00_profile() {
     let (object, _) = rest.split_once('}').unwrap();
     for (key, expected) in [
         ("single_value_bytes", ScalarProfileV1::SINGLE_VALUE_BYTES),
+        ("scalar_record_bytes", ScalarProfileV1::RECORD_BYTES),
+        (
+            "scalar_record_header_bytes",
+            novarocks_result_contract::SCALAR_LEAF_HEADER_BYTES,
+        ),
         ("scalar_child_bytes", ScalarProfileV1::CHILD_BYTES),
         (
             "assignment_scratch_bytes",

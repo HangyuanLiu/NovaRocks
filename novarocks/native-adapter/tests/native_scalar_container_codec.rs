@@ -108,7 +108,7 @@ fn emit(mut encoder: NativeScalarContainerEncoder) -> Vec<u8> {
 fn encode(chunk: &Chunk, schema: &ScalarSchema) -> Result<ScalarRecord, NativeScalarLeafError> {
     let encoder = NativeScalarContainerEncoder::try_encode(chunk, schema, prepaid())?;
     let record = emit(encoder);
-    Ok(ScalarRecord::decode(schema, &record).unwrap())
+    Ok(ScalarRecord::decode_owned(schema, &record).unwrap())
 }
 fn i32_value(value: i64) -> ScalarValue {
     ScalarValue::SignedInteger { bits: 32, value }
@@ -287,7 +287,7 @@ fn nested_json_leaf_requires_its_logical_metadata() {
 }
 
 #[test]
-fn whole_record_is_limited_to_one_single_value_allowance() {
+fn whole_record_including_header_is_limited_to_one_record_allowance() {
     let schema = schema(list_of(leaf(true, ScalarValueType::String), true));
     let text = "x".repeat(1024);
     let build = |count: usize| {
@@ -300,8 +300,8 @@ fn whole_record_is_limited_to_one_single_value_allowance() {
         .unwrap();
         chunk(Arc::new(list), true)
     };
-    // count(4) + n * (presence 1 + length 4 + 1024 bytes)
-    let fits = (ScalarProfileV1::SINGLE_VALUE_BYTES - 4) / (1 + 4 + 1024);
+    // Header(24) + count(4) + n * (presence 1 + length 4 + 1024 bytes)
+    let fits = (ScalarProfileV1::RECORD_PAYLOAD_BYTES - 4) / (1 + 4 + 1024);
     let encoder = NativeScalarContainerEncoder::try_encode(&build(fits), &schema, prepaid())
         .expect("a record within the allowance encodes");
     assert!(encoder.encoded_len() <= novarocks_result_contract::SCALAR_RECORD_MAX_BYTES);
@@ -392,7 +392,7 @@ fn small_output_yields_needs_output_until_complete() {
     assert_eq!(record.len(), total);
     assert_eq!(turns, total.div_ceil(output.len()));
     assert_eq!(
-        ScalarRecord::decode(&schema, &record).unwrap(),
+        ScalarRecord::decode_owned(&schema, &record).unwrap(),
         ScalarRecord::Value(ScalarValue::List(vec![i32_value(1), i32_value(2)]))
     );
 }

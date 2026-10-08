@@ -1586,7 +1586,7 @@ impl FrontendQuerySession {
             PreparedQueryOperation::Immediate(operation) => {
                 let result = match operation.into_result() {
                     StatementResult::Query(result) => {
-                        query_result_to_user_variable_literal(&result).map_err(scalar_query_error)
+                        novarocks_query_application::sql::user_variable::local_mv_scalar_result_to_user_variable_literal(&result).map_err(scalar_query_error)
                     }
                     _ => Err(internal_error(
                         "SET scalar query preparation returned non-query immediate output",
@@ -2839,7 +2839,7 @@ async fn consume_governed_scalar_stream(
         return Err(scalar_query_error(message));
     }
     use novarocks_query_application::api::ResultRowCarrier;
-    use novarocks_result_contract::{InternalResultDomain, RootOutputKind, ScalarRecord};
+    use novarocks_result_contract::{BorrowedScalarRecord, InternalResultDomain, RootOutputKind};
     let relayed = matches!(
         schema.row_carrier(),
         ResultRowCarrier::Relayed {
@@ -2898,15 +2898,15 @@ async fn consume_governed_scalar_stream(
                     }
                     let frozen =
                         scalar_schema.expect("a typed scalar carrier has its frozen contract");
-                    let record = ScalarRecord::decode(frozen, delivery.body())
+                    let record = BorrowedScalarRecord::try_decode(frozen, delivery.body())
                         .map_err(|error| format!("SET scalar record: {error}"))?;
-                    let rows = u64::from(matches!(record, ScalarRecord::Value(_)));
+                    let rows = record.rows();
                     if delivery.rows() != rows {
                         return Err(
                             "SET scalar record row count differs from its delivery".to_string()
                         );
                     }
-                    novarocks_query_application::sql::user_variable::scalar_record_to_user_variable_literal(frozen, &record)
+                    novarocks_query_application::sql::user_variable::borrowed_scalar_record_to_user_variable_literal(&record)
                 })();
                 match decoded {
                     Ok(literal) => {

@@ -31,9 +31,9 @@
 //! | Map(key, value) | `u32` LE count, then `count` (key node, value node) pairs |
 //! | Struct(fields) | one node per field, in frozen field order |
 //!
-//! The whole payload of one record, including every nested child and its
+//! The complete record, including its header, every nested child and its
 //! length/count/presence bytes, is limited to
-//! [`ScalarProfileV1::SINGLE_VALUE_BYTES`] (64 KiB). Nesting depth is limited
+//! [`ScalarProfileV1::RECORD_BYTES`] (64 KiB). Nesting depth is limited
 //! by the frozen schema depth. Neither writer nor decoder allocates beyond the
 //! caller's buffer (writer) or the decoded value tree (decoder). Every owned
 //! allocation in the decoded tree is checked against the shared
@@ -53,13 +53,12 @@ use crate::{
 const PRESENT: u8 = 0;
 const NULL_NODE: u8 = 1;
 
-/// The largest complete record: header plus the 64 KiB payload ceiling.
-pub const SCALAR_RECORD_MAX_BYTES: usize =
-    SCALAR_LEAF_HEADER_BYTES + ScalarProfileV1::SINGLE_VALUE_BYTES;
+/// The largest complete record, including its header and nested metadata.
+pub const SCALAR_RECORD_MAX_BYTES: usize = ScalarProfileV1::RECORD_BYTES;
 
 /// Writes one container record into a caller-provided buffer whose capacity
-/// already covers [`SCALAR_RECORD_MAX_BYTES`]. Every append checks the 64 KiB
-/// payload ceiling first, so the buffer never grows past its prepaid capacity.
+/// already covers [`SCALAR_RECORD_MAX_BYTES`]. Every append checks the complete
+/// record ceiling first, so the buffer never grows past its prepaid capacity.
 /// The caller walks its source in the frozen type order; [`Self::finish`]
 /// writes the header once the payload length is known.
 pub struct ScalarRecordWriter<'a> {
@@ -86,7 +85,7 @@ impl<'a> ScalarRecordWriter<'a> {
         let payload = self.output.len() - SCALAR_LEAF_HEADER_BYTES;
         if payload
             .checked_add(bytes.len())
-            .is_none_or(|total| total > ScalarProfileV1::SINGLE_VALUE_BYTES)
+            .is_none_or(|total| total > ScalarProfileV1::RECORD_PAYLOAD_BYTES)
         {
             return Err(ScalarLeafError::ValueLimit);
         }
@@ -277,8 +276,10 @@ pub enum ScalarRecord {
 }
 
 impl ScalarRecord {
-    /// Validate and decode one complete record against its frozen schema.
-    pub fn decode(schema: &ScalarSchema, record: &[u8]) -> Result<Self, ScalarLeafError> {
+    /// Optional owned materialization under the existing CHILD_BYTES ceiling.
+    /// Production consumption uses BorrowedScalarRecord instead, so compact
+    /// records do not acquire a second semantic limit from owned tree size.
+    pub fn decode_owned(schema: &ScalarSchema, record: &[u8]) -> Result<Self, ScalarLeafError> {
         let malformed = ScalarLeafError::MalformedRecord;
         let header = ScalarLeafHeader::decode(
             schema,
@@ -551,7 +552,7 @@ mod tests {
         let len = writer.finish(&schema).unwrap();
         assert_eq!(len, output.len());
         assert_eq!(
-            ScalarRecord::decode(&schema, &output).unwrap(),
+            ScalarRecord::decode_owned(&schema, &output).unwrap(),
             ScalarRecord::Value(ScalarValue::List(vec![
                 ScalarValue::String("a".into()),
                 ScalarValue::Null,
@@ -626,7 +627,7 @@ mod tests {
             .unwrap();
         writer.finish(&map).unwrap();
         assert_eq!(
-            ScalarRecord::decode(&map, &output).unwrap(),
+            ScalarRecord::decode_owned(&map, &output).unwrap(),
             ScalarRecord::Value(ScalarValue::Map(vec![(
                 ScalarValue::SignedInteger {
                     bits: 32,
@@ -645,13 +646,13 @@ mod tests {
     }
 
     #[test]
-    fn whole_record_payload_is_limited_to_64_kib_including_children() {
+    fn whole_record_is_limited_to_64_kib_including_header_and_children() {
         let schema = list_of_strings();
         let ScalarValueType::List(element) = &schema.field().value_type else {
             unreachable!()
         };
-        // Count (4) + presence (1) + length (4) + bytes == 64 KiB exactly.
-        let exact = "x".repeat(ScalarProfileV1::SINGLE_VALUE_BYTES - 9);
+        // Header (24) + count (4) + presence (1) + length (4) + bytes == 64 KiB.
+        let exact = "x".repeat(ScalarProfileV1::RECORD_PAYLOAD_BYTES - 9);
         let mut output = buffer();
         let capacity = output.capacity();
         let mut writer = ScalarRecordWriter::new(&schema, &mut output).unwrap();
@@ -661,18 +662,19 @@ mod tests {
             .leaf(element, BorrowedScalarLeaf::String(&exact))
             .unwrap();
         writer.finish(&schema).unwrap();
-        assert_eq!(output.len(), SCALAR_RECORD_MAX_BYTES);
+        assert_eq!(output.len(), 64 * 1024);
+        assert_eq!(SCALAR_RECORD_MAX_BYTES, 64 * 1024);
         assert_eq!(
             output.capacity(),
             capacity,
             "no growth past the prepaid buffer"
         );
         assert!(matches!(
-            ScalarRecord::decode(&schema, &output).unwrap(),
+            ScalarRecord::decode_owned(&schema, &output).unwrap(),
             ScalarRecord::Value(ScalarValue::List(_))
         ));
 
-        let over = "x".repeat(ScalarProfileV1::SINGLE_VALUE_BYTES - 8);
+        let over = "x".repeat(ScalarProfileV1::RECORD_PAYLOAD_BYTES - 8);
         let mut output = buffer();
         let mut writer = ScalarRecordWriter::new(&schema, &mut output).unwrap();
         writer.count(1).unwrap();
@@ -693,11 +695,11 @@ mod tests {
         no_rows.copy_range(0, &mut a).unwrap();
         null.copy_range(0, &mut b).unwrap();
         assert_eq!(
-            ScalarRecord::decode(&schema, &a).unwrap(),
+            ScalarRecord::decode_owned(&schema, &a).unwrap(),
             ScalarRecord::NoRows
         );
         assert_eq!(
-            ScalarRecord::decode(&schema, &b).unwrap(),
+            ScalarRecord::decode_owned(&schema, &b).unwrap(),
             ScalarRecord::Value(ScalarValue::Null)
         );
     }
@@ -727,19 +729,19 @@ mod tests {
         // A forged null node for a non-nullable element is refused on decode.
         let mut forged = output.clone();
         forged[SCALAR_LEAF_HEADER_BYTES + 4] = NULL_NODE;
-        assert!(ScalarRecord::decode(&schema, &forged).is_err());
+        assert!(ScalarRecord::decode_owned(&schema, &forged).is_err());
         // A count larger than the remaining payload is refused before allocation.
         let mut inflated = output.clone();
         inflated[SCALAR_LEAF_HEADER_BYTES..SCALAR_LEAF_HEADER_BYTES + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
-            ScalarRecord::decode(&schema, &inflated),
+            ScalarRecord::decode_owned(&schema, &inflated),
             Err(ScalarLeafError::MalformedRecord)
         );
         // Trailing bytes after the value body are malformed.
         let mut trailing = output.clone();
         trailing.push(0);
-        assert!(ScalarRecord::decode(&schema, &trailing).is_err());
+        assert!(ScalarRecord::decode_owned(&schema, &trailing).is_err());
     }
 
     #[test]
@@ -749,7 +751,7 @@ mod tests {
         let mut record = vec![0u8; cursor.encoded_len()];
         cursor.copy_range(0, &mut record).unwrap();
         assert_eq!(
-            ScalarRecord::decode(&schema, &record).unwrap(),
+            ScalarRecord::decode_owned(&schema, &record).unwrap(),
             ScalarRecord::Value(ScalarValue::Date(19000))
         );
     }
@@ -786,12 +788,12 @@ mod tests {
             let schema = ScalarSchema::try_new(field(value_type, false)).unwrap();
             let maximum = ScalarProfileV1::CHILD_BYTES / element_bytes;
             let exact = null_container_record(&schema, maximum, maximum * nodes_per_element);
-            assert!(ScalarRecord::decode(&schema, &exact).is_ok());
+            assert!(ScalarRecord::decode_owned(&schema, &exact).is_ok());
             let over =
                 null_container_record(&schema, maximum + 1, (maximum + 1) * nodes_per_element);
-            assert!(over.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+            assert!(over.len() < ScalarProfileV1::RECORD_PAYLOAD_BYTES);
             assert_eq!(
-                ScalarRecord::decode(&schema, &over),
+                ScalarRecord::decode_owned(&schema, &over),
                 Err(ScalarLeafError::ValueLimit)
             );
         }
@@ -818,9 +820,9 @@ mod tests {
             }
         }
         writer.finish(&schema).unwrap();
-        assert!(output.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+        assert!(output.len() < ScalarProfileV1::RECORD_PAYLOAD_BYTES);
         assert_eq!(
-            ScalarRecord::decode(&schema, &output),
+            ScalarRecord::decode_owned(&schema, &output),
             Err(ScalarLeafError::ValueLimit)
         );
     }
@@ -849,9 +851,9 @@ mod tests {
             writer.append(&[NULL_NODE; 4]).unwrap();
         }
         writer.finish(&schema).unwrap();
-        assert!(output.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+        assert!(output.len() < ScalarProfileV1::RECORD_PAYLOAD_BYTES);
         assert_eq!(
-            ScalarRecord::decode(&schema, &output),
+            ScalarRecord::decode_owned(&schema, &output),
             Err(ScalarLeafError::ValueLimit)
         );
     }
@@ -916,17 +918,17 @@ mod tests {
                 writer.presence(&element, false).unwrap();
                 writer.leaf(&element, leaf).unwrap();
                 writer.finish(&schema).unwrap();
-                assert!(output.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+                assert!(output.len() < ScalarProfileV1::RECORD_PAYLOAD_BYTES);
                 if extra == 0 {
                     let ScalarRecord::Value(value) =
-                        ScalarRecord::decode(&schema, &output).unwrap()
+                        ScalarRecord::decode_owned(&schema, &output).unwrap()
                     else {
                         unreachable!()
                     };
                     assert_eq!(owned_bytes(&value), ScalarProfileV1::CHILD_BYTES);
                 } else {
                     assert_eq!(
-                        ScalarRecord::decode(&schema, &output),
+                        ScalarRecord::decode_owned(&schema, &output),
                         Err(ScalarLeafError::ValueLimit)
                     );
                 }

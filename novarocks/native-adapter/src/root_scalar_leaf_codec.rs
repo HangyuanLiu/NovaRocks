@@ -922,8 +922,8 @@ mod tests {
         );
     }
     #[test]
-    fn exact_64k_payload_forms_one_record_in_two_bounded_turns() {
-        let payload = "x".repeat(64 * 1024);
+    fn exact_64k_record_includes_its_header_and_preserves_output_suffix() {
+        let payload = "x".repeat(64 * 1024 - SCALAR_LEAF_HEADER_BYTES);
         let input = chunk(
             Arc::new(StringArray::from(vec![payload.as_str()])),
             None,
@@ -938,34 +938,33 @@ mod tests {
         .unwrap();
         assert_eq!(cursor.encoded_len(), None);
         finish_validation(&mut cursor).unwrap();
-        assert_eq!(cursor.encoded_len(), Some(65_560));
+        assert_eq!(cursor.encoded_len(), Some(65_536));
         let mut output = vec![0xa5; 64 * 1024 + 17];
         let first = cursor.step(&mut output).unwrap();
         assert_eq!(first.emitted_bytes, 65_536);
-        assert_eq!(first.completed_rows, 0);
-        assert_eq!(first.status, RenderTurnStatus::NeedsOutput);
+        assert_eq!(first.completed_rows, 1);
+        assert_eq!(first.status, RenderTurnStatus::InputComplete);
         assert!(
             output[first.emitted_bytes..]
                 .iter()
                 .all(|byte| *byte == 0xa5)
         );
-        let mut record = output[..first.emitted_bytes].to_vec();
+        let record = output[..first.emitted_bytes].to_vec();
         output.fill(0xa5);
         let second = cursor.step(&mut output).unwrap();
-        assert_eq!(second.emitted_bytes, 24);
-        assert_eq!(second.completed_rows, 1);
+        assert_eq!(second.emitted_bytes, 0);
+        assert_eq!(second.completed_rows, 0);
         assert_eq!(second.status, RenderTurnStatus::InputComplete);
         assert!(
             output[second.emitted_bytes..]
                 .iter()
                 .all(|byte| *byte == 0xa5)
         );
-        record.extend_from_slice(&output[..second.emitted_bytes]);
-        assert_eq!(record.len(), 65_560);
-        assert_eq!(u32::from_le_bytes(record[4..8].try_into().unwrap()), 65_560);
+        assert_eq!(record.len(), 65_536);
+        assert_eq!(u32::from_le_bytes(record[4..8].try_into().unwrap()), 65_536);
         assert_eq!(
             u32::from_le_bytes(record[8..12].try_into().unwrap()),
-            65_536
+            65_512
         );
         assert_eq!(&record[SCALAR_LEAF_HEADER_BYTES..], payload.as_bytes());
         assert_eq!(
@@ -975,6 +974,22 @@ mod tests {
         let complete = cursor.step(&mut output).unwrap();
         assert_eq!(complete.emitted_bytes, 0);
         assert_eq!(complete.completed_rows, 0);
+    }
+    #[test]
+    fn one_byte_over_complete_record_limit_refuses_before_cursor_emission() {
+        let input = chunk(
+            Arc::new(StringArray::from(vec!["x".repeat(65_513)])),
+            None,
+            None,
+        );
+        assert!(matches!(
+            NativeScalarLeafEncoder::try_begin(
+                &input,
+                schema(ScalarValueType::String, true),
+                NativeScalarLeafEncoder::scratch_capacity_bytes()
+            ),
+            Err(NativeScalarLeafError::Leaf(ScalarLeafError::ValueLimit))
+        ));
     }
     #[test]
     fn dictionary_key_and_selected_value_null_are_distinct_physical_cases() {

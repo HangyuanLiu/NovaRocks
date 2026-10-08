@@ -324,41 +324,40 @@ fn zero_output_never_advances_and_tiny_output_splits_every_declaration_boundary(
 }
 
 #[test]
-fn exact_64k_value_obeys_turn_quantum_and_never_writes_output_suffix() {
-    let payload: Vec<u8> = (0..ScalarProfileV1::SINGLE_VALUE_BYTES)
+fn exact_64k_record_obeys_turn_quantum_and_never_writes_output_suffix() {
+    let payload: Vec<u8> = (0..ScalarProfileV1::RECORD_PAYLOAD_BYTES)
         .map(|i| (i % 251) as u8)
         .collect();
     let schema = make_schema(T::Binary, false);
     let mut cursor = ScalarLeafCursor::try_new(&schema, V::Binary(&payload)).unwrap();
-    assert_eq!(cursor.encoded_len(), 65_560);
+    assert_eq!(cursor.encoded_len(), 65_536);
     let mut output = vec![0xa5; 70_000];
     let first = cursor.step(&mut output);
     assert_eq!(first.emitted_bytes, 65_536);
-    assert!(!first.complete);
+    assert!(first.complete);
     assert!(
         output[first.emitted_bytes..]
             .iter()
             .all(|byte| *byte == 0xa5)
     );
-    let mut actual = output[..first.emitted_bytes].to_vec();
+    let actual = output[..first.emitted_bytes].to_vec();
     output.fill(0x5a);
     let second = cursor.step(&mut output);
-    assert_eq!(second.emitted_bytes, 24);
+    assert_eq!(second.emitted_bytes, 0);
     assert!(second.complete);
-    assert!(output[24..].iter().all(|byte| *byte == 0x5a));
-    actual.extend_from_slice(&output[..24]);
+    assert!(output.iter().all(|byte| *byte == 0x5a));
     assert_eq!(actual, golden([8, 0, 0, 0, 0, 0, 0, 0], &payload));
 }
 
 #[test]
 fn every_variable_leaf_limit_is_inclusive_and_empty_value_is_present() {
-    let exact = "x".repeat(65_536);
-    let oversized = "x".repeat(65_537);
+    let exact = "x".repeat(65_512);
+    let oversized = "x".repeat(65_513);
     for ty in [T::String, T::Json, T::Binary, T::Variant, T::Opaque(O::Hll)] {
         let schema = make_schema(ty.clone(), false);
         let cursor = ScalarLeafCursor::try_new(&schema, variable_value(&ty, &exact)).unwrap();
         assert_eq!(cursor.rows(), 1);
-        assert_eq!(cursor.encoded_len(), 65_560);
+        assert_eq!(cursor.encoded_len(), 65_536);
         rejects(&schema, variable_value(&ty, &oversized), E::ValueLimit);
         let empty = ScalarLeafCursor::try_new(&schema, variable_value(&ty, "")).unwrap();
         assert_eq!(empty.rows(), 1);
@@ -844,9 +843,9 @@ fn decoder_checks_utf8_boolean_fixed_width_nullability_and_length_before_payload
         Err(E::MalformedRecord)
     );
     let binary = make_schema(T::Binary, false);
-    let exact = golden([8, 0, 0, 0, 0, 0, 0, 0], &vec![0xff; 65_536]);
-    assert!(matches!(V::decode(&binary, &exact), Ok(V::Binary(bytes)) if bytes.len() == 65_536));
-    let oversized = golden([8, 0, 0, 0, 0, 0, 0, 0], &vec![0; 65_537]);
+    let exact = golden([8, 0, 0, 0, 0, 0, 0, 0], &vec![0xff; 65_512]);
+    assert!(matches!(V::decode(&binary, &exact), Ok(V::Binary(bytes)) if bytes.len() == 65_512));
+    let oversized = golden([8, 0, 0, 0, 0, 0, 0, 0], &vec![0; 65_513]);
     assert_eq!(V::decode(&binary, &oversized), Err(E::ValueLimit));
     assert_eq!(
         V::decode(&binary, &oversized[..24]),
@@ -921,11 +920,11 @@ fn decoder_rechecks_decimal_coefficient_precision_and_signed_minimum() {
 fn header_only_preflight_checks_complete_declarations_before_payload_assembly() {
     let binary = make_schema(T::Binary, false);
     let mut exact = golden([8, 0, 0, 0, 0, 0, 0, 0], &[]);
-    exact[4..8].copy_from_slice(&65_560u32.to_le_bytes());
-    exact[8..12].copy_from_slice(&65_536u32.to_le_bytes());
+    exact[4..8].copy_from_slice(&65_536u32.to_le_bytes());
+    exact[8..12].copy_from_slice(&65_512u32.to_le_bytes());
     let checked = ScalarLeafHeader::decode(&binary, &exact).unwrap();
-    assert_eq!(checked.payload_bytes(), 65_536);
-    assert_eq!(checked.record_bytes(), 65_560);
+    assert_eq!(checked.payload_bytes(), 65_512);
+    assert_eq!(checked.record_bytes(), 65_536);
     assert_eq!(checked.rows(), 1);
     assert_eq!(
         V::decode(&binary, &exact),
@@ -933,8 +932,8 @@ fn header_only_preflight_checks_complete_declarations_before_payload_assembly() 
         "a header grants no completed value"
     );
     let mut too_large = exact.clone();
-    too_large[4..8].copy_from_slice(&65_561u32.to_le_bytes());
-    too_large[8..12].copy_from_slice(&65_537u32.to_le_bytes());
+    too_large[4..8].copy_from_slice(&65_537u32.to_le_bytes());
+    too_large[8..12].copy_from_slice(&65_513u32.to_le_bytes());
     assert_eq!(
         ScalarLeafHeader::decode(&binary, &too_large),
         Err(E::ValueLimit)

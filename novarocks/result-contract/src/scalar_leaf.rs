@@ -104,7 +104,6 @@ pub enum BorrowedScalarLeaf<'a> {
 /// No collector publication or session commit follows from this validation.
 impl<'a> BorrowedScalarLeaf<'a> {
     pub fn decode(schema: &ScalarSchema, record: &'a [u8]) -> Result<Self, ScalarLeafError> {
-        use ScalarValueType as T;
         let malformed = ScalarLeafError::MalformedRecord;
         let header = ScalarLeafHeader::decode(
             schema,
@@ -120,7 +119,28 @@ impl<'a> BorrowedScalarLeaf<'a> {
         if header.flags == NULL {
             return Ok(Self::Null);
         }
-        let value = match &schema.field().value_type {
+        Self::decode_payload(schema.field(), payload)
+    }
+
+    pub(crate) fn decode_payload(
+        field: &ScalarField,
+        payload: &'a [u8],
+    ) -> Result<Self, ScalarLeafError> {
+        use ScalarValueType as T;
+        let malformed = ScalarLeafError::MalformedRecord;
+        let fixed = match field.value_type {
+            T::Boolean => Some(1),
+            T::SignedInteger(bits) => Some(usize::from(bits / 8)),
+            T::LargeInt | T::Decimal { bits: 128, .. } => Some(16),
+            T::Decimal { bits: 256, .. } => Some(32),
+            T::Float32 | T::Date => Some(4),
+            T::Float64 | T::TimeMicros | T::Timestamp { .. } => Some(8),
+            _ => None,
+        };
+        if fixed.is_some_and(|len| payload.len() != len) {
+            return Err(malformed);
+        }
+        let value = match &field.value_type {
             T::Null => return Err(malformed),
             T::Boolean => Self::Boolean(match payload[0] {
                 0 => false,
@@ -179,7 +199,7 @@ impl<'a> BorrowedScalarLeaf<'a> {
         };
         // Canonical encoder validation also checks coefficient precision. No
         // payload formatting, allocation or timezone conversion takes place.
-        ScalarLeafCursor::try_new(schema, value)?;
+        ScalarLeafCursor::try_new_for_field(field, value)?;
         Ok(value)
     }
 }
@@ -200,7 +220,7 @@ impl ScalarLeafHeader {
         }
         let total = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
         let length = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        if length as usize > ScalarProfileV1::SINGLE_VALUE_BYTES {
+        if length as usize > ScalarProfileV1::RECORD_PAYLOAD_BYTES {
             return Err(ScalarLeafError::ValueLimit);
         }
         if total != SCALAR_LEAF_HEADER_BYTES + length as usize {
@@ -435,7 +455,7 @@ impl<'a> ScalarLeafCursor<'a> {
         self.payload_len = bytes.len();
     }
     fn set_variable(&mut self, bytes: &'a [u8]) -> Result<(), ScalarLeafError> {
-        if bytes.len() > ScalarProfileV1::SINGLE_VALUE_BYTES {
+        if bytes.len() > ScalarProfileV1::RECORD_PAYLOAD_BYTES {
             return Err(ScalarLeafError::ValueLimit);
         }
         self.variable = Some(bytes);

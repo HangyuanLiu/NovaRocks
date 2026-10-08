@@ -5569,7 +5569,7 @@ mod tests {
             ));
             let segment = next_segment(&mut stream).await;
             assert_eq!(segment.rows(), rows);
-            let record = ScalarRecord::decode(&schema, segment.body()).unwrap();
+            let record = ScalarRecord::decode_owned(&schema, segment.body()).unwrap();
             assert_eq!(
                 u64::from(matches!(record, ScalarRecord::Value(_))),
                 segment.rows()

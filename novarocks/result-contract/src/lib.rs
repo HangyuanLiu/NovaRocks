@@ -44,6 +44,9 @@ pub use scalar_leaf::{
     ScalarLeafHeader, ScalarLeafTurn,
 };
 
+mod scalar_visit;
+pub use scalar_visit::{BorrowedScalarRecord, ScalarRecordEvent, ScalarVisitError};
+
 mod scalar_record;
 pub use scalar_record::{SCALAR_RECORD_MAX_BYTES, ScalarRecord, ScalarRecordWriter, ScalarValue};
 

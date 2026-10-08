@@ -1222,7 +1222,7 @@ async fn scalar_record(fixture: &Fixture, schema: &ScalarSchema, rows: u64) -> S
     assert!(fixture.session.producer_exited());
     assert_eq!(fixture.channel.snapshot().data_positions, 1);
     let data = read(&fixture.channel, Some(1), 0).await;
-    let record = ScalarRecord::decode(schema, body(&data)).unwrap();
+    let record = ScalarRecord::decode_owned(schema, body(&data)).unwrap();
     drop(data);
     assert_end(&read(&fixture.channel, Some(2), 1).await, 2, rows);
     record
