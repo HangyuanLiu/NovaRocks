@@ -262,3 +262,5 @@ mod array_append_selected;
 
 pub mod regexp_count;
 pub(crate) mod regexp_count_owner;
+
+pub mod sha2_shared;

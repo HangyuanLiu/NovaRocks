@@ -20,6 +20,7 @@
 //! Library digest calls have original-control opaque checkpoints. Checked
 //! output layouts are representation gates, not a formal memory grant.
 
+use super::sha2_shared::{DigestKind, Observation};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -29,17 +30,10 @@ use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use std::{alloc::Layout, sync::Arc};
 
 fn digest_bytes(bits: i64) -> Option<usize> {
-    match bits {
-        224 => Some(28),
-        0 | 256 => Some(32),
-        384 => Some(48),
-        512 => Some(64),
-        _ => None,
-    }
+    DigestKind::for_bits(bits).map(DigestKind::bytes)
 }
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -62,34 +56,20 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
 }
-fn append_digest<D: Digest>(
+fn append_digest(
+    kind: DigestKind,
     text: &[u8],
     bytes: &mut Vec<u8>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
-    work.flush()?;
-    let mut digest = D::new();
-    work.flush()?;
-    // Updates process only selected, non-null source bytes. The library's
-    // compression internals remain opaque; completed byte chunks are observed.
-    for chunk in text.chunks(256) {
-        work.flush()?;
-        digest.update(chunk);
-        work.flush()?;
-        for _ in chunk {
-            work.step()?;
-        }
-    }
-    work.flush()?;
-    let output = digest.finalize();
-    work.flush()?;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in output {
-        bytes.push(HEX[usize::from(byte >> 4)]);
-        bytes.push(HEX[usize::from(byte & 15)]);
-        work.step()?;
-    }
-    Ok(())
+    kind.visit(
+        text,
+        &mut |observation| match observation {
+            Observation::Step => work.step(),
+            Observation::OpaqueBoundary => work.flush(),
+        },
+        &mut |byte| bytes.push(byte),
+    )
 }
 
 pub(super) fn evaluate_string_sha2<'a>(
@@ -207,13 +187,9 @@ pub(super) fn evaluate_string_sha2<'a>(
                     if width > total - bytes.len() {
                         return Err(internal("sha2 exceeded its measured output extent"));
                     }
-                    match bits {
-                        224 => append_digest::<Sha224>(text.as_bytes(), &mut bytes, &mut work)?,
-                        0 | 256 => append_digest::<Sha256>(text.as_bytes(), &mut bytes, &mut work)?,
-                        384 => append_digest::<Sha384>(text.as_bytes(), &mut bytes, &mut work)?,
-                        512 => append_digest::<Sha512>(text.as_bytes(), &mut bytes, &mut work)?,
-                        _ => return Err(internal("sha2 measured an unsupported bit length")),
-                    }
+                    let kind = DigestKind::for_bits(bits)
+                        .ok_or_else(|| internal("sha2 measured an unsupported bit length"))?;
+                    append_digest(kind, text.as_bytes(), &mut bytes, &mut work)?;
                     validity.append(true);
                 }
             }
