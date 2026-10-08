@@ -1316,3 +1316,7 @@ mod legacy_sha2_additional_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_sm3_additional_baseline_tests.rs"]
 mod legacy_sm3_additional_baseline_tests;
+
+#[cfg(test)]
+#[path = "legacy_array_repeat_baseline_tests.rs"]
+mod legacy_array_repeat_baseline_tests;

@@ -1723,3 +1723,11 @@ mod sha2_shared_differential;
 
 #[path = "pure_differential_sm3_shared_tests.rs"]
 mod sm3_shared_differential;
+
+#[cfg(test)]
+#[path = "pure_differential_array_repeat_tests.rs"]
+mod array_repeat_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_array_repeat_encoded_tests.rs"]
+mod array_repeat_encoded_tests;
