@@ -24,97 +24,9 @@ use std::sync::Arc;
 const DEFAULT_IV: &[u8] = b"STARROCKS_16BYTE";
 const GCM_TAG_SIZE: usize = 16;
 
-#[derive(Clone)]
-pub(super) enum OwnedBytesArray {
-    Utf8(StringArray),
-    Binary(BinaryArray),
-}
-
-impl OwnedBytesArray {
-    pub(super) fn len(&self) -> usize {
-        match self {
-            Self::Utf8(arr) => arr.len(),
-            Self::Binary(arr) => arr.len(),
-        }
-    }
-
-    pub(super) fn is_null(&self, row: usize) -> bool {
-        match self {
-            Self::Utf8(arr) => arr.is_null(row),
-            Self::Binary(arr) => arr.is_null(row),
-        }
-    }
-
-    pub(super) fn bytes(&self, row: usize) -> &[u8] {
-        match self {
-            Self::Utf8(arr) => arr.value(row).as_bytes(),
-            Self::Binary(arr) => arr.value(row),
-        }
-    }
-
-    pub(super) fn utf8(&self, row: usize) -> Option<&str> {
-        match self {
-            Self::Utf8(arr) if !arr.is_null(row) => Some(arr.value(row)),
-            _ => None,
-        }
-    }
-}
-
-pub(super) fn to_owned_bytes_array(
-    array: ArrayRef,
-    fn_name: &str,
-    arg_idx: usize,
-) -> Result<OwnedBytesArray, String> {
-    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(OwnedBytesArray::Utf8(arr.clone()));
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(OwnedBytesArray::Binary(arr.clone()));
-    }
-    // Iceberg-backed VARBINARY/VARCHAR columns are materialized in the "Large"
-    // Arrow layout (LargeBinary / LargeUtf8). Normalize them to the small
-    // layout the extractor understands via a zero-copy-ish arrow cast, then
-    // re-enter. The casted array is Binary/Utf8 so this does not recurse again.
-    if matches!(
-        array.data_type(),
-        DataType::LargeBinary | DataType::LargeUtf8
-    ) {
-        let target = if matches!(array.data_type(), DataType::LargeUtf8) {
-            DataType::Utf8
-        } else {
-            DataType::Binary
-        };
-        if let Ok(casted) = cast(&array, &target) {
-            return to_owned_bytes_array(casted, fn_name, arg_idx);
-        }
-    }
-    // A typed-Null literal arrives as a NullArray; treat it as a VARCHAR
-    // column whose every row is NULL so the per-row logic below collapses
-    // the result to NULL rather than failing the static check.
-    if matches!(array.data_type(), DataType::Null) {
-        let len = array.len();
-        let all_null: Vec<Option<&str>> = (0..len).map(|_| None).collect();
-        return Ok(OwnedBytesArray::Utf8(StringArray::from(all_null)));
-    }
-    Err(format!(
-        "{}: arg{} must be VARCHAR or VARBINARY",
-        fn_name, arg_idx
-    ))
-}
-
-pub(super) fn to_owned_bytes_array_with_varchar_cast(
-    array: ArrayRef,
-    fn_name: &str,
-    arg_idx: usize,
-) -> Result<OwnedBytesArray, String> {
-    match to_owned_bytes_array(array.clone(), fn_name, arg_idx) {
-        Ok(bytes) => Ok(bytes),
-        Err(original) => {
-            let casted = cast(&array, &DataType::Utf8).map_err(|_| original)?;
-            to_owned_bytes_array(casted, fn_name, arg_idx)
-        }
-    }
-}
+pub(super) use novarocks_functions::builtin::md5_shared::{
+    OwnedBytesArray, cast_output, to_owned_bytes_array, to_owned_bytes_array_with_varchar_cast,
+};
 
 pub(super) fn to_i64_array(
     array: &ArrayRef,
@@ -132,20 +44,6 @@ pub(super) fn to_i64_array(
         .downcast_ref::<Int64Array>()
         .cloned()
         .ok_or_else(|| format!("{}: arg{} is not BIGINT", fn_name, arg_idx))
-}
-
-pub(super) fn cast_output(
-    out: ArrayRef,
-    output_type: Option<&DataType>,
-    fn_name: &str,
-) -> Result<ArrayRef, String> {
-    let Some(target) = output_type else {
-        return Ok(out);
-    };
-    if out.data_type() == target {
-        return Ok(out);
-    }
-    cast(&out, target).map_err(|e| format!("{}: failed to cast output: {}", fn_name, e))
 }
 
 fn build_binary_array(values: Vec<Option<Vec<u8>>>) -> BinaryArray {

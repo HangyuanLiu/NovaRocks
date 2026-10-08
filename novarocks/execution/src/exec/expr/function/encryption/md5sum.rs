@@ -16,9 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, StringArray};
-use md5::{Digest, Md5};
-use std::sync::Arc;
+use arrow::array::ArrayRef;
+use novarocks_functions::builtin::md5_shared::{self, Operation};
 
 pub fn eval_md5sum(
     arena: &ExprArena,
@@ -27,8 +26,8 @@ pub fn eval_md5sum(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let _ = expr;
-
     let mut inputs = Vec::with_capacity(args.len());
+    // Keep admission before evaluation of the next child, as in the original shell.
     for (idx, arg) in args.iter().enumerate() {
         inputs.push(super::common::to_owned_bytes_array_with_varchar_cast(
             arena.eval(*arg, chunk)?,
@@ -36,18 +35,5 @@ pub fn eval_md5sum(
             idx,
         )?);
     }
-
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
-        let mut hasher = Md5::new();
-        for input in &inputs {
-            if input.is_null(row) {
-                continue;
-            }
-            hasher.update(input.bytes(row));
-        }
-        out.push(Some(hex::encode(hasher.finalize())));
-    }
-
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    md5_shared::evaluate_legacy(Operation::Md5sum, &inputs, chunk.len(), None)
 }

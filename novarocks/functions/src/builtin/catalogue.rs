@@ -2577,6 +2577,7 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_hex_owner::operation(name).is_some() => {
                         Some(super::string_hex_owner::effects())
                     }
+                    "md5sum" => Some(super::md5sum_owner::effects()),
                     name if super::string_md5_owner::operation(name).is_some() => {
                         Some(super::string_md5_owner::effects())
                     }
@@ -2700,6 +2701,7 @@ pub(super) fn dynamic_definition_parts(
             value: error.to_string().into(),
         })?;
     let pure_effects = match name {
+        "md5sum_numeric" => Some(super::md5sum_numeric_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
         "round" => Some(super::round_owner::effects()),
         name if super::scalar_extrema_owner::operation(name) => {
@@ -2752,6 +2754,9 @@ pub fn contribute_builtin_functions(
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {
+            "md5sum_numeric" => {
+                super::md5sum_numeric_owner::definition(name, declaration, resolver)?
+            }
             "truncate" => super::truncate_owner::definition(declaration, resolver)?,
             "round" => super::round_owner::definition(declaration, resolver)?,
             name if super::scalar_extrema_owner::operation(name) => {
@@ -2871,6 +2876,7 @@ pub fn contribute_builtin_functions(
             name if super::string_hex_owner::operation(name).is_some() => {
                 super::string_hex_owner::definition(name, declaration, resolver)?
             }
+            "md5sum" => super::md5sum_owner::definition(&name, declaration, resolver)?,
             name if super::string_md5_owner::operation(name).is_some() => {
                 super::string_md5_owner::definition(name, declaration, resolver)?
             }

@@ -16,9 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, StringArray};
-use md5::{Digest, Md5};
-use std::sync::Arc;
+use arrow::array::ArrayRef;
+use novarocks_functions::builtin::md5_shared::{self, Operation};
 
 pub fn eval_md5(
     arena: &ExprArena,
@@ -28,18 +27,6 @@ pub fn eval_md5(
 ) -> Result<ArrayRef, String> {
     let _ = expr;
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "md5", 0)?;
-
-    let mut out = Vec::with_capacity(input.len());
-    for row in 0..input.len() {
-        if input.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let mut hasher = Md5::new();
-        hasher.update(input.bytes(row));
-        out.push(Some(hex::encode(hasher.finalize())));
-    }
-
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    let rows = input.len();
+    md5_shared::evaluate_legacy(Operation::Md5, &[input], rows, None)
 }
