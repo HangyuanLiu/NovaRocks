@@ -1,0 +1,167 @@
+{
+  "status": "PASS_EIGHT_NATIVE_LIFECYCLE_TRUST_REGRESSIONS_NOT_FINAL_ACCEPTANCE",
+  "source_revision": "b682affdc7ab1ff1d25df6b37fdff972a95e277a",
+  "server_build_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+  "source_dirty": false,
+  "source_delta_since_build": "performance test-only probe and receipt commits; product unchanged",
+  "product_source_unchanged_since_clean_C0_and_native_ten": true,
+  "validation": [
+    {
+      "scenario": "query-lifecycle/mysql-disconnect",
+      "exit_code": 0,
+      "duration_seconds": 0.762,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/query-lifecycle-mysql-disconnect/scenario-evidence.json",
+      "sha256": "962ccdd19b2bab4d01f1172288a4dbfb30fc6e24faddc1184696d5fcdde5c6f1",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "captured query-resource baseline",
+        "sent a blocking query through a raw public MySQL connection",
+        "observed in-flight distributed query resources",
+        "closed the raw public MySQL client connection",
+        "verified query resources converged after the terminal lifecycle outcome",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-lifecycle/query-timeout",
+      "exit_code": 0,
+      "duration_seconds": 1.461,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/query-lifecycle-query-timeout/scenario-evidence.json",
+      "sha256": "29eb95c391b4906cf0f3488dcfe1423caebdaa8c42b79decbf5b03eedac89616",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "captured query-resource baseline",
+        "connected timeout client through public MySQL protocol",
+        "set query_timeout = 1 through the public MySQL protocol",
+        "sent a blocking query expected to time out",
+        "observed in-flight distributed query resources before timeout",
+        "received expected MySQL timeout error: query timed out after 1000 ms",
+        "verified query resources converged after the terminal lifecycle outcome",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-concurrency/late-work-lease-expiry",
+      "exit_code": 0,
+      "duration_seconds": 31.894,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/query-concurrency-late-work-lease-expiry/scenario-evidence.json",
+      "sha256": "0b60d0d05dc2a65b1e5e4c4f3e36b4a9f307ab8036a5736c61303dcd762160df",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "kept both Native directions paused after FE terminal so no further lease renewal can be issued",
+        "observed real Worker resource convergence",
+        "observed BE resource convergence while its FE Native endpoint remained paused, proving the final valid lease bounded orphaned work",
+        "restored delayed Native traffic and completed a fresh query without reviving the retired attempt",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-concurrency/remote-cleanup-retires",
+      "exit_code": 0,
+      "duration_seconds": 10.704,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/query-concurrency-remote-cleanup-retires/scenario-evidence.json",
+      "sha256": "b1238d203151576a3c4c40b3a595a5fd908706b6c71fe44bab268122865dea7c",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "retired q1 remote observation with obligations=0 old_attempts=0 unknown_creates=0 and remote_unknown_endings=1 while BE[1] remained live",
+        "completed a new query after finite FE retirement without replacing the unreachable endpoint",
+        "observed real Worker resource convergence",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "native-ingress/partial-body-deadline",
+      "exit_code": 0,
+      "duration_seconds": 0.591,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/native-ingress-partial-body-deadline/scenario-evidence.json",
+      "sha256": "5a5aa7d4dc51b7ffee167ac32e96d1d2858a467ef607e03024767309217935a1",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "ordinary half-open DATA ended after 109.660542ms with TransportAbort; running_deadline count advanced (RST has no readable gRPC status)",
+        "partial-body holder returned and a later small Cancel completed",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "native-trust/plaintext-ip",
+      "exit_code": 0,
+      "duration_seconds": 0.622,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/native-trust-plaintext-ip/scenario-evidence.json",
+      "sha256": "cc434755719ce1816fe44ba86d290a032f4a32c6f01760d37ec0e9cf50dc83f5",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
+        "proved real 1FE+3BE topology, authenticated FE-to-BE reach on every BE, and a completed FE/BE query round trip with transport=Plaintext; terminal snapshots=3, participating backends={0, 1, 2}",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "native-trust/automatic-dns",
+      "exit_code": 0,
+      "duration_seconds": 0.807,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/native-trust-automatic-dns/scenario-evidence.json",
+      "sha256": "d533ac051264ebe9d0dad598b81a8c8dc456fad9098dde1b6e844d44a0da7ee1",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
+        "proved real 1FE+3BE topology, authenticated FE-to-BE reach on every BE, and a completed FE/BE query round trip with transport=Automatic; terminal snapshots=3, participating backends={0, 1, 2}",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "native-trust/pem-ip",
+      "exit_code": 0,
+      "duration_seconds": 0.769,
+      "path": "logs/mem-1-m07/p09-lifecycle-native-dev-20261008/native-trust-pem-ip/scenario-evidence.json",
+      "sha256": "5accfd9a9a96f72032de0b6d8b6748ffeb2c2b0ea5a6e63e0dfed010e5060680",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
+        "proved real 1FE+3BE topology, authenticated FE-to-BE reach on every BE, and a completed FE/BE query round trip with transport=Pem; terminal snapshots=3, participating backends={0, 1, 2}",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    }
+  ],
+  "release_fault_startup_refusal": {
+    "path": "logs/mem-1-m07/p09-lifecycle-native-driver.log",
+    "reason": "mysql-disconnect injects debug-only query lifecycle fault directory; release server correctly refused. Retained launch diagnostic, then ran canonical debug fault fixture."
+  },
+  "fixture_recovery": {
+    "initial_up_exit": 75,
+    "initial_report": "cannot acquire fixture store lock",
+    "actual_cause": "Docker CLI absent from tool PATH; FileNotFoundError within verification was caught by fixture_store_lock wrapper. Lock acquisition itself was not shown to fail.",
+    "task_only_path_prefix": "/Applications/Docker.app/Contents/Resources/bin",
+    "retry_up_exit": 0,
+    "existing_inputs_bom_verified": true,
+    "publication": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/novarocks-4154ea02/publications/7b5ea0d95e4c4f35be1ea8ef000681f5",
+    "manifest_sha256": "388c1deaa40d13e04388733162ce7acf2ceae3b89f62afd16f05c87dfad21163",
+    "scope": "Existing fixture verified and bound; not SDK listing-scale or full SQL acceptance."
+  },
+  "remaining": [
+    "Ordinary ingress capacity/reference deployment decision pending; no silent D06 retry or frozen-gate relaxation",
+    "P00b valid relative baseline/transport coefficients, P09 full/concentrated/multi-FE/SDK and P10 final evidence remain open"
+  ]
+}
