@@ -747,3 +747,6 @@ mod registry_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod legacy_aggregate_format_baseline_tests;

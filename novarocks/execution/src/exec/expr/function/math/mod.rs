@@ -62,3 +62,9 @@ mod legacy_elementary_raw_contract_tests;
 
 #[cfg(test)]
 mod legacy_numeric_unary_raw_contract_tests;
+
+#[cfg(test)]
+mod legacy_rounding_raw_contract_tests;
+
+#[cfg(test)]
+mod legacy_abs_raw_contract_tests;

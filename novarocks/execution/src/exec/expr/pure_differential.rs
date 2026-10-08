@@ -1559,3 +1559,15 @@ mod numeric_unary_tests;
 #[cfg(test)]
 #[path = "pure_differential_extrema_tests.rs"]
 mod extrema_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_rounding_tests.rs"]
+mod rounding_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_abs_tests.rs"]
+mod abs_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_string_case_tests.rs"]
+mod string_case_tests;

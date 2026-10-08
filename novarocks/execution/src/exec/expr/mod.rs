@@ -1209,3 +1209,6 @@ mod tests {
 
 #[cfg(test)]
 mod legacy_calendar_parts_baseline_tests;
+
+#[cfg(test)]
+mod legacy_calendar_to_date_baseline_tests;

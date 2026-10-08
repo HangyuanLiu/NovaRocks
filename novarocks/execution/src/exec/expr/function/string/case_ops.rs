@@ -54,3 +54,7 @@ pub fn eval_lcase(
 ) -> Result<ArrayRef, String> {
     eval_lower_impl(arena, args, chunk)
 }
+
+#[cfg(test)]
+#[path = "legacy_string_case_baseline_tests.rs"]
+mod legacy_string_case_baseline_tests;
