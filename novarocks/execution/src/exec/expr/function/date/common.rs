@@ -28,11 +28,7 @@ pub fn naive_to_date32(date: NaiveDate) -> i32 {
     date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET
 }
 
-pub fn parse_time(s: &str) -> Option<NaiveTime> {
-    NaiveTime::parse_from_str(s, "%H:%M:%S")
-        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S%.f"))
-        .ok()
-}
+pub use novarocks_functions::builtin::calendar_time_text_shared::parse_time;
 
 pub fn extract_i64_array(array: &ArrayRef, func_name: &str) -> Result<Vec<Option<i64>>, String> {
     novarocks_functions::builtin::calendar_add_interval::legacy_extract_calendar_intervals(
@@ -68,9 +64,7 @@ pub fn date_from_julian(julian: i32) -> Option<NaiveDate> {
     novarocks_functions::builtin::calendar_extended_shared::calendar_date_from_julian(julian)
 }
 
-pub fn time_to_seconds(time: NaiveTime) -> i64 {
-    (time.hour() as i64) * 3600 + (time.minute() as i64) * 60 + (time.second() as i64)
-}
+pub use novarocks_functions::builtin::calendar_time_text_shared::time_to_seconds;
 
 pub fn seconds_to_time(seconds: i64) -> NaiveTime {
     let mut secs = seconds % 86400;

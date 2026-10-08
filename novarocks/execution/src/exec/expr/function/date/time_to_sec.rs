@@ -14,60 +14,27 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{extract_datetime_array, time_to_seconds};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
-use arrow::compute::cast;
+use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
-use std::sync::Arc;
+use novarocks_functions::EvaluationCheckpoints;
+pub use novarocks_functions::builtin::calendar_time_text_shared::parse_hms_duration_to_seconds;
+use novarocks_functions::builtin::calendar_time_text_shared::{
+    self as shared, LegacyControl, MergeMode, TimeTextError,
+};
 
-const SEC_TO_TIME_CAP_SECONDS: i64 = 839 * 3600 + 59 * 60 + 59;
-
-pub fn parse_hms_duration_to_seconds(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-
-    if raw.starts_with('-') {
-        return None;
-    }
-    let s = raw.strip_prefix('+').unwrap_or(raw);
-    let mut parts = s.split(':');
-    let hour = parts.next()?.parse::<i64>().ok()?;
-    let minute = parts.next()?.parse::<i64>().ok()?;
-    let second = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some()
-        || minute >= 60
-        || second >= 60
-        || hour < 0
-        || minute < 0
-        || second < 0
-    {
-        return None;
-    }
-    Some(hour * 3600 + minute * 60 + second)
+fn parse_from_strings(string_arr: &StringArray) -> Result<Vec<Option<i64>>, String> {
+    shared::duration_strings(string_arr, &mut EvaluationCheckpoints::new(&LegacyControl))
+        .map_err(TimeTextError::into_legacy)
 }
 
-fn parse_from_strings(string_arr: &StringArray) -> Vec<Option<i64>> {
-    let mut out = Vec::with_capacity(string_arr.len());
-    for i in 0..string_arr.len() {
-        let value = if string_arr.is_null(i) {
-            None
-        } else {
-            let s = string_arr.value(i);
-            parse_hms_duration_to_seconds(s)
-        };
-        out.push(value);
-    }
-    out
-}
-
-fn parse_direct_string_array(array: &ArrayRef) -> Option<Vec<Option<i64>>> {
-    let str_arr = array.as_any().downcast_ref::<StringArray>()?;
-    Some(parse_from_strings(str_arr))
+fn parse_direct_string_array(array: &ArrayRef) -> Result<Option<Vec<Option<i64>>>, String> {
+    let Some(str_arr) = array.as_any().downcast_ref::<StringArray>() else {
+        return Ok(None);
+    };
+    parse_from_strings(str_arr).map(Some)
 }
 
 fn strip_cast_wrappers(arena: &ExprArena, mut expr_id: ExprId) -> ExprId {
@@ -100,24 +67,9 @@ fn parse_from_sec_to_time_source(
     }
 
     let source = arena.eval(args[0], chunk)?;
-    let source = source
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "sec_to_time source for time_to_sec must be int".to_string())?;
-
-    let mut out = Vec::with_capacity(source.len());
-    for i in 0..source.len() {
-        if source.is_null(i) {
-            out.push(None);
-        } else {
-            out.push(Some(
-                source
-                    .value(i)
-                    .clamp(-SEC_TO_TIME_CAP_SECONDS, SEC_TO_TIME_CAP_SECONDS),
-            ));
-        }
-    }
-    Ok(Some(out))
+    shared::sec_to_time_source(&source, &mut EvaluationCheckpoints::new(&LegacyControl))
+        .map(Some)
+        .map_err(TimeTextError::into_legacy)
 }
 
 fn parse_from_immediate_cast_string_source(
@@ -134,7 +86,7 @@ fn parse_from_immediate_cast_string_source(
         _ => return Ok(None),
     };
     let source = arena.eval(child, chunk)?;
-    Ok(parse_direct_string_array(&source))
+    parse_direct_string_array(&source)
 }
 
 pub fn parse_from_cast_source(
@@ -157,11 +109,8 @@ pub fn parse_from_cast_source(
         return Ok(None);
     }
     let source = arena.eval(current, chunk)?;
-    if let Some(out) = parse_direct_string_array(&source) {
-        return Ok(Some(out));
-    }
-    let source_utf8 = cast(&source, &DataType::Utf8).map_err(|e| e.to_string())?;
-    Ok(parse_direct_string_array(&source_utf8))
+    shared::duration_cast_source(&source, &mut EvaluationCheckpoints::new(&LegacyControl))
+        .map_err(TimeTextError::into_legacy)
 }
 
 pub fn eval_time_to_sec(
@@ -171,45 +120,27 @@ pub fn eval_time_to_sec(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let arg_expr = args[0];
-
+    let mut work = EvaluationCheckpoints::new(&LegacyControl);
     if let Some(out) = parse_from_sec_to_time_source(arena, arg_expr, chunk)? {
-        return Ok(Arc::new(Int64Array::from(out)) as ArrayRef);
+        return shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy);
     }
-
     let arr = arena.eval(arg_expr, chunk)?;
-
-    if let Some(out) = parse_direct_string_array(&arr) {
-        return Ok(Arc::new(Int64Array::from(out)) as ArrayRef);
+    if let Some(out) = parse_direct_string_array(&arr)? {
+        return shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy);
     }
-
-    let mut out = Vec::with_capacity(arr.len());
-    let dts = extract_datetime_array(&arr)?;
-    for dt in dts {
-        out.push(dt.map(|d| time_to_seconds(d.time())));
-    }
-
-    // For implicit CAST(string AS TIME), FE lowers to a CAST node and expects strict
-    // TIME-string parsing semantics (no datetime-prefix acceptance).
+    let mut out = shared::datetime_seconds(&arr, &mut work).map_err(TimeTextError::into_legacy)?;
     if let Some(source_out) = parse_from_immediate_cast_string_source(arena, arg_expr, chunk)? {
-        for (idx, value) in out.iter_mut().enumerate() {
-            if idx < source_out.len() {
-                *value = source_out[idx];
-            }
-        }
-        return Ok(Arc::new(Int64Array::from(out)) as ArrayRef);
+        shared::merge_source(&mut out, &source_out, MergeMode::Override, &mut work)
+            .map_err(TimeTextError::into_legacy)?;
+        return shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy);
     }
-
-    if out.iter().any(Option::is_none)
+    if shared::any_null(&out, &mut work).map_err(TimeTextError::into_legacy)?
         && let Some(source_out) = parse_from_cast_source(arena, arg_expr, chunk)?
     {
-        for (idx, value) in out.iter_mut().enumerate() {
-            if value.is_none() && idx < source_out.len() {
-                *value = source_out[idx];
-            }
-        }
+        shared::merge_source(&mut out, &source_out, MergeMode::FillNull, &mut work)
+            .map_err(TimeTextError::into_legacy)?;
     }
-
-    Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+    shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy)
 }
 
 #[cfg(test)]
@@ -218,10 +149,11 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use arrow::array::{Array, Int32Array};
+    use arrow::array::{Array, Int32Array, Int64Array};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_types::SlotId;
+    use std::sync::Arc;
 
     fn one_row_chunk() -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new(

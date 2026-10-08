@@ -225,3 +225,8 @@ mod calendar_sec_to_time_owner;
 
 pub mod regexp_position;
 mod regexp_position_owner;
+
+pub mod calendar_time_text_shared;
+
+#[cfg(test)]
+mod calendar_time_text_shared_tests;

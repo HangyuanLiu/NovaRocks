@@ -29,8 +29,11 @@ use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc, time::Duration};
 const SEC_TO_TIME_CAP_SECONDS: i64 = 839 * 3600 + 59 * 60 + 59;
+pub fn clamp_sec_to_time_seconds(seconds: i64) -> i64 {
+    seconds.clamp(-SEC_TO_TIME_CAP_SECONDS, SEC_TO_TIME_CAP_SECONDS)
+}
 pub fn format_sec_to_time(seconds: i64) -> String {
-    let clamped = seconds.clamp(-SEC_TO_TIME_CAP_SECONDS, SEC_TO_TIME_CAP_SECONDS);
+    let clamped = clamp_sec_to_time_seconds(seconds);
     let sign = if clamped < 0 { "-" } else { "" };
     let abs = clamped.abs();
     let hour = abs / 3600;
