@@ -1253,3 +1253,6 @@ mod cast_largeint_text_oracle_tests;
 
 #[cfg(test)]
 mod legacy_timestampadd_baseline_tests;
+
+#[cfg(test)]
+mod legacy_unixtime_baseline_tests;
