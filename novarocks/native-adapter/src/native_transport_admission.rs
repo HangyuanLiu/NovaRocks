@@ -267,6 +267,7 @@ struct Core {
     connection_keys: NativeConnectionKeyCapacity,
     incoming_keys: NativeIncomingKeyCapacity,
     incoming_streams: [NativeLaneStreamGate; NativeLane::COUNT],
+    root_result_ingress_owners: usize,
     observer: SharedObserver,
 }
 
@@ -316,6 +317,38 @@ pub fn incoming_lane_stream_limit(
         NativeLane::Membership => 0,
     };
     mul(connections, value(g.transport_streams_per_connection)?)
+}
+
+/// Root unary ownership outlives a served stream when h2 still owns DATA.
+/// Cover every live result stream plus every legal root's fixed metadata and
+/// payload send holder. These are metadata positions, never payload grants.
+/// The root channel's joint process wallet remains the payload authority.
+pub fn root_result_ingress_owner_limit(
+    role: TransportRole,
+    g: &NativeResultSupportGeometry,
+) -> io::Result<usize> {
+    if role == TransportRole::Frontend {
+        return Ok(0);
+    }
+    let roots = mul(
+        value(g.transport_authenticated_live_frontends_per_backend)?,
+        value(g.transport_worst_case_roots_per_frontend_per_backend)?,
+    )?;
+    // Mirrors the channel's finite fixed_metadata_holders geometry: driver
+    // owners, send owners, and one producer cursor. Include payload holders
+    // separately because their backing can coexist with those metadata owners.
+    let metadata = add(
+        add(
+            value(g.root_maximum_root_drivers)?,
+            value(g.root_live_send_holders)?,
+        )?,
+        1,
+    )?;
+    let tails = mul(roots, add(metadata, value(g.root_live_send_holders)?)?)?;
+    add(
+        incoming_lane_stream_limit(role, NativeLane::ResultData, g)?,
+        tails,
+    )
 }
 
 /// Process-scoped Native connection admission. Clones share one set of
@@ -377,6 +410,7 @@ impl NativeTransportAdmission {
         for lane in NativeLane::ALL {
             limits[lane.index()] = incoming_lane_stream_limit(role, lane, &g)?;
         }
+        let root_result_ingress_owners = root_result_ingress_owner_limit(role, &g)?;
         let incoming_streams = NativeLane::ALL.map(|lane| {
             NativeLaneStreamGate::new(
                 lane,
@@ -397,6 +431,7 @@ impl NativeTransportAdmission {
                 connection_keys: NativeConnectionKeyCapacity::new()?,
                 incoming_keys: NativeIncomingKeyCapacity::new()?,
                 incoming_streams,
+                root_result_ingress_owners,
                 observer,
             }),
         };
@@ -449,6 +484,10 @@ impl NativeTransportAdmission {
     /// The positions of streams this process serves on `lane`.
     pub fn incoming_streams(&self, lane: NativeLane) -> &NativeLaneStreamGate {
         &self.core.incoming_streams[lane.index()]
+    }
+
+    pub fn root_result_ingress_owner_limit(&self) -> usize {
+        self.core.root_result_ingress_owners
     }
 
     /// Take one served stream position for `method`'s lane, or refuse.
@@ -780,6 +819,25 @@ impl NativeIncomingConnectionBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_ingress_owner_geometry_covers_live_streams_and_both_root_tail_owners() {
+        let g = NativeResultSupportGeometry::V1;
+        assert_eq!(
+            root_result_ingress_owner_limit(TransportRole::Backend, &g).unwrap(),
+            45_184
+        );
+        assert_eq!(
+            root_result_ingress_owner_limit(TransportRole::Frontend, &g).unwrap(),
+            0
+        );
+        let mut invalid = g;
+        invalid.transport_worst_case_roots_per_frontend_per_backend = u64::MAX;
+        assert!(root_result_ingress_owner_limit(TransportRole::Backend, &invalid).is_err());
+        invalid = g;
+        invalid.root_maximum_root_drivers = u64::MAX;
+        assert!(root_result_ingress_owner_limit(TransportRole::Backend, &invalid).is_err());
+    }
 
     fn small() -> NativeTransportAdmission {
         NativeTransportAdmission::with_dimensions(AdmissionDimensions {

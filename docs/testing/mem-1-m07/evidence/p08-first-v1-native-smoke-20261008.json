@@ -1,0 +1,72 @@
+{
+  "status": "PASS_DEV_NATIVE_SMOKE_NOT_PERFORMANCE_OR_P08_ACCEPTANCE",
+  "source_revision": "edafe236e04acd706d171760bc51b1c6dd77bf7d",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "samples": 22,
+  "failures": 0,
+  "legacy_main_release_revision": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+  "wire_comparison": [
+    {
+      "query": "integer",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "float",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "decimal",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "date-time",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "nested",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "wide",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "wide-slow",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "local-show",
+      "metadata_equal": true,
+      "row_bytes_equal": null
+    },
+    {
+      "query": "count",
+      "metadata_equal": true,
+      "row_bytes_equal": null
+    },
+    {
+      "query": "short",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    },
+    {
+      "query": "over-staging",
+      "metadata_equal": true,
+      "row_bytes_equal": true
+    }
+  ],
+  "artifacts_sha256": {
+    "logs/mem-1-m07/p08-descriptor-native-dev-smoke-20261008/performance-mem-1-m07-wire-baseline/result-wire-samples.json": "e43da921ffee1221831641610dd24124f96883637ffcb3463ab734cd1970f3a6",
+    "logs/mem-1-m07/p08-descriptor-native-dev-smoke-20261008/performance-mem-1-m07-wire-baseline/scenario-evidence.json": "853c80c5889f9566dad055f1d95c5839166c2ef11768522ca1c3d9e52d3abf97",
+    "logs/mem-1-m07/p08-descriptor-native-dev-smoke-driver.log": "129765459d804f5465fad8442b9638487d54e90a0a67bfa10756bda64bdda0c6"
+  },
+  "remaining": "Independent root ingress, FE retirement, P00b/P09/P10/full final SHA"
+}

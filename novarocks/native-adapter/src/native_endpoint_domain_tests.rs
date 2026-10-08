@@ -211,7 +211,13 @@ async fn every_allowed_manifest_method_uses_its_domain_even_without_metrics() {
                     observed: observed.clone(),
                     forbidden: false,
                     expected_gate: match domain {
-                        NativeEndpointDomain::BackendData => Some("ordinary"),
+                        NativeEndpointDomain::BackendData => {
+                            Some(if contract.method == NativeRpcMethod::FetchRootResult {
+                                "root_result"
+                            } else {
+                                "ordinary"
+                            })
+                        }
                         NativeEndpointDomain::BackendControl => Some("control"),
                         NativeEndpointDomain::FrontendMembership => None,
                     },

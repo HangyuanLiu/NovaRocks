@@ -297,6 +297,7 @@ impl Drop for WaitingPermit {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MethodClass {
     Ordinary,
+    RootResult,
     Control,
     Stream,
 }
@@ -314,6 +315,7 @@ enum MethodClass {
 pub struct NativeIngressService<S> {
     inner: S,
     ordinary: Gate,
+    root_result: Gate,
     control: Gate,
     config: NativeIngressConfig,
     domain: NativeEndpointDomain,
@@ -349,6 +351,20 @@ impl<S> NativeIngressService<S> {
                 backend_metrics && domain == NativeEndpointDomain::BackendData,
                 config.ordinary_request_max_bytes,
             ),
+            root_result: Gate::new(
+                if domain == NativeEndpointDomain::BackendData {
+                    crate::native_transport_admission::root_result_ingress_owner_limit(
+                        crate::native_transport_admission::TransportRole::Backend,
+                        &novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1,
+                    ).expect("frozen root ingress geometry fits the target")
+                } else {
+                    0
+                },
+                0,
+                "root_result",
+                backend_metrics && domain == NativeEndpointDomain::BackendData,
+                novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES,
+            ),
             control: Gate::new(
                 if domain == NativeEndpointDomain::BackendControl {
                     config.control_running
@@ -374,6 +390,17 @@ impl<S> NativeIngressService<S> {
     /// Hold each request's lane stream position from `admission` until its
     /// response body exits.
     pub fn with_lane_streams(mut self, admission: Option<NativeTransportAdmission>) -> Self {
+        if self.domain == NativeEndpointDomain::BackendData {
+            if let Some(admission) = &admission {
+                self.root_result = Gate::new(
+                    admission.root_result_ingress_owner_limit(),
+                    0,
+                    "root_result",
+                    self.backend_metrics,
+                    novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES,
+                );
+            }
+        }
         self.lane_streams = admission;
         self
     }
@@ -381,6 +408,8 @@ impl<S> NativeIngressService<S> {
     fn classify(&self, method: NativeRpcMethod) -> MethodClass {
         if self.domain == NativeEndpointDomain::BackendControl {
             MethodClass::Control
+        } else if method == NativeRpcMethod::FetchRootResult {
+            MethodClass::RootResult
         } else if method.contract().body == NativeBodyKind::ServerStream {
             MethodClass::Stream
         } else {
@@ -431,6 +460,7 @@ where
                 None => {
                     match self.classify(method) {
                         MethodClass::Control => self.control.reject("lane_streams"),
+                        MethodClass::RootResult => self.root_result.reject("lane_streams"),
                         MethodClass::Ordinary | MethodClass::Stream => {
                             self.ordinary.reject("lane_streams")
                         }
@@ -458,6 +488,7 @@ where
         let class = self.classify(method);
         let gate = match class {
             MethodClass::Control => self.control.clone(),
+            MethodClass::RootResult => self.root_result.clone(),
             MethodClass::Ordinary | MethodClass::Stream => self.ordinary.clone(),
         };
         let config = self.config;
@@ -485,6 +516,9 @@ where
             });
             let body_limit = match class {
                 MethodClass::Control => Some(config.control_request_max_bytes),
+                MethodClass::RootResult => {
+                    Some(novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES)
+                }
                 MethodClass::Ordinary => Some(config.ordinary_request_max_bytes),
                 MethodClass::Stream => None,
             };
@@ -854,10 +888,167 @@ mod tests {
             assert!(matches!(data.classify(method), MethodClass::Ordinary));
         }
         assert!(matches!(
+            data.classify(NativeRpcMethod::FetchRootResult),
+            MethodClass::RootResult
+        ));
+        assert!(matches!(
             data.classify(NativeRpcMethod::SubscribeTaskStatus),
             MethodClass::Stream
         ));
         assert_eq!(NativeRpcMethod::from_path("/Other/Heartbeat"), None);
+    }
+
+    #[tokio::test]
+    async fn root_ingress_progresses_past_200_without_borrowing_ordinary_or_control() {
+        use crate::native_lane::NativeLane;
+        let admission = NativeTransportAdmission::new().unwrap();
+        let service = tower::service_fn(|_request: Request<Body>| async {
+            Ok::<_, Infallible>(Response::new(tonic::body::boxed(OneDataFrame(Some(
+                Bytes::from_static(b"payload"),
+            )))))
+        });
+        let config = NativeIngressConfig {
+            ordinary_running: 1,
+            ordinary_waiting: 0,
+            ..Default::default()
+        };
+        let data = NativeIngressService::new(
+            service.clone(),
+            config,
+            "test",
+            false,
+            NativeEndpointDomain::BackendData,
+        )
+        .with_lane_streams(Some(admission.clone()));
+        let request = |method: NativeRpcMethod| {
+            Request::builder()
+                .uri(method.contract().path)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ordinary = data
+            .clone()
+            .oneshot(request(NativeRpcMethod::ApplyTaskOperations))
+            .await
+            .unwrap();
+        assert_eq!(data.ordinary.running.available_permits(), 0);
+        let root_limit = data.root_result.running.available_permits();
+        let stream_limit = admission.incoming_streams(NativeLane::ResultData).limit();
+        let mut bodies = Vec::new();
+        for _ in 0..256 {
+            let response = data
+                .clone()
+                .oneshot(request(NativeRpcMethod::FetchRootResult))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert!(response.headers().get("grpc-status").is_none());
+            bodies.push(response.into_body());
+        }
+        assert_eq!(
+            data.root_result.running.available_permits(),
+            root_limit - 256
+        );
+        assert_eq!(
+            admission
+                .incoming_streams(NativeLane::ResultData)
+                .available(),
+            stream_limit - 256
+        );
+        let control = NativeIngressService::new(
+            service,
+            config,
+            "test",
+            false,
+            NativeEndpointDomain::BackendControl,
+        )
+        .with_lane_streams(Some(admission.clone()));
+        let response = control
+            .clone()
+            .oneshot(request(NativeRpcMethod::Heartbeat))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            control.control.running.available_permits(),
+            config.control_running - 1
+        );
+        let mut data_frames = Vec::new();
+        for mut body in bodies {
+            let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                .await
+                .unwrap()
+                .unwrap();
+            data_frames.push(frame);
+            assert!(
+                std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                    .await
+                    .is_none()
+            );
+            drop(body);
+        }
+        assert_eq!(
+            admission
+                .incoming_streams(NativeLane::ResultData)
+                .available(),
+            stream_limit
+        );
+        assert_eq!(
+            data.root_result.running.available_permits(),
+            root_limit - 256,
+            "h2 DATA aliases still own the ingress positions after public stream EOF"
+        );
+        assert_eq!(data.ordinary.running.available_permits(), 0);
+        drop(data_frames);
+        assert_eq!(data.root_result.running.available_permits(), root_limit);
+        drop(ordinary);
+        drop(response);
+        assert_eq!(data.ordinary.running.available_permits(), 1);
+        assert_eq!(
+            control.control.running.available_permits(),
+            config.control_running
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_root_request_refuses_before_handler_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let service = tower::service_fn(move |_request: Request<Body>| {
+            let calls = Arc::clone(&observed);
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, Infallible>(Response::new(tonic::body::empty_body()))
+            }
+        });
+        let ingress = NativeIngressService::new(
+            service,
+            NativeIngressConfig::default(),
+            "test",
+            false,
+            NativeEndpointDomain::BackendData,
+        );
+        let available = ingress.root_result.running.available_permits();
+        let response = ingress
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(NativeRpcMethod::FetchRootResult.contract().path)
+                    .header(
+                        header::CONTENT_LENGTH,
+                        novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES
+                            + GRPC_FRAME_HEADER_BYTES
+                            + 1,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "8");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        drop(response);
+        assert_eq!(ingress.root_result.running.available_permits(), available);
     }
 
     #[test]
