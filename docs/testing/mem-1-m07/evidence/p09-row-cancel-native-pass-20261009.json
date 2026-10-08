@@ -1,0 +1,2491 @@
+{
+  "source_revision": "43463c6f678341e979629cc51ca7387fd813aa1f",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "server_sha256": "c20b4d9726f93a4f8a892b21fa48b696a4243b3a13a04397e8c985126f61fbbc",
+  "runner_sha256": "aeffd3aa8a4b20a1cd4ad7e3ade4542cfbfede1f39dbfd6477200fa189b9da95",
+  "input_sha256": "3f8813c8c8205ba724ad8c3dc6eeecae4562681244e46d12910de360a1c45752",
+  "cancel_input_sha256": "18a25f94a81006ae2920d97f184918cea1ed84484f273638a0ed73382da6f4a2",
+  "exit_code": 0,
+  "duration_seconds": 7.575,
+  "task": "MEM-1-M07",
+  "stage": "P09 paused-client cancellation and retention rerun",
+  "outcome": "native-passed",
+  "actual_server_build_identity": "43463c6f678341e979629cc51ca7387fd813aa1f",
+  "native_compatibility_id": "de762440531d58152ef997c580f1c38d4bdadb13f7b7acbd36bdfcc4a1912923",
+  "pids": [
+    26046,
+    26130,
+    26131,
+    26132,
+    26206,
+    26207,
+    26208,
+    26209,
+    26370,
+    26371,
+    26372,
+    26373
+  ],
+  "pids_gone": true,
+  "scenarios": {
+    "result-delivery-partial-large-row-cancel-poisons-socket": {
+      "evidence": {
+        "schema_version": 5,
+        "scenario": "result-delivery/partial-large-row-cancel-poisons-socket",
+        "outcome": "passed",
+        "exit_code": 0,
+        "started_unix_millis": 1791501507856,
+        "ended_unix_millis": 1791501508909,
+        "command": [
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks-system-tests",
+          "--binary",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+          "--config",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/tools/ci/fixtures/system-scenarios-base.toml",
+          "--artifact-root",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-row-cancel-native-v1-20261009",
+          "--cluster-size",
+          "3",
+          "--timeout-secs",
+          "180",
+          "--only",
+          "result-delivery/producer-exit-context-retention",
+          "--only",
+          "result-delivery/unread-row-cancel-closing-window",
+          "--only",
+          "result-delivery/partial-large-row-cancel-poisons-socket"
+        ],
+        "source_revision": "43463c6f678341e979629cc51ca7387fd813aa1f",
+        "source_dirty": false,
+        "source_tree_sha256": "69286389d186a9cc79a385a8a3c3d4550de8b536c2c539de60a72d070c30c976",
+        "runner_native_build_identity": "43463c6f678341e979629cc51ca7387fd813aa1f",
+        "runner_executable": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks-system-tests",
+        "cargo_lock_sha256": "4e2c1a5f73a4b20fedf40592966d64a75f54c35bce38dc3f2897b7ff6b415d40",
+        "platform": {
+          "os": "macos",
+          "architecture": "aarch64",
+          "logical_cpu_count": 10
+        },
+        "actions": [
+          "cluster launched and topology barrier passed",
+          "scenario assertions passed",
+          "cluster and fixture cleanup passed"
+        ],
+        "phase_observations": [
+          {
+            "phase": "native-row-cancel",
+            "phase_sequence": 1,
+            "logical_read_ordinal": 1,
+            "attempt_ordinal": 1,
+            "capability_path": "public-mysql-native-root",
+            "provider_call_sequence": 1,
+            "outcome": "passed",
+            "counters": {
+              "held_census_samples": 3,
+              "rows": 0,
+              "same_socket_reused": 0
+            }
+          }
+        ],
+        "runtime_dir": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/runtime/26024_1791501507605634000",
+        "primary_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "base_config_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/tools/ci/fixtures/system-scenarios-base.toml",
+        "base_config_sha256": "e959dcbe9214e0a2d2348ac13bab609bf5ed778dd7da316fd92368ba9e83643b",
+        "cluster_size": 3,
+        "launch_profile": "fault-scenario",
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 26370,
+            "process_start_token": "macos:1791501507:610186"
+          },
+          {
+            "role": "be-0",
+            "pid": 26371,
+            "process_start_token": "macos:1791501507:672964"
+          },
+          {
+            "role": "be-1",
+            "pid": 26372,
+            "process_start_token": "macos:1791501507:733432"
+          },
+          {
+            "role": "be-2",
+            "pid": 26373,
+            "process_start_token": "macos:1791501507:793860"
+          }
+        ],
+        "effective_launch_config_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+        "effective_launch_config_semantics_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+        "effective_launch_config": {
+          "schema_version": 1,
+          "semantics": {
+            "child_environment": {
+              "backends": [
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ],
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ],
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ]
+              ],
+              "frontend": [
+                {
+                  "classification": "non-formal-unsealed",
+                  "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                  "present": true
+                }
+              ]
+            },
+            "cluster_size": 3,
+            "expected_eligible_backend_count": 3,
+            "fixed_environment": {
+              "NO_PROXY": "127.0.0.1,localhost"
+            },
+            "launch_profile": "fault-scenario",
+            "native_proxy": {
+              "backends": []
+            },
+            "roles": [
+              {
+                "attachments": [],
+                "backend_index": null,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "catalog_source": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "dynamic-state-store"
+                        }
+                      }
+                    },
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "heartbeat_interval_ms": {
+                          "type": "integer",
+                          "value": 500
+                        },
+                        "heartbeat_timeout_retries": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "fe"
+                        }
+                      }
+                    },
+                    "debug": {
+                      "type": "table",
+                      "value": {
+                        "cleanup_fault_dir": {
+                          "type": "string",
+                          "value": "$RUNTIME/connector-cleanup-faults"
+                        }
+                      }
+                    },
+                    "mv_management": {
+                      "type": "table",
+                      "value": {
+                        "audit_log": {
+                          "type": "string",
+                          "value": "mv-management-audit.log"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "mysql_port": {
+                          "type": "string",
+                          "value": "$FE_MYSQL"
+                        },
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    },
+                    "state_store": {
+                      "type": "table",
+                      "value": {
+                        "cluster_id": {
+                          "type": "string",
+                          "value": "novarocks-system-scenarios"
+                        },
+                        "path": {
+                          "type": "string",
+                          "value": "$RUNTIME/frontend-state.sqlite"
+                        },
+                        "provider": {
+                          "type": "string",
+                          "value": "sqlite"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "fe"
+              },
+              {
+                "attachments": [],
+                "backend_index": 0,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              },
+              {
+                "attachments": [],
+                "backend_index": 1,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              },
+              {
+                "attachments": [],
+                "backend_index": 2,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              }
+            ]
+          }
+        },
+        "diagnostics": null
+      },
+      "cancel-held-root-census": [
+        {
+          "applied_receive_buffer_bytes": 4096,
+          "connection_id": 2,
+          "elapsed_micros": 156477,
+          "matches": false,
+          "roots": [
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            }
+          ]
+        },
+        {
+          "applied_receive_buffer_bytes": 4096,
+          "connection_id": 2,
+          "elapsed_micros": 278578,
+          "matches": true,
+          "roots": [
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 1,
+              "data_positions": 2,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 56841,
+              "metadata_holders": 1,
+              "payload_bytes": 2097152,
+              "producers_exited": 0,
+              "producers_running": 1,
+              "retained_reservations": 2,
+              "sealed": 0,
+              "segments": 2,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            }
+          ]
+        },
+        {
+          "applied_receive_buffer_bytes": 4096,
+          "connection_id": 2,
+          "elapsed_micros": 399141,
+          "matches": true,
+          "roots": [
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 1,
+              "data_positions": 2,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 56841,
+              "metadata_holders": 1,
+              "payload_bytes": 2097152,
+              "producers_exited": 0,
+              "producers_running": 1,
+              "retained_reservations": 2,
+              "sealed": 0,
+              "segments": 2,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            }
+          ]
+        }
+      ],
+      "cancel-same-socket-follow-up": {
+        "rows": 0,
+        "row_payload_bytes": 0,
+        "wire_bytes": 0,
+        "packets": 0,
+        "columns": 0,
+        "schema": [],
+        "metadata_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "wire_prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "first_payload_chunk_micros": null,
+        "first_row_micros": null,
+        "elapsed_micros": 49,
+        "row_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "error": "truncated server response"
+      },
+      "cancel-row-wire": {
+        "rows": 0,
+        "row_payload_bytes": 655360,
+        "wire_bytes": 670785,
+        "packets": 20,
+        "columns": 17,
+        "schema": [
+          {
+            "name": "c0",
+            "mysql_type": 253
+          },
+          {
+            "name": "c1",
+            "mysql_type": 253
+          },
+          {
+            "name": "c2",
+            "mysql_type": 253
+          },
+          {
+            "name": "c3",
+            "mysql_type": 253
+          },
+          {
+            "name": "c4",
+            "mysql_type": 253
+          },
+          {
+            "name": "c5",
+            "mysql_type": 253
+          },
+          {
+            "name": "c6",
+            "mysql_type": 253
+          },
+          {
+            "name": "c7",
+            "mysql_type": 253
+          },
+          {
+            "name": "c8",
+            "mysql_type": 253
+          },
+          {
+            "name": "c9",
+            "mysql_type": 253
+          },
+          {
+            "name": "c10",
+            "mysql_type": 253
+          },
+          {
+            "name": "c11",
+            "mysql_type": 253
+          },
+          {
+            "name": "c12",
+            "mysql_type": 253
+          },
+          {
+            "name": "c13",
+            "mysql_type": 253
+          },
+          {
+            "name": "c14",
+            "mysql_type": 253
+          },
+          {
+            "name": "c15",
+            "mysql_type": 253
+          },
+          {
+            "name": "c16",
+            "mysql_type": 253
+          }
+        ],
+        "metadata_sha256": "e41af3c8b561a13b5a2d687f006c90516cf524b5c530cc916c64ceb08512388f",
+        "wire_prefix_sha256": "3630ac6d94b9246b985c5c32e12b9e769bdaba2bbfde76e0cf8b4313480ce626",
+        "first_payload_chunk_micros": 272681,
+        "first_row_micros": null,
+        "elapsed_micros": 308792,
+        "row_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "error": "truncated server response"
+      },
+      "cancel-timing": {
+        "kill_returned_micros": 400172,
+        "kill_started_micros": 399417,
+        "resume_sent_micros": 400289
+      },
+      "cancel-follow-up-native-tasks": {
+        "after": [
+          0.0,
+          2.0,
+          0.0
+        ],
+        "before": [
+          0.0,
+          2.0,
+          0.0
+        ]
+      }
+    },
+    "result-delivery-producer-exit-context-retention": {
+      "evidence": {
+        "schema_version": 5,
+        "scenario": "result-delivery/producer-exit-context-retention",
+        "outcome": "passed",
+        "exit_code": 0,
+        "started_unix_millis": 1791501505362,
+        "ended_unix_millis": 1791501506185,
+        "command": [
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks-system-tests",
+          "--binary",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+          "--config",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/tools/ci/fixtures/system-scenarios-base.toml",
+          "--artifact-root",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-row-cancel-native-v1-20261009",
+          "--cluster-size",
+          "3",
+          "--timeout-secs",
+          "180",
+          "--only",
+          "result-delivery/producer-exit-context-retention",
+          "--only",
+          "result-delivery/unread-row-cancel-closing-window",
+          "--only",
+          "result-delivery/partial-large-row-cancel-poisons-socket"
+        ],
+        "source_revision": "43463c6f678341e979629cc51ca7387fd813aa1f",
+        "source_dirty": false,
+        "source_tree_sha256": "69286389d186a9cc79a385a8a3c3d4550de8b536c2c539de60a72d070c30c976",
+        "runner_native_build_identity": "43463c6f678341e979629cc51ca7387fd813aa1f",
+        "runner_executable": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks-system-tests",
+        "cargo_lock_sha256": "4e2c1a5f73a4b20fedf40592966d64a75f54c35bce38dc3f2897b7ff6b415d40",
+        "platform": {
+          "os": "macos",
+          "architecture": "aarch64",
+          "logical_cpu_count": 10
+        },
+        "actions": [
+          "cluster launched and topology barrier passed",
+          "scenario assertions passed",
+          "cluster and fixture cleanup passed"
+        ],
+        "phase_observations": [
+          {
+            "phase": "producer-retired-context-held-root",
+            "phase_sequence": 1,
+            "logical_read_ordinal": 1,
+            "attempt_ordinal": 1,
+            "capability_path": "public-mysql-native-root",
+            "provider_call_sequence": 1,
+            "outcome": "passed",
+            "counters": {
+              "census_samples": 3,
+              "held_data_positions": 2,
+              "rows": 1
+            }
+          }
+        ],
+        "runtime_dir": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-producer-exit-context-retention/runtime/26024_1791501502439989000",
+        "primary_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "base_config_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/tools/ci/fixtures/system-scenarios-base.toml",
+        "base_config_sha256": "e959dcbe9214e0a2d2348ac13bab609bf5ed778dd7da316fd92368ba9e83643b",
+        "cluster_size": 3,
+        "launch_profile": "fault-scenario",
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 26046,
+            "process_start_token": "macos:1791501502:447184"
+          },
+          {
+            "role": "be-0",
+            "pid": 26130,
+            "process_start_token": "macos:1791501505:180248"
+          },
+          {
+            "role": "be-1",
+            "pid": 26131,
+            "process_start_token": "macos:1791501505:231170"
+          },
+          {
+            "role": "be-2",
+            "pid": 26132,
+            "process_start_token": "macos:1791501505:288662"
+          }
+        ],
+        "effective_launch_config_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+        "effective_launch_config_semantics_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+        "effective_launch_config": {
+          "schema_version": 1,
+          "semantics": {
+            "child_environment": {
+              "backends": [
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ],
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ],
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ]
+              ],
+              "frontend": [
+                {
+                  "classification": "non-formal-unsealed",
+                  "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                  "present": true
+                }
+              ]
+            },
+            "cluster_size": 3,
+            "expected_eligible_backend_count": 3,
+            "fixed_environment": {
+              "NO_PROXY": "127.0.0.1,localhost"
+            },
+            "launch_profile": "fault-scenario",
+            "native_proxy": {
+              "backends": []
+            },
+            "roles": [
+              {
+                "attachments": [],
+                "backend_index": null,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "catalog_source": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "dynamic-state-store"
+                        }
+                      }
+                    },
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "heartbeat_interval_ms": {
+                          "type": "integer",
+                          "value": 500
+                        },
+                        "heartbeat_timeout_retries": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "fe"
+                        }
+                      }
+                    },
+                    "debug": {
+                      "type": "table",
+                      "value": {
+                        "cleanup_fault_dir": {
+                          "type": "string",
+                          "value": "$RUNTIME/connector-cleanup-faults"
+                        }
+                      }
+                    },
+                    "mv_management": {
+                      "type": "table",
+                      "value": {
+                        "audit_log": {
+                          "type": "string",
+                          "value": "mv-management-audit.log"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "mysql_port": {
+                          "type": "string",
+                          "value": "$FE_MYSQL"
+                        },
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    },
+                    "state_store": {
+                      "type": "table",
+                      "value": {
+                        "cluster_id": {
+                          "type": "string",
+                          "value": "novarocks-system-scenarios"
+                        },
+                        "path": {
+                          "type": "string",
+                          "value": "$RUNTIME/frontend-state.sqlite"
+                        },
+                        "provider": {
+                          "type": "string",
+                          "value": "sqlite"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "fe"
+              },
+              {
+                "attachments": [],
+                "backend_index": 0,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              },
+              {
+                "attachments": [],
+                "backend_index": 1,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              },
+              {
+                "attachments": [],
+                "backend_index": 2,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              }
+            ]
+          }
+        },
+        "diagnostics": null
+      }
+    },
+    "result-delivery-unread-row-cancel-closing-window": {
+      "evidence": {
+        "schema_version": 5,
+        "scenario": "result-delivery/unread-row-cancel-closing-window",
+        "outcome": "passed",
+        "exit_code": 0,
+        "started_unix_millis": 1791501506433,
+        "ended_unix_millis": 1791501507599,
+        "command": [
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks-system-tests",
+          "--binary",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+          "--config",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/tools/ci/fixtures/system-scenarios-base.toml",
+          "--artifact-root",
+          "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-row-cancel-native-v1-20261009",
+          "--cluster-size",
+          "3",
+          "--timeout-secs",
+          "180",
+          "--only",
+          "result-delivery/producer-exit-context-retention",
+          "--only",
+          "result-delivery/unread-row-cancel-closing-window",
+          "--only",
+          "result-delivery/partial-large-row-cancel-poisons-socket"
+        ],
+        "source_revision": "43463c6f678341e979629cc51ca7387fd813aa1f",
+        "source_dirty": false,
+        "source_tree_sha256": "69286389d186a9cc79a385a8a3c3d4550de8b536c2c539de60a72d070c30c976",
+        "runner_native_build_identity": "43463c6f678341e979629cc51ca7387fd813aa1f",
+        "runner_executable": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks-system-tests",
+        "cargo_lock_sha256": "4e2c1a5f73a4b20fedf40592966d64a75f54c35bce38dc3f2897b7ff6b415d40",
+        "platform": {
+          "os": "macos",
+          "architecture": "aarch64",
+          "logical_cpu_count": 10
+        },
+        "actions": [
+          "cluster launched and topology barrier passed",
+          "scenario assertions passed",
+          "cluster and fixture cleanup passed"
+        ],
+        "phase_observations": [
+          {
+            "phase": "native-row-cancel",
+            "phase_sequence": 1,
+            "logical_read_ordinal": 1,
+            "attempt_ordinal": 1,
+            "capability_path": "public-mysql-native-root",
+            "provider_call_sequence": 1,
+            "outcome": "passed",
+            "counters": {
+              "held_census_samples": 3,
+              "rows": 1,
+              "same_socket_reused": 1
+            }
+          }
+        ],
+        "runtime_dir": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/runtime/26024_1791501506191330000",
+        "primary_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "base_config_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/tools/ci/fixtures/system-scenarios-base.toml",
+        "base_config_sha256": "e959dcbe9214e0a2d2348ac13bab609bf5ed778dd7da316fd92368ba9e83643b",
+        "cluster_size": 3,
+        "launch_profile": "fault-scenario",
+        "process_launch_identities": [
+          {
+            "role": "fe",
+            "pid": 26206,
+            "process_start_token": "macos:1791501506:195792"
+          },
+          {
+            "role": "be-0",
+            "pid": 26207,
+            "process_start_token": "macos:1791501506:258414"
+          },
+          {
+            "role": "be-1",
+            "pid": 26208,
+            "process_start_token": "macos:1791501506:314049"
+          },
+          {
+            "role": "be-2",
+            "pid": 26209,
+            "process_start_token": "macos:1791501506:370840"
+          }
+        ],
+        "effective_launch_config_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+        "effective_launch_config_semantics_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+        "effective_launch_config": {
+          "schema_version": 1,
+          "semantics": {
+            "child_environment": {
+              "backends": [
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ],
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ],
+                [
+                  {
+                    "classification": "non-formal-unsealed",
+                    "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                    "present": true
+                  }
+                ]
+              ],
+              "frontend": [
+                {
+                  "classification": "non-formal-unsealed",
+                  "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                  "present": true
+                }
+              ]
+            },
+            "cluster_size": 3,
+            "expected_eligible_backend_count": 3,
+            "fixed_environment": {
+              "NO_PROXY": "127.0.0.1,localhost"
+            },
+            "launch_profile": "fault-scenario",
+            "native_proxy": {
+              "backends": []
+            },
+            "roles": [
+              {
+                "attachments": [],
+                "backend_index": null,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "catalog_source": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "dynamic-state-store"
+                        }
+                      }
+                    },
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "heartbeat_interval_ms": {
+                          "type": "integer",
+                          "value": 500
+                        },
+                        "heartbeat_timeout_retries": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "fe"
+                        }
+                      }
+                    },
+                    "debug": {
+                      "type": "table",
+                      "value": {
+                        "cleanup_fault_dir": {
+                          "type": "string",
+                          "value": "$RUNTIME/connector-cleanup-faults"
+                        }
+                      }
+                    },
+                    "mv_management": {
+                      "type": "table",
+                      "value": {
+                        "audit_log": {
+                          "type": "string",
+                          "value": "mv-management-audit.log"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "mysql_port": {
+                          "type": "string",
+                          "value": "$FE_MYSQL"
+                        },
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    },
+                    "state_store": {
+                      "type": "table",
+                      "value": {
+                        "cluster_id": {
+                          "type": "string",
+                          "value": "novarocks-system-scenarios"
+                        },
+                        "path": {
+                          "type": "string",
+                          "value": "$RUNTIME/frontend-state.sqlite"
+                        },
+                        "provider": {
+                          "type": "string",
+                          "value": "sqlite"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "fe"
+              },
+              {
+                "attachments": [],
+                "backend_index": 0,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              },
+              {
+                "attachments": [],
+                "backend_index": 1,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              },
+              {
+                "attachments": [],
+                "backend_index": 2,
+                "effective_config": {
+                  "type": "table",
+                  "value": {
+                    "cluster": {
+                      "type": "table",
+                      "value": {
+                        "advertise_host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "frontend_endpoint": {
+                          "type": "string",
+                          "value": "$FE_GRPC_ENDPOINT"
+                        },
+                        "role": {
+                          "type": "string",
+                          "value": "be"
+                        }
+                      }
+                    },
+                    "native_trust": {
+                      "type": "table",
+                      "value": {
+                        "deployment_id": {
+                          "type": "string",
+                          "value": "novarocks-system-tests"
+                        },
+                        "shared_secret": {
+                          "type": "string",
+                          "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                        },
+                        "transport": {
+                          "type": "table",
+                          "value": {
+                            "mode": {
+                              "type": "string",
+                              "value": "disabled"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "runtime": {
+                      "type": "table",
+                      "value": {
+                        "data_runtime_max_blocking_threads": {
+                          "type": "integer",
+                          "value": 64
+                        },
+                        "data_runtime_worker_threads": {
+                          "type": "integer",
+                          "value": 2
+                        },
+                        "exchange_io_threads": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "pipeline_exec_thread_pool_thread_num": {
+                          "type": "integer",
+                          "value": 1
+                        },
+                        "query_blocking_worker_threads": {
+                          "type": "integer",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "server": {
+                      "type": "table",
+                      "value": {
+                        "control_grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_CONTROL_GRPC"
+                        },
+                        "grpc_port": {
+                          "type": "string",
+                          "value": "$ROLE_GRPC"
+                        },
+                        "host": {
+                          "type": "string",
+                          "value": "127.0.0.1"
+                        },
+                        "http_port": {
+                          "type": "string",
+                          "value": "$ROLE_HTTP"
+                        }
+                      }
+                    },
+                    "standalone_server": {
+                      "type": "table",
+                      "value": {
+                        "user": {
+                          "type": "string",
+                          "value": "root"
+                        }
+                      }
+                    }
+                  }
+                },
+                "role": "be"
+              }
+            ]
+          }
+        },
+        "diagnostics": null
+      },
+      "cancel-held-root-census": [
+        {
+          "applied_receive_buffer_bytes": 4096,
+          "connection_id": 2,
+          "elapsed_micros": 160722,
+          "matches": false,
+          "roots": [
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            }
+          ]
+        },
+        {
+          "applied_receive_buffer_bytes": 4096,
+          "connection_id": 2,
+          "elapsed_micros": 284530,
+          "matches": true,
+          "roots": [
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 1,
+              "data_positions": 2,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 1,
+              "metadata_bytes": 4215,
+              "metadata_holders": 0,
+              "payload_bytes": 1048584,
+              "producers_exited": 1,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 2,
+              "terminal_task_records": 1
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            }
+          ]
+        },
+        {
+          "applied_receive_buffer_bytes": 4096,
+          "connection_id": 2,
+          "elapsed_micros": 400846,
+          "matches": true,
+          "roots": [
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            },
+            {
+              "channels": 1,
+              "data_positions": 2,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 1,
+              "metadata_bytes": 4215,
+              "metadata_holders": 0,
+              "payload_bytes": 1048584,
+              "producers_exited": 1,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 2,
+              "terminal_task_records": 1
+            },
+            {
+              "channels": 0,
+              "data_positions": 0,
+              "deliveries": 0,
+              "ends_acknowledged": 0,
+              "ends_published": 0,
+              "metadata_bytes": 0,
+              "metadata_holders": 0,
+              "payload_bytes": 0,
+              "producers_exited": 0,
+              "producers_running": 0,
+              "retained_reservations": 0,
+              "sealed": 0,
+              "segments": 0,
+              "terminal_task_records": 0
+            }
+          ]
+        }
+      ],
+      "cancel-same-socket-follow-up": {
+        "rows": 1,
+        "row_payload_bytes": 5,
+        "wire_bytes": 63,
+        "packets": 5,
+        "columns": 1,
+        "schema": [
+          {
+            "name": "total",
+            "mysql_type": 8
+          }
+        ],
+        "metadata_sha256": "7721ce1ad88e56a1097efd8268513a523b6b10f76f8e55af5b98257860f9b846",
+        "wire_prefix_sha256": "c5a9921cd679ec9a845aab2322d8e1b270cd85ab71a8638fe395765de88d642b",
+        "first_payload_chunk_micros": 20190,
+        "first_row_micros": 20192,
+        "elapsed_micros": 20601,
+        "row_sha256": "6dab454b19ecc06d337eb421a7ecc69aaa272a74fdf3a6bf7b81900ca94758b1",
+        "error": null
+      },
+      "cancel-row-wire": {
+        "rows": 1,
+        "row_payload_bytes": 1048580,
+        "wire_bytes": 1048675,
+        "packets": 5,
+        "columns": 1,
+        "schema": [
+          {
+            "name": "payload",
+            "mysql_type": 253
+          }
+        ],
+        "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+        "wire_prefix_sha256": "a3514dfc55c1908f64d4fecbd9548901ae4739d02f79213d857923aa1deac0db",
+        "first_payload_chunk_micros": 379385,
+        "first_row_micros": 431428,
+        "elapsed_micros": 431580,
+        "row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+        "error": "server result error code 1317: Query execution was interrupted"
+      },
+      "cancel-closing-window": [
+        {
+          "elapsed_micros": 402520,
+          "matches": false,
+          "positions": [
+            1,
+            0,
+            0,
+            1
+          ]
+        },
+        {
+          "elapsed_micros": 510021,
+          "matches": true,
+          "positions": [
+            0,
+            0,
+            0,
+            1
+          ]
+        }
+      ],
+      "cancel-timing": {
+        "kill_returned_micros": 401877,
+        "kill_started_micros": 401088,
+        "resume_sent_micros": 510181
+      },
+      "cancel-follow-up-native-tasks": {
+        "after": [
+          0.0,
+          2.0,
+          2.0
+        ],
+        "before": [
+          0.0,
+          2.0,
+          0.0
+        ]
+      }
+    }
+  },
+  "scope": "Original frozen S+8 resident and 17MiB legal-row tests. Held Closing separate from released Client; exact complete resident row+ERR1317+native same-socket health. Missing large tail emits positive wire prefix then EOF; failed follow-up zero wire bytes/schema/rows/packets and unchanged BE task counters after target idle. Repeated retention scenario verifies actor compatibility. Excludes framing cursor/tail exact bytes, full pools, ACK-only, released fixed-core/Arc tail and allocator last exit.",
+  "raw_files": [
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/driver-status.json",
+      "sha256": "929f290d096fec588809c8e4c124936a8c0dd4b3ef472b9598db3b7926eeff67"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/driver.log",
+      "sha256": "6f5f8d228a6b060e0b14942afc76019e4c990d294c0d199abc57f790547b9855"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/cancel-follow-up-native-tasks.json",
+      "sha256": "cc11d93c28314e4a44361b4861d9ff428222f89687c195a909b604abf2fba567"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/cancel-held-root-census.json",
+      "sha256": "fe196f0e0babbddddf462d40af50d7dc40064a553790026633b566527ccd743a"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/cancel-row-wire.json",
+      "sha256": "26fe61eeea78f661873e499790addc3587261c652334094b0e896a9aee200061"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/cancel-same-socket-follow-up.json",
+      "sha256": "13dd60232e84425b70f73a9b2bf9642fdd1ce0dd3df825b2ac2664eb418eb237"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/cancel-timing.json",
+      "sha256": "53441252e29117a68832bf75aed6e194ff04c98638b858ce4481732d838da4b9"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/owner-barrier-row-cancel-after-follow-up.json",
+      "sha256": "90731814f5eec0800d8555c135e3cebd64a7210eee16409c7bcd1ce88a880818"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/owner-barrier-row-cancel-after-target.json",
+      "sha256": "aac3704b2bf7d30bfa29d14799f953c9ff89fee9c30412079279500fc6d1f973"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/owner-barrier-row-cancel-after.json",
+      "sha256": "5fb0c77996f96eca1d83cff07fe65f6fff32c6f24fbfeaa9822f54386a1a6958"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/owner-barrier-row-cancel-before.json",
+      "sha256": "29968341b7a5b1c362387be97c273625426ca558d7250c0e244fc8f57b3175a9"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-partial-large-row-cancel-poisons-socket/scenario-evidence.json",
+      "sha256": "ab54ad0534a6d313559dd5b596e12bfd11181f16e1d1c3ed85024ccf6139d0e2"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-producer-exit-context-retention/owner-barrier-root-retention-after.json",
+      "sha256": "53834ee625638704ca89a2f8f46d6bdb0e58e974949a06c79b523636c4cee143"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-producer-exit-context-retention/owner-barrier-root-retention-before.json",
+      "sha256": "7df104c1ecf184d8a3ed59882a42688c5f1741419adf6c3d9154d88e9bc33c7f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-producer-exit-context-retention/root-context-held-census.json",
+      "sha256": "dad7798772c410cf7422f10756cb5cb333dbc6071e44244702f58ce872fdee42"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-producer-exit-context-retention/root-context-retention-wire.json",
+      "sha256": "577c802f1b6bf66fe1b2cff0f2ab25910376d559458adcda1fbb925ad29bba58"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-producer-exit-context-retention/scenario-evidence.json",
+      "sha256": "14357e9ef8cdff1c721e93d414bacb4d89ddf868d5ec3e9f3678bb770eae6d45"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/cancel-closing-window.json",
+      "sha256": "8ab6db498714750881ae0598fdecca311546351099c23bd4835fde40bf0fd0a7"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/cancel-follow-up-native-tasks.json",
+      "sha256": "d9deb11ee6bb21d1464559ed7b4d8dde20f3aa145e32b1d1ae5f110e887f1f5f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/cancel-held-root-census.json",
+      "sha256": "757952d0ce534bff6d2bb4b4ba09370f14bd7271439a98f2d09041664505241c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/cancel-row-wire.json",
+      "sha256": "d6edc2b7f4290b792208337a203f47b1357e2531f6bda168516ec3a8b33d2e7a"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/cancel-same-socket-follow-up.json",
+      "sha256": "ccc31cb2ab55256cf9005c28774b7af3c3b82821f74eeb69fbcbb65e8999c9c1"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/cancel-timing.json",
+      "sha256": "0d86af44c841c077a7a53685d19694c83c6cf06b99367f45a2b4fec1f5b7bc19"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/owner-barrier-row-cancel-after-follow-up.json",
+      "sha256": "dfbe273b1e6f8ee36fb2049bd25eb12820f9e9d9b25f498e4b153e2191757e65"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/owner-barrier-row-cancel-after.json",
+      "sha256": "3cc0ec362417b1542f006a611d0325d0a7a772483647b14f2be555c11d7fd83c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/owner-barrier-row-cancel-before.json",
+      "sha256": "8e04651cbb9516a875ecd4c8d4b9806ce3acdb9ed99b7568696deb592e01715c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-native-v1-20261009/result-delivery-unread-row-cancel-closing-window/scenario-evidence.json",
+      "sha256": "b8446d474b2348037a9f45dbc9557a5b72dec81653d4bd629145d8942cb5f668"
+    }
+  ]
+}

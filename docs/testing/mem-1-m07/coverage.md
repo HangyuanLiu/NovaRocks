@@ -202,3 +202,11 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 - runner all-target100 PASS/0 FAIL/2既有ignored，覆盖真实handshake身份拒绝与follow-up错误分类；最初缺少test import的E0425保留。C0 from_ref测试清理已纳入。两个主要语义裁决/P09其它门/P00b/P10/final仍OPEN；无push/PR/归档。
 
 取消探针收紧：runner101 PASS/0 FAIL/2 ignored。真实短header后EOF反例记录3 wire bytes但0 packets，后续拒绝必须wire_bytes=0；resume后timing写失败延后到join/save wire后传播。独立只读复核已修正两项具体证据漏洞。native仍待执行。
+
+
+### 2026-10-09：P09 paused-client 取消与留存复跑 native PASS
+
+- 干净 `43463c6f678341e979629cc51ca7387fd813aa1f`、实际同build identity，3个独立native1FE+3BE场景全部PASS，总7.575s；原root-retention场景复跑验证actor改动，无server配置/容量/deadline修改。12个精确FE/BE PID已退出。收据 `p09-row-cancel-native-pass-20261009.json` 保存准确binary/input hashes与原始观测。
+- resident S+8：连续两次W=2/producer guard exited/task退休/End未ACK；KILL仅0.789ms，101ms后观察Client=0/Closing=1；恢复得到完整1048580B行、5packets、独立digest/schema一致、ERR1317。同socket SUM精确5050/native task counter总增2。
+- missing-tail17MiB：W=2/payload2S/producer仍running/End未发布，KILL后收到655360B行前缀、零完整行并真实EOF；后续同socket查询zero wire/schema/row/packet、EOF且三BE task counter完全不变。KILL仅0.755ms。该行为不证明FE parser未收到命令，不外推具体framing cursor/partial-tail/fullpool/allocator最后退出。
+- 定向runner101 PASS/0 FAIL/2既有ignored；上一个产品切片C0为9695源码12280/0/7，当前test-only增量不冒充final同HEAD C0。ACK-only、small/large精确partial矩阵、满池、real CL、CM/CP/P00b/P10/final及两项待裁决语义继续OPEN，无push/PR/归档。
