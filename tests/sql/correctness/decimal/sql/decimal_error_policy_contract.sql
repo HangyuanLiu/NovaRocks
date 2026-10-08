@@ -206,7 +206,8 @@ ORDER BY r.id;
 -- query 43
 -- @skip_result_check=true
 -- @expect_error=numeric type cast involving decimal overflows
-SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(k AS VARCHAR) AS merged_key
+-- The merged key preserves both input ranges; only an explicit narrowing cast overflows.
+SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(k AS DECIMAL(3,0)) AS VARCHAR) AS merged_key
 FROM (SELECT id,k FROM ${case_db}.decimal_implicit_left WHERE id=1) l
 FULL OUTER JOIN ${case_db}.decimal_implicit_right r USING(k);
 

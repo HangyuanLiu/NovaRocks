@@ -83,7 +83,7 @@ id	f
 -- query 42
 left_id	right_id	merged_key
 1	10	1
-NULL	20	NULL
+NULL	20	1000
 NULL	30	NULL
 
 -- query 44
