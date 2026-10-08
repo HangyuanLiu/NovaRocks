@@ -173,3 +173,8 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 - 新注册 `result-delivery/root-read-profile-kind-refusal`；执行前冻结七个请求、精确 gRPC status 与 SUM1..100 健康查询字节摘要。结构合法的 V1 foreign-process baseline 必须到达准确身份拒绝(9)，其余六项 profile/kind/wanted 变体必须在结构 decode 返回3；全部共享同一合法foreign identity，避免不同身份掩盖判错阶段。
 - probe限定 authenticated plaintext/IP；完整异步RPC包含absolute deadline，请求frame/响应DATA各≤4KiB，headers/第三方分配不在此界，Runtime teardown不冒充deadline内的物理退出。成功响应后的driver真实abort/join；授权不入观察。后续健康查询要求真实Native task、独立字节/schema oracle与公开owner连续归零。scope不覆盖malformed replies/installed-root ACK/retirement/closing。
 - 首轮helper重复mutable借用编译失败已保留并修正；最后完整system runner96 PASS/0 FAIL/2既有ignored；独立只读审查无默认IP场景PASS漏洞。收据 `p09-root-refusal-focused-20261009.json`。原生尚待执行，未改产品code/cap/deadline。
+
+### 2026-10-09：C9 root request refusal 原生 PASS
+
+- 干净源码/runner `27899ebd98c008e80b06dd3bdcea0faf4e953d7a`，实际产品仍为已通过C0的 `7607dae64053ab853c47d827deb64eebddb29030`；两者间只有tests/docs/evidence，产品源码未变。原生1FE+3BE的七项请求精确status为9/3/3/3/3/3/3，随后真实Native SUM健康查询的schema/行字节/独立hash正确；前后公开owner连续两次归零，4 PID真实退出。
+- 收据 `p09-root-refusal-native-pass-20261009.json` 保留原始probe/hash/实际二进制身份。只关闭 authenticated plaintext/IP 请求profile/kind/sequence/foreign-process拒绝，不冒充 installed-root ACK/replay/生产退休/context留存/ClosingRow、非法回复或全C9验收。其余门、两个待裁决决定与goal保持OPEN，无push/PR/归档。
