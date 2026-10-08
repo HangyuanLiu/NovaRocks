@@ -2847,9 +2847,7 @@ async fn consume_governed_scalar_stream(
             client_rows: None
         }
     );
-    if (!relayed && schema.row_carrier() != ResultRowCarrier::DecodedBatches)
-        || (relayed && scalar_schema.is_none())
-    {
+    if !relayed || scalar_schema.is_none() {
         let message = "SET scalar query has no matching frozen typed scalar contract";
         schema.fail(QueryExecutionError::new(
             QueryExecutionErrorKind::InvalidRequest,
@@ -2858,13 +2856,6 @@ async fn consume_governed_scalar_stream(
         let _ = execution.request_cancel();
         return Err(scalar_query_error(message.to_string()));
     }
-    let field = &schema.schema().fields()[0];
-    let column = QueryResultColumn::new(
-        field.name(),
-        field.data_type().clone(),
-        field.nullable(),
-        field.logical_type().cloned(),
-    );
     schema.complete();
 
     let mut value = None;
@@ -2923,51 +2914,8 @@ async fn consume_governed_scalar_stream(
                     }
                 }
             }
-            ResultDelivery::Batch(delivery) => {
-                if relayed {
-                    let message = "SET typed scalar query received a decoded batch";
-                    delivery.fail(QueryExecutionError::new(
-                        QueryExecutionErrorKind::InvalidRequest,
-                        message,
-                    ));
-                    let _ = execution.request_cancel();
-                    return Err(scalar_query_error(message.to_string()));
-                }
-
-                let rows = delivery.batch().num_rows();
-                if rows > 1 || (rows == 1 && value.is_some()) {
-                    let message = "Subquery returns more than 1 row".to_string();
-                    delivery.fail(QueryExecutionError::new(
-                        QueryExecutionErrorKind::InvalidRequest,
-                        message.clone(),
-                    ));
-                    let _ = execution.request_cancel();
-                    return Err(scalar_query_error(message));
-                }
-                if rows == 1 {
-                    let result = QueryResult {
-                        columns: vec![column.clone()],
-                        batches: vec![delivery.batch().clone()],
-                    };
-                    value = match query_result_to_user_variable_literal(&result) {
-                        Ok(value) => Some(value),
-                        Err(message) => {
-                            delivery.fail(QueryExecutionError::new(
-                                QueryExecutionErrorKind::InvalidRequest,
-                                message.clone(),
-                            ));
-                            let _ = execution.request_cancel();
-                            return Err(scalar_query_error(message));
-                        }
-                    };
-                }
-                if let Err(error) = delivery.complete_decoded() {
-                    let _ = execution.request_cancel();
-                    return Err(governed_query_execution_error(error));
-                }
-            }
             ResultDelivery::End(delivery) => {
-                if relayed && value.is_none() {
+                if value.is_none() {
                     let message = "SET typed scalar query ended without its required record";
                     delivery.fail(QueryExecutionError::new(
                         QueryExecutionErrorKind::InvalidRequest,
@@ -3322,18 +3270,6 @@ mod tests {
         ResultField::new("value", DataType::Int64, nullable, None)
     }
 
-    fn scalar_batch(values: Vec<Option<i64>>) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                true,
-            )])),
-            vec![Arc::new(Int64Array::from(values))],
-        )
-        .expect("scalar batch")
-    }
-
     fn relayed_scalar_fixture() -> (
         ResultStreamTestProducer,
         novarocks_query_application::api::ExecutionHandle,
@@ -3434,6 +3370,7 @@ mod tests {
             let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
                 panic!("rows");
             };
+            let capacity = producer.result_capacity();
             let (reply, rows) = scalar_root_reply(execution_id, &schema, leaf, 1);
             let produce = async {
                 assert_eq!(
@@ -3453,7 +3390,9 @@ mod tests {
                     producer.enqueue_end(1).await.wait().await,
                     TestResultDeliveryDisposition::Completed
                 );
+                assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
                 producer.finish();
+                assert_eq!(capacity.snapshot().held_positions, [0; 4]);
             };
             let (result, ()) = tokio::join!(
                 consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
@@ -3550,118 +3489,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn governed_scalar_stream_settles_each_batch_before_eof() {
-        let (producer, mut execution, resources, schema_receipt) =
-            scalar_stream_fixture(vec![scalar_field(false)]);
-        let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
-            panic!("expected row output")
+    async fn governed_scalar_stream_rejects_foreign_record_row_count_and_cancels_execution() {
+        let (producer, mut execution, schema_receipt, execution_id, schema) =
+            relayed_scalar_fixture();
+        let capacity = producer.result_capacity();
+        let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
+            panic!("scalar rows");
         };
-
-        let producer_side = async {
-            assert_eq!(
-                schema_receipt.wait().await,
-                TestResultDeliveryDisposition::Completed
-            );
-            let batch_receipt = producer
-                .enqueue_batch(0, scalar_batch(vec![Some(7)]))
-                .await
-                .expect("enqueue scalar batch");
-            assert_eq!(
-                batch_receipt.wait().await,
-                TestResultDeliveryDisposition::Completed
-            );
-            assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
-            let end_receipt = producer.enqueue_end(1).await;
-            assert_eq!(
-                end_receipt.wait().await,
-                TestResultDeliveryDisposition::Completed
-            );
-            producer.finish();
-        };
-        let (value, ()) = tokio::join!(
-            consume_governed_scalar_stream(&mut execution, stream, None),
-            producer_side
+        let (reply, _) = scalar_root_reply(
+            execution_id,
+            &schema,
+            novarocks_result_contract::BorrowedScalarLeaf::NoRows,
+            1,
         );
-
-        assert_eq!(value.expect("scalar query succeeds"), "7");
-        assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_maps_empty_and_null_to_null() {
-        for (batch, expected) in [(None, "null"), (Some(scalar_batch(vec![None])), "NULL")] {
-            let (producer, mut execution, _resources, schema_receipt) =
-                scalar_stream_fixture(vec![scalar_field(true)]);
-            let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output")
-            else {
-                panic!("expected row output")
-            };
-            let producer_side = async {
-                assert_eq!(
-                    schema_receipt.wait().await,
-                    TestResultDeliveryDisposition::Completed
-                );
-                let mut sequence = 0;
-                if let Some(batch) = batch {
-                    let receipt = producer
-                        .enqueue_batch(sequence, batch)
-                        .await
-                        .expect("enqueue null batch");
-                    assert_eq!(
-                        receipt.wait().await,
-                        TestResultDeliveryDisposition::Completed
-                    );
-                    sequence += 1;
-                }
-                let receipt = producer.enqueue_end(sequence).await;
-                assert_eq!(
-                    receipt.wait().await,
-                    TestResultDeliveryDisposition::Completed
-                );
-                producer.finish();
-            };
-            let (value, ()) = tokio::join!(
-                consume_governed_scalar_stream(&mut execution, stream, None),
-                producer_side
-            );
-            assert_eq!(value.expect("empty or null scalar succeeds"), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_rejects_multiple_rows_and_cancels_execution() {
-        let (producer, mut execution, resources, schema_receipt) =
-            scalar_stream_fixture(vec![scalar_field(false)]);
-        let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
-            panic!("expected row output")
-        };
         let producer_side = async {
             assert_eq!(
                 schema_receipt.wait().await,
                 TestResultDeliveryDisposition::Completed
             );
-            let receipt = producer
-                .enqueue_batch(0, scalar_batch(vec![Some(1), Some(2)]))
-                .await
-                .expect("enqueue multirow batch");
+            let receipt = producer.enqueue_segment(0, reply, None, 2).await.unwrap();
             assert!(matches!(
                 receipt.wait().await,
                 TestResultDeliveryDisposition::Failed(_)
             ));
         };
         let (result, ()) = tokio::join!(
-            consume_governed_scalar_stream(&mut execution, stream, None),
+            consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
             producer_side
         );
-
-        let error = result.expect_err("multirow scalar must fail");
+        let error = result.expect_err("record and delivery row counts must agree");
         assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
         assert_eq!(
             producer.cancellation_reason(),
             Some(WorkCancellationReason::Requested)
         );
-        assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
         producer.finish();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[tokio::test]
@@ -3689,8 +3553,8 @@ mod tests {
 
     #[tokio::test]
     async fn governed_scalar_stream_failure_cancels_execution_after_schema_ack() {
-        let (producer, mut execution, _resources, schema_receipt) =
-            scalar_stream_fixture(vec![scalar_field(false)]);
+        let (producer, mut execution, schema_receipt, _execution_id, schema) =
+            relayed_scalar_fixture();
         let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
             panic!("expected row output")
         };
@@ -3699,7 +3563,7 @@ mod tests {
             "test scalar stream failure",
         ));
 
-        let error = consume_governed_scalar_stream(&mut execution, stream, None)
+        let error = consume_governed_scalar_stream(&mut execution, stream, Some(&schema))
             .await
             .expect_err("failed scalar result stream must fail");
         assert_eq!(error.kind(), QueryServiceErrorKind::Internal);

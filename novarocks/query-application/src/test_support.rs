@@ -22,7 +22,6 @@
 //! application crate. Production adapters cannot use this module because the
 //! production dependency does not enable `test-support`.
 
-use arrow::record_batch::RecordBatch;
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, QueryContextRef, ResultPacketSequence,
 };
@@ -49,8 +48,8 @@ use crate::coordination::{
 };
 
 use crate::api::result::{
-    BatchDelivery, DecodedResultBatch, EndDelivery, QueryResultTransport, ResultDelivery,
-    ResultDeliveryDisposition, ResultDeliveryReceipt,
+    EndDelivery, QueryResultTransport, ResultDelivery, ResultDeliveryDisposition,
+    ResultDeliveryReceipt,
 };
 
 /// Test-only observation of one move-only protocol delivery.
@@ -89,6 +88,7 @@ pub struct ResultStreamTestProducer {
     workload: WorkloadControl,
     root: Option<RootWork>,
     window: Option<novarocks_workload_control::ResultWindowGrant>,
+    capacity: Option<novarocks_workload_control::ResultCapacityHandle>,
 }
 
 impl ResultStreamTestProducer {
@@ -111,7 +111,16 @@ impl ResultStreamTestProducer {
             fields,
             delivery_capacity,
             resource_config,
-            crate::api::ResultRowCarrier::DecodedBatches,
+            crate::api::ResultRowCarrier::relayed(
+                novarocks_result_contract::RootOutputKind::ClientRows,
+                Some(
+                    novarocks_result_contract::ClientRowProfile::try_new(
+                        novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
+                        novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
+                    )
+                    .expect("frozen client profile"),
+                ),
+            )?,
         )
     }
 
@@ -143,7 +152,7 @@ impl ResultStreamTestProducer {
         let root = workload
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .expect("test result root work is admitted");
-        let window = capacity.map(|capacity| {
+        let window = capacity.as_ref().map(|capacity| {
             let class = match carrier {
                 crate::api::ResultRowCarrier::Relayed {
                     kind: novarocks_result_contract::RootOutputKind::ClientRows,
@@ -175,6 +184,7 @@ impl ResultStreamTestProducer {
                 workload,
                 root: Some(root),
                 window,
+                capacity,
             },
             handle,
             resources,
@@ -182,36 +192,71 @@ impl ResultStreamTestProducer {
         ))
     }
 
-    pub async fn enqueue_batch(
+    pub fn result_capacity(&self) -> novarocks_workload_control::ResultCapacityHandle {
+        self.capacity
+            .as_ref()
+            .expect("test relayed capacity")
+            .clone()
+    }
+
+    /// Encoded ClientRows fixture transferred through the real V1 validator.
+    pub async fn enqueue_client_body(
         &self,
         sequence: u64,
-        batch: RecordBatch,
+        body: Vec<u8>,
+        rows: u64,
     ) -> Result<TestResultDeliveryReceipt, QueryExecutionError> {
-        let decoded = DecodedResultBatch::try_new(batch)?;
-        let bytes = decoded.governance_charge_bytes();
-        let root = self.root.as_ref().expect("test result root remains active");
-        let authority = self.workload.resources();
-        let credit = authority
-            .reserve_result_credit(&root.owner.scope(), bytes)
-            .expect("test result fetch credit is representable")
-            .begin_fetch()
-            .expect("test result fetch begins")
-            .retain_raw(bytes)
-            .expect("test result raw payload is retained")
-            .reserve_decode(&authority, bytes)
-            .expect("test result decode capacity is reserved")
-            .queue_decoded(bytes)
-            .expect("test result decoded payload is queued");
-        let (delivery, receipt) = BatchDelivery::try_new(
-            self.execution_id,
-            ResultPacketSequence::new(sequence),
-            decoded,
-            credit,
-        )?;
-        let permit = self.transport.reserve_owned().await?;
-        self.transport
-            .enqueue(permit, ResultDelivery::Batch(delivery));
-        Ok(TestResultDeliveryReceipt(receipt))
+        use novarocks_execution_contract::TaskIdentity;
+        use novarocks_execution_contract::root_result::{
+            RootReadOutcome, RootResultData, RootResultReply,
+        };
+        use novarocks_result_contract::{
+            ClientRowProfile, ClientRowStreamCursor, RootOutputKind, RootProfileId, RootProfileV1,
+        };
+        use novarocks_types::{BackendProcessId, StageId, TaskId};
+        let data = RootResultData::try_new(
+            RootOutputKind::ClientRows,
+            std::num::NonZeroU64::new(sequence.checked_add(1).ok_or_else(|| {
+                crate::api::QueryExecutionError::new(
+                    crate::api::QueryExecutionErrorKind::InvalidRequest,
+                    "fixture sequence overflow",
+                )
+            })?)
+            .unwrap(),
+            bytes::Bytes::from(body),
+            None,
+        )
+        .map_err(|error| {
+            crate::api::QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+        self.enqueue_segment(
+            sequence,
+            RootResultReply {
+                root_task: TaskIdentity::new(
+                    self.execution_id,
+                    StageId::new(1).unwrap(),
+                    TaskId::new(1).unwrap(),
+                    BackendProcessId::new_v7(),
+                ),
+                profile: RootProfileId::V1,
+                kind: RootOutputKind::ClientRows,
+                accepted_consumed: sequence,
+                outcome: RootReadOutcome::Data(data),
+            },
+            Some((
+                ClientRowProfile::try_new(
+                    RootProfileV1::SEGMENT_BYTES,
+                    RootProfileV1::ROW_PAYLOAD_BYTES,
+                )
+                .unwrap(),
+                ClientRowStreamCursor::default(),
+            )),
+            rows,
+        )
+        .await
     }
 
     /// Test-only transfer through the real move-only segment/receipt boundary.

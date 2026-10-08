@@ -18,17 +18,15 @@
 //! Query-application-owned result delivery contracts.
 //!
 //! A row result begins with one schema delivery, continues with zero or more
-//! exactly sequenced batch deliveries, and ends only with an explicitly
+//! exactly sequenced Backend-encoded segment deliveries, and ends only with an explicitly
 //! acknowledged success EOF. Every delivery is move-only and reports whether
-//! the protocol consumer completed, failed, or dropped it. The batch token
-//! owns the existing workload-control credit through protocol consumption, so
-//! an item queue can never become a second or weaker byte authority.
+//! the protocol consumer completed, failed, or dropped it. Each segment keeps
+//! its original full-window alias through actual consumption and backing exit.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayData, ArrayRef},
-    buffer::Buffer,
+    array::ArrayRef,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -37,90 +35,10 @@ use novarocks_result_contract::{
     ClientRowProfile, ClientRowStreamCursor, RootOutputKind, ValidatedClientBody,
 };
 use novarocks_types::{QueryExecutionId, QueryId, schema::SqlType};
-use novarocks_workload_control::{
-    LocalResourceAuthority, ResultCredit, ResultCreditReservationError, ResultCreditStage,
-    WorkError,
-};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::root_delivery::{RetainedRootReply, RootReplyView};
 use super::{QueryExecutionError, QueryExecutionErrorKind};
-
-/// Move-only decoded result and its canonical workload-accounting facts.
-///
-/// Construction walks the Arrow graph exactly once. Several arrays and slices
-/// may share one allocation, so the backing measure charges each reachable
-/// allocation once. Sharing across separate batches remains conservatively
-/// charged once per owner. A batch without Arrow backing retains a one-byte
-/// governance sentinel because its row count can still carry result semantics.
-/// The private fields prevent a caller from pairing a batch with invented
-/// accounting facts.
-pub(crate) struct DecodedResultBatch {
-    batch: RecordBatch,
-    unique_backing_bytes: u64,
-    governance_charge_bytes: u64,
-}
-
-impl DecodedResultBatch {
-    pub(crate) fn try_new(batch: RecordBatch) -> Result<Self, QueryExecutionError> {
-        let unique_backing_bytes = u64::try_from(unique_arrow_backing_bytes(&batch))
-            .map_err(|_| invalid_result_delivery("decoded result backing size does not fit u64"))?;
-        Ok(Self {
-            batch,
-            unique_backing_bytes,
-            governance_charge_bytes: unique_backing_bytes.max(1),
-        })
-    }
-
-    pub(crate) const fn batch(&self) -> &RecordBatch {
-        &self.batch
-    }
-
-    pub(crate) const fn unique_backing_bytes(&self) -> u64 {
-        self.unique_backing_bytes
-    }
-
-    pub(crate) const fn governance_charge_bytes(&self) -> u64 {
-        self.governance_charge_bytes
-    }
-}
-
-fn unique_arrow_backing_bytes(batch: &RecordBatch) -> usize {
-    let mut seen = HashSet::new();
-    batch.columns().iter().fold(0usize, |total, column| {
-        total.saturating_add(array_backing_bytes(&column.to_data(), &mut seen))
-    })
-}
-
-/// Return the exact governance charge required while this decoded Arrow batch
-/// remains owned by an application or protocol consumer.
-pub fn decoded_result_batch_governance_charge(
-    batch: &RecordBatch,
-) -> Result<u64, QueryExecutionError> {
-    Ok(DecodedResultBatch::try_new(batch.clone())?.governance_charge_bytes())
-}
-
-fn array_backing_bytes(data: &ArrayData, seen: &mut HashSet<usize>) -> usize {
-    let mut total = 0usize;
-    for buffer in data.buffers() {
-        total = total.saturating_add(buffer_backing_bytes(buffer, seen));
-    }
-    if let Some(nulls) = data.nulls() {
-        total = total.saturating_add(buffer_backing_bytes(nulls.buffer(), seen));
-    }
-    for child in data.child_data() {
-        total = total.saturating_add(array_backing_bytes(child, seen));
-    }
-    total
-}
-
-fn buffer_backing_bytes(buffer: &Buffer, seen: &mut HashSet<usize>) -> usize {
-    let allocation = buffer.data_ptr().as_ptr() as usize;
-    if !seen.insert(allocation) {
-        return 0;
-    }
-    buffer.capacity().max(buffer.len())
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultField {
@@ -339,67 +257,6 @@ impl ResultSchema {
                 .collect::<Vec<_>>(),
         ))
     }
-
-    pub(crate) fn accepts(&self, batch: &RecordBatch) -> bool {
-        self.mismatch(batch).is_none()
-    }
-
-    /// Names the first field that disagrees with what the query declared, or
-    /// `None` when the batch is exactly the declared shape. A schema this side
-    /// rejects is otherwise indistinguishable from any other rejection, and
-    /// the difference is the whole diagnosis.
-    pub(crate) fn mismatch(&self, batch: &RecordBatch) -> Option<String> {
-        let actual = batch.schema();
-        if actual.fields().len() != self.fields.len() {
-            return Some(format!(
-                "column count {} != declared {}",
-                actual.fields().len(),
-                self.fields.len()
-            ));
-        }
-        for (ordinal, (actual, expected)) in
-            actual.fields().iter().zip(self.fields.iter()).enumerate()
-        {
-            if actual.name() != expected.name() {
-                return Some(format!(
-                    "column name {:?} != declared {:?}",
-                    actual.name(),
-                    expected.name()
-                ));
-            }
-            if actual.data_type() != expected.data_type() {
-                return Some(format!(
-                    "column {:?} type {:?} != declared {:?}",
-                    actual.name(),
-                    actual.data_type(),
-                    expected.data_type()
-                ));
-            }
-            // An Arrow field's nullable flag says what the array may carry,
-            // not what it does: a column built nullable and filled with a
-            // constant satisfies a declaration that no null arrives. What the
-            // client was told is broken only by a null actually arriving.
-            if actual.is_nullable()
-                && !expected.nullable()
-                && batch.column(ordinal).null_count() > 0
-            {
-                return Some(format!(
-                    "column {:?} carries {} null(s) where none was declared",
-                    actual.name(),
-                    batch.column(ordinal).null_count()
-                ));
-            }
-            if !actual.is_nullable() && expected.nullable() {
-                return Some(format!(
-                    "column {:?} nullable {} != declared {}",
-                    actual.name(),
-                    actual.is_nullable(),
-                    expected.nullable()
-                ));
-            }
-        }
-        None
-    }
 }
 
 pub enum ExecutionOutput {
@@ -524,260 +381,6 @@ impl SchemaDelivery {
     }
 }
 
-pub struct BatchDeliveryReservationError {
-    error: WorkError,
-    delivery: BatchDelivery,
-}
-
-impl BatchDeliveryReservationError {
-    pub const fn error(&self) -> &WorkError {
-        &self.error
-    }
-
-    pub fn into_parts(self) -> (WorkError, BatchDelivery) {
-        (self.error, self.delivery)
-    }
-}
-
-impl std::fmt::Debug for BatchDeliveryReservationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BatchDeliveryReservationError")
-            .field("error", &self.error)
-            .field("execution_id", &self.delivery.execution_id)
-            .field("sequence", &self.delivery.sequence)
-            .finish()
-    }
-}
-
-/// Move-only ownership of one decoded batch and its result byte credit.
-pub struct BatchDelivery {
-    execution_id: QueryExecutionId,
-    sequence: ResultPacketSequence,
-    decoded: Option<DecodedResultBatch>,
-    decoded_bytes: u64,
-    credit: Option<ResultCredit>,
-    signal: DeliverySignal,
-}
-
-impl BatchDelivery {
-    pub(crate) fn try_new(
-        execution_id: QueryExecutionId,
-        sequence: ResultPacketSequence,
-        decoded: DecodedResultBatch,
-        credit: ResultCredit,
-    ) -> Result<(Self, ResultDeliveryReceipt), QueryExecutionError> {
-        let mut decoded = Some(decoded);
-        let mut credit = Some(credit);
-        if credit.as_ref().unwrap().stage() != ResultCreditStage::DecodedQueued {
-            let actual = credit.as_ref().unwrap().stage();
-            return Err(reject_batch(
-                decoded.take().unwrap(),
-                credit.take().unwrap(),
-                invalid_result_delivery(format!(
-                    "result batch credit must be DecodedQueued, got {actual:?}"
-                )),
-            ));
-        }
-        let decoded_bytes = decoded.as_ref().unwrap().governance_charge_bytes();
-        if credit.as_ref().unwrap().held_bytes() != decoded_bytes {
-            let credited = credit.as_ref().unwrap().held_bytes();
-            return Err(reject_batch(
-                decoded.take().unwrap(),
-                credit.take().unwrap(),
-                invalid_result_delivery(format!(
-                    "decoded result batch holds {decoded_bytes} bytes but its credit holds {credited}"
-                )),
-            ));
-        }
-        let (signal, receipt) = DeliverySignal::channel();
-        Ok((
-            Self {
-                execution_id,
-                sequence,
-                decoded,
-                decoded_bytes,
-                credit,
-                signal,
-            },
-            receipt,
-        ))
-    }
-
-    pub const fn execution_id(&self) -> QueryExecutionId {
-        self.execution_id
-    }
-
-    pub const fn sequence(&self) -> ResultPacketSequence {
-        self.sequence
-    }
-
-    pub fn batch(&self) -> &RecordBatch {
-        self.decoded
-            .as_ref()
-            .expect("batch delivery owns its decoded result before completion")
-            .batch()
-    }
-
-    pub const fn decoded_bytes(&self) -> u64 {
-        self.decoded_bytes
-    }
-
-    pub fn credit_stage(&self) -> ResultCreditStage {
-        self.credit
-            .as_ref()
-            .expect("batch delivery owns credit before completion")
-            .stage()
-    }
-
-    pub fn reserve_protocol(
-        mut self,
-        authority: &LocalResourceAuthority,
-        bytes: u64,
-    ) -> Result<Self, BatchDeliveryReservationError> {
-        let credit = self
-            .credit
-            .take()
-            .expect("batch delivery owns credit before completion");
-        match credit.reserve_protocol(authority, bytes) {
-            Ok(credit) => {
-                self.credit = Some(credit);
-                Ok(self)
-            }
-            Err(error) => {
-                let (error, credit) = reservation_parts(error);
-                self.credit = Some(credit);
-                Err(BatchDeliveryReservationError {
-                    error,
-                    delivery: self,
-                })
-            }
-        }
-    }
-
-    /// Reserve protocol-output capacity, asynchronously waiting through
-    /// temporary local pressure while retaining this delivery and its decoded
-    /// credit.
-    ///
-    /// The wait is attributed to the credit's original work scope and inherits
-    /// that scope's cancellation and deadline. Permanent capacity, authority,
-    /// lifecycle, and transition failures return the intact delivery so the
-    /// adapter can report an explicit failure. Dropping this future drops the
-    /// delivery and reports `Dropped` to its logical owner.
-    pub async fn reserve_protocol_when_available(
-        mut self,
-        authority: &LocalResourceAuthority,
-        bytes: u64,
-    ) -> Result<Self, BatchDeliveryReservationError> {
-        let credit = self
-            .credit
-            .take()
-            .expect("batch delivery owns credit while awaiting protocol capacity");
-        match credit
-            .reserve_protocol_when_available(authority, bytes)
-            .await
-        {
-            Ok(credit) => {
-                self.credit = Some(credit);
-                Ok(self)
-            }
-            Err(rejection) => {
-                let (error, credit) = rejection.into_parts();
-                self.credit = Some(credit);
-                Err(BatchDeliveryReservationError {
-                    error,
-                    delivery: self,
-                })
-            }
-        }
-    }
-
-    pub fn begin_protocol_write(mut self, actual_bytes: u64) -> Result<Self, QueryExecutionError> {
-        let credit = self
-            .credit
-            .take()
-            .expect("batch delivery owns credit before completion");
-        match credit.begin_protocol_write(actual_bytes) {
-            Ok(credit) => {
-                self.credit = Some(credit);
-                Ok(self)
-            }
-            Err(error) => {
-                let (error, credit) = reservation_parts(error);
-                drop(self.decoded.take());
-                drop(credit);
-                let error = failed_result_delivery("begin protocol result write", error);
-                self.signal
-                    .finish(ResultDeliveryDisposition::Failed(error.clone()));
-                Err(error)
-            }
-        }
-    }
-
-    /// Release all result credit after actual protocol acceptance.
-    pub fn complete(mut self) -> Result<(), QueryExecutionError> {
-        // The credit covers the Arrow buffers through their final owner.
-        drop(self.decoded.take());
-        let credit = self
-            .credit
-            .take()
-            .expect("batch delivery owns credit before completion");
-        match credit.consume() {
-            Ok(()) => {
-                self.signal.finish(ResultDeliveryDisposition::Completed);
-                Ok(())
-            }
-            Err(error) => {
-                let error = failed_result_delivery("consume protocol result", error);
-                self.signal
-                    .finish(ResultDeliveryDisposition::Failed(error.clone()));
-                Err(error)
-            }
-        }
-    }
-
-    /// Release decoded-result credit after an in-process application sink has
-    /// accepted this batch. This is distinct from protocol completion: no
-    /// protocol reservation or write exists for scalar/session consumers.
-    pub fn complete_decoded(mut self) -> Result<(), QueryExecutionError> {
-        let stage = self
-            .credit
-            .as_ref()
-            .expect("batch delivery owns credit before completion")
-            .stage();
-        if stage != ResultCreditStage::DecodedQueued {
-            let error = invalid_result_delivery(format!(
-                "decoded application sink requires DecodedQueued credit, got {stage:?}"
-            ));
-            drop(self.decoded.take());
-            drop(self.credit.take());
-            self.signal
-                .finish(ResultDeliveryDisposition::Failed(error.clone()));
-            return Err(error);
-        }
-        drop(self.decoded.take());
-        drop(self.credit.take());
-        self.signal.finish(ResultDeliveryDisposition::Completed);
-        Ok(())
-    }
-
-    pub fn fail(mut self, error: QueryExecutionError) {
-        drop(self.decoded.take());
-        drop(self.credit.take());
-        self.signal.finish(ResultDeliveryDisposition::Failed(error));
-    }
-}
-
-impl Drop for BatchDelivery {
-    fn drop(&mut self) {
-        // The payload dies before its capacity becomes available, and both
-        // happen before the owner observes Dropped.
-        drop(self.decoded.take());
-        drop(self.credit.take());
-        self.signal.finish(ResultDeliveryDisposition::Dropped);
-    }
-}
-
 /// Successful EOF for one exact execution. Only the logical execution actor
 /// may construct this after it has irreversibly committed logical success.
 /// The consumer disposition settles visible transport only; it cannot revoke
@@ -815,7 +418,7 @@ impl EndDelivery {
     }
 
     /// Checked row count of the original root plan, carried by its locally
-    /// consumed V1 End. Legacy decoded streams have no such root fact.
+    /// consumed V1 End.
     pub const fn root_output_rows(&self) -> Option<u64> {
         self.root_output_rows
     }
@@ -970,7 +573,6 @@ impl Drop for RootSegmentDelivery {
 }
 
 pub enum ResultDelivery {
-    Batch(BatchDelivery),
     /// A Backend-encoded root item, relayed without Arrow decode.
     Segment(RootSegmentDelivery),
     End(EndDelivery),
@@ -979,7 +581,6 @@ pub enum ResultDelivery {
 impl ResultDelivery {
     pub const fn execution_id(&self) -> QueryExecutionId {
         match self {
-            Self::Batch(delivery) => delivery.execution_id(),
             Self::Segment(delivery) => delivery.execution_id(),
             Self::End(delivery) => delivery.execution_id(),
         }
@@ -1153,9 +754,7 @@ impl QueryResultStream {
             StreamEvent::Message(message) => message,
         };
         match message {
-            Some(delivery @ (ResultDelivery::Batch(_) | ResultDelivery::Segment(_))) => {
-                Ok(Some(delivery))
-            }
+            Some(delivery @ ResultDelivery::Segment(_)) => Ok(Some(delivery)),
             Some(delivery @ ResultDelivery::End(_)) => {
                 self.terminal_seen = true;
                 Ok(Some(delivery))
@@ -1170,27 +769,8 @@ impl QueryResultStream {
     }
 }
 
-fn reservation_parts(error: ResultCreditReservationError) -> (WorkError, ResultCredit) {
-    error.into_parts()
-}
-
-fn reject_batch(
-    decoded: DecodedResultBatch,
-    credit: ResultCredit,
-    error: QueryExecutionError,
-) -> QueryExecutionError {
-    // Never make the governed bytes available while their Arrow owner lives.
-    drop(decoded);
-    drop(credit);
-    error
-}
-
 fn invalid_result_delivery(message: impl Into<Arc<str>>) -> QueryExecutionError {
     QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, message)
-}
-
-fn failed_result_delivery(context: &str, error: WorkError) -> QueryExecutionError {
-    failed_result_delivery_message(format!("{context}: {error}"))
 }
 
 fn failed_result_delivery_message(message: impl Into<Arc<str>>) -> QueryExecutionError {
@@ -1200,12 +780,12 @@ fn failed_result_delivery_message(message: impl Into<Arc<str>>) -> QueryExecutio
 #[cfg(test)]
 mod tests {
     use arrow::{
-        array::{Array, ArrayData, ArrayRef, DictionaryArray, Int64Array, ListArray, StringArray},
-        datatypes::{DataType, Field, Int32Type, Schema},
+        array::{Array, ArrayRef, Int64Array, StringArray},
+        datatypes::DataType,
     };
     use novarocks_types::{AttemptId, QueryId};
     use novarocks_workload_control::{
-        CancellationReason, ResourceClass, ResourceConfig, WorkClass, WorkRequest, WorkScope,
+        ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
         WorkloadConfig, WorkloadControl,
     };
 
@@ -1224,14 +804,36 @@ mod tests {
         )])
     }
 
-    fn batch() -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![11_i64, 13]))],
+    fn workload() -> (
+        WorkloadControl,
+        novarocks_workload_control::ResultCapacityHandle,
+    ) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        (control, capacity)
+    }
+
+    fn carrier() -> ResultRowCarrier {
+        ResultRowCarrier::relayed(
+            RootOutputKind::ClientRows,
+            Some(
+                ClientRowProfile::try_new(
+                    novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
+                    novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
+                )
+                .unwrap(),
+            ),
         )
         .unwrap()
     }
@@ -1387,203 +989,12 @@ mod tests {
         );
     }
 
-    fn decoded(batch: RecordBatch) -> DecodedResultBatch {
-        DecodedResultBatch::try_new(batch).unwrap()
-    }
-
-    fn shallow_backing_bytes(data: &ArrayData) -> u64 {
-        let buffers = data.buffers().iter().fold(0_u64, |total, buffer| {
-            total + u64::try_from(buffer.capacity().max(buffer.len())).unwrap()
-        });
-        buffers
-            + data
-                .nulls()
-                .map(|nulls| {
-                    u64::try_from(nulls.buffer().capacity().max(nulls.buffer().len())).unwrap()
-                })
-                .unwrap_or(0)
-    }
-
-    #[test]
-    fn decoded_result_batch_measures_fixed_width_backing() {
-        let fixed = Arc::new(Int64Array::from(vec![11_i64, 13, 17])) as ArrayRef;
-        let expected = shallow_backing_bytes(&fixed.to_data());
-        let decoded = decoded(RecordBatch::try_from_iter(vec![("fixed", fixed)]).unwrap());
-
-        assert_eq!(decoded.unique_backing_bytes(), expected);
-        assert_eq!(decoded.governance_charge_bytes(), expected);
-    }
-
-    #[test]
-    fn decoded_result_batch_measures_varlen_and_null_backing() {
-        let strings =
-            Arc::new(StringArray::from(vec![Some("ready"), None, Some("done")])) as ArrayRef;
-        let nullable = Arc::new(Int64Array::from(vec![Some(11_i64), None, Some(17)])) as ArrayRef;
-        let expected =
-            shallow_backing_bytes(&strings.to_data()) + shallow_backing_bytes(&nullable.to_data());
-        let decoded = decoded(
-            RecordBatch::try_from_iter(vec![("strings", strings), ("nullable", nullable)]).unwrap(),
-        );
-
-        assert_eq!(decoded.unique_backing_bytes(), expected);
-        assert_eq!(decoded.governance_charge_bytes(), expected);
-    }
-
-    #[test]
-    fn decoded_result_batch_measures_nested_backing() {
-        let list = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([
-            Some(vec![Some(11), None]),
-            None,
-            Some(vec![Some(17)]),
-        ])) as ArrayRef;
-        let data = list.to_data();
-        let expected = shallow_backing_bytes(&data)
-            + data
-                .child_data()
-                .iter()
-                .map(shallow_backing_bytes)
-                .sum::<u64>();
-        let decoded = decoded(RecordBatch::try_from_iter(vec![("nested", list)]).unwrap());
-
-        assert_eq!(decoded.unique_backing_bytes(), expected);
-        assert_eq!(decoded.governance_charge_bytes(), expected);
-    }
-
-    #[test]
-    fn decoded_result_batch_measures_dictionary_backing() {
-        let dictionary = Arc::new(
-            vec!["ready", "running", "ready"]
-                .into_iter()
-                .collect::<DictionaryArray<Int32Type>>(),
-        ) as ArrayRef;
-        let data = dictionary.to_data();
-        let expected = shallow_backing_bytes(&data)
-            + data
-                .child_data()
-                .iter()
-                .map(shallow_backing_bytes)
-                .sum::<u64>();
-        let decoded =
-            decoded(RecordBatch::try_from_iter(vec![("dictionary", dictionary)]).unwrap());
-
-        assert_eq!(decoded.unique_backing_bytes(), expected);
-        assert_eq!(decoded.governance_charge_bytes(), expected);
-    }
-
-    #[test]
-    fn decoded_result_batch_charges_shared_slice_backing_once() {
-        let source = Int64Array::from(vec![11_i64, 13, 17, 19]);
-        let left = Arc::new(source.slice(0, 2)) as ArrayRef;
-        let right = Arc::new(source.slice(2, 2)) as ArrayRef;
-        let left_only = RecordBatch::try_from_iter(vec![("left", Arc::clone(&left))]).unwrap();
-        let shared = RecordBatch::try_from_iter(vec![("left", left), ("right", right)]).unwrap();
-
-        let left_only = decoded(left_only);
-        let shared = decoded(shared);
-
-        assert_eq!(
-            shared.unique_backing_bytes(),
-            left_only.unique_backing_bytes()
-        );
-        assert_eq!(
-            shared.governance_charge_bytes(),
-            shared.unique_backing_bytes()
-        );
-    }
-
-    #[test]
-    fn decoded_result_batch_separates_zero_backing_from_governance_charge() {
-        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(7));
-        let batch =
-            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
-        let decoded = decoded(batch);
-
-        assert_eq!(decoded.unique_backing_bytes(), 0);
-        assert_eq!(decoded.governance_charge_bytes(), 1);
-
-        let control = workload();
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let credit = decoded_credit(&control, &root.owner.scope(), 1);
-        let (delivery, _receipt) = BatchDelivery::try_new(
-            execution_id(1),
-            ResultPacketSequence::new(0),
-            decoded,
-            credit,
-        )
-        .unwrap();
-        assert_eq!(delivery.batch().num_rows(), 7);
-        assert_eq!(delivery.decoded_bytes(), 1);
-    }
-
-    #[test]
-    fn batch_delivery_rejects_non_exact_governance_credit() {
-        let decoded = decoded(batch());
-        let charge = decoded.governance_charge_bytes();
-        let control = workload();
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let credit = decoded_credit(&control, &root.owner.scope(), charge + 1);
-
-        let error = match BatchDelivery::try_new(
-            execution_id(1),
-            ResultPacketSequence::new(0),
-            decoded,
-            credit,
-        ) {
-            Ok(_) => panic!("non-exact decoded credit must be rejected"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
-        assert_eq!(control.resources().snapshot().result_credit.held_bytes(), 0);
-        drop(root);
-    }
-
-    fn workload() -> WorkloadControl {
-        workload_with_limits(1024 * 1024 - 1024, 1024 * 1024 - 1024)
-    }
-
-    fn workload_with_limits(data_bytes: u64, per_scope_bytes: u64) -> WorkloadControl {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: data_bytes + 1024,
-                control_bytes: 1024,
-                per_scope_bytes,
-            },
-        )
-        .unwrap();
-        control.mark_ready().unwrap();
-        control
-    }
-
-    fn decoded_credit(control: &WorkloadControl, scope: &WorkScope, bytes: u64) -> ResultCredit {
-        let authority = control.resources();
-        authority
-            .reserve_result_credit(scope, bytes)
-            .unwrap()
-            .begin_fetch()
-            .unwrap()
-            .retain_raw(bytes)
-            .unwrap()
-            .reserve_decode(&authority, bytes)
-            .unwrap()
-            .queue_decoded(bytes)
-            .unwrap()
-    }
-
     #[tokio::test]
     async fn schema_disposition_distinguishes_complete_failure_and_drop() {
         let id = execution_id(1);
 
-        let (complete, complete_receipt) = SchemaDelivery::new(
-            id.query_id(),
-            result_schema(),
-            ResultRowCarrier::DecodedBatches,
-        );
+        let (complete, complete_receipt) =
+            SchemaDelivery::new(id.query_id(), result_schema(), carrier());
         complete.complete();
         assert_eq!(
             complete_receipt.await.unwrap(),
@@ -1591,22 +1002,16 @@ mod tests {
         );
 
         let expected = QueryExecutionError::new(QueryExecutionErrorKind::Failed, "encode schema");
-        let (failed, failed_receipt) = SchemaDelivery::new(
-            id.query_id(),
-            result_schema(),
-            ResultRowCarrier::DecodedBatches,
-        );
+        let (failed, failed_receipt) =
+            SchemaDelivery::new(id.query_id(), result_schema(), carrier());
         failed.fail(expected.clone());
         assert_eq!(
             failed_receipt.await.unwrap(),
             ResultDeliveryDisposition::Failed(expected)
         );
 
-        let (dropped, dropped_receipt) = SchemaDelivery::new(
-            id.query_id(),
-            result_schema(),
-            ResultRowCarrier::DecodedBatches,
-        );
+        let (dropped, dropped_receipt) =
+            SchemaDelivery::new(id.query_id(), result_schema(), carrier());
         drop(dropped);
         assert_eq!(
             dropped_receipt.await.unwrap(),
@@ -1615,448 +1020,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_credit_lives_until_protocol_completion() {
-        let control = workload();
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let credit = decoded_credit(&control, &root.owner.scope(), bytes);
-        let authority = control.resources();
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(1), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-        assert_eq!(
-            authority.snapshot().result_credit.decoded_queued_bytes,
-            bytes
-        );
-
-        let delivery = delivery
-            .reserve_protocol_when_available(&authority, bytes)
-            .await
-            .unwrap();
-        let delivery = delivery.begin_protocol_write(bytes).unwrap();
-        assert_eq!(
-            authority.snapshot().result_credit.protocol_writing_bytes,
-            bytes * 2
-        );
-        delivery.complete().unwrap();
-
-        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Completed);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop(root);
-    }
-
-    #[tokio::test]
-    async fn protocol_capacity_wait_succeeds_after_capacity_release() {
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let control = workload_with_limits(bytes * 3, bytes * 2);
-        let work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let blocker_work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let authority = control.resources();
-        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let blocker = authority
-            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
-            .unwrap();
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(2), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-
-        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
-        tokio::select! {
-            biased;
-            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
-            _ = tokio::task::yield_now() => {}
-        }
-        assert_eq!(control.snapshot().resource_waiters, 1);
-
-        drop(blocker);
-        let delivery = waiting.await.unwrap();
-        assert_eq!(delivery.credit_stage(), ResultCreditStage::ProtocolReserved);
-        delivery.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            "test completed after capacity release",
-        ));
-        assert!(matches!(
-            receipt.await.unwrap(),
-            ResultDeliveryDisposition::Failed(_)
-        ));
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop((work, blocker_work));
-    }
-
-    #[tokio::test]
-    async fn protocol_capacity_waits_from_one_scope_are_fifo_and_coexist() {
-        let first_batch = decoded(batch());
-        let second_batch = decoded(batch());
-        let bytes = first_batch.governance_charge_bytes();
-        let control = workload_with_limits(bytes * 5, bytes * 4);
-        let work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let blocker_work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let authority = control.resources();
-        let first_credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let second_credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let mut blocker = authority
-            .reserve(&blocker_work.owner.scope(), bytes * 3, ResourceClass::Data)
-            .unwrap();
-        let (first, first_receipt) = BatchDelivery::try_new(
-            execution_id(8),
-            ResultPacketSequence::new(0),
-            first_batch,
-            first_credit,
-        )
-        .unwrap();
-        let (second, second_receipt) = BatchDelivery::try_new(
-            execution_id(8),
-            ResultPacketSequence::new(1),
-            second_batch,
-            second_credit,
-        )
-        .unwrap();
-
-        let mut first = Box::pin(first.reserve_protocol_when_available(&authority, bytes));
-        let mut second = Box::pin(second.reserve_protocol_when_available(&authority, bytes));
-        tokio::select! {
-            biased;
-            _ = &mut first => panic!("first protocol reservation must wait for capacity"),
-            _ = tokio::task::yield_now() => {}
-        }
-        tokio::select! {
-            biased;
-            _ = &mut second => panic!("second protocol reservation must wait for capacity"),
-            _ = tokio::task::yield_now() => {}
-        }
-        assert_eq!(control.snapshot().resource_waiters, 2);
-
-        blocker.release_unused(bytes).unwrap();
-        tokio::select! {
-            biased;
-            _ = &mut second => panic!("later protocol waiter must not bypass the queue head"),
-            _ = tokio::task::yield_now() => {}
-        }
-        let first = first.await.unwrap();
-        assert_eq!(control.snapshot().resource_waiters, 1);
-        first.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            "release the first FIFO protocol grant",
-        ));
-        assert!(matches!(
-            first_receipt.await.unwrap(),
-            ResultDeliveryDisposition::Failed(_)
-        ));
-
-        let second = second.await.unwrap();
-        assert_eq!(control.snapshot().resource_waiters, 0);
-        second.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            "release the second FIFO protocol grant",
-        ));
-        assert!(matches!(
-            second_receipt.await.unwrap(),
-            ResultDeliveryDisposition::Failed(_)
-        ));
-        drop(blocker);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop((work, blocker_work));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn protocol_capacity_wait_timeout_is_one_absolute_deadline() {
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let control = workload_with_limits(bytes * 3, bytes * 2);
-        let work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let blocker_work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let authority = control.resources();
-        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let blocker = authority
-            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
-            .unwrap();
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(9), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
-        tokio::select! {
-            biased;
-            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
-            _ = tokio::task::yield_now() => {}
-        }
-
-        for _ in 0..2 {
-            tokio::time::advance(std::time::Duration::from_secs(10)).await;
-            let signal = authority
-                .reserve(&blocker_work.owner.scope(), 1, ResourceClass::Control)
-                .unwrap();
-            drop(signal);
-            tokio::select! {
-                biased;
-                _ = &mut waiting => panic!("capacity notification must not renew the wait deadline"),
-                _ = tokio::task::yield_now() => {}
-            }
-        }
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
-        let rejection = match waiting.await {
-            Ok(_) => panic!("protocol capacity wait must expire at its original deadline"),
-            Err(rejection) => rejection,
-        };
-        assert_eq!(rejection.error(), &WorkError::CapacityWaitTimeout);
-        let (_, delivery) = rejection.into_parts();
-        drop(delivery);
-        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
-        assert_eq!(control.snapshot().resource_waiters, 0);
-        drop(blocker);
-        drop((work, blocker_work));
-    }
-
-    #[tokio::test]
-    async fn protocol_capacity_wait_returns_cancelled_delivery_to_adapter() {
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let control = workload_with_limits(bytes * 3, bytes * 2);
-        let work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let blocker_work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let authority = control.resources();
-        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let blocker = authority
-            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
-            .unwrap();
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(3), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-
-        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
-        tokio::select! {
-            biased;
-            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
-            _ = tokio::task::yield_now() => {}
-        }
-        work.owner.cancel(CancellationReason::Requested);
-        let rejection = match waiting.await {
-            Ok(_) => panic!("cancelled work must not reserve protocol capacity"),
-            Err(rejection) => rejection,
-        };
-        assert!(matches!(rejection.error(), WorkError::Cancelled(_)));
-        let (_, delivery) = rejection.into_parts();
-        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
-        assert_eq!(
-            authority.snapshot().result_credit.decoded_queued_bytes,
-            bytes
-        );
-        delivery.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Cancelled,
-            "protocol capacity wait cancelled",
-        ));
-        assert!(matches!(
-            receipt.await.unwrap(),
-            ResultDeliveryDisposition::Failed(_)
-        ));
-        drop(blocker);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop((work, blocker_work));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn protocol_capacity_wait_uses_the_work_scope_deadline() {
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let control = workload_with_limits(bytes * 3, bytes * 2);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        let work = control
-            .try_begin_root(WorkRequest {
-                class: WorkClass::Query,
-                deadline: Some(deadline),
-            })
-            .unwrap();
-        let blocker_work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let authority = control.resources();
-        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let blocker = authority
-            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
-            .unwrap();
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(4), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-
-        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
-        tokio::select! {
-            biased;
-            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
-            _ = tokio::task::yield_now() => {}
-        }
-        tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        let rejection = match waiting.await {
-            Ok(_) => panic!("scope deadline must bound the protocol capacity wait"),
-            Err(rejection) => rejection,
-        };
-        assert_eq!(
-            rejection.error(),
-            &WorkError::Cancelled(CancellationReason::DeadlineExceeded)
-        );
-        let (_, delivery) = rejection.into_parts();
-        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
-        drop(delivery);
-        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
-        assert_eq!(control.snapshot().resource_waiters, 0);
-        drop(blocker);
-        drop((work, blocker_work));
-    }
-
-    #[tokio::test]
-    async fn unrepresentable_protocol_capacity_fails_without_waiting() {
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let control = workload_with_limits(bytes * 3, bytes * 2);
-        let work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let authority = control.resources();
-        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(5), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-
-        let rejection = match delivery
-            .reserve_protocol_when_available(&authority, bytes * 2)
-            .await
-        {
-            Ok(_) => panic!("unrepresentable protocol capacity must fail"),
-            Err(rejection) => rejection,
-        };
-        assert_eq!(
-            rejection.error(),
-            &WorkError::Capacity("unrepresentable protocol allocation")
-        );
-        assert_eq!(control.snapshot().resource_waiters, 0);
-        let (_, delivery) = rejection.into_parts();
-        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
-        drop(delivery);
-        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop(work);
-    }
-
-    #[tokio::test]
-    async fn dropping_protocol_capacity_wait_releases_delivery_credit() {
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let control = workload_with_limits(bytes * 3, bytes * 2);
-        let work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let blocker_work = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let authority = control.resources();
-        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
-        let blocker = authority
-            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
-            .unwrap();
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(6), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-
-        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
-        tokio::select! {
-            biased;
-            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
-            _ = tokio::task::yield_now() => {}
-        }
-        assert_eq!(control.snapshot().resource_waiters, 1);
-        drop(waiting);
-
-        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
-        assert_eq!(control.snapshot().resource_waiters, 0);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        assert_eq!(authority.snapshot().held_bytes(), bytes * 2);
-        drop(blocker);
-        drop((work, blocker_work));
-    }
-
-    #[tokio::test]
-    async fn foreign_protocol_capacity_authority_fails_closed() {
-        let local = workload();
-        let foreign = workload();
-        let work = local
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let credit = decoded_credit(&local, &work.owner.scope(), bytes);
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(7), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-
-        let rejection = match delivery
-            .reserve_protocol_when_available(&foreign.resources(), bytes)
-            .await
-        {
-            Ok(_) => panic!("foreign authority must fail"),
-            Err(rejection) => rejection,
-        };
-        assert!(matches!(rejection.error(), WorkError::ForeignAuthority));
-        let (_, delivery) = rejection.into_parts();
-        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
-        drop(delivery);
-        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
-        assert_eq!(local.resources().snapshot().result_credit.held_bytes(), 0);
-        drop(work);
-    }
-
-    #[tokio::test]
-    async fn dropped_batch_releases_credit_before_owner_observes_drop() {
-        let control = workload();
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let credit = decoded_credit(&control, &root.owner.scope(), bytes);
-        let authority = control.resources();
-        let (delivery, receipt) =
-            BatchDelivery::try_new(execution_id(1), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
-
-        drop(delivery);
-        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop(root);
-    }
-
-    #[tokio::test]
     async fn stream_transport_only_moves_actor_authorized_deliveries() {
-        let control = workload();
+        let (control, capacity) = workload();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let id = execution_id(2);
         let (transport, schema_receipt, _failure_sender, mut stream) =
-            QueryResultStream::try_channel(
-                id.query_id(),
-                result_schema(),
-                ResultRowCarrier::DecodedBatches,
-                1,
-            )
-            .unwrap();
+            QueryResultStream::try_channel(id.query_id(), result_schema(), carrier(), 1).unwrap();
 
         let error = match stream.next().await {
             Err(error) => error,
@@ -2071,22 +1042,71 @@ mod tests {
             ResultDeliveryDisposition::Completed
         );
 
-        let batch = decoded(batch());
-        let bytes = batch.governance_charge_bytes();
-        let credit = decoded_credit(&control, &root.owner.scope(), bytes);
-        let (delivery, receipt) =
-            BatchDelivery::try_new(id, ResultPacketSequence::new(0), batch, credit).unwrap();
+        use novarocks_execution_contract::{
+            TaskIdentity,
+            root_result::{RootReadOutcome, RootResultData, RootResultReply},
+        };
+        use novarocks_result_contract::RootProfileId;
+        use novarocks_types::{BackendProcessId, StageId, TaskId};
+        let window = capacity
+            .try_acquire(&root.owner.scope(), ResultWindowClass::Client)
+            .unwrap();
+        let reply = RetainedRootReply::try_new(
+            RootResultReply {
+                root_task: TaskIdentity::new(
+                    id,
+                    StageId::new(1).unwrap(),
+                    TaskId::new(1).unwrap(),
+                    BackendProcessId::new_v7(),
+                ),
+                profile: RootProfileId::V1,
+                kind: RootOutputKind::ClientRows,
+                accepted_consumed: 0,
+                outcome: RootReadOutcome::Data(
+                    RootResultData::try_new(
+                        RootOutputKind::ClientRows,
+                        std::num::NonZeroU64::new(1).unwrap(),
+                        bytes::Bytes::from_static(&[2, 0, 0, 0, 1, b'7']),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            },
+            window.retain_alias(),
+            4096,
+        )
+        .unwrap();
+        drop(window);
+        let (delivery, receipt) = RootSegmentDelivery::try_new(
+            id,
+            ResultPacketSequence::new(0),
+            reply,
+            Some((
+                match carrier() {
+                    ResultRowCarrier::Relayed {
+                        client_rows: Some(profile),
+                        ..
+                    } => profile,
+                    _ => unreachable!(),
+                },
+                ClientRowStreamCursor::default(),
+            )),
+            1,
+        )
+        .unwrap();
         let slot = transport.reserve_owned().await.unwrap();
-        transport.enqueue(slot, ResultDelivery::Batch(delivery));
-        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+        transport.enqueue(slot, ResultDelivery::Segment(delivery));
+        let ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("expected batch delivery");
         };
         assert_eq!(delivery.execution_id(), id);
         assert_eq!(delivery.sequence(), ResultPacketSequence::new(0));
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
         delivery.fail(QueryExecutionError::new(
             QueryExecutionErrorKind::Failed,
             "client disconnected",
         ));
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         assert!(matches!(
             receipt.await.unwrap(),
             ResultDeliveryDisposition::Failed(_)
@@ -2114,13 +1134,7 @@ mod tests {
     async fn stream_failure_is_terminal_without_success_eof() {
         let id = execution_id(3);
         let (_transport, schema_receipt, failure_sender, mut stream) =
-            QueryResultStream::try_channel(
-                id.query_id(),
-                result_schema(),
-                ResultRowCarrier::DecodedBatches,
-                1,
-            )
-            .unwrap();
+            QueryResultStream::try_channel(id.query_id(), result_schema(), carrier(), 1).unwrap();
         stream.begin_schema().unwrap().complete();
         assert_eq!(
             schema_receipt.await.unwrap(),
@@ -2141,13 +1155,7 @@ mod tests {
     async fn owner_loss_drops_queued_success_eof() {
         let id = execution_id(4);
         let (transport, schema_receipt, failure_sender, mut stream) =
-            QueryResultStream::try_channel(
-                id.query_id(),
-                result_schema(),
-                ResultRowCarrier::DecodedBatches,
-                1,
-            )
-            .unwrap();
+            QueryResultStream::try_channel(id.query_id(), result_schema(), carrier(), 1).unwrap();
         stream.begin_schema().unwrap().complete();
         assert_eq!(
             schema_receipt.await.unwrap(),

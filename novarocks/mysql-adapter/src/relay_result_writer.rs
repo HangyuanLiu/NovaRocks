@@ -213,13 +213,6 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                     }
                 }
             }
-            ResultDelivery::Batch(delivery) => {
-                let error = invalid("relayed MySQL result received a decoded batch");
-                delivery.fail(error.clone());
-                drop(lease);
-                let _ = result.fail();
-                return Err(io_error(error));
-            }
         }
     }
 }

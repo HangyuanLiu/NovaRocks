@@ -1,0 +1,45 @@
+{
+  "status": "PASS_COMPONENT_DECODED_DELIVERY_API_RETIRED_P08_PARTIAL",
+  "base_revision": "b243d834f",
+  "changes": [
+    "MySQL streaming writer now has a single relay path. Removed generic schema/Arrow row byte reservation walkers, decoded batch writes and wallet transitions.",
+    "Removed DecodedResultBatch, BatchDelivery/ReservationError, decoded governance charge walker and ResultDelivery::Batch. No query/frontend/mysql callers remain.",
+    "Removed Scalar Arrow batch fallback. Scalar consumer requires the matching frozen ScalarValueV1 contract and one bounded typed record.",
+    "Migrated receipt/order/slow consumer/failure/cancellation fixtures to V1 retained segments. Original producer alias retains the full window after receipt completion until actual exit.",
+    "Stream transport tests retain real Client-window alias ownership through failure. Typed Scalar tests retain actual Internal window, reject delivery/record row-count mismatch and keep missing/duplicate/foreign/late failure checks.",
+    "Retired tests of deleted credit and byte-bound algorithms. Existing typed value/null/no-row test subsumes two old decoded success fixtures; native Scalar session already covers multirow producer refusal."
+  ],
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-batch-api-query-tests-v1.log",
+      "sha256": "12fff1ea4a4f47288571970f9f986a2b09cde821f92eda3370aa84be68be7281",
+      "result": [
+        "test result: ok. 483 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-batch-api-mysql-tests.log",
+      "sha256": "31d58eaec81fb4f2e81ace2e9dfc2a80a71932ca960825256e9e9df355a4c3e4",
+      "result": [
+        "test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-batch-api-frontend-tests-v3.log",
+      "sha256": "b2a4e1f22a3e6758a67f5cfe09b0e3592ab312d1bac815aed34bfb260e4151fa",
+      "result": [
+        "test result: ok. 1449 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.05s"
+      ]
+    }
+  ],
+  "retained_failures": [
+    "p08-mysql-decoded-retirement-tests-v1.log: fixture identity types imported from the wrong crate, corrected",
+    "p08-batch-api-frontend-tests-v1.log: three legacy Scalar fixtures still used removed enqueue_batch, migrated",
+    "p08-batch-api-frontend-tests-v2.log: 1447 passed, two new assertions used Local position index instead of actual Internal index, corrected without product changes"
+  ],
+  "remaining": [
+    "Unfrozen/DecodedBatches carrier metadata and result-specific LRA stages/wait queue/observations/config",
+    "Clean C0 and native convergence",
+    "P00b measured transport coefficients, P09/P10 and final same-HEAD evidence"
+  ]
+}
