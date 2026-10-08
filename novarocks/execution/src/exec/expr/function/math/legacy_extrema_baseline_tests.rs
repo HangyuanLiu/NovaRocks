@@ -204,3 +204,23 @@ fn legacy_extrema_baseline_extreme_date32_invalid_and_null_rows() {
         );
     }
 }
+
+#[test]
+fn legacy_extrema_baseline_exact_null_target_retains_full_batch_cast_failure_even_when_empty() {
+    let expected =
+        "math: failed to cast output: Cast error: Casting from Timestamp(µs) to Null not supported";
+    for name in ["greatest", "least"] {
+        for rows in [0, 5] {
+            assert_eq!(
+                evaluate(
+                    name,
+                    vec![Arc::new(NullArray::new(rows))],
+                    DataType::Null,
+                    None
+                )
+                .unwrap_err(),
+                expected
+            );
+        }
+    }
+}

@@ -195,3 +195,6 @@ mod window_value_tests;
 
 mod string_regexp_extract;
 mod string_regexp_replace;
+
+pub mod scalar_extrema;
+mod scalar_extrema_owner;

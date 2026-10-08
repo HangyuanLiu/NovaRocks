@@ -1555,3 +1555,7 @@ mod count_distinct_tests;
 #[cfg(test)]
 #[path = "pure_differential_numeric_unary_tests.rs"]
 mod numeric_unary_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_extrema_tests.rs"]
+mod extrema_tests;

@@ -2695,6 +2695,9 @@ pub(super) fn dynamic_definition_parts(
     let pure_effects = match name {
         "truncate" => Some(super::truncate_owner::effects()),
         "round" => Some(super::round_owner::effects()),
+        name if super::scalar_extrema_owner::operation(name) => {
+            Some(super::scalar_extrema_owner::effects())
+        }
         _ => None,
     };
     let overload_declaration = if let Some(effects) = pure_effects {
@@ -2741,6 +2744,9 @@ pub fn contribute_builtin_functions(
         let definition = match *name {
             "truncate" => super::truncate_owner::definition(declaration, resolver)?,
             "round" => super::round_owner::definition(declaration, resolver)?,
+            name if super::scalar_extrema_owner::operation(name) => {
+                super::scalar_extrema_owner::definition(name, declaration, resolver)?
+            }
             _ => FunctionDefinition::try_new_bound(
                 name,
                 FunctionVisibility::Public,
