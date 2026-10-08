@@ -1,0 +1,150 @@
+{
+  "source_revision": "5049eb0c9d7f78333e019df56f02513423a06a21",
+  "source_dirty": false,
+  "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+  "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+  "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+  "server_sha256": "1f1b3d39f1bfc32c098a35e4fee7b7ce1bc62930aeac5d5c75076f16d94703d5",
+  "launch_profile": "fault-scenario",
+  "results": [
+    {
+      "suite": "function",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 51.206,
+      "case_counts": {
+        "total": 45,
+        "pass": 45,
+        "fail": 0
+      },
+      "log_sha256": "4390281af0a61d0f4c811ed1f8e4782531c82e3a5c594952cd34ff8eb9b7e2f9"
+    },
+    {
+      "suite": "analytic",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 227.852,
+      "case_counts": {
+        "total": 38,
+        "pass": 38,
+        "fail": 0
+      },
+      "log_sha256": "6c8353c70f1a73071c4bd74303eb7782e39503e6219c2d9669da9f7b99def26b"
+    },
+    {
+      "suite": "set-op",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 1.758,
+      "case_counts": {
+        "total": 19,
+        "pass": 19,
+        "fail": 0
+      },
+      "log_sha256": "029e76f5ea829b90bfee85f5d2dbf89c067f13a0c089fdd565f90d2430133aa0"
+    },
+    {
+      "suite": "project",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 5.146,
+      "case_counts": {
+        "total": 27,
+        "pass": 27,
+        "fail": 0
+      },
+      "log_sha256": "abcff039fcbc75e82a4bb56d815361195dc37ff13f38b50ff2844edb97899d05"
+    },
+    {
+      "suite": "limit",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 3.288,
+      "case_counts": {
+        "total": 2,
+        "pass": 2,
+        "fail": 0
+      },
+      "log_sha256": "7172eda61d59c09be36d1131acedfc6bd3af8e8bfcec6675520eceb83bda2aba"
+    },
+    {
+      "suite": "session",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 0.478,
+      "case_counts": {
+        "total": 1,
+        "pass": 1,
+        "fail": 0
+      },
+      "log_sha256": "d471c7609f82cce479445620eed15e136f74e900e5007ad7cf6c125a2227b2bf"
+    },
+    {
+      "suite": "table-function",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 0.548,
+      "case_counts": {
+        "total": 6,
+        "pass": 6,
+        "fail": 0
+      },
+      "log_sha256": "786147d533886f787cf637a465fb68932a1b89e2f4ccaad6449b15e87a4c3f66"
+    },
+    {
+      "suite": "runtime-filter",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 115.311,
+      "case_counts": {
+        "total": 27,
+        "pass": 27,
+        "fail": 0
+      },
+      "log_sha256": "e267d46e01fcc4bd3b9bfe9dbfecb6e63d4c8c58061902dd51e7181e1b31c9ea"
+    },
+    {
+      "suite": "sql-reject",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 0.391,
+      "case_counts": {
+        "total": 5,
+        "pass": 5,
+        "fail": 0
+      },
+      "log_sha256": "7db187de53b27f1fd9e8c32d7c5d9fbe6129e3beba05e15b3c363fb01d8726af"
+    },
+    {
+      "suite": "optimizer",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 122.224,
+      "case_counts": {
+        "total": 89,
+        "pass": 89,
+        "fail": 0
+      },
+      "log_sha256": "c8d17d81ad50072255449341b5447fba9cff3817815bb9f8cf8279d86725cff9"
+    },
+    {
+      "suite": "optimizer-dist",
+      "sql_glob": "*.sql",
+      "exit_code": 0,
+      "duration_seconds": 24.967,
+      "case_counts": {
+        "total": 8,
+        "pass": 8,
+        "fail": 0
+      },
+      "log_sha256": "27200db7db707d46a622beef4086c3e246cf5b5995a24d693b5459bb27048bb0"
+    }
+  ],
+  "fixture_startup_exit_code": 0,
+  "fixture_cleanup_exit_code": 0,
+  "status": "PASS_REMAINING_EXPRESSION_SUITES_NOT_FINAL_ACCEPTANCE",
+  "actual_server_build_identities": [
+    "dae50b53e888ff146d18f486b236def189a7b808"
+  ],
+  "raw_status_sha256": "444d43f6502d4059b5cbac81d05da079f884748b7e45d23dbf1799ac11638333"
+}
