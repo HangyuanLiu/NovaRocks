@@ -122,6 +122,7 @@ mod numeric_binary_owner;
 pub mod numeric_elementary;
 mod numeric_elementary_owner;
 mod numeric_mod;
+pub mod numeric_mod_core;
 mod numeric_mod_owner;
 pub mod numeric_unary;
 mod numeric_unary_owner;

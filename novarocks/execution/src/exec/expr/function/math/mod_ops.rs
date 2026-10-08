@@ -14,10 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{NumericArrayView, cast_output, value_at_i64};
+use super::common::{NumericArrayView, cast_output};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Int64Array};
+use novarocks_functions::builtin::numeric_mod_core::{NumericModOp, evaluate_mod_rows};
 use std::sync::Arc;
 
 fn eval_mod_impl(
@@ -33,27 +34,37 @@ fn eval_mod_impl(
     let right_view = NumericArrayView::new(&right)?;
     let len = chunk.len();
     let mut values = Vec::with_capacity(len);
-    for row in 0..len {
-        let l = value_at_i64(&left_view, row, len);
-        let r = value_at_i64(&right_view, row, len);
-        let out = match (l, r) {
-            (Some(a), Some(b)) if b != 0 => {
-                // Widen before division and absolute value: i64::MIN % -1
-                // and abs(i64::MIN) overflow despite their remainder fitting.
-                let mut v = (a as i128) % (b as i128);
-                if positive && v < 0 {
-                    v += (b as i128).abs();
-                }
-                // |remainder| < |b| <= 2^63. Positive correction lies in
-                // [0, |b| - 1], so both formulas always fit signed BIGINT.
-                Some(i64::try_from(v).map_err(|_| {
-                    "internal error: integer remainder exceeds its proven signed range".to_string()
-                })?)
-            }
-            _ => None,
-        };
-        values.push(out);
-    }
+    let operation = if positive {
+        NumericModOp::Pmod
+    } else {
+        NumericModOp::Mod
+    };
+    evaluate_mod_rows(
+        operation,
+        &left_view,
+        &right_view,
+        0..len,
+        |_, row| {
+            Ok((
+                if left_view.len() == 1 && len > 1 {
+                    0
+                } else {
+                    row
+                },
+                if right_view.len() == 1 && len > 1 {
+                    0
+                } else {
+                    row
+                },
+            ))
+        },
+        |out| {
+            values.push(out);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .map_err(|error| error.to_string())?;
     let out = Arc::new(Int64Array::from(values)) as ArrayRef;
     cast_output(out, arena.data_type(expr))
 }

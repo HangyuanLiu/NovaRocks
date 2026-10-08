@@ -14,114 +14,47 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-//! Selected integer remainder computation for exact installed builtin owners.
+//! Selected MOD/PMOD contracts and addresses delegate to the ONE original core.
 //! Arrow builder allocation still requires formal host memory admission.
-
-use std::sync::Arc;
-
-use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    builder::Float64Builder,
-};
-use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
-
+pub(super) use super::numeric_mod_core::NumericModOp;
+use super::numeric_mod_core::{NumericModError, evaluate_mod_rows};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
+    math_numeric::NumericArrayView,
 };
-
-/// Chosen by the exact immutable preparation owner, never from runtime names.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NumericModOp {
-    Mod,
-    Pmod,
-}
-impl NumericModOp {
-    fn apply(self, left: i64, right: i64) -> Result<Option<f64>, KernelFailure> {
-        if right == 0 {
-            return Ok(None);
-        }
-        // Widen before division and absolute value. MIN % -1 and abs(MIN)
-        // overflow signed BIGINT, although every remainder fits its range.
-        let mut remainder = i128::from(left) % i128::from(right);
-        if self == Self::Pmod && remainder < 0 {
-            remainder += i128::from(right).abs();
-        }
-        // |r| < |b| <= 2^63; positive correction is [0, |b|-1]. Failure
-        // here is an implementation bug, never a legal row data error.
-        let result = i64::try_from(remainder)
-            .map_err(|_| internal("integer remainder exceeds its proven signed range"))?;
-        Ok(Some(result as f64))
+use arrow_array::{Array, ArrayRef, builder::Float64Builder};
+#[cfg(test)]
+use arrow_array::{Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_schema::DataType;
+use novarocks_type_contract::ValueLogicalType;
+use std::sync::Arc;
+fn checked_view<'a>(
+    array: &'a ArrayRef,
+    data_type: &DataType,
+) -> Result<NumericArrayView<'a>, KernelFailure> {
+    if array.data_type() != data_type {
+        return Err(internal(
+            "integer remainder carrier differs from its checked argument",
+        ));
     }
-}
-
-enum NumericInput<'a> {
-    Int8(&'a Int8Array),
-    Int16(&'a Int16Array),
-    Int32(&'a Int32Array),
-    Int64(&'a Int64Array),
-    Float32(&'a Float32Array),
-    Float64(&'a Float64Array),
-}
-impl<'a> NumericInput<'a> {
-    fn checked(array: &'a ArrayRef, data_type: &DataType) -> Result<Self, KernelFailure> {
-        if array.data_type() != data_type {
-            return Err(internal(
-                "integer remainder carrier differs from its checked argument",
-            ));
-        }
-        macro_rules! downcast {
-            ($array:ty, $variant:ident) => {
-                array
-                    .as_any()
-                    .downcast_ref::<$array>()
-                    .map(Self::$variant)
-                    .ok_or_else(|| {
-                        internal("integer remainder selected carrier cannot be downcast")
-                    })
-            };
-        }
-        match data_type {
-            DataType::Int8 => downcast!(Int8Array, Int8),
-            DataType::Int16 => downcast!(Int16Array, Int16),
-            DataType::Int32 => downcast!(Int32Array, Int32),
-            DataType::Int64 => downcast!(Int64Array, Int64),
-            DataType::Float32 => downcast!(Float32Array, Float32),
-            DataType::Float64 => downcast!(Float64Array, Float64),
-            _ => Err(invalid(
-                "integer remainder input is not an installed numeric profile",
-            )),
-        }
+    if !matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+    ) {
+        return Err(invalid(
+            "integer remainder input is not an installed numeric profile",
+        ));
     }
-    fn value(&self, row: usize) -> Option<i64> {
-        match self {
-            Self::Int8(array) => Some(i64::from(array.value(row))),
-            Self::Int16(array) => Some(i64::from(array.value(row))),
-            Self::Int32(array) => Some(i64::from(array.value(row))),
-            Self::Int64(array) => Some(array.value(row)),
-            Self::Float32(array) => {
-                let value = f64::from(array.value(row));
-                if value.is_finite() {
-                    Some(value as i64)
-                } else {
-                    None
-                }
-            }
-            Self::Float64(array) => {
-                let value = array.value(row);
-                if value.is_finite() {
-                    Some(value as i64)
-                } else {
-                    None
-                }
-            }
-        }
-    }
+    NumericArrayView::new(array)
+        .map_err(|_| internal("integer remainder selected carrier cannot be downcast"))
 }
-
 pub(super) fn evaluate_numeric_mod<'a>(
     op: NumericModOp,
     input: ScalarCallInput<'_, 'a>,
@@ -155,51 +88,54 @@ pub(super) fn evaluate_numeric_mod<'a>(
     }
     let left_array = left.array();
     let right_array = right.array();
-    let left_view = NumericInput::checked(left_array, &left_type.data_type)?;
-    let right_view = NumericInput::checked(right_array, &right_type.data_type)?;
+    let left_view = checked_view(left_array, &left_type.data_type)?;
+    let right_view = checked_view(right_array, &right_type.data_type)?;
     let selection = input.selection();
     output_capacity(selection.len())?;
     let mut builder = Float64Builder::with_capacity(selection.len());
     let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        // Each argument owns its mapping: scalar row zero, checked constant
-        // pool ordinal, original column row or compact selected ordinal.
-        let left_row = left.value_row(ordinal, batch_row);
-        let right_row = right.value_row(ordinal, batch_row);
-        if left_row >= left_array.len() || right_row >= right_array.len() {
-            return Err(internal(
-                "integer remainder selected row is outside its checked carrier",
-            ));
-        }
-        let left_null = left_array.is_null(left_row);
-        let right_null = right_array.is_null(right_row);
-        if (left_null && !left_type.nullable) || (right_null && !right_type.nullable) {
-            return Err(internal(
-                "integer remainder non-null input contains selected SQL NULL",
-            ));
-        }
-        if left_null || right_null {
-            builder.append_null();
-        } else {
-            // Signed source precision is preserved before the remainder;
-            // floats retain the old finite/truncating/saturating Rust cast.
-            let value = match (left_view.value(left_row), right_view.value(right_row)) {
-                (Some(left), Some(right)) => op.apply(left, right)?,
-                _ => None,
-            };
-            match value {
-                Some(value) => builder.append_value(value),
-                None => builder.append_null(),
+    evaluate_mod_rows(
+        op,
+        &left_view,
+        &right_view,
+        selection.iter(),
+        |ordinal, batch_row| {
+            let left_row = left.value_row(ordinal, batch_row);
+            let right_row = right.value_row(ordinal, batch_row);
+            if left_row >= left_array.len() || right_row >= right_array.len() {
+                return Err(internal(
+                    "integer remainder selected row is outside its checked carrier",
+                ));
             }
+            if (left_array.is_null(left_row) && !left_type.nullable)
+                || (right_array.is_null(right_row) && !right_type.nullable)
+            {
+                return Err(internal(
+                    "integer remainder non-null input contains selected SQL NULL",
+                ));
+            }
+            Ok((left_row, right_row))
+        },
+        |value| {
+            match value {
+                Some(value) => builder.append_value(value as f64),
+                None => builder.append_null(),
+            };
+            Ok(())
+        },
+        || work.step(),
+    )
+    .map_err(|error| match error {
+        NumericModError::RangeInvariant => {
+            internal("integer remainder exceeds its proven signed range")
         }
-    }
+        NumericModError::Control(error) => error,
+    })?;
     let values = Arc::new(builder.finish()) as ArrayRef;
     work.finish()?;
     SelectedValues::try_new(selection, &target.data_type, values, Box::default())
         .map_err(|_| internal("integer remainder compact output violates its selected contract"))
 }
-
 /// Rust allocation representability only; this does not authorize memory.
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     let values = rows
@@ -733,6 +669,55 @@ mod tests {
                 control.calls().iter().filter(|units| **units == 0).count(),
                 4
             );
+        }
+    }
+
+    #[test]
+    fn shared_mod_every_actual_callback_preserves_all_seven_causes_and_failed_latch() {
+        let left: ArrayRef = Arc::new(Float64Array::from(vec![-7.9]));
+        let right: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN]));
+        let arguments = [
+            EvaluatedArgument::Scalar(&left),
+            EvaluatedArgument::Scalar(&right),
+        ];
+        let types = [
+            FunctionValueType::new(DataType::Float64, false),
+            FunctionValueType::new(DataType::Int64, false),
+        ];
+        let selection = Selection::all(513);
+        for name in ["mod", "pmod"] {
+            let mut baseline = instance(name, &types);
+            let control = Control::default();
+            baseline.evaluate(selection, &arguments, &control).unwrap();
+            for cause in [
+                KernelFailure::Cancelled,
+                KernelFailure::DeadlineExceeded,
+                KernelFailure::ResourceExhausted,
+                crate::kernel_control::invalid("original invalid"),
+                crate::kernel_control::internal("original internal"),
+                KernelFailure::Operational(crate::kernel_control::KernelDiagnostic::new(
+                    "original operational",
+                )),
+                KernelFailure::InstanceFailed,
+            ] {
+                for at in 0..control.calls().len() {
+                    let mut kernel = instance(name, &types);
+                    let refusal = Control::refusing(at, cause.clone());
+                    assert_eq!(
+                        kernel
+                            .evaluate(selection, &arguments, &refusal)
+                            .unwrap_err(),
+                        cause
+                    );
+                    assert_eq!(refusal.calls().len(), at + 1);
+                    assert_eq!(
+                        kernel
+                            .evaluate(selection, &arguments, &Control::default())
+                            .unwrap_err(),
+                        KernelFailure::InstanceFailed
+                    );
+                }
+            }
         }
     }
 }
