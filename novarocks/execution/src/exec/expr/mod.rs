@@ -30,6 +30,8 @@ mod in_pred;
 mod literal;
 #[cfg(test)]
 pub(crate) mod pure_differential;
+#[cfg(test)]
+mod legacy_regexp_replace_baseline_tests;
 mod slot;
 pub(crate) mod static_program;
 mod struct_expr;
