@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "stage": "P09 original complete Iceberg SQL first failure",
+  "matrix": {
+    "source_revision": "d2498d165eaea50122259f0a4c628a4bbfd662ba",
+    "source_dirty": false,
+    "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+    "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "launch_profile": "fault-scenario",
+    "results": [
+      {
+        "suite": "iceberg",
+        "sql_glob": "*.sql",
+        "exit_code": 1,
+        "duration_seconds": 27.801
+      }
+    ],
+    "fixture_startup_exit_code": 0,
+    "fixture_cleanup_exit_code": 0
+  },
+  "passed_cases": 24,
+  "failed_cases": 3,
+  "failure": "Foreground rewrite_data_files and rewrite_position_delete_files CALL statements receive Local capacity; RequestScopedMaintenanceEngine distributed rewrite requires Internal capacity before construction. Three observed failures are internal result CPU requires an admitted Internal window.",
+  "pids": [
+    25975,
+    25976,
+    25977,
+    25978
+  ],
+  "all_pids_absent": true,
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-iceberg-complete-native-20261009/iceberg.log",
+      "sha256": "d293dd490e71f2a7638acef884b753ec23940259977fcb562369d8a1dd72a3ad"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-iceberg-complete-native-20261009/matrix-status.json",
+      "sha256": "541454842260da85ea40e6b075772d39b9fe0ec865497210dfa293b3ee7dc32d"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-iceberg-complete-native-20261009/cleanup.log",
+      "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+    }
+  ],
+  "local_only": true
+}

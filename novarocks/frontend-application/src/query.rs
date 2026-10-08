@@ -2787,7 +2787,8 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
 
 /// Work classification selects statement admission; the output purpose
 /// independently selects its result capacity. Foreground MV refresh and
-/// repartition are management commands whose writes produce InternalFacts.
+/// repartition and foreground distributed maintenance rewrites are management
+/// commands whose writes produce InternalFacts.
 fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWindowClass {
     match statement {
         ParsedStatement::Dml(_)
@@ -2802,6 +2803,14 @@ fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWin
                 alter.action,
                 ast::MaterializedViewAlterAction::Repartition(_)
             ) =>
+        {
+            ResultWindowClass::Internal
+        }
+        ParsedStatement::Maintenance(ast::MaintenanceStatement::Call(call))
+            if matches!(call.procedure.parts.as_slice(), [_, namespace, procedure]
+                if namespace.value.eq_ignore_ascii_case("system")
+                    && (procedure.value.eq_ignore_ascii_case("rewrite_data_files")
+                        || procedure.value.eq_ignore_ascii_case("rewrite_position_delete_files"))) =>
         {
             ResultWindowClass::Internal
         }
@@ -3096,7 +3105,13 @@ mod tests {
             ResultWindowClass::Internal
         );
 
-        for sql in ["INSERT INTO target VALUES (1)", "EXPLAIN ANALYZE SELECT 1"] {
+        for sql in [
+            "INSERT INTO target VALUES (1)",
+            "EXPLAIN ANALYZE SELECT 1",
+            "CALL ice.system.rewrite_data_files(table => 'db.orders')",
+            "CALL ice.system.rewrite_position_delete_files(table => 'db.orders')",
+            "CALL ice.SYSTEM.REWRITE_POSITION_DELETE_FILES(table => 'db.orders')",
+        ] {
             let statement = parse_single_statement(sql).expect("parse internal output command");
             assert_eq!(
                 typed_statement_result_window_class(&statement),
@@ -3120,6 +3135,9 @@ mod tests {
             "SHOW MATERIALIZED VIEWS",
             "ALTER MATERIALIZED VIEW mv PAUSE REFRESH",
             "CREATE DATABASE result_capacity_test",
+            "CALL ice.system.rewrite_manifests(table => 'db.orders')",
+            "CALL ice.system.expire_snapshots(table => 'db.orders', retain_last => 1)",
+            "CALL ice.other.rewrite_position_delete_files(table => 'db.orders')",
         ] {
             let statement = parse_single_statement(sql).expect("parse local output command");
             assert_eq!(
