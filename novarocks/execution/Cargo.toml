@@ -25,8 +25,8 @@ chrono-tz = "0.10"
 crc32c.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
 futures.workspace = true
-hashbrown = { version = "0.14", features = ["raw"] }
-allocator-api2 = "0.2"
+hashbrown = { workspace = true, features = ["raw"] }
+allocator-api2.workspace = true
 hex.workspace = true
 libm = "0.2"
 md-5.workspace = true
