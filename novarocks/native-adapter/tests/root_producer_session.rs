@@ -413,7 +413,12 @@ async fn ordinary_upstream_output_beyond_the_input_allowance_fails_after_pull() 
         .session
         .submit_input(owned_chunk(Arc::new(array)), input(&fixture.session).await)
         .unwrap_err();
-    assert!(error.to_string().contains("exceeds its profile"));
+    assert!(
+        error
+            .to_string()
+            .contains("root input backing exceeds its frozen capacity"),
+        "unexpected refusal: {error}"
+    );
     // The refused input exits with its position; nothing was published.
     drop(input(&fixture.session).await);
     assert_eq!(fixture.channel.snapshot().produced_through, 0);
@@ -449,7 +454,12 @@ async fn unknown_actual_schema_refuses_before_producer_and_drops_chunk_before_cr
             observed.fetch_add(1, Ordering::SeqCst);
         }));
     let error = fixture.session.submit_input(unknown, permit).unwrap_err();
-    assert!(error.to_string().contains("backing is unproven"));
+    assert!(
+        error
+            .to_string()
+            .contains("root input actual schema differs from its metadata owner"),
+        "unexpected refusal: {error}"
+    );
     assert!(callbacks.load(Ordering::SeqCst) > 0);
     assert!(dropped_before_wake.load(Ordering::SeqCst));
     assert!(fixture.session.producer_exited());
