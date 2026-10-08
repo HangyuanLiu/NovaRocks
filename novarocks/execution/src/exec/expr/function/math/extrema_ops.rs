@@ -798,3 +798,7 @@ mod legacy_extrema_contract_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_extrema_baseline_tests.rs"]
+mod legacy_extrema_baseline_tests;
