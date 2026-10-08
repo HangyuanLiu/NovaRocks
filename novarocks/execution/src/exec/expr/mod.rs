@@ -27,11 +27,13 @@ mod dict_decode;
 pub mod dict_peel;
 pub mod function;
 mod in_pred;
+#[cfg(test)]
+mod legacy_calendar_add_baseline_tests;
+#[cfg(test)]
+mod legacy_regexp_replace_baseline_tests;
 mod literal;
 #[cfg(test)]
 pub(crate) mod pure_differential;
-#[cfg(test)]
-mod legacy_regexp_replace_baseline_tests;
 mod slot;
 pub(crate) mod static_program;
 mod struct_expr;
