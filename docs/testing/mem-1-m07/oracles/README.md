@@ -17,3 +17,6 @@ python3 docs/testing/mem-1-m07/oracles/decimal-read-write-v1.py \
 
 
 `decimal-string-functions-v1.py` 独立推导字符串函数 fixture 的7行、8个读取查询。以完整原 SQL SHA 冻结 setup、表达式、alias 和排序；字面量与实际 DDL 生成固定scale字符串，之后用ASCII字符操作计算CONCAT、截取、定位、正则、split、pad、大小写、replace和reverse。RPAD截取超过长度的输入，并保留短输入的尾部空格。该fixture无需舍入或溢出，helper显式拒绝这两类情况。任何SQL变化需新版本审阅；预期不读取任何数据库或golden。原生old/new独立核验通过前不改仓库golden。
+
+
+`decimal-partitioned-v1.py` 以原SQL SHA冻结24行literal setup及9个读取query，独立计算month/category分组、SUM/AVG（固定scale，HALF_UP）、排序、rank/running SUM/LAG和筛选。所有原input Decimal均在实际精度/scale内。query9保留既有nullable Decimal128中间溢出：scale15的除法先把left unscaled值乘10^15，15行均超出有符号128位范围，按照已有OutputNull合同为NULL；不是按无限精度数学改成100。该约束来自 `type-contract/src/arithmetic.rs` 的division/output域及 `execution/src/exec/expr/arithmetic.rs` 的checked intermediate，不是数据库输出。AVG合同来自canonical_agg_decimal_type和既有HALF_UP整数除法。60行预期不读取任何golden；原生old/new核验通过并审阅后才能修原golden。

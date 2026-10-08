@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "stage": "P09 four previously unreached real Paimon native regressions",
+  "outcome": "passed for the frozen four-scenario selection",
+  "matrix": {
+    "source_revision": "68a47385659a20da87fc78746abf7165e7064afb",
+    "source_dirty": false,
+    "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+    "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "launch_profile": "fault-scenario",
+    "results": [
+      {
+        "scenarios": [
+          "connector/paimon-merge-filter-correctness",
+          "connector/paimon-cancel-and-budget",
+          "connector/paimon-unsupported-and-binding",
+          "connector/iceberg-paimon-read"
+        ],
+        "exit_code": 0,
+        "duration_seconds": 3.289
+      }
+    ],
+    "fixture_startup_exit_code": 0,
+    "paimon_prepare_exit_code": 0,
+    "paimon_cleanup_exit_code": 0,
+    "fixture_cleanup_exit_code": 0
+  },
+  "actual_product_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "input": {
+    "path": "docs/testing/mem-1-m07/inputs/paimon-native-regression-freeze-v2.json",
+    "sha256": "4427ded7b35a7ebbbbf3e199cd02d25d8d712dc9a68b719b8e940a0aedd2068a"
+  },
+  "external_fixture": {
+    "manifest": {
+      "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/paimon-fixture/manifest.json",
+      "sha256": "1e0771d61f9babbc61e6fa3bf44de1d907ce888c9c70dff8a98e1bfc26a418de"
+    },
+    "last_stage": "schema",
+    "stage_evidence": [
+      {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/paimon-fixture/stages/compacted.json",
+        "sha256": "a408a4a3e431e153960d46ec5449c079205dc3ac074eeb938effff87883018db"
+      },
+      {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/paimon-fixture/stages/s1.json",
+        "sha256": "efa1a84aa69f9ee6265250cdb264f9e84798e45534800c4b6fc05e98ec6b3b9b"
+      },
+      {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/paimon-fixture/stages/s2.json",
+        "sha256": "5465cb0b5613a3b7c9eb8b09a11b609ddb7877754c4d1fa25f544af231e45f32"
+      },
+      {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/paimon-fixture/stages/schema.json",
+        "sha256": "25d7956268676a7b2227c45ddd56094572099e3e1a16d8cafe145cd45b9f14e7"
+      }
+    ],
+    "cleanup": {
+      "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/paimon-fixture/CLEANED",
+      "sha256": "580da9b6718e83c83b098075944f26930a90d38dda4478488423090f89f570bd"
+    }
+  },
+  "scenarios": [
+    {
+      "name": "connector/iceberg-paimon-read",
+      "evidence": {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/native/connector-iceberg-paimon-read/scenario-evidence.json",
+        "sha256": "08c650971e01c728abb918f6be951a9a9de3980803ab90426668816317c076e5"
+      },
+      "source_revision": "68a47385659a20da87fc78746abf7165e7064afb",
+      "actual_runner_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "processes": [
+        {
+          "role": "fe",
+          "pid": 2484,
+          "process_start_token": "macos:1791489879:470007"
+        },
+        {
+          "role": "be-0",
+          "pid": 2486,
+          "process_start_token": "macos:1791489879:530965"
+        },
+        {
+          "role": "be-1",
+          "pid": 2487,
+          "process_start_token": "macos:1791489879:591429"
+        },
+        {
+          "role": "be-2",
+          "pid": 2488,
+          "process_start_token": "macos:1791489879:645725"
+        }
+      ]
+    },
+    {
+      "name": "connector/paimon-cancel-and-budget",
+      "evidence": {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/native/connector-paimon-cancel-and-budget/scenario-evidence.json",
+        "sha256": "93309fed3718e08ca57df142cb44c0ad32a26e4e179c6b93f9ee9f82d423dd98"
+      },
+      "source_revision": "68a47385659a20da87fc78746abf7165e7064afb",
+      "actual_runner_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "processes": [
+        {
+          "role": "fe",
+          "pid": 2311,
+          "process_start_token": "macos:1791489878:117228"
+        },
+        {
+          "role": "be-0",
+          "pid": 2312,
+          "process_start_token": "macos:1791489878:178174"
+        },
+        {
+          "role": "be-1",
+          "pid": 2313,
+          "process_start_token": "macos:1791489878:238616"
+        },
+        {
+          "role": "be-2",
+          "pid": 2314,
+          "process_start_token": "macos:1791489878:295225"
+        }
+      ]
+    },
+    {
+      "name": "connector/paimon-merge-filter-correctness",
+      "evidence": {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/native/connector-paimon-merge-filter-correctness/scenario-evidence.json",
+        "sha256": "f94f65b7ca9ceb2ae38a65ae3d9890b75bad75b66ea2885a019ba0cb7141767f"
+      },
+      "source_revision": "68a47385659a20da87fc78746abf7165e7064afb",
+      "actual_runner_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "processes": [
+        {
+          "role": "fe",
+          "pid": 2229,
+          "process_start_token": "macos:1791489876:933700"
+        },
+        {
+          "role": "be-0",
+          "pid": 2230,
+          "process_start_token": "macos:1791489877:145507"
+        },
+        {
+          "role": "be-1",
+          "pid": 2231,
+          "process_start_token": "macos:1791489877:213984"
+        },
+        {
+          "role": "be-2",
+          "pid": 2232,
+          "process_start_token": "macos:1791489877:273708"
+        }
+      ]
+    },
+    {
+      "name": "connector/paimon-unsupported-and-binding",
+      "evidence": {
+        "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/native/connector-paimon-unsupported-and-binding/scenario-evidence.json",
+        "sha256": "7f5da38bc623dde3585fb521c91e18f77e041e432700529fe52b3400d764e155"
+      },
+      "source_revision": "68a47385659a20da87fc78746abf7165e7064afb",
+      "actual_runner_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "processes": [
+        {
+          "role": "fe",
+          "pid": 2385,
+          "process_start_token": "macos:1791489878:818941"
+        },
+        {
+          "role": "be-0",
+          "pid": 2386,
+          "process_start_token": "macos:1791489878:896845"
+        },
+        {
+          "role": "be-1",
+          "pid": 2387,
+          "process_start_token": "macos:1791489878:952899"
+        },
+        {
+          "role": "be-2",
+          "pid": 2388,
+          "process_start_token": "macos:1791489879:9607"
+        }
+      ]
+    }
+  ],
+  "all_16_pids_absent": true,
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/native-driver.log",
+      "sha256": "72ce1ce5af2ba56ef4883d9f1de372e3fc6d71bb55dd3b875e8af40def9bb227"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-paimon-remaining-native-20261009/matrix-status.json",
+      "sha256": "b9535e09afd945236b71d782d2d057236ed378cba9c656e469c0e53b409ed666"
+    }
+  ],
+  "scope": "Together with the separately recorded read-data pass, five native Paimon contracts pass. Snapshot-and-schema remains failed due to the separately confirmed MySQL producer-wait deadline regression. Not six-scenario, large provider CL or final M07 acceptance.",
+  "local_only": true
+}
