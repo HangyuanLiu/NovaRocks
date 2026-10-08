@@ -140,3 +140,5 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 2026-10-09 additional native coverage：statistics7/63步、MV七suite33/537步、真实HMS1/6步已PASS；前台rewrite接线补齐后actual70dc18f8a完整Iceberg27/compatibility20/resilience13（60/536步）及membership/ingress11场景PASS，全部记录PID退出、私有fixture cleanup0。普通64承载/writer决定、real大provider CL、result-delivery新case、transport/CM/P00b/final仍OPEN；历史63 C0不能当作70dc全量。详见对应20261009 JSON收据。
 
 2026-10-09 clean856e28f52前台rewrite C0全量PASS：12266/0fail/7ignored，524s，收据evidence/p09-foreground-rewrite-c0-pass-20261009.json。此次cargo-only不含native，不是final；MV rename六case原始输入已freeze v1，等待串行旧main/候选对照。
+
+2026-10-09 MV rename对照v1被错误fixture凭据挡在INSERT，非rename证据；runner final fixture secret binding修复通过SQLlib269/harness7/focused2/fmt。输入freeze v2，原SQL/golden保留，server不变，native pending。

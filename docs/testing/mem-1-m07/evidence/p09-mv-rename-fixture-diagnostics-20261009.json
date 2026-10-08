@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 MV rename performance-profile fixture diagnostics",
+  "outcome": "verification_failed_before_rename",
+  "scope": "Both old and candidate initial runs failed during setup. Neither run proves MV rename conformance or regression. Preserve original SQL/golden and all failed runs.",
+  "cause": "The ignored driver resolved role config secret references before SQL runner replaced the outer provider with its suite-private fixture. Performance children then used literal credentials for the wrong provider. Correct launch must bind the final projected fixture secrets from declared role config references.",
+  "runs": [
+    {
+      "actual_build_identity": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+      "matrix_status": {
+        "path": "logs/mem-1-m07/p09-mv-rename-old-main-native-20261009/matrix-status.json",
+        "sha256": "5e5d9a09c6a8afbc9541caf1baf2d07aed14ba612d8de06dbfb66b46266d0539"
+      },
+      "suite_log": {
+        "path": "logs/mem-1-m07/p09-mv-rename-old-main-native-20261009/iceberg-ivm.log",
+        "sha256": "da4664423b38d70b585690cbe2f4468475545b11b39896e9d5347028c530ba48"
+      },
+      "cleanup_log": {
+        "path": "logs/mem-1-m07/p09-mv-rename-old-main-native-20261009/cleanup.log",
+        "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+      },
+      "process_ids_absent": [
+        52061,
+        52062,
+        52063,
+        52064
+      ],
+      "case_passed": 0,
+      "case_failed": 6,
+      "failure_step": 1,
+      "diagnostic": "INSERT rejected during object-store parent directory creation before rename; cleanup missing-MV errors are downstream",
+      "fixture_cleanup_exit_code": 0
+    },
+    {
+      "actual_build_identity": "856e28f52f0c97e816835e44df77576bcb32d7c9",
+      "matrix_status": {
+        "path": "logs/mem-1-m07/p09-mv-rename-candidate-native-20261009/matrix-status.json",
+        "sha256": "2183be0a6f7356feed8da50aeb508f0eba5ba27dbc67419e6316977e7a12646e"
+      },
+      "suite_log": {
+        "path": "logs/mem-1-m07/p09-mv-rename-candidate-native-20261009/iceberg-ivm.log",
+        "sha256": "b9517ee034343b672d11c0c1ce7986c8715a672efe55104a9a907f13741b3984"
+      },
+      "cleanup_log": {
+        "path": "logs/mem-1-m07/p09-mv-rename-candidate-native-20261009/cleanup.log",
+        "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+      },
+      "process_ids_absent": [
+        52725,
+        52726,
+        52727,
+        52728
+      ],
+      "case_passed": 0,
+      "case_failed": 6,
+      "failure_step": 1,
+      "diagnostic": "INSERT rejected during object-store parent directory creation before rename; cleanup missing-MV errors are downstream",
+      "fixture_cleanup_exit_code": 0
+    }
+  ],
+  "process_ids_absent": [
+    52061,
+    52062,
+    52063,
+    52064,
+    52725,
+    52726,
+    52727,
+    52728
+  ],
+  "next_input_driver": {
+    "path": "logs/mem-1-m07/run_isolated_sql_matrix_final_fixture.py",
+    "sha256": "8efe85ee5c4dac90c7852dec4c4a8b78c9d43194f926cb76090660a8793fd7c8"
+  },
+  "runner_fix_scope": [
+    "tests/sql/runner/src/cluster.rs",
+    "tests/cluster-harness/src/effective_launch_config.rs"
+  ]
+}

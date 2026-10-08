@@ -27,6 +27,8 @@ use toml::Value;
 const ARTIFACT_SCHEMA_VERSION: u8 = 1;
 const FIXED_NO_PROXY: &str = "127.0.0.1,localhost";
 const FORMAL_SECRET_ENVIRONMENT: &[&str] = &[
+    "AWS_S3_ACCESS_KEY_ID",
+    "AWS_S3_SECRET_ACCESS_KEY",
     "NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET",
     "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
     "NOVAROCKS_UEA1_PERF_S3_ACCESS_KEY_ID",
@@ -863,6 +865,14 @@ mod tests {
     #[test]
     fn delete_fixture_credentials_record_presence_without_values() {
         let environment = BTreeMap::from([
+            (
+                "AWS_S3_ACCESS_KEY_ID".to_string(),
+                "access-canary".to_string(),
+            ),
+            (
+                "AWS_S3_SECRET_ACCESS_KEY".to_string(),
+                "secret-canary".to_string(),
+            ),
             (
                 "NOVAROCKS_UEA4G_FIXTURE_ACCESS".to_string(),
                 "access-canary".to_string(),
