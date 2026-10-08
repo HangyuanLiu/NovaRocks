@@ -16,10 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, Int64Builder, LargeBinaryArray, LargeStringArray, StringArray,
-};
-use std::sync::Arc;
+use arrow::array::ArrayRef;
 
 pub fn eval_crc32(
     arena: &ExprArena,
@@ -28,85 +25,7 @@ pub fn eval_crc32(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
-    let mut builder = Int64Builder::with_capacity(input.len());
-
-    match input.data_type() {
-        arrow::datatypes::DataType::Utf8 => {
-            let typed = input
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "downcast StringArray failed".to_string())?;
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    builder.append_null();
-                    continue;
-                }
-                builder.append_value(crc32_zlib(typed.value(row).as_bytes()) as i64);
-            }
-        }
-        arrow::datatypes::DataType::LargeUtf8 => {
-            let typed = input
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "downcast LargeStringArray failed".to_string())?;
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    builder.append_null();
-                    continue;
-                }
-                builder.append_value(crc32_zlib(typed.value(row).as_bytes()) as i64);
-            }
-        }
-        arrow::datatypes::DataType::Binary => {
-            let typed = input
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "downcast BinaryArray failed".to_string())?;
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    builder.append_null();
-                    continue;
-                }
-                builder.append_value(crc32_zlib(typed.value(row)) as i64);
-            }
-        }
-        arrow::datatypes::DataType::LargeBinary => {
-            let typed = input
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "downcast LargeBinaryArray failed".to_string())?;
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    builder.append_null();
-                    continue;
-                }
-                builder.append_value(crc32_zlib(typed.value(row)) as i64);
-            }
-        }
-        other => {
-            return Err(format!(
-                "crc32 expects VARCHAR/BINARY input, got {:?}",
-                other
-            ));
-        }
-    }
-
-    Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
-fn crc32_zlib(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xedb8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    crc ^ 0xffff_ffff
+    novarocks_functions::builtin::crc32::evaluate_legacy(&input)
 }
 
 #[cfg(test)]
@@ -115,10 +34,13 @@ mod legacy_crc32_contract_tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::ExprNode;
     use crate::exec::expr::function::FunctionKind;
-    use arrow::array::Int64Array;
+    use arrow::array::{
+        Array, BinaryArray, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_types::SlotId;
+    use std::sync::Arc;
 
     // Independent Python standard-library zlib.crc32 fixtures. Recording old
     // runtime carriers does not install additional pure function profiles.

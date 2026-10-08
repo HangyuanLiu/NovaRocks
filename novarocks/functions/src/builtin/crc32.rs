@@ -20,12 +20,16 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, StringArray, builder::Int64Builder};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
+    builder::Int64Builder,
+};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
+    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
+    ScalarCallInput, SelectedValues, Selection,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
@@ -53,58 +57,165 @@ pub(super) fn evaluate_crc32<'a>(
     if argument.array().data_type() != &DataType::Utf8 {
         return Err(internal("crc32 carrier differs from its checked argument"));
     }
-    let values = argument
+    argument
         .array()
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| internal("crc32 selected Utf8 carrier cannot be downcast"))?;
     let selection = input.selection();
     output_capacity(selection.len())?;
-    let mut builder = Int64Builder::with_capacity(selection.len());
-    let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        let row = argument.value_row(ordinal, batch_row);
-        if row >= values.len() {
-            return Err(internal(
-                "crc32 selected row is outside its checked carrier",
-            ));
-        }
-        if values.is_null(row) {
-            if !source.nullable {
-                return Err(internal(
-                    "crc32 non-null argument contains selected SQL NULL",
-                ));
+    let output =
+        evaluate_bytes(*argument, selection, source.nullable, true, control).map_err(|error| {
+            match error {
+                CoreError::Legacy(message) => internal(&message),
+                CoreError::Kernel(failure) => failure,
             }
-            builder.append_null();
-        } else {
-            // Preserve the original UTF-8 bytes without normalization or
-            // signed reinterpretation of the final unsigned 32-bit checksum.
-            builder.append_value(i64::from(checksum(
-                values.value(row).as_bytes(),
-                &mut work,
-            )?));
-        }
-    }
-    let output = Arc::new(builder.finish()) as ArrayRef;
-    work.finish()?;
+        })?;
     SelectedValues::try_new(selection, &target.data_type, output, Box::default())
         .map_err(|_| internal("crc32 compact output violates its selected contract"))
 }
 
-fn checksum(bytes: &[u8], work: &mut EvaluationCheckpoints<'_>) -> Result<u32, KernelFailure> {
-    let mut crc = 0xffff_ffff_u32;
-    for &byte in bytes {
+/// The original carrier admission errors remain full owned Strings for v1.
+enum CoreError {
+    Legacy(String),
+    Kernel(KernelFailure),
+}
+impl From<KernelFailure> for CoreError {
+    fn from(failure: KernelFailure) -> Self {
+        Self::Kernel(failure)
+    }
+}
+enum Bytes<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+    Binary(&'a BinaryArray),
+    LargeBinary(&'a LargeBinaryArray),
+}
+impl<'a> Bytes<'a> {
+    fn from_array(array: &'a ArrayRef) -> Result<Self, CoreError> {
+        let failure = |message: &str| CoreError::Legacy(message.to_string());
+        match array.data_type() {
+            DataType::Utf8 => array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(Self::Utf8)
+                .ok_or_else(|| failure("downcast StringArray failed")),
+            DataType::LargeUtf8 => array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .map(Self::LargeUtf8)
+                .ok_or_else(|| failure("downcast LargeStringArray failed")),
+            DataType::Binary => array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .map(Self::Binary)
+                .ok_or_else(|| failure("downcast BinaryArray failed")),
+            DataType::LargeBinary => array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .map(Self::LargeBinary)
+                .ok_or_else(|| failure("downcast LargeBinaryArray failed")),
+            other => Err(CoreError::Legacy(format!(
+                "crc32 expects VARCHAR/BINARY input, got {:?}",
+                other
+            ))),
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Utf8(a) => a.len(),
+            Self::LargeUtf8(a) => a.len(),
+            Self::Binary(a) => a.len(),
+            Self::LargeBinary(a) => a.len(),
+        }
+    }
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Utf8(a) => a.is_null(row),
+            Self::LargeUtf8(a) => a.is_null(row),
+            Self::Binary(a) => a.is_null(row),
+            Self::LargeBinary(a) => a.is_null(row),
+        }
+    }
+    fn value(&self, row: usize) -> &[u8] {
+        match self {
+            Self::Utf8(a) => a.value(row).as_bytes(),
+            Self::LargeUtf8(a) => a.value(row).as_bytes(),
+            Self::Binary(a) => a.value(row),
+            Self::LargeBinary(a) => a.value(row),
+        }
+    }
+}
+/// ONE original byte calculation and Int64 assembly for full and selected calls.
+fn evaluate_bytes(
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    nullable: bool,
+    selected: bool,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, CoreError> {
+    // Preserve v1 builder allocation before carrier admission and pure's
+    // existing allocation position after exact output representability checks.
+    let mut builder = Int64Builder::with_capacity(selection.len());
+    let values = Bytes::from_array(argument.array())?;
+    let mut work = EvaluationCheckpoints::new(control);
+    for (ordinal, batch_row) in selection.iter().enumerate() {
         work.step()?;
-        crc ^= u32::from(byte);
-        // Eight fixed bit operations are one bounded byte work unit. The
-        // polynomial is IEEE CRC-32 (zlib), not the CRC32C workspace library.
+        let row = argument.value_row(ordinal, batch_row);
+        if selected && row >= values.len() {
+            return Err(internal("crc32 selected row is outside its checked carrier").into());
+        }
+        if values.is_null(row) {
+            if !nullable {
+                return Err(internal("crc32 non-null argument contains selected SQL NULL").into());
+            }
+            builder.append_null();
+        } else {
+            builder.append_value(crc32_zlib_observed(values.value(row), &mut work)? as i64);
+        }
+    }
+    let output = Arc::new(builder.finish()) as ArrayRef;
+    work.finish()?;
+    Ok(output)
+}
+/// The v1 shell evaluates only its first argument; output metadata is ignored.
+pub fn evaluate_legacy(input: &ArrayRef) -> Result<ArrayRef, String> {
+    evaluate_bytes(
+        EvaluatedArgument::Column(input),
+        Selection::all(input.len()),
+        true,
+        false,
+        &LegacyControl,
+    )
+    .map_err(|error| match error {
+        CoreError::Legacy(message) => message,
+        CoreError::Kernel(failure) => failure.to_string(),
+    })
+}
+struct LegacyControl;
+impl KernelEvaluationControl for LegacyControl {
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        panic!("CRC32 calculation never waits")
+    }
+}
+
+fn crc32_zlib_observed(
+    data: &[u8],
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<u32, KernelFailure> {
+    let mut crc = 0xffff_ffff_u32;
+    for &byte in data {
+        work.step()?;
+        crc ^= byte as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb8_8320;
             } else {
-                crc >> 1
-            };
+                crc >>= 1;
+            }
         }
     }
     Ok(crc ^ 0xffff_ffff)
@@ -130,3 +241,7 @@ fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
 #[cfg(test)]
 #[path = "crc32_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "crc32_shared_tests.rs"]
+mod shared_tests;
