@@ -528,9 +528,12 @@ fn normalized_theta_artifact(
     identity: StatisticsArtifactIdentity,
     body: Bytes,
 ) -> Result<novarocks_spi::connector::StatisticsArtifactDraft, ConnectorError> {
+    // Identity retains the original admitted holder across unions. The new
+    // body and metadata keep that holder through their own clone/async exits.
+    let retention = novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(identity.clone());
     let estimate = novarocks_connector_iceberg_functions::estimate_compact_theta(&body)
         .map_err(|error| corrupt(error.to_string()))?;
-    novarocks_spi::connector::StatisticsArtifactDraft::try_new(
+    novarocks_spi::connector::StatisticsArtifactDraft::try_new_with_guard(
         identity.input_fields().to_vec(),
         identity.blob_type(),
         body,
@@ -538,6 +541,7 @@ fn normalized_theta_artifact(
             crate::stats_loader::NDV_PROPERTY.to_string(),
             estimate.to_string(),
         )]),
+        retention,
     )
 }
 

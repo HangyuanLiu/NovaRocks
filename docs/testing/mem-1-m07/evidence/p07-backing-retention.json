@@ -1,0 +1,60 @@
+{
+  "commit": "4b9184d8ed3615f85d6e4428520289e46e39b4d9",
+  "base": "a91441d33",
+  "worktree": "/Users/harbor/.codex/worktrees/mem-1-m07-p07-backing/NovaRocks",
+  "branch": "codex/mem-1-m07-p07-backing",
+  "clean": true,
+  "tests": [
+    {
+      "command": "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/Users/harbor/.codex/worktrees/b946/NovaRocks/target cargo test -p novarocks-spi --lib",
+      "passed": 348,
+      "failed": 0
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/Users/harbor/.codex/worktrees/b946/NovaRocks/target cargo test -p novarocks-native-adapter --lib",
+      "passed": 713,
+      "failed": 0
+    }
+  ],
+  "static_checks": [
+    "rustfmt --edition 2024 --check (six scoped files)",
+    "git diff --check"
+  ],
+  "logs": [
+    {
+      "path": "/tmp/mem-1-m07-p07-spi-final.log",
+      "sha256": "d735531f73e0ec402a726f758f43b62fbe1e06d9c3b4f3ba63703a0897678465",
+      "mirrored_path": "logs/mem-1-m07/mem-1-m07-p07-spi-final.log"
+    },
+    {
+      "path": "/tmp/mem-1-m07-p07-native-final.log",
+      "sha256": "ccbf4d2148dd015f7470ef73048ac21b4462dab0d799cf10db57e0c9637fd18c",
+      "mirrored_path": "logs/mem-1-m07/mem-1-m07-p07-native-final.log"
+    },
+    {
+      "path": "/tmp/mem-1-m07-p07-native-retention.log",
+      "sha256": "0fb5e82ff359175fac84f92e718ea872d8c23385f18f724bb2d15589ca1b07d5",
+      "mirrored_path": "logs/mem-1-m07/mem-1-m07-p07-native-retention.log"
+    },
+    {
+      "path": "/tmp/mem-1-m07-p07-spi-retention.log",
+      "sha256": "02e1029617e38b281695cfd04fe44e372ff482cd771bea6c3173a1ffd148bc16",
+      "mirrored_path": "logs/mem-1-m07/mem-1-m07-p07-spi-retention.log"
+    }
+  ],
+  "unrun": [
+    "workspace CI",
+    "SQL",
+    "native 1FE+3BE",
+    "performance",
+    "Miri"
+  ],
+  "migration": [
+    "StatisticsArtifactDraft::into_parts remains transition-only; main must migrate the two Iceberg consumers to into_guarded_parts before retiring it.",
+    "Guarded factory/attach_guard assumes an already-admitted actual holder; it acquires no capacity and cannot make an arbitrary preexisting ungoverned graph compliant.",
+    "Arrow Buffer clone/slice/to_data retains actual backing and holder; naked SchemaRef/RecordBatch getters remain public transition surfaces, so arbitrary schema/Null batch clones are not structurally sealed. Source receipts retain holders; whole-selection and guarded-parts clones retain holders.",
+    "CowSelectionStreamDecoder::finish_with_guard hands off the empty-stream schema holder; try_new_owned_with_guard retains empty selection schema and indices."
+  ],
+  "integrated_commit": "a09b4ffca",
+  "main_base": "a6f93f2cf"
+}
