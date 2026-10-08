@@ -61,6 +61,7 @@ mod higher_order_kernel;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
+pub mod pattern_memo;
 mod pure_catalogue;
 mod scalar_kernel;
 pub mod selected_copy;

@@ -43,6 +43,7 @@ pub enum Operation {
     ToBinary,
     Money,
     Murmur,
+    RegexpReplace,
 }
 pub(super) fn operation(name: &str) -> Option<Operation> {
     match name {
@@ -50,13 +51,14 @@ pub(super) fn operation(name: &str) -> Option<Operation> {
         "to_binary" => Some(Operation::ToBinary),
         "money_format" => Some(Operation::Money),
         "murmur_hash3_32" => Some(Operation::Murmur),
+        "regexp_replace" => Some(Operation::RegexpReplace),
         _ => None,
     }
 }
 pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: if matches!(operation, Operation::Money) {
+        own_row_error: if matches!(operation, Operation::Money | Operation::RegexpReplace) {
             FunctionIntrinsicRowError::MayRaise
         } else {
             FunctionIntrinsicRowError::NoRowError

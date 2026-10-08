@@ -45,6 +45,7 @@ pub(super) fn validate_profile(
         Operation::Unhex | Operation::Money => types.len() == 1,
         Operation::ToBinary => types.len() == 1 || types.len() == 2,
         Operation::Murmur => !types.is_empty(),
+        Operation::RegexpReplace => types.len() == 3,
     };
     if !arity {
         return Err(invalid(
@@ -58,7 +59,9 @@ pub(super) fn validate_profile(
         step()?;
         let physical = ty.logical_type == ValueLogicalType::Physical;
         let admitted = match op {
-            Operation::Unhex | Operation::ToBinary => physical && ty.data_type == DataType::Utf8,
+            Operation::Unhex | Operation::ToBinary | Operation::RegexpReplace => {
+                physical && ty.data_type == DataType::Utf8
+            }
             Operation::Money => {
                 physical
                     && matches!(
@@ -101,7 +104,7 @@ pub(super) fn validate_profile(
     }
     let expected = match op {
         Operation::Unhex | Operation::ToBinary => DataType::Binary,
-        Operation::Money => DataType::Utf8,
+        Operation::Money | Operation::RegexpReplace => DataType::Utf8,
         Operation::Murmur => DataType::Int32,
     };
     step()?;
@@ -208,6 +211,9 @@ fn visit_row(
             super::string_binary::visit(text, format, matches!(op, Operation::Unhex), work, emit)
         }
         Operation::Money => super::string_money::visit(array.as_ref(), row, work, emit),
+        Operation::RegexpReplace => {
+            Err(internal("regexp_replace must use its shared selected core"))
+        }
         Operation::Murmur => {
             let mut seed = 104_729u32;
             for i in 0..input.arguments().len() {
@@ -294,11 +300,14 @@ pub fn evaluate_selected<'a>(
     input: StringCoreInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
+    if matches!(op, Operation::RegexpReplace) {
+        return super::string_regexp_replace::evaluate_selected(input, control);
+    }
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
     let target = match op {
         Operation::Unhex | Operation::ToBinary => DataType::Binary,
-        Operation::Money => DataType::Utf8,
+        Operation::Money | Operation::RegexpReplace => DataType::Utf8,
         Operation::Murmur => DataType::Int32,
     };
     let result = (|| {
@@ -392,7 +401,7 @@ pub fn evaluate_selected<'a>(
         work.flush()?;
         let array: ArrayRef = match op {
             Operation::Murmur => Arc::new(Int32Array::from(hashes)),
-            Operation::Money => Arc::new(StringArray::new(
+            Operation::Money | Operation::RegexpReplace => Arc::new(StringArray::new(
                 OffsetBuffer::new(offsets.into()),
                 Buffer::from(bytes),
                 has_null.then(|| NullBuffer::new(validity.finish())),

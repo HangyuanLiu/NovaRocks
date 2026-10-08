@@ -1513,3 +1513,6 @@ mod s1_tests;
 #[cfg(test)]
 #[path = "pure_differential_s2_tests.rs"]
 mod s2_tests;
+
+#[path = "pure_differential_regexp_replace_tests.rs"]
+mod regexp_replace_tests;
