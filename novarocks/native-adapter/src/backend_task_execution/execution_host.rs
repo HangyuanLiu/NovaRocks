@@ -828,13 +828,25 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         "StatisticsArtifactV1 requires its bounded final Unpivot source",
                     ));
                 }
+                // V1 input/hydrate coexistence uses the frozen joint root
+                // allowance. Legacy Arrow results keep their original limit;
+                // both paths still debit the same process budget below.
+                let bounded_limits = novarocks_worker::WorkerResultRetainedLimits::try_new(
+                    usize::try_from(
+                        novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                            .root_joint_retained_bytes_per_root,
+                    )
+                    .map_err(|_| resource_exhausted("bounded root limit exceeds the target"))?,
+                    self.result_retained_limits.per_process().get(),
+                )
+                .map_err(|error| resource_exhausted(format!("bind bounded root capacity: {error}")))?;
                 let channel = novarocks_worker::root_result_channel::RootResultChannel::try_open(
                     novarocks_execution::runtime::fragment::io::RootResultWriteSpec {
                         task: identity,
                         contract: Arc::clone(contract),
                     },
                     Arc::clone(&self.result_retained_budget),
-                    self.result_retained_limits,
+                    bounded_limits,
                 )
                 .map_err(|error| {
                     resource_exhausted(format!("open task {identity} root channel: {error}"))
@@ -4431,11 +4443,20 @@ mod tests {
             Self::new_with_context_dop(query, 1)
         }
         fn new_with_context_dop(query: i64, dop: i32) -> Self {
+            Self::new_with_legacy_root_limit(query, dop, 256 * 1024 * 1024)
+        }
+        fn new_with_legacy_root_limit(query: i64, dop: i32, legacy_root_bytes: usize) -> Self {
             let backend = BackendProcessId::new_v7();
             let facts = Arc::new(StubContextFacts::default());
             facts.set_context_dop(dop);
+            let mut inner = host(facts);
+            inner.result_retained_limits = novarocks_worker::WorkerResultRetainedLimits::try_new(
+                legacy_root_bytes,
+                inner.result_retained_limits.per_process().get(),
+            )
+            .unwrap();
             let counting = Arc::new(CountingHost {
-                inner: host(facts),
+                inner,
                 installs: AtomicUsize::new(0),
             });
             let mut config = TaskExecutionRegistryConfig::for_process(backend, 16, 16);
@@ -5106,7 +5127,11 @@ mod tests {
             1,
         )
         .unwrap();
-        let fixture = OwnerFixture::new(91_002);
+        let fixture = OwnerFixture::new_with_legacy_root_limit(91_002, 1, 16 * 1024 * 1024);
+        assert_eq!(
+            fixture.host.inner.result_retained_limits.per_root().get(),
+            16 * 1024 * 1024
+        );
         let root = fixture.identity(1);
         let descriptor = consistent_descriptor(root, UniqueId::new(91_002, 1));
         let receipt = fixture.create(

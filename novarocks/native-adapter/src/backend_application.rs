@@ -691,6 +691,22 @@ impl BackendApplicationHost {
                 format!("verify backend Native file descriptor baseline: {error}"),
             )
         })?;
+        let bounded_root_process_bytes = usize::try_from(
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                .root_joint_retained_bytes_per_process,
+        )
+        .map_err(|_| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                "bounded root process capacity exceeds the target",
+            )
+        })?;
+        if result_retained_limits.per_process().get() < bounded_root_process_bytes {
+            return Err(BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                "backend result retained process capacity cannot cover the frozen bounded root profile",
+            ));
+        }
         let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
             result_retained_limits.per_process(),
         );
@@ -1436,6 +1452,30 @@ mod tests {
             "the envelope must be decided by the participant the query context \
              installed, not refused for having no owner: {reason}"
         );
+    }
+
+    #[test]
+    fn insufficient_joint_root_process_capacity_refuses_before_listener_binds() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let data_port = unused_port();
+        let mut config = backend_config(data_port, data_port);
+        let control_port = config.control_grpc_port;
+        let metrics_port = config.metrics_http_port;
+        let required =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                .root_joint_retained_bytes_per_process as usize;
+        config.result_retained_limits =
+            WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, required - 1).unwrap();
+        let error = BackendApplicationHost::open(config, test_data_runtime()).unwrap_err();
+        assert_eq!(error.kind(), BackendApplicationErrorKind::Configuration);
+        assert!(
+            error
+                .to_string()
+                .contains("cannot cover the frozen bounded root profile")
+        );
+        let _data = TcpListener::bind(("127.0.0.1", data_port)).unwrap();
+        let _control = TcpListener::bind(("127.0.0.1", control_port)).unwrap();
+        let _metrics = TcpListener::bind(("127.0.0.1", metrics_port)).unwrap();
     }
 
     #[test]
