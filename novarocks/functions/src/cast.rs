@@ -307,6 +307,9 @@ impl DecimalTextSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
     LargeIntText,
+    DateFloat {
+        target: Target,
+    },
     DecimalText {
         source: DecimalTextSource,
         scale: i8,
@@ -431,6 +434,26 @@ impl PreparedCastRecipe {
             }
             let source_kind =
                 Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
+            if source_kind == Source::Date32
+                && matches!(result.data_type, DataType::Float32 | DataType::Float64)
+            {
+                if source.nullable && !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                let target = if result.data_type == DataType::Float32 {
+                    Target::F32
+                } else {
+                    Target::F64
+                };
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::DateFloat { target },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
             if crate::temporal_carrier::supports(&source.data_type, &result.data_type) {
                 if source.nullable && !result.nullable {
                     return Err(CastPrepareError::TypeMismatch);
@@ -557,6 +580,9 @@ impl PreparedCastRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
+            // Raw Date32 admits invalid days and original unchecked arithmetic.
+            // Preserve its data error and overflow panic rather than promising never-fails.
+            CastBody::DateFloat { .. } => true,
             // Conservatively retain failure awareness for the original i128 MIN
             // positive-scale abs bug; do not translate its panic into a row error.
             CastBody::DecimalText {
@@ -677,6 +703,44 @@ impl PreparedCastRecipe {
                 };
                 work.flush()?;
                 return Ok(CastRowResult::Text(text));
+            }
+            if let CastBody::DateFloat { target } = self.body {
+                let row =
+                    self.checked_row(Source::Date32, argument, ordinal, logical_row, &mut work)?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                let days = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| internal("checked date float has a foreign carrier"))?
+                    .value(row);
+                work.flush()?;
+                let converted = match target {
+                    Target::F32 => {
+                        crate::date_float_cast::value_f32(days).map(CastRowResult::Float32)
+                    }
+                    Target::F64 => {
+                        crate::date_float_cast::value_f64(days).map(CastRowResult::Float64)
+                    }
+                    _ => return Err(internal("date float has a foreign frozen target")),
+                };
+                work.flush()?;
+                return Ok(match converted {
+                    Ok(value) => value,
+                    Err(message) => CastRowResult::RowError(RowDataError::new(
+                        ordinal,
+                        &format!(
+                            "CAST failed: from {:?} to {:?}: {message}",
+                            self.source.data_type, self.result.data_type
+                        ),
+                    )),
+                });
             }
             if let CastBody::TemporalCarrier { source } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
@@ -1156,3 +1220,7 @@ mod decimal_text_tests;
 #[cfg(test)]
 #[path = "cast_largeint_text_tests.rs"]
 mod largeint_text_tests;
+
+#[cfg(test)]
+#[path = "cast_date_float_tests.rs"]
+mod date_float_tests;

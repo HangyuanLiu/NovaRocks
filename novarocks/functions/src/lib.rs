@@ -2638,3 +2638,5 @@ mod tests {
         assert_eq!(options.max_output_bytes(), Some(4096));
     }
 }
+
+pub mod date_float_cast;

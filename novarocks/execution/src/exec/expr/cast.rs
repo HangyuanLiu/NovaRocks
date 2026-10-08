@@ -50,12 +50,6 @@ use novarocks_types::value::variant::{
     variant_to_time_micros,
 };
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-fn date32_to_date_literal(days: i32) -> Result<i32, String> {
-    let date = NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
-        .ok_or_else(|| format!("invalid Date32 value {days}"))?;
-    Ok(date.year() * 10000 + date.month() as i32 * 100 + date.day() as i32)
-}
-
 fn date_literal_to_date32(value: i64) -> Result<i32, String> {
     let standardized =
         standardize_date_literal(value).ok_or_else(|| format!("invalid date literal {value}"))?;
@@ -437,8 +431,9 @@ fn cast_date32_to_float64(arr: &Date32Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let literal = date32_to_date_literal(arr.value(i))?;
-        builder.append_value(literal as f64);
+        builder.append_value(novarocks_functions::date_float_cast::value_f64(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -450,8 +445,9 @@ fn cast_date32_to_float32(arr: &Date32Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let literal = date32_to_date_literal(arr.value(i))?;
-        builder.append_value(literal as f32);
+        builder.append_value(novarocks_functions::date_float_cast::value_f32(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }

@@ -1095,3 +1095,6 @@ mod decimal_text_profile_tests;
 
 #[path = "cast_largeint_text_tests.rs"]
 mod largeint_text_profile_tests;
+
+#[path = "cast_date_float_tests.rs"]
+mod date_float_profile_tests;
