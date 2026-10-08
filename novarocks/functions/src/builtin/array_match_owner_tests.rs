@@ -315,3 +315,68 @@ fn array_match_selected_all_seven_causes_each_observation_and_failed_instance_la
         assert!(control.trace.lock().unwrap().contains(&256));
     }
 }
+
+#[test]
+fn array_match_compile_callbacks_preserve_primary_causes_on_success_and_rejection() {
+    for name in ["all_match", "any_match"] {
+        for (source, succeeds) in [
+            (
+                FunctionValueType::new(
+                    DataType::List(Arc::new(Field::new("item", DataType::Boolean, true))),
+                    true,
+                ),
+                true,
+            ),
+            (FunctionValueType::new(DataType::Binary, true), false),
+        ] {
+            let good = CompileControl::default();
+            assert_eq!(
+                prepared_for_test_with_control(
+                    name,
+                    &[source.clone()],
+                    DecimalOverflowPolicy::OutputNull,
+                    &good,
+                )
+                .is_ok(),
+                succeeds,
+            );
+            let trace = good.trace.lock().unwrap().clone();
+            assert!(!trace.is_empty());
+            for stop in 0..trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = CompileControl {
+                        trace: Mutex::new(vec![]),
+                        refusal: Some((stop, cause)),
+                    };
+                    let error = prepared_for_test_with_control(
+                        name,
+                        &[source.clone()],
+                        DecimalOverflowPolicy::OutputNull,
+                        &control,
+                    )
+                    .err()
+                    .expect("refused compilation must not publish a prepared kernel");
+                    let actual = match error {
+                        crate::FunctionSpecializationFailure::Control(actual) => Some(actual),
+                        crate::FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
+                            Some(CompileControlError::Cancelled)
+                        }
+                        crate::FunctionSpecializationFailure::Kernel(
+                            KernelFailure::DeadlineExceeded,
+                        ) => Some(CompileControlError::DeadlineExceeded),
+                        crate::FunctionSpecializationFailure::Kernel(
+                            KernelFailure::ResourceExhausted,
+                        ) => Some(CompileControlError::ResourceExhausted),
+                        _ => None,
+                    };
+                    assert_eq!(actual, Some(cause));
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+                }
+            }
+        }
+    }
+}
