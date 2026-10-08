@@ -1195,15 +1195,12 @@ impl FrontendQuerySession {
             ),
         };
         match result {
-            Ok(StatementResult::Ok) => {
-                governed.complete_execution();
-                Ok(StatementResult::GovernedCompletion(
-                    GovernedCompletionStatementResult::new(
-                        self.service.workload_resources.clone(),
-                        governed,
-                    ),
-                ))
-            }
+            Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
+                GovernedCompletionStatementResult::new(
+                    self.service.workload_resources.clone(),
+                    governed,
+                ),
+            )),
             Ok(StatementResult::Query(result)) => {
                 // Local delivery may still use transitional LRA credits under
                 // this exact scope. Its root exits at the protocol terminal.
@@ -2571,16 +2568,17 @@ impl QuerySession for FrontendQuerySession {
     ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
     {
         let token = self.token()?;
-        let mut statement = self
+        let statement = self
             .service
             .query_control
-            .begin_governed_statement(
+            .begin_governed_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 WorkClass::Management,
                 None,
                 None,
                 None,
+                ResultWindowClass::Local,
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let cancellation = QueryCancellationView::governed(
@@ -2591,19 +2589,14 @@ impl QuerySession for FrontendQuerySession {
             .init_database_with_cancellation(schema, cancellation)
             .await
         {
-            Ok(()) => {
-                statement.complete_execution();
-                Ok(
-                    novarocks_query_application::session::QuerySessionStatement::output_owned(
-                        StatementResult::GovernedCompletion(
-                            GovernedCompletionStatementResult::new(
-                                self.service.workload_resources.clone(),
-                                statement,
-                            ),
-                        ),
-                    ),
-                )
-            }
+            Ok(()) => Ok(
+                novarocks_query_application::session::QuerySessionStatement::output_owned(
+                    StatementResult::GovernedCompletion(GovernedCompletionStatementResult::new(
+                        self.service.workload_resources.clone(),
+                        statement,
+                    )),
+                ),
+            ),
             Err(error) => Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
                     self.governed_typed_error(error, statement),

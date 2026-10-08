@@ -55,6 +55,10 @@ reader grows input buffers without an explicit limit. This patch adds:
    through the final socket flush, keeping partial IO poisoned on timeout.
    The relay and closing writers retain their separately owned deadlines.
    Existing entry points retain their previous timeout policy.
+   `InitWriter::into_streaming` uses the same empty-boundary lease for
+   COM_INIT_DB, with read-only limits/capabilities. This lets its consumer
+   retain the governed generation through actual packet write and flush,
+   including bounded independent closing, without exposing raw IO.
 10. `permits_query_shortcuts` lets the consumer apply its connection-class
     admission to every query, including the built-in max-packet shortcut.
     `reject_connection` flushes a bounded refusal and then exits the command

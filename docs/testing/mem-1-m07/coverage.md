@@ -118,3 +118,8 @@ FE FD含accept拒绝瞬时socket共710；handshake总量160。定向与完整Nat
 ### P07 Local governed 接线（2026-10-08）
 
 封闭Local source→原statement window→opaque graph→pure cursor→MySQL finite writer已接生产；旧decoded/protocol LRA随普通及closing实际writer保留。TCP半header驻留补尾/缺尾断连/初始取消/前序pending OK转交及下一generation反例通过；Query525、Frontend1446、MySQL71、opaque doctest1 PASS。见 `evidence/p07-local-delivery.md`。不将此结果扩展为ordinary terminal/全部Internal领域或原生1FE+3BE验收；P07/P08与后续门保持OPEN。
+
+
+## P07 ordinary terminal 检查点（2026-10-08）
+
+Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing owner 已接线；6项新增 TCP/partial/flush 反例与 MySQL77、Frontend1446、vendor lib150 PASS。范围/原始日志/失败与锁种子处理见 `evidence/p07-terminal-delivery.md`。整体 distributed/domain 矩阵与原生/性能门仍 OPEN；旧防护保留。

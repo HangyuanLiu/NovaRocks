@@ -82,11 +82,16 @@ pub const MYSQL_INTERMEDIARY_OPTIONS: IntermediaryOptions = IntermediaryOptions 
 };
 
 pub fn normalize_init_database_schema(schema: &str) -> String {
-    schema
-        .split('.')
-        .map(|part| part.trim_matches('`'))
-        .collect::<Vec<_>>()
-        .join(".")
+    // The connection's bounded command already covers one exact-size copy;
+    // never grow an unbounded Vec of one element per dot before admission.
+    let mut normalized = String::with_capacity(schema.len());
+    for (index, part) in schema.split('.').enumerate() {
+        if index != 0 {
+            normalized.push('.');
+        }
+        normalized.push_str(part.trim_matches('`'));
+    }
+    normalized
 }
 
 pub fn error_kind_for_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {

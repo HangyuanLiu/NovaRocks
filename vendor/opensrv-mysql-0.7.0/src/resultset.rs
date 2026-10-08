@@ -31,6 +31,23 @@ pub struct InitWriter<'a, W> {
 }
 
 impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
+    /// Facts from this exact connection, before transferring its IO owner.
+    pub fn client_capabilities(&self) -> CapabilityFlags {
+        self.client_capabilities
+    }
+
+    pub fn protocol_limits(&self) -> crate::ProtocolLimits {
+        self.writer.limits()
+    }
+
+    /// Transfer COM_INIT_DB's initial boundary into the same finite response
+    /// lease used for COM_QUERY. No output packet or finalizer is constructed.
+    pub fn into_streaming(self) -> io::Result<crate::StreamingResponseLease<'a, W>> {
+        QueryResultWriter::new(self.writer, false, self.client_capabilities)
+            .into_streaming()
+            .map_err(|(_, error)| error)
+    }
+
     /// Tell client that database context has been changed
     pub async fn ok(self) -> io::Result<()> {
         writers::write_ok_packet(self.writer, self.client_capabilities, OkResponse::default()).await

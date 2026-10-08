@@ -67,7 +67,12 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
             .await
         }
         StatementResult::GovernedCompletion(result) => {
-            crate::write_governed_terminal_ok_one(result.into_protocol(), results).await
+            crate::terminal::write_governed_terminal_ok_with_more(
+                result.into_protocol(),
+                results,
+                more_results,
+            )
+            .await
         }
         StatementResult::GovernedError(result) => {
             let (error, protocol) = result.into_parts();

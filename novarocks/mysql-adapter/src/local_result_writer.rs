@@ -649,6 +649,21 @@ mod tests {
                 session,
             }
         }
+        fn protocol(&self) -> GovernedProtocolOwner {
+            let statement = self
+                .control
+                .begin_governed_statement_with_result(
+                    self.session.token(),
+                    &self.host.root_admission(),
+                    WorkClass::Management,
+                    None,
+                    None,
+                    None,
+                    ResultWindowClass::Local,
+                )
+                .unwrap();
+            GovernedProtocolOwner::new(statement, self.host.resources())
+        }
         fn result(&self, value: String) -> GovernedImmediateStatementResult {
             let statement = self
                 .control
@@ -674,16 +689,20 @@ mod tests {
     }
     struct WriteGate {
         remaining: std::sync::atomic::AtomicUsize,
+        pause_flush: std::sync::atomic::AtomicBool,
         waiter: std::sync::Mutex<Option<std::task::Waker>>,
     }
     impl WriteGate {
         fn new() -> Self {
             Self {
                 remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                pause_flush: std::sync::atomic::AtomicBool::new(false),
                 waiter: std::sync::Mutex::new(None),
             }
         }
         fn release(&self) {
+            self.pause_flush
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             self.remaining
                 .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
             if let Some(waker) = self.waiter.lock().unwrap().take() {
@@ -724,6 +743,14 @@ mod tests {
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<io::Result<()>> {
+            if self
+                .gate
+                .pause_flush
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                *self.gate.waiter.lock().unwrap() = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
+            }
             std::pin::Pin::new(&mut self.inner).poll_flush(cx)
         }
         fn poll_shutdown(
@@ -758,11 +785,98 @@ mod tests {
             W: 'async_trait,
         {
         }
+        async fn on_init<'a>(
+            &'a mut self,
+            schema: &'a str,
+            writer: opensrv_mysql::InitWriter<'a, W>,
+        ) -> io::Result<()> {
+            if schema == "slow-init" {
+                self.gate
+                    .remaining
+                    .store(2, std::sync::atomic::Ordering::SeqCst);
+            }
+            if schema == "missing" {
+                crate::terminal::write_governed_init_error(
+                    novarocks_query_application::session_error::QueryServiceError::new(
+                        novarocks_query_application::session_error::QueryServiceErrorKind::BadDatabase,
+                        "unknown database"), self.fixture.protocol(), writer).await
+            } else {
+                crate::terminal::write_governed_init_ok(self.fixture.protocol(), writer).await
+            }
+        }
         async fn on_query<'a>(
             &'a mut self,
             query: &'a str,
             results: QueryResultWriter<'a, W>,
         ) -> io::Result<()> {
+            if matches!(
+                query,
+                "terminal"
+                    | "terminal-more"
+                    | "slow-terminal"
+                    | "flush-terminal"
+                    | "cancel-terminal"
+            ) {
+                if query == "slow-terminal" {
+                    self.gate
+                        .remaining
+                        .store(2, std::sync::atomic::Ordering::SeqCst);
+                }
+                if query == "flush-terminal" {
+                    self.gate
+                        .pause_flush
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let protocol = self.fixture.protocol();
+                if query == "cancel-terminal" {
+                    self.fixture.control.cancel_session_statement(
+                        self.fixture.session.token(),
+                        QueryCancellationReason::ExplicitKill {
+                            requester_connection_id: 901,
+                        },
+                    );
+                }
+                let more = query == "terminal-more";
+                return match crate::terminal::write_governed_terminal_ok_with_more(
+                    protocol, results, more,
+                )
+                .await?
+                {
+                    MysqlStatementWriteOutcome::Continue(writer) if more => {
+                        match write_local_result_one(
+                            self.fixture.result("next".into()),
+                            writer,
+                            false,
+                        )
+                        .await?
+                        {
+                            MysqlStatementWriteOutcome::Continue(writer) => {
+                                writer.no_more_results().await
+                            }
+                            MysqlStatementWriteOutcome::Terminated => Ok(()),
+                        }
+                    }
+                    MysqlStatementWriteOutcome::Continue(writer) => writer.no_more_results().await,
+                    MysqlStatementWriteOutcome::Terminated => Ok(()),
+                };
+            }
+            if matches!(query, "typed-error" | "slow-typed") {
+                if query == "slow-typed" {
+                    self.gate
+                        .remaining
+                        .store(2, std::sync::atomic::Ordering::SeqCst);
+                }
+                let error = novarocks_query_application::session_error::QueryServiceError::new(
+                    novarocks_query_application::session_error::QueryServiceErrorKind::BadDatabase,
+                    "unknown database",
+                );
+                return crate::terminal::write_governed_terminal_error(
+                    error,
+                    self.fixture.protocol(),
+                    results,
+                )
+                .await;
+            }
             let value = if matches!(query, "wide" | "partialwide") {
                 "x".repeat(128 * 1024)
             } else {
@@ -1058,6 +1172,148 @@ mod tests {
             assert_eq!(ok[3], 8);
             let (sequence, error) = read_packet(&mut client).await;
             assert_eq!(sequence, 2);
+            assert_eq!(&error[..3], &[0xff, 0x25, 0x05]);
+            packet(&mut client, 0, b"\x03again").await;
+            assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+            packet(&mut client, 0, &[1]).await;
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn finite_terminal_ok_has_explicit_more_results_and_no_deferred_owner() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut client, server) = socket().await;
+            packet(&mut client, 0, b"\x03terminal-more").await;
+            assert_eq!(
+                read_packet(&mut client).await,
+                (1, vec![0, 0, 0, 8, 0, 0, 0])
+            );
+            assert_eq!(read_result(&mut client, 2).await.0, b"\x04next");
+            packet(&mut client, 0, &[1]).await;
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn finite_terminal_and_init_packets_preserve_types_and_next_command() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut client, server) = socket().await;
+            for query in [b"\x03terminal".as_slice(), b"\x02db"] {
+                packet(&mut client, 0, query).await;
+                assert_eq!(
+                    read_packet(&mut client).await,
+                    (1, vec![0, 0, 0, 0, 0, 0, 0])
+                );
+            }
+            for query in [b"\x03typed-error".as_slice(), b"\x02missing"] {
+                packet(&mut client, 0, query).await;
+                let (sequence, error) = read_packet(&mut client).await;
+                assert_eq!(sequence, 1);
+                assert_eq!(&error[..3], &[0xff, 0x19, 0x04]); // ER_BAD_DB_ERROR
+                assert_eq!(&error[4..9], b"42000");
+                assert_eq!(&error[9..], b"unknown database");
+            }
+            packet(&mut client, 0, b"\x03again").await;
+            assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+            packet(&mut client, 0, &[1]).await;
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn slow_terminal_success_retains_ordinary_window_and_generation_until_write_exit() {
+        for command in [b"\x03slow-terminal".as_slice(), b"\x02slow-init"] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let fixture = Fixture::new();
+                let capacity = fixture.host.resources().result_capacity().unwrap();
+                let control = fixture.control.clone();
+                let session = fixture.session.token();
+                let gate = Arc::new(WriteGate::new());
+                let (mut client, server) = socket_with(fixture, Arc::clone(&gate)).await;
+                packet(&mut client, 0, command).await;
+                let mut header = [0; 4];
+                client.read_exact(&mut header[..2]).await.unwrap();
+                assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+                assert!(control.begin_statement(session).is_err());
+                gate.release();
+                client.read_exact(&mut header[2..]).await.unwrap();
+                assert_eq!(header, [7, 0, 0, 1]);
+                let mut ok = [0; 7];
+                client.read_exact(&mut ok).await.unwrap();
+                assert_eq!(ok, [0; 7]);
+                packet(&mut client, 0, b"\x03again").await;
+                assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+                packet(&mut client, 0, &[1]).await;
+                server.await.unwrap().unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn slow_typed_error_retires_local_window_but_retains_closing_generation() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = Fixture::new();
+            let capacity = fixture.host.resources().result_capacity().unwrap();
+            let control = fixture.control.clone();
+            let session = fixture.session.token();
+            let gate = Arc::new(WriteGate::new());
+            let (mut client, server) = socket_with(fixture, Arc::clone(&gate)).await;
+            packet(&mut client, 0, b"\x03slow-typed").await;
+            let mut header = [0; 4];
+            client.read_exact(&mut header[..2]).await.unwrap();
+            assert_eq!(capacity.snapshot().held_positions, [0, 0, 0, 1]);
+            assert!(control.begin_statement(session).is_err());
+            gate.release();
+            client.read_exact(&mut header[2..]).await.unwrap();
+            let len = usize::from(header[0]);
+            let mut error = vec![0; len];
+            client.read_exact(&mut error).await.unwrap();
+            assert_eq!(&error[..3], &[0xff, 0x19, 0x04]);
+            packet(&mut client, 0, b"\x03again").await;
+            assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+            packet(&mut client, 0, &[1]).await;
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn terminal_flush_holds_ordinary_generation_after_the_complete_packet() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = Fixture::new();
+            let capacity = fixture.host.resources().result_capacity().unwrap();
+            let control = fixture.control.clone();
+            let session = fixture.session.token();
+            let gate = Arc::new(WriteGate::new());
+            let (mut client, server) = socket_with(fixture, Arc::clone(&gate)).await;
+            packet(&mut client, 0, b"\x03flush-terminal").await;
+            assert_eq!(read_packet(&mut client).await, (1, vec![0; 7]));
+            assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+            assert!(
+                control.begin_statement(session).is_err(),
+                "packet completion alone is not flush exit"
+            );
+            gate.release();
+            packet(&mut client, 0, b"\x03again").await;
+            assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+            packet(&mut client, 0, &[1]).await;
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_terminal_uses_closing_and_keeps_the_connection() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut client, server) = socket().await;
+            packet(&mut client, 0, b"\x03cancel-terminal").await;
+            let (sequence, error) = read_packet(&mut client).await;
+            assert_eq!(sequence, 1);
             assert_eq!(&error[..3], &[0xff, 0x25, 0x05]);
             packet(&mut client, 0, b"\x03again").await;
             assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
