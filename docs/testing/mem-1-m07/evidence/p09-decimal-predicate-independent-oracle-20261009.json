@@ -1,0 +1,371 @@
+{
+  "schema_version": 1,
+  "stage": "P09 independent Decimal predicate fixture golden correction",
+  "source_revision": "19900635431c66e0ebd2017d9dd9cecf1839d488",
+  "outcome": "independent oracle passed on both native versions; reviewed golden corrected",
+  "topology": "1FE+3BE",
+  "oracle": {
+    "path": "docs/testing/mem-1-m07/oracles/decimal-predicate-v1.py",
+    "sha256": "24f75cbfc85a2032707231eecec8740b7a7f35d7e7d94edb7079a1ec7b436b58"
+  },
+  "audit": {
+    "schema_version": 1,
+    "sql_sha256": "8b8c608fd31122e4ca2ce934c391174b16d41295668279f4fde2139557970989",
+    "oracle_sha256": "24f75cbfc85a2032707231eecec8740b7a7f35d7e7d94edb7079a1ec7b436b58",
+    "result_sha256": "6bcf5bff1386da3dd4e01b9aa796be489496cc2bfb78576724660a8d9ee5981a",
+    "queries": 172,
+    "rows": 1818,
+    "basis": "Exact 25 literal rows and actual DDL; independent three-valued predicate logic, Decimal128 sum/AVG HALF_UP scales, NULL grouping/count, sort clauses. SQL runner existing order_sensitive=false compares exact multisets; this does not prove tied-row order. No database/golden input."
+  },
+  "expected": {
+    "path": "logs/mem-1-m07/p09-decimal-predicate-oracle-20261009/test_decimal256_predicate.result",
+    "sha256": "6bcf5bff1386da3dd4e01b9aa796be489496cc2bfb78576724660a8d9ee5981a"
+  },
+  "previous_golden": {
+    "path": "logs/mem-1-m07/p09-decimal-predicate-oracle-20261009/legacy-golden-before.result",
+    "sha256": "8efb84329acb82e99614c155fb792eae96c15ef7d730a7d8c4c38505684092dc"
+  },
+  "sql": {
+    "path": "tests/sql/correctness/decimal/sql/test_decimal256_predicate.sql",
+    "sha256": "8b8c608fd31122e4ca2ce934c391174b16d41295668279f4fde2139557970989"
+  },
+  "review": {
+    "queries": 172,
+    "rows": 1818,
+    "changed_queries": [
+      2,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      84,
+      85,
+      86,
+      91,
+      92,
+      93,
+      99,
+      100,
+      101,
+      102,
+      103,
+      105,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133,
+      138,
+      139,
+      141,
+      142,
+      144,
+      153,
+      154,
+      155,
+      156,
+      157,
+      158,
+      159,
+      160,
+      161,
+      162,
+      163,
+      164,
+      165,
+      166,
+      167,
+      168,
+      169,
+      170,
+      171,
+      172,
+      173
+    ],
+    "overlapping_position_changed_cells": 2661,
+    "headers_unchanged": true,
+    "row_count_changes": [
+      {
+        "query": 4,
+        "before": 0,
+        "after": 6
+      },
+      {
+        "query": 5,
+        "before": 0,
+        "after": 6
+      },
+      {
+        "query": 13,
+        "before": 0,
+        "after": 7
+      },
+      {
+        "query": 14,
+        "before": 0,
+        "after": 7
+      },
+      {
+        "query": 16,
+        "before": 19,
+        "after": 12
+      },
+      {
+        "query": 17,
+        "before": 19,
+        "after": 12
+      },
+      {
+        "query": 26,
+        "before": 5,
+        "after": 11
+      },
+      {
+        "query": 40,
+        "before": 16,
+        "after": 17
+      },
+      {
+        "query": 43,
+        "before": 17,
+        "after": 19
+      },
+      {
+        "query": 74,
+        "before": 1,
+        "after": 5
+      },
+      {
+        "query": 75,
+        "before": 1,
+        "after": 5
+      },
+      {
+        "query": 120,
+        "before": 6,
+        "after": 12
+      },
+      {
+        "query": 121,
+        "before": 6,
+        "after": 12
+      },
+      {
+        "query": 131,
+        "before": 6,
+        "after": 13
+      },
+      {
+        "query": 132,
+        "before": 6,
+        "after": 13
+      }
+    ],
+    "sql_unchanged": true,
+    "basis": "Independent exact typed literals change comparison membership and aggregate values relative to legacy Float-rounded data. Original input NULL positions retained. Existing order_sensitive=false and epsilon=None unchanged; tied-row ordering is not an acceptance claim."
+  },
+  "mutation_checks": {
+    "three_valued_truth_table_cases": 9,
+    "NULL_membership_range_CASE_cases": 5,
+    "predicate_change": {
+      "rejected": true,
+      "reason": "frozen SQL changed; oracle review required"
+    },
+    "extra_setup": {
+      "rejected": true,
+      "reason": "frozen SQL changed; oracle review required"
+    }
+  },
+  "native_runs": [
+    {
+      "label": "candidate",
+      "matrix": {
+        "source_revision": "19900635431c66e0ebd2017d9dd9cecf1839d488",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+        "launch_profile": "fault-scenario",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_decimal256_predicate.sql",
+            "exit_code": 0,
+            "duration_seconds": 15.276
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "passed_steps": 173,
+      "raw": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-predicate-candidate-20261009/matrix-status.json",
+          "sha256": "9947399477f70e532b8ae47a892574934824edf9732694e3d49514b02a53c9b6"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-predicate-candidate-20261009/decimal.log",
+          "sha256": "23bf78aa0937606c75f76f9038c4dd1ceecc290b5b2cba47c13ddad7090b664d"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-predicate-candidate-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    },
+    {
+      "label": "old-main",
+      "matrix": {
+        "source_revision": "19900635431c66e0ebd2017d9dd9cecf1839d488",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/mem-1-m07-main-baseline/NovaRocks/target/release/novarocks",
+        "server_sha256": "5c5bdea5490f209cc0140c1b1e73a30f6ce32c48052673e5fee23ea1300f5756",
+        "launch_profile": "performance",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_decimal256_predicate.sql",
+            "exit_code": 0,
+            "duration_seconds": 2.957
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+      "passed_steps": 173,
+      "raw": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-predicate-old-main-20261009/matrix-status.json",
+          "sha256": "b9f6d7451adc2ab53ddd9988feaed47797df5b27f20e236c8885316962a56bca"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-predicate-old-main-20261009/decimal.log",
+          "sha256": "cfa7ecdd70613b7084f07dc07e576ed483267066448f0e957780a9d58715edc4"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-predicate-old-main-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    }
+  ],
+  "pids": [
+    9720,
+    9721,
+    9722,
+    9723,
+    9937,
+    9938,
+    9939,
+    9940
+  ],
+  "all_pids_absent": true,
+  "scope": "Only this fixture. Full Decimal suite, SQL/CL/performance/final gates remain open.",
+  "local_only": true,
+  "corrected_golden": {
+    "path": "tests/sql/correctness/decimal/result/test_decimal256_predicate.result",
+    "sha256": "6bcf5bff1386da3dd4e01b9aa796be489496cc2bfb78576724660a8d9ee5981a"
+  }
+}
