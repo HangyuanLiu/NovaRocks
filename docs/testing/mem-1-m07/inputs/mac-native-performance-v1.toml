@@ -1,0 +1,76 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Provider-neutral base configuration for native 1FE+3BE system scenarios.
+#
+# `novarocks-cluster-harness` owns the real launch contract and rewrites the
+# volatile parts of this file per process: it inserts `[cluster] role`, the BE
+# endpoint list, every port, a per-run `[state_store] path`, and removes the
+# FE-only catalog source from BE configs. Only the
+# provider-neutral, non-volatile fields belong here.
+#
+# It also materializes one mandatory `[native_trust]` table for every generated
+# FE/BE config. The generated TOML retains only an `${ENV:...}` reference for
+# the ephemeral test secret; the fixture deliberately contains no reusable
+# trust secret, certificate path, or TLS mode. Individual system scenarios
+# select authenticated plaintext, automatic TLS, or generated PEM TLS through
+# the harness-owned profile.
+#
+# Deliberately absent:
+#
+# - `[connector.object_store]`: every registered scenario creates its Iceberg
+#   warehouse on the local filesystem under the harness runtime directory, so
+#   the system stage needs neither MinIO nor the iceberg-rest Docker fixture.
+# - SQLite is the only production StateStore provider. MySQL/FoundationDB leaf
+#   checks are experimental and do not participate in this native scenario.
+
+[state_store]
+provider = "sqlite"
+cluster_id = "novarocks-system-scenarios"
+path = "tmp/system-scenarios-state-store.sqlite"
+
+[catalog_source]
+# System scenarios create and mutate catalogs through SQL, so their FE uses
+# the explicit DynamicStateStore authority. The harness strips this section
+# while rendering every BE config.
+mode = "dynamic-state-store"
+
+[standalone_server]
+mysql_port = 9030
+user = "root"
+
+# A system scenario preserves the production FE/BE process boundary, but is
+# not a host-capacity benchmark.  The default runtime values derive several
+# executor pools from every visible CPU.  With one FE and three BEs that can
+# oversubscribe a developer machine before a scenario issues its first query.
+# Keep all role-local pools bounded here; a performance run that needs a
+# different capacity must provide an explicit deployment config instead of
+# making the ordinary correctness path host-dependent.
+[runtime]
+pipeline_exec_thread_pool_thread_num = 2
+exchange_io_threads = 1
+# Iceberg split discovery synchronously bridges onto this runtime from a data
+# runtime worker. The bridge also performs blocking metadata reads.
+data_runtime_worker_threads = 2
+data_runtime_max_blocking_threads = 64
+query_blocking_worker_threads = 4
+
+# Frozen before sampling; both server revisions use this common capacity.
+[runtime.frontend_workload]
+concurrency_limit = 256
+waiting_limit = 1024
+capacity_wait_timeout_ms = 30000

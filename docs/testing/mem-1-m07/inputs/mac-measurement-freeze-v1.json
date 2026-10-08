@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "status": "FROZEN_BEFORE_CURRENT_MAIN_AND_CANDIDATE_SAMPLING",
+  "frozen_at_utc": "2026-10-08T09:47:18.962719+00:00",
+  "baseline_server_revision": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+  "server_profile": "release",
+  "topology": "native 1FE+3BE",
+  "inputs_sha256": {
+    "inputs/wire-baseline-v1.json": "50422e3061ae2152c5d7777a9137cf5145fc0ff01ae7167267ffed0275c19c39",
+    "inputs/wire-baseline-smoke-v1.json": "796e7edc57bc9df90d9fe7197f4230a3aa8ecab3ef60a0dd84496145eabf425f",
+    "inputs/mac-native-performance-v1.toml": "98a4584eb008ddd74d8161bef3060ad7aafb211f162927af80bc87b185585be0",
+    "performance-gates-v1.json": "4e538606237c74e80eb413aa0b390137d7784d1c66bd2a2e5bc86afca4bb7819"
+  },
+  "host": {
+    "os": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "architecture": "arm64",
+    "logical_cpus": 10,
+    "memory_bytes": 25769803776
+  },
+  "measurement": {
+    "query_windows": "each query x concurrency x manifest repetition; setup/connect reported separately",
+    "goodput": "successful expected-row observations divided by (last ended_millis - first started_millis) / 1000",
+    "quantiles": "nearest-rank over successful observations; failures retained and counted separately",
+    "relative_spread": "(maximum - minimum) / median across the three manifest repetitions of each query/concurrency window",
+    "cpu": "sum of per-role cumulative CPU last-first over complete run, divided by successful expected-row observations; no invented per-window timestamp alignment",
+    "rss": "per-role monitor high water; not an attribution charge or transport coefficient",
+    "probe": "64KiB row scratch; wire rows hashed while streamed, metadata separately hashed",
+    "background_load": "no concurrent task-owned Cargo, full suite, or benchmark during sampling; inspect external process load and record contamination; do not terminate unrelated work",
+    "on_noise": "inconclusive; rerun identical inputs and frozen gates after identifying external load"
+  },
+  "acceptance": "NOT_RUN; smoke cannot replace frozen matrix, native tails, transport coefficients or Linux manual gate"
+}
