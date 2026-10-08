@@ -317,16 +317,19 @@ impl Scenario for CancelRows {
             serde_json::json!(epoch.elapsed().as_micros()),
         );
         let _ = resume.send(());
-        std::fs::write(
-            context.scenario_root().join("cancel-timing.json"),
-            serde_json::to_vec_pretty(&timing)?,
-        )?;
+        let timing_write = serde_json::to_vec_pretty(&timing)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                std::fs::write(context.scenario_root().join("cancel-timing.json"), bytes)
+                    .map_err(anyhow::Error::from)
+            });
         let (mut stream, observation) =
             runtime.block_on(job).context("join canceled row client")?;
         std::fs::write(
             context.scenario_root().join("cancel-row-wire.json"),
             serde_json::to_vec_pretty(&observation)?,
         )?;
+        timing_write?;
         held?;
         ensure!(
             observation.columns == case.expected_columns
@@ -414,6 +417,7 @@ impl Scenario for CancelRows {
                     && health.schema.is_empty()
                     && health.packets == 0
                     && health.row_payload_bytes == 0
+                    && health.wire_bytes == 0
                     && before == after,
                 "poisoned socket follow-up was not refused before native task creation"
             );

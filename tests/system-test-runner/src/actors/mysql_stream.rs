@@ -1246,6 +1246,42 @@ mod tests {
         assert_eq!(observation.rows, 0);
     }
 
+    #[tokio::test]
+    async fn observation_retains_short_header_prefix_before_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let peer = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.expect("accept");
+            read_wire_packet_async(&mut peer, Duration::from_secs(2))
+                .await
+                .expect("query");
+            peer.write_all(&[1, 0, 0]).await.expect("short header");
+        });
+        let observation = AsyncMysqlStream {
+            stream: client,
+            timeout: Duration::from_secs(2),
+            receive_buffer_bytes: None,
+            connection_id: 0,
+        }
+        .observe_text_query("SELECT 1", Duration::ZERO)
+        .await;
+        peer.await.expect("peer");
+        assert!(
+            observation
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("truncated server response"))
+        );
+        assert_eq!(observation.wire_bytes, 3);
+        assert_eq!(observation.packets, 0);
+        assert_eq!(observation.columns, 0);
+        assert_eq!(observation.rows, 0);
+    }
+
     #[test]
     fn mysql_error_text_reads_sqlstate_and_plain_packets() {
         assert_eq!(

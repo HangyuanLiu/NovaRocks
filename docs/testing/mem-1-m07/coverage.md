@@ -200,3 +200,5 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 - 首次 native 前冻结 `root-cancel-closing-freeze-v1.json`：原 S+8 单行暂停客户端读取，要求独立 Closing=1/Client=0、完整 row+ERR1317、同 socket 精确 SUM oracle 与实际 Native task 增长；原17×1MiB合法行冻结到W=2未完成producer，要求正 wire prefix/零完整行、物理EOF/reset、同 socket 后续零schema/packet/bytes且三BE task counter不增长。握手真实connection ID用于KILL，无猜测。
 - KILL start/return/resume时间保存；返回后复查原2s观察截止，Closing观察2s从KILL返回计算，不作为生产5s deadline的起点证明。失败仍恢复并join客户端保存wire；不证明具体framing cursor/partial-tail/full-pool/allocator exit。生产配置、容量和deadline未改。
 - runner all-target100 PASS/0 FAIL/2既有ignored，覆盖真实handshake身份拒绝与follow-up错误分类；最初缺少test import的E0425保留。C0 from_ref测试清理已纳入。两个主要语义裁决/P09其它门/P00b/P10/final仍OPEN；无push/PR/归档。
+
+取消探针收紧：runner101 PASS/0 FAIL/2 ignored。真实短header后EOF反例记录3 wire bytes但0 packets，后续拒绝必须wire_bytes=0；resume后timing写失败延后到join/save wire后传播。独立只读复核已修正两项具体证据漏洞。native仍待执行。

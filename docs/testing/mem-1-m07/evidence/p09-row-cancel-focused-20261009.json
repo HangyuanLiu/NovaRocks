@@ -6,7 +6,7 @@
   "source_dirty": true,
   "tests": {
     "system_runner_all_targets": {
-      "passed": 100,
+      "passed": 101,
       "failed": 0,
       "ignored": 2
     }
@@ -28,7 +28,12 @@
     {
       "path": "logs/mem-1-m07/p09-row-cancel-runner-tests-v3-20261009.log",
       "sha256": "91d4e5564c0d7a46cce0a1c1562686e29d76be9926f4a512c6efd8ae58059bb6"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-runner-tests-v4-20261009.log",
+      "sha256": "11e9a687840a12055e75431f8193045a4a47ff4e2d3607fd13742df3ea407570"
     }
   ],
-  "historical_failure": "First compile failed E0425 for a missing explicit test-module handshake helper import, corrected before passing runs."
+  "historical_failure": "First compile failed E0425 for a missing explicit test-module handshake helper import, corrected before passing runs.",
+  "independent_review": "Read-only review identified short-header bytes and timing-save early-return gaps; corrected with explicit zero wire bytes, real short-header EOF test, and delayed timing error propagation after join/wire save."
 }
