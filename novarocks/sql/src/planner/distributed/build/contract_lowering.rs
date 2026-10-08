@@ -7220,6 +7220,16 @@ impl ContractLoweringVisitor {
             });
         }
 
+        // A literal can carry the position's nullability directly. Wrapping
+        // each non-null cell in CASE TRUE ELSE NULL would multiply a large
+        // VALUES relation's expression count without changing its values.
+        // Different data types still take the explicit conversion path below.
+        if source.data_type == target.data_type
+            && let ExprKind::Literal(literal) = &expression.kind
+        {
+            return self.lower_literal_at_type(owner, literal, target.clone());
+        }
+
         let mut lowered = self.lower_expression(owner, expression, &BTreeMap::new())?;
         let mut lowered_type = source;
         if lowered_type.data_type != target.data_type {
@@ -7870,7 +7880,15 @@ impl ContractLoweringVisitor {
         literal: &LiteralValue,
         expression: &TypedExpr,
     ) -> Result<ExprId, ContractLoweringError> {
-        let target = expression_type(expression);
+        self.lower_literal_at_type(owner, literal, expression_type(expression))
+    }
+
+    fn lower_literal_at_type(
+        &mut self,
+        owner: NodeId,
+        literal: &LiteralValue,
+        target: ValueType,
+    ) -> Result<ExprId, ContractLoweringError> {
         let (literal, source) = lower_literal(literal, &target)?;
         // A literal is an exact value; the position it stands in states the
         // type, because everything that reads this expression was typed
@@ -11716,7 +11734,44 @@ mod tests {
         for expression in rows.iter().map(|row| row[0]) {
             let expression = fragment.expressions().get(expression).unwrap();
             assert_eq!(expression.ty, ValueType::new(DataType::Float64, true));
-            assert!(matches!(expression.kind, ContractExprKind::Case { .. }));
+        }
+        assert!(matches!(
+            fragment.expressions().get(rows[0][0]).unwrap().kind,
+            ContractExprKind::Case { .. }
+        ));
+        assert!(matches!(
+            fragment.expressions().get(rows[1][0]).unwrap().kind,
+            ContractExprKind::Literal(ContractLiteralValue::Float64Bits(bits))
+                if bits == 1.5_f64.to_bits()
+        ));
+    }
+
+    #[test]
+    fn large_nullable_literal_values_fit_without_redundant_case_expressions() {
+        let columns = (1..=4)
+            .map(|id| column(id, &format!("text_{id}"), DataType::Utf8, true))
+            .collect();
+        let rows = (0..16_384)
+            .map(|row| {
+                (0..4)
+                    .map(|col| TypedExpr {
+                        kind: ExprKind::Literal(if row == 0 && col == 0 {
+                            LiteralValue::Null
+                        } else {
+                            LiteralValue::String(format!("{row}_{col}"))
+                        }),
+                        data_type: DataType::Utf8,
+                        nullable: row == 0 && col == 0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let final_plan = finish_for_test(&values(columns, rows)).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        assert_eq!(fragment.expressions().len(), 65_536);
+        for (_, expression) in fragment.expressions().iter() {
+            assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
+            assert!(matches!(expression.kind, ContractExprKind::Literal(_)));
         }
     }
 
