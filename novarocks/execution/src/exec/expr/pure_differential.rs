@@ -1744,3 +1744,6 @@ mod parse_url_tests;
 #[cfg(test)]
 #[path = "pure_differential_cardinality_dedup_tests.rs"]
 mod cardinality_dedup_tests;
+
+#[path = "pure_differential_to_base64_tests.rs"]
+mod to_base64_tests;

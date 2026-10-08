@@ -1317,3 +1317,6 @@ mod legacy_cardinality_dedup_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_numeric_unary_intrinsic_baseline_tests.rs"]
 mod legacy_numeric_unary_intrinsic_baseline_tests;
+
+#[cfg(test)]
+mod legacy_to_base64_source_baseline_tests;
