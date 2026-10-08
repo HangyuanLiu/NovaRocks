@@ -17,7 +17,8 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
-
+use novarocks_functions::builtin::aes_rows::{self, Operation, Row};
+use novarocks_type_contract::ToBase64ByteSource;
 pub fn eval_aes_encrypt(
     arena: &ExprArena,
     expr: ExprId,
@@ -61,58 +62,33 @@ pub fn eval_aes_encrypt(
         None
     };
 
+    let two;
+    let four;
+    let five;
+    let inputs = if args.len() == 2 {
+        two = [src, key];
+        &two[..]
+    } else if args.len() == 4 {
+        four = [src, key, iv.unwrap(), mode.unwrap()];
+        &four[..]
+    } else {
+        five = [src, key, iv.unwrap(), mode.unwrap(), aad.unwrap()];
+        &five[..]
+    };
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
-        if src.is_null(row) || key.is_null(row) {
-            out.push(None);
-            continue;
+        let rows = [row; 5];
+        match aes_rows::evaluate_row(
+            Operation::Encrypt,
+            &inputs,
+            &rows[..inputs.len()],
+            ToBase64ByteSource::Ordinary,
+        ) {
+            Row::Value(value) => out.push(value),
+            Row::Data(_) => {
+                return Err("aes_encrypt: requires GCM mode to use AAD parameter".to_string());
+            }
         }
-
-        if args.len() == 2 {
-            out.push(super::common::aes_encrypt_raw(
-                super::common::AesMode::Aes128Ecb,
-                src.bytes(row),
-                key.bytes(row),
-                None,
-                None,
-            ));
-            continue;
-        }
-
-        let mode_arr = mode.as_ref().unwrap();
-        if mode_arr.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let mode = super::common::AesMode::parse(mode_arr.bytes(row));
-        let iv_arr = iv.as_ref().unwrap();
-
-        if !mode.is_ecb() && iv_arr.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let iv_bytes = if iv_arr.is_null(row) {
-            None
-        } else {
-            Some(iv_arr.bytes(row))
-        };
-        let aad_bytes = aad
-            .as_ref()
-            .and_then(|arr| (!arr.is_null(row)).then_some(arr.bytes(row)));
-        if aad_bytes.is_some() && !mode.is_gcm() {
-            return Err("aes_encrypt: requires GCM mode to use AAD parameter".to_string());
-        }
-
-        out.push(super::common::aes_encrypt_raw(
-            mode,
-            src.bytes(row),
-            key.bytes(row),
-            iv_bytes,
-            aad_bytes,
-        ));
     }
-
     super::common::build_bytes_output_latin1(out, arena.data_type(expr))
 }

@@ -278,3 +278,7 @@ pub mod collection_offset_count;
 mod string_to_base64;
 mod string_to_base64_owner;
 pub mod to_base64_shared;
+
+pub mod aes_primitive;
+pub mod aes_rows;
+pub mod bytes_output;
