@@ -344,7 +344,8 @@ impl Scenario for CatalogListingCancellation {
                 .err()
                 .context("delayed SDK listing must exceed its absolute deadline")?;
             ensure!(
-                error.to_string().contains("DeadlineExceeded"),
+                matches!(&error, mysql::Error::MySqlError(error)
+                    if error.code == 1105 && error.message == "query timed out after 1000 ms"),
                 "listing failed outside its absolute deadline: {error}"
             );
             control.query_drop("SET query_timeout=0")?;
