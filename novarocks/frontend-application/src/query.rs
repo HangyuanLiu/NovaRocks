@@ -471,7 +471,6 @@ fn process_list_result(
     processes: Vec<novarocks_query_application::session_control::SessionProcess>,
     full: bool,
 ) -> Result<QueryResult, String> {
-    use arrow::array::{Int64Array, StringArray};
     use novarocks_query_application::api::LocalResultBound;
 
     // The snapshot shares each statement text with its session. Count the
@@ -512,26 +511,28 @@ fn process_list_result(
     LocalResultBound::V1.admit(processes.len(), bytes)?;
 
     let schema = process_list_schema();
-    let ids: Int64Array = processes
-        .iter()
-        .map(|process| Some(i64::from(process.connection_id)))
-        .collect();
-    let users: StringArray = processes
-        .iter()
-        .map(|process| Some(process.principal.as_ref()))
-        .collect();
-    let hosts: StringArray = processes.iter().map(|_| None::<&str>).collect();
-    let databases: StringArray = processes.iter().map(|_| None::<&str>).collect();
-    let commands: StringArray = processes
-        .iter()
-        .map(|process| Some(process.command()))
-        .collect();
-    let times: Int64Array = processes
-        .iter()
-        .map(|process| Some(i64::try_from(process.elapsed.as_secs()).unwrap_or(i64::MAX)))
-        .collect();
-    let states: StringArray = processes.iter().map(|_| None::<&str>).collect();
-    let info: StringArray = info.iter().map(Option::as_deref).collect();
+    let mut ids = arrow::array::Int64Builder::with_capacity(processes.len());
+    let mut times = arrow::array::Int64Builder::with_capacity(processes.len());
+    for process in &processes {
+        ids.append_value(i64::from(process.connection_id));
+        times.append_value(i64::try_from(process.elapsed.as_secs()).unwrap_or(i64::MAX));
+    }
+    let ids = ids.finish();
+    let times = times.finish();
+    // All requested values/offset/validity storage is covered by the borrowed
+    // whole-table preflight above. Iterator constructors cannot infer string
+    // bytes and may geometrically replace a nearly full values buffer.
+    let users = process_list_text_column(
+        processes
+            .iter()
+            .map(|process| Some(process.principal.as_ref())),
+    )?;
+    let hosts = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
+    let databases = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
+    let commands =
+        process_list_text_column(processes.iter().map(|process| Some(process.command())))?;
+    let states = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
+    let info = process_list_text_column(info.iter().map(Option::as_deref))?;
 
     let batch = arrow::record_batch::RecordBatch::try_new(
         Arc::clone(&schema),
@@ -563,6 +564,22 @@ fn process_list_result(
             .collect(),
         batches: vec![batch],
     })
+}
+
+/// Only the closed SHOW PROCESSLIST source uses this constructor. Count
+/// borrowed cells first; no source alias is installed in the new Arrow graph.
+fn process_list_text_column<'a>(
+    values: impl ExactSizeIterator<Item = Option<&'a str>> + Clone,
+) -> Result<arrow::array::StringArray, String> {
+    let bytes = values.clone().flatten().try_fold(0usize, |sum, value| {
+        sum.checked_add(value.len())
+            .ok_or("SHOW PROCESSLIST text capacity overflows")
+    })?;
+    let mut builder = arrow::array::StringBuilder::with_capacity(values.len(), bytes);
+    for value in values {
+        builder.append_option(value);
+    }
+    Ok(builder.finish())
 }
 
 /// Truncates on a character boundary, so a multi-byte statement cannot be cut
@@ -3216,6 +3233,42 @@ mod tests {
         assert_eq!(truncated_info.chars().count(), PROCESS_LIST_INFO_LIMIT);
         assert!(full_info.chars().count() > PROCESS_LIST_INFO_LIMIT);
         assert_eq!(full_info, text);
+    }
+
+    #[test]
+    fn full_process_list_preallocates_long_text_without_geometric_value_slack() {
+        use arrow::array::{StringArray, StringBuilder};
+        use novarocks_query_application::session_control::SessionProcess;
+
+        let text: Arc<str> = Arc::from("x".repeat(65_537));
+        let processes = (0..3)
+            .map(|connection_id| SessionProcess {
+                connection_id,
+                principal: Arc::from("root"),
+                elapsed: Duration::from_secs(1),
+                statement: Some(Arc::clone(&text)),
+            })
+            .collect();
+        let result = process_list_result(processes, true).unwrap();
+        let info = result.batches[0]
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let requested = 3 * text.len();
+        // The public preallocated builder is the capacity oracle; do not
+        // assume Arrow's alignment or allocator rounding in product code.
+        let reserved = StringBuilder::with_capacity(3, requested).finish();
+        assert_eq!(info.values().capacity(), reserved.values().capacity());
+        for row in 0..3 {
+            assert_eq!(info.value(row), text.as_ref());
+        }
+        assert_eq!(result.columns[0].data_type(), &DataType::Int64);
+        assert_eq!(result.columns[5].data_type(), &DataType::Int64);
+        // This workload exercises the old iterator's replacement buffer,
+        // rather than merely restating the current constructor.
+        let iterator_built: StringArray = std::iter::repeat_n(Some(text.as_ref()), 3).collect();
+        assert!(iterator_built.values().capacity() > info.values().capacity());
     }
 
     #[test]
