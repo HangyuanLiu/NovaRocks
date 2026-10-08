@@ -1331,3 +1331,6 @@ mod legacy_binary_text_hidden_null_baseline_tests;
 
 #[cfg(test)]
 mod cast_binary_text_oracle_tests;
+
+#[cfg(test)]
+mod legacy_array_match_baseline_tests;

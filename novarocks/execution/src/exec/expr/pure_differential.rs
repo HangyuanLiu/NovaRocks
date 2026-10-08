@@ -1760,3 +1760,6 @@ mod to_binary_metadata_tests;
 #[cfg(test)]
 #[path = "pure_differential_aes_family_tests.rs"]
 mod aes_family_tests;
+
+#[path = "pure_differential_array_match_tests.rs"]
+mod array_match_tests;
