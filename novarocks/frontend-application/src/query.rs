@@ -753,6 +753,24 @@ where
         .await
 }
 
+/// A preparation worker and its unclaimed result retain the admitted window.
+/// Cancelling the waiter does not interrupt a synchronous compiler or release
+/// the capability while that compiler can still construct its output.
+async fn execute_cancellable_preparation<T, F>(
+    executor: &QueryCpuExecutor,
+    cancellation: QueryCancellationView,
+    window: Option<ResultWindowAlias>,
+    prepare: F,
+) -> Result<(T, Option<ResultWindowAlias>), QueryCpuRunError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    executor
+        .run_cancellable(cancellation, move || (prepare(), window))
+        .await
+}
+
 /// Runs a DML plan and its external-effect dispatch as distinct governed
 /// blocking edges. A successful plan is still pre-dispatch state, so the
 /// second edge independently checks cancellation before it can cross the
@@ -1274,6 +1292,7 @@ impl FrontendQuerySession {
         statement_token: StatementToken,
         cancellation: novarocks_workload_control::CancellationView,
         preparation_scope: &novarocks_workload_control::WorkScope,
+        preparation_window: Option<ResultWindowAlias>,
     ) -> Result<PreparedQueryOperation, GovernedPreparationError> {
         let parsed_statement =
             state
@@ -1326,10 +1345,11 @@ impl FrontendQuerySession {
         let preparation_scope = preparation_scope.clone();
         let observed_sql =
             crate::preparation_diagnostics::statement_observations_active().then(|| sql.to_owned());
-        let prepared = self
-            .service
-            .query_cpu_executor
-            .run_cancellable(cancellation, move || {
+        let (prepared, _preparation_window) = execute_cancellable_preparation(
+            &self.service.query_cpu_executor,
+            cancellation,
+            preparation_window,
+            move || {
                 let _diagnostic_scope =
                     crate::preparation_diagnostics::enter_statement(statement_token);
                 let _observation_scope = observed_sql.as_deref().and_then(|sql| {
@@ -1341,16 +1361,17 @@ impl FrontendQuerySession {
                     Some(query_options),
                     &preparation_scope,
                 )
-            })
-            .await
-            .map_err(|error| match error {
-                QueryCpuRunError::Cancelled(reason) => {
-                    GovernedPreparationError::Cancelled(cancellation_error(reason))
-                }
-                QueryCpuRunError::Executor(error) => {
-                    GovernedPreparationError::Service(internal_error(error))
-                }
-            })?;
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            QueryCpuRunError::Cancelled(reason) => {
+                GovernedPreparationError::Cancelled(cancellation_error(reason))
+            }
+            QueryCpuRunError::Executor(error) => {
+                GovernedPreparationError::Service(internal_error(error))
+            }
+        })?;
         match prepared {
             Ok(operation) => Ok(operation),
             Err(FrontendQueryCompilerError::Engine(error)) => {
@@ -1372,21 +1393,36 @@ impl FrontendQuerySession {
         for assignment in &set.assignments {
             self.admit_session_set_assignment(&source, assignment)?;
         }
-        let mut staged_state = self.state.lock().map_err(poisoned_state)?.clone();
-        let (deadline, timeout_ms) = governed_query_deadline(&staged_state)?;
+        let (deadline, timeout_ms) = {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            governed_query_deadline(&state)?
+        };
+        let window_class = if set
+            .assignments
+            .iter()
+            .any(|assignment| matches!(&assignment.value, ast::SetValue::Query(_)))
+        {
+            ResultWindowClass::Internal
+        } else {
+            ResultWindowClass::Local
+        };
         let token = self.token()?;
         let mut statement = self
             .service
             .query_control
-            .begin_queued_governed_query_statement(
+            .begin_queued_governed_query_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
                 Some(Arc::from(source.as_str())),
+                window_class,
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
+        // The staged/live session overlap and every scalar child belong to
+        // this one whole window, acquired before copying or compiling them.
+        let mut staged_state = self.state.lock().map_err(poisoned_state)?.clone();
         for assignment in &set.assignments {
             let ast::SetTarget::UserVariable(variable) = &assignment.target else {
                 if let Err(error) = self.apply_session_set_assignment_to_state(
@@ -1487,6 +1523,7 @@ impl FrontendQuerySession {
                 statement.token(),
                 statement.cancellation().clone(),
                 statement.scope(),
+                statement.result_window_alias(),
             )
             .await
             .map_err(|error| match error {
@@ -1598,6 +1635,7 @@ impl FrontendQuerySession {
                 statement.token(),
                 statement.cancellation().clone(),
                 statement.scope(),
+                statement.result_window_alias(),
             )
             .await
         {
@@ -3812,6 +3850,82 @@ mod tests {
     #[tokio::test]
     async fn abandoned_explain_dispatch_retains_local_window_until_actual_worker_exit() {
         assert_abandoned_synchronous_window(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_scalar_preparation_keeps_internal_window_until_worker_exit() {
+        use novarocks_query_application::cpu::{QueryCpuExecutorConfig, QueryCpuExecutorOwner};
+        use novarocks_workload_control::{ResultCapacityConfig, WorkloadConfig, WorkloadControl};
+
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let root = workload
+            .root_admission()
+            .begin_query_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let (permit, window) = root
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Internal)
+            .unwrap()
+            .await
+            .unwrap();
+        let source = QueryCancellationSource::new();
+        let cancellation = source.view();
+        let mut cpu = QueryCpuExecutorOwner::try_new(QueryCpuExecutorConfig::with_idle_keepalive(
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+        let executor = cpu.executor();
+        let alias = window.retain_alias();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            execute_cancellable_preparation(&executor, cancellation, Some(alias), move || {
+                started.send(()).unwrap();
+                let (open, changed) = &*worker_gate;
+                let (open, _) = changed
+                    .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| !*open)
+                    .unwrap();
+                assert!(*open, "test compiler gate timed out");
+                StatementResult::Ok
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        source.request(QueryCancellationReason::ClientDisconnected);
+        assert!(matches!(
+            caller.await.unwrap(),
+            Err(QueryCpuRunError::Cancelled(
+                QueryCancellationReason::ClientDisconnected
+            ))
+        ));
+        drop(permit);
+        root.owner.complete();
+        drop(window);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let (open, changed) = &*gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+        cpu.shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
