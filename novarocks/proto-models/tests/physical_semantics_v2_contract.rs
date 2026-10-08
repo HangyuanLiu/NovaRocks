@@ -204,6 +204,7 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
             .enumerate()
             .map(|(ordinal, site)| v2::FrozenCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 site: Some(v2::CallSite { kind: Some(site) }),
                 context: Some(v2::EffectContext {
@@ -759,4 +760,49 @@ fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_v
         assert_eq!(binary.decimal_overflow_policy, i32::from(value));
         assert_eq!(cast.decimal_overflow_policy, i32::from(value));
     }
+}
+
+#[test]
+fn to_base64_field7_preserves_absent_positive_ordinary_latin1_and_unknown() {
+    assert_eq!(
+        v2::FrozenCall::decode(&b""[..])
+            .unwrap()
+            .to_base64_byte_source,
+        None
+    );
+    for (bytes, value) in [([0x38, 0x00], 0), ([0x38, 0x01], 1), ([0x38, 0x63], 99)] {
+        let decoded = v2::FrozenCall::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.to_base64_byte_source, Some(value));
+        assert_eq!(decoded.encode_to_vec(), bytes);
+    }
+    // The typed calls codec independently refuses the preserved unknown enum.
+    assert!(v2::ToBase64ByteSource::try_from(99).is_err());
+}
+
+#[test]
+fn to_base64_descriptor_field7_has_positive_zero_presence_and_closed_enum() {
+    let pool = pool();
+    let message = pool
+        .get_message_by_name("novarocks.physical_semantics_v2.FrozenCall")
+        .unwrap();
+    let field = message.get_field_by_name("to_base64_byte_source").unwrap();
+    assert_eq!(field.number(), 7);
+    assert!(field.supports_presence());
+    let Kind::Enum(source) = field.kind() else {
+        panic!("TO_BASE64 source is a closed enum")
+    };
+    assert_eq!(
+        source.full_name(),
+        "novarocks.physical_semantics_v2.ToBase64ByteSource"
+    );
+    assert_eq!(
+        source
+            .values()
+            .map(|v| (v.number(), v.name().to_owned()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "TO_BASE64_ORDINARY".into()),
+            (1, "TO_BASE64_NATIVE_V1_ENCRYPTION_LATIN1".into()),
+        ]
+    );
 }

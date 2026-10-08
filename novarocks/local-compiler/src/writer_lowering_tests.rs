@@ -1727,6 +1727,7 @@ fn freeze_writer_calls(
                 .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
             FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 site,
                 context,

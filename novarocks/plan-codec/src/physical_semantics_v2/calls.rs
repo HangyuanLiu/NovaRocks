@@ -437,6 +437,10 @@ fn encode_calls_core(
                 novarocks_type_contract::RegexpCountPatternSource::Dynamic => 0,
                 novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent => 1,
             }),
+            to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
+                novarocks_type_contract::ToBase64ByteSource::Ordinary => 0,
+                novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1 => 1,
+            }),
             temporal_source: call
                 .temporal_source
                 .as_ref()
@@ -540,6 +544,11 @@ fn decode_calls_core(
                 0 => Ok(novarocks_type_contract::RegexpCountPatternSource::Dynamic),
                 1 => Ok(novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent),
                 _ => Err(E::InvalidShape("unknown regexp_count pattern source tag")),
+            }).transpose()?,
+            to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
+                0 => Ok(novarocks_type_contract::ToBase64ByteSource::Ordinary),
+                1 => Ok(novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1),
+                _ => Err(E::InvalidShape("unknown to_base64 byte source tag")),
             }).transpose()?,
             temporal_source: call
                 .temporal_source
@@ -840,6 +849,7 @@ mod tests {
             .values()
             .map(|invocation| FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(invocation.context.use_id),
@@ -1024,6 +1034,7 @@ mod tests {
             let context = context(use_id, 0, EvaluationDemand::Value);
             calls.push(FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Aggregate {
@@ -1043,6 +1054,7 @@ mod tests {
             .context;
         calls.push(FrozenPhysicalCall {
             regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
             temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Expression(window_use.use_id),
@@ -1052,6 +1064,7 @@ mod tests {
         let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
             regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
             temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Table { node: table },

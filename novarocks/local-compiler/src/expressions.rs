@@ -1713,6 +1713,36 @@ fn prepare_core(
                         }
                         None
                     };
+                    let to_base64_byte_source = if function.function_id.as_str()
+                        == "builtin.scalar/to_base64/v1"
+                    {
+                        let expected = novarocks_physical_plan::to_base64_byte_source_observed(
+                            package.fragment().expressions(),
+                            args,
+                            work,
+                        )
+                        .map_err(|error| match error {
+                            novarocks_physical_plan::TemporalSourceProjectionError::Control(
+                                cause,
+                            ) => ExpressionLoweringError::Control(cause),
+                            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                                message,
+                            ) => ExpressionLoweringError::Invalid(message),
+                        })?;
+                        if frozen.to_base64_byte_source != Some(expected) {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "to_base64 frozen source differs from actual native-v1 projection",
+                            ));
+                        }
+                        Some(expected)
+                    } else {
+                        if frozen.to_base64_byte_source.is_some() {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "foreign to_base64 byte source",
+                            ));
+                        }
+                        None
+                    };
                     let input = CallEffectInput {
                         context: frozen.context,
                         argument_uses: match &frozen.temporal_source {
@@ -1729,9 +1759,19 @@ fn prepare_core(
                                         channels: &argument_uses,
                                     }
                                 }
-                                None => novarocks_functions::CallArgumentUses::SelectedChannels(
-                                    &argument_uses,
-                                ),
+                                None => match to_base64_byte_source {
+                                    Some(source) => {
+                                        novarocks_functions::CallArgumentUses::ToBase64Bytes {
+                                            source,
+                                            channels: &argument_uses,
+                                        }
+                                    }
+                                    None => {
+                                        novarocks_functions::CallArgumentUses::SelectedChannels(
+                                            &argument_uses,
+                                        )
+                                    }
+                                },
                             },
                         },
                         function_id: &function.function_id,

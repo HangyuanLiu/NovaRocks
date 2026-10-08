@@ -240,6 +240,7 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
     work.flush()?;
     let frozen = FrozenPhysicalCall {
         regexp_count_pattern_source: None,
+        to_base64_byte_source: None,
         temporal_source: None,
         site,
         context,

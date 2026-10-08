@@ -724,7 +724,10 @@ pub(crate) fn run_scalar_differential(
             reason: "lookup_function has no legacy kind".into(),
         });
     };
-    if bound.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
+    if matches!(
+        bound.function_id.as_str(),
+        "builtin.scalar/regexp_count/v1" | "builtin.scalar/to_base64/v1"
+    ) {
         return temporal::run_native_source_scalar(
             spec,
             &bound,

@@ -462,6 +462,7 @@ fn package() -> p::FragmentPackage {
             let ctx = context(id, 0);
             p::FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 site: p::PhysicalCallSite::Expression(ctx.use_id),
                 context: ctx,
@@ -490,6 +491,7 @@ fn package() -> p::FragmentPackage {
         let ctx = context(use_id, 0);
         claims.push(p::FrozenPhysicalCall {
             regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
             temporal_source: None,
             site,
             context: ctx,
@@ -1341,6 +1343,7 @@ fn wide_package() -> p::FragmentPackage {
         &uses,
         vec![p::FrozenPhysicalCall {
             regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
             temporal_source: None,
             site: p::PhysicalCallSite::Expression(ExpressionUseId::new(0)),
             context: context(0, 0),

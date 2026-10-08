@@ -109,3 +109,9 @@ mod temporal_source_control_tests;
 
 mod regexp_count_source;
 pub use regexp_count_source::RegexpCountPatternSource;
+
+mod to_base64_source;
+pub use to_base64_source::{
+    NATIVE_V1_ENCRYPTION_FUNCTIONS, NonCanonicalNativeV1FunctionName, ToBase64ByteSource,
+    native_v1_function_name,
+};

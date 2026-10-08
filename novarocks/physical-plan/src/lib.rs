@@ -87,7 +87,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 11;
+pub const PLAN_CONTRACT_REVISION: u32 = 12;
 
 #[cfg(test)]
 mod tests;
@@ -97,4 +97,5 @@ mod physical_temporal_source_tests;
 
 pub use physical_temporal_source::{
     native_v1_emitted_constant_reference, regexp_count_pattern_source_observed,
+    to_base64_byte_source_observed,
 };

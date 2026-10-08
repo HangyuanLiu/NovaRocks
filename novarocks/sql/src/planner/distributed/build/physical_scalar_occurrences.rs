@@ -304,6 +304,26 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     } else {
         None
     };
+    let to_base64_byte_source = if function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
+        let definitions = input
+            .definitions
+            .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                "to_base64 requires the original emitted definition arena",
+            ))?;
+        Some(
+            novarocks_physical_plan::to_base64_byte_source_observed(definitions, args, work)
+                .map_err(|error| match error {
+                    novarocks_physical_plan::TemporalSourceProjectionError::Control(cause) => {
+                        PhysicalScalarOccurrenceError::Control(cause)
+                    }
+                    novarocks_physical_plan::TemporalSourceProjectionError::Invalid(message) => {
+                        PhysicalScalarOccurrenceError::InvalidSource(message)
+                    }
+                })?,
+        )
+    } else {
+        None
+    };
     let call = CallEffectInput {
         context: invocation.context,
         argument_uses: match input.temporal_source {
@@ -316,7 +336,13 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
                     source,
                     channels: &argument_uses,
                 },
-                None => novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
+                None => match to_base64_byte_source {
+                    Some(source) => novarocks_functions::CallArgumentUses::ToBase64Bytes {
+                        source,
+                        channels: &argument_uses,
+                    },
+                    None => novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
+                },
             },
         },
         function_id: &function.function_id,
@@ -344,6 +370,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         effects: preparation.call_contract().effects().clone(),
         decimal_overflow_policy: input.decimal_overflow_policy,
         regexp_count_pattern_source,
+        to_base64_byte_source,
         temporal_source: input.temporal_source.cloned(),
     };
     work.flush()?;

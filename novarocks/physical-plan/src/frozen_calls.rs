@@ -67,6 +67,8 @@ pub struct FrozenPhysicalCall {
     /// Present only for the exact REGEXP_COUNT scalar; Dynamic is positive
     /// authored evidence, never the default for an absent source receipt.
     pub regexp_count_pattern_source: Option<novarocks_type_contract::RegexpCountPatternSource>,
+    /// Exact immediate emitted-source receipt; Ordinary must be positively authored.
+    pub to_base64_byte_source: Option<novarocks_type_contract::ToBase64ByteSource>,
 }
 
 /// Borrow the real binding; this table never copies a second signature DSL.
@@ -438,6 +440,40 @@ impl FrozenFragmentCalls {
                             } else if call.regexp_count_pattern_source.is_some() {
                                 return Err(FrozenCallError::WrongControl);
                             }
+                            let to_base64_byte =
+                                function.function_id.as_str() == "builtin.scalar/to_base64/v1";
+                            if to_base64_byte {
+                                if invocation.control
+                                    != novarocks_type_contract::ControlShape::Eager
+                                {
+                                    return Err(FrozenCallError::WrongControl);
+                                }
+                                let source = fragment
+                                    .expressions()
+                                    .get(invocation.definition)
+                                    .ok_or(FrozenCallError::WrongControl)?;
+                                let ExprKind::FunctionCall { args, .. } = &source.kind else {
+                                    return Err(FrozenCallError::WrongControl);
+                                };
+                                let expected = crate::to_base64_byte_source_observed(
+                                    fragment.expressions(),
+                                    args,
+                                    work,
+                                )
+                                .map_err(|error| match error {
+                                    crate::TemporalSourceProjectionError::Control(cause) => {
+                                        FrozenCallError::Control(cause)
+                                    }
+                                    crate::TemporalSourceProjectionError::Invalid(_) => {
+                                        FrozenCallError::WrongControl
+                                    }
+                                })?;
+                                if call.to_base64_byte_source != Some(expected) {
+                                    return Err(FrozenCallError::WrongControl);
+                                }
+                            } else if call.to_base64_byte_source.is_some() {
+                                return Err(FrozenCallError::WrongControl);
+                            }
                             match (invocation.control, &call.temporal_source) {
                                 (
                                     novarocks_type_contract::ControlShape::TemporalSource(shape),
@@ -514,6 +550,7 @@ impl FrozenFragmentCalls {
                         PhysicalCallBinding::Window { .. } => {
                             if call.temporal_source.is_some()
                                 || call.regexp_count_pattern_source.is_some()
+                                || call.to_base64_byte_source.is_some()
                             {
                                 return Err(FrozenCallError::WrongControl);
                             }
@@ -534,7 +571,9 @@ impl FrozenFragmentCalls {
                 | PhysicalCallSite::WriterPartial { .. }
                 | PhysicalCallSite::WriterFinal { .. }
                 | PhysicalCallSite::Table { .. } => {
-                    if call.temporal_source.is_some() || call.regexp_count_pattern_source.is_some()
+                    if call.temporal_source.is_some()
+                        || call.regexp_count_pattern_source.is_some()
+                        || call.to_base64_byte_source.is_some()
                     {
                         return Err(FrozenCallError::WrongControl);
                     }

@@ -61,16 +61,7 @@ fn bytes_to_latin1_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| char::from(*b)).collect()
 }
 
-pub(super) fn latin1_string_to_bytes(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len());
-    for ch in s.chars() {
-        if (ch as u32) > 0xff {
-            return None;
-        }
-        out.push(ch as u8);
-    }
-    Some(out)
-}
+pub(super) use novarocks_functions::builtin::to_base64_shared::latin1_string_to_bytes;
 
 pub(super) fn build_bytes_output_lossy(
     values: Vec<Option<Vec<u8>>>,
@@ -414,9 +405,7 @@ pub(super) fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
-pub(super) fn encode_base64(input: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(input)
-}
+pub(super) use novarocks_functions::builtin::to_base64_shared::encode_base64;
 
 #[cfg(test)]
 mod tests {

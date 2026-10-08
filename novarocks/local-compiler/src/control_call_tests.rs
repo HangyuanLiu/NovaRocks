@@ -501,6 +501,7 @@ fn package(
         vec![
             FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(parent_context.use_id),
                 context: parent_context,
@@ -509,6 +510,7 @@ fn package(
             },
             FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(rng_context.use_id),
                 context: rng_context,

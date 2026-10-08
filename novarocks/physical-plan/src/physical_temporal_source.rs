@@ -20,7 +20,6 @@
 //! does not mint funding or authenticate an installed owner.
 use crate::{ExprArena, ExprId, ExprKind};
 use arrow_schema::DataType;
-use novarocks_type_contract::FunctionId;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, MAX_CONTROL_DEPTH, TemporalCastKind,
     TemporalSourceDefinitions, TemporalSourceFacts, TemporalSourceKind,
@@ -35,24 +34,7 @@ impl From<CompileControlError> for TemporalSourceProjectionError {
         Self::Control(e)
     }
 }
-/// The FE author uses exactly the v1 wire namespace projection. This never
-/// enters a math API or chooses a runtime implementation by display name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NonCanonicalNativeV1FunctionName;
-/// Sole native-v1 identity projection. Callers format their own full diagnostics.
-/// This does not select a computation or a runtime implementation.
-pub fn native_v1_function_name(
-    identity: &FunctionId,
-) -> Result<&str, NonCanonicalNativeV1FunctionName> {
-    identity
-        .as_str()
-        .strip_prefix("builtin.")
-        .or_else(|| identity.as_str().strip_prefix("parametric."))
-        .and_then(|v| v.split_once('/').map(|(_, name)| name))
-        .and_then(|name| name.strip_suffix("/v1"))
-        .filter(|name| !name.is_empty())
-        .ok_or(NonCanonicalNativeV1FunctionName)
-}
+pub use novarocks_type_contract::{NonCanonicalNativeV1FunctionName, native_v1_function_name};
 fn dtype<'a>(
     arena: &'a ExprArena,
     id: ExprId,
@@ -294,4 +276,49 @@ pub fn regexp_count_pattern_source_observed(
             novarocks_type_contract::RegexpCountPatternSource::Dynamic
         },
     )
+}
+
+/// Exact TO_BASE64 immediate source author using the same actual native-v1 identity projection.
+pub fn to_base64_byte_source_observed(
+    arena: &ExprArena,
+    args: &[ExprId],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_type_contract::ToBase64ByteSource, TemporalSourceProjectionError> {
+    if args.len() != 1 {
+        return Err(TemporalSourceProjectionError::Invalid(
+            "to_base64 source requires one argument",
+        ));
+    }
+    let child = arena
+        .get(args[0])
+        .ok_or(TemporalSourceProjectionError::Invalid(
+            "to_base64 source definition is absent",
+        ))?;
+    work.step()?;
+    if matches!(child.kind, ExprKind::Literal(_)) {
+        return Err(TemporalSourceProjectionError::Invalid(
+            "to_base64 requires checked native-v1 source; unchecked Literal is not emitted",
+        ));
+    }
+    if child.ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+        || child.ty.data_type != DataType::Utf8
+    {
+        return Err(TemporalSourceProjectionError::Invalid(
+            "to_base64 emitted source is not exact Physical Utf8",
+        ));
+    }
+    let name = if let ExprKind::FunctionCall { function, .. } = &child.kind {
+        Some(native_v1_function_name(&function.function_id).map_err(|_| {
+            TemporalSourceProjectionError::Invalid(
+                "to_base64 immediate function has no native-v1 identity",
+            )
+        })?)
+    } else {
+        None
+    };
+    work.flush()?;
+    let source =
+        novarocks_type_contract::ToBase64ByteSource::from_immediate_native_function_name(name);
+    work.flush()?;
+    Ok(source)
 }

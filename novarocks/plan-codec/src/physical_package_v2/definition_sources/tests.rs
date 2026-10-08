@@ -478,6 +478,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
             let ctx = context(id, 0);
             p::FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 site: p::PhysicalCallSite::Expression(ctx.use_id),
                 context: ctx,
@@ -506,6 +507,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         let ctx = context(use_id, 0);
         claims.push(p::FrozenPhysicalCall {
             regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
             temporal_source: None,
             site,
             context: ctx,
@@ -773,6 +775,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
                 effect.argument_control = ArgumentControl::Eager;
                 p::FrozenPhysicalCall {
                     regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
                     temporal_source: None,
                     site: p::PhysicalCallSite::Expression(ctx.use_id),
                     context: ctx,

@@ -268,9 +268,13 @@ pub mod sha2_shared;
 
 pub mod sm3_shared;
 
-pub mod string_parse_url_shared;
 mod string_parse_url;
 mod string_parse_url_owner;
+pub mod string_parse_url_shared;
 
-pub mod collection_offset_count;
 pub mod collection_cardinality_core;
+pub mod collection_offset_count;
+
+mod string_to_base64;
+mod string_to_base64_owner;
+pub mod to_base64_shared;

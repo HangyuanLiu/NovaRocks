@@ -70,6 +70,11 @@ impl ScalarCallContract {
     ) -> Option<novarocks_type_contract::RegexpCountPatternSource> {
         self.0.regexp_count_pattern_source()
     }
+    pub const fn to_base64_byte_source(
+        &self,
+    ) -> Option<novarocks_type_contract::ToBase64ByteSource> {
+        self.0.to_base64_byte_source()
+    }
 
     pub const fn function_id(&self) -> &FunctionId {
         self.0.function_id()

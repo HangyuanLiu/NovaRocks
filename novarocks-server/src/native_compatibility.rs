@@ -513,4 +513,35 @@ mod tests {
         assert_eq!(production.carriers(), candidate.carriers());
         assert_eq!(production.epoch(), candidate.epoch());
     }
+    #[test]
+    fn prior_peer_without_to_base64_source_receipt_has_a_distinct_plan_digest() {
+        let manifest = server_manifest();
+        let current = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            [0x41; 32],
+            11,
+            PLAN_TREE,
+        )
+        .unwrap();
+        assert!(current.plan_contract_revision() > 11);
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+        assert_eq!(
+            current.function_catalog_digest(),
+            prior.function_catalog_digest()
+        );
+        assert_eq!(
+            current.execution_implementation_manifest_digest(),
+            prior.execution_implementation_manifest_digest()
+        );
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+    }
 }

@@ -873,6 +873,28 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                 } else {
                     None
                 };
+            let to_base64_byte_source =
+                if owner.function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
+                    let definition = fragment.expressions().get(invocation.definition).unwrap();
+                    let ExprKind::FunctionCall { args, .. } = &definition.kind else {
+                        panic!("base64 actual call source")
+                    };
+                    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                        &Control,
+                        CompilePhase::FunctionSpecialization,
+                    )
+                    .unwrap();
+                    let source = novarocks_physical_plan::to_base64_byte_source_observed(
+                        fragment.expressions(),
+                        args,
+                        &mut work,
+                    )
+                    .unwrap();
+                    work.finish().unwrap();
+                    Some(source)
+                } else {
+                    None
+                };
             let token = functions
                 .prepare_fresh(
                     CallEffectInput {
@@ -891,9 +913,19 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                                         channels: &argument_uses,
                                     }
                                 }
-                                None => novarocks_functions::CallArgumentUses::SelectedChannels(
-                                    &argument_uses,
-                                ),
+                                None => match to_base64_byte_source {
+                                    Some(source) => {
+                                        novarocks_functions::CallArgumentUses::ToBase64Bytes {
+                                            source,
+                                            channels: &argument_uses,
+                                        }
+                                    }
+                                    None => {
+                                        novarocks_functions::CallArgumentUses::SelectedChannels(
+                                            &argument_uses,
+                                        )
+                                    }
+                                },
                             },
                         },
                         function_id: &owner.function.function_id,
@@ -916,6 +948,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                 effects: token.call_contract().effects().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 regexp_count_pattern_source,
+                to_base64_byte_source,
                 temporal_source: source_plan,
             });
             token.effects()
@@ -1421,3 +1454,6 @@ mod regexp_count_tests;
 
 #[path = "parse_url_tests.rs"]
 mod parse_url_tests;
+
+#[path = "to_base64_tests.rs"]
+mod to_base64_tests;

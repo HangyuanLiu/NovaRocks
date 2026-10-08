@@ -309,6 +309,7 @@ fn package_with_case(
                 .unwrap();
             calls.push(FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(use_id),
                 context,

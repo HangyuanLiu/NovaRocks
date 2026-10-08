@@ -331,6 +331,9 @@ impl ProgramResolvedCalls {
                 let call = pending
                     .remove(&site)
                     .ok_or(ProgramResolvedCallsError::MissingSite(site))?;
+                validate_to_base64_source(
+                    &snapshot, occurrence, args, &call, &pending, &checked, &mut work,
+                )?;
                 validate_expression(&snapshot, occurrence, args, &call, &mut work)?;
                 let scope = ProgramExpressionCallScope {
                     root: *owners
@@ -1151,3 +1154,73 @@ pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) mod relational_tests;
+
+fn validate_to_base64_source(
+    snapshot: &ProgramRootControlBindings,
+    occurrence: ProgramUseRef,
+    args: &[crate::ProgramExprId],
+    token: &PureCallSpecialization,
+    pending: &BTreeMap<ProgramCallSite, PureCallSpecialization>,
+    checked: &BTreeMap<ProgramCallSite, ProgramResolvedCall>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramResolvedCallsError> {
+    let call = token.call_contract();
+    if call.function_id().as_str() != "builtin.scalar/to_base64/v1" {
+        if call.to_base64_byte_source().is_some() {
+            return Err(ProgramResolvedCallsError::WrongArguments);
+        }
+        return Ok(());
+    }
+    let flow = &snapshot.flows()[&occurrence.arena];
+    let invocation = &flow.uses()[&occurrence.use_id];
+    if invocation.control != ControlShape::Eager
+        || args.len() != 1
+        || invocation.arguments.len() != 1
+    {
+        return Err(ProgramResolvedCallsError::WrongArguments);
+    }
+    let definitions = &snapshot.roots().arenas()[&occurrence.arena];
+    let source = definitions
+        .node(args[0])
+        .ok_or(ProgramResolvedCallsError::InvalidSite)?;
+    work.step()?;
+    let (name, emitted) = match source.kind() {
+        crate::StaticExprKind::Literal(_) => return Err(ProgramResolvedCallsError::WrongArguments),
+        crate::StaticExprKind::BoundCall { .. } => {
+            let child = ProgramCallSite::Expression(ProgramUseRef {
+                arena: occurrence.arena,
+                use_id: invocation.arguments[0],
+            });
+            let child = pending
+                .get(&child)
+                .map(|t| t.call_contract())
+                .or_else(|| checked.get(&child).map(ProgramResolvedCall::call_contract))
+                .ok_or(ProgramResolvedCallsError::MissingSite(child))?;
+            (
+                Some(
+                    novarocks_type_contract::native_v1_function_name(child.function_id())
+                        .map_err(|_| ProgramResolvedCallsError::WrongArguments)?,
+                ),
+                true,
+            )
+        }
+        crate::StaticExprKind::FunctionCall {
+            kind: crate::StaticFunctionKind::Encryption(name),
+            ..
+        } => (Some(*name), false),
+        _ => (None, false),
+    };
+    let expected = if emitted {
+        work.flush()?;
+        let fact =
+            novarocks_type_contract::ToBase64ByteSource::from_immediate_native_function_name(name);
+        work.flush()?;
+        fact
+    } else {
+        novarocks_type_contract::ToBase64ByteSource::from_immediate_encryption_identity(name)
+    };
+    if call.to_base64_byte_source() != Some(expected) {
+        return Err(ProgramResolvedCallsError::WrongArguments);
+    }
+    Ok(())
+}

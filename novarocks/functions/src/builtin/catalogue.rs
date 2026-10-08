@@ -2653,6 +2653,7 @@ pub(super) fn scalar_definition_parts(
                     }
                     "regexp_count" => Some(super::regexp_count_owner::effects()),
                     "parse_url" => Some(super::string_parse_url_owner::effects()),
+                    "to_base64" => Some(super::string_to_base64_owner::effects()),
                     "regexp_position" => Some(super::regexp_position_owner::effects()),
                     name if super::string_reverse_owner::operation(name).is_some() => {
                         Some(super::string_reverse_owner::effects())
@@ -2980,6 +2981,9 @@ pub fn contribute_builtin_functions(
             "regexp_count" => super::regexp_count_owner::definition(&name, declaration, resolver)?,
             name if super::string_parse_url_owner::operation(name).is_some() => {
                 super::string_parse_url_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_to_base64_owner::operation(name).is_some() => {
+                super::string_to_base64_owner::definition(name, declaration, resolver)?
             }
             "regexp_position" => super::regexp_position_owner::definition(declaration, resolver)?,
             name if super::string_reverse_owner::operation(name).is_some() => {

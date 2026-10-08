@@ -574,6 +574,7 @@ fn broadcast_table_fixture() -> Fixture {
         calls: vec![
             FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(scalar_context.use_id),
@@ -582,6 +583,7 @@ fn broadcast_table_fixture() -> Fixture {
             },
             FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Table { node: table },

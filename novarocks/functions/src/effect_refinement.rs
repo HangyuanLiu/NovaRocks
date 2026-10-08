@@ -36,6 +36,10 @@ pub enum CallArgumentUses<'a> {
         source: novarocks_type_contract::RegexpCountPatternSource,
         channels: &'a [Option<novarocks_type_contract::ExpressionUseId>],
     },
+    ToBase64Bytes {
+        source: novarocks_type_contract::ToBase64ByteSource,
+        channels: &'a [Option<novarocks_type_contract::ExpressionUseId>],
+    },
     TemporalSources {
         facts: &'a novarocks_type_contract::TemporalSourceFacts,
         channels: &'a [crate::TemporalSourceChannel<'a>],
@@ -58,6 +62,16 @@ impl CallArgumentUses<'_> {
                     channels: lc,
                 },
                 Self::RegexpCountPattern {
+                    source: right,
+                    channels: rc,
+                },
+            ) => left == right && std::ptr::eq(lc, rc),
+            (
+                Self::ToBase64Bytes {
+                    source: left,
+                    channels: lc,
+                },
+                Self::ToBase64Bytes {
                     source: right,
                     channels: rc,
                 },
@@ -192,6 +206,11 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                     && channels.len() == 2
                     && input.request.arguments.len() == 2
             }
+            CallArgumentUses::ToBase64Bytes { channels, .. } => {
+                input.kind == FunctionKind::Scalar
+                    && channels.len() == 1
+                    && input.request.arguments.len() == 1
+            }
             CallArgumentUses::TemporalSources { facts, channels } => {
                 input.kind == FunctionKind::Scalar
                     && facts.validate().is_ok()
@@ -240,6 +259,13 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 "foreign regexp_count pattern source",
             ));
         }
+        if matches!(input.argument_uses, CallArgumentUses::ToBase64Bytes { .. })
+            && input.function_id.as_str() != "builtin.scalar/to_base64/v1"
+        {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "foreign to_base64 byte source",
+            ));
+        }
         // Specialization consumes already-coerced arguments. Check their complete
         // types before any owner operation; this does not resolve FE coercions or
         // infer a legacy literal payload's type.
@@ -247,6 +273,7 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         let merge_state = match input.argument_uses {
             CallArgumentUses::SelectedChannels(_)
             | CallArgumentUses::RegexpCountPattern { .. }
+            | CallArgumentUses::ToBase64Bytes { .. }
             | CallArgumentUses::TemporalSources { .. } => None,
             CallArgumentUses::AggregateMerge {
                 state_input_type, ..
@@ -331,9 +358,17 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 "regexp_count source requires eager scalar control",
             ));
         }
+        if matches!(input.argument_uses, CallArgumentUses::ToBase64Bytes { .. })
+            && declaration.argument_control != novarocks_type_contract::ArgumentControl::Eager
+        {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "to_base64 source requires eager scalar control",
+            ));
+        }
         match input.argument_uses {
             CallArgumentUses::SelectedChannels(uses)
-            | CallArgumentUses::RegexpCountPattern { channels: uses, .. } => {
+            | CallArgumentUses::RegexpCountPattern { channels: uses, .. }
+            | CallArgumentUses::ToBase64Bytes { channels: uses, .. } => {
                 if matches!(
                     declaration.argument_control,
                     novarocks_type_contract::ArgumentControl::TemporalSource(_)

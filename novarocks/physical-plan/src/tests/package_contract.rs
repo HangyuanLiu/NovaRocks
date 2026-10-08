@@ -147,6 +147,7 @@ fn fixture_calls(fragment: &Fragment, uses: &PhysicalRootUses) -> FrozenFragment
             };
             calls.push(FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(*id),
@@ -1790,6 +1791,7 @@ fn parameter_calls_with_references(
             assert!(args.is_empty());
             FrozenPhysicalCall {
                 regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(*id),
