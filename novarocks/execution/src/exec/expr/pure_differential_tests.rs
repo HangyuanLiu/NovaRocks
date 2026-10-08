@@ -816,13 +816,6 @@ fn column_argument(data_type: DataType) -> DiffArgument {
 fn pure_differential_reports_missing_owners_for_the_census() {
     let scalar_census: Vec<(&str, Vec<DiffArgument>)> = vec![
         (
-            "ifnull",
-            vec![
-                column_argument(DataType::Int64),
-                column_argument(DataType::Int64),
-            ],
-        ),
-        (
             "days_add",
             vec![
                 column_argument(timestamp()),
@@ -892,7 +885,7 @@ fn pure_differential_owner_inventory_covers_the_builtin_catalogue() {
             .iter()
             .all(|installed| *installed)
     );
-    assert_eq!(installed_named("ifnull", CatalogKind::Scalar), vec![false]);
+    assert_eq!(installed_named("ifnull", CatalogKind::Scalar), vec![true]);
     assert!(
         installed_named("avg", CatalogKind::Aggregate)
             .iter()

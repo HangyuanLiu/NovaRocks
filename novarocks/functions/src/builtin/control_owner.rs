@@ -43,7 +43,7 @@ pub(super) enum ControlOperation {
 pub(super) fn operation(name: &str) -> Option<ControlOperation> {
     match name {
         "if" => Some(ControlOperation::If),
-        "coalesce" => Some(ControlOperation::Coalesce),
+        "coalesce" | "ifnull" => Some(ControlOperation::Coalesce),
         _ => None,
     }
 }

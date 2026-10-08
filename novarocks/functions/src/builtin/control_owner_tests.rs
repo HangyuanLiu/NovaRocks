@@ -29,7 +29,7 @@ use novarocks_type_contract::{
 };
 use std::sync::Mutex;
 
-const NAMES: [&str; 2] = ["if", "coalesce"];
+const NAMES: [&str; 3] = ["if", "coalesce", "ifnull"];
 fn parts(name: &str) -> (FunctionBindingDeclaration, BuiltinScalarResolver) {
     let (_, signatures) = super::super::registry::builtin_scalar_declarations()
         .into_iter()
@@ -50,7 +50,7 @@ fn catalog() -> PureEngineFunctionCatalog {
             .register(definition(name, declaration, resolver).unwrap())
             .unwrap();
     }
-    // Independent installation inventory for this actual two-owner subset.
+    // Independent installation inventory for this actual control-owner subset.
     // This is not the Server manifest or a claim about its remaining families.
     builder
         .seal_pure([
@@ -61,6 +61,10 @@ fn catalog() -> PureEngineFunctionCatalog {
             record(
                 "coalesce",
                 "builtin.scalar/coalesce/(any<T>...)->any<T>;widen;legacy",
+            ),
+            record(
+                "ifnull",
+                "builtin.scalar/ifnull/(any<T>,any<T>)->any<T>;widen;legacy",
             ),
         ])
         .unwrap()
@@ -170,7 +174,7 @@ fn actual_catalogue_attaches_exact_control_records_without_scalar_instances() {
             PureKernelAbi::ControlIntrinsicV1
         );
     }
-    for name in ["IF", "ifnull", "case", "nullif"] {
+    for name in ["IF", "case", "nullif", "nvl"] {
         assert!(operation(name).is_none());
     }
 }
