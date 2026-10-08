@@ -144,3 +144,5 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 2026-10-09 MV rename对照v1被错误fixture凭据挡在INSERT，非rename证据；runner final fixture secret binding修复通过SQLlib269/harness7/focused2/fmt。输入freeze v2，原SQL/golden保留，server不变，native pending。
 
 2026-10-09 MV rename six-case old-main native comparison: old9c7723bbe/candidate856e28f52相同步骤/相同guard五FAIL，unreferenced control两侧PASS；原SQL/golden不变，8PID退出cleanup0。见evidence/p09-mv-rename-old-main-native-comparison-20261009.json；确认已有失败，不说五PASS，非性能/final验收。
+
+2026-10-09 P09 result-delivery两wire场景预冻结/实现/registry/build/fmt PASS，native尚未运行；200000小行跨S和16777474B单行跨U24，独立oracle见oracles/result_delivery_wire_oracle.py。仅wire与public owner oracle范围，其他P09/CM/CP门保持OPEN。

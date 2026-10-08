@@ -466,7 +466,7 @@ fn idle_snapshot(context: &mut ScenarioContext, client: &Client) -> Result<(Valu
     ))
 }
 
-fn await_idle(
+pub(super) fn await_idle(
     context: &mut ScenarioContext,
     window: &str,
     phase: &str,

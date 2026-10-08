@@ -25,6 +25,7 @@ mod preparation_capacity;
 mod query_concurrency;
 mod query_lifecycle;
 mod query_output;
+mod result_delivery;
 mod result_delivery_baseline;
 mod runtime_filter;
 mod state_family;
@@ -50,6 +51,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.push(Box::new(listing::ObjectStoreListingBoundary));
     scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(result_delivery_baseline::scenarios());
+    scenarios.extend(result_delivery::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
     scenarios.extend(uea4_range_reads::scenarios());
     scenarios.extend(uea4_rss_baselines::scenarios());

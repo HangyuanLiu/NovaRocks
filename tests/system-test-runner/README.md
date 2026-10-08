@@ -61,6 +61,16 @@ remove the generated runtime directory.
 
 ## In CI
 
+`result-delivery/many-small-rows-cross-segment` 验证 200000 小行跨 Native
+1 MiB 段时的准确顺序与字节；`result-delivery/large-row-cross-u24` 验证一个
+16777474 字节字符串跨 MySQL U24 packet。输入在
+`docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v1.json` 冻结，独立
+Python literal oracle 生成期待摘要。原始 actor 以 64 KiB scratch 流式校验
+packet sequence、列数、行数、length-encoded 字段及数据摘要，不积累整行。
+每项还要求真实 BE Task 创建，并保留前后两次连续零值的 FE window/governance
+和 BE reservation/ingress 快照。这里只证明 wire 正确性与公开资源收敛；closing
+满池、精确 alias 退出、全部 W=2 容量矩阵和 transport 测量仍是独立验收。
+
 `tools/ci/local-full-ci.sh` runs this registry as its own stable stage,
 between the server binary smoke and the SQL suites. The stage discovers
 default scenarios through `--list-default` and runs each one with a single `--only`
