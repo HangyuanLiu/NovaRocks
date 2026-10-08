@@ -8,12 +8,16 @@ superseded-by: null
 date: 2026-10-06
 provenance:
   - "discussion: 2026-10-06 rejection of a vendored Tokio/Hyper/H2/Tonic/Tower/HTTP/Bytes/Arrow stack for bounded result delivery"
+  - "discussion: 2026-10-08 accepted MEM-1-M07 revision 7, trusted catalog SDK listing growth with three narrow protocol changes (D15/D16)"
   - "PR: pending — backfill the number once MEM-1 M07 merges"
 code-anchors:
   - "Cargo.toml ([patch.crates-io])"
   - "novarocks/native-adapter/src/native_transport_admission.rs (NativeTransportAdmission)"
   - "novarocks/worker/src/guarded_bytes.rs (bytes_with_exit_guard)"
   - "novarocks/execution/src/exec/chunk/root_array_storage.rs (ARROW_BUFFER_OWNER_METADATA_BOUND)"
+  - "novarocks/connector/iceberg/src/catalog/listing_admission.rs (ListingAdmission)"
+  - "novarocks/fs/src/list_body_limit.rs (ListBodyLimitFetch)"
+  - "vendor/iceberg-catalog-rest-0.9.0/PATCH.md (single-page REST protocol extension and upstream exit)"
 ---
 
 ## 问题
@@ -28,6 +32,7 @@ NovaRocks 的内存治理分两类对象，保证程度不同：
 |---|---|---|---|
 | NovaRocks 自有对象 | 结果窗口段、行游标、collector、交给传输层的 payload `Bytes`、自建队列 | 事前精确授权 | 最后一个 NovaRocks owner 被 Drop（payload 用上游 `Bytes::from_owner` 观察第三方持有的最后 alias） |
 | 第三方内部对象 | HPACK 表、帧缓冲、Hyper/Tonic 任务、Tokio socket 注册与 TaskCell、Tower Buffer 内部、错误 Box | 公开配置限定数量和单项尺寸；NovaRocks 在库外持有计数门；字节为结构上界，用 jemalloc 测量验证 | 公开 API 可观察的事件：IO wrapper 被 Drop、JoinHandle 返回、response body EOF/RST/Drop |
+| 受信 catalog SDK 列表内部 | REST/HMS 响应体、反序列化对象及 SDK 跨页累积 | 调用准入、绝对期限、协议分页与观测；没有配置推导的单响应字节上界（D15） | SDK future 返回或取消后 Drop；位置在该 future 退出后归还 |
 | 第三方内部分配的记账 | 上一行对象的实际字节 | BE 侧由归属 allocator 在执行作用域下分配时归属（见 memory-governance 领域）；FE 侧只有结构上界与测量 | 归属 allocator 的真实 free |
 
 `[patch.crates-io]` 对整个 workspace 全局生效：一旦 patch Tokio，锁文件中所有依赖 Tokio 的包（数十个，包括 AWS SDK、OpenDAL）都跑在私有副本上。path 依赖没有 registry 身份，cargo-deny 对这些包的已知安全公告不再可见，`deny.toml` 中对应的 ignore 条目也会因“未使用”而必须删除，于是公告从治理视野中消失，而不是被修复。
@@ -60,6 +65,19 @@ NovaRocks 的内存治理分两类对象，保证程度不同：
 7. **Measure the rest**：第三方内部字节以“数量上限 × 配置单项上限 + 测得的每对象固定开销”作为结构上界，用 jemalloc 测量门验证线性与回落；测量失败先补库外准入或修正配置，不以修改第三方库过门。
 8. **Pin private layouts by test**：确需引用第三方私有类型尺寸时，用常量加计数 allocator 测试钉住，测试在升级导致尺寸变化时失败。
 
+**外部 SDK 列表的窄例外（2026-10-08，D15/D16）：**
+
+远端 catalog 决定响应大小。规则 6、7 不为 Iceberg REST/HMS、Paimon 与 OpenDAL 的 SDK 列表内部缓冲声称配置字节上界，也不把进程高水位拟合成列表响应的固定尺寸。管理员配置的受信端点是此前提；NovaRocks 自有名字、页/token 记录与结果副本仍在增长前检查，越界拒绝整批，不截断。单表加载、config 与 OAuth 同样可能整体读入，本例外不构成对恶意 catalog 的 FE 安全保证。
+
+- Iceberg REST/HMS 列表计数位置属于准确 catalog generation；等待与已进入 SDK 调用均受原绝对 deadline/stop 控制。超时或取消是结束请求，位置必须等 SDK future 返回或 Drop 后才归还。`ListingAdmission` 当前冻结为每 generation 八个位置。
+- 已允许的 vendored REST crate 只增加 `list_tables_page`、`list_namespaces_page`、`list_views_page` 协议接口；NovaRocks 持有分页循环及页数、名字字节、token 长度/重复检查。支持分页的服务端按请求 pageSize 返回；忽略分页的服务端仍可能整体返回。补丁不增加 SDK 分配计量或退出钩子，不新增 patch crate；上游提供等价单页/流式接口后删除补丁。
+- OpenDAL 只经现有公开 `HttpClientLayer`/`HttpFetch` 对 `Operation::List` 包装响应体。实际读取超过冻结 16 MiB 时返回不可重试错误，非列表 I/O 保留自己的合同。`raw` 接缝不承诺升级稳定，升级必须重跑钉住行为测试。有限响应体不等于 XML/SDK 内部全部分配的逐字节授权。
+- HMS 保留 `get_all_*`，加调用准入与绝对期限；使用服务端支持的既有 framed 选项，不 fork pilota 或生成代码作计量。framed 消息限制不能防止解码器在检查实际剩余数据之前按声明长度/元素数预分配。
+
+仓库钉住的 pilota 0.11.10 `thrift/binary.rs::read_string` 先按线上长度 `vec![0; len]`；hive_metastore 0.2.0 的 GetAllTables 生成解码先按声明元素数 `Vec::with_capacity`。误配传输、错端口或流错位也可能触发大分配；该缺口按已接受设计交上游独立修复，M07 不扩大 vendor 范围。
+
+CL 记录条目、名字字节、页数、实际进程身份及调用期间 jemalloc 采样高水位，不进入 `E_FE_result` 结构上界证明。整个 information_schema SQL 还包含自有 AST/规划/wire 工作，lake discovery 还包含单表加载与 request metadata cache；这些整段高水位不能直接归因为 SDK 列表缓冲。HTTP fixture 的 handler 结束也不能代替 SDK future 或后台 job 的退出。受控协议检查不替代真实 REST/HMS/Paimon 跨 provider 验收，当前收据与未完成门见 `docs/testing/mem-1-m07/evidence/`。
+
 ## 接受的妥协（诚实记录）
 
 **第三方内部字节没有事前逐字节授权。** 单帧解码临时缓冲、任务结构体、Waker、错误对象等只由数量与配置间接约束，并通过测量验证；测量门本身依赖代表性负载，不是形式证明。
@@ -76,3 +94,6 @@ NovaRocks 的内存治理分两类对象，保证程度不同：
 - 测量门持续出现无法用库外准入或配置解释的非线性增长或不回落：先回到设计讨论，评估更换实现（选项 C）或升级版本，而不是 fork。
 - 某个第三方依赖停止维护、出现无法规避的安全问题或许可证变化：评估替换依赖；vendor 只作为有退出条件的过渡，并按规则 2 单独立 ADR。
 - 产品需要对 FE 进程建立单一内存账本：重新审视 FE 侧第三方内部内存只做结构上界与测量的范围。
+- 非管理员/RBAC/多租户允许任意 catalog 端点：重审全部 catalog I/O 边界，不能只界住列表。
+- 上游提供等价分页/流式列表或响应体上限：复核并改用上游，删除对应协议补丁。
+- 测量确认列表峰值成为 FE 内存主要来源或存在无法解释的增长：回到设计讨论；先区分自有副本、单表加载/缓存和 SDK 列表缓冲，不用整体 SQL 峰值冒充单一来源。
