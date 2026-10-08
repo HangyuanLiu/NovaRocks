@@ -23,3 +23,6 @@ python3 docs/testing/mem-1-m07/oracles/decimal-read-write-v1.py \
 
 
 `decimal-window-v1.py` 以完整原SQL SHA固定12行输入和6个窗口query（72行）。独立排序/rank、按行frame、category累计AVG/MAX、LAG/LEAD及固定default、FIRST/LAST和moving AVG；原实际scale为15/20/0，AVG HALF_UP。query7的乘积保留nullable Decimal128中间/precision溢出，所有乘积超过i128和DECIMAL(38,35)域，SUM全NULL仍为NULL。未知frame或SQL变更拒绝。原生old/new验证之前不修改golden，不从引擎结果取期望值。
+
+
+`decimal-complex-v1.py` 以完整SQL SHA固定四张表的实际递归DDL和15行literal，独立解析ARRAY/MAP/ROW/NULL及精确Decimal文本。根据实际precision/scale执行nullable cast，独立计算元素/字段/lookup、排序的MAP_KEYS/VALUES和 capped Decimal128算术域；MySQL嵌套文本以原entry顺序render，数值不经float。原NULL依据实际overflow判定，不能把历史golden中的额外NULL当规范。未知DDL、lookup或setup变化拒绝。只生成11个读取query候选；必须old/new完整原生核验并审阅后才能修订仓库golden。
