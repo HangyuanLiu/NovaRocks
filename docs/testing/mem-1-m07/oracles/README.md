@@ -14,3 +14,6 @@ python3 docs/testing/mem-1-m07/oracles/decimal-read-write-v1.py \
 ```
 
 生成候选不是验收。必须通过 SQL runner 的 `--result-dir` 指向独立目录，在 native 1FE+3BE 的 old main 和 candidate 上分别核验完整 case，再审阅差异后决定是否修订原 golden。该 helper 不为其他五个失败 case 提供预期，也不证明更高精度持久列能力、完整 Decimal suite 或最终 M07 验收。
+
+
+`decimal-string-functions-v1.py` 独立推导字符串函数 fixture 的7行、8个读取查询。以完整原 SQL SHA 冻结 setup、表达式、alias 和排序；字面量与实际 DDL 生成固定scale字符串，之后用ASCII字符操作计算CONCAT、截取、定位、正则、split、pad、大小写、replace和reverse。RPAD截取超过长度的输入，并保留短输入的尾部空格。该fixture无需舍入或溢出，helper显式拒绝这两类情况。任何SQL变化需新版本审阅；预期不读取任何数据库或golden。原生old/new独立核验通过前不改仓库golden。

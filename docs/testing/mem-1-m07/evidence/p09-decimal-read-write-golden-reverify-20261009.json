@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "stage": "P09 corrected checked-in Decimal read/write golden verification",
+  "matrix": {
+    "source_revision": "870885719b1858e64d85752678a55b8170150307",
+    "source_dirty": false,
+    "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+    "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "launch_profile": "fault-scenario",
+    "results": [
+      {
+        "suite": "decimal",
+        "sql_glob": "test_read_write_decimal256.sql",
+        "exit_code": 0,
+        "duration_seconds": 31.36
+      }
+    ],
+    "fixture_startup_exit_code": 0,
+    "fixture_cleanup_exit_code": 0
+  },
+  "actual_server_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "passed_steps": 89,
+  "epsilon": "None; exact comparison",
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-decimal-golden-reverify-20261009/matrix-status.json",
+      "sha256": "7ac160653ad29689b693769dfeed78bd73796e4014e0ce9d432fdbba1ed423f2"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-decimal-golden-reverify-20261009/decimal.log",
+      "sha256": "afafbbc1292fff3847e14e526b8dc47d3a514ed1bfee9aeeed62a81543c11968"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-decimal-golden-reverify-20261009/cleanup.log",
+      "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+    }
+  ],
+  "golden": {
+    "path": "tests/sql/correctness/decimal/result/test_read_write_decimal256.result",
+    "sha256": "a4764f945ffe5edb77bd9b104732d2d6456432e13bc2aa615fd7ef5e6da771b9"
+  },
+  "processes": {
+    "pids": [
+      89493,
+      89494,
+      89495,
+      89496
+    ],
+    "all_absent": true
+  },
+  "scope": "Only one corrected legacy Decimal golden, no product source change or final M07 acceptance.",
+  "local_only": true
+}
