@@ -296,7 +296,7 @@ pub enum CastRowResult {
     RowError(RowDataError),
 }
 
-/// Only decimal text admission, independent from general carrier conversions.
+/// Exact decimal carrier admission, independent from general carrier conversions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecimalTextSource {
     Decimal128,
@@ -321,6 +321,10 @@ enum CastBody {
         target: Target,
     },
     DecimalText {
+        source: DecimalTextSource,
+        scale: i8,
+    },
+    DecimalFloat {
         source: DecimalTextSource,
         scale: i8,
     },
@@ -435,6 +439,35 @@ impl PreparedCastRecipe {
                         source: source.clone(),
                         result: result.clone(),
                         body: CastBody::DecimalText {
+                            source: decimal,
+                            scale,
+                        },
+                        decimal_overflow_policy: policy,
+                        allow_throw_exception,
+                    });
+                }
+            }
+            if result.data_type == DataType::Float64
+                && matches!(
+                    source.data_type,
+                    DataType::Decimal128(..) | DataType::Decimal256(..)
+                )
+            {
+                let decimal = match source.data_type {
+                    DataType::Decimal128(_, scale) => Some((DecimalTextSource::Decimal128, scale)),
+                    DataType::Decimal256(_, scale) => Some((DecimalTextSource::Decimal256, scale)),
+                    _ => None,
+                };
+                work.step()?;
+                if let Some((decimal, scale)) = decimal {
+                    if source.nullable && !result.nullable {
+                        return Err(CastPrepareError::TypeMismatch);
+                    }
+                    return Ok(Self {
+                        operation,
+                        source: source.clone(),
+                        result: result.clone(),
+                        body: CastBody::DecimalFloat {
                             source: decimal,
                             scale,
                         },
@@ -635,6 +668,11 @@ impl PreparedCastRecipe {
                 source: DecimalTextSource::Decimal256,
                 ..
             } => false,
+            // The original Decimal256 -scale expression panics for i8::MIN
+            // in checked builds. Retain failure awareness without converting it.
+            CastBody::DecimalFloat { source, scale } => {
+                source == DecimalTextSource::Decimal256 && scale == i8::MIN
+            }
             CastBody::TemporalCarrier { .. } => {
                 matches!(self.result.data_type, DataType::Date32 | DataType::Utf8)
             }
@@ -780,6 +818,45 @@ impl PreparedCastRecipe {
                 };
                 work.flush()?;
                 return Ok(CastRowResult::Text(text));
+            }
+            if let CastBody::DecimalFloat { source, scale } = self.body {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| source.validate(array),
+                )?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                work.flush()?;
+                let value = match source {
+                    DecimalTextSource::Decimal128 => crate::decimal_float_cast::decimal128_to_f64(
+                        argument
+                            .array()
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .ok_or_else(|| internal("checked decimal float has a foreign carrier"))?
+                            .value(row),
+                        scale,
+                    ),
+                    DecimalTextSource::Decimal256 => crate::decimal_float_cast::decimal256_to_f64(
+                        argument
+                            .array()
+                            .as_any()
+                            .downcast_ref::<Decimal256Array>()
+                            .ok_or_else(|| internal("checked decimal float has a foreign carrier"))?
+                            .value(row),
+                        scale,
+                    ),
+                };
+                work.flush()?;
+                return Ok(CastRowResult::Float64(value));
             }
             if let CastBody::DateFloat { target } = self.body {
                 let row =
@@ -1350,3 +1427,7 @@ mod float_date_tests;
 #[cfg(test)]
 #[path = "cast_binary_text_tests.rs"]
 mod binary_text_tests;
+
+#[cfg(test)]
+#[path = "cast_decimal_float_tests.rs"]
+mod decimal_float_tests;

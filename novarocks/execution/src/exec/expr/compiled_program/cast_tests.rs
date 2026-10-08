@@ -321,9 +321,9 @@ fn fixture(
         } else {
             let value = match source_type.data_type {
                 DataType::Binary => LiteralValue::Binary(b"native\0producer".to_vec().into_boxed_slice()),
-                DataType::Decimal128(..) => LiteralValue::Decimal128(71),
+                DataType::Decimal128(..) => LiteralValue::Decimal128(1),
                 DataType::Decimal256(..) => {
-                    LiteralValue::Decimal256(arrow_buffer::i256::from_i128(71).to_be_bytes())
+                    LiteralValue::Decimal256(arrow_buffer::i256::from_i128(1).to_be_bytes())
                 },
                 DataType::Boolean => LiteralValue::Boolean(true),
                 DataType::Date32 => LiteralValue::Date32(71),

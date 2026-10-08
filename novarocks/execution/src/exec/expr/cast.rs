@@ -2499,18 +2499,7 @@ fn decimal256_integral_values(arr: &Decimal256Array, source_scale: i8) -> Vec<Op
 }
 
 fn decimal256_to_f64(value: i256, scale: i8) -> f64 {
-    // Convert i256 to f64 using the same arithmetic approach as StarRocks BE:
-    // (double)unscaled / (double)scale_factor.
-    // This matches StarRocks's to_float() implementation in decimalv3.h which does:
-    //   *to_value = static_cast<To>(static_cast<double>(value) / static_cast<double>(scale_factor));
-    let unscaled_f64 = value.to_f64().unwrap_or(f64::NAN);
-    if scale <= 0 {
-        let factor = 10f64.powi((-scale) as i32);
-        unscaled_f64 * factor
-    } else {
-        let factor = 10f64.powi(scale as i32);
-        unscaled_f64 / factor
-    }
+    novarocks_functions::decimal_float_cast::decimal256_to_f64(value, scale)
 }
 
 fn cast_decimal256_to_float64(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {

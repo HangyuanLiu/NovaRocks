@@ -91,7 +91,7 @@ fn full(wide: bool) {
                             allow,
                         );
                         let cb = batch(&constant, input(wide, p, scale, vec![Some(0); 4]));
-                        let expanded = input(wide, p, scale, vec![Some(71); 3]);
+                        let expanded = input(wide, p, scale, vec![Some(1); 3]);
                         let out = instance(&constant)
                             .evaluate(&cb, Selection::try_sparse(4, &rows).unwrap(), &Control)
                             .unwrap();
@@ -145,6 +145,45 @@ fn decimal_float_actual_physical_source_rejects_out_of_range_scale_before_compil
             message.contains(&format!(
                 "Arrow decimal precision/scale (1, -127) is outside 1..={max} and -{max}..={max}"
             )),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn decimal_float_actual_constant_source_rejects_out_of_precision_payload() {
+    for wide in [false, true] {
+        let ty = FunctionValueType::new(
+            if wide {
+                DataType::Decimal256(1, 0)
+            } else {
+                DataType::Decimal128(1, 0)
+            },
+            false,
+        );
+        let field = Arc::new(ty.try_to_field("original-decimal-constant").unwrap());
+        let result = if wide {
+            novarocks_functions::ConstantValue::from_decimal256_be(
+                field,
+                ty,
+                arrow_buffer::i256::from_i128(71).to_be_bytes(),
+                options().constants,
+                CompilePhase::FunctionSpecialization,
+                &Control,
+            )
+        } else {
+            novarocks_functions::ConstantValue::from_decimal128(
+                field,
+                ty,
+                71,
+                options().constants,
+                CompilePhase::FunctionSpecialization,
+                &Control,
+            )
+        };
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("precision 1") && message.contains("too large"),
             "{message}"
         );
     }

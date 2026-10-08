@@ -1017,6 +1017,15 @@ pub fn cast_scalar_with_special_rules(
         (DataType::Decimal128(_, s), DataType::Utf8) => cast_decimal_to_utf8_array(array, *s),
         (DataType::Decimal256(_, s), DataType::Utf8) => cast_decimal256_to_utf8_array(array, *s),
         (DataType::Decimal256(_, s), DataType::Float32) => cast_decimal256_to_float32(array, *s),
+        (DataType::Decimal128(_, s), DataType::Float64) => {
+            // Retain the original pinned Arrow primitive unary operation, including
+            // hidden NULL backing values; only its value author is now shared.
+            use arrow_array::cast::AsArray;
+            let arr = array.as_primitive::<arrow_array::types::Decimal128Type>();
+            Ok(Arc::new(
+                novarocks_functions::decimal_float_cast::decimal128_array_to_f64(arr, *s),
+            ))
+        }
         (DataType::Decimal256(_, s), DataType::Float64) => cast_decimal256_to_float64(array, *s),
         (DataType::Decimal256(_, s), DataType::Boolean) => cast_decimal256_to_boolean(array, *s),
         (DataType::Decimal256(_, s), DataType::Int8) => cast_decimal256_to_int8(array, *s),
@@ -1620,18 +1629,7 @@ fn decimal256_integral_values(arr: &Decimal256Array, source_scale: i8) -> Vec<Op
 }
 
 fn decimal256_to_f64(value: i256, scale: i8) -> f64 {
-    // Convert i256 to f64 using the same arithmetic approach as StarRocks BE:
-    // (double)unscaled / (double)scale_factor.
-    // This matches StarRocks's to_float() implementation in decimalv3.h which does:
-    //   *to_value = static_cast<To>(static_cast<double>(value) / static_cast<double>(scale_factor));
-    let unscaled_f64 = value.to_f64().unwrap_or(f64::NAN);
-    if scale <= 0 {
-        let factor = 10f64.powi((-scale) as i32);
-        unscaled_f64 * factor
-    } else {
-        let factor = 10f64.powi(scale as i32);
-        unscaled_f64 / factor
-    }
+    novarocks_functions::decimal_float_cast::decimal256_to_f64(value, scale)
 }
 
 fn cast_decimal256_to_float64(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {

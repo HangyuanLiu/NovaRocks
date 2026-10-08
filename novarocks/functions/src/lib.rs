@@ -2653,3 +2653,5 @@ pub mod binary_text;
 
 #[cfg(test)]
 mod native_negate_original_decimal_carrier_baseline_tests;
+
+pub mod decimal_float_cast;
