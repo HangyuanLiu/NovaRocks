@@ -39,3 +39,7 @@ MySQL新增7项包含真实TCP握手/协议字节与受控partial write：短行
 - P07 ordinary completion/error/COM_INIT_DB的finite实际packet/flush/closing接线：当前terminal.rs deferred OK与若干取消分支提前settlement仍需替换；本Local路径的pending finalize交接不能替它证明原OK owner正确。
 - distributed FrozenRootOutput、Internal领域有限CPU/collector及write/COW/stats/scalar完整生产矩阵；旧Client decoded carrier和旧LRA不在本slice退休。
 - P08唯一完整切换；P00b实际测量；P09原生1FE+3BE功能/性能/尾部；P10 ADR/最终同HEAD证据及Linux用户手工门。
+
+## 同 HEAD workspace 收敛
+
+干净HEAD `9a7f316e6f330494c5b310ce8ed0705054f49c86`，dev cargo-only完整脚本PASS，384秒；12287 passed / 0 failed / 7 existing ignored。guard/mutation/fixture contract、fmt/all-targets/System allocator/Clippy/build/error manifest、组件及Server owner/binary smoke均通过。机器收据 `p07-local-delivery-convergence-20261008.json` 保存各阶段计数/日志sha，原日志 `logs/ci-full/20261008-135850`。未运行SQL、System场景或原生/性能/传输测量；不代替P08之后最终同HEAD验收。
