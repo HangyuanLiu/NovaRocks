@@ -1853,6 +1853,7 @@ mod statistics {
                     )
                     .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
                 FrozenPhysicalCall {
+                    regexp_count_pattern_source: None,
                     temporal_source: None,
                     site,
                     context,

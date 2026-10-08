@@ -294,6 +294,7 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
         .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
+        regexp_count_pattern_source: None,
         temporal_source: None,
         site,
         context,
@@ -441,6 +442,7 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
         .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
+        regexp_count_pattern_source: None,
         temporal_source: None,
         site,
         context,

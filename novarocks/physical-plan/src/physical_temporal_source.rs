@@ -246,3 +246,52 @@ pub fn temporal_source_definitions_observed(
     work.flush()?;
     Ok(TemporalSourceDefinitions { facts, definitions })
 }
+
+/// ONE author of the actual native-v1 checked Constant -> Literal projection.
+/// This classifies the emitted expression kind, never lexical syntax or
+/// FunctionArgument.constant. Native codec payload admission remains exact.
+pub fn native_v1_emitted_constant_reference(kind: &ExprKind) -> Option<crate::ConstantReference> {
+    match kind {
+        ExprKind::Constant(reference) => Some(*reference),
+        _ => None,
+    }
+}
+/// Author the existing two-child scalar's immutable pattern error policy.
+/// A Utf8 NULL Constant emits LiteralNull, and is masked before this policy;
+/// the nominal fact promises only the non-NULL emitted LiteralUtf8 shape.
+pub fn regexp_count_pattern_source_observed(
+    arena: &ExprArena,
+    args: &[ExprId],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_type_contract::RegexpCountPatternSource, TemporalSourceProjectionError> {
+    if args.len() != 2 {
+        return Err(TemporalSourceProjectionError::Invalid(
+            "regexp_count source requires two arguments",
+        ));
+    }
+    let pattern = arena
+        .get(args[1])
+        .ok_or(TemporalSourceProjectionError::Invalid(
+            "regexp_count pattern definition is absent",
+        ))?;
+    work.step()?;
+    if matches!(pattern.kind, ExprKind::Literal(_)) {
+        return Err(TemporalSourceProjectionError::Invalid(
+            "regexp_count requires checked native-v1 source; unchecked Literal is not emitted",
+        ));
+    }
+    if pattern.ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+        || pattern.ty.data_type != DataType::Utf8
+    {
+        return Err(TemporalSourceProjectionError::Invalid(
+            "regexp_count emitted pattern is not exact Physical Utf8",
+        ));
+    }
+    Ok(
+        if native_v1_emitted_constant_reference(&pattern.kind).is_some() {
+            novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent
+        } else {
+            novarocks_type_contract::RegexpCountPatternSource::Dynamic
+        },
+    )
+}

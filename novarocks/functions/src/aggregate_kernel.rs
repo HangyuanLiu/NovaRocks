@@ -206,7 +206,8 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
     let aligned = (|| {
         let phase = options.phase;
         let correct = match input.argument_uses {
-            crate::CallArgumentUses::TemporalSources { .. } => false,
+            crate::CallArgumentUses::TemporalSources { .. }
+            | crate::CallArgumentUses::RegexpCountPattern { .. } => false,
             crate::CallArgumentUses::SelectedChannels(_) => {
                 phase.consumes_logical_arguments() && options.state_input_type.is_none()
             }
@@ -224,7 +225,8 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
             ));
         }
         match input.argument_uses {
-            crate::CallArgumentUses::TemporalSources { .. } => Err(invalid(
+            crate::CallArgumentUses::TemporalSources { .. }
+            | crate::CallArgumentUses::RegexpCountPattern { .. } => Err(invalid(
                 "aggregate preparation rejects scalar temporal source channels",
             )),
             crate::CallArgumentUses::SelectedChannels(_) => Ok(None),

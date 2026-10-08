@@ -104,6 +104,7 @@ fn checked_package(
                 )
                 .unwrap();
             frozen.push(FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(context.use_id),
                 context,

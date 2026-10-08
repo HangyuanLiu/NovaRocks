@@ -30,8 +30,8 @@ mod frozen_calls;
 mod frozen_pruning;
 mod identity;
 mod package;
-mod plan;
 mod physical_temporal_source;
+mod plan;
 mod predicate;
 mod pruning_structure;
 mod relation;
@@ -63,11 +63,11 @@ pub use novarocks_type_contract::{
     PartitionSpaceIdentityError,
 };
 pub use package::*;
-pub use plan::*;
 pub use physical_temporal_source::{
-    native_v1_function_name, NonCanonicalNativeV1FunctionName, temporal_source_definitions_observed,
-    TemporalSourceProjectionError,
+    NonCanonicalNativeV1FunctionName, TemporalSourceProjectionError, native_v1_function_name,
+    temporal_source_definitions_observed,
 };
+pub use plan::*;
 pub use predicate::*;
 pub use pruning_structure::*;
 pub use relation::*;
@@ -94,3 +94,7 @@ mod tests;
 
 #[cfg(test)]
 mod physical_temporal_source_tests;
+
+pub use physical_temporal_source::{
+    native_v1_emitted_constant_reference, regexp_count_pattern_source_observed,
+};

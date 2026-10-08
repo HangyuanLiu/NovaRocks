@@ -42,6 +42,7 @@ pub struct FunctionCallContract {
     effects: CallEffects,
     parameters: SemanticParameters,
     temporal_source: Option<crate::TemporalCallContract>,
+    regexp_count_pattern_source: Option<novarocks_type_contract::RegexpCountPatternSource>,
 }
 impl FunctionCallContract {
     pub fn from_refined(
@@ -140,11 +141,21 @@ impl FunctionCallContract {
             effects: receipt.facts().clone(),
             parameters,
             temporal_source,
+            regexp_count_pattern_source: match input.argument_uses {
+                crate::CallArgumentUses::RegexpCountPattern { source, .. } => Some(source),
+                _ => None,
+            },
         })
     }
     pub fn temporal_source(&self) -> Option<&crate::TemporalCallContract> {
         self.temporal_source.as_ref()
     }
+    pub const fn regexp_count_pattern_source(
+        &self,
+    ) -> Option<novarocks_type_contract::RegexpCountPatternSource> {
+        self.regexp_count_pattern_source
+    }
+
     pub const fn function_id(&self) -> &FunctionId {
         &self.function_id
     }

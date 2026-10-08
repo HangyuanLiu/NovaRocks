@@ -16,6 +16,7 @@
 //! Test-only real temporal ControlIntrinsic route, sharing the checked package
 //! author rather than invoking an owner through the ordinary scalar ABI.
 use super::*;
+use arrow::array::StringArray;
 use crate::exec::expr::compiled_program::{CompiledExpressionInstance, guarded_tests as host};
 use novarocks_functions::{
     EngineFunctionCatalogBuilder, InstalledPureKernel, PureEngineFunctionCatalog,
@@ -106,7 +107,12 @@ struct CompiledCall {
     program: Arc<LocalProgram>,
     input: RecordBatch,
 }
-fn compile(spec: &ScalarDiffSpec, rows: usize, result_type: &FunctionValueType) -> CompiledCall {
+fn compile(
+    spec: &ScalarDiffSpec,
+    rows: usize,
+    result_type: &FunctionValueType,
+    native_checked_constants: bool,
+) -> CompiledCall {
     let functions = pure_catalogue(&spec.name, spec.temporal_source.as_ref());
     let source_node = NodeId::new(u32::MAX);
     let input_node = NodeId::new(41);
@@ -161,12 +167,22 @@ fn compile(spec: &ScalarDiffSpec, rows: usize, result_type: &FunctionValueType) 
             DiffArgument::Column { value_type, values } => {
                 assert_eq!(values.len(), rows, "actual source column invocation length");
                 let value = ValueId::new(index as u32 + 901);
+                // COUNT's pooled fixture is an actual non-null Utf8 Value
+                // edge. Its unused producer definition must keep that type;
+                // a NULL literal cannot claim a non-null source contract.
+                let producer = if native_checked_constants && !value_type.nullable {
+                    let strings = values
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("native source fixture requires its exact Utf8 carrier");
+                    assert!(rows > 0, "non-null pooled fixture has no source value");
+                    assert!(!strings.is_null(0));
+                    PLiteral::Utf8(strings.value(0).into())
+                } else {
+                    PLiteral::Null
+                };
                 let definition = builder
-                    .add_expression(
-                        input_node,
-                        value_type.clone(),
-                        PKind::Literal(PLiteral::Null),
-                    )
+                    .add_expression(input_node, value_type.clone(), PKind::Literal(producer))
                     .unwrap();
                 builder
                     .insert_value(ValueDef {
@@ -186,7 +202,11 @@ fn compile(spec: &ScalarDiffSpec, rows: usize, result_type: &FunctionValueType) 
                     .unwrap()
             }
             DiffArgument::Constant(value) => {
-                let literal = if spec.temporal_source.is_some() && index == 0 {
+                let literal = if native_checked_constants {
+                    // Exact checked Constant -> native v1 Literal emission; the
+                    // sole Physical author, not this value, determines policy.
+                    None
+                } else if spec.temporal_source.is_some() && index == 0 {
                     // These source fixtures admit literal-capable exact source values.
                     physical_literal(value)
                 } else if spec.legacy_constants == LegacyConstantForm::Literal {
@@ -333,25 +353,27 @@ fn compile(spec: &ScalarDiffSpec, rows: usize, result_type: &FunctionValueType) 
             &HarnessControl,
         )
         .unwrap();
-    let ArgumentControl::TemporalSource(kind) = installed.effects().argument_control else {
-        panic!("actual source control declaration")
-    };
-    let PKind::FunctionCall { args, .. } = &fragment.expressions().get(root_expr).unwrap().kind
-    else {
-        unreachable!()
-    };
-    let mut work =
-        CompileCheckpoints::try_new(&HarnessControl, CompilePhase::FunctionSpecialization).unwrap();
-    let projected = novarocks_physical_plan::temporal_source_definitions_observed(
-        kind,
-        fragment.expressions(),
-        args,
-        &mut work,
-    )
-    .unwrap();
-    work.finish().unwrap();
-    authors.get_mut(&root_expr).unwrap().shape =
-        ControlShape::TemporalSource(projected.facts.shape());
+    if let ArgumentControl::TemporalSource(kind) = installed.effects().argument_control {
+        let PKind::FunctionCall { args, .. } = &fragment.expressions().get(root_expr).unwrap().kind
+        else {
+            unreachable!()
+        };
+        let mut work =
+            CompileCheckpoints::try_new(&HarnessControl, CompilePhase::FunctionSpecialization)
+                .unwrap();
+        let projected = novarocks_physical_plan::temporal_source_definitions_observed(
+            kind,
+            fragment.expressions(),
+            args,
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        authors.get_mut(&root_expr).unwrap().shape =
+            ControlShape::TemporalSource(projected.facts.shape());
+    } else {
+        assert_eq!(installed.effects().argument_control, ArgumentControl::Eager);
+    }
     let result = ResultPort {
         fragment: fragment_id,
         output: fragment.nodes()[&output_node].output.clone(),
@@ -487,14 +509,77 @@ pub(super) fn run(
         name: legacy_name.into(),
         reason: "no original implementation".into(),
     })?;
+    run_compiled(
+        spec,
+        spec,
+        bound,
+        legacy_name,
+        legacy_kind,
+        rows,
+        result_type,
+        false,
+    )
+}
+
+/// A real native source fixture for the existing Eager scalar ABI. Explicit
+/// pooled legacy syntax becomes a runtime Value edge because the native-v1
+/// Constant emitter always creates LiteralUtf8; the old pooled oracle stays
+/// untouched. Both Dynamic shapes have the original non-literal error policy.
+pub(super) fn run_native_source_scalar(
+    spec: &ScalarDiffSpec,
+    bound: &ResolvedFunctionBinding,
+    legacy_name: &str,
+    legacy_kind: ScalarLegacyImplementation,
+    rows: usize,
+    result_type: &FunctionValueType,
+) -> Result<ScalarDiffSummary, DifferentialFailure> {
+    let mut fixture = spec.clone();
+    if spec.legacy_constants == LegacyConstantForm::Pool {
+        for argument in &mut fixture.arguments {
+            if let DiffArgument::Constant(value) = argument {
+                let indices = UInt64Array::from(vec![u64::from(value.ordinal()); rows]);
+                let values = take(value.pool().array().as_ref(), &indices, None)
+                    .map_err(|e| DifferentialFailure::InvalidSpec(e.to_string()))?;
+                *argument = DiffArgument::Column {
+                    value_type: value.value_type().clone(),
+                    values,
+                };
+            }
+        }
+    }
+    run_compiled(
+        spec,
+        &fixture,
+        bound,
+        legacy_name,
+        legacy_kind,
+        rows,
+        result_type,
+        true,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn run_compiled(
+    spec: &ScalarDiffSpec,
+    fixture: &ScalarDiffSpec,
+    bound: &ResolvedFunctionBinding,
+    legacy_name: &str,
+    legacy_kind: ScalarLegacyImplementation,
+    rows: usize,
+    result_type: &FunctionValueType,
+    native_checked_constants: bool,
+) -> Result<ScalarDiffSummary, DifferentialFailure> {
     let call = ScalarCall {
         spec,
         legacy_kind,
         result_type,
         rows,
     };
-    let compiled = catch_unwind(AssertUnwindSafe(|| compile(spec, rows, result_type)))
-        .map_err(|e| DifferentialFailure::Specialization(panic_message(&e)))?;
+    let compiled = catch_unwind(AssertUnwindSafe(|| {
+        compile(fixture, rows, result_type, native_checked_constants)
+    }))
+    .map_err(|e| DifferentialFailure::Specialization(panic_message(&e)))?;
     let mut summary = ScalarDiffSummary {
         function: bound.function_id.clone(),
         overload: bound.selected.overload.clone(),

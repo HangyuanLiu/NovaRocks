@@ -2651,6 +2651,7 @@ pub(super) fn scalar_definition_parts(
                     name if super::calendar_sec_to_time_owner::operation(name).is_some() => {
                         Some(super::calendar_sec_to_time_owner::effects())
                     }
+                    "regexp_count" => Some(super::regexp_count_owner::effects()),
                     "regexp_position" => Some(super::regexp_position_owner::effects()),
                     name if super::string_reverse_owner::operation(name).is_some() => {
                         Some(super::string_reverse_owner::effects())
@@ -2975,6 +2976,7 @@ pub fn contribute_builtin_functions(
             name if super::calendar_sec_to_time_owner::operation(name).is_some() => {
                 super::calendar_sec_to_time_owner::definition(name, declaration, resolver)?
             }
+            "regexp_count" => super::regexp_count_owner::definition(&name, declaration, resolver)?,
             "regexp_position" => super::regexp_position_owner::definition(declaration, resolver)?,
             name if super::string_reverse_owner::operation(name).is_some() => {
                 super::string_reverse_owner::definition(name, declaration, resolver)?

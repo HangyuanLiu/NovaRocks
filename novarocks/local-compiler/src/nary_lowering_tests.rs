@@ -596,6 +596,7 @@ fn a_frozen_function_call_cannot_be_attached_to_a_physical_nary_intrinsic() {
             &fixture.fragment,
             &uses,
             vec![FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(invocation.context.use_id),
                 context: invocation.context,

@@ -166,6 +166,7 @@ fn fixture_uses_and_calls(fragment: &Fragment) -> (PhysicalRootUses, FrozenFragm
             };
             assert_eq!(function.function_id.as_str(), "fixture/guarantee/boolean");
             Some(FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(*id),
                 context: invocation.context,

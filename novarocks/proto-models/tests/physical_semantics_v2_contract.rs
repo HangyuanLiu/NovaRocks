@@ -203,6 +203,7 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
             .into_iter()
             .enumerate()
             .map(|(ordinal, site)| v2::FrozenCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 site: Some(v2::CallSite { kind: Some(site) }),
                 context: Some(v2::EffectContext {

@@ -98,12 +98,6 @@ mod calendar_period_diff;
 mod calendar_period_diff_owner;
 pub mod calendar_to_date;
 mod calendar_to_date_owner;
-pub mod map_size_core;
-mod map_size_selected;
-mod map_size_owner;
-pub mod map_projection_core;
-mod map_projection_selected;
-mod map_projection_owner;
 mod collection_cardinality;
 mod collection_cardinality_owner;
 mod control_owner;
@@ -116,6 +110,12 @@ pub mod dround_core;
 mod dround_owner;
 mod makedate;
 mod makedate_owner;
+pub mod map_projection_core;
+mod map_projection_owner;
+mod map_projection_selected;
+pub mod map_size_core;
+mod map_size_owner;
+mod map_size_selected;
 mod md5_selected;
 pub mod md5_shared;
 mod md5sum_numeric_owner;
@@ -234,8 +234,8 @@ mod calendar_sec_to_time_owner;
 pub mod regexp_position;
 mod regexp_position_owner;
 
-pub mod calendar_time_text_shared;
 mod calendar_time_text_owner;
+pub mod calendar_time_text_shared;
 
 #[cfg(test)]
 mod calendar_time_text_shared_tests;
@@ -259,3 +259,6 @@ mod calendar_slice_owner;
 pub mod array_append_core;
 mod array_append_owner;
 mod array_append_selected;
+
+pub mod regexp_count;
+pub(crate) mod regexp_count_owner;

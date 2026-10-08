@@ -851,6 +851,28 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let regexp_count_pattern_source =
+                if owner.function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
+                    let definition = fragment.expressions().get(invocation.definition).unwrap();
+                    let ExprKind::FunctionCall { args, .. } = &definition.kind else {
+                        panic!("count actual call source")
+                    };
+                    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                        &Control,
+                        CompilePhase::FunctionSpecialization,
+                    )
+                    .unwrap();
+                    let source = novarocks_physical_plan::regexp_count_pattern_source_observed(
+                        fragment.expressions(),
+                        args,
+                        &mut work,
+                    )
+                    .unwrap();
+                    work.finish().unwrap();
+                    Some(source)
+                } else {
+                    None
+                };
             let token = functions
                 .prepare_fresh(
                     CallEffectInput {
@@ -862,9 +884,17 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                                     channels: &source_channels,
                                 }
                             }
-                            None => novarocks_functions::CallArgumentUses::SelectedChannels(
-                                &argument_uses,
-                            ),
+                            None => match regexp_count_pattern_source {
+                                Some(source) => {
+                                    novarocks_functions::CallArgumentUses::RegexpCountPattern {
+                                        source,
+                                        channels: &argument_uses,
+                                    }
+                                }
+                                None => novarocks_functions::CallArgumentUses::SelectedChannels(
+                                    &argument_uses,
+                                ),
+                            },
                         },
                         function_id: &owner.function.function_id,
                         kind: FunctionKind::Scalar,
@@ -885,6 +915,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                 context,
                 effects: token.call_contract().effects().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                regexp_count_pattern_source,
                 temporal_source: source_plan,
             });
             token.effects()
@@ -1385,3 +1416,5 @@ pub(crate) fn record_temporal_invocation_data(
         }
     });
 }
+#[path = "regexp_count_tests.rs"]
+mod regexp_count_tests;

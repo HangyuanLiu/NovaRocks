@@ -314,6 +314,7 @@ fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
         .uses()
         .values()
         .map(|invocation| FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
@@ -612,6 +613,7 @@ fn case_fixture() -> Fixture {
         .map(|id| {
             let context = uses.flow().uses()[&ExpressionUseId::new(id)].context;
             FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(context.use_id),
@@ -805,6 +807,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
     for (call, use_id) in [(0, special_base), (1, special_base + 1)] {
         let context = context(use_id, 0, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Aggregate {
@@ -823,6 +826,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         .unwrap()
         .context;
     calls.push(FrozenPhysicalCall {
+        regexp_count_pattern_source: None,
         temporal_source: None,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Expression(window_use.use_id),
@@ -831,6 +835,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
     });
     let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
     calls.push(FrozenPhysicalCall {
+        regexp_count_pattern_source: None,
         temporal_source: None,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Table { node: table },
@@ -1129,6 +1134,7 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
     let mut claimed = effects(FunctionKind::Scalar, current.domain);
     claimed.argument_control = ArgumentControl::TypeOnly;
     let parent_call = FrozenPhysicalCall {
+        regexp_count_pattern_source: None,
         temporal_source: None,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Expression(current.use_id),

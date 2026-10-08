@@ -3655,6 +3655,7 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         call: 0,
     };
     let call = FrozenPhysicalCall {
+        regexp_count_pattern_source: None,
         temporal_source: None,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site,

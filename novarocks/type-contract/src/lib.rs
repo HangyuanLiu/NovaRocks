@@ -63,7 +63,6 @@ pub use compile_control::{
     PureCompileControl,
 };
 pub use control_flow::*;
-pub use temporal_source::*;
 pub use effects::*;
 pub use function::{
     AggregateStateArgumentContract, AggregateStateFormatId, FunctionArgumentEvaluation,
@@ -97,6 +96,7 @@ pub use semantics::{
     SemanticParameterProjectionError, SemanticParameterProjectionVisit, SemanticParameterRef,
     SemanticParameterValue, SemanticParameters,
 };
+pub use temporal_source::*;
 pub use value_arithmetic::{
     arithmetic_result_value_type_with_op, is_integer_value_type, is_numeric_value_type,
 };
@@ -106,3 +106,6 @@ pub use window::{WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnit
 
 #[cfg(test)]
 mod temporal_source_control_tests;
+
+mod regexp_count_source;
+pub use regexp_count_source::RegexpCountPatternSource;

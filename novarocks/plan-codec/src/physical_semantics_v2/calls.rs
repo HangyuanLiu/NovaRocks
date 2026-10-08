@@ -433,6 +433,10 @@ fn encode_calls_core(
             context: Some(encode_context(&call.context)),
             effects: Some(encode_effects(&call.effects, resources, work)?),
             decimal_overflow_policy: Some(encode_policy(call.decimal_overflow_policy)),
+            regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
+                novarocks_type_contract::RegexpCountPatternSource::Dynamic => 0,
+                novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent => 1,
+            }),
             temporal_source: call
                 .temporal_source
                 .as_ref()
@@ -532,6 +536,11 @@ fn decode_calls_core(
                 resources,
                 work,
             )?,
+            regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
+                0 => Ok(novarocks_type_contract::RegexpCountPatternSource::Dynamic),
+                1 => Ok(novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent),
+                _ => Err(E::InvalidShape("unknown regexp_count pattern source tag")),
+            }).transpose()?,
             temporal_source: call
                 .temporal_source
                 .as_ref()
@@ -830,6 +839,7 @@ mod tests {
             .uses()
             .values()
             .map(|invocation| FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(invocation.context.use_id),
@@ -1013,6 +1023,7 @@ mod tests {
         for (call, use_id) in [(0, special_base), (1, special_base + 1)] {
             let context = context(use_id, 0, EvaluationDemand::Value);
             calls.push(FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Aggregate {
@@ -1031,6 +1042,7 @@ mod tests {
             .unwrap()
             .context;
         calls.push(FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Expression(window_use.use_id),
@@ -1039,6 +1051,7 @@ mod tests {
         });
         let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Table { node: table },
@@ -1131,6 +1144,26 @@ mod tests {
                 Err(E::InvalidShape(_))
             ));
         }
+    }
+
+    #[test]
+    fn regexp_count_wire_source_unknown_and_foreign_tags_never_supply_a_default() {
+        let fixture = scalar_fixture(1, 0);
+        let dto = encode_checked(&fixture.checked().unwrap(), &TestControl::default()).unwrap();
+        assert_eq!(dto.entries[0].regexp_count_pattern_source, None);
+        for source in [-1, i32::MAX, 0, 1] {
+            let mut wrong = dto.clone();
+            wrong.entries[0].regexp_count_pattern_source = Some(source);
+            // Unknown tags fail projection; valid tags on a foreign ordinary
+            // call fail the real same-snapshot source validator.
+            assert!(decode_checked(&fixture, &wrong, &TestControl::default()).is_err());
+        }
+        let out = decode_checked(&fixture, &dto, &TestControl::default()).unwrap();
+        assert!(
+            out.entries()
+                .values()
+                .all(|call| call.regexp_count_pattern_source.is_none())
+        );
     }
 
     #[test]

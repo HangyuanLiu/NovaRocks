@@ -146,6 +146,7 @@ fn fixture_calls(fragment: &Fragment, uses: &PhysicalRootUses) -> FrozenFragment
                 panic!("the parameter fixture requires its selected timezone reference");
             };
             calls.push(FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(*id),
@@ -1788,6 +1789,7 @@ fn parameter_calls_with_references(
             assert!(function.argument_types.is_empty());
             assert!(args.is_empty());
             FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(*id),

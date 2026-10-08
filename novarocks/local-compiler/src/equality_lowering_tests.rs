@@ -546,6 +546,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             )
             .unwrap();
         frozen.push(FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
             context: invocation.context,

@@ -282,6 +282,28 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         },
         _ => unreachable!("only the two admitted installed ABIs reach preparation"),
     };
+    let regexp_count_pattern_source = if function.function_id.as_str()
+        == "builtin.scalar/regexp_count/v1"
+    {
+        let definitions = input
+            .definitions
+            .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                "regexp_count requires the original emitted definition arena",
+            ))?;
+        Some(
+            novarocks_physical_plan::regexp_count_pattern_source_observed(definitions, args, work)
+                .map_err(|error| match error {
+                    novarocks_physical_plan::TemporalSourceProjectionError::Control(cause) => {
+                        PhysicalScalarOccurrenceError::Control(cause)
+                    }
+                    novarocks_physical_plan::TemporalSourceProjectionError::Invalid(message) => {
+                        PhysicalScalarOccurrenceError::InvalidSource(message)
+                    }
+                })?,
+        )
+    } else {
+        None
+    };
     let call = CallEffectInput {
         context: invocation.context,
         argument_uses: match input.temporal_source {
@@ -289,7 +311,13 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
                 facts: &source.facts,
                 channels: &source_channels,
             },
-            None => novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
+            None => match regexp_count_pattern_source {
+                Some(source) => novarocks_functions::CallArgumentUses::RegexpCountPattern {
+                    source,
+                    channels: &argument_uses,
+                },
+                None => novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
+            },
         },
         function_id: &function.function_id,
         kind: function.kind,
@@ -315,6 +343,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         context: invocation.context,
         effects: preparation.call_contract().effects().clone(),
         decimal_overflow_policy: input.decimal_overflow_policy,
+        regexp_count_pattern_source,
         temporal_source: input.temporal_source.cloned(),
     };
     work.flush()?;

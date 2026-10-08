@@ -1305,3 +1305,6 @@ mod legacy_string_measure_additional_baseline_tests;
 
 #[cfg(test)]
 mod legacy_regexp_count_extended_baseline_tests;
+
+#[cfg(test)]
+mod legacy_regexp_count_long_error_baseline_tests;

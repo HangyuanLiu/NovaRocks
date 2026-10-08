@@ -448,6 +448,35 @@ impl Author<'_> {
                     self.work.control(),
                 )
                 .map_err(ExpressionOccurrenceError::function)?;
+            if function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
+                let owner = self
+                    .source_owner
+                    .ok_or(ExpressionOccurrenceError::TemporalSource(
+                        "regexp_count source has no original SQL emission journal",
+                    ))?;
+                self.work.flush()?;
+                owner
+                    .checked_expression_call_source_observed(self.fragment, node, &mut self.work)
+                    .map_err(|error| match error {
+                        SqlSourceJournalError::Control(cause) => {
+                            ExpressionOccurrenceError::Control(cause)
+                        }
+                        error => ExpressionOccurrenceError::Journal(error),
+                    })?;
+                // SAME emitted-definition source author as codec/validator/BE.
+                self.work.flush()?;
+                novarocks_physical_plan::regexp_count_pattern_source_observed(
+                    self.fragment.expressions(),
+                    args,
+                    &mut self.work,
+                )
+                .map_err(|error| match error {
+                    SourceError::Control(cause) => ExpressionOccurrenceError::Control(cause),
+                    SourceError::Invalid(message) => {
+                        ExpressionOccurrenceError::TemporalSource(message)
+                    }
+                })?;
+            }
             let shape = if let ArgumentControl::TemporalSource(kind) =
                 declaration.effects().argument_control
             {

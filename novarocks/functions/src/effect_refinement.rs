@@ -32,6 +32,10 @@ pub const MAX_CALL_EFFECT_ARGUMENTS: usize = 4096;
 #[derive(Clone, Copy, Debug)]
 pub enum CallArgumentUses<'a> {
     SelectedChannels(&'a [Option<novarocks_type_contract::ExpressionUseId>]),
+    RegexpCountPattern {
+        source: novarocks_type_contract::RegexpCountPatternSource,
+        channels: &'a [Option<novarocks_type_contract::ExpressionUseId>],
+    },
     TemporalSources {
         facts: &'a novarocks_type_contract::TemporalSourceFacts,
         channels: &'a [crate::TemporalSourceChannel<'a>],
@@ -48,6 +52,16 @@ impl CallArgumentUses<'_> {
             (Self::SelectedChannels(left), Self::SelectedChannels(right)) => {
                 std::ptr::eq(left, right)
             }
+            (
+                Self::RegexpCountPattern {
+                    source: left,
+                    channels: lc,
+                },
+                Self::RegexpCountPattern {
+                    source: right,
+                    channels: rc,
+                },
+            ) => left == right && std::ptr::eq(lc, rc),
             (
                 Self::TemporalSources {
                     facts: left,
@@ -173,6 +187,11 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         }
         let selected_shape = match input.argument_uses {
             CallArgumentUses::SelectedChannels(uses) => uses.len() == input.request.arguments.len(),
+            CallArgumentUses::RegexpCountPattern { channels, .. } => {
+                input.kind == FunctionKind::Scalar
+                    && channels.len() == 2
+                    && input.request.arguments.len() == 2
+            }
             CallArgumentUses::TemporalSources { facts, channels } => {
                 input.kind == FunctionKind::Scalar
                     && facts.validate().is_ok()
@@ -212,14 +231,23 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 EffectContractError::ProofScopeMismatch,
             ));
         }
+        if matches!(
+            input.argument_uses,
+            CallArgumentUses::RegexpCountPattern { .. }
+        ) && input.function_id.as_str() != "builtin.scalar/regexp_count/v1"
+        {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "foreign regexp_count pattern source",
+            ));
+        }
         // Specialization consumes already-coerced arguments. Check their complete
         // types before any owner operation; this does not resolve FE coercions or
         // infer a legacy literal payload's type.
         validate_input_types(input, &mut work)?;
         let merge_state = match input.argument_uses {
-            CallArgumentUses::SelectedChannels(_) | CallArgumentUses::TemporalSources { .. } => {
-                None
-            }
+            CallArgumentUses::SelectedChannels(_)
+            | CallArgumentUses::RegexpCountPattern { .. }
+            | CallArgumentUses::TemporalSources { .. } => None,
             CallArgumentUses::AggregateMerge {
                 state_input_type, ..
             } => {
@@ -294,8 +322,18 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 work.step().map_err(CallEffectRefinementError::Control)?;
             }
         }
+        if matches!(
+            input.argument_uses,
+            CallArgumentUses::RegexpCountPattern { .. }
+        ) && declaration.argument_control != novarocks_type_contract::ArgumentControl::Eager
+        {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "regexp_count source requires eager scalar control",
+            ));
+        }
         match input.argument_uses {
-            CallArgumentUses::SelectedChannels(uses) => {
+            CallArgumentUses::SelectedChannels(uses)
+            | CallArgumentUses::RegexpCountPattern { channels: uses, .. } => {
                 if matches!(
                     declaration.argument_control,
                     novarocks_type_contract::ArgumentControl::TemporalSource(_)

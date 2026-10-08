@@ -1682,6 +1682,37 @@ fn prepare_core(
                         }
                         work.step()?;
                     }
+                    let regexp_count_pattern_source = if function.function_id.as_str()
+                        == "builtin.scalar/regexp_count/v1"
+                    {
+                        let expected =
+                            novarocks_physical_plan::regexp_count_pattern_source_observed(
+                                package.fragment().expressions(),
+                                args,
+                                work,
+                            )
+                            .map_err(|error| match error {
+                                novarocks_physical_plan::TemporalSourceProjectionError::Control(
+                                    cause,
+                                ) => ExpressionLoweringError::Control(cause),
+                                novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                                    message,
+                                ) => ExpressionLoweringError::Invalid(message),
+                            })?;
+                        if frozen.regexp_count_pattern_source != Some(expected) {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "regexp_count frozen source differs from actual native-v1 projection",
+                            ));
+                        }
+                        Some(expected)
+                    } else {
+                        if frozen.regexp_count_pattern_source.is_some() {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "foreign regexp_count pattern source",
+                            ));
+                        }
+                        None
+                    };
                     let input = CallEffectInput {
                         context: frozen.context,
                         argument_uses: match &frozen.temporal_source {
@@ -1691,9 +1722,17 @@ fn prepare_core(
                                     channels: &source_channels,
                                 }
                             }
-                            None => novarocks_functions::CallArgumentUses::SelectedChannels(
-                                &argument_uses,
-                            ),
+                            None => match regexp_count_pattern_source {
+                                Some(source) => {
+                                    novarocks_functions::CallArgumentUses::RegexpCountPattern {
+                                        source,
+                                        channels: &argument_uses,
+                                    }
+                                }
+                                None => novarocks_functions::CallArgumentUses::SelectedChannels(
+                                    &argument_uses,
+                                ),
+                            },
                         },
                         function_id: &function.function_id,
                         kind: function.kind,

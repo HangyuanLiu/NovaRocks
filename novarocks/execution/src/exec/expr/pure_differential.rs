@@ -724,6 +724,16 @@ pub(crate) fn run_scalar_differential(
             reason: "lookup_function has no legacy kind".into(),
         });
     };
+    if bound.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
+        return temporal::run_native_source_scalar(
+            spec,
+            &bound,
+            &legacy_name,
+            legacy_kind,
+            rows,
+            &result_type,
+        );
+    }
     let prepared = prepare_scalar(catalog, spec, &bound, &dependencies)?;
     let call = ScalarCall {
         spec,

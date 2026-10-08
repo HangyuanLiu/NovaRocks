@@ -66,6 +66,8 @@ message FrozenCall {
   // decode rejects absence, UNSPECIFIED and unknown values without a default.
   optional DecimalOverflowPolicy decimal_overflow_policy = 4;
   TemporalSourcePlan temporal_source = 5;
+  // Explicit presence preserves proved dynamic versus missing source facts.
+  optional RegexpCountPatternSource regexp_count_pattern_source = 6;
 }
 
 // One shared semantic policy for actual function calls and Binary/Cast nodes.
@@ -252,4 +254,10 @@ message TemporalSourcePlan {
   novarocks.physical_control_v2.TemporalSourceShape shape = 1;
   repeated TemporalCastKind cast_chain = 2;
   repeated TemporalSourceOccurrence sources = 3;
+}
+
+// Actual emitted native-v1 source; no lexical Literal/known-constant inference.
+enum RegexpCountPatternSource {
+  REGEXP_COUNT_DYNAMIC = 0;
+  REGEXP_COUNT_NATIVE_V1_UTF8_LITERAL_WHEN_PRESENT = 1;
 }

@@ -625,6 +625,7 @@ fn package(
         &fragment,
         &root_uses,
         vec![FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             site: PhysicalCallSite::Table { node: TABLE },
             context,

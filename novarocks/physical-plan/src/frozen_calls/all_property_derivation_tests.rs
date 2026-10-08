@@ -56,6 +56,7 @@ pub(super) fn frozen_fixture(fragment: Fragment) -> Fixture {
         .uses()
         .values()
         .map(|invocation| FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
             context: invocation.context,

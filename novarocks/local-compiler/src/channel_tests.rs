@@ -481,6 +481,7 @@ fn package_with_outputs(
             )
             .unwrap();
         call_entries.push(FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             site: PhysicalCallSite::Expression(*call_use),
             context,

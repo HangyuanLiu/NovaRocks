@@ -65,6 +65,12 @@ impl ScalarCallContract {
     pub const fn call(&self) -> &crate::FunctionCallContract {
         &self.0
     }
+    pub const fn regexp_count_pattern_source(
+        &self,
+    ) -> Option<novarocks_type_contract::RegexpCountPatternSource> {
+        self.0.regexp_count_pattern_source()
+    }
+
     pub const fn function_id(&self) -> &FunctionId {
         self.0.function_id()
     }

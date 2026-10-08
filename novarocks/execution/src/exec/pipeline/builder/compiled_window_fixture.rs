@@ -727,6 +727,7 @@ pub(super) fn package(
         let call_context = context(use_id.get());
         if call.uninstalled {
             frozen.push(FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(use_id),
                 context: call_context,
@@ -800,6 +801,7 @@ pub(super) fn package(
             )
             .unwrap_or_else(|error| panic!("fixture window call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             site: PhysicalCallSite::Expression(use_id),
             context: call_context,

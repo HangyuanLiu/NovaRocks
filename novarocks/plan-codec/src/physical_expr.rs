@@ -623,8 +623,13 @@ fn encode_kind(
         ExprKind::Literal(_) => {
             return Err("native wire v1 requires a checked constant reference".into());
         }
-        ExprKind::Constant(reference) => Kind::Literal(expr::LiteralExpr {
-            value: Some(cv_projection::encode(*reference, expression_type, context)?),
+        ExprKind::Constant(_) => Kind::Literal(expr::LiteralExpr {
+            value: Some(cv_projection::encode(
+                novarocks_physical_plan::native_v1_emitted_constant_reference(kind)
+                    .expect("matched actual native v1 Constant emission"),
+                expression_type,
+                context,
+            )?),
         }),
         ExprKind::Unary { op, expr: operand } => Kind::UnaryOp(Box::new(expr::UnaryOpExpr {
             op: encode_unary(*op)? as i32,

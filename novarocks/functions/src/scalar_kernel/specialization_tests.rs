@@ -365,7 +365,8 @@ fn argument_summary(input: CallEffectInput<'_>) -> ScopedExpressionEffects {
                 crate::CallArgumentUses::AggregateMerge { .. } => {
                     panic!("scalar fixture has aggregate merge channels")
                 }
-                crate::CallArgumentUses::TemporalSources { .. } => {
+                crate::CallArgumentUses::TemporalSources { .. }
+                | crate::CallArgumentUses::RegexpCountPattern { .. } => {
                     panic!("eager scalar fixture has temporal source channels")
                 }
             },

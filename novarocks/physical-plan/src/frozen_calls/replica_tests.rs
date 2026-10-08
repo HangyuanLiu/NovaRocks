@@ -573,6 +573,7 @@ fn broadcast_table_fixture() -> Fixture {
         uses,
         calls: vec![
             FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(scalar_context.use_id),
@@ -580,6 +581,7 @@ fn broadcast_table_fixture() -> Fixture {
                 effects: effects(FunctionKind::Scalar, scalar_context.domain),
             },
             FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Table { node: table },

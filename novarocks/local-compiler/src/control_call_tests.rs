@@ -500,6 +500,7 @@ fn package(
         &expression_uses,
         vec![
             FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(parent_context.use_id),
                 context: parent_context,
@@ -507,6 +508,7 @@ fn package(
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
             FrozenPhysicalCall {
+                regexp_count_pattern_source: None,
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(rng_context.use_id),
                 context: rng_context,

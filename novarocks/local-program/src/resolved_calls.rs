@@ -610,6 +610,24 @@ fn validate_expression(
         return Err(ProgramResolvedCallsError::WrongArguments);
     }
     let definitions = &snapshot.roots().arenas()[&occurrence.arena];
+    if call.function_id().as_str() == "builtin.scalar/regexp_count/v1" {
+        if invocation.control != ControlShape::Eager || args.len() != 2 {
+            return Err(ProgramResolvedCallsError::WrongArguments);
+        }
+        let pattern = definitions
+            .node(args[1])
+            .ok_or(ProgramResolvedCallsError::InvalidSite)?;
+        let expected = if matches!(pattern.kind(), crate::StaticExprKind::Constant(_)) {
+            novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent
+        } else {
+            novarocks_type_contract::RegexpCountPatternSource::Dynamic
+        };
+        if call.regexp_count_pattern_source() != Some(expected) {
+            return Err(ProgramResolvedCallsError::WrongArguments);
+        }
+    } else if call.regexp_count_pattern_source().is_some() {
+        return Err(ProgramResolvedCallsError::WrongArguments);
+    }
     if let ControlShape::TemporalSource(shape) = invocation.control {
         let source = call
             .temporal_source()

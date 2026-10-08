@@ -1698,6 +1698,7 @@ fn freeze_counts(
             )
             .unwrap_or_else(|error| panic!("COUNT(*) prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            regexp_count_pattern_source: None,
             temporal_source: None,
             site: PhysicalCallSite::Aggregate {
                 node,
