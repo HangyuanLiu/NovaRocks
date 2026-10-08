@@ -111,6 +111,10 @@ pub(crate) enum FrontendMaintenanceSkip {
     Stopping {
         mv_id: i64,
     },
+    ExecutionBindingFailed {
+        mv_id: i64,
+        reason: String,
+    },
     Admission {
         mv_id: i64,
         admission: MaintenanceAdmission,
@@ -206,6 +210,7 @@ impl FrontendMaintenanceWorker {
         let AdmittedAutomaticQuery {
             owner,
             query_concurrency,
+            result_capacity,
         } = match admit_automatic_query(
             &self.dependencies.root_admission,
             &self.dependencies.runtime,
@@ -238,6 +243,22 @@ impl FrontendMaintenanceWorker {
             return;
         }
 
+        let engine = match self
+            .dependencies
+            .table_maintenance_engine
+            .for_admitted_execution(&result_capacity)
+        {
+            Ok(engine) => engine,
+            Err(reason) => {
+                finish_automatic_root(owner, query_concurrency);
+                pass.skipped
+                    .push(FrontendMaintenanceSkip::ExecutionBindingFailed {
+                        mv_id: definition.mv_id,
+                        reason,
+                    });
+                return;
+            }
+        };
         let attempt = match self
             .runtime
             .try_begin(definition.mv_id, target.clone(), &facts, now_ms)
@@ -253,7 +274,7 @@ impl FrontendMaintenanceWorker {
             }
         };
         let mut runner = TableMaintenanceAutomaticRunner {
-            engine: Arc::clone(&self.dependencies.table_maintenance_engine),
+            engine,
             service: Arc::clone(&self.dependencies.table_maintenance_service),
             connector_control: Arc::clone(&self.dependencies.connector_control),
             readiness: Arc::clone(&self.dependencies.readiness),
@@ -280,6 +301,8 @@ impl FrontendMaintenanceWorker {
 struct AdmittedAutomaticQuery {
     owner: WorkOwner,
     query_concurrency: QueryConcurrencyPermit,
+    result_capacity:
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 }
 
 fn admit_automatic_query(
@@ -288,10 +311,21 @@ fn admit_automatic_query(
 ) -> Result<AdmittedAutomaticQuery, novarocks_workload_control::WorkError> {
     let root =
         root_admission.begin_warehouse_root(WorkRequest::new(WorkClass::MaterializedView))?;
-    let query_concurrency = runtime.block_on(async { root.owner.scope().admit_query()?.await })?;
+    let (query_concurrency, window) = runtime.block_on(async {
+        root.owner
+            .scope()
+            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)?
+            .await
+    })?;
+    let result_capacity =
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(),
+            window.retain_alias(),
+        )?;
     Ok(AdmittedAutomaticQuery {
         owner: root.owner,
         query_concurrency,
+        result_capacity,
     })
 }
 

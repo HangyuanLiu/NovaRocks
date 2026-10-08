@@ -550,7 +550,7 @@ impl FrontendDistributedQueryCoordinator {
         retry_boundary: Option<&dyn PreReadyRetryBoundary>,
         credential_lease_source: RoundCredentialLeaseSource,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let mut parts = request.into_parts();
+        let parts = request.into_parts();
         let delivery = ProductionRootDelivery::bind(
             parts.description.row_carrier(),
             parts

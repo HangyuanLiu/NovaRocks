@@ -763,20 +763,56 @@ pub fn background_maintenance_attempt(
     topology: BackendTopologyService,
     max_attempt_duration: std::time::Duration,
     runtime: &tokio::runtime::Handle,
+    capacity: Option<
+        &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    >,
 ) -> Result<BackgroundMaintenanceAttempt, String> {
+    if let Some(capacity) = capacity {
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )?;
+    }
     let topology = topology.snapshot().map_err(|error| error.to_string())?;
     let deadline = std::time::Instant::now()
         .checked_add(max_attempt_duration)
         .ok_or_else(|| "automatic maintenance deadline overflow".to_string())?;
-    let cancellation = novarocks_query_application::cancellation::QueryCancellationSource::new();
+    let (cancellation, deadline) = match capacity {
+        Some(capacity) => {
+            let view = capacity
+                .scope()
+                .cancellation()
+                .map_err(|error| error.to_string())?;
+            let deadline = view
+                .deadline()
+                .map(std::time::Instant::from)
+                .map_or(deadline, |root_deadline| root_deadline.min(deadline));
+            (
+                novarocks_query_application::cancellation::QueryCancellationView::governed(
+                    view, None,
+                ),
+                deadline,
+            )
+        }
+        None => (
+            novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
+            deadline,
+        ),
+    };
     let execution = novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
         role,
         topology,
         Some(deadline),
-        cancellation.view(),
+        cancellation,
         novarocks_sql::compiler::SessionOptimizerSettings::default(),
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     );
+    let execution = match capacity {
+        Some(capacity) => execution
+            .with_result_capacity(capacity.clone())
+            .map_err(|error| error.to_string())?,
+        None => execution,
+    };
     let connector_context = crate::connector::connector_request_context_for_execution_on_runtime(
         None, &execution, runtime,
     )?;

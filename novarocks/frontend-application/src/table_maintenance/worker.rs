@@ -438,7 +438,11 @@ impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
             Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
             Err(error) => return Err(format!("admit governed optimize root failed: {error}")),
         };
-        let permit = match root.owner.scope().admit_query() {
+        let (permit, window) = match root
+            .owner
+            .scope()
+            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
+        {
             Ok(admission) => match admission.await {
                 Ok(permit) => permit,
                 Err(WorkError::Cancelled(_))
@@ -458,8 +462,9 @@ impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
                 ));
             }
         };
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).map_err(|error| format!("bind admitted optimize capacity: {error}"))?;
         Ok(OptimizeJobAdmission::Acquired(Box::new(
-            FrontendOptimizeJobScope::new(root.owner, permit),
+            FrontendOptimizeJobScope::new(root.owner, permit, capacity),
         )))
     }
 }
@@ -471,20 +476,43 @@ struct FrontendOptimizeJobScope {
 struct AdmittedOptimizeJob {
     owner: WorkOwner,
     query_concurrency: QueryConcurrencyPermit,
+    result_capacity:
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 }
 
 impl FrontendOptimizeJobScope {
-    fn new(owner: WorkOwner, query_concurrency: QueryConcurrencyPermit) -> Self {
+    fn new(
+        owner: WorkOwner,
+        query_concurrency: QueryConcurrencyPermit,
+        result_capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Self {
         Self {
             work: Mutex::new(Some(AdmittedOptimizeJob {
                 owner,
                 query_concurrency,
+                result_capacity,
             })),
         }
     }
 }
 
 impl OptimizeJobScope for FrontendOptimizeJobScope {
+    fn result_capacity(
+        &self,
+    ) -> Result<
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        String,
+    > {
+        let work = self
+            .work
+            .lock()
+            .map_err(|error| format!("lock optimize result capacity: {error}"))?;
+        let work = work
+            .as_ref()
+            .ok_or("optimize result capacity was released")?;
+        Ok(work.result_capacity.clone())
+    }
+
     fn is_cancelled(&self) -> Result<bool, String> {
         let work = self
             .work
@@ -506,6 +534,7 @@ impl Drop for FrontendOptimizeJobScope {
         let Some(AdmittedOptimizeJob {
             owner,
             query_concurrency,
+            result_capacity,
         }) = self
             .work
             .get_mut()
@@ -516,6 +545,7 @@ impl Drop for FrontendOptimizeJobScope {
         };
         drop(query_concurrency);
         owner.complete();
+        drop(result_capacity);
     }
 }
 
@@ -538,14 +568,18 @@ impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
         self.engine.strong_count() != 0 && self.product.strong_count() != 0
     }
 
-    fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
-        self.engine
-            .upgrade()
-            .zip(self.product.upgrade())
-            .map(|(engine, product)| {
-                Box::new(FrontendOptimizeJobExecution { engine, product })
-                    as Box<dyn OptimizeJobExecution>
-            })
+    fn acquire(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
+        let Some((engine, product)) = self.engine.upgrade().zip(self.product.upgrade()) else {
+            return Ok(None);
+        };
+        let engine = engine.for_admitted_execution(capacity)?;
+        Ok(Some(Box::new(FrontendOptimizeJobExecution {
+            engine,
+            product,
+        })))
     }
 }
 
@@ -573,14 +607,19 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
     fn execute(
         &self,
         job: &OptimizeJob,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
+        let engine = self
+            .engine
+            .for_admitted_execution(capacity)
+            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         stat2f_record_provider_dispatch(job.job_id).map_err(OptimizeTerminalError::failed)?;
         let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
             format!("maintenance-job:{}", job.job_id),
             format!("maintenance-job:{}", job.job_id),
         );
         self.product.execute_rewrite_terminal(
-            &FrontendMaintenanceEffectPort::new(self.engine.as_ref()),
+            &FrontendMaintenanceEffectPort::new(engine.as_ref()),
             &job.target,
             RewriteIntent::DataFiles { rewrite_all: true },
         )
@@ -590,7 +629,12 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
         &self,
         job: &OptimizeJob,
         effect_id: MaintenanceEffectId,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<AutomaticMaintenanceOutcome, OptimizeTerminalError> {
+        let engine = self
+            .engine
+            .for_admitted_execution(capacity)
+            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         stat2f_record_provider_dispatch(job.job_id)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
@@ -598,7 +642,7 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             format!("maintenance-job:{}", job.job_id),
         );
         self.product.execute_automatic_rewrite_terminal(
-            &FrontendMaintenanceEffectPort::new(self.engine.as_ref()),
+            &FrontendMaintenanceEffectPort::new(engine.as_ref()),
             &job.target,
             effect_id,
         )

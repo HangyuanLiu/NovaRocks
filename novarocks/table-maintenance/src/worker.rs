@@ -41,6 +41,12 @@ use crate::{
 /// reads cancellation but never manufactures a host scope or a second
 /// admission authority.
 pub trait OptimizeJobScope: Send + Sync {
+    fn result_capacity(
+        &self,
+    ) -> Result<
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        String,
+    >;
     fn is_cancelled(&self) -> Result<bool, String>;
 }
 
@@ -71,14 +77,21 @@ pub trait OptimizeJobExecutionPort: Send + Sync {
     /// Acquires one exact provider/native execution lease for a claimed job.
     /// The returned value keeps the host capability alive through both target
     /// rebind and dispatch, so host teardown cannot race between them.
-    fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>>;
+    fn acquire(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String>;
 }
 
 /// One exact provider/native execution lease for a claimed OPTIMIZE job.
 pub trait OptimizeJobExecution: Send {
     fn rebind_target(&self, job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String>;
 
-    fn execute(&self, job: &OptimizeJob) -> Result<crate::MaintenanceActionOutcome, TerminalError>;
+    fn execute(
+        &self,
+        job: &OptimizeJob,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<crate::MaintenanceActionOutcome, TerminalError>;
 
     /// Executes an MV-owned OPTIMIZE using the identity frozen before job
     /// submission. An adapter without this capability fails before dispatch.
@@ -86,6 +99,7 @@ pub trait OptimizeJobExecution: Send {
         &self,
         _job: &OptimizeJob,
         _effect_id: MaintenanceEffectId,
+        _capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         Err(TerminalError::pre_dispatch_failed(
             "automatic optimize effect identity is unsupported",
@@ -198,12 +212,46 @@ async fn run_worker(
             }
             continue;
         };
-        let Some(execution) = execution.acquire() else {
-            drop(scope);
-            cancel_for_shutdown(jobs.as_ref()).await?;
-            return Ok(());
+        let acquisition = match scope.is_cancelled() {
+            Ok(true) => {
+                finish_cancelled(
+                    jobs.as_ref(),
+                    job.job_id,
+                    "optimize job cancelled before execution binding",
+                )
+                .await?;
+                drop(scope);
+                continue;
+            }
+            Ok(false) => scope.result_capacity().and_then(|capacity| {
+                execution
+                    .acquire(&capacity)
+                    .map(|execution| (execution, capacity))
+            }),
+            Err(error) => Err(error),
         };
-        let result = execute_claimed_job(jobs.as_ref(), execution, scope.as_ref(), job).await;
+        let (execution, capacity) = match acquisition {
+            Ok((Some(execution), capacity)) => (execution, capacity),
+            Ok((None, _)) => {
+                drop(scope);
+                cancel_for_shutdown(jobs.as_ref()).await?;
+                return Ok(());
+            }
+            Err(error) => {
+                finish(
+                    jobs.as_ref(),
+                    job.job_id,
+                    Err(TerminalError::pre_dispatch_failed(format!(
+                        "bind optimize execution before target rebind failed: {error}"
+                    ))),
+                )
+                .await?;
+                drop(scope);
+                continue;
+            }
+        };
+        let result =
+            execute_claimed_job(jobs.as_ref(), execution, scope.as_ref(), capacity, job).await;
         drop(scope);
         result?;
     }
@@ -219,6 +267,7 @@ async fn execute_claimed_job(
     jobs: &OptimizeProcessRuntime,
     execution: Box<dyn OptimizeJobExecution>,
     scope: &dyn OptimizeJobScope,
+    capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     job: OptimizeJob,
 ) -> Result<(), String> {
     let job_id = job.job_id;
@@ -289,14 +338,18 @@ async fn execute_claimed_job(
     }
     let automatic = job.effect_id.is_some();
     let execution = tokio::task::spawn_blocking(move || match job.effect_id {
-        Some(effect_id) => execution.execute_automatic(&job, effect_id).map(|outcome| {
-            let (action, committed) = match outcome {
-                AutomaticMaintenanceOutcome::KnownCommitted(action) => (action, true),
-                AutomaticMaintenanceOutcome::NoOpWithoutCommit(action) => (action, false),
-            };
-            (action, Some(committed))
-        }),
-        None => execution.execute(&job).map(|action| (action, None)),
+        Some(effect_id) => execution
+            .execute_automatic(&job, effect_id, &capacity)
+            .map(|outcome| {
+                let (action, committed) = match outcome {
+                    AutomaticMaintenanceOutcome::KnownCommitted(action) => (action, true),
+                    AutomaticMaintenanceOutcome::NoOpWithoutCommit(action) => (action, false),
+                };
+                (action, Some(committed))
+            }),
+        None => execution
+            .execute(&job, &capacity)
+            .map(|action| (action, None)),
     })
     .await;
     let terminal = match execution {
@@ -357,7 +410,7 @@ fn now_unix_millis() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -369,12 +422,69 @@ mod tests {
 
     struct TestScope {
         cancelled: bool,
+        root: Option<novarocks_workload_control::WorkOwner>,
+        permit: Option<novarocks_workload_control::QueryConcurrencyPermit>,
+        capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    }
+    impl Drop for TestScope {
+        fn drop(&mut self) {
+            drop(self.permit.take());
+            if let Some(root) = self.root.take() {
+                root.complete();
+            }
+        }
     }
 
     impl OptimizeJobScope for TestScope {
+        fn result_capacity(
+            &self,
+        ) -> Result<
+            novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            String,
+        > {
+            Ok(self.capacity.clone())
+        }
         fn is_cancelled(&self) -> Result<bool, String> {
             Ok(self.cancelled)
         }
+    }
+
+    pub(crate) async fn admitted_scope_fixture() -> Box<dyn OptimizeJobScope> {
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+            WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .root_admission()
+            .begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance))
+            .unwrap();
+        let (permit, window) = root
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Internal)
+            .unwrap()
+            .await
+            .unwrap();
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+        Box::new(TestScope {
+            cancelled: false,
+            root: Some(root.owner),
+            permit: Some(permit),
+            capacity,
+        })
     }
 
     struct TestAdmission {
@@ -391,9 +501,9 @@ mod tests {
             if !self.ready.load(Ordering::Acquire) {
                 return Ok(OptimizeJobAdmission::RetryLater);
             }
-            Ok(OptimizeJobAdmission::Acquired(Box::new(TestScope {
-                cancelled: false,
-            })))
+            Ok(OptimizeJobAdmission::Acquired(
+                admitted_scope_fixture().await,
+            ))
         }
     }
 
@@ -408,8 +518,15 @@ mod tests {
             true
         }
 
-        fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
-            Some(Box::new(self.clone()))
+        fn acquire(
+            &self,
+            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
+            capacity
+                .scope()
+                .check()
+                .map_err(|error| error.to_string())?;
+            Ok(Some(Box::new(self.clone())))
         }
     }
 
@@ -419,7 +536,16 @@ mod tests {
             Ok(self.rebind)
         }
 
-        fn execute(&self, _job: &OptimizeJob) -> Result<MaintenanceActionOutcome, TerminalError> {
+        fn execute(
+            &self,
+            _job: &OptimizeJob,
+            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        ) -> Result<MaintenanceActionOutcome, TerminalError> {
+            assert_eq!(
+                capacity.class(),
+                novarocks_workload_control::ResultWindowClass::Internal
+            );
+            capacity.scope().check().unwrap();
             self.calls.lock().expect("calls lock").push("execute");
             Ok(MaintenanceActionOutcome::RewriteDataFiles {
                 target_snapshot_id: Some(1),
@@ -535,6 +661,49 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn capacity_binding_failure_finishes_claim_without_target_rebind() {
+        struct RefusedExecution;
+        impl OptimizeJobExecutionPort for RefusedExecution {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn acquire(
+                &self,
+                capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
+                assert_eq!(
+                    capacity.class(),
+                    novarocks_workload_control::ResultWindowClass::Internal
+                );
+                Err("frozen attempt capacity mismatch".to_string())
+            }
+        }
+        let jobs = Arc::new(OptimizeProcessRuntime::new());
+        let job_id = submit_job(jobs.as_ref()).await;
+        let mut worker = OptimizeWorker::start(
+            &Handle::current(),
+            Arc::clone(&jobs),
+            Arc::new(TestAdmission {
+                ready: Arc::new(AtomicBool::new(true)),
+                closed: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(RefusedExecution),
+        );
+        let terminal = jobs
+            .wait_for_completion(job_id)
+            .await
+            .expect("binding refusal is terminal");
+        assert_eq!(
+            terminal.state,
+            crate::runtime::MaintenanceJobState::PreDispatchFailed
+        );
+        worker
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("worker remains stoppable");
     }
 
     #[tokio::test]
