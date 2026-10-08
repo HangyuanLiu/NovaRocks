@@ -739,6 +739,11 @@ pub fn preflight_extend(
 pub fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
     if let Some(width) = ty.primitive_width() {
         buffer_extent(rows, width)?;
+    } else if let DataType::FixedSizeBinary(width) = ty {
+        buffer_extent(
+            rows,
+            usize::try_from(*width).map_err(|_| CopyError::Extent)?,
+        )?;
     } else if *ty != DataType::Boolean {
         return Err(CopyError::Unsupported(ty.clone()));
     }

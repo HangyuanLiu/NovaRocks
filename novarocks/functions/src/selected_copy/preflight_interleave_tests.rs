@@ -127,7 +127,6 @@ fn unsupported_variable_and_encoded_carriers_are_not_silently_copied_or_retagged
     for ty in [
         DataType::Null,
         DataType::Utf8,
-        DataType::FixedSizeBinary(16),
         DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
         DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
@@ -222,4 +221,45 @@ fn ordinary_choice_failure_still_observes_tail_and_tail_refusal_is_primary() {
         );
         assert_eq!(callbacks, trace.len());
     }
+}
+
+#[test]
+fn fixed_binary_interleave_preserves_selected_bytes_nulls_and_exact_width() {
+    use arrow_array::FixedSizeBinaryArray;
+    let first = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [Some([1u8; 16]), None, Some([3u8; 16])].into_iter(),
+        16,
+    )
+    .unwrap();
+    let second = FixedSizeBinaryArray::try_from_iter([[9u8; 16]].into_iter()).unwrap();
+    let arrays: Vec<ArrayRef> = vec![Arc::new(first.slice(1, 2)), Arc::new(second)];
+    let choices = [(1, 0), (0, 0), (0, 1), (1, 0)];
+    preflight_guarded_interleave(
+        &DataType::FixedSizeBinary(16),
+        &arrays,
+        &choices,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let refs: Vec<&dyn Array> = arrays.iter().map(AsRef::as_ref).collect();
+    let result = arrow_select::interleave::interleave(&refs, &choices).unwrap();
+    let result = result
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(result.value(0), &[9u8; 16]);
+    assert!(result.is_null(1));
+    assert_eq!(result.value(2), &[3u8; 16]);
+    assert_eq!(result.value(3), &[9u8; 16]);
+    assert!(matches!(
+        preflight_guarded_interleave(&DataType::FixedSizeBinary(8), &arrays, &choices, |_| Ok(())),
+        Err(CopyError::Invalid(_))
+    ));
+    assert!(
+        fixed_interleave_extent(&DataType::FixedSizeBinary(16), isize::MAX as usize / 16).is_ok()
+    );
+    assert!(matches!(
+        fixed_interleave_extent(&DataType::FixedSizeBinary(16), isize::MAX as usize / 16 + 1),
+        Err(CopyError::Extent)
+    ));
 }
