@@ -1750,3 +1750,6 @@ mod cardinality_dedup_tests;
 
 #[path = "pure_differential_to_base64_tests.rs"]
 mod to_base64_tests;
+
+#[path = "pure_differential_calendar_leaf_dedup_tests.rs"]
+mod calendar_leaf_dedup_tests;
