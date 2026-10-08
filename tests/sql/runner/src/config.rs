@@ -107,9 +107,11 @@ pub fn load_runner_config(path: Option<&Path>) -> Result<RunnerConfig> {
     Ok(config)
 }
 
-const FIXTURE_ENDPOINT_KEYS: [&str; 5] = [
+const FIXTURE_ENDPOINT_KEYS: [&str; 7] = [
     "iceberg_rest_uri",
     "iceberg_rest_warehouse",
+    "iceberg_rest_mv_uri",
+    "iceberg_rest_mv_warehouse",
     "oss_endpoint",
     "oss_ak",
     "oss_sk",
@@ -128,7 +130,7 @@ pub(crate) fn project_fixture_value(config: &mut RunnerConfig, key: &str, value:
 /// One endpoint projection for generated configurations and private fixtures.
 /// Secrets deliberately have no Debug implementation.
 pub(crate) struct FixtureEndpoints {
-    values: [String; 5],
+    values: [String; 7],
     env_file: PathBuf,
 }
 
@@ -191,7 +193,7 @@ impl FixtureEndpoints {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         let env_file = PathBuf::from(required("fixture_env_file")?);
-        Self::new(values.try_into().expect("five endpoint keys"), env_file)
+        Self::new(values.try_into().expect("seven endpoint keys"), env_file)
     }
 
     pub(crate) fn from_isolated(
@@ -203,6 +205,8 @@ impl FixtureEndpoints {
             [
                 endpoints.rest_uri.clone(),
                 endpoints.rest_warehouse.clone(),
+                endpoints.rest_mv_uri.clone(),
+                endpoints.rest_mv_warehouse.clone(),
                 endpoints.minio_endpoint.clone(),
                 identity.access_key_id.clone(),
                 identity.secret_access_key.clone(),
@@ -211,11 +215,11 @@ impl FixtureEndpoints {
         )
     }
 
-    fn new(values: [String; 5], env_file: PathBuf) -> Result<Self> {
+    fn new(values: [String; 7], env_file: PathBuf) -> Result<Self> {
         for (key, value) in FIXTURE_ENDPOINT_KEYS.iter().zip(&values) {
             anyhow::ensure!(
                 !value.trim().is_empty(),
-                "fixture runtime configuration required: missing {key}"
+                "fixture runtime configuration required: missing {key}; use the generated sql-test.toml after docker/iceberg-rest/up.sh"
             );
         }
         anyhow::ensure!(
@@ -234,7 +238,15 @@ impl FixtureEndpoints {
             project_fixture_value(config, key, value);
         }
         project_fixture_value(config, "fixture_env_file", &self.env_file.to_string_lossy());
-        let [rest, warehouse, endpoint, access_key, secret_key] = &self.values;
+        let [
+            rest,
+            warehouse,
+            rest_mv,
+            rest_mv_warehouse,
+            endpoint,
+            access_key,
+            secret_key,
+        ] = &self.values;
         [
             ("AWS_S3_ENDPOINT", endpoint.clone()),
             ("AWS_S3_ACCESS_KEY_ID", access_key.clone()),
@@ -243,6 +255,11 @@ impl FixtureEndpoints {
             ("MINIO_ROOT_PASSWORD", secret_key.clone()),
             ("NOVAROCKS_ICEBERG_REST_URI", rest.clone()),
             ("NOVAROCKS_ICEBERG_REST_WAREHOUSE", warehouse.clone()),
+            ("NOVAROCKS_ICEBERG_REST_MV_URI", rest_mv.clone()),
+            (
+                "NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE",
+                rest_mv_warehouse.clone(),
+            ),
             ("NOVA_ENV_REST_WAREHOUSE_URI", warehouse.clone()),
             (
                 "NOVA_ENV_REST_ENV_FILE",
@@ -819,6 +836,8 @@ port = "23223"
 fixture_env_file = {env_file:?}
 iceberg_rest_uri = "http://127.0.0.1:38181"
 iceberg_rest_warehouse = "s3://warehouse/worktree/rest"
+iceberg_rest_mv_uri = "http://127.0.0.1:38182"
+iceberg_rest_mv_warehouse = "s3://warehouse/worktree/rest-mv"
 oss_endpoint = "http://127.0.0.1:38000"
 oss_ak = "fixture-key"
 oss_sk = "fixture-secret"
@@ -849,6 +868,8 @@ oss_sk = "fixture-secret"
         let endpoints = IsolatedIcebergRestEndpoints {
             rest_uri: "http://127.0.0.1:39181".into(),
             rest_warehouse: "s3://warehouse/isolated/rest".into(),
+            rest_mv_uri: "http://127.0.0.1:39182".into(),
+            rest_mv_warehouse: "s3://warehouse/isolated/rest-mv".into(),
             minio_endpoint: "http://127.0.0.1:39000".into(),
             compose_project: "nr-isolated-rest-test".into(),
         };
@@ -895,6 +916,14 @@ oss_sk = "fixture-secret"
         assert_eq!(captured["MINIO_ROOT_PASSWORD"], identity.secret_access_key);
         assert_eq!(captured["NOVAROCKS_ICEBERG_REST_URI"], endpoints.rest_uri);
         assert_eq!(
+            captured["NOVAROCKS_ICEBERG_REST_MV_URI"],
+            endpoints.rest_mv_uri
+        );
+        assert_eq!(
+            captured["NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE"],
+            endpoints.rest_mv_warehouse
+        );
+        assert_eq!(
             captured["NOVAROCKS_ICEBERG_REST_WAREHOUSE"],
             endpoints.rest_warehouse
         );
@@ -928,6 +957,10 @@ oss_sk = "fixture-secret"
                 .err()
                 .expect("missing input must fail");
             assert!(error.to_string().contains(key), "{error}");
+            assert!(
+                error.to_string().contains("docker/iceberg-rest/up.sh"),
+                "{error}"
+            );
         }
         let mut conflict = configured.clone();
         conflict

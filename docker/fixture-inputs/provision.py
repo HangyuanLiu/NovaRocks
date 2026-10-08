@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Network-enabled, atomic fixture input provisioner. Never called by verify CI."""
+"""Network-enabled fixture input provisioner. Never called by verify CI."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from typing import Any
 
 from fixture_inputs import (
     FixtureInputError,
-    artifact_entry,
     definition_sha256,
     fixture_store,
     fixture_store_lock,
@@ -115,28 +114,110 @@ def prepare_artifacts(lock: dict[str, Any], staging: Path) -> dict[str, dict[str
     return receipts
 
 
+def build_context(
+    lock: dict[str, Any], name: str, repo_root: Path, artifacts_dir: Path, out: Path
+) -> Path:
+    """Assemble only declared repository files and already verified artifacts."""
+    item = lock["derived_images"][name]
+    repo_root = repo_root.resolve()
+    definitions = {require_relative(path) for path in item["definition_files"]}
+    dockerfile = require_relative(item["dockerfile"])
+    if dockerfile not in definitions:
+        raise FixtureInputError(f"fixture Dockerfile is not a definition input: {dockerfile}")
+    sources: list[tuple[Path, Path]] = []
+    if "context" in item:
+        context = repo_root / require_relative(item["context"])
+        if not context.resolve().is_relative_to(repo_root) or not context.is_dir():
+            raise FixtureInputError(f"fixture build context is not a repository directory: {name}")
+        if out.resolve().is_relative_to(context.resolve()):
+            raise FixtureInputError("fixture build output must not be inside its source context")
+        for path in sorted(context.rglob("*")):
+            if path.is_symlink():
+                raise FixtureInputError(f"fixture build context must not contain symlinks: {path.relative_to(repo_root)}")
+            if path.is_dir():
+                continue
+            relative = path.relative_to(repo_root)
+            if not path.is_file() or relative not in definitions:
+                raise FixtureInputError(f"fixture context file is not a definition input: {relative}")
+            destination = path.relative_to(context)
+            if destination.parts[0] == "artifacts":
+                raise FixtureInputError("fixture build context reserves artifacts/ for locked artifacts")
+            if destination == Path("Dockerfile") and relative != dockerfile:
+                raise FixtureInputError("fixture build context Dockerfile differs from the declared Dockerfile")
+            sources.append((path, destination))
+    source_dockerfile = repo_root / dockerfile
+    if not source_dockerfile.resolve().is_relative_to(repo_root) or not source_dockerfile.is_file():
+        raise FixtureInputError(f"fixture Dockerfile is missing from the repository: {dockerfile}")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise FixtureInputError(f"fixture build output must be an empty directory: {out}")
+    out.mkdir(parents=True, exist_ok=True)
+    for source, destination in sources:
+        target = out / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    shutil.copy2(source_dockerfile, out / "Dockerfile")
+    (out / "artifacts").mkdir()
+    for artifact in item["artifacts"]:
+        relative = require_relative(artifact)
+        target = out / "artifacts" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(artifacts_dir / relative, target)
+    return out
+
+
 def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, lock_sha: str) -> dict[str, dict[str, str]]:
     receipts: dict[str, dict[str, str]] = {}
     for name, item in lock["derived_images"].items():
-        context = staging / "build-contexts" / name
-        (context / "artifacts").mkdir(parents=True)
-        dockerfile = repo_root / require_relative(item["dockerfile"])
-        shutil.copy2(dockerfile, context / "Dockerfile")
-        for artifact in item["artifacts"]:
-            shutil.copy2(staging / "artifacts" / artifact, context / "artifacts" / artifact)
+        context = build_context(lock, name, repo_root, staging / "artifacts", staging / "build-contexts" / name)
         definition = definition_sha256(repo_root, item["definition_files"])
-        base = lock["images"][item["base"]]["alias"]
+        build_args = [argument for key, base in item["bases"].items()
+                      for argument in ("--build-arg", f"{key}={lock['images'][base]['alias']}")]
+        iidfile = context.parent / f"{name}.iid"
         run([
             "docker", "build", "--platform", item["platform"],
-            "--build-arg", f"SPARK_BASE={base}",
+            *build_args,
             "--label", f"novarocks.fixture.lock.sha256={lock_sha}",
             "--label", f"novarocks.fixture.definition.sha256={definition}",
-            "-t", item["alias"], str(context),
+            "--iidfile", str(iidfile), str(context),
         ])
-        info = inspect_image(item["alias"])
+        try:
+            image_id = iidfile.read_text().strip()
+        except OSError as error:
+            raise FixtureInputError(f"fixture build did not produce an image ID: {name}") from error
+        if not image_id:
+            raise FixtureInputError(f"fixture build produced an empty image ID: {name}")
+        info = inspect_image(image_id)
         verify_image(info, item, derived=True)
-        receipts[name] = {"alias": item["alias"], "platform": item["platform"], "definition_sha256": definition, "image_id": str(info.get("Id", ""))}
+        if info.get("Id") != image_id:
+            raise FixtureInputError(f"fixture build image ID mismatch: {name}")
+        receipts[name] = {"alias": item["alias"], "platform": item["platform"], "definition_sha256": definition, "image_id": image_id}
     return receipts
+
+
+def context_only(
+    repo_root: Path, lock_path: Path, name: str, out: Path,
+    image_source_specs: list[str], pull_timeout_seconds: int,
+) -> Path:
+    """Prepare one build context without reading or publishing the fixture store."""
+    if pull_timeout_seconds < 1:
+        raise FixtureInputError("--docker-pull-timeout-seconds must be a positive integer")
+    lock, _ = load_lock(lock_path)
+    item = lock["derived_images"].get(name)
+    if item is None:
+        raise FixtureInputError(f"unknown fixture derived image: {name}")
+    selected = {
+        "images": {base: lock["images"][base] for base in item["bases"].values()},
+        "artifacts": {artifact: lock["artifacts"][artifact] for artifact in item["artifacts"]},
+    }
+    image_sources = parse_image_sources(image_source_specs, set(lock["images"]))
+    with tempfile.TemporaryDirectory(prefix="novarocks-fixture-context-") as temporary:
+        staging = Path(temporary)
+        prepare_images(selected, image_sources, pull_timeout_seconds)
+        prepare_artifacts(selected, staging)
+        definition_sha256(repo_root, item["definition_files"])
+        build_context(lock, name, repo_root, staging / "artifacts", out)
+    print(out)
+    return out
 
 
 def provision(
@@ -157,6 +238,10 @@ def provision(
             images = prepare_images(lock, image_sources, pull_timeout_seconds)
             artifacts = prepare_artifacts(lock, staging)
             derived = build_derived_images(lock, repo_root, staging, lock_sha)
+            # Only successful builds enter the mutable publication segment.
+            # A crash here can still require a new provision to repair aliases.
+            for receipt in derived.values():
+                run(["docker", "tag", receipt["image_id"], receipt["alias"]])
             generation = f"generation-{uuid.uuid4().hex}"
             generations = store / "generations"
             generations.mkdir(exist_ok=True)
@@ -184,6 +269,8 @@ def main() -> int:
     parser.add_argument("--store")
     parser.add_argument("--repo-root", default=SCRIPT_DIR.parents[1])
     parser.add_argument("--lock", default=SCRIPT_DIR / "lock.json")
+    parser.add_argument("--context-only", metavar="NAME", help="prepare one derived image context without publishing a BOM")
+    parser.add_argument("--out", type=Path, metavar="DIR", help="empty output directory for --context-only")
     parser.add_argument(
         "--image-source",
         action="append",
@@ -198,7 +285,16 @@ def main() -> int:
         help="bound one explicit Docker image transfer (default: 180)",
     )
     args = parser.parse_args()
+    if bool(args.context_only) != (args.out is not None):
+        parser.error("--context-only and --out must be provided together")
     try:
+        if args.context_only:
+            context_only(
+                Path(args.repo_root).resolve(), Path(args.lock).resolve(),
+                args.context_only, args.out.resolve(), args.image_source,
+                args.docker_pull_timeout_seconds,
+            )
+            return 0
         provision(
             fixture_store(args.store),
             Path(args.repo_root).resolve(),
