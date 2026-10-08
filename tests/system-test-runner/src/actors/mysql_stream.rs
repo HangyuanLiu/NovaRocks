@@ -44,6 +44,7 @@ pub struct AsyncMysqlStream {
     stream: AsyncTcpStream,
     timeout: Duration,
     receive_buffer_bytes: Option<u32>,
+    connection_id: u32,
 }
 
 pub struct MysqlPacket {
@@ -400,7 +401,7 @@ impl AsyncMysqlStream {
         .await;
         observation.error = match result {
             Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.to_string().chars().take(512).collect()),
+            Ok(Err(error)) => Some(format!("{error:#}").chars().take(512).collect()),
             Err(_) => Some("absolute query deadline exceeded".to_string()),
         };
         observation.elapsed_micros = started.elapsed().as_micros();
@@ -477,6 +478,14 @@ impl AsyncMysqlStream {
         .await
     }
 
+    pub fn connection_id(&self) -> Result<u32> {
+        ensure!(
+            self.connection_id != 0,
+            "MySQL connection identity is unavailable"
+        );
+        Ok(self.connection_id)
+    }
+
     pub fn receive_buffer_bytes(&self) -> Option<u32> {
         self.receive_buffer_bytes
     }
@@ -522,6 +531,7 @@ impl AsyncMysqlStream {
             handshake.first().copied() == Some(10),
             "expected MySQL protocol v10 handshake, got payload={handshake:?}"
         );
+        let connection_id = handshake_connection_id(&handshake)?;
 
         let client_flags = CLIENT_LONG_PASSWORD
             | CLIENT_LONG_FLAG
@@ -560,6 +570,7 @@ impl AsyncMysqlStream {
             stream,
             timeout,
             receive_buffer_bytes,
+            connection_id,
         })
     }
 
@@ -617,6 +628,25 @@ impl AsyncMysqlStream {
             .context("read async timed query terminal error")?;
         mysql_error_text(&terminal)
     }
+}
+
+fn handshake_connection_id(handshake: &[u8]) -> Result<u32> {
+    ensure!(
+        handshake.first() == Some(&10),
+        "invalid MySQL handshake version"
+    );
+    let version = &handshake[1..];
+    let end = version
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("missing MySQL server version terminator")?;
+    ensure!(end > 0, "empty MySQL server version");
+    let bytes = version
+        .get(end + 1..end + 5)
+        .context("truncated MySQL connection identity")?;
+    let identity = u32::from_le_bytes(bytes.try_into()?);
+    ensure!(identity != 0, "zero MySQL connection identity");
+    Ok(identity)
 }
 
 fn mysql_error_text(payload: &[u8]) -> Result<String> {
@@ -900,7 +930,10 @@ async fn write_packet_async(
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncMysqlStream, mysql_error_text, read_wire_packet_async, write_packet_async};
+    use super::{
+        AsyncMysqlStream, handshake_connection_id, mysql_error_text, read_wire_packet_async,
+        write_packet_async,
+    };
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
@@ -936,6 +969,7 @@ mod tests {
                     stream: client,
                     timeout: Duration::from_millis(200),
                     receive_buffer_bytes: None,
+                    connection_id: 0,
                 }
                 .observe_text_query_with_metadata_pause(
                     "SELECT 7",
@@ -968,6 +1002,21 @@ mod tests {
                 assert_eq!((observation.rows, observation.packets), (0, 3));
             }
         }
+    }
+
+    #[test]
+    fn handshake_identity_is_exact_and_never_guessed() {
+        let mut handshake = vec![10, b'8', b'.', b'0', 0];
+        handshake.extend_from_slice(&12345u32.to_le_bytes());
+        assert_eq!(handshake_connection_id(&handshake).unwrap(), 12345);
+        for length in 0..handshake.len() {
+            assert!(handshake_connection_id(&handshake[..length]).is_err());
+        }
+        handshake[0] = 9;
+        assert!(handshake_connection_id(&handshake).is_err());
+        handshake[0] = 10;
+        handshake[5..9].copy_from_slice(&0u32.to_le_bytes());
+        assert!(handshake_connection_id(&handshake).is_err());
     }
 
     fn column_definition() -> Vec<u8> {
@@ -1030,6 +1079,7 @@ mod tests {
             stream: client,
             timeout: Duration::from_secs(2),
             receive_buffer_bytes: None,
+            connection_id: 0,
         }
         .observe_text_query("SELECT 7", Duration::ZERO)
         .await;
@@ -1096,6 +1146,7 @@ mod tests {
             stream: client,
             timeout: Duration::from_secs(2),
             receive_buffer_bytes: None,
+            connection_id: 0,
         }
         .observe_text_query("SELECT ''", Duration::ZERO)
         .await;
@@ -1156,6 +1207,7 @@ mod tests {
             stream: client,
             timeout: Duration::from_secs(5),
             receive_buffer_bytes: None,
+            connection_id: 0,
         }
         .observe_text_query("SELECT large_value", Duration::ZERO)
         .await;
@@ -1184,6 +1236,7 @@ mod tests {
             stream: client,
             timeout: Duration::from_secs(2),
             receive_buffer_bytes: None,
+            connection_id: 0,
         }
         .observe_text_query("SELECT 1", Duration::ZERO)
         .await;

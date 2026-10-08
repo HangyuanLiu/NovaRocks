@@ -1,0 +1,34 @@
+{
+  "task": "MEM-1-M07",
+  "stage": "P09 paused-client cancellation probes",
+  "outcome": "focused-passed-native-pending",
+  "source_parent": "5fd0fa9f76bc1f7d15199cc0a7e28d3190f7248a",
+  "source_dirty": true,
+  "tests": {
+    "system_runner_all_targets": {
+      "passed": 100,
+      "failed": 0,
+      "ignored": 2
+    }
+  },
+  "input": {
+    "path": "docs/testing/mem-1-m07/inputs/root-cancel-closing-freeze-v1.json",
+    "sha256": "18a25f94a81006ae2920d97f184918cea1ed84484f273638a0ed73382da6f4a2"
+  },
+  "scope": "Cancellation while a real client pauses reads: observe a held Closing window after KILL returns with Client released, full row plus ERR1317 and native same-socket reuse; incomplete large row emits a positive wire prefix, physically closes the socket and refuses a zero-response follow-up without new BE tasks. KILL start/return/resume times are recorded; the 2s post-KILL observation is not the production 5s Closing deadline origin. Excludes explicit framing cursor/tail bytes proof, full pools, ACK-only and allocator exit.",
+  "raw_logs": [
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-runner-tests-20261009.log",
+      "sha256": "6fa632caafb406ccac69dfd32c5292b57f5b39ed54a7495fcec9f9de2f9f8fb8"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-runner-tests-v2-20261009.log",
+      "sha256": "83b4a97dde85c4ba4034c57cd6fed3a8788a4fc50d181becb34e77438d301eea"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-row-cancel-runner-tests-v3-20261009.log",
+      "sha256": "91d4e5564c0d7a46cce0a1c1562686e29d76be9926f4a512c6efd8ae58059bb6"
+    }
+  ],
+  "historical_failure": "First compile failed E0425 for a missing explicit test-module handshake helper import, corrected before passing runs."
+}

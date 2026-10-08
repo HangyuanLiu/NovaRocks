@@ -27,6 +27,7 @@ mod query_lifecycle;
 mod query_output;
 mod result_delivery;
 mod result_delivery_baseline;
+mod result_delivery_closing;
 mod runtime_filter;
 mod state_family;
 mod table_maintenance;
@@ -52,6 +53,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(result_delivery_baseline::scenarios());
     scenarios.extend(result_delivery::scenarios());
+    scenarios.extend(result_delivery_closing::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
     scenarios.extend(uea4_range_reads::scenarios());
     scenarios.extend(uea4_rss_baselines::scenarios());

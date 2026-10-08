@@ -97,3 +97,10 @@ P04 本地出站HPACK表上限已完成切片；[收据](evidence/p04-h2-send-he
 线协议探针校验完整 ColumnDefinition41 结构，并比较执行前 v4 冻结的列名和 MySQL type。v3 的合法大行 root backing 拒绝已保留为 FAIL；历史行字节观察不证明列元数据正确。原生复跑须使用强化探针，全部输入与上限不变。
 
 `result-delivery/root-read-profile-kind-refusal` 使用真实认证 Native RootResult endpoint：结构合法的 foreign-process V1 请求必须进入准确身份拒绝；其余六个仅改变 profile/kind/sequence 的请求必须在结构 decode 被拒绝。此场景明确限定 authenticated plaintext/IP；每次请求有绝对 RPC probe deadline 与 4KiB gRPC 请求 frame 与累计响应 DATA 界（不作为 header/第三方分配界），不外推 DNS/TLS teardown 界，完成后用真正 Native SUM 查询验证精确行字节及公开 owner 收敛。冻结输入 `inputs/root-read-refusal-freeze-v1.json`；不证明 installed-root replay/ACK/生产退休/ClosingRow，也不证明非法响应拒绝。
+
+
+### 2026-10-09：P09 paused-client 取消场景，native 待执行
+
+- 首次 native 前冻结 `root-cancel-closing-freeze-v1.json`：原 S+8 单行暂停客户端读取，要求独立 Closing=1/Client=0、完整 row+ERR1317、同 socket 精确 SUM oracle 与实际 Native task 增长；原17×1MiB合法行冻结到W=2未完成producer，要求正 wire prefix/零完整行、物理EOF/reset、同 socket 后续零schema/packet/bytes且三BE task counter不增长。握手真实connection ID用于KILL，无猜测。
+- KILL start/return/resume时间保存；返回后复查原2s观察截止，Closing观察2s从KILL返回计算，不作为生产5s deadline的起点证明。失败仍恢复并join客户端保存wire；不证明具体framing cursor/partial-tail/full-pool/allocator exit。生产配置、容量和deadline未改。
+- runner all-target100 PASS/0 FAIL/2既有ignored，覆盖真实handshake身份拒绝与follow-up错误分类；最初缺少test import的E0425保留。C0 from_ref测试清理已纳入。两个主要语义裁决/P09其它门/P00b/P10/final仍OPEN；无push/PR/归档。

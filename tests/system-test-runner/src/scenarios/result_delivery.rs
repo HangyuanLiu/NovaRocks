@@ -104,8 +104,7 @@ fn foreign_root_task() -> proto::TaskIdentity {
         backend_process_id: Some(proto::BackendProcessId {
             value: novarocks_types::BackendProcessId::new_v7()
                 .to_bytes()
-                .to_vec()
-                .into(),
+                .to_vec(),
         }),
     }
 }
@@ -412,7 +411,7 @@ const ROOT_RESOURCES: [&str; 14] = [
     "metadata_bytes",
 ];
 
-fn root_census(rows: &[serde_json::Value]) -> Result<Option<BTreeMap<String, u64>>> {
+pub(super) fn root_census(rows: &[serde_json::Value]) -> Result<Option<BTreeMap<String, u64>>> {
     use super::result_delivery_baseline::metric;
     let available = metric(
         rows,
@@ -643,7 +642,7 @@ mod census_tests {
         use serde_json::json;
         let available = json!({"tags":{"metric":"novarocks_backend_root_ownership_snapshot_available"},"value":1});
         assert!(root_census(&[]).is_err());
-        assert!(root_census(&[available.clone()]).is_err());
+        assert!(root_census(std::slice::from_ref(&available)).is_err());
         let mut rows = vec![available.clone()];
         rows.extend(ROOT_RESOURCES.iter().map(|name| json!({"tags":{"metric":"novarocks_backend_root_ownership","resource":name},"value":0})));
         assert!(root_census(&rows).unwrap().is_some());
