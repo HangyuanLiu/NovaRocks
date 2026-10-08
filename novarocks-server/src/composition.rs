@@ -626,22 +626,8 @@ pub fn compose_frontend_role_config(
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
     let task_execution_budgets = compose_task_execution_budgets(config)?;
-    let result_fetch_byte_limit = novarocks_execution_contract::ResultByteLimit::new(
-        u64::try_from(runtime_config.result_retained_bytes_per_root)
-            .map_err(|_| anyhow::anyhow!("runtime.result_retained_bytes_per_root exceeds u64"))?,
-    )
-    .map_err(|error| anyhow::anyhow!("construct result fetch byte limit: {error}"))?;
-    if result_fetch_byte_limit.get()
-        > novarocks_native_adapter::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
-    {
-        anyhow::bail!(
-            "runtime.result_retained_bytes_per_root {} exceeds the Native root-result payload limit {}",
-            result_fetch_byte_limit.get(),
-            novarocks_native_adapter::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
-        );
-    }
     let (logical_supervisor, workload, workload_resources, abort_capacity) =
-        compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
+        compose_frontend_workload_runtime(runtime_config)?;
     let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
@@ -820,7 +806,6 @@ struct ComposedTaskExecutionBudgets {
 
 fn compose_frontend_workload_runtime(
     runtime: &crate::app_config::RuntimeConfig,
-    result_fetch_byte_limit: novarocks_execution_contract::ResultByteLimit,
 ) -> anyhow::Result<(
     LogicalExecutionSupervisorConfig,
     WorkloadConfig,
@@ -903,15 +888,6 @@ fn compose_frontend_workload_runtime(
         )?,
         max_attempts,
         Duration::from_millis(input.logical_replacement_reservation_ms),
-        novarocks_execution_contract::MaxWait::new(Duration::from_millis(
-            input.logical_result_fetch_wait_ms,
-        ))
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "runtime.frontend_workload.logical_result_fetch_wait_ms is invalid: {error}"
-            )
-        })?,
-        result_fetch_byte_limit,
     );
     let supervisor = LogicalExecutionSupervisorConfig::new(
         nonzero(
@@ -1400,9 +1376,8 @@ mod tests {
         config.runtime.mem_limit = "1G".to_string();
         config.runtime.frontend_workload.control_bytes = 64 * 1024 * 1024;
         config.runtime.frontend_workload.per_scope_bytes = 512 * 1024 * 1024;
-        let byte_limit = novarocks_execution_contract::ResultByteLimit::new(1024).unwrap();
         let (_, workload, resources, abort_capacity) =
-            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+            compose_frontend_workload_runtime(&config.runtime)
                 .expect("explicit frontend workload fields compose");
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
@@ -1415,7 +1390,7 @@ mod tests {
             .frontend_workload
             .logical_replacement_reservation_ms = 0;
         assert!(
-            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+            compose_frontend_workload_runtime(&config.runtime)
                 .expect_err("zero replacement reservation must fail preflight")
                 .to_string()
                 .contains("logical_replacement_reservation_ms")
@@ -1428,24 +1403,9 @@ mod tests {
         config
             .runtime
             .frontend_workload
-            .logical_result_fetch_wait_ms = 0;
-        assert!(
-            compose_frontend_workload_runtime(&config.runtime, byte_limit)
-                .expect_err("zero Native result wait must fail preflight")
-                .to_string()
-                .contains("logical_result_fetch_wait_ms")
-        );
-
-        config
-            .runtime
-            .frontend_workload
-            .logical_result_fetch_wait_ms = 200;
-        config
-            .runtime
-            .frontend_workload
             .logical_abort_effect_capacity = 0;
         assert!(
-            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+            compose_frontend_workload_runtime(&config.runtime)
                 .expect_err("zero logical Abort effect capacity must fail preflight")
                 .to_string()
                 .contains("logical_abort_effect_capacity")
@@ -1457,7 +1417,7 @@ mod tests {
             .logical_abort_effect_capacity = 16;
         config.runtime.frontend_workload.per_scope_bytes = 2 * 1024 * 1024 * 1024;
         assert!(
-            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+            compose_frontend_workload_runtime(&config.runtime)
                 .expect_err("per-scope authority cannot exceed the process budget")
                 .to_string()
                 .contains("frontend workload resources")

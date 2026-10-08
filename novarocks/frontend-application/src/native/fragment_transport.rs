@@ -47,11 +47,7 @@ use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
 use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind},
-    coordination::{
-        AttemptFailureClass, PreflightedRootResultPacket, RootResultDecodeBounds,
-        RootResultDecodeRuntime, RootResultFetchFailure,
-        RootResultFetchOutcome as PumpRootResultFetchOutcome, RootResultPumpBinding,
-    },
+    coordination::{AttemptFailureClass, RootResultFetchFailure},
 };
 use novarocks_task_codec::operation::{
     MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, decode_operation_outcome, encode_fetch_dynamic_filters,
@@ -928,92 +924,6 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
     }
 }
 
-/// Binds one frozen Native result transport to the query application's sole
-/// fetch/decode/ACK pump. The binding preserves the exact request identity and
-/// bounds; it does not create a second polling or acknowledgement authority.
-#[allow(
-    dead_code,
-    reason = "The production coordinator cutover consumes this Native result-pump adapter."
-)]
-pub(crate) fn native_root_result_pump_binding(
-    decode_runtime: RootResultDecodeRuntime,
-    transport: Arc<NativeTaskResultTransport>,
-    expected_output_schema: ChunkSchemaRef,
-) -> RootResultPumpBinding {
-    RootResultPumpBinding::new(decode_runtime, move |request| {
-        let transport = Arc::clone(&transport);
-        let expected_output_schema = Arc::clone(&expected_output_schema);
-        async move {
-            let outcome = transport
-                .fetch_root_result_for_pump(
-                    request.root,
-                    request.max_wait,
-                    request.acknowledged,
-                    request.max_result_bytes,
-                )
-                .await
-                .map_err(|error| {
-                    error.into_pump_failure_for_backend(request.root.backend_process_id())
-                })?;
-            adapt_native_root_result_outcome(outcome, expected_output_schema)
-        }
-    })
-}
-
-fn adapt_native_root_result_outcome(
-    outcome: RootResultOutcome,
-    expected_output_schema: ChunkSchemaRef,
-) -> Result<PumpRootResultFetchOutcome, RootResultFetchFailure> {
-    match outcome {
-        RootResultOutcome::Ready(packet) => {
-            let sequence = packet.packet_sequence();
-            let payload_bytes = packet.payload_bytes();
-            let native_bounds = packet.decode_bounds();
-            let bounds = RootResultDecodeBounds::new(
-                native_bounds.decode_operation_upper_bound(),
-                native_bounds.retained_backing_upper_bound(),
-            )
-            .map_err(|error| {
-                RootResultFetchFailure::new(AttemptFailureClass::ContractViolation, error)
-            })?;
-            PreflightedRootResultPacket::new(sequence, payload_bytes, bounds, move || {
-                packet
-                    .decode(Some(ExpectedOutputSchemaView::new(&expected_output_schema)))
-                    .map(|batch| batch.into_chunk().batch)
-                    .map_err(|error| {
-                        QueryExecutionError::new(
-                            QueryExecutionErrorKind::InvalidRequest,
-                            format!("decode Native root result packet failed: {error}"),
-                        )
-                    })
-            })
-            .map(PumpRootResultFetchOutcome::Ready)
-            .map_err(|error| {
-                RootResultFetchFailure::new(AttemptFailureClass::ContractViolation, error)
-            })
-        }
-        RootResultOutcome::NotReady => Ok(PumpRootResultFetchOutcome::NotReady),
-        RootResultOutcome::AwaitTerminalControl => {
-            Ok(PumpRootResultFetchOutcome::AwaitTerminalControl)
-        }
-        RootResultOutcome::EndOfStreamPending { packet_sequence } => Ok(
-            PumpRootResultFetchOutcome::EndPending(ResultPacketSequence::new(packet_sequence)),
-        ),
-        RootResultOutcome::EndOfStream { packet_sequence } => Ok(
-            PumpRootResultFetchOutcome::EndAcknowledged(ResultPacketSequence::new(packet_sequence)),
-        ),
-        // The wire ERROR variant currently has no discriminator: it can mean
-        // an exact-route refusal, a result-buffer protocol failure, or a
-        // canceled execution. The accepted Task status projection is the
-        // attempt's execution-failure authority, so guessing ExecutionFailure
-        // here could make a contract or authorization refusal retryable.
-        RootResultOutcome::Failed(detail) => Err(RootResultFetchFailure::new(
-            AttemptFailureClass::ContractViolation,
-            QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, detail),
-        )),
-    }
-}
-
 fn validate_native_result_byte_limit(limit: ResultByteLimit) -> Result<(), String> {
     if limit.get() > MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
         return Err(format!(
@@ -1195,16 +1105,13 @@ mod tests {
         task_execution::{ResultByteLimit, ResultPacketSequence},
     };
     use novarocks_proto_models::novarocks::{FetchResultResponse, fetch_result_response::Status};
-    use novarocks_query_application::coordination::{
-        AttemptFailureClass, RootResultFetchOutcome as PumpRootResultFetchOutcome,
-    };
+    use novarocks_query_application::coordination::AttemptFailureClass;
     use novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
 
     use super::{
-        NativeRootResultFetchError, RootResultOutcome, adapt_native_root_result_outcome,
-        classify_fetch_task_result_rpc_status, classify_root_result_response,
-        decode_fetched_query_batch, validate_native_result_byte_limit,
-        validate_result_payload_size,
+        NativeRootResultFetchError, RootResultOutcome, classify_fetch_task_result_rpc_status,
+        classify_root_result_response, decode_fetched_query_batch,
+        validate_native_result_byte_limit, validate_result_payload_size,
     };
 
     fn typed_empty_result_payload() -> Vec<u8> {
@@ -1275,68 +1182,6 @@ mod tests {
 
         let batch = packet.decode(None).expect("explicit packet decode");
         assert_eq!(batch.into_chunk().len(), 0);
-    }
-
-    #[test]
-    fn query_adapter_preserves_preflighted_packet_identity_and_bounds() {
-        let payload = typed_empty_result_payload();
-        let payload_bytes = u64::try_from(payload.len()).unwrap();
-        let limit = ResultByteLimit::new(payload_bytes).unwrap();
-        let RootResultOutcome::Ready(packet) =
-            classify_root_result_response("backend", ready_response(payload), None, limit)
-                .expect("current writer output passes transport preflight")
-        else {
-            panic!("READY data must remain a raw packet");
-        };
-        let native_bounds = packet.decode_bounds();
-
-        let PumpRootResultFetchOutcome::Ready(packet) = adapt_native_root_result_outcome(
-            RootResultOutcome::Ready(packet),
-            Arc::new(ChunkSchema::empty()),
-        )
-        .expect("metadata-preflighted Native packet binds to the query pump") else {
-            panic!("READY must remain READY across the application adapter");
-        };
-        assert_eq!(packet.sequence().get(), 7);
-        assert_eq!(packet.payload_bytes(), payload_bytes);
-        assert_eq!(
-            packet.bounds().decode_operation_upper_bound(),
-            native_bounds.decode_operation_upper_bound()
-        );
-        assert_eq!(
-            packet.bounds().retained_backing_upper_bound(),
-            native_bounds.retained_backing_upper_bound()
-        );
-    }
-
-    #[test]
-    fn query_adapter_preserves_terminal_sequences_and_failure_class() {
-        let schema = Arc::new(ChunkSchema::empty());
-        assert!(matches!(
-            adapt_native_root_result_outcome(
-                RootResultOutcome::EndOfStreamPending { packet_sequence: 9 },
-                Arc::clone(&schema),
-            )
-            .unwrap(),
-            PumpRootResultFetchOutcome::EndPending(sequence) if sequence.get() == 9
-        ));
-        assert!(matches!(
-            adapt_native_root_result_outcome(
-                RootResultOutcome::EndOfStream { packet_sequence: 9 },
-                schema,
-            )
-            .unwrap(),
-            PumpRootResultFetchOutcome::EndAcknowledged(sequence) if sequence.get() == 9
-        ));
-        let error = match adapt_native_root_result_outcome(
-            RootResultOutcome::Failed("root failed".to_string()),
-            Arc::new(ChunkSchema::empty()),
-        ) {
-            Ok(_) => panic!("Native root failure cannot become a pump outcome"),
-            Err(error) => error,
-        };
-        assert_eq!(error.class(), AttemptFailureClass::ContractViolation);
-        assert_eq!(error.error().message(), "root failed");
     }
 
     #[test]
@@ -1538,14 +1383,6 @@ mod tests {
             )
             .unwrap(),
             RootResultOutcome::AwaitTerminalControl
-        ));
-        assert!(matches!(
-            adapt_native_root_result_outcome(
-                RootResultOutcome::AwaitTerminalControl,
-                Arc::new(ChunkSchema::empty())
-            )
-            .unwrap(),
-            PumpRootResultFetchOutcome::AwaitTerminalControl
         ));
         for bad in [
             FetchResultResponse {

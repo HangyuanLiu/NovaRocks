@@ -23,7 +23,6 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
 use crate::query_execution::service::QueryExecutionService;
-use novarocks_execution_contract::{MaxWait, ResultByteLimit};
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::QueryExecutionClient;
 use novarocks_query_application::coordination::{
@@ -90,7 +89,6 @@ const DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32
 const DEFAULT_RESULT_DELIVERY_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(30);
-const DEFAULT_RESULT_FETCH_MAX_WAIT: Duration = Duration::from_millis(200);
 const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
@@ -746,10 +744,6 @@ impl FrontendLogicalExecutionRuntimeConfig {
                     DEFAULT_RESULT_DELIVERY_CAPACITY,
                     DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS,
                     DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR,
-                    MaxWait::new(DEFAULT_RESULT_FETCH_MAX_WAIT)
-                        .expect("the test result fetch wait is representable"),
-                    ResultByteLimit::new(16 * 1024 * 1024)
-                        .expect("the test result fetch byte limit is nonzero"),
                 ),
             ),
             WorkloadConfig::default(),
@@ -1963,7 +1957,7 @@ mod tests {
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
         FrontendExecutionConfig, FrontendExecutionRuntimeOwner, LogicalExecutionRowsConfig,
-        LogicalExecutionSupervisorConfig, MaxWait, ResultByteLimit, test_native_trust,
+        LogicalExecutionSupervisorConfig, test_native_trust,
     };
     use novarocks_native_adapter::FrontendNativeTransport;
 
@@ -1987,8 +1981,6 @@ mod tests {
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
                     Duration::from_secs(1),
-                    MaxWait::new(Duration::from_millis(20)).unwrap(),
-                    ResultByteLimit::new(1024).unwrap(),
                 ),
             ),
             WorkloadConfig::default(),
@@ -2037,8 +2029,6 @@ mod tests {
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
                     Duration::from_secs(1),
-                    MaxWait::new(Duration::from_millis(20)).unwrap(),
-                    ResultByteLimit::new(1024).unwrap(),
                 ),
             ),
             WorkloadConfig::default(),
@@ -2097,8 +2087,6 @@ mod tests {
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
                     Duration::from_secs(1),
-                    MaxWait::new(Duration::from_millis(20)).unwrap(),
-                    ResultByteLimit::new(1024).unwrap(),
                 ),
             ),
             WorkloadConfig::default(),

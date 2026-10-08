@@ -41,7 +41,7 @@ use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
     AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptFailureClass, AttemptSchedule,
     NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort,
-    ReplacementWorkerAdmissionEvidence, RootResultPumpBinding,
+    ReplacementWorkerAdmissionEvidence,
 };
 use crate::preparation::FrozenExecutionDescription;
 
@@ -467,20 +467,6 @@ impl ActivatedNativeAttempt {
         }
     }
 
-    pub fn rows(
-        owner: impl ActiveNativeAttemptOwner,
-        binding: RootResultPumpBinding,
-        statuses: AcceptedRootStatusSource,
-    ) -> Self {
-        Self {
-            owner: Box::new(owner),
-            rows: Some(NativeRowsAttemptRuntime {
-                binding: NativeRowsDelivery::Pump(binding),
-                statuses,
-            }),
-        }
-    }
-
     /// Rows relayed as Backend-encoded root items, without decode.
     pub fn relayed_rows(
         owner: impl ActiveNativeAttemptOwner,
@@ -489,10 +475,7 @@ impl ActivatedNativeAttempt {
     ) -> Self {
         Self {
             owner: Box::new(owner),
-            rows: Some(NativeRowsAttemptRuntime {
-                binding: NativeRowsDelivery::Relay(binding),
-                statuses,
-            }),
+            rows: Some(NativeRowsAttemptRuntime { binding, statuses }),
         }
     }
 
@@ -510,16 +493,8 @@ impl ActivatedNativeAttempt {
 /// attempt. Native retains transport and Task status internals; the query
 /// supervisor receives only the closed pump inputs it owns.
 pub(crate) struct NativeRowsAttemptRuntime {
-    pub(crate) binding: NativeRowsDelivery,
+    pub(crate) binding: crate::coordination::RootRelayBinding,
     pub(crate) statuses: AcceptedRootStatusSource,
-}
-
-/// How one attempt's root rows reach their consumer.
-pub(crate) enum NativeRowsDelivery {
-    /// Legacy packets decoded on the Frontend.
-    Pump(RootResultPumpBinding),
-    /// Backend-encoded root items relayed in order.
-    Relay(crate::coordination::RootRelayBinding),
 }
 
 /// Typed activation failure. The supervisor still retains the exact dormant

@@ -1202,7 +1202,6 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub logical_rows_delivery_capacity: usize,
     pub logical_replacement_reservation_ms: u64,
     pub logical_remote_cleanup_timeout_ms: u64,
-    pub logical_result_fetch_wait_ms: u64,
     /// How long an idle elastic planning worker remains reusable before it
     /// exits. This affects worker reuse only; it is not an admission bound.
     pub planning_idle_keepalive_ms: u64,
@@ -1231,7 +1230,6 @@ impl Default for FrontendWorkloadRuntimeConfig {
             logical_rows_delivery_capacity: 32,
             logical_replacement_reservation_ms: 30_000,
             logical_remote_cleanup_timeout_ms: 5_000,
-            logical_result_fetch_wait_ms: 200,
             planning_idle_keepalive_ms: 60_000,
         }
     }
@@ -3176,6 +3174,7 @@ mod tests {
             "logical_start_capacity",
             "result_decode_worker_count",
             "result_decode_queue_capacity",
+            "logical_result_fetch_wait_ms",
         ] {
             let document = format!("[runtime.frontend_workload]\n{field} = 1\n",);
             let error = match toml::from_str::<NovaRocksConfig>(&document) {

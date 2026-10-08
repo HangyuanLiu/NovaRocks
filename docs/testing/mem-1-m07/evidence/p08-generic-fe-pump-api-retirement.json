@@ -1,0 +1,49 @@
+{
+  "status": "PASS_COMPONENT_GENERIC_FE_PUMP_API_RETIRED_P08_PARTIAL",
+  "base_revision": "8b32720e1",
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-relay-query-tests-v4.log",
+      "sha256": "e47c2f82fee1881bfb638e5e3775a70529ffd037307ec7c6d13fc5b84d044d60",
+      "result": "test result: ok. 501 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-generic-pump-frontend-tests.log",
+      "sha256": "760efe9e7ed1053c39e4b49d68dbca05c62234ba16690af5a5be261f8bbb7757",
+      "result": "test result: ok. 1460 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.09s"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-generic-pump-server-tests.log",
+      "sha256": "d99f26c4ae8da05fc8e84a2466933e600f737a8dc193912da7d80fab3f7a84c1",
+      "result": "test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s"
+    }
+  ],
+  "changes": [
+    "Removed generic decode runtime, opaque preflighted packet, decoded pump binding and decoded native activation APIs.",
+    "The query supervisor runs only the bounded root relay; replacement, cancellation, visibility and residual-convergence tests use actual encoded V1 items.",
+    "Relay checks the original admitted scope and Client/Internal window class before binding or reading.",
+    "Retired old fetch wait/byte policy in FE composition; result_retained_bytes_per_root is no longer used as an FE cap.",
+    "Fixed synchronous application worker queues are owned by CPU and keep their original bounded admission and actual-exit semantics."
+  ],
+  "retired_configuration_keys": [
+    "runtime.frontend_workload.result_decode_worker_count",
+    "runtime.frontend_workload.result_decode_queue_capacity",
+    "runtime.frontend_workload.logical_result_fetch_wait_ms"
+  ],
+  "test_migration": "Decoded executor/credit tests retire with their deleted APIs. Lifecycle/replacement supervisor assertions now drive V1; relay tests cover original cause, pending cause refinement, visible failure, revoked-output exact control, missing seal and invalid window.",
+  "retained_diagnostic_failures": [
+    "p08-generic-pump-query-compile.log",
+    "p08-generic-pump-query-tests.log",
+    "p08-relay-failure-authority-tests.log",
+    "p08-relay-failure-authority-tests-v2.log",
+    "p08-relay-failure-authority-tests-v3.log",
+    "p08-relay-failure-diagnostic.log"
+  ],
+  "diagnostic_resolution": "Test-only publish() intentionally marks termination as DerivedPending. Original failure needs the serialized authoritative attempt latch. A contiguous Running-to-Aborted sample is invalid; the test now accounts for the skipped Aborting version. Visible output ends logically instead of returning replacement authority. Temporary diagnostics were removed.",
+  "remaining": [
+    "C0 for the committed API/config deletion",
+    "Legacy FE raw result transport/preflight and coordinator fetch facade",
+    "FE result credit stages/wait queue and the fixed 16 fetch gate",
+    "P00b measured transport coefficients and P09/P10/final same-HEAD acceptance"
+  ]
+}

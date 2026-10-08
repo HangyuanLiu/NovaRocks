@@ -4644,10 +4644,6 @@ impl RootResultPolls {
         LegacyRootResultPolls::start(transport, root, deadline, limit, wake, runtime)
             .map(Self::Legacy)
     }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Transition binds the same transport owners to one declared carrier."
-    )]
     fn start_for_delivery(
         delivery: &ProductionRootDelivery,
         port: Option<&Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
