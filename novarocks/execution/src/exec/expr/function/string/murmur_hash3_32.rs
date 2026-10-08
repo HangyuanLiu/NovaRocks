@@ -16,15 +16,12 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int8Array, Int16Array, Int32Array, Int32Builder,
-    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::array::ArrayRef;
+use arrow::datatypes::DataType;
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 const MURMUR3_32_SEED: u32 = 104_729;
 
 pub fn eval_murmur_hash3_32(
@@ -36,17 +33,16 @@ pub fn eval_murmur_hash3_32(
     let mut inputs = Vec::with_capacity(args.len());
     for arg in args {
         let input = arena.eval(*arg, chunk)?;
-        // The public function accepts typed numeric arguments and hashes their
-        // VARCHAR representation. Use the existing CAST owner once per batch,
-        // including its zero, integral-float and exponent normalization.
+        // Unsupported selected-owner profiles retain the existing v1 carrier
+        // projection. Their bytes still enter the single shared Murmur3 core.
         let numeric_text = matches!(
             input.data_type(),
             DataType::Float32
                 | DataType::Float64
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-        ) || matches!(input.data_type(), DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH);
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..)
+                | DataType::FixedSizeBinary(16)
+        );
         if numeric_text {
             inputs.push(
                 crate::exec::expr::cast_with_special_rules(&input, &DataType::Utf8).map_err(
@@ -60,220 +56,15 @@ pub fn eval_murmur_hash3_32(
         }
     }
 
-    let mut builder = Int32Builder::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
-        let mut seed = MURMUR3_32_SEED;
-        let mut has_null = false;
-        for input in &inputs {
-            match input.data_type() {
-                DataType::Utf8 => {
-                    let arr = input
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| "downcast StringArray failed".to_string())?;
-                    if arr.is_null(row) {
-                        has_null = true;
-                        break;
-                    }
-                    seed = murmur_hash3_32(arr.value(row).as_bytes(), seed);
-                }
-                DataType::LargeUtf8 => {
-                    let arr = input
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .ok_or_else(|| "downcast LargeStringArray failed".to_string())?;
-                    if arr.is_null(row) {
-                        has_null = true;
-                        break;
-                    }
-                    seed = murmur_hash3_32(arr.value(row).as_bytes(), seed);
-                }
-                DataType::Binary => {
-                    let arr = input
-                        .as_any()
-                        .downcast_ref::<BinaryArray>()
-                        .ok_or_else(|| "downcast BinaryArray failed".to_string())?;
-                    if arr.is_null(row) {
-                        has_null = true;
-                        break;
-                    }
-                    seed = murmur_hash3_32(arr.value(row), seed);
-                }
-                DataType::LargeBinary => {
-                    let arr = input
-                        .as_any()
-                        .downcast_ref::<LargeBinaryArray>()
-                        .ok_or_else(|| "downcast LargeBinaryArray failed".to_string())?;
-                    if arr.is_null(row) {
-                        has_null = true;
-                        break;
-                    }
-                    seed = murmur_hash3_32(arr.value(row), seed);
-                }
-                // StarRocks coerces non-VARCHAR inputs to their textual form
-                // via `ColumnViewer<TYPE_VARCHAR>`; mirror that so callers like
-                // `murmur_hash3_32(ifnull(int_col, 0))` hash the value's decimal
-                // representation rather than failing.
-                _ => {
-                    if let Some(s) = try_stringify_scalar(input, row)? {
-                        seed = murmur_hash3_32(s.as_bytes(), seed);
-                    } else {
-                        has_null = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if has_null {
-            builder.append_null();
-        } else {
-            builder.append_value(seed as i32);
-        }
-    }
-
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    novarocks_functions::builtin::string_extended::evaluate_legacy(
+        novarocks_functions::builtin::string_extended::StringOperation::Murmur,
+        &inputs,
+        chunk.len(),
+    )
 }
 
-/// Best-effort StarRocks-compatible `ColumnViewer<TYPE_VARCHAR>` on an arbitrary
-/// scalar input array. Returns `None` when the row is NULL. Returns an error
-/// for aggregate/nested types that StarRocks itself doesn't hash directly.
-fn try_stringify_scalar(input: &ArrayRef, row: usize) -> Result<Option<String>, String> {
-    if input.is_null(row) {
-        return Ok(None);
-    }
-    macro_rules! cast {
-        ($t:ty) => {{
-            let arr = input
-                .as_any()
-                .downcast_ref::<$t>()
-                .ok_or_else(|| format!("downcast {} failed", stringify!($t)))?;
-            Ok(Some(arr.value(row).to_string()))
-        }};
-    }
-    match input.data_type() {
-        DataType::Int8 => cast!(Int8Array),
-        DataType::Int16 => cast!(Int16Array),
-        DataType::Int32 => cast!(Int32Array),
-        DataType::Int64 => cast!(Int64Array),
-        DataType::UInt8 => cast!(UInt8Array),
-        DataType::UInt16 => cast!(UInt16Array),
-        DataType::UInt32 => cast!(UInt32Array),
-        DataType::UInt64 => cast!(UInt64Array),
-        DataType::Boolean => {
-            let arr = input
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "downcast BooleanArray failed".to_string())?;
-            // StarRocks casts BOOLEAN → VARCHAR as "1"/"0".
-            Ok(Some(if arr.value(row) { "1" } else { "0" }.to_string()))
-        }
-        // Arrow's default cast for Timestamp produces ISO 8601 with a `T`
-        // separator (e.g. `2024-01-01T12:34:56`), but StarRocks's
-        // VARCHAR-viewer of DATETIME uses a space (`2024-01-01 12:34:56`).
-        // Use NovaRocks's StarRocks-compatible formatter so
-        // `murmur_hash3_32(datetime_col)` hashes the same bytes StarRocks
-        // would, including inside `array_map` over `array<datetime>`.
-        DataType::Timestamp(unit, tz) => {
-            let value = match unit {
-                TimeUnit::Second => input
-                    .as_any()
-                    .downcast_ref::<TimestampSecondArray>()
-                    .ok_or_else(|| "downcast TimestampSecondArray failed".to_string())?
-                    .value(row),
-                TimeUnit::Millisecond => input
-                    .as_any()
-                    .downcast_ref::<TimestampMillisecondArray>()
-                    .ok_or_else(|| "downcast TimestampMillisecondArray failed".to_string())?
-                    .value(row),
-                TimeUnit::Microsecond => input
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or_else(|| "downcast TimestampMicrosecondArray failed".to_string())?
-                    .value(row),
-                TimeUnit::Nanosecond => input
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .ok_or_else(|| "downcast TimestampNanosecondArray failed".to_string())?
-                    .value(row),
-            };
-            Ok(Some(crate::exec::expr::cast::format_timestamp_for_varchar(
-                unit,
-                value,
-                tz.as_deref(),
-            )))
-        }
-        _ => {
-            // Numeric text was converted once per batch by the public CAST owner.
-            // Retain the existing Arrow formatter for the remaining carriers.
-            use arrow::compute::kernels::cast::{CastOptions, cast_with_options};
-            use arrow::util::display::FormatOptions;
-            let opts = CastOptions {
-                safe: false,
-                format_options: FormatOptions::default(),
-            };
-            let casted = cast_with_options(input.as_ref(), &DataType::Utf8, &opts)
-                .map_err(|e| format!("cast to Utf8 failed for murmur_hash3_32: {e}"))?;
-            let arr = casted
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "cast result is not StringArray".to_string())?;
-            if arr.is_null(row) {
-                Ok(None)
-            } else {
-                Ok(Some(arr.value(row).to_string()))
-            }
-        }
-    }
-}
-
-fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
-    const C1: u32 = 0xcc9e2d51;
-    const C2: u32 = 0x1b873593;
-
-    let mut hash = seed;
-    let mut chunks = data.chunks_exact(4);
-    for chunk in &mut chunks {
-        let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        k = k.wrapping_mul(C1);
-        k = k.rotate_left(15);
-        k = k.wrapping_mul(C2);
-        hash ^= k;
-        hash = hash.rotate_left(13);
-        hash = hash.wrapping_mul(5).wrapping_add(0xe6546b64);
-    }
-
-    let rem = chunks.remainder();
-    let mut k1 = 0u32;
-    match rem.len() {
-        3 => {
-            k1 ^= (rem[2] as u32) << 16;
-            k1 ^= (rem[1] as u32) << 8;
-            k1 ^= rem[0] as u32;
-        }
-        2 => {
-            k1 ^= (rem[1] as u32) << 8;
-            k1 ^= rem[0] as u32;
-        }
-        1 => {
-            k1 ^= rem[0] as u32;
-        }
-        _ => {}
-    }
-    if k1 != 0 {
-        k1 = k1.wrapping_mul(C1);
-        k1 = k1.rotate_left(15);
-        k1 = k1.wrapping_mul(C2);
-        hash ^= k1;
-    }
-
-    hash ^= data.len() as u32;
-    hash ^= hash >> 16;
-    hash = hash.wrapping_mul(0x85ebca6b);
-    hash ^= hash >> 13;
-    hash = hash.wrapping_mul(0xc2b2ae35);
-    hash ^= hash >> 16;
-    hash
-}
+#[cfg(test)]
+use novarocks_functions::builtin::string_extended::murmur_hash3_32;
 
 #[cfg(test)]
 mod tests {
@@ -282,7 +73,10 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::ExprNode;
     use crate::exec::expr::function::FunctionKind;
-    use arrow::array::{Decimal128Array, Decimal256Array, Float32Array, Float64Array};
+    use arrow::array::{
+        Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, StringArray,
+    };
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow_buffer::i256;

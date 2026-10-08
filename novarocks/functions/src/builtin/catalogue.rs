@@ -2606,6 +2606,12 @@ pub(super) fn scalar_definition_parts(
                     name if super::calendar_parts_owner::operation(name).is_some() => {
                         Some(super::calendar_parts_owner::effects())
                     }
+                    name if super::string_extended_owner::operation(name).is_some() => {
+                        Some(super::string_extended_owner::effects(
+                            super::string_extended_owner::operation(name)
+                                .expect("matched operation"),
+                        ))
+                    }
                     name if super::date_owner::operation(name).is_some() => {
                         Some(super::date_owner::effects())
                     }
@@ -2867,6 +2873,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::calendar_extended_owner::operation(name).is_some() => {
                 super::calendar_extended_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_extended_owner::operation(name).is_some() => {
+                super::string_extended_owner::definition(name, declaration, resolver)?
             }
             name if super::calendar_parts_owner::operation(name).is_some() => {
                 super::calendar_parts_owner::definition(name, declaration, resolver)?

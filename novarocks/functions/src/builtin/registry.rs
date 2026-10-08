@@ -146,7 +146,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "url_encode",
         "url_decode",
         "char",
-        "unhex",
         "sm3",
     ] {
         add(
@@ -155,6 +154,12 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
         );
     }
+
+    add(
+        m,
+        "unhex",
+        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Binary),
+    );
 
     // md5sum hashes the bytes of whatever it is given, over any number of
     // arguments -- it is not one of the string transforms it was grouped with.

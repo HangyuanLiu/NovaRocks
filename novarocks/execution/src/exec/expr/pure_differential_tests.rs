@@ -822,7 +822,6 @@ fn pure_differential_reports_missing_owners_for_the_census() {
                 column_argument(DataType::Int64),
             ],
         ),
-        ("murmur_hash3_32", vec![column_argument(DataType::Utf8)]),
         (
             "days_add",
             vec![
@@ -832,9 +831,6 @@ fn pure_differential_reports_missing_owners_for_the_census() {
         ),
         ("hour_from_unixtime", vec![column_argument(DataType::Int64)]),
         ("time_to_sec", vec![column_argument(timestamp())]),
-        ("unhex", vec![column_argument(DataType::Utf8)]),
-        ("to_binary", vec![column_argument(DataType::Utf8)]),
-        ("money_format", vec![column_argument(DataType::Int64)]),
     ];
     let mut inventory = Vec::new();
     for (name, arguments) in scalar_census {
