@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "stage": "P09 independent Decimal read/write golden correction",
+  "source_revision": "8f59f39530df6295dd81a1beeecea103927eda47",
+  "outcome": "independent oracle passed on both native versions; reviewed golden corrected",
+  "topology": "1FE+3BE",
+  "basis": "Exact SQL literal text and actual DDL, Python Decimal precision 128, existing HALF_UP and nullable overflow policy; no engine output recording and no float epsilon.",
+  "sql": {
+    "path": "tests/sql/correctness/decimal/sql/test_read_write_decimal256.sql",
+    "sha256": "836b381f7d10afac795058dcd86d609a75bf2e709f4af99e61f5bb074ad1004a"
+  },
+  "oracle": {
+    "path": "docs/testing/mem-1-m07/oracles/decimal-read-write-v1.py",
+    "sha256": "76635142847f46663035fdbb8097c36e2771ad00885fbe8385109e895be7af34"
+  },
+  "audit": {
+    "schema_version": 1,
+    "sql_sha256": "836b381f7d10afac795058dcd86d609a75bf2e709f4af99e61f5bb074ad1004a",
+    "oracle_sha256": "76635142847f46663035fdbb8097c36e2771ad00885fbe8385109e895be7af34",
+    "result_sha256": "a4764f945ffe5edb77bd9b104732d2d6456432e13bc2aa615fd7ef5e6da771b9",
+    "basis": "Exact literal text, actual DDL precision/scale, fixture HALF_UP and nullable-overflow contract, explicit SELECT/aggregate shapes. No database output used.",
+    "queries": 88,
+    "rows": 303,
+    "result": "logs/mem-1-m07/p09-decimal-independent-oracle-20261009/test_read_write_decimal256.result"
+  },
+  "expected": {
+    "path": "logs/mem-1-m07/p09-decimal-independent-oracle-20261009/test_read_write_decimal256.result",
+    "sha256": "a4764f945ffe5edb77bd9b104732d2d6456432e13bc2aa615fd7ef5e6da771b9"
+  },
+  "previous_golden": {
+    "path": "logs/mem-1-m07/p09-decimal-independent-oracle-20261009/legacy-golden-before.result",
+    "sha256": "4858044a3d4cb63fee99692b894cfabbf1a2c3c03d9ec8b0411bcf345f4f81e8"
+  },
+  "review": {
+    "queries": 88,
+    "rows": 303,
+    "changed_queries": [
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      13,
+      14,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      27,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      59,
+      60,
+      61,
+      62,
+      63,
+      67,
+      68,
+      69,
+      70,
+      71,
+      76,
+      77,
+      83,
+      85,
+      87,
+      88,
+      89
+    ],
+    "changed_cells": 163,
+    "headers_unchanged": true,
+    "row_counts_unchanged": true,
+    "null_count_changes": [
+      {
+        "query": 39,
+        "old_null_cells": 0,
+        "new_null_cells": 2
+      },
+      {
+        "query": 59,
+        "old_null_cells": 0,
+        "new_null_cells": 2
+      },
+      {
+        "query": 60,
+        "old_null_cells": 0,
+        "new_null_cells": 2
+      },
+      {
+        "query": 61,
+        "old_null_cells": 0,
+        "new_null_cells": 2
+      },
+      {
+        "query": 62,
+        "old_null_cells": 0,
+        "new_null_cells": 2
+      },
+      {
+        "query": 63,
+        "old_null_cells": 0,
+        "new_null_cells": 2
+      },
+      {
+        "query": 76,
+        "old_null_cells": 0,
+        "new_null_cells": 3
+      },
+      {
+        "query": 77,
+        "old_null_cells": 3,
+        "new_null_cells": 5
+      }
+    ],
+    "null_change_basis": "Values outside actual declared precision become NULL under the existing nullable overflow policy; NULL-first ORDER BY shifts some other row positions.",
+    "sql_unchanged": true
+  },
+  "shape_mutations": {
+    "extra_update": {
+      "rejected": true,
+      "reason": "setup statement count changed"
+    },
+    "replace_literal_with_update": {
+      "rejected": true,
+      "reason": "unsupported setup statement"
+    },
+    "unsupported_append_type": {
+      "rejected": true,
+      "reason": "unsupported table declaration"
+    },
+    "changed_format": {
+      "rejected": true,
+      "reason": "unsupported setup statement"
+    }
+  },
+  "oracle_after_hardening_result_identical": true,
+  "native_runs": [
+    {
+      "label": "candidate",
+      "matrix": {
+        "source_revision": "8f59f39530df6295dd81a1beeecea103927eda47",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+        "launch_profile": "fault-scenario",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_read_write_decimal256.sql",
+            "exit_code": 0,
+            "duration_seconds": 39.565
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "steps_passed": 89,
+      "comparison": "exact strings, epsilon=None",
+      "raw_files": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-candidate-20261009/matrix-status.json",
+          "sha256": "c097b0ca2fde03cbb7ef5f1cea5ec4910783d38b16ba285e597fc219b18037be"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-candidate-20261009/decimal.log",
+          "sha256": "9d73d0413afc9e3a6d22ce6db4aee6364eca0b7fb266f307c53fae75dab9c3bc"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-candidate-20261009/startup.log",
+          "sha256": "fcd26a2a860596b59a2bcee16e1f00cb7792e6baeb3848870147a419c4728fa6"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-candidate-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    },
+    {
+      "label": "old-main",
+      "matrix": {
+        "source_revision": "8f59f39530df6295dd81a1beeecea103927eda47",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/mem-1-m07-main-baseline/NovaRocks/target/release/novarocks",
+        "server_sha256": "5c5bdea5490f209cc0140c1b1e73a30f6ce32c48052673e5fee23ea1300f5756",
+        "launch_profile": "performance",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_read_write_decimal256.sql",
+            "exit_code": 0,
+            "duration_seconds": 14.91
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+      "steps_passed": 89,
+      "comparison": "exact strings, epsilon=None",
+      "raw_files": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-old-main-20261009/matrix-status.json",
+          "sha256": "0ef3b9dab571d1dca827082d343bf6c607bb91c9267981a37ff4da92e4539246"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-old-main-20261009/decimal.log",
+          "sha256": "ef03cd89bacbf89c8a5879b9c7d151649842469fb8d33ad10fd89be5fb91dba3"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-old-main-20261009/startup.log",
+          "sha256": "5cb5334c7b5004032bc9951e21660cbe6aa28b86f4d871d6cd2e0ddf8cfcf772"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-oracle-old-main-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    }
+  ],
+  "process_exit_checks": [
+    {
+      "run": "candidate",
+      "pids": [
+        85772,
+        85773,
+        85774,
+        85775
+      ],
+      "all_absent": true,
+      "build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3"
+    },
+    {
+      "run": "old-main",
+      "pids": [
+        86397,
+        86398,
+        86399,
+        86400
+      ],
+      "all_absent": true,
+      "build_identity": "9c7723bbe45dbd5738b90ae86664b184e99bab2e"
+    }
+  ],
+  "scope": "Only this legacy read/write golden. No persistent precision >38 claim, remaining five legacy Decimal goldens/full SQL/P09/P10 acceptance remain open.",
+  "local_only": true,
+  "corrected_golden": {
+    "path": "tests/sql/correctness/decimal/result/test_read_write_decimal256.result",
+    "sha256": "a4764f945ffe5edb77bd9b104732d2d6456432e13bc2aa615fd7ef5e6da771b9"
+  }
+}

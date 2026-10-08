@@ -52,17 +52,39 @@ def decimal_cell(literal, precision, scale, nullable):
 
 
 def derive(sql):
+    reads = re.split(r"(?m)^-- query (\d+)\s*\n", sql)
+    require([int(reads[i]) for i in range(1, len(reads), 2)] == list(range(1, 90)), "read shapes changed")
     # This fixture has no comment delimiters inside its literals.
-    source = re.sub(r"--[^\n]*", "", sql)
-    definitions = re.findall(
-        r"CREATE TABLE \$\{case_db\}\.(\w+)\s*\((.*?)\)\s*TBLPROPERTIES",
-        source, re.S | re.I,
-    )
+    source = re.sub(r"--[^\n]*", "", reads[2])
+    require(source.rstrip().endswith(";"), "setup has an unterminated statement")
+    statements = [statement.strip() for statement in source.split(";") if statement.strip()]
+    require(len(statements) == 387, "setup statement count changed")
+    definitions, insertions = [], []
+    for statement in statements:
+        declaration = re.fullmatch(
+            r'CREATE TABLE \$\{case_db\}\.(\w+)\s*\((.*?)\)\s*TBLPROPERTIES\s*\("format-version"\s*=\s*"3"\)',
+            statement, re.S | re.I,
+        )
+        insertion = re.fullmatch(r"INSERT INTO \$\{case_db\}\.(\w+)\s+(.+)", statement, re.S | re.I)
+        require(declaration or insertion, "unsupported setup statement")
+        if declaration:
+            definitions.append(declaration.groups())
+        else:
+            insertions.append(insertion.groups())
     require(len(definitions) == 86, "fixture DDL shape changed")
     schemas = {}
     rows = {}
     direct = set()
+    append_declarations = {
+        "decimal_append_test_p39_s0": "user_id varchar(42) NOT NULL, asset_id varchar(42) NOT NULL, timestamp datetime NOT NULL, shop_id int NOT NULL, day_bucket DATE NOT NULL, value DECIMAL(38,0) NOT NULL",
+        "decimal_append_test_p50_s10": "id1 bigint NOT NULL, id2 varchar(50) NOT NULL, id3 int NOT NULL, decimal_value DECIMAL(38,10) NOT NULL, decimal_nullable DECIMAL(38,15), regular_value bigint",
+    }
     for name, body in definitions:
+        require(name not in schemas, "duplicate table declaration")
+        scalar = re.fullmatch(r"\s*d1\s+decimal\(\d+,\s*\d+\)\s*", body, re.I)
+        if not scalar:
+            normalize = lambda text: re.sub(r"\s+", "", text).lower()
+            require(name in append_declarations and normalize(body) == normalize(append_declarations[name]), "unsupported table declaration")
         decimals = {}
         for field, precision, scale, not_null in re.findall(
             r"(\w+)\s+decimal\((\d+),\s*(\d+)\)(\s+NOT NULL)?", body, re.I
@@ -73,10 +95,9 @@ def derive(sql):
         require(decimals, "fixture table has no declared Decimal field")
         schemas[name] = decimals
         rows[name] = []
-        if re.fullmatch(r"\s*d1\s+decimal\(\d+,\s*\d+\)\s*", body, re.I):
+        if scalar:
             direct.add(name)
     require(len(direct) == 84, "single-column fixture shape changed")
-    insertions = re.findall(r"INSERT INTO \$\{case_db\}\.(\w+)\s+([^;]+);", source, re.I)
     require(len(insertions) == 301, "fixture insertion count changed")
     append_fields = {
         "decimal_append_test_p39_s0": ["user_id", "asset_id", "timestamp", "shop_id", "day_bucket", "value"],
@@ -103,8 +124,6 @@ def derive(sql):
                 row[field] = decimal_cell(row[field], *geometry)
         rows[name].append(row)
 
-    reads = re.split(r"(?m)^-- query (\d+)\s*\n", sql)
-    require([int(reads[i]) for i in range(1, len(reads), 2)] == list(range(1, 90)), "read shapes changed")
     results = {}
     for index in range(3, len(reads), 2):
         number, query = int(reads[index]), reads[index + 1].strip()

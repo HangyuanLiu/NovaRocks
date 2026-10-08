@@ -2,7 +2,7 @@
 
 `decimal-read-write-v1.py` 只识别现有 `test_read_write_decimal256.sql` 的固定形状：86 张表、301 次 literal INSERT 和 88 个读取查询。它不是通用 SQL 解释器；DDL、插入数、读取形状或未知表达式变化时直接拒绝。
 
-预期值由原始 SQL 的十进制字面量和实际 DDL 计算，使用 Python 标准库 Decimal（128 位十进制精度），不从 old main 或 candidate 输出录制。历史表名和注释中的 p39/p76 等数字不作为类型依据；此 fixture 的持久列实际声明为 DECIMAL(38, scale)。保留原 SQL、列名、行数、NULL 和查询形状。独立算术应用 fixture 明确要求的 HALF_UP（包括负数）与 nullable overflow；对应既有冻结 policy 为 `type-contract/src/arithmetic.rs` 的 OutputNull/ReportError，既有 `execution/src/exec/expr/cast.rs` 的 downscale HALF_UP 回归单独钉住舍入合同。显式 ReportError case 不在这个 helper 内。
+预期值由原始 SQL 的十进制字面量和实际 DDL 计算，使用 Python 标准库 Decimal（128 位十进制精度），不从 old main 或 candidate 输出录制。历史表名和注释中的 p39/p76 等数字不作为类型依据；此 fixture 的持久列实际精度最高为 38（包括 DECIMAL(35,33)），每列均以实际 DDL 为准。保留原 SQL、列名、行数和查询形状；超出实际精度的 nullable 值按已有合同生成 NULL。独立算术应用 fixture 明确要求的 HALF_UP（包括负数）与 nullable overflow；对应既有冻结 policy 为 `type-contract/src/arithmetic.rs` 的 OutputNull/ReportError，既有 `execution/src/exec/expr/cast.rs` 的 downscale HALF_UP 回归单独钉住舍入合同。显式 ReportError case 不在这个 helper 内。
 
 运行示例（只写独立候选文件，不修改原 golden）：
 
