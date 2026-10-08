@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact MAX_BY/MIN_BY over the original tracked scalar and recursive codec.
-use super::aggregate_by_core::{ByDirection, ByEncodeBuffer, ByState};
+//! Exact MAX_N/MIN_N over the original tracked scalar and scalar codec.
+use super::aggregate_by::HostByBuffer;
+use super::aggregate_n_core::NState;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
@@ -27,35 +28,9 @@ use arrow_array::{Array, ArrayRef, BinaryArray, builder::BinaryBuilder};
 use arrow_schema::DataType;
 use std::sync::Arc;
 #[derive(Debug)]
-pub(super) struct ByKernel {
+pub(super) struct NKernel {
     pub(super) contract: Arc<AggregateCallContract>,
-    pub(super) direction: ByDirection,
-}
-pub(super) struct HostByBuffer(pub(super) HostVec<u8, HostAggregateAllocator>);
-impl ByEncodeBuffer for HostByBuffer {
-    fn push(&mut self, byte: u8) -> Result<(), ScalarStateError> {
-        self.0
-            .try_reserve(1)
-            .map_err(|_| ScalarStateError::Kernel(self.0.allocator().take_failure()))?;
-        self.0.push(byte);
-        Ok(())
-    }
-    fn append(
-        &mut self,
-        bytes: &[u8],
-        work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
-        work.flush()?;
-        self.0
-            .try_reserve(bytes.len())
-            .map_err(|_| ScalarStateError::Kernel(self.0.allocator().take_failure()))?;
-        work.flush()?;
-        for byte in bytes {
-            work.step()?;
-            self.0.push(*byte);
-        }
-        Ok(())
-    }
+    pub(super) keep_smallest: bool,
 }
 fn observed<T>(
     control: &dyn KernelEvaluationControl,
@@ -68,7 +43,7 @@ fn observed<T>(
     let result = work.finish_result(result);
     observation.finish(result)
 }
-impl ByKernel {
+impl NKernel {
     fn output_type(&self) -> &DataType {
         let FunctionResultType::Scalar(output) = &self.contract.call().selected().result_type
         else {
@@ -77,8 +52,8 @@ impl ByKernel {
         &output.data_type
     }
 }
-impl PreparedAggregateKernel for ByKernel {
-    type State = ByState<HostAggregateAllocator>;
+impl PreparedAggregateKernel for NKernel {
+    type State = NState<HostAggregateAllocator>;
     type PreparedUpdateBatch<'a> = SelectedAggregateUpdateInput<'a, 'a>;
     type PreparedMergeBatch<'a> = SelectedAggregateMergeInput<'a, 'a>;
     fn contract(&self) -> &Arc<AggregateCallContract> {
@@ -96,7 +71,7 @@ impl PreparedAggregateKernel for ByKernel {
     ) -> Result<Self::State, KernelFailure> {
         control.checkpoint(0)?;
         Err(invalid(
-            "allocation-tracked max_by/min_by requires a host allocator",
+            "allocation-tracked min_n/max_n requires a host allocator",
         ))
     }
     fn create_state_with_allocator(
@@ -106,10 +81,10 @@ impl PreparedAggregateKernel for ByKernel {
     ) -> Result<Self::State, KernelFailure> {
         observed(control, |work| {
             let allocator = allocator.ok_or_else(|| {
-                invalid("allocation-tracked max_by/min_by requires a host allocator")
+                invalid("allocation-tracked min_n/max_n requires a host allocator")
             })?;
             work.step()?;
-            Ok(ByState::new(HostAggregateAllocator::try_new(allocator)?))
+            Ok(NState::new(HostAggregateAllocator::try_new(allocator)?))
         })
     }
     fn prepare_update<'a>(
@@ -125,7 +100,7 @@ impl PreparedAggregateKernel for ByKernel {
                 || !input.order_arguments().is_empty()
             {
                 return Err(invalid(
-                    "max_by/min_by update differs from its exact phase or channels",
+                    "min_n/max_n update differs from its exact phase or channels",
                 ));
             }
             Ok(input)
@@ -145,22 +120,22 @@ impl PreparedAggregateKernel for ByKernel {
             let row = input
                 .selection()
                 .row(ordinal)
-                .ok_or_else(|| invalid("max_by/min_by selected ordinal is out of bounds"))?;
+                .ok_or_else(|| invalid("min_n/max_n selected ordinal is out of bounds"))?;
             work.step()?;
             let values = input.logical_arguments()[0];
             let keys = input.logical_arguments()[1];
             let value_row = values.value_row(ordinal, row);
             let key_row = keys.value_row(ordinal, row);
             if value_row >= values.array().len() || key_row >= keys.array().len() {
-                return Err(internal("max_by/min_by selected address is out of bounds"));
+                return Err(internal("min_n/max_n selected address is out of bounds"));
             }
             state
                 .update_from_arrays(
-                    self.direction,
                     values.array(),
                     value_row,
                     keys.array(),
                     key_row,
+                    self.keep_smallest,
                     &mut ScalarWork::new(Some(work)),
                 )
                 .map_err(ScalarStateError::into_kernel_failure)
@@ -182,7 +157,7 @@ impl PreparedAggregateKernel for ByKernel {
                 || input.state().array().data_type() != &DataType::Binary
             {
                 return Err(invalid(
-                    "max_by/min_by merge differs from its exact phase or Binary state",
+                    "min_n/max_n merge differs from its exact phase or Binary state",
                 ));
             }
             Ok(input)
@@ -202,7 +177,7 @@ impl PreparedAggregateKernel for ByKernel {
             let row = input
                 .selection()
                 .row(ordinal)
-                .ok_or_else(|| invalid("max_by/min_by merge ordinal is out of bounds"))?;
+                .ok_or_else(|| invalid("min_n/max_n merge ordinal is out of bounds"))?;
             work.step()?;
             let argument = input.state();
             let address = argument.value_row(ordinal, row);
@@ -210,17 +185,18 @@ impl PreparedAggregateKernel for ByKernel {
                 .array()
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| internal("max_by/min_by expected exact BinaryArray state"))?;
+                .ok_or_else(|| internal("min_n/max_n expected exact BinaryArray state"))?;
             if address >= array.len() {
-                return Err(internal("max_by/min_by merge address is out of bounds"));
+                return Err(internal("min_n/max_n merge address is out of bounds"));
             }
             if array.is_null(address) {
                 return Ok(());
             }
             state
-                .merge_bytes(
-                    self.direction,
-                    array.value(address),
+                .merge_from_array(
+                    argument.array(),
+                    address,
+                    self.keep_smallest,
                     &mut ScalarWork::new(Some(work)),
                 )
                 .map_err(ScalarStateError::into_kernel_failure)
@@ -245,7 +221,7 @@ impl PreparedAggregateKernel for ByKernel {
             let mut work = ScalarWork::new(Some(work));
             for state in states {
                 if count == expected {
-                    return Err(internal("max_by/min_by state iterator exceeded its extent"));
+                    return Err(internal("min_n/max_n state iterator exceeded its extent"));
                 }
                 count += 1;
                 if state.failed {
@@ -253,23 +229,17 @@ impl PreparedAggregateKernel for ByKernel {
                 }
                 work.step().map_err(ScalarStateError::into_kernel_failure)?;
                 let mut bytes = HostByBuffer(HostVec::new_in(state.allocator.clone()));
-                if state
+                state
                     .serialize(&mut bytes, &mut work)
-                    .map_err(ScalarStateError::into_kernel_failure)?
-                {
-                    work.flush()
-                        .map_err(ScalarStateError::into_kernel_failure)?;
-                    builder.append_value(&bytes.0);
-                    work.flush()
-                        .map_err(ScalarStateError::into_kernel_failure)?;
-                } else {
-                    builder.append_null();
-                }
+                    .map_err(ScalarStateError::into_kernel_failure)?;
+                work.flush()
+                    .map_err(ScalarStateError::into_kernel_failure)?;
+                builder.append_value(&bytes.0);
+                work.flush()
+                    .map_err(ScalarStateError::into_kernel_failure)?;
             }
             if count != expected {
-                return Err(internal(
-                    "max_by/min_by state iterator shortened its extent",
-                ));
+                return Err(internal("min_n/max_n state iterator shortened its extent"));
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         })
@@ -291,7 +261,7 @@ impl PreparedAggregateKernel for ByKernel {
             let mut work = ScalarWork::new(Some(work));
             for state in states {
                 if values.len() == expected {
-                    return Err(internal("max_by/min_by state iterator exceeded its extent"));
+                    return Err(internal("min_n/max_n state iterator exceeded its extent"));
                 }
                 if state.failed {
                     return Err(KernelFailure::InstanceFailed);
@@ -300,13 +270,12 @@ impl PreparedAggregateKernel for ByKernel {
                 values.push(
                     state
                         .output(&mut work)
+                        .map(Some)
                         .map_err(ScalarStateError::into_kernel_failure)?,
                 );
             }
             if values.len() != expected {
-                return Err(internal(
-                    "max_by/min_by state iterator shortened its extent",
-                ));
+                return Err(internal("min_n/max_n state iterator shortened its extent"));
             }
             scalar::build_scalar_array(self.output_type(), values, &mut work)
                 .map_err(ScalarStateError::into_kernel_failure)
@@ -319,29 +288,57 @@ pub(super) fn validate_contract(
 ) -> Result<(), KernelFailure> {
     let [
         FunctionArgumentType::Value(value),
-        FunctionArgumentType::Value(key),
+        FunctionArgumentType::Value(limit),
     ] = contract.call().selected().argument_types.as_ref()
     else {
-        return Err(invalid(
-            "max_by/min_by requires exactly two value arguments",
-        ));
+        return Err(invalid("min_n/max_n requires exactly two value arguments"));
     };
     let FunctionResultType::Scalar(output) = &contract.call().selected().result_type else {
-        return Err(invalid("max_by/min_by requires a scalar result"));
+        return Err(invalid("min_n/max_n requires a scalar result"));
     };
-    // Only domains installed by the original recursive scalar reader; no
-    // catalogue derivation is changed to fit the selected implementation.
-    if !super::aggregate_any_value::supported(&value.data_type, work)?
-        || !super::aggregate_any_value::supported(&key.data_type, work)?
-    {
+    work.step().map_err(compile_failure)?;
+    if value.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
         return Err(invalid(&format!(
-            "{} has no installed max_by/min_by input profile for {:?}",
+            "{} has no installed min_n/max_n logical input profile for {:?}",
+            contract.call().function_id().as_str(),
+            value.logical_type
+        )));
+    }
+    // The installed profile must close the original scalar state codec in
+    // every phase; legacy Single-only nested/Binary slices remain outside it.
+    let source = matches!(
+        value.data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Timestamp(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::FixedSizeBinary(16)
+    );
+    let integer = limit.logical_type == novarocks_type_contract::ValueLogicalType::Physical
+        && matches!(
+            limit.data_type,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        );
+    if !source || !integer {
+        return Err(invalid(&format!(
+            "{} has no installed min_n/max_n input profile for {:?}",
             contract.call().function_id().as_str(),
             contract.call().selected().argument_types
         )));
     }
-    let mut expected = value.clone();
-    expected.nullable = true;
+    let expected = FunctionValueType::new(
+        DataType::List(Arc::new(super::signature::value_field("item", value, true))),
+        true,
+    );
     if !expected
         .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
         || !FunctionValueType::new(DataType::Binary, true)
@@ -350,12 +347,12 @@ pub(super) fn validate_contract(
             })?
     {
         return Err(invalid(
-            "max_by/min_by selected result or intermediate differs from its exact value and Binary state",
+            "min_n/max_n selected result or intermediate differs from its exact nullable List and Binary state",
         ));
     }
     Ok(())
 }
 
 #[cfg(test)]
-#[path = "aggregate_by_failure_tests.rs"]
+#[path = "aggregate_n_failure_tests.rs"]
 mod failure_tests;

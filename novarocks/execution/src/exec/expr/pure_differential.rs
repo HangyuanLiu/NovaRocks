@@ -1539,3 +1539,11 @@ mod nullif_tests;
 
 #[path = "pure_differential/by_tests.rs"]
 mod by_tests;
+
+#[cfg(test)]
+#[path = "pure_differential/n_tests.rs"]
+mod n_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_s1_parts_tests.rs"]
+mod s1_parts_tests;

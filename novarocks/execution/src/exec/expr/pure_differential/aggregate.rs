@@ -88,6 +88,8 @@ pub(crate) struct AggregateDiffSpec {
     pub semantics: DiffSemantics,
     pub float_comparison: FloatComparison,
     pub error_messages: ErrorMessageCheck,
+    /// Only explicitly frozen original panic payloads can match.
+    pub expected_panic_payload: Option<String>,
 }
 
 impl AggregateDiffSpec {
@@ -103,6 +105,7 @@ impl AggregateDiffSpec {
             semantics: DiffSemantics::default(),
             float_comparison: FloatComparison::Exact,
             error_messages: ErrorMessageCheck::LegacyContainsPure,
+            expected_panic_payload: None,
         }
     }
 
@@ -162,6 +165,13 @@ impl AggregateDiffSpec {
         self
     }
 
+    /// Opt in to one exact original library panic, without treating it as a
+    /// successful NULL or an equivalent Operational data failure.
+    pub(crate) fn expected_panic_payload(mut self, payload: &str) -> Self {
+        self.expected_panic_payload = Some(payload.into());
+        self
+    }
+
     fn rows(&self) -> Result<usize, DifferentialFailure> {
         let mut rows = None;
         for argument in &self.arguments {
@@ -202,6 +212,9 @@ pub(crate) struct AggregateDiffSummary {
     pub partitions: usize,
     /// Shapes in which both paths failed with an equivalent data failure.
     pub matched_failures: usize,
+    /// Shapes where both paths panic with the same complete payload. This is
+    /// distinct from an equivalent Operational data failure.
+    pub matched_panics: usize,
     pub null_results: usize,
 }
 
@@ -318,6 +331,7 @@ pub(crate) fn run_aggregate_differential(
         groups: layout.groups,
         partitions: spec.partitions,
         matched_failures: 0,
+        matched_panics: 0,
         null_results: 0,
     };
     let mut details = Vec::new();
@@ -325,12 +339,12 @@ pub(crate) fn run_aggregate_differential(
         (
             "single phase",
             guard_legacy(|| legacy.single(spec, &layout)),
-            pure.single(spec, &layout),
+            guard_pure(|| pure.single(spec, &layout)),
         ),
         (
             "partial -> final",
             guard_legacy(|| legacy.two_phase(spec, &layout)),
-            pure.two_phase(spec, &layout),
+            guard_pure(|| pure.two_phase(spec, &layout)),
         ),
     ] {
         compare_shape(
@@ -365,6 +379,17 @@ fn guard_legacy(run: impl FnOnce() -> Result<ArrayRef, String>) -> Result<ArrayR
     })
 }
 
+enum GuardedPureResult {
+    Finished(Result<ArrayRef, KernelFailure>),
+    Panicked(String),
+}
+fn guard_pure(run: impl FnOnce() -> Result<ArrayRef, KernelFailure>) -> GuardedPureResult {
+    match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(result) => GuardedPureResult::Finished(result),
+        Err(panic) => GuardedPureResult::Panicked(panic_message(&panic)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compare_shape(
     spec: &AggregateDiffSpec,
@@ -372,10 +397,31 @@ fn compare_shape(
     shape: &str,
     groups: usize,
     legacy: Result<ArrayRef, String>,
-    pure: Result<ArrayRef, KernelFailure>,
+    pure: GuardedPureResult,
     summary: &mut AggregateDiffSummary,
     details: &mut Vec<String>,
 ) {
+    let pure = match pure {
+        GuardedPureResult::Finished(result) => result,
+        GuardedPureResult::Panicked(payload) => {
+            match legacy {
+                Err(message)
+                    if message.strip_prefix(super::LEGACY_PANIC_PREFIX)
+                        == Some(payload.as_str())
+                        && spec.expected_panic_payload.as_deref() == Some(payload.as_str()) =>
+                {
+                    summary.matched_panics += 1;
+                }
+                Err(message) => details.push(format!(
+                    "{shape}: panic mismatch: legacy `{message}`, pure `{payload}`"
+                )),
+                Ok(_) => details.push(format!(
+                    "{shape}: pure panicked with `{payload}` but legacy completed"
+                )),
+            }
+            return;
+        }
+    };
     match (legacy, pure) {
         (Ok(legacy), Ok(pure)) => {
             if legacy.len() != groups || pure.len() != groups {
@@ -905,4 +951,124 @@ pub(crate) fn aggregate_pure_owner_status(
     };
     installed_declaration(catalog, &spec.name, &bound, CatalogKind::Aggregate, legacy)?;
     Ok((bound.function_id, bound.selected.overload))
+}
+
+#[cfg(test)]
+mod panic_comparison_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use novarocks_functions::KernelDiagnostic;
+    const PAYLOAD: &str = "frozen original library panic";
+    fn legacy_panic() -> Result<ArrayRef, String> {
+        guard_legacy(|| panic!("{PAYLOAD}"))
+    }
+    fn pure_panic(payload: &str) -> GuardedPureResult {
+        guard_pure(|| panic!("{payload}"))
+    }
+    fn compare(
+        spec: AggregateDiffSpec,
+        legacy: Result<ArrayRef, String>,
+        pure: GuardedPureResult,
+    ) -> (AggregateDiffSummary, Vec<String>) {
+        let result = FunctionValueType::new(DataType::Int64, true);
+        let mut summary = AggregateDiffSummary {
+            function: FunctionId::try_new("builtin.aggregate/min_n/v1").unwrap(),
+            overload: FunctionOverloadId::try_new("builtin.aggregate/min_n/derived-v1").unwrap(),
+            result_type: result.clone(),
+            pure_state_type: FunctionValueType::new(DataType::Binary, true),
+            legacy_intermediate_type: DataType::Binary,
+            rows: 0,
+            groups: 1,
+            partitions: 1,
+            matched_failures: 0,
+            matched_panics: 0,
+            null_results: 0,
+        };
+        let mut details = Vec::new();
+        compare_shape(
+            &spec,
+            &result,
+            "independent panic guard",
+            1,
+            legacy,
+            pure,
+            &mut summary,
+            &mut details,
+        );
+        (summary, details)
+    }
+    #[test]
+    fn aggregate_same_panic_without_explicit_opt_in_is_rejected() {
+        let (summary, details) = compare(
+            AggregateDiffSpec::new("min_n"),
+            legacy_panic(),
+            pure_panic(PAYLOAD),
+        );
+        assert_eq!(summary.matched_panics, 0);
+        assert_eq!(summary.matched_failures, 0);
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains("panic mismatch"));
+    }
+    #[test]
+    fn aggregate_opt_in_requires_both_complete_payloads_and_frozen_payload_to_match() {
+        for payload in [
+            "different library panic",
+            "frozen original library panic with tail",
+        ] {
+            let (summary, details) = compare(
+                AggregateDiffSpec::new("min_n").expected_panic_payload(PAYLOAD),
+                legacy_panic(),
+                pure_panic(payload),
+            );
+            assert_eq!(summary.matched_panics, 0);
+            assert_eq!(summary.matched_failures, 0);
+            assert_eq!(details.len(), 1);
+        }
+        let (summary, details) = compare(
+            AggregateDiffSpec::new("min_n").expected_panic_payload("different frozen payload"),
+            legacy_panic(),
+            pure_panic(PAYLOAD),
+        );
+        assert_eq!(summary.matched_panics, 0);
+        assert_eq!(details.len(), 1);
+    }
+    #[test]
+    fn aggregate_legacy_success_and_pure_panic_are_never_equivalent() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let (summary, details) = compare(
+            AggregateDiffSpec::new("min_n").expected_panic_payload(PAYLOAD),
+            Ok(values),
+            pure_panic(PAYLOAD),
+        );
+        assert_eq!(summary.matched_panics, 0);
+        assert_eq!(summary.matched_failures, 0);
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains("legacy completed"));
+    }
+    #[test]
+    fn aggregate_legacy_panic_and_pure_operational_are_never_equivalent() {
+        let (summary, details) = compare(
+            AggregateDiffSpec::new("min_n").expected_panic_payload(PAYLOAD),
+            legacy_panic(),
+            GuardedPureResult::Finished(Err(KernelFailure::Operational(KernelDiagnostic::new(
+                PAYLOAD,
+            )))),
+        );
+        assert_eq!(summary.matched_panics, 0);
+        assert_eq!(summary.matched_failures, 0);
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains(super::super::LEGACY_PANIC_PREFIX));
+    }
+    #[test]
+    fn aggregate_exact_opted_in_panic_increments_only_separate_panic_evidence() {
+        let (summary, details) = compare(
+            AggregateDiffSpec::new("min_n").expected_panic_payload(PAYLOAD),
+            legacy_panic(),
+            pure_panic(PAYLOAD),
+        );
+        assert_eq!(summary.matched_panics, 1);
+        assert_eq!(summary.matched_failures, 0);
+        assert_eq!(summary.null_results, 0);
+        assert!(details.is_empty());
+    }
 }

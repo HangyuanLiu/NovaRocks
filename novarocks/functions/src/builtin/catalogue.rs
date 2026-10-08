@@ -2942,6 +2942,7 @@ pub fn contribute_builtin_functions(
                     "count" => Some(super::aggregate_count_owner::effects()),
                     "any_value" => Some(super::aggregate_any_value_owner::effects()),
                     "max_by" | "min_by" => Some(super::aggregate_by_owner::effects()),
+                    "min_n" | "max_n" => Some(super::aggregate_n_owner::effects()),
                     "sum" => Some(super::aggregate_sum_owner::effects()),
                     name if super::aggregate_distinct_numeric_kernel::operation(name).is_some() => {
                         Some(super::aggregate_distinct_numeric_owner::effects())
@@ -2980,6 +2981,14 @@ pub fn contribute_builtin_functions(
         // One resolver in both roles: it answers binding questions and it is
         // the typed signature contract an aggregate is resolved through.
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+        if matches!(declaration.name, "min_n" | "max_n") {
+            builder.register(super::aggregate_n_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
         if matches!(declaration.name, "max_by" | "min_by") {
             builder.register(super::aggregate_by_owner::definition(
                 declaration.name,
