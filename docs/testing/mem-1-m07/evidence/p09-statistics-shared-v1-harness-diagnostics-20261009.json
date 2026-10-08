@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "stage": "P09 private shared statistics v1 harness diagnostics",
+  "classification": "driver failed to restore repository workspace after sourcing private consumer publication; three shell helper paths unavailable",
+  "matrix": {
+    "source_revision": "15212d404ef686797eae2dbe6ae9b1142fd18377",
+    "source_dirty": false,
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "owner_control_root": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-private-shared-statistics-native-20261009/fixture-owner",
+    "topology": "1FE+3BE",
+    "input_freeze_sha256": "2454aaedb3a6a7e588a0c2c598bf77c93b2f9877562c6691bc637b0907629197",
+    "rest-startup.log": {
+      "exit_code": 0,
+      "duration_seconds": 4.104
+    },
+    "fixture_publication": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-private-shared-statistics-native-20261009/consumer/docker/iceberg-rest/runtime/consumer-530ffec5/publications/762918217fc94a99a37c527a30d74156",
+    "owner_locator": {
+      "control_root": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-private-shared-statistics-native-20261009/fixture-owner",
+      "daemon_id": "b79582e0-9a8f-4fa8-93bc-71e5d8ccba24"
+    },
+    "catalog_runtime": "cat-ff2bcfd3257a",
+    "object_store_runtime": "os-eec671f90159",
+    "iceberg-hms.log": {
+      "exit_code": 1,
+      "duration_seconds": 4.061
+    },
+    "rest-unbind.log": {
+      "exit_code": 0,
+      "duration_seconds": 0.471
+    },
+    "catalog-delete.log": {
+      "exit_code": 0,
+      "duration_seconds": 2.325
+    },
+    "object-store-delete.log": {
+      "exit_code": 0,
+      "duration_seconds": 0.98
+    },
+    "cleanup_complete": true
+  },
+  "actual_product_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "passed_cases": 4,
+  "failed_cases": 3,
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-private-shared-statistics-native-20261009/iceberg-hms.log",
+      "sha256": "2bfbb261e668b818956e01ff80715369a2788bc5f390baa020ff281c7a370e68"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-shared-statistics-native-20261009/matrix-status.json",
+      "sha256": "f572c2e5d527d7186a8359f0fdeb06203ee71c467051f38074dae26dd9670265"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-shared-statistics-native-20261009/rest-unbind.log",
+      "sha256": "56761e36a57c302469c2b0d7c008bef14149a93bba187610352786b0fe60ded2"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-shared-statistics-native-20261009/catalog-delete.log",
+      "sha256": "ba8b684d454c78712998928c78f5c112791eeabd1a43ddd63d78a9ec933225fc"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-shared-statistics-native-20261009/object-store-delete.log",
+      "sha256": "bb6b66bcf67ec9e1faf4eb8a1d21009432ec92ca1c417c4eaaaa5a5e9f57e9f2"
+    }
+  ],
+  "pids": [
+    18389,
+    18390,
+    18391,
+    18392
+  ],
+  "all_pids_absent": true,
+  "local_only": true,
+  "scope": "Not product regression or full suite acceptance. Canonical cleanup0. Correct only driver workspace/log/binary overrides, preserving original seven cases."
+}

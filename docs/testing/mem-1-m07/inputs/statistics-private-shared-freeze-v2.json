@@ -1,0 +1,80 @@
+{
+  "schema_version": 2,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "frozen_before_execution": true,
+  "purpose": "Repeat all seven existing statistics SQL cases under task-private canonical shared RuntimeOwner publication, required by existing Trino helper; no HMS startup.",
+  "topology": "1FE+3BE",
+  "selection": "statistics:*.sql",
+  "timeout_seconds": 600,
+  "pins": [
+    {
+      "path": "logs/mem-1-m07/run_private_shared_statistics.py",
+      "sha256": "0340d21416d424f40cef972ac766928e32a7820457b8bfdd274836a0b754443d"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/cleanup.sql",
+      "sha256": "37dbe0d709d34dfb6623094859d1d1b864c154e6538887699f8220f4796fdb4e"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/init.sql",
+      "sha256": "2246cf865da49c73c833d2df1db38554ab1860bb13de0d7b5166d61e9b12744c"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/sql/analyze_synchronous_terminal.sql",
+      "sha256": "447bba372fe46003f9caddb2b67c26d4f5a43ff336af864447f7166f07777036"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/sql/analyze_target_replaced.sql",
+      "sha256": "82c1d636b39dc7a0b4a2686c64ea559ad6b50da62b2bac5b151ab6069c236176"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/sql/ancestor_ndv_survives_table_advance.sql",
+      "sha256": "3bf64c19dd87f8bce84f36e38302e209332768b7dfa568beba932e5d68b6be31"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/sql/collect_on_write_snapshot_truth.sql",
+      "sha256": "53e86ed6d71c17a516ba954fd04d1a6cf4c460b2fe71e18f778af406b4b6e353"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/sql/iceberg_statistics_puffin_read_by_spark.sql",
+      "sha256": "d1b15567a0b1597be2d6654eb634fa57510581b65c8fc3f22312049ff2026391"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/sql/largeint_minmax.sql",
+      "sha256": "19fa09a075feaee883d9676ef094bbbd34974a6aaa90c96a1632b0ec32c90f4b"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/sql/trino_rest_puffin_show_stats.sql",
+      "sha256": "4c4eb72df0fcbb0e8faeb9e8b8ab14e3747cd50a7fff012c45dc6321a739b14d"
+    },
+    {
+      "path": "tests/sql/correctness/statistics/result/largeint_minmax.result",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/datasketches-tck/interop/trino/verify_rest_catalog.sh",
+      "sha256": "ad5b42dc00ba5f7c1d8bfaaaa5074ecc5daaecfd0c5cf05f3bf99052ea3d765c"
+    },
+    {
+      "path": "docker/fixture-inputs/lock.json",
+      "sha256": "a64be4b432bfcb835224996a778d985eb507d30c2e9baf2031e06e186b56b857"
+    },
+    {
+      "path": "docker/iceberg-rest/runtime_entry.py",
+      "sha256": "2795ed749539c579c8a5ff2935b4dd6a7f4d20c5d9b81d9691cb2f1d4cc116a8"
+    },
+    {
+      "path": "docker/iceberg-rest/fixture_runtime.py",
+      "sha256": "f5da3d8cc681f887c763214b63de466c08af99317c538ebf3a46a0ee2a1ab819"
+    }
+  ],
+  "fixture_owner": "New private control root/consumer, no current publication or existing shared fixture mutation.",
+  "cleanup": "Exact REST entry unbind --runtime-only --purge, then exact ordinary catalog/object store owner deletes.",
+  "correction_of": {
+    "path": "docs/testing/mem-1-m07/inputs/statistics-private-shared-freeze-v1.json",
+    "sha256": "2454aaedb3a6a7e588a0c2c598bf77c93b2f9877562c6691bc637b0907629197",
+    "reason": "v1 driver omitted repository workspace overrides after sourcing the private consumer publication; shell helpers resolved nonexistent private consumer paths. v2 restores the same canonical SQL-driver binary/workspace/log overrides and verifies helper availability. Original SQL/golden/caps/timeout/cleanup unchanged."
+  },
+  "unchanged": "Same original seven SQL cases, goldens, caps, assertions and canonical Trino483 digest check. No pull/build/download, no smaller workload or error bypass."
+}
