@@ -1281,3 +1281,6 @@ mod legacy_mod_pmod_shared_baseline_tests;
 
 #[cfg(test)]
 mod legacy_numeric_binary_shared_baseline_tests;
+
+#[cfg(test)]
+mod legacy_time_source_errors_baseline_tests;
