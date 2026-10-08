@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "stage": "P09 statistics initial native diagnostics",
+  "matrix": {
+    "source_revision": "3556f0d79371c2800aa37d2ea89937f83c931467",
+    "source_dirty": false,
+    "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+    "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "launch_profile": "fault-scenario",
+    "results": [
+      {
+        "suite": "statistics",
+        "sql_glob": "*.sql",
+        "exit_code": 1,
+        "duration_seconds": 50.977
+      }
+    ],
+    "fixture_startup_exit_code": 0,
+    "fixture_cleanup_exit_code": 0
+  },
+  "actual_product_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+  "passed_cases": 6,
+  "failed_cases": 1,
+  "classification": "Trino interop shell rejects isolated publication before Trino/product execution; other six native cases pass",
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-statistics-sql-native-20261009/statistics.log",
+      "sha256": "d6cd1dedf6f77000011d00cdd4ac46e84febdedf6c6036cd0d522e93828efef0"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-statistics-sql-native-20261009/matrix-status.json",
+      "sha256": "9b7833bf9bb5bf9dbf9a334afdc2279887b5bc35d529e4f5e7384ccd1ed6a420"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-statistics-sql-native-20261009/cleanup.log",
+      "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+    }
+  ],
+  "pids": [
+    16974,
+    16975,
+    16976,
+    16977
+  ],
+  "all_pids_absent": true,
+  "scope": "Not a full statistics suite PASS; repeat original seven under task-private canonical shared owner, preserving SQL/goldens/assertions/caps. No product regression or missing image claim.",
+  "local_only": true
+}
