@@ -47,17 +47,19 @@ pub(super) struct NumericDistinctState {
     pub(super) failed: bool,
 }
 impl NumericDistinctState {
-    pub(super) fn new(host: Arc<dyn AggregateStateAllocator>) -> Self {
-        let allocator = HostAggregateAllocator::new(host);
-        Self {
+    pub(super) fn new(host: Arc<dyn AggregateStateAllocator>) -> Result<Self, KernelFailure> {
+        let allocator = HostAggregateAllocator::try_new(host)?;
+        Ok(Self {
             values: HashSet::with_hasher_in(DefaultHashBuilder::default(), allocator.clone()),
             allocator,
             key_backing_bytes: 0,
             failed: false,
-        }
+        })
     }
     pub(super) fn retained_bytes(&self) -> usize {
-        self.values.raw_table().allocation_info().1.size() + self.key_backing_bytes
+        self.allocator.metadata_bytes()
+            + self.values.raw_table().allocation_info().1.size()
+            + self.key_backing_bytes
     }
     pub(super) fn insert(
         &mut self,

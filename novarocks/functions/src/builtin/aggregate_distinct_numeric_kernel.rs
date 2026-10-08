@@ -108,7 +108,7 @@ impl PreparedAggregateKernel for DistinctNumericKernel {
                 invalid("allocation-tracked numeric DISTINCT requires a host allocator")
             })?;
             work.step()?;
-            Ok(NumericDistinctState::new(host))
+            NumericDistinctState::new(host)
         })
     }
     fn prepare_update<'a>(

@@ -62,11 +62,12 @@ struct Ledger {
     bytes: usize,
     peak: usize,
     live: Vec<(usize, Layout)>,
+    metadata: Option<(usize, Layout)>,
 }
 #[derive(Default)]
 struct Host {
     ledger: Mutex<Ledger>,
-    refusal: Option<(usize, KernelFailure)>,
+    refusal: Mutex<Option<(usize, KernelFailure)>>,
 }
 impl AggregateStateAllocator for Host {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
@@ -74,7 +75,7 @@ impl AggregateStateAllocator for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &self.refusal {
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
             if *stop == at {
                 return Err(cause.clone());
             }
@@ -83,7 +84,11 @@ impl AggregateStateAllocator for Host {
             .ok_or(KernelFailure::ResourceExhausted)?;
         ledger.bytes += layout.size();
         ledger.peak = ledger.peak.max(ledger.bytes);
-        ledger.live.push((pointer.as_ptr().addr(), layout));
+        let block = (pointer.as_ptr().addr(), layout);
+        if ledger.metadata.is_none() {
+            ledger.metadata = Some(block);
+        }
+        ledger.live.push(block);
         Ok(pointer)
     }
     unsafe fn release(&self, pointer: NonNull<u8>, layout: Layout) {
@@ -97,6 +102,18 @@ impl AggregateStateAllocator for Host {
         ledger.bytes -= layout.size();
         unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
     }
+}
+fn arm_refusal(host: &Host, offset: usize, cause: KernelFailure) {
+    let next = host.ledger.lock().unwrap().attempts;
+    *host.refusal.lock().unwrap() = Some((next + offset, cause));
+}
+fn assert_metadata_only(host: &Host) {
+    let ledger = host.ledger.lock().unwrap();
+    let metadata = ledger
+        .metadata
+        .expect("successful constructor allocated metadata");
+    assert_eq!(ledger.live.as_slice(), &[metadata]);
+    assert_eq!(ledger.bytes, metadata.1.size());
 }
 fn causes() -> [KernelFailure; 7] {
     [
@@ -276,7 +293,10 @@ fn assert_failed(kernel: &ByKernel, state: &ByState<HostAggregateAllocator>) {
     assert!(state.failed);
     assert!(state.key.is_none());
     assert!(state.value.is_none());
-    assert_eq!(kernel.retained_bytes(state), 0);
+    assert_eq!(
+        kernel.retained_bytes(state),
+        state.allocator.metadata_bytes()
+    );
     assert!(matches!(
         kernel.build_final(std::iter::once(state), &Control::default()),
         Err(KernelFailure::InstanceFailed)
@@ -316,6 +336,8 @@ fn by_losing_and_tied_keys_still_allocate_full_value_before_comparison() {
         for key in [if name == "max_by" { "a" } else { "z" }, "mm"] {
             let host = Arc::new(Host::default());
             let mut state = new_state(&kernel, host.clone());
+            let initial = host.ledger.lock().unwrap().attempts;
+            let metadata = state.allocator.metadata_bytes();
             update(
                 &kernel,
                 &mut state,
@@ -324,7 +346,7 @@ fn by_losing_and_tied_keys_still_allocate_full_value_before_comparison() {
                 &Control::default(),
             )
             .unwrap();
-            assert_eq!(host.ledger.lock().unwrap().attempts, 2);
+            assert_eq!(host.ledger.lock().unwrap().attempts, initial + 2);
             update(
                 &kernel,
                 &mut state,
@@ -334,11 +356,11 @@ fn by_losing_and_tied_keys_still_allocate_full_value_before_comparison() {
             )
             .unwrap();
             let ledger = host.ledger.lock().unwrap();
-            assert_eq!(ledger.attempts, 4);
-            assert_eq!(ledger.bytes, 4);
-            assert_eq!(ledger.peak, 4 + key.len() + 9);
+            assert_eq!(ledger.attempts, initial + 4);
+            assert_eq!(ledger.bytes, metadata + 4);
+            assert_eq!(ledger.peak, metadata + 4 + key.len() + 9);
             drop(ledger);
-            assert_eq!(kernel.retained_bytes(&state), 4);
+            assert_eq!(kernel.retained_bytes(&state), metadata + 4);
             let out = kernel
                 .build_final(std::iter::once(&state), &Control::default())
                 .unwrap();
@@ -356,12 +378,9 @@ fn by_losing_or_tied_key_value_actual_refusal_releases_and_failed_latch_is_perma
     for name in ["max_by", "min_by"] {
         let kernel = kernel(name, text_type(), text_type(), AggregateKernelPhase::Single);
         for key in [if name == "max_by" { "a" } else { "z" }, "mm"] {
-            for stop in [2, 3] {
+            for stop in [0, 1] {
                 for cause in causes() {
-                    let host = Arc::new(Host {
-                        refusal: Some((stop, cause.clone())),
-                        ..Host::default()
-                    });
+                    let host = Arc::new(Host::default());
                     let mut state = new_state(&kernel, host.clone());
                     update(
                         &kernel,
@@ -371,6 +390,7 @@ fn by_losing_or_tied_key_value_actual_refusal_releases_and_failed_latch_is_perma
                         &Control::default(),
                     )
                     .unwrap();
+                    arm_refusal(&host, stop, cause.clone());
                     assert_eq!(
                         update(
                             &kernel,
@@ -382,7 +402,7 @@ fn by_losing_or_tied_key_value_actual_refusal_releases_and_failed_latch_is_perma
                         Err(cause)
                     );
                     assert_failed(&kernel, &state);
-                    assert_released(&host);
+                    assert_metadata_only(&host);
                     let attempts = host.ledger.lock().unwrap().attempts;
                     assert_eq!(
                         update(
@@ -434,18 +454,17 @@ fn by_recursive_decode_actual_refusal_restores_each_original_cause_and_partial_g
         let kernel = kernel(name, source, text_type(), AggregateKernelPhase::Final);
         for stop in 0..4 {
             for cause in causes() {
-                let host = Arc::new(Host {
-                    refusal: Some((stop, cause.clone())),
-                    ..Host::default()
-                });
+                let host = Arc::new(Host::default());
                 let mut state = new_state(&kernel, host.clone());
+                let initial = host.ledger.lock().unwrap().attempts;
+                arm_refusal(&host, stop, cause.clone());
                 assert_eq!(
                     merge(&kernel, &mut state, &wire, &Control::default()),
                     Err(cause)
                 );
                 assert_failed(&kernel, &state);
-                assert_eq!(host.ledger.lock().unwrap().attempts, stop + 1);
-                assert_released(&host);
+                assert_eq!(host.ledger.lock().unwrap().attempts, initial + stop + 1);
+                assert_metadata_only(&host);
                 drop(state);
                 assert_released(&host);
             }
@@ -456,11 +475,14 @@ fn by_recursive_decode_actual_refusal_restores_each_original_cause_and_partial_g
         let malformed: ArrayRef = Arc::new(BinaryArray::from(vec![Some(malformed.as_slice())]));
         let host = Arc::new(Host::default());
         let mut state = new_state(&kernel, host.clone());
+        let initial = host.ledger.lock().unwrap().attempts;
         assert!(
             matches!(merge(&kernel,&mut state,&malformed,&Control::default()),Err(KernelFailure::Operational(error)) if error.message()=="max_by/min_by merge input has trailing bytes")
         );
-        assert_eq!(host.ledger.lock().unwrap().attempts, 4);
+        assert_eq!(host.ledger.lock().unwrap().attempts, initial + 4);
         assert_failed(&kernel, &state);
+        assert_metadata_only(&host);
+        drop(state);
         assert_released(&host);
     }
 }
@@ -491,10 +513,7 @@ fn by_every_serialization_temporary_allocation_refusal_releases_only_the_temp() 
         assert_released(&host);
         for stop in 0..allocations {
             for cause in causes() {
-                let host = Arc::new(Host {
-                    refusal: Some((initial + stop, cause.clone())),
-                    ..Host::default()
-                });
+                let host = Arc::new(Host::default());
                 let mut state = new_state(&kernel, host.clone());
                 update(
                     &kernel,
@@ -504,6 +523,7 @@ fn by_every_serialization_temporary_allocation_refusal_releases_only_the_temp() 
                     &Control::default(),
                 )
                 .unwrap();
+                arm_refusal(&host, stop, cause.clone());
                 assert!(
                     matches!(kernel.build_intermediate(std::iter::once(&state),&Control::default()),Err(error) if error==cause)
                 );
@@ -577,7 +597,7 @@ fn by_every_update_merge_serialize_and_final_checkpoint_preserves_original_cause
                         };
                         assert_eq!(error, Err(cause));
                         assert_failed(kernel, &fresh);
-                        assert_released(&host);
+                        assert_metadata_only(&host);
                         drop(fresh);
                         assert_released(&host);
                     } else {
@@ -595,5 +615,21 @@ fn by_every_update_merge_serialize_and_final_checkpoint_preserves_original_cause
         }
         drop(first);
         assert_released(&host);
+    }
+}
+
+#[test]
+fn by_actual_metadata_constructor_refusal_is_typed_and_never_published() {
+    for name in ["min_by", "max_by"] {
+        let kernel = kernel(name, text_type(), text_type(), AggregateKernelPhase::Single);
+        for cause in causes() {
+            let host = Arc::new(Host::default());
+            arm_refusal(&host, 0, cause.clone());
+            assert!(
+                matches!(kernel.create_state_with_allocator(Some(host.clone()), &Control::default()), Err(error) if error == cause)
+            );
+            assert_eq!(host.ledger.lock().unwrap().attempts, 1);
+            assert_released(&host);
+        }
     }
 }

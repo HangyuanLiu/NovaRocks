@@ -97,7 +97,7 @@ impl PreparedAggregateKernel for AnyValueKernel {
         AggregateStateMemoryPolicy::AllocationTracked
     }
     fn retained_bytes(&self, state: &Self::State) -> usize {
-        state.retained_bytes()
+        state.allocator.metadata_bytes() + state.retained_bytes()
     }
     fn create_state(
         &self,
@@ -117,7 +117,9 @@ impl PreparedAggregateKernel for AnyValueKernel {
             let allocator = allocator
                 .ok_or_else(|| invalid("allocation-tracked any_value requires a host allocator"))?;
             work.step()?;
-            Ok(AnyValueState::new(HostAggregateAllocator::new(allocator)))
+            Ok(AnyValueState::new(HostAggregateAllocator::try_new(
+                allocator,
+            )?))
         })
     }
     fn prepare_update<'a>(
@@ -370,11 +372,12 @@ mod failure_tests {
         attempts: usize,
         bytes: usize,
         live: Vec<(usize, Layout)>,
+        metadata: Option<(usize, Layout)>,
     }
     #[derive(Default)]
     struct Host {
         ledger: Mutex<Ledger>,
-        refusal: Option<(usize, KernelFailure)>,
+        refusal: Mutex<Option<(usize, KernelFailure)>>,
     }
     impl AggregateStateAllocator for Host {
         fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
@@ -382,7 +385,7 @@ mod failure_tests {
             let mut ledger = self.ledger.lock().unwrap();
             let at = ledger.attempts;
             ledger.attempts += 1;
-            if let Some((stop, cause)) = &self.refusal {
+            if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
                 if *stop == at {
                     return Err(cause.clone());
                 }
@@ -390,7 +393,11 @@ mod failure_tests {
             let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
                 .ok_or(KernelFailure::ResourceExhausted)?;
             ledger.bytes += layout.size();
-            ledger.live.push((pointer.as_ptr().addr(), layout));
+            let block = (pointer.as_ptr().addr(), layout);
+            if ledger.metadata.is_none() {
+                ledger.metadata = Some(block);
+            }
+            ledger.live.push(block);
             Ok(pointer)
         }
         unsafe fn release(&self, pointer: NonNull<u8>, layout: Layout) {
@@ -406,6 +413,18 @@ mod failure_tests {
             ledger.bytes -= layout.size();
             unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
         }
+    }
+    fn arm_refusal(host: &Host, offset: usize, cause: KernelFailure) {
+        let next = host.ledger.lock().unwrap().attempts;
+        *host.refusal.lock().unwrap() = Some((next + offset, cause));
+    }
+    fn assert_metadata_only(host: &Host) {
+        let ledger = host.ledger.lock().unwrap();
+        let metadata = ledger
+            .metadata
+            .expect("successful constructor allocated metadata");
+        assert_eq!(ledger.live.as_slice(), &[metadata]);
+        assert_eq!(ledger.bytes, metadata.1.size());
     }
     fn causes() -> [KernelFailure; 7] {
         [
@@ -546,13 +565,12 @@ mod failure_tests {
         // Root recursive vector, first UTF8 child, then second UTF8 child.
         for stop in [0, 1, 2] {
             for cause in causes() {
-                let host = Arc::new(Host {
-                    refusal: Some((stop, cause.clone())),
-                    ..Host::default()
-                });
+                let host = Arc::new(Host::default());
                 let mut state = kernel
                     .create_state_with_allocator(Some(host.clone()), &Control::default())
                     .unwrap();
+                let initial = host.ledger.lock().unwrap().attempts;
+                arm_refusal(&host, stop, cause.clone());
                 assert_eq!(
                     update(&kernel, &mut state, &values, &Control::default()),
                     Err(cause)
@@ -560,9 +578,12 @@ mod failure_tests {
                 assert!(state.failed);
                 assert!(!state.has_value);
                 assert!(state.value.is_none());
-                assert_eq!(kernel.retained_bytes(&state), 0);
-                assert_eq!(host.ledger.lock().unwrap().attempts, stop + 1);
-                assert_released(&host);
+                assert_eq!(
+                    kernel.retained_bytes(&state),
+                    state.allocator.metadata_bytes()
+                );
+                assert_eq!(host.ledger.lock().unwrap().attempts, initial + stop + 1);
+                assert_metadata_only(&host);
                 let attempts = host.ledger.lock().unwrap().attempts;
                 assert_eq!(
                     update(&kernel, &mut state, &values, &Control::default()),
@@ -615,8 +636,11 @@ mod failure_tests {
                 );
                 assert!(state.failed);
                 assert!(!state.has_value);
-                assert_eq!(kernel.retained_bytes(&state), 0);
-                assert_released(&host);
+                assert_eq!(
+                    kernel.retained_bytes(&state),
+                    state.allocator.metadata_bytes()
+                );
+                assert_metadata_only(&host);
                 assert_eq!(
                     update(&kernel, &mut state, &values, &Control::default()),
                     Err(KernelFailure::InstanceFailed)
@@ -658,5 +682,18 @@ mod failure_tests {
         }
         drop(state);
         assert_released(&host);
+    }
+    #[test]
+    fn any_value_actual_metadata_constructor_refusal_is_typed_and_never_published() {
+        let kernel = kernel(FunctionValueType::new(DataType::Utf8, false));
+        for cause in causes() {
+            let host = Arc::new(Host::default());
+            arm_refusal(&host, 0, cause.clone());
+            assert!(
+                matches!(kernel.create_state_with_allocator(Some(host.clone()), &Control::default()), Err(error) if error == cause)
+            );
+            assert_eq!(host.ledger.lock().unwrap().attempts, 1);
+            assert_released(&host);
+        }
     }
 }

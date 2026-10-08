@@ -88,7 +88,7 @@ impl PreparedAggregateKernel for ByKernel {
         AggregateStateMemoryPolicy::AllocationTracked
     }
     fn retained_bytes(&self, state: &Self::State) -> usize {
-        state.retained_bytes()
+        state.allocator.metadata_bytes() + state.retained_bytes()
     }
     fn create_state(
         &self,
@@ -109,7 +109,7 @@ impl PreparedAggregateKernel for ByKernel {
                 invalid("allocation-tracked max_by/min_by requires a host allocator")
             })?;
             work.step()?;
-            Ok(ByState::new(HostAggregateAllocator::new(allocator)))
+            Ok(ByState::new(HostAggregateAllocator::try_new(allocator)?))
         })
     }
     fn prepare_update<'a>(

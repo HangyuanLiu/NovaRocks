@@ -22,23 +22,54 @@ use std::{
     alloc::Layout,
     fmt,
     ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering, fence},
+    },
 };
 
-pub(super) struct HostAggregateAllocator {
+// This block is owned by the actual host, once per created aggregate state.
+// Allocator clones are thin handles to it; clone never allocates.
+struct HostAllocatorInner {
+    references: AtomicUsize,
     host: Arc<dyn AggregateStateAllocator>,
-    // The actual container's allocator records its own rejected operation.
     failure: Mutex<Option<KernelFailure>>,
 }
+pub(super) struct HostAggregateAllocator {
+    inner: NonNull<HostAllocatorInner>,
+}
+// SAFETY: the pointee remains alive while any handle exists; its immutable
+// host is Send + Sync and its refcount/journal use atomic/Mutex synchronization.
+unsafe impl Send for HostAggregateAllocator {}
+unsafe impl Sync for HostAggregateAllocator {}
 impl HostAggregateAllocator {
-    pub(super) fn new(host: Arc<dyn AggregateStateAllocator>) -> Self {
-        Self {
-            host,
-            failure: Mutex::new(None),
-        }
+    pub(super) fn try_new(host: Arc<dyn AggregateStateAllocator>) -> Result<Self, KernelFailure> {
+        let pointer = host
+            .allocate(Layout::new::<HostAllocatorInner>())?
+            .cast::<HostAllocatorInner>();
+        // SAFETY: the host returned this exact nonzero, aligned Layout and it
+        // has not been published or initialized. No fallible work follows.
+        unsafe {
+            pointer.as_ptr().write(HostAllocatorInner {
+                references: AtomicUsize::new(1),
+                host,
+                failure: Mutex::new(None),
+            })
+        };
+        Ok(Self { inner: pointer })
+    }
+    fn inner(&self) -> &HostAllocatorInner {
+        // SAFETY: this owning handle contributes one reference, so the block
+        // cannot be destroyed for the lifetime of the returned borrow.
+        unsafe { self.inner.as_ref() }
+    }
+    /// Count the one actual metadata block once per state, not per clone.
+    pub(super) fn metadata_bytes(&self) -> usize {
+        Layout::new::<HostAllocatorInner>().size()
     }
     pub(super) fn take_failure(&self) -> KernelFailure {
-        self.failure
+        self.inner()
+            .failure
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take()
@@ -46,6 +77,7 @@ impl HostAggregateAllocator {
     }
     fn refuse(&self, error: KernelFailure) -> AllocError {
         let mut slot = self
+            .inner()
             .failure
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -57,7 +89,30 @@ impl HostAggregateAllocator {
 }
 impl Clone for HostAggregateAllocator {
     fn clone(&self) -> Self {
-        Self::new(Arc::clone(&self.host))
+        let previous = self.inner().references.fetch_add(1, Ordering::Relaxed);
+        // An infallible Clone cannot return an overflow error. Match the Arc
+        // guard before overflow can make a live block appear unreferenced.
+        if previous > isize::MAX as usize {
+            std::process::abort();
+        }
+        Self { inner: self.inner }
+    }
+}
+impl Drop for HostAggregateAllocator {
+    fn drop(&mut self) {
+        if self.inner().references.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        fence(Ordering::Acquire);
+        // Retain the host outside its own metadata block before destroying it.
+        // Arc clone is refcount-only; it does not allocate a replacement block.
+        let host = Arc::clone(&self.inner().host);
+        let pointer = self.inner;
+        // SAFETY: the last reference owns destruction exactly once, and no
+        // references to the inner block are used after this call.
+        unsafe { std::ptr::drop_in_place(pointer.as_ptr()) };
+        // SAFETY: exact original block and Layout; host remains alive locally.
+        unsafe { host.release(pointer.cast(), Layout::new::<HostAllocatorInner>()) };
     }
 }
 impl fmt::Debug for HostAggregateAllocator {
@@ -76,6 +131,7 @@ unsafe impl Allocator for HostAggregateAllocator {
             return Ok(NonNull::slice_from_raw_parts(pointer, 0));
         }
         if self
+            .inner()
             .failure
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -84,6 +140,7 @@ unsafe impl Allocator for HostAggregateAllocator {
             return Err(AllocError);
         }
         let pointer = self
+            .inner()
             .host
             .allocate(layout)
             .map_err(|error| self.refuse(error))?;
@@ -92,7 +149,7 @@ unsafe impl Allocator for HostAggregateAllocator {
     unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
         if layout.size() != 0 {
             // SAFETY: exact block and Layout forwarded from this host.
-            unsafe { self.host.release(pointer, layout) };
+            unsafe { self.inner().host.release(pointer, layout) };
         }
     }
 }
@@ -105,3 +162,7 @@ impl crate::aggregate_scalar::ScalarStateAllocator for HostAggregateAllocator {
         crate::aggregate_scalar::ScalarStateError::Kernel(self.take_failure())
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_host_allocator_tests.rs"]
+mod tests;
