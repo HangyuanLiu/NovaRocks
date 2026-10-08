@@ -393,7 +393,10 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
     }
     for (source, target) in [
         (DataType::Timestamp(TimeUnit::Second, None), DataType::Int64),
-        (DataType::Int64, DataType::Timestamp(TimeUnit::Second, None)),
+        (
+            DataType::Int64,
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+        ),
         (
             DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
             DataType::Timestamp(TimeUnit::Second, None),

@@ -35,7 +35,7 @@ pub fn makedate_from_year_day(year: i64, day: i64) -> Option<NaiveDate> {
     base.and_then(|date| date.checked_add_days(Days::new((day - 1) as u64)))
 }
 
-fn standardize_numeric_datetime_literal(value: i64) -> Option<i64> {
+pub fn standardize_numeric_datetime_literal(value: i64) -> Option<i64> {
     const YY_PART_YEAR: i64 = 70;
     if value <= 0 {
         return None;

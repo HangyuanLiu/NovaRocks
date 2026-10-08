@@ -30,10 +30,14 @@ use arrow_array::{
 use arrow_buffer::i256;
 use arrow_cast::cast;
 use arrow_schema::{DataType, TimeUnit};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use num_traits::ToPrimitive;
 
 use crate::largeint;
+use novarocks_functions::calendar_numeric::{
+    numeric_datetime_literal_to_naive as datetime_literal_to_naive_datetime,
+    standardize_numeric_datetime_literal as standardize_date_literal,
+};
 
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
 
@@ -179,50 +183,6 @@ fn pow10_i256(exp: usize) -> Result<i256, String> {
             .ok_or_else(|| "decimal overflow".to_string())?;
     }
     Ok(out)
-}
-
-fn standardize_date_literal(value: i64) -> Option<i64> {
-    const YY_PART_YEAR: i64 = 70;
-    if value <= 0 {
-        return None;
-    }
-    if value >= 10000101000000 {
-        if value > 99999999999999 {
-            return None;
-        }
-        return Some(value);
-    }
-    if value < 101 {
-        return None;
-    }
-    if value <= (YY_PART_YEAR - 1) * 10000 + 1231 {
-        return Some((value + 20000000) * 1000000);
-    }
-    if value < YY_PART_YEAR * 10000 + 101 {
-        return None;
-    }
-    if value <= 991231 {
-        return Some((value + 19000000) * 1000000);
-    }
-    if value < 10000101 {
-        return None;
-    }
-    if value <= 99991231 {
-        return Some(value * 1000000);
-    }
-    if value < 101000000 {
-        return None;
-    }
-    if value <= (YY_PART_YEAR - 1) * 10000000000 + 1231235959 {
-        return Some(value + 20000000000000);
-    }
-    if value < YY_PART_YEAR * 10000000000 + 101000000 {
-        return None;
-    }
-    if value <= 991231235959 {
-        return Some(value + 19000000000000);
-    }
-    Some(value)
 }
 
 fn pow10_i128(scale: u32) -> Option<i128> {
@@ -433,23 +393,6 @@ fn cast_numeric_to_largeint_binary_array(array: &ArrayRef) -> Result<ArrayRef, S
         values.push(numeric_largeint_literal_at(array, row)?);
     }
     largeint::array_from_i128(&values)
-}
-
-fn datetime_literal_to_naive_datetime(value: i64) -> Option<NaiveDateTime> {
-    let standardized = standardize_date_literal(value)?;
-    let date_part = standardized / 1_000_000;
-    let time_part = standardized % 1_000_000;
-
-    let year = (date_part / 10_000) as i32;
-    let month = ((date_part / 100) % 100) as u32;
-    let day = (date_part % 100) as u32;
-    let hour = (time_part / 10_000) as u32;
-    let minute = ((time_part / 100) % 100) as u32;
-    let second = (time_part % 100) as u32;
-
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-    Some(date.and_time(time))
 }
 
 fn is_numeric_datetime_source(ty: &DataType) -> bool {
@@ -756,60 +699,11 @@ fn cast_utf8_to_boolean_array(arr: &StringArray) -> ArrayRef {
 }
 
 fn format_float64_for_varchar(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    let mut buf = ryu::Buffer::new();
-    let formatted = buf.format(value);
-    normalize_float_string_for_varchar(formatted)
+    novarocks_functions::builtin::string_extended::format_float64_for_varchar(value)
 }
 
 fn format_float32_for_varchar(value: f32) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    let mut buf = ryu::Buffer::new();
-    let formatted = buf.format(value);
-    normalize_float_string_for_varchar(formatted)
-}
-
-fn normalize_float_string_for_varchar(formatted: &str) -> String {
-    let stripped = formatted.strip_suffix(".0").unwrap_or(formatted);
-    if let Some(exp_pos) = stripped.find('e') {
-        let mut out = String::with_capacity(stripped.len() + 1);
-        out.push_str(&stripped[..=exp_pos]);
-        if let Some(sign_or_digit) = stripped.as_bytes().get(exp_pos + 1) {
-            if *sign_or_digit == b'+' || *sign_or_digit == b'-' {
-                out.push_str(&stripped[exp_pos + 1..]);
-            } else {
-                out.push('+');
-                out.push_str(&stripped[exp_pos + 1..]);
-            }
-        }
-        out
-    } else {
-        stripped.to_string()
-    }
+    novarocks_functions::builtin::string_extended::format_float32_for_varchar(value)
 }
 
 fn cast_float64_to_utf8_array(arr: &Float64Array) -> ArrayRef {
@@ -937,51 +831,7 @@ fn cast_float_to_decimal_with_rounding(
 }
 
 pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str>) -> String {
-    let timestamp_str = match unit {
-        TimeUnit::Second => {
-            let dt = DateTime::from_timestamp(value, 0)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-        }
-        TimeUnit::Millisecond => {
-            let seconds = value.div_euclid(1_000);
-            let millis = value.rem_euclid(1_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, millis * 1_000_000)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if millis == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-            }
-        }
-        TimeUnit::Microsecond => {
-            let seconds = value.div_euclid(1_000_000);
-            let micros = value.rem_euclid(1_000_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, micros * 1_000)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if micros == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-            }
-        }
-        TimeUnit::Nanosecond => {
-            let seconds = value.div_euclid(1_000_000_000);
-            let nanos = value.rem_euclid(1_000_000_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if nanos == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string()
-            }
-        }
-    };
-    if let Some(tz) = tz {
-        format!("{timestamp_str} {tz}")
-    } else {
-        timestamp_str
-    }
+    novarocks_functions::builtin::string_extended::format_timestamp_for_varchar(unit, value, tz)
 }
 
 fn cast_timestamp_to_utf8_array(
@@ -1082,6 +932,36 @@ pub fn cast_scalar_with_special_rules(
         return Ok(new_null_array(target_type, array.len()));
     }
 
+    if target_type == &DataType::Utf8
+        && matches!(
+            array.data_type(),
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Timestamp(_, _)
+        )
+    {
+        let mut builder = StringBuilder::new();
+        for row in 0..array.len() {
+            if array.is_null(row) {
+                builder.append_null();
+            } else {
+                builder.append_value(
+                    novarocks_functions::carrier_text::render(array.as_ref(), row)
+                        .map_err(str::to_string)?,
+                );
+            }
+        }
+        return Ok(Arc::new(builder.finish()));
+    }
     match (array.data_type(), target_type) {
         (DataType::Utf8, DataType::Date32) => {
             let arr = array

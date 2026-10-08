@@ -41,6 +41,7 @@ pub mod bit_numeric;
 pub mod builtin;
 pub mod calendar_julian;
 pub mod calendar_numeric;
+pub mod carrier_text;
 pub mod calendar_period_numeric;
 mod call_contract;
 #[cfg(test)]

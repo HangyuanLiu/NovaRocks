@@ -1225,6 +1225,16 @@ fn evaluate_cast<'a>(
     use arrow::array::{Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array};
     use novarocks_functions::CastRowResult as R;
     let ty = &recipe.result_type().data_type;
+    // An unzoned primitive rendering fits within 64 bytes, including the
+    // widest Chrono year and nanosecond fraction. Check Arrow's i32 offset
+    // extent before producing text. This is not a host memory grant.
+    if ty == &DataType::Utf8 {
+        selection
+            .len()
+            .checked_mul(64)
+            .filter(|n| *n <= i32::MAX as usize)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+    }
     // Checked representation and fallible reservation are not a host memory grant.
     let bitmap = selection
         .len()
@@ -1246,9 +1256,11 @@ fn evaluate_cast<'a>(
     work.flush()?;
     enum Output {
         Boolean(Vec<Option<bool>>),
+        Text(Vec<Option<String>>),
         I8(Vec<Option<i8>>),
         I16(Vec<Option<i16>>),
         I32(Vec<Option<i32>>),
+        Date32(Vec<Option<i32>>),
         I64(Vec<Option<i64>>),
         Timestamp(Vec<Option<i64>>),
         U8(Vec<Option<u8>>),
@@ -1260,9 +1272,11 @@ fn evaluate_cast<'a>(
     }
     let mut output = match ty {
         DataType::Boolean => Output::Boolean(Vec::new()),
+        DataType::Utf8 => Output::Text(Vec::new()),
         DataType::Int8 => Output::I8(Vec::new()),
         DataType::Int16 => Output::I16(Vec::new()),
         DataType::Int32 => Output::I32(Vec::new()),
+        DataType::Date32 => Output::Date32(Vec::new()),
         DataType::Int64 => Output::I64(Vec::new()),
         DataType::Timestamp(_, None) => Output::Timestamp(Vec::new()),
         DataType::UInt8 => Output::U8(Vec::new()),
@@ -1275,9 +1289,11 @@ fn evaluate_cast<'a>(
     };
     match &mut output {
         Output::Boolean(v) => v.try_reserve_exact(selection.len()),
+        Output::Text(v) => v.try_reserve_exact(selection.len()),
         Output::I8(v) => v.try_reserve_exact(selection.len()),
         Output::I16(v) => v.try_reserve_exact(selection.len()),
         Output::I32(v) => v.try_reserve_exact(selection.len()),
+        Output::Date32(v) => v.try_reserve_exact(selection.len()),
         Output::I64(v) => v.try_reserve_exact(selection.len()),
         Output::Timestamp(v) => v.try_reserve_exact(selection.len()),
         Output::U8(v) => v.try_reserve_exact(selection.len()),
@@ -1313,6 +1329,8 @@ fn evaluate_cast<'a>(
         };
         match (&mut output, value) {
             (Output::Boolean(v), R::Boolean(n)) => v.push(Some(n)),
+            (Output::Text(v), R::Text(n)) => v.push(Some(n)),
+            (Output::Text(v), R::Null) => v.push(None),
             (Output::I8(v), R::Signed(n)) => v.push(Some(
                 i8::try_from(n).map_err(|_| internal("cast returned an out-of-range Int8"))?,
             )),
@@ -1327,6 +1345,11 @@ fn evaluate_cast<'a>(
                 })?))
             }
             (Output::I64(v), R::Signed(n)) => v.push(Some(n)),
+            (Output::Date32(v), R::Signed(n)) => {
+                v.push(Some(i32::try_from(n).map_err(|_| {
+                    internal("cast returned an out-of-range Date32")
+                })?))
+            }
             (Output::Timestamp(v), R::Timestamp(n)) => v.push(Some(n)),
             (Output::U8(v), R::Unsigned(n)) => {
                 v.push(Some(u8::try_from(n).map_err(|_| {
@@ -1350,6 +1373,7 @@ fn evaluate_cast<'a>(
             (Output::Boolean(v), R::Null) => v.push(None),
             (Output::I16(v), R::Null) => v.push(None),
             (Output::I32(v), R::Null) => v.push(None),
+            (Output::Date32(v), R::Null) => v.push(None),
             (Output::I64(v), R::Null) => v.push(None),
             (Output::Timestamp(v), R::Null) => v.push(None),
             (Output::U8(v), R::Null) => v.push(None),
@@ -1370,9 +1394,11 @@ fn evaluate_cast<'a>(
     // Arrow construction is an opaque observed boundary, not internally cooperative allocation.
     let array: ArrayRef = match output {
         Output::Boolean(v) => Arc::new(BooleanArray::from(v)),
+        Output::Text(v) => Arc::new(arrow::array::StringArray::from(v)),
         Output::I8(v) => Arc::new(Int8Array::from(v)),
         Output::I16(v) => Arc::new(Int16Array::from(v)),
         Output::I32(v) => Arc::new(Int32Array::from(v)),
+        Output::Date32(v) => Arc::new(arrow::array::Date32Array::from(v)),
         Output::I64(v) => Arc::new(Int64Array::from(v)),
         Output::Timestamp(v) => match ty {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None) => {

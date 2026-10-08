@@ -27,7 +27,7 @@ use crate::{
 };
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_cast::cast::{cast_num_to_bool, num_cast};
@@ -38,6 +38,9 @@ use novarocks_type_contract::{
     ValueLogicalType,
 };
 use std::{error::Error, fmt};
+
+#[path = "cast_calendar.rs"]
+mod calendar;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CastOperation {
@@ -153,6 +156,17 @@ impl UnsignedWidth {
 /// Successful-NULL obligations of exact primitive carrier casts. This is a
 /// static semantic fact, not an installed runtime capability whitelist.
 pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
+    if matches!(target, DataType::Date32 | DataType::Timestamp(_, None))
+        && !matches!(source, DataType::Timestamp(_, _))
+        && Source::from_type(source).is_some()
+    {
+        return true;
+    }
+    if source == &DataType::Utf8
+        && (SignedWidth::from_type(target).is_some() || target == &DataType::Boolean)
+    {
+        return true;
+    }
     let integer = |ty: &DataType| match ty {
         DataType::Int8 => Some((true, 8)),
         DataType::Int16 => Some((true, 16)),
@@ -188,6 +202,7 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
+    Utf8,
     Boolean,
     Signed(SignedWidth),
     Unsigned(UnsignedWidth),
@@ -201,6 +216,7 @@ impl Source {
             .map(Self::Signed)
             .or_else(|| UnsignedWidth::from_type(ty).map(Self::Unsigned))
             .or(match ty {
+                DataType::Utf8 => Some(Self::Utf8),
                 DataType::Boolean => Some(Self::Boolean),
                 DataType::Float32 => Some(Self::F32),
                 DataType::Float64 => Some(Self::F64),
@@ -210,6 +226,7 @@ impl Source {
     }
     fn validate(self, array: &dyn Array) -> bool {
         match self {
+            Self::Utf8 => array.as_any().is::<StringArray>(),
             Self::Boolean => array.as_any().is::<BooleanArray>(),
             Self::Signed(width) => width.validate(array),
             Self::Unsigned(width) => width.validate(array),
@@ -262,14 +279,25 @@ pub enum CastRowResult {
     Float32(f32),
     Float64(f64),
     Timestamp(i64),
+    Text(String),
     RowError(RowDataError),
 }
 
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    Text {
+        source: Source,
+    },
+    Calendar {
+        source: Source,
+        unit: Option<TimeUnit>,
+    },
     /// A primitive carrier conversion with a row operation.
-    Carrier { source: Source, target: Target },
+    Carrier {
+        source: Source,
+        target: Target,
+    },
     /// Same carrier and logical type; only nullability may widen. The value
     /// passes unchanged, so no row can fail or become NULL.
     Identity,
@@ -330,8 +358,52 @@ impl PreparedCastRecipe {
             }
             let source_kind =
                 Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
+            if result.data_type == DataType::Utf8 && source_kind != Source::Utf8 {
+                if source.nullable && !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::Text {
+                        source: source_kind,
+                    },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
+            if !matches!(source_kind, Source::Timestamp(_))
+                && matches!(
+                    result.data_type,
+                    DataType::Date32 | DataType::Timestamp(_, None)
+                )
+            {
+                if !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                let unit = match result.data_type {
+                    DataType::Timestamp(unit, None) => Some(unit),
+                    _ => None,
+                };
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::Calendar {
+                        source: source_kind,
+                        unit,
+                    },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
             let target =
                 Target::from_type(&result.data_type).ok_or(CastPrepareError::Unsupported)?;
+            if source_kind == Source::Utf8 && !matches!(target, Target::Signed(_) | Target::Boolean)
+            {
+                return Err(CastPrepareError::Unsupported);
+            }
             let source_timestamp = matches!(source_kind, Source::Timestamp(_));
             let target_timestamp = matches!(target, Target::Timestamp(_));
             work.step()?;
@@ -397,7 +469,8 @@ impl PreparedCastRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
-            CastBody::Identity => false,
+            CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
+            CastBody::Identity | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {
                 (source.is_float()
                     && matches!(target, Target::Signed(_) | Target::Unsigned(_))
@@ -431,6 +504,39 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if let CastBody::Text { source } = self.body {
+                let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                work.flush()?;
+                let text = crate::carrier_text::render(argument.array().as_ref(), row)
+                    .map_err(|_| internal("checked text cast has a foreign carrier"))?;
+                work.flush()?;
+                return Ok(CastRowResult::Text(text));
+            }
+            if let CastBody::Calendar { source, unit } = self.body {
+                let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid("non-null cast argument contains a selected NULL"))
+                    };
+                }
+                return calendar::evaluate(
+                    source,
+                    argument.array().as_ref(),
+                    row,
+                    ordinal,
+                    unit,
+                    &mut work,
+                );
+            }
             let CastBody::Carrier {
                 source: source_kind,
                 target: carrier_target,
@@ -447,6 +553,52 @@ impl PreparedCastRecipe {
                 } else {
                     Err(invalid("non-null cast argument contains a selected NULL"))
                 };
+            }
+            if source_kind == Source::Utf8 {
+                let text = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
+                    .value(row);
+                let value = match carrier_target {
+                    Target::Signed(width) => {
+                        let parsed = crate::builtin::round_cast_text::parse_i64(text, &mut work)?;
+                        parsed
+                            .and_then(|number| match width {
+                                SignedWidth::I8 => i8::try_from(number).ok().map(i64::from),
+                                SignedWidth::I16 => i16::try_from(number).ok().map(i64::from),
+                                SignedWidth::I32 => i32::try_from(number).ok().map(i64::from),
+                                SignedWidth::I64 => Some(number),
+                            })
+                            .map(CastRowResult::Signed)
+                    }
+                    Target::Boolean => {
+                        // Observe trimming before the borrowed standard-library operation.
+                        for _ in text.chars() {
+                            work.step()?;
+                        }
+                        let trimmed = text.trim();
+                        let integer =
+                            crate::builtin::round_cast_text::parse_i64(trimmed, &mut work)?
+                                .and_then(|value| i32::try_from(value).ok());
+                        integer
+                            .map(|value| value != 0)
+                            .or_else(|| {
+                                if trimmed.eq_ignore_ascii_case("true") {
+                                    Some(true)
+                                } else if trimmed.eq_ignore_ascii_case("false") {
+                                    Some(false)
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(CastRowResult::Boolean)
+                    }
+                    _ => return Err(internal("text cast contains a foreign frozen target")),
+                };
+                work.step()?;
+                return Ok(value.unwrap_or(CastRowResult::Null));
             }
             if let Source::Timestamp(unit) = source_kind {
                 let Target::Timestamp(target) = carrier_target else {
@@ -609,6 +761,7 @@ impl PreparedCastRecipe {
                 }};
             }
             Ok(match source_kind {
+                Source::Utf8 => return Err(internal("text cast escaped its checked operation")),
                 Source::Timestamp(_) => {
                     return Err(internal("timestamp cast escaped its checked operation"));
                 }

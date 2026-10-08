@@ -357,7 +357,7 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
         for target in [
             DataType::Float16,
             DataType::Binary,
-            DataType::Date32,
+            DataType::Date64,
             DataType::Decimal128(10, 0),
         ] {
             assert_eq!(

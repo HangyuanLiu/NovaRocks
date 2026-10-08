@@ -91,7 +91,7 @@ mod rand_owner;
 mod round;
 mod round_cast;
 mod round_cast_float_text;
-mod round_cast_text;
+pub(crate) mod round_cast_text;
 mod round_owner;
 mod rounding_binding;
 mod string_append_trailing;

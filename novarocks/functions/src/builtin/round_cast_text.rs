@@ -29,7 +29,7 @@ use crate::{KernelFailure, kernel_input::EvaluationCheckpoints};
 /// atoi's checked parser consumption. Invalid bytes end parsing immediately.
 /// Unlike Arrow's last-byte shortcut, this walks the encountered prefix in
 /// order; it never delegates an unobserved long string to an opaque parser.
-pub(super) fn parse_i64(
+pub(crate) fn parse_i64(
     text: &str,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<i64>, KernelFailure> {

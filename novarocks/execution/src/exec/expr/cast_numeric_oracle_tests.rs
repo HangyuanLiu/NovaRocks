@@ -175,7 +175,20 @@ fn compare_legacy_rows(
             CastRowResult::Null => assert!(legacy.is_null(row)),
             CastRowResult::Signed(value) => {
                 assert!(!legacy.is_null(row));
-                assert_eq!(signed_at(legacy.as_ref(), row), *value);
+                if let DataType::Date32 = target {
+                    assert_eq!(
+                        i64::from(
+                            legacy
+                                .as_any()
+                                .downcast_ref::<arrow::array::Date32Array>()
+                                .unwrap()
+                                .value(row)
+                        ),
+                        *value
+                    );
+                } else {
+                    assert_eq!(signed_at(legacy.as_ref(), row), *value);
+                }
             }
             CastRowResult::Float32(value) => {
                 assert!(!legacy.is_null(row));
@@ -204,8 +217,60 @@ fn compare_legacy_rows(
             CastRowResult::RowError(error) => {
                 panic!("signed cast must not raise a row error: {error:?}")
             }
-            CastRowResult::Boolean(_) => panic!("signed numeric cast returned a boolean"),
-            CastRowResult::Timestamp(_) => panic!("signed numeric cast returned a timestamp"),
+            CastRowResult::Boolean(value) => {
+                assert!(!legacy.is_null(row));
+                assert_eq!(
+                    legacy
+                        .as_any()
+                        .downcast_ref::<arrow::array::BooleanArray>()
+                        .unwrap()
+                        .value(row),
+                    *value
+                );
+            }
+            CastRowResult::Timestamp(value) => {
+                use arrow::array::{
+                    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+                    TimestampSecondArray,
+                };
+                use arrow::datatypes::TimeUnit;
+                assert!(!legacy.is_null(row));
+                let actual = match &target {
+                    DataType::Timestamp(TimeUnit::Second, None) => legacy
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .unwrap()
+                        .value(row),
+                    DataType::Timestamp(TimeUnit::Millisecond, None) => legacy
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap()
+                        .value(row),
+                    DataType::Timestamp(TimeUnit::Microsecond, None) => legacy
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .value(row),
+                    DataType::Timestamp(TimeUnit::Nanosecond, None) => legacy
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap()
+                        .value(row),
+                    _ => panic!("timestamp result has a non-timestamp target"),
+                };
+                assert_eq!(actual, *value);
+            }
+            CastRowResult::Text(value) => {
+                assert!(!legacy.is_null(row));
+                assert_eq!(
+                    legacy
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .unwrap()
+                        .value(row),
+                    value
+                );
+            }
             CastRowResult::Unsigned(_) => {
                 panic!("signed numeric cast returned an unsigned integer")
             }
@@ -377,5 +442,250 @@ fn legacy_nonnullable_signed_cast_widening_stays_exact_and_narrowing_overflow_is
             );
             assert_eq!(legacy.null_count(), 0);
         }
+    }
+}
+
+#[test]
+fn legacy_text_to_signed_cast_oracle_matches_widths_allow_and_sparse_source_slices() {
+    let source: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+        Some("unused"),
+        Some("127"),
+        Some("128"),
+        Some("-128"),
+        Some("-129"),
+        Some("32767"),
+        Some("32768"),
+        Some("2147483647"),
+        Some("2147483648"),
+        Some("9223372036854775807"),
+        Some("-9223372036854775808"),
+        Some("9223372036854775808"),
+        Some("+0001"),
+        Some(" 1"),
+        Some("1.5"),
+        Some("true"),
+        Some(""),
+        Some("-"),
+        None,
+    ]));
+    let source = source.slice(1, source.len() - 1);
+    for target in signed_types() {
+        for allow in [false, true] {
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                let (_, rows) =
+                    compare_legacy_rows(source.clone(), true, target.clone(), true, policy, allow);
+                assert_eq!(rows[0], CastRowResult::Signed(127));
+                assert_eq!(rows[12], CastRowResult::Null);
+                assert_eq!(rows[17], CastRowResult::Null);
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_text_to_boolean_cast_oracle_preserves_trim_numeric_and_text_rules() {
+    let source: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+        Some(" true "),
+        Some("FALSE"),
+        Some("+1"),
+        Some("-1"),
+        Some("0"),
+        Some("2147483647"),
+        Some("2147483648"),
+        Some(""),
+        Some("1.5"),
+        Some("yes"),
+        Some("\u{2003}false\u{2003}"),
+        None,
+    ]));
+    for allow in [false, true] {
+        let (_, actual) = compare_legacy_rows(
+            source.clone(),
+            true,
+            DataType::Boolean,
+            true,
+            DecimalOverflowPolicy::OutputNull,
+            allow,
+        );
+        assert_eq!(
+            actual,
+            vec![
+                CastRowResult::Boolean(true),
+                CastRowResult::Boolean(false),
+                CastRowResult::Boolean(true),
+                CastRowResult::Boolean(true),
+                CastRowResult::Boolean(false),
+                CastRowResult::Boolean(true),
+                CastRowResult::Null,
+                CastRowResult::Null,
+                CastRowResult::Null,
+                CastRowResult::Null,
+                CastRowResult::Boolean(false),
+                CastRowResult::Null
+            ]
+        );
+    }
+}
+
+#[test]
+fn legacy_calendar_cast_oracle_matches_compact_integer_and_text_profiles() {
+    use arrow::array::StringArray;
+    use arrow::datatypes::TimeUnit;
+    let integer: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(20240101),
+        None,
+        Some(690101),
+        Some(700101),
+        Some(991231),
+        Some(20240229),
+        Some(20230229),
+        Some(101),
+        Some(0),
+        Some(-1),
+        Some(20241008235959),
+        Some(99991231),
+        Some(i64::MAX),
+    ]));
+    let text: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("2024-10-08 12:30:01.123456789"),
+        None,
+        Some("1969-12-31 23:59:59.999999999"),
+        Some("1970-01-01"),
+        Some(""),
+        Some("junk"),
+        Some("2023-02-29"),
+        Some("2024-02-29"),
+        Some(" 2024-01-02 "),
+        Some("2024-01-03T12:13:14"),
+    ]));
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for allow in [false, true] {
+            for source in [&integer, &text] {
+                for target in [
+                    DataType::Date32,
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                ] {
+                    compare_legacy_rows(source.clone(), true, target, true, policy, allow);
+                }
+            }
+            compare_legacy_rows(
+                text.clone(),
+                true,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+                policy,
+                allow,
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_primitive_text_cast_oracle_preserves_widths_extremes_nulls_and_float_spelling() {
+    let mut inputs: Vec<ArrayRef> = signed_types()
+        .into_iter()
+        .map(|ty| {
+            let (low, high) = bounds(&ty);
+            signed_array(
+                &ty,
+                &[Some(low), Some(-1), None, Some(0), Some(1), Some(high)],
+            )
+            .slice(1, 4)
+        })
+        .collect();
+    inputs.push(Arc::new(Float64Array::from(vec![
+        Some(-0.0),
+        None,
+        Some(0.0),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(1.0),
+        Some(1e20),
+        Some(1e-20),
+    ])));
+    inputs.push(Arc::new(Float32Array::from(vec![
+        Some(-0.0),
+        None,
+        Some(f32::NAN),
+        Some(f32::INFINITY),
+        Some(f32::NEG_INFINITY),
+        Some(1.0),
+        Some(1e20),
+        Some(1e-20),
+    ])));
+    inputs.push(Arc::new(arrow::array::BooleanArray::from(vec![
+        Some(true),
+        None,
+        Some(false),
+    ])));
+    for input in inputs {
+        for policy in [
+            DecimalOverflowPolicy::ReportError,
+            DecimalOverflowPolicy::OutputNull,
+        ] {
+            for allow in [false, true] {
+                compare_legacy_rows(input.clone(), true, DataType::Utf8, true, policy, allow);
+            }
+        }
+    }
+    let (_, values) = compare_legacy_rows(
+        Arc::new(Float64Array::from(vec![
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e20,
+        ])),
+        false,
+        DataType::Utf8,
+        false,
+        DecimalOverflowPolicy::ReportError,
+        true,
+    );
+    assert_eq!(
+        values,
+        ["0", "nan", "inf", "-inf", "1e+20"].map(|s| CastRowResult::Text(s.into()))
+    );
+}
+
+#[test]
+fn legacy_timestamp_text_cast_oracle_preserves_units_fraction_negative_and_epoch_projection() {
+    use arrow::array::{
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    let values = vec![
+        Some(i64::MIN),
+        Some(-1),
+        None,
+        Some(0),
+        Some(1),
+        Some(1_700_000_000),
+        Some(i64::MAX),
+    ];
+    let inputs: Vec<ArrayRef> = vec![
+        Arc::new(TimestampSecondArray::from(values.clone())),
+        Arc::new(TimestampMillisecondArray::from(values.clone())),
+        Arc::new(TimestampMicrosecondArray::from(values.clone())),
+        Arc::new(TimestampNanosecondArray::from(values)),
+    ];
+    for input in inputs {
+        compare_legacy_rows(
+            input,
+            true,
+            DataType::Utf8,
+            true,
+            DecimalOverflowPolicy::ReportError,
+            false,
+        );
     }
 }

@@ -4642,6 +4642,7 @@ dependencies = [
  "arrow-schema",
  "base64 0.22.1",
  "chrono",
+ "novarocks-functions",
  "novarocks-type-contract",
  "num-traits",
  "roaring 0.10.12",
