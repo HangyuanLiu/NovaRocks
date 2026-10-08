@@ -1333,3 +1333,7 @@ mod cast_float_date_oracle_tests;
 
 #[cfg(test)]
 mod legacy_parse_url_baseline_tests;
+
+#[cfg(test)]
+#[path = "legacy_cardinality_dedup_baseline_tests.rs"]
+mod legacy_cardinality_dedup_baseline_tests;

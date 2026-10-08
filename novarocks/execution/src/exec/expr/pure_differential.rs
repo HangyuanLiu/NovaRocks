@@ -1740,3 +1740,7 @@ pub(crate) mod aggregate_count_generic_diff_tests;
 
 #[path = "pure_differential_parse_url_tests.rs"]
 mod parse_url_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_cardinality_dedup_tests.rs"]
+mod cardinality_dedup_tests;
