@@ -477,6 +477,7 @@ mod failure_tests {
                 PureCallPreparation::Aggregate {
                     arguments: ScopedExpressionEffects::pure_value(context),
                     options: AggregatePreparationOptions {
+                        state_interpretation: None,
                         phase: AggregateKernelPhase::Single,
                         distinct: false,
                         order_keys: Arc::from([]),

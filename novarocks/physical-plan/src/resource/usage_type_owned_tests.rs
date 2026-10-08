@@ -79,6 +79,7 @@ fn function(kind: FunctionKind, lambda: bool) -> BoundFunction {
 }
 fn binding() -> AggregateBinding {
     AggregateBinding {
+        state_interpretation: None,
         state_argument_contract:
             novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         function: function(FunctionKind::Aggregate, false),

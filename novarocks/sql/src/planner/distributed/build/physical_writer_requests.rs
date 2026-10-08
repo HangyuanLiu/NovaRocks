@@ -155,6 +155,7 @@ impl<'entry, 'source> AuthoredPhysicalWriterRequest<'entry, 'source> {
         PureCallPreparation::Aggregate {
             arguments,
             options: AggregatePreparationOptions {
+                state_interpretation: None,
                 phase: self.phase,
                 distinct: false,
                 order_keys: Arc::from([]),

@@ -304,6 +304,12 @@ fn aggregate_definition_backing(
     let mut bytes = array_bytes::<wire::AggregateBindingDefinition>(definitions.capacity())?;
     for definition in definitions {
         bytes = add(bytes, definition.state_format.capacity())?;
+        if let Some(receipt) = &definition.state_interpretation {
+            bytes = add(
+                bytes,
+                array_bytes::<wire::AggregateStateOrderKey>(receipt.order_keys.capacity())?,
+            )?;
+        }
         work.step()?;
     }
     Ok(bytes)

@@ -828,6 +828,14 @@ fn prepare_core<'loan, 'source, 'control>(
                     if let Some(aggregate) = aggregate_binding {
                         source_floor =
                             numeric.add(source_floor, aggregate.state_format.as_str().len())?;
+                        if let Some(receipt) = &aggregate.state_interpretation {
+                            source_floor = numeric.add(
+                                source_floor,
+                                numeric.bytes::<novarocks_type_contract::AggregateStateOrderKey>(
+                                    receipt.order_keys.len(),
+                                )?,
+                            )?;
+                        }
                         signature_source_floor(
                             &aggregate.function,
                             &mut source_floor,

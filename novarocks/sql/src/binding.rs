@@ -53,6 +53,32 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
 
+/// Captured at an actual logical GROUP_CONCAT call in its lexical SELECT scope.
+/// The optional raw limit distinguishes missing admission from a real value.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GroupConcatSourceFacts {
+    pub legacy: bool,
+    pub max_len: Option<i64>,
+    pub state: novarocks_type_contract::AggregateStateInterpretation,
+}
+impl GroupConcatSourceFacts {
+    pub fn environment(&self) -> [novarocks_type_contract::SemanticParameterRef; 2] {
+        use novarocks_type_contract::{
+            SemanticParameterId as I, SemanticParameterKey as K, SemanticParameterRef as R,
+        };
+        [
+            R {
+                id: I::new(if self.legacy { 2 } else { 1 }),
+                expected_key: K::GroupConcatLegacy,
+            },
+            R {
+                id: I::new(3),
+                expected_key: K::GroupConcatMaxLen,
+            },
+        ]
+    }
+}
+
 /// One call's exact selection and authored semantic policy. The selected
 /// overload remains catalog-owned; a SQL scope does not redefine its identity.
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -61,6 +87,7 @@ struct SqlFunctionCallFacts {
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     /// A real producer-supplied result target, separate from inferred selection.
     result_constraint: Option<novarocks_functions::FunctionValueType>,
+    group_concat: Option<GroupConcatSourceFacts>,
 }
 
 impl SqlFunctionBinding {
@@ -72,6 +99,7 @@ impl SqlFunctionBinding {
             resolved,
             decimal_overflow_policy,
             result_constraint: None,
+            group_concat: None,
         }))
     }
 
@@ -86,7 +114,22 @@ impl SqlFunctionBinding {
             resolved,
             decimal_overflow_policy,
             result_constraint: Some(result_constraint),
+            group_concat: None,
         }))
+    }
+
+    pub(crate) fn with_group_concat_source(mut self, facts: GroupConcatSourceFacts) -> Self {
+        let old = &self.0;
+        self.0 = Arc::new(SqlFunctionCallFacts {
+            resolved: old.resolved.clone(),
+            decimal_overflow_policy: old.decimal_overflow_policy,
+            result_constraint: old.result_constraint.clone(),
+            group_concat: Some(facts),
+        });
+        self
+    }
+    pub(crate) fn group_concat_source(&self) -> Option<&GroupConcatSourceFacts> {
+        self.0.group_concat.as_ref()
     }
 
     pub(crate) fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {

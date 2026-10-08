@@ -194,6 +194,7 @@ fn count_binding(catalog: &EngineFunctionCatalog, types: &[FunctionValueType]) -
     let intermediate_type = aggregate.intermediate_type.clone();
     let state_format = AggregateStateFormatId::try_new(aggregate.state_format.as_str()).unwrap();
     AggregateBinding {
+        state_interpretation: None,
         state_argument_contract,
         function: scalar(resolved),
         phase: AggregatePhase::Single,

@@ -518,6 +518,7 @@ fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_ad
             PureCallPreparation::Aggregate {
                 arguments: ScopedExpressionEffects::pure_value(context()),
                 options: AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase: AggregateKernelPhase::Single,
                     distinct: false,
                     order_keys: Arc::new([]),
@@ -533,6 +534,7 @@ fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_ad
                 arguments: ScopedExpressionEffects::pure_value(context()),
                 options: AggregateWindowPreparationOptions {
                     aggregate: AggregatePreparationOptions {
+                        state_interpretation: None,
                         phase: AggregateKernelPhase::Single,
                         distinct: false,
                         order_keys: Arc::new([]),

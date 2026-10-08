@@ -2965,6 +2965,7 @@ pub fn contribute_builtin_functions(
             FunctionKind::Aggregate,
             [FunctionOverloadDeclaration {
                 effects: match declaration.name {
+                    "group_concat" | "string_agg" => Some(super::aggregate_concat_owner::effects()),
                     "count" => Some(super::aggregate_count_owner::effects()),
                     "multi_distinct_count" => {
                         Some(super::aggregate_count_distinct_owner::effects())
@@ -3010,6 +3011,14 @@ pub fn contribute_builtin_functions(
         // One resolver in both roles: it answers binding questions and it is
         // the typed signature contract an aggregate is resolved through.
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+        if matches!(declaration.name, "group_concat" | "string_agg") {
+            builder.register(super::aggregate_concat_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
         if matches!(declaration.name, "min_n" | "max_n") {
             builder.register(super::aggregate_n_owner::definition(
                 declaration.name,

@@ -22,6 +22,59 @@ use crate::{CompileCheckpoints, CompileControlError, CompilePhase, PureCompileCo
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+/// Interpretation of original state rows, separate from merge execution channels.
+/// Absence is never an assertion that rows are plain or unordered.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AggregateStateOrderKey {
+    pub ascending: bool,
+    pub nulls_first: bool,
+}
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AggregateStateInterpretation {
+    pub distinct: bool,
+    pub order_keys: Box<[AggregateStateOrderKey]>,
+}
+
+impl AggregateStateInterpretation {
+    pub fn matches_observed<E>(
+        &self,
+        other: &Self,
+        mut step: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        step()?;
+        if self.distinct != other.distinct || self.order_keys.len() != other.order_keys.len() {
+            return Ok(false);
+        }
+        for (left, right) in self.order_keys.iter().zip(&other.order_keys) {
+            step()?;
+            if left != right {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    pub fn clone_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, CompileControlError> {
+        work.flush()?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(self.order_keys.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for key in &self.order_keys {
+            keys.push(*key);
+            work.step()?;
+        }
+        work.flush()?;
+        let output = Self {
+            distinct: self.distinct,
+            order_keys: keys.into_boxed_slice(),
+        };
+        work.flush()?;
+        Ok(output)
+    }
+}
+
 /// Stable semantic keys, independent of a parameter's fragment-local ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SemanticParameterKey {

@@ -96,6 +96,12 @@ fn counts_core(
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
+    if let Some(receipt) = &source.state_interpretation {
+        model.request::<novarocks_type_contract::AggregateStateOrderKey>(
+            receipt.order_keys.len(),
+            2,
+        )?;
+    }
     if admit.is_some() {
         model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
         model.request::<u8>(source.state_format.as_str().len(), 1)?;
@@ -174,6 +180,11 @@ pub(crate) fn copy_aggregate_binding_observed(
     )?;
     work.flush()?;
     let output = AggregateBinding {
+        state_interpretation: source
+            .state_interpretation
+            .as_ref()
+            .map(|value| value.clone_observed(work))
+            .transpose()?,
         function,
         phase: source.phase,
         logical_argument_count: source.logical_argument_count,

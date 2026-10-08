@@ -90,10 +90,10 @@ pub use schema::{
     arrow_fields_exact_borrowed_observed, arrow_fields_exact_observed, arrow_schemas_exact,
 };
 pub use semantics::{
-    BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
-    SemanticParameterProjectionVisit, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters,
+    AggregateStateInterpretation, AggregateStateOrderKey, BooleanValue, EvaluationDemand,
+    MAX_SEMANTIC_PARAMETERS, SemanticParameterError, SemanticParameterId, SemanticParameterKey,
+    SemanticParameterProjectionError, SemanticParameterProjectionVisit, SemanticParameterRef,
+    SemanticParameterValue, SemanticParameters,
 };
 pub use value_arithmetic::{
     arithmetic_result_value_type_with_op, is_integer_value_type, is_numeric_value_type,

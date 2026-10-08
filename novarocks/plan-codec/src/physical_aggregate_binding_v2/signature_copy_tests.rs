@@ -95,6 +95,7 @@ fn fixture(phase: AggregatePhase) -> AggregateBinding {
             .with_metadata(HashMap::from([("unknown".into(), "preserved".into())])),
     );
     AggregateBinding {
+        state_interpretation: None,
         function: BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),

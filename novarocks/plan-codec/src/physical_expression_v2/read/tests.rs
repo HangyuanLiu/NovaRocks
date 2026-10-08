@@ -264,6 +264,7 @@ impl Fixture {
             function(9, wire::FunctionKind::Aggregate, vec![arg(1)]),
         ];
         let aggregates = vec![wire::AggregateBindingDefinition {
+            state_interpretation: None,
             id: u32::MAX,
             function_binding_id: Some(9),
             phase: Some(wire::AggregatePhase {

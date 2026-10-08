@@ -24,16 +24,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow_buffer::i256;
-use chrono::{DateTime, NaiveDate};
 use std::cmp::Ordering;
 
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, aggregate_bytes};
 use novarocks_types::largeint;
-const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-
-fn date32_to_naive(days: i32) -> Option<NaiveDate> {
-    NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
-}
 
 pub(in crate::exec::expr::agg) fn build_bool_array(
     offset: usize,
@@ -555,177 +549,12 @@ pub(in crate::exec::expr::agg) fn scalar_to_string(
     value: &AggScalarValue,
     data_type: &DataType,
 ) -> Result<String, String> {
-    match value {
-        AggScalarValue::Bool(v) => Ok(if *v { "1".to_string() } else { "0".to_string() }),
-        AggScalarValue::Int64(v) => Ok(v.to_string()),
-        AggScalarValue::Float64(v) => Ok(v.to_string()),
-        AggScalarValue::Utf8(v) => Ok(v.clone()),
-        AggScalarValue::Date32(v) => {
-            let date = date32_to_naive(*v).ok_or_else(|| "invalid date32 value".to_string())?;
-            Ok(date.format("%Y-%m-%d").to_string())
-        }
-        AggScalarValue::Timestamp(v) => match data_type {
-            DataType::Timestamp(unit, tz) => Ok(format_timestamp(*unit, *v, tz.as_deref())),
-            _ => Ok(v.to_string()),
-        },
-        AggScalarValue::Decimal128(v) => match data_type {
-            DataType::Decimal128(_, scale) => Ok(format_decimal(*v, *scale)),
-            _ => Ok(v.to_string()),
-        },
-        AggScalarValue::Decimal256(v) => match data_type {
-            DataType::Decimal256(_, scale) => Ok(format_decimal256(*v, *scale)),
-            _ => Ok(v.to_string()),
-        },
-        AggScalarValue::Binary(v) => Ok(hex::encode(v)),
-        AggScalarValue::Struct(items) => {
-            let mut rendered = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Some(v) => rendered.push(scalar_to_string(v, data_type)?),
-                    None => rendered.push("NULL".to_string()),
-                }
-            }
-            Ok(format!("{{{}}}", rendered.join(",")))
-        }
-        AggScalarValue::Map(items) => {
-            let mut rendered = Vec::with_capacity(items.len());
-            for (k, v) in items {
-                let key = match k {
-                    Some(k) => scalar_to_string(k, data_type)?,
-                    None => "NULL".to_string(),
-                };
-                let value = match v {
-                    Some(v) => scalar_to_string(v, data_type)?,
-                    None => "NULL".to_string(),
-                };
-                rendered.push(format!("{}:{}", key, value));
-            }
-            Ok(format!("{{{}}}", rendered.join(",")))
-        }
-        AggScalarValue::List(items) => {
-            let mut rendered = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Some(v) => rendered.push(scalar_to_string(v, data_type)?),
-                    None => rendered.push("NULL".to_string()),
-                }
-            }
-            Ok(format!("[{}]", rendered.join(",")))
-        }
-    }
-}
-
-fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
-    // Align with StarRocks: omit fractional part when zero (e.g. "2020-01-01 00:10:00" not "2020-01-01 00:10:00.000000")
-    let timestamp_str = match unit {
-        TimeUnit::Second => {
-            let dt = DateTime::from_timestamp(value, 0)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-        }
-        TimeUnit::Millisecond => {
-            let seconds = value / 1_000;
-            let millis = value.rem_euclid(1_000) as u32;
-            let nanos = millis * 1_000_000;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if millis == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-            }
-        }
-        TimeUnit::Microsecond => {
-            let seconds = value.div_euclid(1_000_000);
-            let micros = value.rem_euclid(1_000_000) as u32;
-            let nanos = micros * 1_000;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if micros == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-            }
-        }
-        TimeUnit::Nanosecond => {
-            let seconds = value.div_euclid(1_000_000_000);
-            let nanos = value.rem_euclid(1_000_000_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if nanos == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string()
-            }
-        }
-    };
-    if let Some(tz) = tz {
-        format!("{} {}", timestamp_str, tz)
-    } else {
-        timestamp_str
-    }
-}
-
-fn format_decimal(unscaled: i128, scale: i8) -> String {
-    let scale = scale as i32;
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-
-    let unscaled_str = unscaled.abs().to_string();
-    let scale_usize = scale as usize;
-
-    if unscaled_str.len() <= scale_usize {
-        let padded = format!("{:0>width$}", unscaled_str, width = scale_usize);
-        if unscaled < 0 {
-            format!("-0.{}", padded)
-        } else {
-            format!("0.{}", padded)
-        }
-    } else {
-        let split_pos = unscaled_str.len() - scale_usize;
-        let integer_part = &unscaled_str[..split_pos];
-        let fractional_part = &unscaled_str[split_pos..];
-        if unscaled < 0 {
-            format!("-{}.{}", integer_part, fractional_part)
-        } else {
-            format!("{}.{}", integer_part, fractional_part)
-        }
-    }
-}
-
-fn format_decimal256(unscaled: i256, scale: i8) -> String {
-    let scale = scale as i32;
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-
-    let negative = unscaled.is_negative();
-    let abs = if negative {
-        unscaled.checked_neg().unwrap_or(unscaled)
-    } else {
-        unscaled
-    };
-    let abs_str = abs.to_string();
-    let scale_usize = scale as usize;
-
-    if abs_str.len() <= scale_usize {
-        let padded = format!("{:0>width$}", abs_str, width = scale_usize);
-        if negative {
-            format!("-0.{}", padded)
-        } else {
-            format!("0.{}", padded)
-        }
-    } else {
-        let split_pos = abs_str.len() - scale_usize;
-        let integer_part = &abs_str[..split_pos];
-        let fractional_part = &abs_str[split_pos..];
-        if negative {
-            format!("-{}.{}", integer_part, fractional_part)
-        } else {
-            format!("{}.{}", integer_part, fractional_part)
-        }
-    }
+    novarocks_functions::aggregate_format::scalar_to_string(
+        value,
+        data_type,
+        &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub fn compare_scalar_values(

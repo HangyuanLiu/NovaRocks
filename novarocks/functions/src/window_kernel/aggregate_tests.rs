@@ -156,6 +156,7 @@ impl Owner {
     }
     fn options(&self) -> AggregatePreparationOptions {
         AggregatePreparationOptions {
+            state_interpretation: None,
             phase: AggregateKernelPhase::Single,
             distinct: true,
             order_keys: vec![AggregateOrderKey {

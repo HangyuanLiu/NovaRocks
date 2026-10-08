@@ -279,6 +279,13 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
     )?;
     work.flush()?;
     let options = AggregatePreparationOptions {
+        state_interpretation: source
+            .binding
+            .state_interpretation
+            .as_ref()
+            .map(|value| value.clone_observed(work))
+            .transpose()?
+            .map(Arc::new),
         phase,
         distinct: source.distinct,
         order_keys: keys.into(),
@@ -368,6 +375,20 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
         source,
         work,
     )?;
+    if let Some(facts) = captured.binding().group_concat_source() {
+        let original = source.binding.state_interpretation.as_ref().ok_or(
+            PhysicalAggregateRequestError::InvalidSource(
+                "group_concat update has no original state interpretation",
+            ),
+        )?;
+        if !facts.state.matches_observed(original, || work.step())?
+            || facts.state.distinct != source.distinct
+        {
+            return Err(PhysicalAggregateRequestError::InvalidSource(
+                "group_concat physical update changes its logical source interpretation",
+            ));
+        }
+    }
     // Retain the exact same-emission Arc for refinement and preparation.
     // An Arc clone is not a second selected-signature author or host grant.
     work.flush()?;
@@ -388,6 +409,13 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
     }
     work.flush()?;
     let options = AggregatePreparationOptions {
+        state_interpretation: source
+            .binding
+            .state_interpretation
+            .as_ref()
+            .map(|value| value.clone_observed(work))
+            .transpose()?
+            .map(Arc::new),
         phase,
         distinct: source.distinct,
         order_keys: keys.into(),
@@ -416,6 +444,7 @@ pub(crate) struct AuthoredPhysicalAggregateMergeRequest<'entry, 'source> {
     state_inputs: super::lowered_draft::CheckedAggregateStateInputs<'source>,
     state_id: ExprId,
     state: &'source novarocks_physical_plan::ExprNode,
+    state_interpretation: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
     phase: AggregateKernelPhase,
     selected: Arc<FunctionBindingSelection>,
 }
@@ -460,6 +489,7 @@ impl AuthoredPhysicalAggregateMergeRequest<'_, '_> {
         PureCallPreparation::Aggregate {
             arguments,
             options: AggregatePreparationOptions {
+                state_interpretation: self.state_interpretation.clone(),
                 phase: self.phase,
                 distinct: false,
                 order_keys: Arc::from([]),
@@ -532,6 +562,24 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
         .visit_observed(
             work,
             |producer, _, work| {
+                let expected = entry.captured().binding().group_concat_source();
+                let actual = producer.captured().binding().group_concat_source();
+                let same_semantics = match (expected, actual) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.legacy == b.legacy && a.max_len == b.max_len && a.state.matches_observed(&b.state, || work.step())?,
+                    _ => false,
+                };
+                let same_state = match (&source.binding.state_interpretation, &producer.source().binding.state_interpretation) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.matches_observed(b, || work.step())?,
+                    _ => false,
+                };
+                if !same_semantics || !same_state {
+                    return Err(super::lowered_draft::SqlSourceJournalError::InvalidSource(
+                        "aggregate state producer changes its original interpretation or semantic source",
+                    ));
+                }
+                work.step()?;
                 let result = if producer.phase().consumes_logical_arguments() {
                     author_physical_aggregate_update_request_from_journal_observed(&producer, work)
                         .map(|_| ())
@@ -556,7 +604,16 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
             |_, _, _, _| Ok(()),
         )
         .map_err(source_error)?;
+    work.flush()?;
+    let state_interpretation = source
+        .binding
+        .state_interpretation
+        .as_ref()
+        .map(|value| value.clone_observed(work).map(Arc::new))
+        .transpose()?;
+    work.flush()?;
     Ok(AuthoredPhysicalAggregateMergeRequest {
+        state_interpretation,
         entry,
         state_inputs,
         state_id,

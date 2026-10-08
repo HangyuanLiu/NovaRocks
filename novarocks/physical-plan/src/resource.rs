@@ -1102,6 +1102,12 @@ fn add_aggregate_binding_usage_core<P: TypeValidationPolicy>(
     policy: &mut P,
 ) -> Result<(), P::Error> {
     usage.add_bytes(binding.state_format.as_str().len());
+    if let Some(receipt) = &binding.state_interpretation {
+        usage.add_items(receipt.order_keys.len());
+        usage.add_bytes(receipt.order_keys.len().saturating_mul(std::mem::size_of::<
+            novarocks_type_contract::AggregateStateOrderKey,
+        >()));
+    }
     add_function_usage_core(
         &binding.function,
         &format!("{path}.function"),
@@ -2509,6 +2515,7 @@ mod tests {
             },
         };
         let binding = AggregateBinding {
+            state_interpretation: None,
             state_argument_contract:
                 novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function,

@@ -388,6 +388,7 @@ impl<'owner> Call<'owner> {
 }
 fn aggregate_options(phase: AggregateKernelPhase) -> AggregatePreparationOptions {
     AggregatePreparationOptions {
+        state_interpretation: None,
         phase,
         distinct: false,
         order_keys: Arc::from([]),
@@ -959,6 +960,7 @@ pub(crate) fn aggregate_node(
                     input: ProgramNodeId::new(0),
                     group_by: vec![ProgramExprId::new(0); group_roots],
                     functions: vec![StaticAggregateCall {
+                        state_interpretation: None,
                         // Deliberately unrelated display text: it is never implementation authority.
                         name: "display_alias_without_catalogue_entry".into(),
                         inputs: vec![ProgramExprId::new(0)],

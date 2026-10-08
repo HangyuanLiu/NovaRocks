@@ -235,6 +235,7 @@ fn nominal() -> FunctionValueType {
 }
 fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
     p::AggregateBinding {
+        state_interpretation: None,
         function: p::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),

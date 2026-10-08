@@ -186,6 +186,7 @@ fn count(catalog: &EngineFunctionCatalog, types: &[FunctionValueType]) -> Aggreg
     let intermediate_type = selected.intermediate_type.clone();
     let state_format = AggregateStateFormatId::try_new(selected.state_format.as_str()).unwrap();
     AggregateBinding {
+        state_interpretation: None,
         state_argument_contract,
         function: scalar(resolved),
         phase: AggregatePhase::Single,

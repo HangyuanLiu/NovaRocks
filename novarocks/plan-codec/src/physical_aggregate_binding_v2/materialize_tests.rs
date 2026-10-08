@@ -161,6 +161,7 @@ fn raw_function(wide: bool) -> wire::FunctionBindingDefinition {
 }
 fn raw_aggregate(id: u32, phase: wire::aggregate_phase::Kind) -> wire::AggregateBindingDefinition {
     wire::AggregateBindingDefinition {
+        state_interpretation: None,
         id,
         function_binding_id: Some(u32::MAX),
         phase: Some(wire::AggregatePhase { kind: Some(phase) }),

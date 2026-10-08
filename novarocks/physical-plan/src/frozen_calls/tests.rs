@@ -674,6 +674,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         aggregate_calls.push(AggregateCall {
             id,
             binding: AggregateBinding {
+                state_interpretation: None,
                 state_argument_contract:
                     novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 function: function(FunctionKind::Aggregate, integer()),

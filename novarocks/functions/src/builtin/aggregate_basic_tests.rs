@@ -159,6 +159,7 @@ impl Fixture {
     }
     fn aggregate_options(distinct: bool) -> AggregatePreparationOptions {
         AggregatePreparationOptions {
+            state_interpretation: None,
             phase: AggregateKernelPhase::Single,
             distinct,
             order_keys: Arc::from([]),

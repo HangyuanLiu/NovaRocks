@@ -138,6 +138,7 @@ fn function(kind: FunctionKind) -> BoundFunction {
 }
 fn aggregate(function: &BoundFunction) -> AggregateBinding {
     AggregateBinding {
+        state_interpretation: None,
         function: function.clone(),
         phase: AggregatePhase::Partial {
             sequence: AggregateSequenceId::new(u32::MAX),

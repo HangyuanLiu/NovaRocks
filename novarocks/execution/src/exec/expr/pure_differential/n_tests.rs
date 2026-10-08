@@ -314,6 +314,7 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift_and_n
                             PureCallPreparation::Aggregate {
                                 arguments: ScopedExpressionEffects::pure_value(context),
                                 options: AggregatePreparationOptions {
+                                    state_interpretation: None,
                                     phase: AggregateKernelPhase::Single,
                                     distinct: false,
                                     order_keys: Arc::from([]),

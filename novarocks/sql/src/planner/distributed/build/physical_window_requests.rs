@@ -468,6 +468,7 @@ fn aggregate_options_observed(
             }
             work.flush()?;
             Some(AggregatePreparationOptions {
+                state_interpretation: None,
                 phase: AggregateKernelPhase::Single,
                 distinct,
                 order_keys: keys.into(),

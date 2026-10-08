@@ -152,6 +152,46 @@ fn author_one(
     let occurrences =
         author_physical_occurrences_observed(fragment, owner.function_catalog().as_ref(), control)?;
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let environments = (|| {
+        let mut aggregate_environments = BTreeMap::new();
+        for &(site, _) in &occurrences.relational_contexts {
+            if let PhysicalCallSite::Aggregate { node, .. }
+            | PhysicalCallSite::TopNState { node, .. } = site
+            {
+                let node =
+                    fragment
+                        .nodes()
+                        .get(&node)
+                        .ok_or(PackageSemanticsError::InvalidSource(
+                            "aggregate node is absent",
+                        ))?;
+                let source = aggregate_source(node, site)?;
+                let entry = owner
+                    .checked_aggregate_source_observed(fragment, node, site, source, &mut work)?;
+                if let Some(facts) = entry.captured().binding().group_concat_source() {
+                    let refs = facts.environment();
+                    for reference in refs {
+                        owner.plan().parameters().require(reference).map_err(|_| {
+                            PackageSemanticsError::InvalidSource(
+                                "group_concat admitted parameter is absent",
+                            )
+                        })?;
+                        work.step()?;
+                    }
+                    aggregate_environments.insert(site, refs);
+                }
+            }
+        }
+        Ok(aggregate_environments)
+    })();
+    let aggregate_environments = match environments {
+        Ok(environments) => environments,
+        Err(PackageSemanticsError::Control(cause)) => return Err(cause.into()),
+        Err(error) => {
+            work.finish()?;
+            return Err(error);
+        }
+    };
     let scopes = (|| {
         let mut expressions: BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'_>> =
             BTreeMap::new();
@@ -251,7 +291,9 @@ fn author_one(
                 PhysicalRelationalCallSourceScope {
                     source: node,
                     decimal_overflow_policy: decimal,
-                    environment: &[],
+                    environment: aggregate_environments
+                        .get(&site)
+                        .map_or(&[][..], |refs| refs.as_slice()),
                     proof_scope: CallProofScope::Domain(context.domain),
                 },
             );

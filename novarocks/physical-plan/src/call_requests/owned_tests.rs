@@ -277,6 +277,7 @@ fn caller_owned_validation_leaves_empty_success_and_wrong_fragment_tail_to_calle
 #[test]
 fn caller_owned_relational_records_follow_actual_call_array_ordinals() {
     let binding = AggregateBinding {
+        state_interpretation: None,
         function: crate::BoundFunction {
             kind: FunctionKind::Aggregate,
             ..function(vec![])

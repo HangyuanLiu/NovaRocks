@@ -3018,6 +3018,7 @@ fn grouped_writer_fragment_with_sources(
             shared_state_input
         },
         binding: AggregateBinding {
+            state_interpretation: None,
             state_argument_contract:
                 novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: BoundFunction {

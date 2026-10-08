@@ -393,6 +393,7 @@ fn assert_binding_drift_refused(name: &str, values: ArrayRef, raw_output: DataTy
         PureCallPreparation::Aggregate {
             arguments: ScopedExpressionEffects::pure_value(context),
             options: AggregatePreparationOptions {
+                state_interpretation: None,
                 phase: AggregateKernelPhase::Single,
                 distinct: false,
                 order_keys: Arc::from([]),

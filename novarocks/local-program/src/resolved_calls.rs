@@ -755,6 +755,17 @@ fn validate_aggregate(
 ) -> Result<(), ProgramResolvedCallsError> {
     let contract = aggregate_contract(token)?;
     check_aggregate_source(&source.resolved, contract, work)?;
+    let same_interpretation = match (
+        &source.state_interpretation,
+        contract.state_interpretation(),
+    ) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.matches_observed(right, || work.step())?,
+        _ => false,
+    };
+    if !same_interpretation {
+        return Err(ProgramResolvedCallsError::WrongOrder);
+    }
     let phase = match (source.input_is_intermediate, finalize) {
         (false, false) => AggregateKernelPhase::Partial,
         (false, true) => AggregateKernelPhase::Single,

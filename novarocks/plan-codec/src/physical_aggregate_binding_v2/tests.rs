@@ -102,6 +102,7 @@ fn aggregate(
     phase: AggregatePhase,
 ) -> AggregateBinding {
     AggregateBinding {
+        state_interpretation: None,
         function: function.clone(),
         phase,
         logical_argument_count: 1,
@@ -187,6 +188,7 @@ fn aggregate_emission_preserves_all_phases_sparse_ids_and_original_source_loans(
         assert_eq!(
             *definition,
             wire::AggregateBindingDefinition {
+                state_interpretation: None,
                 id: input.id,
                 function_binding_id: Some(u32::MAX),
                 phase: Some(wire::AggregatePhase { kind: Some(kind) }),

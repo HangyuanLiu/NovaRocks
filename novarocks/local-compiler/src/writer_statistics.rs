@@ -895,6 +895,7 @@ fn prepare_call(
         (
             CallArgumentUses::SelectedChannels(&argument_uses),
             AggregatePreparationOptions {
+                state_interpretation: None,
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),
@@ -910,6 +911,7 @@ fn prepare_call(
                 state_input_type: input_type,
             },
             AggregatePreparationOptions {
+                state_interpretation: None,
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),

@@ -184,6 +184,8 @@ impl AggregatePhase {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregateBinding {
+    /// Original state-row policy, independent of this phase's input channels.
+    pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub state_argument_contract: novarocks_type_contract::AggregateStateArgumentContract,
     pub function: BoundFunction,
     pub phase: AggregatePhase,

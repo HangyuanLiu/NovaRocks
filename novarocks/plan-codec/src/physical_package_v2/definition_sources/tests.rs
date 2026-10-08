@@ -244,6 +244,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         .map(|(id, output)| p::AggregateCall {
             id: p::AggregateCallId::new(id),
             binding: p::AggregateBinding {
+                state_interpretation: None,
                 state_argument_contract: AggregateStateArgumentContract::ExactSignature,
                 function: function(FunctionKind::Aggregate, Box::default()),
                 phase: p::AggregatePhase::Single,

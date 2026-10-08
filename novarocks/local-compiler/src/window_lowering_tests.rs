@@ -414,6 +414,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         let aggregate_binding = (call.kind == FunctionKind::Aggregate).then(|| {
             let aggregate = bound.selected.aggregate.as_ref().unwrap();
             Box::new(AggregateBinding {
+                state_interpretation: None,
                 state_argument_contract: aggregate.state_argument_contract,
                 function: function.clone(),
                 phase: AggregatePhase::Single,
@@ -645,6 +646,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             PureCallPreparation::Aggregate {
                 arguments,
                 options: AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase: AggregateKernelPhase::Single,
                     distinct: false,
                     order_keys: Arc::from([]),

@@ -188,6 +188,15 @@ message AggregateBindingDefinition {
   optional uint32 intermediate_value_type_id = 5;
   string state_format = 6;
   AggregateStateArgumentContract state_argument_contract = 7;
+  AggregateStateInterpretation state_interpretation = 8;
+}
+message AggregateStateInterpretation {
+  optional bool distinct = 1;
+  repeated AggregateStateOrderKey order_keys = 2;
+}
+message AggregateStateOrderKey {
+  optional bool ascending = 1;
+  optional bool nulls_first = 2;
 }
 enum AggregateStateArgumentContract {
   AGGREGATE_STATE_ARGUMENT_CONTRACT_UNSPECIFIED = 0;

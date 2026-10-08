@@ -219,6 +219,7 @@ impl Fixture {
         PureCallPreparation::Aggregate {
             arguments: ScopedExpressionEffects::pure_value(context()),
             options: AggregatePreparationOptions {
+                state_interpretation: None,
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),

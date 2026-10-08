@@ -338,6 +338,7 @@ struct ContractLoweringVisitor<'a> {
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     root_allow_throw_exception_used: bool,
+    group_concat_parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     control: &'a dyn PureCompileControl,
     work: CompileCheckpoints<'a>,
@@ -1397,6 +1398,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             root_allow_throw_exception,
             constant_policy,
             root_allow_throw_exception_used: false,
+            group_concat_parameters: BTreeMap::new(),
             functions,
             control,
             work,
@@ -1986,15 +1988,17 @@ impl<'a> ContractLoweringVisitor<'a> {
                 self.plan_builder.add_fragment(fragment)?;
             }
             if self.root_allow_throw_exception_used {
-                let parameters = SemanticParameters::try_new([(
+                self.group_concat_parameters.insert(
                     SemanticParameterId::new(0),
                     SemanticParameterValue::AllowThrowException(self.root_allow_throw_exception),
-                )])
-                .map_err(|error| {
-                    ContractLoweringError::InvalidFunctionBinding {
-                        detail: error.to_string(),
-                    }
-                })?;
+                );
+            }
+            if !self.group_concat_parameters.is_empty() {
+                let parameters =
+                    SemanticParameters::try_new(std::mem::take(&mut self.group_concat_parameters))
+                        .map_err(|error| ContractLoweringError::InvalidFunctionBinding {
+                            detail: error.to_string(),
+                        })?;
                 Ok(Some(parameters))
             } else {
                 Ok(None)
@@ -5689,7 +5693,31 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: "call output identity differs from the output layout".into(),
                 });
             }
-            let original_binding = lower_aggregate_binding(call, phase)?;
+            let original_binding = lower_aggregate_binding(call, phase, &mut self.work)?;
+            if let Some(facts) = call.source.binding().group_concat_source() {
+                let raw = facts
+                    .max_len
+                    .ok_or(ContractLoweringError::InvalidAggregate {
+                        detail: "group_concat has no admitted max length source",
+                    })?;
+                let mode = SemanticParameterValue::GroupConcatLegacy(facts.legacy);
+                let mode_id = SemanticParameterId::new(if facts.legacy { 2 } else { 1 });
+                self.work.flush()?;
+                self.group_concat_parameters.insert(mode_id, mode);
+                let max_id = SemanticParameterId::new(3);
+                let value = SemanticParameterValue::GroupConcatMaxLen(raw);
+                if self
+                    .group_concat_parameters
+                    .get(&max_id)
+                    .is_some_and(|prior| prior != &value)
+                {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "group_concat changes its admitted max length source",
+                    });
+                }
+                self.group_concat_parameters.insert(max_id, value);
+                self.work.step()?;
+            }
             let logical_source = self.capture_aggregate_source(&call.source)?;
             let mut channels =
                 if phase.consumes_logical_arguments() && logical_source.captured().is_some() {
@@ -5850,9 +5878,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 _ => None,
             };
             let binding = match &canonical {
-                Some(canonical) => {
-                    lower_aggregate_binding_from_selection(call, canonical.selected(), phase)?
-                }
+                Some(canonical) => lower_aggregate_binding_from_selection(
+                    call,
+                    canonical.selected(),
+                    phase,
+                    &mut self.work,
+                )?,
                 None => original_binding,
             };
             let expected_output_type = if phase.produces_final_result() {
@@ -10075,6 +10106,7 @@ fn lower_writer_aggregate_binding_from_selection(
         .as_ref()
         .ok_or_else(|| invalid_write("writer aggregate has no state contract".into()))?;
     Ok(AggregateBinding {
+        state_interpretation: None,
         state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved, selected, result),
         phase,
@@ -11010,6 +11042,7 @@ fn lower_resolved_aggregate_binding(
                 detail: "aggregate window binding lacks state metadata".to_string(),
             })?;
     Ok(AggregateBinding {
+        state_interpretation: None,
         state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved, selected, result_type),
         phase,
@@ -11084,14 +11117,16 @@ fn expression_is_replica_deterministic(expression: &TypedExpr) -> bool {
 fn lower_aggregate_binding(
     call: &crate::planner::payload::AggregateCall,
     phase: AggregatePhase,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateBinding, ContractLoweringError> {
-    lower_aggregate_binding_from_selection(call, &call.source.binding().selected, phase)
+    lower_aggregate_binding_from_selection(call, &call.source.binding().selected, phase, work)
 }
 
 fn lower_aggregate_binding_from_selection(
     call: &crate::planner::payload::AggregateCall,
     selected: &novarocks_functions::FunctionBindingSelection,
     phase: AggregatePhase,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateBinding, ContractLoweringError> {
     let resolved = call.source.binding();
     if resolved.kind != novarocks_physical_plan::FunctionKind::Aggregate {
@@ -11123,6 +11158,10 @@ fn lower_aggregate_binding_from_selection(
     // there. The phase carrier is checked against this binding where the
     // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
+        state_interpretation: resolved
+            .group_concat_source()
+            .map(|facts| facts.state.clone_observed(work))
+            .transpose()?,
         state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved.resolved(), selected, result_type),
         phase,

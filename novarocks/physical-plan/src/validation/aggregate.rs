@@ -250,6 +250,14 @@ fn aggregate_bindings_match_with(
     {
         return Ok(false);
     }
+    let same_state = match (&expected.state_interpretation, &actual.state_interpretation) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.matches_observed(b, || charge(1))?,
+        _ => false,
+    };
+    if !same_state {
+        return Ok(false);
+    }
     for (ordinal, (a, b)) in left
         .argument_types
         .iter()

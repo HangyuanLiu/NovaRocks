@@ -86,6 +86,7 @@ pub(crate) struct AggregateDiffSpec {
     pub partitions: usize,
     pub partition_seed: u64,
     pub semantics: DiffSemantics,
+    pub original_state: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub float_comparison: FloatComparison,
     pub error_messages: ErrorMessageCheck,
     /// Only explicitly frozen original panic payloads can match.
@@ -103,6 +104,7 @@ impl AggregateDiffSpec {
             partitions: 3,
             partition_seed: 0xA66,
             semantics: DiffSemantics::default(),
+            original_state: None,
             float_comparison: FloatComparison::Exact,
             error_messages: ErrorMessageCheck::LegacyContainsPure,
             expected_panic_payload: None,
@@ -148,6 +150,33 @@ impl AggregateDiffSpec {
         self.partitions = partitions;
         self.partition_seed = seed;
         self
+    }
+
+    /// The test producer authors the same original state options for both paths.
+    pub(crate) fn original_state_interpretation(
+        mut self,
+        distinct: bool,
+        order: Vec<novarocks_type_contract::AggregateStateOrderKey>,
+    ) -> Self {
+        self.original_state = Some(novarocks_type_contract::AggregateStateInterpretation {
+            distinct,
+            order_keys: order.into_boxed_slice(),
+        });
+        self
+    }
+    fn logical_argument_count(&self) -> Result<usize, DifferentialFailure> {
+        self.arguments
+            .len()
+            .checked_sub(
+                self.original_state
+                    .as_ref()
+                    .map_or(0, |state| state.order_keys.len()),
+            )
+            .ok_or_else(|| {
+                DifferentialFailure::InvalidSpec(
+                    "state interpretation has more order keys than channels".into(),
+                )
+            })
     }
 
     pub(crate) fn semantics(mut self, semantics: DiffSemantics) -> Self {
@@ -274,12 +303,41 @@ impl Layout {
     }
 }
 
+fn resolve_aggregate_spec(
+    catalog: &EngineFunctionCatalog,
+    spec: &AggregateDiffSpec,
+) -> Result<ResolvedFunctionBinding, DifferentialFailure> {
+    if spec.original_state.is_none() {
+        return resolve_like_sql(catalog, &spec.name, CatalogKind::Aggregate, &spec.arguments);
+    }
+    let arguments = spec
+        .arguments
+        .iter()
+        .map(DiffArgument::request)
+        .collect::<Vec<_>>();
+    catalog
+        .resolve_bound_user(
+            &spec.name,
+            CatalogKind::Aggregate,
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: spec.logical_argument_count()?,
+                expected_result_type: None,
+            },
+            &HarnessControl,
+        )
+        .map_err(|error| DifferentialFailure::Resolution {
+            name: spec.name.clone(),
+            error: error.to_string(),
+        })
+}
+
 pub(crate) fn run_aggregate_differential(
     spec: &AggregateDiffSpec,
 ) -> Result<AggregateDiffSummary, DifferentialFailure> {
     let rows = spec.rows()?;
     let catalog = builtin_engine_function_catalog();
-    let bound = resolve_like_sql(catalog, &spec.name, CatalogKind::Aggregate, &spec.arguments)?;
+    let bound = resolve_aggregate_spec(catalog, spec)?;
     let FunctionResultType::Scalar(result_type) = bound.selected.result_type.clone() else {
         return Err(DifferentialFailure::InvalidSpec(
             "aggregate selected a relation result".into(),
@@ -548,7 +606,16 @@ impl LegacyAggregate {
             }),
             order: AggOrderSpec {
                 group_concat_max_len,
-                ..AggOrderSpec::default()
+                is_distinct: spec
+                    .original_state
+                    .as_ref()
+                    .is_some_and(|state| state.distinct),
+                is_asc_order: spec.original_state.as_ref().map_or_else(Vec::new, |state| {
+                    state.order_keys.iter().map(|key| key.ascending).collect()
+                }),
+                nulls_first: spec.original_state.as_ref().map_or_else(Vec::new, |state| {
+                    state.order_keys.iter().map(|key| key.nulls_first).collect()
+                }),
             },
         };
         let functions = test_builtin_execution_function_set();
@@ -791,8 +858,8 @@ impl PureAggregate {
         let input = SelectedAggregateUpdateInput::try_new(
             &contract,
             selection,
-            &arguments,
-            &[],
+            &arguments[..contract.call().logical_argument_count()],
+            &arguments[contract.call().logical_argument_count()..],
             &HarnessControl,
         )?;
         column
@@ -904,7 +971,7 @@ fn prepare_aggregate(
         request: FunctionBindingRequest {
             expected_result_type: None,
             arguments: &request_arguments,
-            logical_argument_count: request_arguments.len(),
+            logical_argument_count: spec.logical_argument_count()?,
         },
         environment: &environment,
         parameters: &parameters,
@@ -918,9 +985,31 @@ fn prepare_aggregate(
             PureCallPreparation::Aggregate {
                 arguments: ScopedExpressionEffects::pure_value(context),
                 options: AggregatePreparationOptions {
+                    state_interpretation: spec.original_state.clone().map(Arc::new),
                     phase,
-                    distinct: false,
-                    order_keys: Arc::from([]),
+                    distinct: phase.consumes_logical_arguments()
+                        && spec
+                            .original_state
+                            .as_ref()
+                            .is_some_and(|state| state.distinct),
+                    order_keys: if phase.consumes_logical_arguments() {
+                        spec.original_state.as_ref().map_or_else(
+                            || Arc::from([]),
+                            |state| {
+                                state
+                                    .order_keys
+                                    .iter()
+                                    .map(|key| novarocks_functions::AggregateOrderKey {
+                                        ascending: key.ascending,
+                                        nulls_first: key.nulls_first,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into()
+                            },
+                        )
+                    } else {
+                        Arc::from([])
+                    },
                     state_input_type: (!phase.consumes_logical_arguments())
                         .then(|| state_type.clone()),
                 },
@@ -942,7 +1031,7 @@ pub(crate) fn aggregate_pure_owner_status(
     spec: &AggregateDiffSpec,
 ) -> Result<(FunctionId, FunctionOverloadId), DifferentialFailure> {
     let catalog = builtin_engine_function_catalog();
-    let bound = resolve_like_sql(catalog, &spec.name, CatalogKind::Aggregate, &spec.arguments)?;
+    let bound = resolve_aggregate_spec(catalog, spec)?;
     let signature = resolved_aggregate_signature_from_binding(bound.clone())
         .map_err(|error| DifferentialFailure::InvalidSpec(error.to_string()))?;
     let legacy = match LegacyAggregate::try_new(spec, &signature) {

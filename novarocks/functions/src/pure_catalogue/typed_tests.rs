@@ -365,6 +365,7 @@ impl<'owner> Call<'owner> {
 }
 fn aggregate_options(phase: AggregateKernelPhase) -> AggregatePreparationOptions {
     AggregatePreparationOptions {
+        state_interpretation: None,
         phase,
         distinct: false,
         order_keys: Arc::from([]),

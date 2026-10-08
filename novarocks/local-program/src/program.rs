@@ -147,6 +147,7 @@ pub struct StaticAggregateOrder {
 
 #[derive(Clone, Debug)]
 pub struct StaticAggregateCall {
+    pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub name: Arc<str>,
     pub inputs: Vec<ProgramExprId>,
     pub input_is_intermediate: bool,

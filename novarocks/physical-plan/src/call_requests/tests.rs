@@ -472,6 +472,7 @@ fn static_requests_value_nullable_covariance_and_lambda_complete_exactness_stay_
 #[test]
 fn static_requests_relational_call_ordinal_is_not_aggregate_id_or_expression_use() {
     let binding = AggregateBinding {
+        state_interpretation: None,
         function: crate::BoundFunction {
             kind: FunctionKind::Aggregate,
             ..function(vec![])

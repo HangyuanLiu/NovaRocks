@@ -69,8 +69,8 @@ pub(crate) struct LoweredAggregate {
 }
 
 /// Lower one Aggregate whose output is its group values followed by one value
-/// per call, in call order. Function ORDER BY has no local owner yet and is an
-/// explicit refusal.
+/// per call, in call order. Function ORDER channels follow logical arguments
+/// and retain their original state interpretation across merge phases.
 pub(crate) fn lower_aggregate(
     package: &FragmentPackage,
     node: &PhysicalNode,
@@ -249,12 +249,6 @@ fn lower_call(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<StaticAggregateCall, FragmentCompileError> {
-    if !call.order_by.is_empty() {
-        return Err(FragmentCompileError::Unsupported {
-            node: Some(node.id),
-            feature: "aggregate function ORDER BY",
-        });
-    }
     let binding = &call.binding;
     let function = &binding.function;
     if function.kind != FunctionKind::Aggregate {
@@ -263,8 +257,19 @@ fn lower_call(
         ));
     }
     let mut inputs = Vec::new();
-    reserve_vec(&mut inputs, call.arguments.len(), work)?;
-    for argument in call.arguments.iter() {
+    let input_count = call
+        .arguments
+        .len()
+        .checked_add(call.order_by.len())
+        .ok_or(FragmentCompileError::Invalid(
+            "aggregate channel count exhausted",
+        ))?;
+    reserve_vec(&mut inputs, input_count, work)?;
+    for argument in call
+        .arguments
+        .iter()
+        .chain(call.order_by.iter().map(|key| &key.expr))
+    {
         inputs.push(
             *expressions
                 .get(argument)
@@ -296,15 +301,29 @@ fn lower_call(
     work.flush()?;
     let name: Arc<str> = Arc::from(function.function_id.as_str());
     work.flush()?;
+    let mut ascending = Vec::new();
+    let mut nulls_first = Vec::new();
+    reserve_vec(&mut ascending, call.order_by.len(), work)?;
+    reserve_vec(&mut nulls_first, call.order_by.len(), work)?;
+    for key in &call.order_by {
+        ascending.push(key.direction == novarocks_physical_plan::SortDirection::Ascending);
+        nulls_first.push(key.null_ordering == novarocks_physical_plan::NullOrdering::First);
+        work.step()?;
+    }
     Ok(StaticAggregateCall {
+        state_interpretation: binding
+            .state_interpretation
+            .as_ref()
+            .map(|value| value.clone_observed(work))
+            .transpose()?,
         // A diagnostic tag only; the frozen preparation owns the call.
         name,
         inputs,
         input_is_intermediate: !binding.phase.consumes_logical_arguments(),
         types: None,
         order: StaticAggregateOrder {
-            is_asc_order: Vec::new(),
-            nulls_first: Vec::new(),
+            is_asc_order: ascending,
+            nulls_first,
             is_distinct: call.distinct,
             group_concat_max_len: None,
         },
@@ -391,9 +410,6 @@ fn prepare_call(
         node: node.id,
         call: ordinal,
     };
-    if !call.order_by.is_empty() {
-        return Err(ExpressionLoweringError::UnsupportedCall(site));
-    }
     let binding = &call.binding;
     let function = &binding.function;
     if function.kind != FunctionKind::Aggregate {
@@ -448,19 +464,41 @@ fn prepare_call(
     // Each argument root is an independent unguarded Value occurrence whose
     // definition is the call's ordered argument.
     let mut argument_uses = Vec::new();
-    reserve_vec(&mut argument_uses, call.arguments.len(), work)?;
+    let channel_count = call
+        .arguments
+        .len()
+        .checked_add(call.order_by.len())
+        .ok_or(ExpressionLoweringError::Invalid(
+            "aggregate channel count exhausted",
+        ))?;
+    reserve_vec(&mut argument_uses, channel_count, work)?;
     let mut contexts = Vec::new();
-    reserve_vec(&mut contexts, call.arguments.len(), work)?;
+    reserve_vec(&mut contexts, channel_count, work)?;
     let mut children = ExpressionEffects::PURE_VALUE;
-    for (argument, &definition) in call.arguments.iter().enumerate() {
+    for (argument, &definition) in call
+        .arguments
+        .iter()
+        .chain(call.order_by.iter().map(|key| &key.expr))
+        .enumerate()
+    {
         let argument = u32::try_from(argument).map_err(|_| {
             ExpressionLoweringError::Invalid("aggregate argument ordinal exhausted")
         })?;
         let root = ExpressionRootSite {
             node: node.id,
-            role: ExpressionRootRole::AggregateArgument {
-                call: ordinal,
-                argument,
+            role: if (argument as usize) < call.arguments.len() {
+                ExpressionRootRole::AggregateArgument {
+                    call: ordinal,
+                    argument,
+                }
+            } else {
+                ExpressionRootRole::AggregateOrder {
+                    call: ordinal,
+                    key: argument
+                        - u32::try_from(call.arguments.len()).map_err(|_| {
+                            ExpressionLoweringError::Invalid("aggregate argument ordinal exhausted")
+                        })?,
+                }
             },
         };
         let use_id = *roots
@@ -496,13 +534,28 @@ fn prepare_call(
         contexts.push(invocation.context);
         work.step()?;
     }
+    let original = binding
+        .state_interpretation
+        .as_ref()
+        .map(|value| value.clone_observed(work).map(Arc::new))
+        .transpose()?;
+    let mut order_keys = Vec::new();
+    reserve_vec(&mut order_keys, call.order_by.len(), work)?;
+    for key in &call.order_by {
+        order_keys.push(novarocks_functions::AggregateOrderKey {
+            ascending: key.direction == novarocks_physical_plan::SortDirection::Ascending,
+            nulls_first: key.null_ordering == novarocks_physical_plan::NullOrdering::First,
+        });
+        work.step()?;
+    }
     let (argument_uses_shape, options) = if phase.consumes_logical_arguments() {
         (
             novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
             AggregatePreparationOptions {
+                state_interpretation: original.clone(),
                 phase,
                 distinct: call.distinct,
-                order_keys: Arc::from([]),
+                order_keys: order_keys.into(),
                 state_input_type: None,
             },
         )
@@ -534,6 +587,7 @@ fn prepare_call(
                 state_input_type: state_type,
             },
             AggregatePreparationOptions {
+                state_interpretation: original,
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),

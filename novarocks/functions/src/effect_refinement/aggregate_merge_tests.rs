@@ -438,6 +438,7 @@ impl CountFixture {
         PureCallPreparation::Aggregate {
             arguments: ScopedExpressionEffects::pure_value(operator()),
             options: AggregatePreparationOptions {
+                state_interpretation: None,
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),
@@ -521,6 +522,7 @@ fn installed_merge_options_cannot_replace_phase_or_full_actual_state_type() {
         let options = PureCallPreparation::Aggregate {
             arguments: ScopedExpressionEffects::pure_value(operator()),
             options: AggregatePreparationOptions {
+                state_interpretation: None,
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),
@@ -553,6 +555,7 @@ fn installed_merge_options_cannot_replace_phase_or_full_actual_state_type() {
         let options = PureCallPreparation::Aggregate {
             arguments: ScopedExpressionEffects::pure_value(operator()),
             options: AggregatePreparationOptions {
+                state_interpretation: None,
                 phase: AggregateKernelPhase::Final,
                 distinct,
                 order_keys,

@@ -193,6 +193,7 @@ impl Fixture {
         PureCallPreparation::Aggregate {
             arguments: ScopedExpressionEffects::pure_value(context()),
             options: AggregatePreparationOptions {
+                state_interpretation: None,
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),
@@ -316,6 +317,7 @@ fn aggregate_count_closed_catalog_uses_one_exact_owner_for_aggregate_and_over() 
                     arguments: ScopedExpressionEffects::pure_value(context()),
                     options: AggregateWindowPreparationOptions {
                         aggregate: AggregatePreparationOptions {
+                            state_interpretation: None,
                             phase: AggregateKernelPhase::Single,
                             distinct: false,
                             order_keys: Arc::from([]),
@@ -596,6 +598,7 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
     let options = PureCallPreparation::Aggregate {
         arguments: ScopedExpressionEffects::pure_value(context()),
         options: AggregatePreparationOptions {
+            state_interpretation: None,
             phase: AggregateKernelPhase::Single,
             distinct: true,
             order_keys: Arc::from([]),
@@ -616,6 +619,7 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
     let options = PureCallPreparation::Aggregate {
         arguments: ScopedExpressionEffects::pure_value(context()),
         options: AggregatePreparationOptions {
+            state_interpretation: None,
             phase: AggregateKernelPhase::Single,
             distinct: false,
             order_keys: Arc::from([AggregateOrderKey {
@@ -655,6 +659,7 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
     let options = PureCallPreparation::Aggregate {
         arguments: ScopedExpressionEffects::pure_value(context()),
         options: AggregatePreparationOptions {
+            state_interpretation: None,
             phase: AggregateKernelPhase::Final,
             distinct: false,
             order_keys: Arc::from([]),

@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 fn binding(ty: crate::ValueType) -> crate::AggregateBinding {
     crate::AggregateBinding {
+        state_interpretation: None,
         state_argument_contract: AggregateStateArgumentContract::ValueRootNullabilityIndependent,
         function: crate::BoundFunction {
             function_id: novarocks_type_contract::FunctionId::try_new("test/state-argument-owner")

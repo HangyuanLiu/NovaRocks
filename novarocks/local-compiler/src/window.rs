@@ -828,6 +828,7 @@ fn prepare_call(
                 arguments,
                 options: AggregateWindowPreparationOptions {
                     aggregate: AggregatePreparationOptions {
+                        state_interpretation: None,
                         phase: AggregateKernelPhase::Single,
                         distinct: *distinct,
                         order_keys: Arc::from([]),

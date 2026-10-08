@@ -134,6 +134,7 @@ fn with_functions<T>(
 }
 fn definition(id: u32, phase: wire::aggregate_phase::Kind) -> wire::AggregateBindingDefinition {
     wire::AggregateBindingDefinition {
+        state_interpretation: None,
         id,
         function_binding_id: Some(0),
         phase: Some(wire::AggregatePhase { kind: Some(phase) }),

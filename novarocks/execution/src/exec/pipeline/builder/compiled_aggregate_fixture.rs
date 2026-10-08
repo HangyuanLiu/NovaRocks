@@ -206,6 +206,7 @@ impl Bound {
             semantic_parameters: Box::default(),
         });
         AggregateBinding {
+            state_interpretation: None,
             state_argument_contract: aggregate.state_argument_contract,
             function,
             phase,
@@ -634,6 +635,7 @@ fn freeze(
                 // A call's frozen effects do not depend on DISTINCT; whether
                 // the owner implements DISTINCT is the compiler's preparation.
                 AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),
@@ -655,6 +657,7 @@ fn freeze(
                     state_input_type: &state_type,
                 },
                 AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),

@@ -1190,6 +1190,7 @@ mod statistics {
             panic!("Theta returns one scalar")
         };
         AggregateBinding {
+            state_interpretation: None,
             state_argument_contract: aggregate.state_argument_contract,
             function: BoundFunction {
                 legacy_metadata: None,
@@ -1841,6 +1842,7 @@ mod statistics {
                                 ExpressionEffects::PURE_VALUE,
                             ),
                             options: AggregatePreparationOptions {
+                                state_interpretation: None,
                                 phase,
                                 distinct: false,
                                 order_keys: Arc::from([]),

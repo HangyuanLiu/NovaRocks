@@ -1442,6 +1442,7 @@ impl CountStar {
         AggregateCall {
             id: AggregateCallId::new(id),
             binding: AggregateBinding {
+                state_interpretation: None,
                 state_argument_contract: self.aggregate().state_argument_contract,
                 function,
                 phase,
@@ -1631,6 +1632,7 @@ fn freeze_counts(
             (
                 CallArgumentUses::SelectedChannels(&[]),
                 AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),
@@ -1658,6 +1660,7 @@ fn freeze_counts(
                     state_input_type: &state_type,
                 },
                 AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),

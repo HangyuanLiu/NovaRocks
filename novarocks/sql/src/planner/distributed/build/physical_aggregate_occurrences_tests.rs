@@ -147,6 +147,7 @@ fn binding(
         panic!("scalar aggregate result")
     };
     AggregateBinding {
+        state_interpretation: None,
         state_argument_contract,
         function: BoundFunction {
             function_id: r.function_id,

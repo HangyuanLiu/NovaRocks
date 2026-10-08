@@ -262,6 +262,16 @@ fn preflight(
     admit_work(&mut facts, state_bytes, lookup_work, limits, policy, admit)?;
     for definition in definitions {
         known = add(known, definition.state_format.capacity())?;
+        if let Some(receipt) = &definition.state_interpretation {
+            known = add(
+                known,
+                bytes::<wire::AggregateStateOrderKey>(receipt.order_keys.capacity())?,
+            )?;
+            state_bytes = add(
+                state_bytes,
+                bytes::<wire::AggregateStateOrderKey>(receipt.order_keys.len())?,
+            )?;
+        }
         state_bytes = add(state_bytes, definition.state_format.len())?;
         source_floor(source, known)?;
         admit_work(&mut facts, state_bytes, lookup_work, limits, policy, admit)?;
@@ -289,6 +299,9 @@ fn validate(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
     for definition in definitions {
+        if let Some(receipt) = &definition.state_interpretation {
+            validate_state_interpretation(receipt, work)?;
+        }
         let state_contract = decode_state_argument_contract(definition.state_argument_contract);
         work.step()?;
         state_contract?;

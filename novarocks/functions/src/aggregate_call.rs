@@ -105,6 +105,7 @@ pub struct AggregateCallContract {
     distinct: bool,
     order_keys: Arc<[AggregateOrderKey]>,
     state_input_type: Option<FunctionValueType>,
+    state_interpretation: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
 }
 impl AggregateCallContract {
     /// Preserve the same logical binding in every phase. Merge input layout
@@ -126,6 +127,7 @@ impl AggregateCallContract {
                 distinct,
                 order_keys,
                 state_input_type,
+                state_interpretation: None,
             },
             None,
             control,
@@ -137,6 +139,7 @@ impl AggregateCallContract {
         phase: AggregateKernelPhase,
         distinct: bool,
         order_keys: Arc<[AggregateOrderKey]>,
+        state_interpretation: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
         state: Option<AlignedAggregateMergeState<'_>>,
         proof: Option<ValidatedAggregateMergeState<'_>>,
         control: &dyn PureCompileControl,
@@ -163,6 +166,7 @@ impl AggregateCallContract {
                 distinct,
                 order_keys,
                 state_input_type,
+                state_interpretation,
             },
             proof,
             control,
@@ -180,6 +184,7 @@ impl AggregateCallContract {
             distinct,
             order_keys,
             state_input_type,
+            state_interpretation,
         } = options;
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
@@ -207,6 +212,32 @@ impl AggregateCallContract {
                     return Err(invalid("aggregate channel cannot be a lambda"));
                 }
                 work.step().map_err(compile_failure)?;
+            }
+            if let Some(original) = &state_interpretation {
+                if original.order_keys.len() != channels.len() - logical {
+                    return Err(invalid(
+                        "aggregate state interpretation differs from selected order channels",
+                    ));
+                }
+                if phase.consumes_logical_arguments() {
+                    if original.distinct != distinct
+                        || original.order_keys.len() != order_keys.len()
+                    {
+                        return Err(invalid(
+                            "aggregate update changes its original state interpretation",
+                        ));
+                    }
+                    for (original, actual) in original.order_keys.iter().zip(order_keys.iter()) {
+                        work.step().map_err(compile_failure)?;
+                        if original.ascending != actual.ascending
+                            || original.nulls_first != actual.nulls_first
+                        {
+                            return Err(invalid(
+                                "aggregate update changes its original state ordering",
+                            ));
+                        }
+                    }
+                }
             }
             if phase.consumes_logical_arguments() {
                 if state_input_type.is_some() || order_keys.len() != channels.len() - logical {
@@ -262,7 +293,13 @@ impl AggregateCallContract {
             distinct,
             order_keys,
             state_input_type,
+            state_interpretation,
         })
+    }
+    pub fn state_interpretation(
+        &self,
+    ) -> Option<&novarocks_type_contract::AggregateStateInterpretation> {
+        self.state_interpretation.as_deref()
     }
     pub fn call(&self) -> &Arc<FunctionCallContract> {
         &self.call

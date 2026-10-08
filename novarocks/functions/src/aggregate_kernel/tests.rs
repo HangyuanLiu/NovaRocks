@@ -241,6 +241,7 @@ impl Owner {
     fn options(&self, phase: AggregateKernelPhase) -> AggregatePreparationOptions {
         let update = phase.consumes_logical_arguments();
         AggregatePreparationOptions {
+            state_interpretation: None,
             phase,
             distinct: update,
             order_keys: if update {

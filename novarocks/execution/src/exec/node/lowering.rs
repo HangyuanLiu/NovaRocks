@@ -572,6 +572,7 @@ impl Lowering<'_> {
                     .into_iter()
                     .zip(n.resolved_aggregates)
                     .map(|(function, resolved)| lp::StaticAggregateCall {
+                        state_interpretation: None,
                         name: Arc::from(function.name),
                         inputs: function.inputs.into_iter().map(expr).collect(),
                         input_is_intermediate: function.input_is_intermediate,

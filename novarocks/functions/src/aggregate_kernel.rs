@@ -134,6 +134,7 @@ pub trait PureAggregateImplementation:
 
 #[derive(Clone, Debug)]
 pub struct AggregatePreparationOptions {
+    pub state_interpretation: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
     pub phase: AggregateKernelPhase,
     pub distinct: bool,
     pub order_keys: Arc<[AggregateOrderKey]>,
@@ -276,6 +277,7 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
             options.phase,
             options.distinct,
             options.order_keys,
+            options.state_interpretation,
             aligned,
             receipt.aggregate_merge_state(),
             control,

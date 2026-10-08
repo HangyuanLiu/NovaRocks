@@ -257,6 +257,12 @@ fn preflight(
     }
     for raw in headers.as_wire() {
         model.request::<u8>(raw.state_format.len(), 1)?;
+        if let Some(receipt) = &raw.state_interpretation {
+            model.request::<novarocks_type_contract::AggregateStateOrderKey>(
+                receipt.order_keys.len(),
+                2,
+            )?;
+        }
         if observed {
             model.check_admitted(limits, admit)?;
         } else {
@@ -404,6 +410,11 @@ fn materialize_core<'loan, 'headers, 'source>(
             definitions.push((
                 raw.id,
                 AggregateBinding {
+                    state_interpretation: raw
+                        .state_interpretation
+                        .as_ref()
+                        .map(|value| super::decode_state_interpretation(value, work))
+                        .transpose()?,
                     state_argument_contract,
                     function,
                     phase,

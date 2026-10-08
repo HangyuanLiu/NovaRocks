@@ -816,6 +816,7 @@ mod tests {
             aggregate_calls.push(AggregateCall {
                 id,
                 binding: AggregateBinding {
+                    state_interpretation: None,
                     function: function(FunctionKind::Aggregate, integer()),
                     phase: AggregatePhase::Single,
                     logical_argument_count: 0,

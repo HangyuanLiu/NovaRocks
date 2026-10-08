@@ -1039,6 +1039,7 @@ fn theta_binding(
         panic!("Theta returns one scalar")
     };
     AggregateBinding {
+        state_interpretation: None,
         state_argument_contract: aggregate.state_argument_contract,
         function: BoundFunction {
             legacy_metadata: None,
@@ -1714,6 +1715,7 @@ fn freeze_writer_calls(
                             ExpressionEffects::PURE_VALUE,
                         ),
                         options: AggregatePreparationOptions {
+                            state_interpretation: None,
                             phase,
                             distinct: false,
                             order_keys: Arc::from([]),

@@ -204,16 +204,11 @@ impl CompiledAggregateProcessorFactory {
             };
             let handle = kernel.clone();
             let contract = Arc::clone(handle.contract());
-            if !contract.order_keys().is_empty() {
-                return Err(format!(
-                    "compiled Aggregate call {call} at local node {at} with function ORDER BY is not executable"
-                ));
-            }
             let merge = !contract.phase().consumes_logical_arguments();
             let roots = if merge {
                 1
             } else {
-                contract.logical_argument_types().len()
+                contract.logical_argument_types().len() + contract.order_keys().len()
             };
             if function.inputs.len() != roots {
                 return Err(format!(
@@ -610,8 +605,8 @@ impl CompiledAggregateProcessor {
                 let input = SelectedAggregateUpdateInput::try_new(
                     call.contract.as_ref(),
                     selection,
-                    &arguments,
-                    &[],
+                    &arguments[..call.contract.call().logical_argument_count()],
+                    &arguments[call.contract.call().logical_argument_count()..],
                     &self.control,
                 )?;
                 column.prepare_update_batch(&mapping, input, &self.control)?

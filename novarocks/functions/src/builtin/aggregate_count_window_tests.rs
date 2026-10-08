@@ -162,6 +162,7 @@ impl Fixture {
             arguments: ScopedExpressionEffects::pure_value(context()),
             options: AggregateWindowPreparationOptions {
                 aggregate: AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase: AggregateKernelPhase::Single,
                     distinct: false,
                     order_keys: Arc::from([]),

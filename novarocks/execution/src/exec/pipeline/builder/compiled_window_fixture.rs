@@ -478,6 +478,7 @@ pub(super) fn package(
                 .as_ref()
                 .expect("aggregate selection");
             Box::new(AggregateBinding {
+                state_interpretation: None,
                 state_argument_contract: aggregate.state_argument_contract,
                 function: function.clone(),
                 phase: AggregatePhase::Single,
@@ -740,6 +741,7 @@ pub(super) fn package(
             PureCallPreparation::Aggregate {
                 arguments,
                 options: AggregatePreparationOptions {
+                    state_interpretation: None,
                     phase: AggregateKernelPhase::Single,
                     distinct: false,
                     order_keys: Arc::from([]),

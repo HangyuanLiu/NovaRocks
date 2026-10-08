@@ -59,6 +59,69 @@ pub(crate) use signature_copy::{
     preflight_aggregate_binding_copy_types_in,
 };
 
+// This is part of the original aggregate-binding codec, not a state payload decoder.
+pub(crate) fn validate_state_interpretation(
+    raw: &wire::AggregateStateInterpretation,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    if raw.distinct.is_none() {
+        return Err(invalid("aggregate state DISTINCT interpretation is absent"));
+    }
+    work.step()?;
+    for key in &raw.order_keys {
+        let complete = key.ascending.is_some() && key.nulls_first.is_some();
+        work.step()?;
+        if !complete {
+            return Err(invalid(
+                "aggregate state ORDER interpretation is incomplete",
+            ));
+        }
+    }
+    Ok(())
+}
+pub(crate) fn encode_state_interpretation(
+    source: &novarocks_type_contract::AggregateStateInterpretation,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::AggregateStateInterpretation, BindingCodecError> {
+    work.flush()?;
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(source.order_keys.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    for key in &source.order_keys {
+        keys.push(wire::AggregateStateOrderKey {
+            ascending: Some(key.ascending),
+            nulls_first: Some(key.nulls_first),
+        });
+        work.step()?;
+    }
+    Ok(wire::AggregateStateInterpretation {
+        distinct: Some(source.distinct),
+        order_keys: keys,
+    })
+}
+pub(crate) fn decode_state_interpretation(
+    raw: &wire::AggregateStateInterpretation,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_type_contract::AggregateStateInterpretation, BindingCodecError> {
+    validate_state_interpretation(raw, work)?;
+    work.flush()?;
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(raw.order_keys.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    for key in &raw.order_keys {
+        keys.push(novarocks_type_contract::AggregateStateOrderKey {
+            ascending: key.ascending.expect("validated key"),
+            nulls_first: key.nulls_first.expect("validated key"),
+        });
+        work.step()?;
+    }
+    work.flush()?;
+    Ok(novarocks_type_contract::AggregateStateInterpretation {
+        distinct: raw.distinct.expect("validated interpretation"),
+        order_keys: keys.into_boxed_slice(),
+    })
+}
+
 /// Projects the explicit state owner's contract, independently of function identity.
 pub(crate) fn encode_state_argument_contract(contract: AggregateStateArgumentContract) -> i32 {
     match contract {
@@ -249,8 +312,17 @@ fn verify_aggregate_inner(
 ) -> Result<VerifiedAggregateSignature, BindingCodecError> {
     let policy = Policy(admit.is_some());
     let sum = |a, b| policy.add(a, b, "aggregate projection arithmetic overflow");
+    let receipt_work = sum(
+        left.state_interpretation
+            .as_ref()
+            .map_or(0, |r| r.order_keys.len()),
+        right
+            .state_interpretation
+            .as_ref()
+            .map_or(0, |r| r.order_keys.len()),
+    )?;
     let bound = sum(
-        4,
+        sum(4, receipt_work)?,
         sum(
             left.state_format.as_str().len(),
             right.state_format.as_str().len(),
@@ -276,7 +348,13 @@ fn verify_aggregate_inner(
         matches: false,
         work: bound,
     };
-    let same_headers = left.phase == right.phase
+    let same_interpretation = match (&left.state_interpretation, &right.state_interpretation) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.matches_observed(b, || work.step())?,
+        _ => false,
+    };
+    let same_headers = same_interpretation
+        && left.phase == right.phase
         && left.logical_argument_count == right.logical_argument_count
         && left.state_argument_contract == right.state_argument_contract
         && left.state_format.as_str() == right.state_format.as_str();
@@ -533,6 +611,29 @@ fn preflight(
     let mut chunks = 0;
     for input in inputs {
         let state = input.source.state_format.as_str();
+        if let Some(receipt) = &input.source.state_interpretation {
+            request::<wire::AggregateStateOrderKey>(receipt.order_keys.len(), &mut facts, policy)?;
+            chunks = add(chunks, receipt.order_keys.len())?;
+            if source
+                < add(
+                    size_of::<AggregateBinding>(),
+                    add(
+                        state.len(),
+                        bytes::<novarocks_type_contract::AggregateStateOrderKey>(
+                            receipt.order_keys.len(),
+                        )?,
+                    )?,
+                )?
+            {
+                return Err(invalid(
+                    "aggregate source invoice omits original state interpretation",
+                ));
+            }
+            if policy.0 {
+                refresh(&mut facts, source, base, chunks, policy)?;
+                policy.gate(&facts, limits, admit)?;
+            }
+        }
         if policy.0 {
             request::<u8>(state.len(), &mut facts, policy)?;
             chunks = add(chunks, state.len().div_ceil(1024))?;
@@ -793,6 +894,12 @@ fn encode(
             logical_argument_count: input.source.logical_argument_count,
             intermediate_value_type_id: Some(input.intermediate_value_type_id),
             state_format,
+            state_interpretation: input
+                .source
+                .state_interpretation
+                .as_ref()
+                .map(|value| encode_state_interpretation(value, work))
+                .transpose()?,
             state_argument_contract: encode_state_argument_contract(
                 input.source.state_argument_contract,
             ),
@@ -805,3 +912,7 @@ fn encode(
 #[cfg(test)]
 #[path = "physical_aggregate_binding_v2/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "physical_aggregate_binding_v2/state_interpretation_tests.rs"]
+mod state_interpretation_tests;

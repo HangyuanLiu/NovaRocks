@@ -1591,3 +1591,7 @@ mod crc32_shared_tests;
 #[cfg(test)]
 #[path = "pure_differential_regexp_position_tests.rs"]
 mod regexp_position_tests;
+
+#[cfg(test)]
+#[path = "pure_differential/concat_tests.rs"]
+mod concat_tests;
