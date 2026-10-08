@@ -1579,3 +1579,7 @@ mod to_date_tests;
 #[cfg(test)]
 #[path = "pure_differential_xx_hash3_128_tests.rs"]
 mod xx_hash3_128_tests;
+
+#[cfg(test)]
+#[path = "pure_differential/sec_to_time_tests.rs"]
+mod sec_to_time_tests;
