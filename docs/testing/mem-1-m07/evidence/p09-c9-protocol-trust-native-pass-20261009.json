@@ -1,0 +1,439 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 C9 protocol/terminal/trust checkpoints",
+  "outcome": "passed",
+  "scope": "Eleven existing registered native scenarios; no new capacity/timeout knobs and no claim of all C9, closing pool/partial row, transport envelope or performance acceptance. Named domain-mismatch negative uses a wrong automatic TLS endpoint reference before authenticated dispatch.",
+  "cases": [
+    {
+      "name": "native-trust/automatic-dns",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
+        "proved real 1FE+3BE topology, authenticated FE-to-BE reach on every BE, and a completed FE/BE query round trip with transport=Automatic; terminal snapshots=3, participating backends={0, 1, 2}",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86836,
+          "process_start_token": "macos:1791497975:995252"
+        },
+        {
+          "role": "be-0",
+          "pid": 86837,
+          "process_start_token": "macos:1791497976:56303"
+        },
+        {
+          "role": "be-1",
+          "pid": 86838,
+          "process_start_token": "macos:1791497976:130050"
+        },
+        {
+          "role": "be-2",
+          "pid": 86839,
+          "process_start_token": "macos:1791497976:196992"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/native-trust-automatic-dns/scenario-evidence.json",
+      "sha256": "93937cd89c1a3b5dd9cc0fa8c776c91f89c85a372bed1a4ecc60fbd05e6eaa60"
+    },
+    {
+      "name": "native-trust/pem-ip",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
+        "proved real 1FE+3BE topology, authenticated FE-to-BE reach on every BE, and a completed FE/BE query round trip with transport=Pem; terminal snapshots=3, participating backends={0, 1, 2}",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86905,
+          "process_start_token": "macos:1791497976:708903"
+        },
+        {
+          "role": "be-0",
+          "pid": 86906,
+          "process_start_token": "macos:1791497976:771425"
+        },
+        {
+          "role": "be-1",
+          "pid": 86907,
+          "process_start_token": "macos:1791497976:828069"
+        },
+        {
+          "role": "be-2",
+          "pid": 86908,
+          "process_start_token": "macos:1791497976:884678"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/native-trust-pem-ip/scenario-evidence.json",
+      "sha256": "b7ffb0ba89fa6e333a6accc5a187b4040697b1213944a36df9791fd6fcd61c85"
+    },
+    {
+      "name": "native-trust/plaintext-ip",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
+        "proved real 1FE+3BE topology, authenticated FE-to-BE reach on every BE, and a completed FE/BE query round trip with transport=Plaintext; terminal snapshots=3, participating backends={0, 1, 2}",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86767,
+          "process_start_token": "macos:1791497975:384092"
+        },
+        {
+          "role": "be-0",
+          "pid": 86768,
+          "process_start_token": "macos:1791497975:441890"
+        },
+        {
+          "role": "be-1",
+          "pid": 86769,
+          "process_start_token": "macos:1791497975:498681"
+        },
+        {
+          "role": "be-2",
+          "pid": 86770,
+          "process_start_token": "macos:1791497975:550356"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/native-trust-plaintext-ip/scenario-evidence.json",
+      "sha256": "66f7dff11776fe4edec12c81fab2a86b036339db6a2ae8b77dcf83fc828c8767"
+    },
+    {
+      "name": "native-trust/reject-automatic-pem-mismatch",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "rejected Native mismatch fixture=Automatic probe=Pem before any authenticated RPC dispatch",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 87112,
+          "process_start_token": "macos:1791497978:453137"
+        },
+        {
+          "role": "be-0",
+          "pid": 87113,
+          "process_start_token": "macos:1791497978:523653"
+        },
+        {
+          "role": "be-1",
+          "pid": 87114,
+          "process_start_token": "macos:1791497978:580222"
+        },
+        {
+          "role": "be-2",
+          "pid": 87115,
+          "process_start_token": "macos:1791497978:640559"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/native-trust-reject-automatic-pem-mismatch/scenario-evidence.json",
+      "sha256": "b9dc616cec7adb373ebf0c11f5a1ee99c4aec4c24b1fc75ec9840a49812a88d6"
+    },
+    {
+      "name": "native-trust/reject-jwt-domain-mismatch",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "rejected Native mismatch fixture=Automatic probe=Automatic before any authenticated RPC dispatch",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86974,
+          "process_start_token": "macos:1791497977:469392"
+        },
+        {
+          "role": "be-0",
+          "pid": 86975,
+          "process_start_token": "macos:1791497977:532039"
+        },
+        {
+          "role": "be-1",
+          "pid": 86976,
+          "process_start_token": "macos:1791497977:587497"
+        },
+        {
+          "role": "be-2",
+          "pid": 86977,
+          "process_start_token": "macos:1791497977:650245"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/native-trust-reject-jwt-domain-mismatch/scenario-evidence.json",
+      "sha256": "e01aa9362119f0ad9e8f6e33e3c3c3b648767921f5941835456db3947df78516"
+    },
+    {
+      "name": "native-trust/reject-plaintext-tls-mismatch",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified real independent-process 1FE+3BE Native topology",
+        "rejected Native mismatch fixture=Plaintext probe=Automatic before any authenticated RPC dispatch",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 87043,
+          "process_start_token": "macos:1791497978:25436"
+        },
+        {
+          "role": "be-0",
+          "pid": 87044,
+          "process_start_token": "macos:1791497978:86356"
+        },
+        {
+          "role": "be-1",
+          "pid": 87045,
+          "process_start_token": "macos:1791497978:138592"
+        },
+        {
+          "role": "be-2",
+          "pid": 87046,
+          "process_start_token": "macos:1791497978:195661"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/native-trust-reject-plaintext-tls-mismatch/scenario-evidence.json",
+      "sha256": "1d28d17008232ae2f63663758573d76af6133ac1270d2614f3cd8274f4fd10fe"
+    },
+    {
+      "name": "query-concurrency/terminal-releases-slot",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "paused an admitted q1 on BE[1] while retaining process identity 86657",
+        "observed q2 in the sole warehouse admission queue",
+        "received q1 terminal and observed q2 hold the released permit while q1 BE work remained live",
+        "observed real Worker resource convergence",
+        "q2 completed before q1's delayed Worker cleanup; restoring Native transport then converged real resources",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86655,
+          "process_start_token": "macos:1791497972:531633"
+        },
+        {
+          "role": "be-0",
+          "pid": 86656,
+          "process_start_token": "macos:1791497972:592017"
+        },
+        {
+          "role": "be-1",
+          "pid": 86657,
+          "process_start_token": "macos:1791497972:647664"
+        },
+        {
+          "role": "be-2",
+          "pid": 86658,
+          "process_start_token": "macos:1791497972:705674"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/query-concurrency-terminal-releases-slot/scenario-evidence.json",
+      "sha256": "38316a6f3b5022801f1b65e0ee2422d83b55da3bf251e262089e959158d954db"
+    },
+    {
+      "name": "query-output/negotiated-multi-result",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "verified negotiated multi-result wire order and terminal status flags",
+        "verified negotiated multi-result resources converged",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86468,
+          "process_start_token": "macos:1791497971:434229"
+        },
+        {
+          "role": "be-0",
+          "pid": 86469,
+          "process_start_token": "macos:1791497971:497309"
+        },
+        {
+          "role": "be-1",
+          "pid": 86470,
+          "process_start_token": "macos:1791497971:592424"
+        },
+        {
+          "role": "be-2",
+          "pid": 86471,
+          "process_start_token": "macos:1791497971:651979"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/query-output-negotiated-multi-result/scenario-evidence.json",
+      "sha256": "1e34e42a8b70ad604037526b21f70f581b9c4d575a239169df8ebf39977998c2"
+    },
+    {
+      "name": "query-output/non-negotiated-multi-statement",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "verified unnegotiated multi-statement COM_QUERY is rejected",
+        "verified rejected multi-statement resources converged",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86384,
+          "process_start_token": "macos:1791497970:983842"
+        },
+        {
+          "role": "be-0",
+          "pid": 86385,
+          "process_start_token": "macos:1791497971:55303"
+        },
+        {
+          "role": "be-1",
+          "pid": 86386,
+          "process_start_token": "macos:1791497971:104820"
+        },
+        {
+          "role": "be-2",
+          "pid": 86387,
+          "process_start_token": "macos:1791497971:157408"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/query-output-non-negotiated-multi-statement/scenario-evidence.json",
+      "sha256": "2c63e37e66bb76fb424b5d67852d27acae41967a41c53591d80fdb8a8b73faec"
+    },
+    {
+      "name": "query-output/scalar-session",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "verified native Scalar numeric, aggregate, empty, and failed session publication",
+        "verified Scalar session resources converged after success and failure",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86556,
+          "process_start_token": "macos:1791497971:949398"
+        },
+        {
+          "role": "be-0",
+          "pid": 86557,
+          "process_start_token": "macos:1791497972:9229"
+        },
+        {
+          "role": "be-1",
+          "pid": 86558,
+          "process_start_token": "macos:1791497972:63518"
+        },
+        {
+          "role": "be-2",
+          "pid": 86559,
+          "process_start_token": "macos:1791497972:120729"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/query-output-scalar-session/scenario-evidence.json",
+      "sha256": "4b912a7d3a5456e183b0d8f2dde2328e0a37762815022f64994fe42744f8db3f"
+    },
+    {
+      "name": "query-output/schema-once",
+      "outcome": "passed",
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "captured query-output resource baseline",
+        "sent one-column two-row query through raw public MySQL stream",
+        "verified one schema prefix, two rows, and one terminal success packet",
+        "verified query-output resources converged after terminal packet",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ],
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 86284,
+          "process_start_token": "macos:1791497970:475195"
+        },
+        {
+          "role": "be-0",
+          "pid": 86285,
+          "process_start_token": "macos:1791497970:550212"
+        },
+        {
+          "role": "be-1",
+          "pid": 86286,
+          "process_start_token": "macos:1791497970:607906"
+        },
+        {
+          "role": "be-2",
+          "pid": 86287,
+          "process_start_token": "macos:1791497970:662754"
+        }
+      ],
+      "artifact": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/query-output-schema-once/scenario-evidence.json",
+      "sha256": "b4fdc41fbb579e9544f77fd48265367bb6ac6db606df826dd8d74173bba723c5"
+    }
+  ],
+  "processes_absent": 44,
+  "actual_server_build_identity": "7607dae64053ab853c47d827deb64eebddb29030",
+  "source_revision": "7607dae64053ab853c47d827deb64eebddb29030",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "scenarios": [
+    "query-output/schema-once",
+    "query-output/non-negotiated-multi-statement",
+    "query-output/negotiated-multi-result",
+    "query-output/scalar-session",
+    "query-concurrency/terminal-releases-slot",
+    "native-trust/plaintext-ip",
+    "native-trust/automatic-dns",
+    "native-trust/pem-ip",
+    "native-trust/reject-jwt-domain-mismatch",
+    "native-trust/reject-plaintext-tls-mismatch",
+    "native-trust/reject-automatic-pem-mismatch"
+  ],
+  "server_sha256": "c3e7a269f31119b15c6e2a51e6fd965c4354893e9f03fca3449b017603c4f324",
+  "runner_sha256": "d3996fe32a13e4e14908dd7f0bf3a9c1ce3a34c054f1f1a78a0d5516323fc81e",
+  "exit_code": 0,
+  "duration_seconds": 9.601,
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/driver.log",
+      "sha256": "4f61951b50502a18fc803763012cbe7d2a2eca473eb41089a052f3fcc59f2bdc"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-c9-protocol-trust-native-20261009/driver-status.json",
+      "sha256": "f4a6876fbfddccb07f39e41352bdc861d13489708365f218947eba7e4ced15d6"
+    }
+  ]
+}

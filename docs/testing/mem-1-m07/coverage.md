@@ -161,3 +161,9 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 - 干净源码与实际产品同为 `a4a6ce16bb3533839a81dbe841caa104669a46d0`，原生 1FE+3BE：200000 小行（1288895 B/200004 packets）和 17 列合法大行（17825860 B/22 packets）均 PASS。v4 仅新增独立列名/type oracle，原 SQL/行数据/全部 cap/deadline 不变；schema 结构、名字/type、sequence、精确字节摘要/行序及成功终态均验证。
 - 每场景均实际创建 Native task；前后公开 FE governance/window 与 BE reservation/ingress 连续两次归零，8 个启动 PID 全部退出。收据 `p09-result-wire-v4-native-pass-20261009.json`。v2 输入错误、v3 backing 拒绝与探针审查历史保留，没有重写为 PASS。
 - 这两项不证明全 C9、逐个晚 alias 的真实退出、RSS、transport envelope/CM/CP；P00b/P09/P10/final 与两个未收到答复的重大决定保持 OPEN。执行当前检查点的 cargo-only C0 收敛，再继续独立矩阵，无 push/PR/归档。
+
+### 2026-10-09：共享 backing 检查点 C0 与协议/trust 原生收敛
+
+- 干净 `7607dae64053ab853c47d827deb64eebddb29030` 的 dev cargo-only C0 全部 PASS，706s；component12091、Server owner178、binary smoke4，共12273 PASS/0 FAIL/7既有ignored。守卫/Cargo依赖政策/fmt/all-targets/System allocator/Clippy/build/错误清单通过；初次错误CLI组合在任何检查前被拒绝（2），原始诊断保留。收据 `p09-root-shared-backing-c0-pass-20261009.json`，没有把 Cargo-only 当作 runtime 验收。
+- 同一 clean HEAD 与实际产品 `7607dae64` 的原生1FE+3BE：query-output 的 schema-once、non-negotiated-multi-statement、negotiated-multi-result、scalar-session；query-concurrency/terminal-releases-slot；native-trust 三项 plaintext/automatic/PEM 正常配置与三项 transport mismatch，11/11 PASS。44 个启动 PID 全部退出；无外部fixture更改。收据 `p09-c9-protocol-trust-native-pass-20261009.json`。名为 reject-jwt-domain-mismatch 的既有负例实际使用错误 automatic TLS reference，拒绝发生在 authenticated dispatch 前，不能据名称宣称另一种 JWT issuer 故障。
+- P09其余直接 root 状态/晚 alias/ClosingRow/满池、真实 cross-provider CL、transport coefficients/CM/CP/P10/final 保持OPEN。ordinary支持承载与write deadline两个决定仍未得到答复；未改gate/cap/deadline/失败语义，goal active，无push/PR/归档。
