@@ -64,21 +64,14 @@ impl Scenario for CatalogListing {
         let user = context.mysql_user().to_string();
         let port = context.mysql_port();
         let mut control = mysql_actor::connect(&user, port, timeout)?;
-        let catalog_sql = |name: &str| {
-            format!(
-                "CREATE EXTERNAL CATALOG {name} PROPERTIES (\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"warehouse\"=\"s3://cl-fixture/warehouse\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"cl-fixture\",\"credential.object-store-metadata.generation\"=\"v1\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"cl-fixture\",\"credential.object-store-data.generation\"=\"v1\")",
-                fixture.endpoint(),
-                fixture.endpoint()
-            )
-        };
-        control.query_drop(catalog_sql("cl_normal"))?;
+        control.query_drop(listing_catalog_sql(&fixture, "cl_normal"))?;
         await_fixture(&fixture, timeout, |audit| {
             audit.namespace_pages == 1 && audit.active_listing_requests == 0
         })?;
         let mut phases = Vec::new();
         fixture.set_mode(ListingMode::Normal)?;
         phases.push(measure(context, "lake-discovery", || {
-            control.query_drop(catalog_sql("cl_discovery"))?;
+            control.query_drop(listing_catalog_sql(&fixture, "cl_discovery"))?;
             let audit = await_fixture(&fixture, timeout, |audit| {
                 audit.table_loads == (NAMESPACES * MEMBERS) as u64
                     && audit.active_listing_requests == 0
@@ -306,4 +299,137 @@ fn measure(
     )?;
     outcome.with_context(|| format!("listing phase {phase}"))?;
     Ok(measurement)
+}
+
+fn listing_catalog_sql(fixture: &ListingRestFixture, name: &str) -> String {
+    format!(
+        "CREATE EXTERNAL CATALOG {name} PROPERTIES (\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"warehouse\"=\"s3://cl-fixture/warehouse\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"cl-fixture\",\"credential.object-store-metadata.generation\"=\"v1\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"cl-fixture\",\"credential.object-store-data.generation\"=\"v1\")",
+        fixture.endpoint(),
+        fixture.endpoint()
+    )
+}
+
+pub struct CatalogListingCancellation;
+
+impl Scenario for CatalogListingCancellation {
+    fn name(&self) -> &'static str {
+        "catalog/mem-1-m07-sdk-listing-cancellation"
+    }
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn launch_config(&self, root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        CatalogListing.launch_config(root)
+    }
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let fixture = ListingRestFixture::start()?;
+        let timeout = context
+            .remaining("listing cancellation")?
+            .min(Duration::from_secs(20));
+        let user = context.mysql_user().to_string();
+        let port = context.mysql_port();
+        let mut control = mysql_actor::connect(&user, port, timeout)?;
+        control.query_drop(listing_catalog_sql(&fixture, "cl_cancel"))?;
+        await_fixture(&fixture, timeout, |audit| {
+            audit.namespace_pages == 1 && audit.active_listing_requests == 0
+        })?;
+        control.query_drop("USE cl_cancel.cl_ns_0000")?;
+        fixture.set_mode(ListingMode::Delayed)?;
+        measure(context, "listing-deadline", || {
+            control.query_drop("SET query_timeout=1")?;
+            let error = control
+                .query::<String, _>("SHOW VIEWS")
+                .err()
+                .context("delayed SDK listing must exceed its absolute deadline")?;
+            ensure!(
+                error.to_string().contains("DeadlineExceeded"),
+                "listing failed outside its absolute deadline: {error}"
+            );
+            control.query_drop("SET query_timeout=0")?;
+            let one = control.query_first::<u64, _>("SELECT 1")?;
+            ensure!(
+                one == Some(1),
+                "deadline left the statement generation unusable"
+            );
+            Ok(json!({"error":error.to_string(),"provider":fixture.snapshot()?}))
+        })?;
+        // The remote HTTP handler can outlive its cancelled client future.
+        // Drain that fixture handler before resetting provider observations.
+        await_fixture(&fixture, timeout, |audit| {
+            audit.active_listing_requests == 0
+        })?;
+        fixture.set_mode(ListingMode::Delayed)?;
+        let mut victim = mysql_actor::connect(&user, port, timeout)?;
+        victim.query_drop("USE cl_cancel.cl_ns_0000")?;
+        let connection_id = victim
+            .query_first::<u64, _>("SELECT CONNECTION_ID()")?
+            .context("missing cancellation connection identity")?;
+        measure(context, "listing-kill-query", || {
+            let error = std::thread::scope(|scope| -> Result<mysql::Error> {
+                let target = scope.spawn(|| victim.query::<String, _>("SHOW VIEWS"));
+                await_fixture(&fixture, timeout, |audit| {
+                    audit.active_listing_requests == 1
+                })?;
+                control.query_drop(format!("KILL QUERY {connection_id}"))?;
+                target
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("cancelled listing actor panicked"))?
+                    .err()
+                    .context("cancelled listing unexpectedly succeeded")
+            })?;
+            ensure!(
+                matches!(&error, mysql::Error::MySqlError(error) if error.code == 1317),
+                "listing cancellation did not return ER_QUERY_INTERRUPTED: {error}"
+            );
+            ensure!(
+                victim.query_first::<u64, _>("SELECT 1")? == Some(1),
+                "cancelled listing left the statement generation unusable"
+            );
+            Ok(json!({"error":error.to_string(),"provider":fixture.snapshot()?}))
+        })?;
+        await_fixture(&fixture, timeout, |audit| {
+            audit.active_listing_requests == 0
+        })?;
+        fixture.set_mode(ListingMode::Delayed)?;
+        measure(context, "listing-eight-position-reuse", || {
+            let barrier = Arc::new(Barrier::new(8));
+            std::thread::scope(|scope| -> Result<()> {
+                let targets = (0..8)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        let user = &user;
+                        scope.spawn(move || -> Result<()> {
+                            barrier.wait();
+                            let mut client = mysql_actor::connect(user, port, timeout)?;
+                            client.query_drop("USE cl_cancel.cl_ns_0000")?;
+                            let views = client.query::<String, _>("SHOW VIEWS")?;
+                            ensure!(
+                                views.len() == MEMBERS,
+                                "reused listing position produced incomplete output"
+                            );
+                            Ok(())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for target in targets {
+                    target
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("listing reuse actor panicked"))??;
+                }
+                Ok(())
+            })?;
+            let audit = fixture.snapshot()?;
+            ensure!(
+                audit.peak_listing_requests == 8
+                    && audit.view_pages == 16
+                    && audit.active_listing_requests == 0,
+                "all eight listing positions were not reused: {audit:?}"
+            );
+            Ok(json!({"clients":8,"provider":audit}))
+        })?;
+        await_resource_convergence(context, &baseline, "listing cancellation")?;
+        Ok(())
+    }
 }

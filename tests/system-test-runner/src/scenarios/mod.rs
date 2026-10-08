@@ -46,6 +46,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(query_output::scenarios());
     scenarios.extend(memory_attribution::scenarios());
     scenarios.push(Box::new(listing::CatalogListing));
+    scenarios.push(Box::new(listing::CatalogListingCancellation));
     scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(result_delivery_baseline::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
