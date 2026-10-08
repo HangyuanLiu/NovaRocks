@@ -68,17 +68,44 @@ enum InputEncoder {
     ScalarEmpty,
 }
 impl InputEncoder {
-    fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, ()> {
+    fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, &'static str> {
         match self {
             Self::Client(encoder) => encoder.step(output).map_err(|error| {
                 tracing::warn!(
                     ?error,
                     "Root client encoding failed under its frozen schema"
                 );
+                use novarocks_result_render::RenderErrorKind;
+                match error.kind {
+                    RenderErrorKind::SchemaMismatch => {
+                        "root client encoding violated frozen schema"
+                    }
+                    RenderErrorKind::UnsupportedCarrier => {
+                        "root client encoding encountered an unsupported carrier"
+                    }
+                    RenderErrorKind::UnsupportedPresentation => {
+                        "root client encoding encountered an unsupported presentation"
+                    }
+                    RenderErrorKind::RowTooLarge => "root client row exceeds its frozen size bound",
+                    RenderErrorKind::ElementLimit => {
+                        "root client row exceeds its frozen element bound"
+                    }
+                    RenderErrorKind::DepthLimit => {
+                        "root client value exceeds its frozen depth bound"
+                    }
+                    RenderErrorKind::ArithmeticOverflow => {
+                        "root client encoding arithmetic overflow"
+                    }
+                    RenderErrorKind::Cancelled => "root client encoding was cancelled",
+                }
             }),
-            Self::WriteCommit(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::WriteCommit(encoder) => encoder
+                .step(output)
+                .map_err(|_| "root encoding failed under its frozen domain"),
             Self::CowSelection(encoder) => Ok(encoder.step(output)),
-            Self::ScalarLeaf(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::ScalarLeaf(encoder) => encoder
+                .step(output)
+                .map_err(|_| "root encoding failed under its frozen domain"),
             Self::ScalarContainer(encoder) => Ok(encoder.step(output)),
             Self::ScalarEmpty => Ok(RenderTurn {
                 emitted_bytes: 0,
@@ -100,7 +127,7 @@ impl InputEncoder {
                         StatisticsCodecStatus::InputComplete => RenderTurnStatus::InputComplete,
                     },
                 })
-                .map_err(|_| ()),
+                .map_err(|_| "root encoding failed under its frozen domain"),
         }
     }
     fn statistics_totals(&self) -> Option<StatisticsCodecTotals> {
@@ -411,7 +438,7 @@ impl NativeRootResultSession {
                 .step(state.builder.as_mut().unwrap().output_at(state.used))
             {
                 Ok(turn) => turn,
-                Err(_) => return self.fail(state, "root encoding failed under its frozen domain"),
+                Err(message) => return self.fail(state, message),
             };
             state.used += turn.emitted_bytes;
             if self.channel.note_rows(turn.completed_rows).is_err() {
