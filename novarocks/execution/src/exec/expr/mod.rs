@@ -1337,3 +1337,7 @@ mod legacy_parse_url_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_cardinality_dedup_baseline_tests.rs"]
 mod legacy_cardinality_dedup_baseline_tests;
+
+#[cfg(test)]
+#[path = "legacy_numeric_unary_intrinsic_baseline_tests.rs"]
+mod legacy_numeric_unary_intrinsic_baseline_tests;
