@@ -92,12 +92,12 @@ pub use result_window::{
     ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
 };
 pub use scope::{
-    BusinessPermit, DeadlineExpiryHandle, PendingQueryRoot, QueryConcurrencyPermit,
-    RootAdmissionHandle, RootWork, ServingState, WorkCancellationRequestOutcome,
-    WorkCancellationRequester, WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope,
-    WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig, WorkloadControl,
-    WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision, WorkloadShutdown,
-    WorkloadShutdownError, WorkloadShutdownFailure,
+    BusinessPermit, CountedWorkloadControlParts, DeadlineExpiryHandle, PendingQueryRoot,
+    QueryConcurrencyPermit, RootAdmissionHandle, RootWork, ServingState,
+    WorkCancellationRequestOutcome, WorkCancellationRequester, WorkClass, WorkId, WorkOwner,
+    WorkRequest, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig,
+    WorkloadControl, WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision,
+    WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 /// Admission failures never imply cancellation, physical stop, or release.

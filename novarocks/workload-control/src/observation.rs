@@ -163,13 +163,13 @@ pub struct WorkloadSnapshot {
     pub obligation_endings: ObligationEndSnapshot,
     pub control_ready: usize,
     pub control_inflight: usize,
-    /// Fixed process-local resource ceiling resolved by Server at startup.
-    pub resource_limit_bytes: u64,
+    /// Explicit allocation ceiling, absent for count-only composition.
+    pub resource_limit_bytes: Option<u64>,
     /// Current charge held by the single process-local resource authority.
     pub held_bytes: u64,
     /// Exact high-water mark recorded by that authority.
     pub peak_held_bytes: u64,
-    /// Current subset of `held_bytes` retained by result delivery credits.
+    /// Original result-window positions and their retained objects.
     pub result_windows: crate::ResultCapacitySnapshot,
     pub root_lifecycle: RootLifecycleSnapshot,
     pub scopes: Vec<ScopeSnapshot>,
@@ -238,7 +238,10 @@ fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
         obligation_endings: state.obligation_endings,
         control_ready: state.control_ready.len(),
         control_inflight: state.control_inflight,
-        resource_limit_bytes: inner.resource_config.total_bytes,
+        resource_limit_bytes: inner
+            .resource_config
+            .as_ref()
+            .map(|config| config.total_bytes),
         held_bytes: state
             .data_reserved
             .saturating_add(state.data_used)

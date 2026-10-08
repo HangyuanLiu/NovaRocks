@@ -1733,8 +1733,7 @@ mod tests {
                 window,
             ) = relay_harness(56).await;
             let (foreign, foreign_window) = relay_harness(57).await;
-            let wrong_class = control
-                .resources()
+            let wrong_class = scope
                 .result_capacity()
                 .unwrap()
                 .try_acquire(&scope, ResultWindowClass::Local)

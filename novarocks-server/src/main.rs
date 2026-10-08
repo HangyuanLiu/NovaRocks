@@ -336,7 +336,7 @@ fn compose_memory_authority(config: &NovaRocksConfig) -> anyhow::Result<Arc<Memo
     // Control-plane traffic gets its own branch off the root before any work
     // account exists. Installation precommits its protected floor, so ordinary
     // work cannot consume cancellation/status backing, even after shrink.
-    let control_bytes = config.runtime.frontend_workload.control_bytes;
+    let control_bytes = config.runtime.memory.control_bytes;
     authority
         .install_control_branch(control_bytes)
         .map_err(|error| anyhow::anyhow!("install process control branch: {error}"))?;
@@ -449,7 +449,8 @@ mod tests {
     /// The control partition exists before any work account can.
     #[test]
     fn the_composed_authority_partitions_its_bound_and_installs_control() {
-        let config = NovaRocksConfig::default();
+        let mut config = NovaRocksConfig::default();
+        config.runtime.memory.control_bytes = 32 * 1024 * 1024;
         let authority = compose_memory_authority(&config).expect("the default config composes");
 
         assert!(
@@ -463,6 +464,10 @@ mod tests {
         );
         let (snapshot, pressure) = authority.accounting_snapshot();
         let control = authority.control_branch().unwrap();
+        assert_eq!(
+            control.committed_bytes(),
+            config.runtime.memory.control_bytes
+        );
         assert!(pressure.classification_complete);
         assert!(pressure.storage_metadata > 0);
         assert_eq!(snapshot.root.live_bytes, pressure.storage_metadata);

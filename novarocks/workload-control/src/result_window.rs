@@ -192,19 +192,6 @@ impl ResultCapacityHandle {
     }
 }
 
-impl crate::LocalResourceAuthority {
-    /// Observe the already-installed host capacity. This never creates a
-    /// fallback pool or changes the admission geometry.
-    pub fn result_capacity(&self) -> Result<ResultCapacityHandle, WorkError> {
-        if self.inner.state.lock().unwrap().result_capacity.is_none() {
-            return Err(WorkError::NotReady);
-        }
-        Ok(ResultCapacityHandle {
-            inner: Arc::clone(&self.inner),
-        })
-    }
-}
-
 impl WorkScope {
     /// Access this scope's original installed host capacity. This never creates a
     /// fallback pool or changes the admission geometry.
@@ -448,20 +435,14 @@ impl ResultWindowAlias {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ResourceConfig, WorkClass, WorkRequest, WorkloadConfig};
+    use crate::{WorkClass, WorkRequest, WorkloadConfig};
     fn control() -> (WorkloadControl, ResultCapacityHandle) {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig {
-                query_concurrency_limit: 1,
-                ..WorkloadConfig::default()
-            },
-            ResourceConfig {
-                total_bytes: 1024 * 1024,
-                control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
-            },
-        )
-        .unwrap();
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            query_concurrency_limit: 1,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
         let handle = control
             .configure_result_capacity(ResultCapacityConfig {
                 client_compute_positions: 1,
@@ -472,6 +453,8 @@ mod tests {
                 ..ResultCapacityConfig::V1
             })
             .unwrap();
+        assert!(matches!(control.resources(), Err(WorkError::NotReady)));
+        assert_eq!(control.snapshot().resource_limit_bytes, None);
         control.mark_ready().unwrap();
         (control, handle)
     }
@@ -564,15 +547,9 @@ mod tests {
 
     #[test]
     fn nonqueued_root_rejects_unconfigured_or_closing_window_without_work() {
-        let unconfigured = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1024,
-                control_bytes: 128,
-                per_scope_bytes: 896,
-            },
-        )
-        .unwrap();
+        let unconfigured = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
         unconfigured.mark_ready().unwrap();
         assert!(matches!(
             unconfigured.root_admission().try_begin_root_with_result(
@@ -746,18 +723,12 @@ mod tests {
     }
     /// Two query permits but one Client window, so the window decides.
     fn window_bound_control() -> (WorkloadControl, ResultCapacityHandle) {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig {
-                query_concurrency_limit: 2,
-                ..WorkloadConfig::default()
-            },
-            ResourceConfig {
-                total_bytes: 1024 * 1024,
-                control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
-            },
-        )
-        .unwrap();
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            query_concurrency_limit: 2,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
         let handle = control
             .configure_result_capacity(ResultCapacityConfig {
                 client_compute_positions: 2,
@@ -768,6 +739,8 @@ mod tests {
                 ..ResultCapacityConfig::V1
             })
             .unwrap();
+        assert!(matches!(control.resources(), Err(WorkError::NotReady)));
+        assert_eq!(control.snapshot().resource_limit_bytes, None);
         control.mark_ready().unwrap();
         (control, handle)
     }
@@ -892,15 +865,9 @@ mod tests {
             Err(WorkError::AlreadyAdmitted)
         ));
         drop(pending);
-        let unconfigured = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1024 * 1024,
-                control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
-            },
-        )
-        .unwrap();
+        let unconfigured = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
         unconfigured.mark_ready().unwrap();
         let root = unconfigured
             .try_begin_root(WorkRequest::new(WorkClass::Query))

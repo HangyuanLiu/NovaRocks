@@ -537,8 +537,7 @@ mod tests {
         session_control::{QueryControlService, QuerySessionLease, SessionIdentity},
     };
     use novarocks_workload_control::{
-        ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkloadConfig,
-        WorkloadControl,
+        ResultCapacityConfig, ResultWindowClass, WorkClass, WorkloadConfig, WorkloadControl,
     };
     use opensrv_mysql::{
         AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, ParamParser, StatementMetaWriter,
@@ -550,21 +549,17 @@ mod tests {
 
     struct Fixture {
         host: WorkloadControl,
+        capacity: novarocks_workload_control::ResultCapacityHandle,
         control: QueryControlService,
         session: QuerySessionLease,
     }
     impl Fixture {
         fn new() -> Self {
-            let host = WorkloadControl::try_new(
-                WorkloadConfig::default(),
-                ResourceConfig {
-                    total_bytes: 128 * 1024 * 1024,
-                    control_bytes: 1024,
-                    per_scope_bytes: 128 * 1024 * 1024 - 1024,
-                },
-            )
-            .unwrap();
-            host.configure_result_capacity(ResultCapacityConfig::V1)
+            let host = WorkloadControl::try_new_counted(WorkloadConfig::default())
+                .unwrap()
+                .owner;
+            let capacity = host
+                .configure_result_capacity(ResultCapacityConfig::V1)
                 .unwrap();
             host.mark_ready().unwrap();
             let control = QueryControlService::new(Arc::new(QueryApplicationControl::default()));
@@ -576,6 +571,7 @@ mod tests {
                 .unwrap();
             Self {
                 host,
+                capacity,
                 control,
                 session,
             }
@@ -994,8 +990,7 @@ mod tests {
     async fn resident_local_partial_header_moves_only_writer_tail_to_closing() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let fixture = Fixture::new();
-            let resources = fixture.host.resources();
-            let capacity = resources.result_capacity().unwrap();
+            let capacity = fixture.capacity.clone();
             let control = fixture.control.clone();
             let session = fixture.session.token();
             let gate = Arc::new(WriteGate::new());
@@ -1041,8 +1036,7 @@ mod tests {
     async fn incomplete_local_resident_row_disconnects_without_rendering_the_tail() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let fixture = Fixture::new();
-            let resources = fixture.host.resources();
-            let capacity = resources.result_capacity().unwrap();
+            let capacity = fixture.capacity.clone();
             let control = fixture.control.clone();
             let session = fixture.session.token();
             let (mut client, server) = socket_with(fixture, Arc::new(WriteGate::new())).await;
@@ -1074,8 +1068,7 @@ mod tests {
     async fn initial_cancel_transfers_before_a_pending_previous_ok_can_block() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let fixture = Fixture::new();
-            let resources = fixture.host.resources();
-            let capacity = resources.result_capacity().unwrap();
+            let capacity = fixture.capacity.clone();
             let gate = Arc::new(WriteGate::new());
             let (mut client, server) = socket_with(fixture, Arc::clone(&gate)).await;
             packet(&mut client, 0, b"\x03cancel-after-ok").await;
@@ -1154,7 +1147,7 @@ mod tests {
         for command in [b"\x03slow-terminal".as_slice(), b"\x02slow-init"] {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let fixture = Fixture::new();
-                let capacity = fixture.host.resources().result_capacity().unwrap();
+                let capacity = fixture.capacity.clone();
                 let control = fixture.control.clone();
                 let session = fixture.session.token();
                 let gate = Arc::new(WriteGate::new());
@@ -1183,7 +1176,7 @@ mod tests {
     async fn slow_typed_error_retires_local_window_but_retains_closing_generation() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let fixture = Fixture::new();
-            let capacity = fixture.host.resources().result_capacity().unwrap();
+            let capacity = fixture.capacity.clone();
             let control = fixture.control.clone();
             let session = fixture.session.token();
             let gate = Arc::new(WriteGate::new());
@@ -1211,7 +1204,7 @@ mod tests {
     async fn terminal_flush_holds_ordinary_generation_after_the_complete_packet() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let fixture = Fixture::new();
-            let capacity = fixture.host.resources().result_capacity().unwrap();
+            let capacity = fixture.capacity.clone();
             let control = fixture.control.clone();
             let session = fixture.session.token();
             let gate = Arc::new(WriteGate::new());
@@ -1251,7 +1244,7 @@ mod tests {
     #[tokio::test]
     async fn local_buffers_keep_original_window_after_statement_owner_exits() {
         let fixture = Fixture::new();
-        let capacity = fixture.host.resources().result_capacity().unwrap();
+        let capacity = fixture.capacity.clone();
         let (graph, mut protocol) = fixture.result("hello".into()).into_parts();
         let cursor = graph.into_cursor();
         let buffers = LocalProtocolBuffers {

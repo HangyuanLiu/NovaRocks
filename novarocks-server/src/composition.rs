@@ -69,7 +69,7 @@ use novarocks_state_store_runtime::{
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};
-use novarocks_workload_control::{ResourceConfig, WorkloadConfig};
+use novarocks_workload_control::WorkloadConfig;
 
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
@@ -626,14 +626,10 @@ pub fn compose_frontend_role_config(
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
     let task_execution_budgets = compose_task_execution_budgets(config)?;
-    let (logical_supervisor, workload, workload_resources, abort_capacity) =
+    let (logical_supervisor, workload, abort_capacity) =
         compose_frontend_workload_runtime(runtime_config)?;
-    let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
-        logical_supervisor,
-        workload,
-        workload_resources,
-        abort_capacity,
-    );
+    let logical_runtime =
+        FrontendLogicalExecutionRuntimeConfig::new(logical_supervisor, workload, abort_capacity);
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
         native_compatibility_id,
@@ -809,7 +805,6 @@ fn compose_frontend_workload_runtime(
 ) -> anyhow::Result<(
     LogicalExecutionSupervisorConfig,
     WorkloadConfig,
-    ResourceConfig,
     NonZeroUsize,
 )> {
     let input = &runtime.frontend_workload;
@@ -842,14 +837,6 @@ fn compose_frontend_workload_runtime(
     workload
         .validate()
         .map_err(|error| anyhow::anyhow!("construct frontend workload policy: {error}"))?;
-    let resources = ResourceConfig {
-        total_bytes: runtime.effective_process_mem_limit_bytes()?,
-        control_bytes: input.control_bytes,
-        per_scope_bytes: input.per_scope_bytes,
-    };
-    resources
-        .validate()
-        .map_err(|error| anyhow::anyhow!("construct frontend workload resources: {error}"))?;
     let nonzero = |field: &'static str, value: usize| {
         NonZeroUsize::new(value)
             .ok_or_else(|| anyhow::anyhow!("runtime.frontend_workload.{field} must be nonzero"))
@@ -907,7 +894,7 @@ fn compose_frontend_workload_runtime(
     .with_remote_cleanup_timeout(Duration::from_millis(
         input.logical_remote_cleanup_timeout_ms,
     ));
-    Ok((supervisor, workload, resources, abort_capacity))
+    Ok((supervisor, workload, abort_capacity))
 }
 
 fn compose_task_execution_budgets(
@@ -1374,15 +1361,10 @@ mod tests {
     fn frontend_workload_runtime_is_built_from_validated_server_fields() {
         let mut config = crate::app_config::NovaRocksConfig::default();
         config.runtime.mem_limit = "1G".to_string();
-        config.runtime.frontend_workload.control_bytes = 64 * 1024 * 1024;
-        config.runtime.frontend_workload.per_scope_bytes = 512 * 1024 * 1024;
-        let (_, workload, resources, abort_capacity) =
-            compose_frontend_workload_runtime(&config.runtime)
-                .expect("explicit frontend workload fields compose");
+        let (_, workload, abort_capacity) = compose_frontend_workload_runtime(&config.runtime)
+            .expect("explicit frontend workload fields compose");
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
-        assert_eq!(resources.total_bytes, 966_367_641);
-        assert_eq!(resources.per_scope_bytes, 512 * 1024 * 1024);
         assert_eq!(abort_capacity.get(), 16);
 
         config
@@ -1415,13 +1397,9 @@ mod tests {
             .runtime
             .frontend_workload
             .logical_abort_effect_capacity = 16;
-        config.runtime.frontend_workload.per_scope_bytes = 2 * 1024 * 1024 * 1024;
-        assert!(
-            compose_frontend_workload_runtime(&config.runtime)
-                .expect_err("per-scope authority cannot exceed the process budget")
-                .to_string()
-                .contains("frontend workload resources")
-        );
+        // FE admission no longer derives an allocation budget from mem_limit.
+        config.runtime.mem_limit = "64M".to_string();
+        assert!(compose_frontend_workload_runtime(&config.runtime).is_ok());
     }
 }
 

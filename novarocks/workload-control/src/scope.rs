@@ -378,7 +378,7 @@ impl State {
 
 pub(crate) struct Inner {
     pub config: WorkloadConfig,
-    pub resource_config: ResourceConfig,
+    pub resource_config: Option<Arc<ResourceConfig>>,
     pub state: Mutex<State>,
     pub changed: Notify,
 }
@@ -465,6 +465,13 @@ pub struct WorkloadControlParts {
     pub root_admission: RootAdmissionHandle,
     pub observation: WorkloadObservationHandle,
     pub resources: LocalResourceAuthority,
+}
+
+/// Process-composition capabilities for a role with no allocation budget.
+pub struct CountedWorkloadControlParts {
+    pub owner: WorkloadControl,
+    pub root_admission: RootAdmissionHandle,
+    pub observation: WorkloadObservationHandle,
 }
 
 /// Proof that the unique workload owner closed admission and observed a fully
@@ -696,16 +703,15 @@ impl RootAdmissionHandle {
 }
 
 impl WorkloadControl {
-    /// Transitional owner-only constructor retained until the Frontend host
-    /// atomically switches to [`Self::try_new_split`]. Do not inject this owner
-    /// into product-lived services.
+    /// Construct a workload owner with an explicit allocation budget.
+    /// Inject narrow capabilities into product-lived services.
     pub fn try_new(config: WorkloadConfig, resources: ResourceConfig) -> Result<Self, WorkError> {
         config.validate()?;
         resources.validate()?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
-                resource_config: resources,
+                resource_config: Some(Arc::new(resources)),
                 state: Mutex::new(State::default()),
                 changed: Notify::new(),
             }),
@@ -722,7 +728,28 @@ impl WorkloadControl {
         Ok(WorkloadControlParts {
             root_admission: owner.root_admission(),
             observation: owner.observation(),
-            resources: owner.resources(),
+            resources: owner.resources()?,
+            owner,
+        })
+    }
+
+    /// Construct responsibility, admission and lifecycle control without a
+    /// generic allocation authority. Result windows are installed separately.
+    pub fn try_new_counted(
+        config: WorkloadConfig,
+    ) -> Result<CountedWorkloadControlParts, WorkError> {
+        config.validate()?;
+        let owner = Self {
+            inner: Arc::new(Inner {
+                config,
+                resource_config: None,
+                state: Mutex::new(State::default()),
+                changed: Notify::new(),
+            }),
+        };
+        Ok(CountedWorkloadControlParts {
+            root_admission: owner.root_admission(),
+            observation: owner.observation(),
             owner,
         })
     }
@@ -828,10 +855,18 @@ impl WorkloadControl {
         })
     }
 
-    pub fn resources(&self) -> LocalResourceAuthority {
-        LocalResourceAuthority {
+    /// Obtain the explicitly installed allocation authority. Count-only role
+    /// composition has no allocation budget and cannot mint this capability.
+    pub fn resources(&self) -> Result<LocalResourceAuthority, WorkError> {
+        let config = self
+            .inner
+            .resource_config
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        Ok(LocalResourceAuthority {
             inner: Arc::clone(&self.inner),
-        }
+            config: Arc::clone(config),
+        })
     }
 
     /// Adopt an orphan without manufacturing a stop or release fact.

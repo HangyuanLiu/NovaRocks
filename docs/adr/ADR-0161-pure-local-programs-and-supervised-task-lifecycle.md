@@ -26,6 +26,10 @@ code-anchors:
   - "novarocks/execution-contract/src/task_convergence.rs (TaskConvergenceReceipt)"
 ---
 
+## MEM-1-M07 FE 资源路径更新（2026-10-08）
+
+FE 的 accepted/installed、业务结论与 actual convergence 仍分别成立。结果 handoff 已只携带原固定窗口及准确用途；FE protocol、query service 与 supervisor 不再持有 LRA，也不为 Fetch/decode/write 重新申请阶段信用。Count-only WorkloadControl 保留取消、义务、责任与排空；Closing 从原 statement scope 获取独立容量，最后 writer/metadata/segment/alias 退出才归还。BE 现有 process control 和 retained 保护不随 FE 切换删除。当前这项代码更新不代替最终原生、性能与传输测量验收。
+
 ## 问题
 
 分布式执行如何复用纯静态程序，同时分别证明 Task 已接管、能力已安装、结果已成功以及工作真正退出，并在准备、观察和正常关闭期间持续维持有界资源责任？

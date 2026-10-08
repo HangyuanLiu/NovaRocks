@@ -34,8 +34,8 @@ use novarocks_query_application::cpu::{
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_workload_control::{
-    CancellationReason, DeadlineExpiryHandle, ResourceConfig, RootAdmissionHandle, WorkloadConfig,
-    WorkloadControl, WorkloadObservationHandle, WorkloadShutdownError,
+    CancellationReason, DeadlineExpiryHandle, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
+    WorkloadObservationHandle, WorkloadShutdownError,
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
@@ -92,9 +92,6 @@ const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::n
 const DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
 const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
-const TEST_WORKLOAD_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const TEST_WORKLOAD_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
-const TEST_WORKLOAD_PER_SCOPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[cfg(test)]
 fn test_native_trust() -> Arc<NativeTrust> {
@@ -278,17 +275,12 @@ impl FrontendExecutionRuntimeOwner {
         frontend_process_id: FrontendProcessId,
         supervisor_config: LogicalExecutionSupervisorConfig,
         workload_config: WorkloadConfig,
-        resource_config: ResourceConfig,
         query_cpu_config: QueryCpuExecutorConfig,
         query_blocking_config: QueryBlockingExecutorConfig,
     ) -> Result<Self, FrontendApplicationError> {
-        let workload =
-            WorkloadControl::try_new_split(workload_config, resource_config).map_err(|error| {
-                FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::WorkloadControlOpen,
-                    error,
-                )
-            })?;
+        let workload = WorkloadControl::try_new_counted(workload_config).map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::WorkloadControlOpen, error)
+        })?;
         // The frozen result profile must cover computation admission; a
         // concurrency limit beyond its client positions is refused here.
         let result_capacity = workload
@@ -707,7 +699,6 @@ impl Default for FrontendQueryControlTimeouts {
 pub struct FrontendLogicalExecutionRuntimeConfig {
     supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
-    resources: ResourceConfig,
     abort_effect_capacity: NonZeroUsize,
 }
 
@@ -715,13 +706,11 @@ impl FrontendLogicalExecutionRuntimeConfig {
     pub fn new(
         supervisor: LogicalExecutionSupervisorConfig,
         workload: WorkloadConfig,
-        resources: ResourceConfig,
         abort_effect_capacity: NonZeroUsize,
     ) -> Self {
         Self {
             supervisor,
             workload,
-            resources,
             abort_effect_capacity,
         }
     }
@@ -739,11 +728,6 @@ impl FrontendLogicalExecutionRuntimeConfig {
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: TEST_WORKLOAD_TOTAL_BYTES,
-                control_bytes: TEST_WORKLOAD_CONTROL_BYTES,
-                per_scope_bytes: TEST_WORKLOAD_PER_SCOPE_BYTES,
-            },
             DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY,
         )
     }
@@ -784,7 +768,6 @@ pub struct FrontendExecutionConfig {
     /// Fixed process-wide worker and waiting bounds for synchronous result decode.
     logical_execution_supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
-    workload_resources: ResourceConfig,
     logical_abort_effect_capacity: NonZeroUsize,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
@@ -833,7 +816,6 @@ impl FrontendExecutionConfig {
             ),
             logical_execution_supervisor: logical_runtime.supervisor,
             workload: logical_runtime.workload,
-            workload_resources: logical_runtime.resources,
             logical_abort_effect_capacity: logical_runtime.abort_effect_capacity,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
@@ -1126,7 +1108,6 @@ impl FrontendApplicationHost {
             frontend_process_id,
             execution.logical_execution_supervisor,
             execution.workload.clone(),
-            execution.workload_resources.clone(),
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
         )?;
@@ -1936,7 +1917,7 @@ mod tests {
     use novarocks_state_store_runtime::{
         StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
     };
-    use novarocks_workload_control::{ResourceConfig, WorkClass, WorkRequest, WorkloadConfig};
+    use novarocks_workload_control::{WorkClass, WorkRequest, WorkloadConfig};
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
@@ -1968,11 +1949,6 @@ mod tests {
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2016,11 +1992,6 @@ mod tests {
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2074,11 +2045,6 @@ mod tests {
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),

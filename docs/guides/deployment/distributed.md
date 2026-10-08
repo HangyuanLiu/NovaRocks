@@ -462,3 +462,7 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 | Native 或 management endpoint 冲突 | 让 FE MySQL、FE Native gRPC、FE management HTTP、BE Data gRPC、BE Control gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
 | 启动拒绝 Native descriptor baseline | 检查 BE soft `RLIMIT_NOFILE` 至少 1024、FE 至少 2048；在启动环境设置，不依赖 Server 自动提高。 |
 | `/metrics` 在 gRPC port 不可用 | 改访问对应 role 的 `[server].http_port`；metrics 使用 role-local registry，不会跨 FE/BE 混合。 |
+
+### MEM-1-M07 配置迁移
+
+`[runtime.frontend_workload]` 中的 `control_bytes`、`per_scope_bytes` 已退役，旧键会报配置错误。FE 使用计数准入与固定结果窗口；不再从进程内存上限派生通用 LRA result budget。进程 MemoryAuthority 的控制 floor 使用 `[runtime.memory].control_bytes`，默认保持 64 MiB，FE/BE 进程启动仍在 work account 之前安装该保护。需要调整控制 floor 的部署应把原控制值移到新位置；`per_scope_bytes` 无替代 FE 配置。BE retained 保护与 M03/M04 后续接线边界保持独立。

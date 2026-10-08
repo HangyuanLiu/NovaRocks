@@ -78,6 +78,7 @@ impl ResourceSnapshot {
 #[derive(Clone)]
 pub struct LocalResourceAuthority {
     pub(crate) inner: Arc<Inner>,
+    pub(crate) config: Arc<ResourceConfig>,
 }
 
 /// Metadata admission only. The request's desired bytes are not a reservation.
@@ -202,7 +203,7 @@ impl LocalResourceAuthority {
             return Err(WorkError::Capacity("zero-byte reservation"));
         }
         self.inner.update_facts_silent(|state| {
-            check_capacity(state, &self.inner.resource_config, scope.id, bytes, class)?;
+            check_capacity(state, &self.config, scope.id, bytes, class)?;
             let node = state.nodes.get_mut(&scope.id).unwrap();
             node.resource_holders = node
                 .resource_holders
@@ -211,6 +212,7 @@ impl LocalResourceAuthority {
             reserve_bytes(state, scope.id, bytes, class);
             Ok(Reservation {
                 scope: scope.clone(),
+                config: Arc::clone(&self.config),
                 remaining: bytes,
                 class,
             })
@@ -220,7 +222,7 @@ impl LocalResourceAuthority {
     pub fn snapshot(&self) -> ResourceSnapshot {
         let state = self.inner.state.lock().unwrap();
         ResourceSnapshot {
-            total_limit_bytes: self.inner.resource_config.total_bytes,
+            total_limit_bytes: self.config.total_bytes,
             data_reserved_bytes: state.data_reserved,
             data_used_bytes: state.data_used,
             control_reserved_bytes: state.control_reserved,
@@ -244,14 +246,12 @@ impl LocalResourceAuthority {
             return Err(WorkError::ForeignAuthority);
         }
         let limit = match class {
-            ResourceClass::Data => {
-                self.inner.resource_config.total_bytes - self.inner.resource_config.control_bytes
-            }
-            ResourceClass::Control => self.inner.resource_config.control_bytes,
+            ResourceClass::Data => self.config.total_bytes - self.config.control_bytes,
+            ResourceClass::Control => self.config.control_bytes,
         };
         if bytes == 0
             || bytes > limit
-            || (class == ResourceClass::Data && bytes > self.inner.resource_config.per_scope_bytes)
+            || (class == ResourceClass::Data && bytes > self.config.per_scope_bytes)
         {
             return Err(WorkError::Capacity("unrepresentable allocation"));
         }
@@ -280,7 +280,7 @@ impl LocalResourceAuthority {
             }
             match check_capacity(
                 &self.inner.state.lock().unwrap(),
-                &self.inner.resource_config,
+                &self.config,
                 scope.id,
                 bytes,
                 class,
@@ -306,6 +306,7 @@ impl LocalResourceAuthority {
 /// into allocation charges. Growth is checked before the allocation occurs.
 pub struct Reservation {
     scope: WorkScope,
+    config: Arc<ResourceConfig>,
     remaining: u64,
     class: ResourceClass,
 }
@@ -317,13 +318,7 @@ impl Reservation {
 
     pub fn grow(&mut self, additional: u64) -> Result<(), WorkError> {
         self.scope.inner.update_facts(|state| {
-            check_capacity(
-                state,
-                &self.scope.inner.resource_config,
-                self.scope.id,
-                additional,
-                self.class,
-            )?;
+            check_capacity(state, &self.config, self.scope.id, additional, self.class)?;
             if self.remaining == 0 && additional != 0 {
                 let node = state.nodes.get_mut(&self.scope.id).unwrap();
                 node.resource_holders = node
@@ -373,6 +368,7 @@ impl Reservation {
             Ok(AllocationCharge {
                 allocation: Arc::new(Allocation {
                     inner: Arc::clone(&self.scope.inner),
+                    config: Arc::clone(&self.config),
                     owner: Mutex::new(self.scope.id),
                     bytes,
                     class: self.class,
@@ -423,6 +419,7 @@ impl Drop for Reservation {
 
 struct Allocation {
     inner: Arc<Inner>,
+    config: Arc<ResourceConfig>,
     owner: Mutex<WorkId>,
     bytes: u64,
     class: ResourceClass,
@@ -481,7 +478,7 @@ impl AllocationCharge {
                 .and_then(|held| held.checked_add(self.allocation.bytes))
                 .ok_or(WorkError::ArithmeticOverflow)?;
             if self.allocation.class == ResourceClass::Data
-                && held > self.allocation.inner.resource_config.per_scope_bytes
+                && held > self.allocation.config.per_scope_bytes
             {
                 return Err(WorkError::Capacity("recipient allocation bytes"));
             }

@@ -996,6 +996,7 @@ fn stage_capability_and_resource_authority_are_bound_to_the_exact_scope() {
     assert!(matches!(
         control
             .resources()
+            .unwrap()
             .reserve(&c.owner.scope(), 1, ResourceClass::Data),
         Err(WorkError::ForeignAuthority)
     ));
@@ -1006,7 +1007,7 @@ fn reservation_and_usage_share_one_charge_and_slices_keep_the_original_allocatio
     let control = control();
     let work = root(&control, WorkClass::Query);
     let scope = work.owner.scope();
-    let resources = control.resources();
+    let resources = control.resources().unwrap();
     let mut reservation = resources.reserve(&scope, 100, ResourceClass::Data).unwrap();
     let allocation = reservation.charge(80).unwrap();
     let slice = allocation.clone();
@@ -1042,6 +1043,7 @@ fn commit_wait_releases_execution_but_keeps_output_and_business_responsibility()
     let execution = query.scope().try_acquire(Stage::Execution).unwrap();
     let mut reserve = control
         .resources()
+        .unwrap()
         .reserve(&query.scope(), 64, ResourceClass::Data)
         .unwrap();
     let output = reserve.charge(48).unwrap();
@@ -1054,7 +1056,7 @@ fn commit_wait_releases_execution_but_keeps_output_and_business_responsibility()
     query.complete();
     let snapshot = control.snapshot();
     assert_eq!((snapshot.execution, snapshot.businesses), (0, 1));
-    assert_eq!(control.resources().snapshot().data_used_bytes, 48);
+    assert_eq!(control.resources().unwrap().snapshot().data_used_bytes, 48);
     drop(output);
     assert_eq!(control.snapshot().scopes.len(), 1);
     work.owner.complete();
@@ -1075,6 +1077,7 @@ fn allocation_handoff_is_atomic_and_foreign_processes_cannot_receive_it() {
     let foreign = root(&other_control, WorkClass::Query);
     let mut reservation = control
         .resources()
+        .unwrap()
         .reserve(&a.owner.scope(), 80, ResourceClass::Data)
         .unwrap();
     let allocation = reservation.charge(80).unwrap();
@@ -1086,7 +1089,7 @@ fn allocation_handoff_is_atomic_and_foreign_processes_cannot_receive_it() {
         Err(WorkError::ForeignAuthority)
     );
     allocation.transfer_to(&b.owner.scope()).unwrap();
-    assert_eq!(control.resources().snapshot().held_bytes(), 80);
+    assert_eq!(control.resources().unwrap().snapshot().held_bytes(), 80);
     assert_eq!(control.snapshot().root_responsibilities, 1);
     b.owner.complete();
     b.business.release();
@@ -1102,6 +1105,7 @@ async fn data_saturation_and_cancellation_preserve_control_progress_and_memory()
         .collect::<Vec<_>>();
     let mut reserve = control
         .resources()
+        .unwrap()
         .reserve(&works[0].owner.scope(), 112, ResourceClass::Data)
         .unwrap();
     let data = reserve.charge(112).unwrap();
@@ -1112,15 +1116,17 @@ async fn data_saturation_and_cancellation_preserve_control_progress_and_memory()
     assert!(matches!(
         control
             .resources()
+            .unwrap()
             .reserve(&works[1].owner.scope(), 1, ResourceClass::Data),
         Err(WorkError::Cancelled(_))
     ));
     let mut control_reserve = control
         .resources()
+        .unwrap()
         .reserve(&works[0].owner.scope(), 16, ResourceClass::Control)
         .unwrap();
     let control_bytes = control_reserve.charge(16).unwrap();
-    assert_eq!(control.resources().snapshot().held_bytes(), 128);
+    assert_eq!(control.resources().unwrap().snapshot().held_bytes(), 128);
     let first = control.next_control().unwrap();
     let second = control.next_control().unwrap();
     assert!(control.next_control().is_none());
@@ -1135,7 +1141,7 @@ async fn data_saturation_and_cancellation_preserve_control_progress_and_memory()
     }
     assert_eq!(seen.len(), 4);
     assert!(seen.contains(&retried));
-    assert_eq!(control.resources().snapshot().data_used_bytes, 112);
+    assert_eq!(control.resources().unwrap().snapshot().data_used_bytes, 112);
     drop((data, reserve, control_bytes, control_reserve));
     for work in works {
         work.owner.complete();
@@ -1149,7 +1155,7 @@ async fn allocation_waiter_wakes_on_real_release_and_cancel() {
     let control = control();
     let a = root(&control, WorkClass::Query);
     let b = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let reserve = authority
         .reserve(&a.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -1194,7 +1200,7 @@ fn unknown_create_and_old_attempt_bounds_preserve_last_known_usage() {
     let usage = snapshot.scopes[0].obligations[0].usage.as_ref().unwrap();
     assert_eq!(usage.last_known_bytes, 10_000);
     assert!(usage.current_unknown);
-    assert_eq!(control.resources().snapshot().held_bytes(), 0);
+    assert_eq!(control.resources().unwrap().snapshot().held_bytes(), 0);
     let unknown1 = scope
         .register_obligation(key(2), ObligationKind::UnknownCreate)
         .unwrap();
@@ -1365,6 +1371,7 @@ fn an_empty_reservation_has_no_release_claim_and_cannot_revive_completed_work() 
     let scope = work.owner.scope();
     let mut reserve = control
         .resources()
+        .unwrap()
         .reserve(&scope, 10, ResourceClass::Data)
         .unwrap();
     reserve.release_unused(10).unwrap();
@@ -1518,7 +1525,7 @@ async fn resource_wait_timeout_is_absolute_despite_repeated_capacity_notificatio
     let control = control();
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -1564,7 +1571,7 @@ async fn resource_wait_uses_the_earlier_inherited_query_deadline() {
             deadline: Some(Instant::now() + Duration::from_secs(60)),
         })
         .unwrap();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -1586,7 +1593,7 @@ async fn cleanup_capacity_wait_is_bounded_even_when_data_work_is_cancelled() {
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
     work.owner.cancel(CancellationReason::Requested);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 16, ResourceClass::Control)
         .unwrap();
@@ -1616,7 +1623,7 @@ async fn cleanup_capacity_can_become_available_after_inherited_deadline_expires(
         .unwrap();
     let query = child(&work.owner.scope());
     let scope = query.scope();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 16, ResourceClass::Control)
         .unwrap();
@@ -1661,7 +1668,7 @@ async fn cleanup_capacity_uses_its_full_independent_timeout_after_parent_deadlin
         .unwrap();
     let query = child(&work.owner.scope());
     let scope = query.scope();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 16, ResourceClass::Control)
         .unwrap();
@@ -1691,7 +1698,7 @@ async fn resource_wait_registration_is_unique_under_concurrent_polling() {
     let control = control();
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -1750,7 +1757,7 @@ async fn distinct_resource_classes_have_distinct_bounded_registrations() {
     let control = control();
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let data = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -1806,7 +1813,7 @@ async fn stage_and_resource_waits_share_one_global_entry_limit() {
         .scope()
         .try_acquire(Stage::Execution)
         .unwrap();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -1883,7 +1890,7 @@ async fn stage_and_resource_waits_share_one_global_entry_limit() {
 async fn pending_resource_wait_retains_completed_scope_until_future_drop() {
     let control = control();
     let blocker = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();

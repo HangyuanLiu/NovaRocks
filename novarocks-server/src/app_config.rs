@@ -1193,8 +1193,6 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub obligation_records_limit: usize,
     pub control_inflight_limit: usize,
     pub control_ready_limit: usize,
-    pub control_bytes: u64,
-    pub per_scope_bytes: u64,
     pub logical_actor_mailbox_capacity: usize,
     pub logical_context_admission_issue_capacity: usize,
     pub logical_context_establish_capacity: usize,
@@ -1221,8 +1219,6 @@ impl Default for FrontendWorkloadRuntimeConfig {
             obligation_records_limit: 8192,
             control_inflight_limit: 16,
             control_ready_limit: 256,
-            control_bytes: 64 * 1024 * 1024,
-            per_scope_bytes: 2 * 1024 * 1024 * 1024,
             logical_actor_mailbox_capacity: 64,
             logical_context_admission_issue_capacity: 16,
             logical_context_establish_capacity: 16,
@@ -1702,8 +1698,12 @@ fn default_native_control_request_max_bytes() -> usize {
 /// Both keys default, and both can be set explicitly. `B + H <= P` is an
 /// invariant of the authority, not a preference, so a configuration that
 /// breaks it is refused at startup rather than discovered later.
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeMemoryConfig {
+    /// Protected process control floor. This is independent of FE result windows.
+    #[serde(default = "default_process_control_bytes")]
+    pub control_bytes: u64,
     /// `B`: hard-governed capacity. Absent derives `P - H`.
     #[serde(default)]
     pub capacity_bytes: Option<u64>,
@@ -1713,6 +1713,20 @@ pub struct RuntimeMemoryConfig {
     /// allocation paths come under hard governance.
     #[serde(default)]
     pub headroom_bytes: Option<u64>,
+}
+
+fn default_process_control_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+impl Default for RuntimeMemoryConfig {
+    fn default() -> Self {
+        Self {
+            capacity_bytes: None,
+            headroom_bytes: None,
+            control_bytes: default_process_control_bytes(),
+        }
+    }
 }
 
 /// The fraction of `P` reserved as headroom when `headroom_bytes` is absent.
@@ -3001,6 +3015,7 @@ mod tests {
         let explicit_headroom = RuntimeMemoryConfig {
             capacity_bytes: None,
             headroom_bytes: Some(P / 10),
+            ..RuntimeMemoryConfig::default()
         }
         .authority_config(P)
         .expect("an explicit headroom must derive the capacity");
@@ -3013,6 +3028,7 @@ mod tests {
         let explicit_capacity = RuntimeMemoryConfig {
             capacity_bytes: Some(P / 2),
             headroom_bytes: None,
+            ..RuntimeMemoryConfig::default()
         }
         .authority_config(P)
         .expect("an explicit capacity must keep the default headroom");
@@ -3025,6 +3041,7 @@ mod tests {
         let error = RuntimeMemoryConfig {
             capacity_bytes: Some(P),
             headroom_bytes: Some(P / 4),
+            ..RuntimeMemoryConfig::default()
         }
         .authority_config(P)
         .expect_err("B + H > P must be refused at startup, not discovered later");
@@ -3066,11 +3083,17 @@ mod tests {
             [memory]
             capacity_bytes = 1024
             headroom_bytes = 512
+            control_bytes = 128
             "#,
         )
         .expect("[runtime.memory] must parse");
         assert_eq!(parsed.memory.capacity_bytes, Some(1024));
         assert_eq!(parsed.memory.headroom_bytes, Some(512));
+        assert_eq!(parsed.memory.control_bytes, 128);
+        assert_eq!(
+            RuntimeMemoryConfig::default().control_bytes,
+            64 * 1024 * 1024
+        );
     }
     use novarocks_native_adapter::{
         FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
@@ -3175,6 +3198,8 @@ mod tests {
             "result_decode_worker_count",
             "result_decode_queue_capacity",
             "logical_result_fetch_wait_ms",
+            "control_bytes",
+            "per_scope_bytes",
         ] {
             let document = format!("[runtime.frontend_workload]\n{field} = 1\n",);
             let error = match toml::from_str::<NovaRocksConfig>(&document) {

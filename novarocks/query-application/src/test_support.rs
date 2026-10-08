@@ -175,7 +175,7 @@ impl ResultStreamTestProducer {
             root.owner.cancellation_requester(),
             ExecutionOutput::Rows(stream),
         );
-        let resources = workload.resources();
+        let resources = workload.resources().unwrap();
         Ok((
             Self {
                 execution_id,

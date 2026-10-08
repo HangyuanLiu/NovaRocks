@@ -2307,8 +2307,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let window = control
-            .resources()
+        let window = scope
             .result_capacity()
             .unwrap()
             .try_acquire(scope, novarocks_workload_control::ResultWindowClass::Client)

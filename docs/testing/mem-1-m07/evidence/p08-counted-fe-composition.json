@@ -1,0 +1,93 @@
+{
+  "status": "PASS_COMPONENT_COUNT_ONLY_FE_COMPOSITION_P08_PARTIAL",
+  "base_revision": "ea2f43d65a62cdee1c1ade7dbfa7ec58eed976fd",
+  "changes": [
+    "FE constructs count-only WorkloadControl with no allocation budget/capability. Uninstalled resources() explicitly returns NotReady. Explicit allocation owners retain immutable config and reservation/charge guards.",
+    "Retired FE control_bytes/per_scope_bytes rejected. Process MemoryAuthority control floor moved to runtime.memory.control_bytes, keeping 64 MiB default and startup precommit.",
+    "Retired FE allocation metrics replaced with actual Client/Local/Internal/Closing positions. Native concurrency scenario refuses missing observation and requires zero positions for convergence.",
+    "Count-only Local writer and result-window tests retain actual alias/Closing ownership; exact process control floor covered by Server test.",
+    "ADR-0147/0161 and deployment migration updated. BE process/retained protections remain."
+  ],
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-check-v2.log",
+      "sha256": "528ccd2e6627f2f0f6e4de8b717cb2ffc43e38f148f6e49a2aabf85bffa4db03",
+      "result": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.11s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-workload-tests.log",
+      "sha256": "ecf8de573c2d903e57e9e392fb2855d4c0147b107e5f63dbe423690523ced5c2",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.12s",
+        "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s",
+        "test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-server-tests.log",
+      "sha256": "b99a548d5dc4928ead5ba39b31d255bd3236f0f9f3aee876fd02c14b7c9a76c2",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.53s",
+        "test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-server-owner-tests.log",
+      "sha256": "054196290425cb69c7da2ab968bd1205d892190ae90b89a2c5a4423ba4bd6895",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.60s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-query-tests.log",
+      "sha256": "dd8169d7f7210e261263c6aaccb77c0f074df1c75111e2c01d891a2c299de8a3",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.05s",
+        "test result: ok. 483 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-mysql-tests.log",
+      "sha256": "7ab16309dbb5a31f581430c083f9eedfcefabc131271cbf549e9450ebf4d055c",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.86s",
+        "test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-frontend-tests.log",
+      "sha256": "9301c07a3297ec15041aecb3de568e1d5fd3c817ca5476925cd1921fd4ea2397",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.10s",
+        "test result: ok. 1449 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.83s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-observation-tests.log",
+      "sha256": "6022f4adfa69cb9f44ff2c0a52b326111d784cf5515f3262d9f20f010914d307",
+      "result": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.97s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1444 filtered out; finished in 0.01s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-counted-fe-runner-check.log",
+      "sha256": "d3a1977b962931901e28a6df9d0e2606308929f7a0ffd68df8e84e98c11d1411",
+      "result": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.86s"
+      ]
+    }
+  ],
+  "failures_resolved": [
+    "Initial server all-targets check found three test config literals needing the explicit default control floor. No runtime fallback was introduced."
+  ],
+  "remaining": [
+    "Unfrozen carrier metadata",
+    "Clean C0/native validation on converged source",
+    "P00b measured coefficients and valid baseline, P09/P10 final acceptance"
+  ]
+}
