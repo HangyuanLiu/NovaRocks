@@ -36,6 +36,7 @@ use tokio::sync::oneshot;
 pub const NAMESPACES: usize = 32;
 pub const MEMBERS: usize = 512;
 pub const PAGE_SIZE: usize = 256;
+pub const OBJECT_STORE_LIST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ListingMode {
@@ -63,11 +64,15 @@ pub struct ListingSnapshot {
     pub emitted_name_bytes: u64,
     pub table_loads: u64,
     pub destructive_mutations: u64,
+    pub table_commits: u64,
+    pub object_store_list_requests: u64,
+    pub object_store_list_body_bytes: u64,
 }
 
 #[derive(Default)]
 struct Facts {
     mode: ListingMode,
+    object_store_list_body_bytes: Option<usize>,
     audit: ListingSnapshot,
     removed_tables: BTreeSet<String>,
     removed_views: BTreeSet<String>,
@@ -156,6 +161,28 @@ impl ListingRestFixture {
             .clone())
     }
 
+    /// A controlled S3 list page at the frozen public-fetcher boundary.
+    pub fn set_object_store_list_body_bytes(&self, bytes: usize) -> Result<()> {
+        ensure!(
+            bytes == OBJECT_STORE_LIST_BODY_BYTES || bytes == OBJECT_STORE_LIST_BODY_BYTES + 1,
+            "object-store fixture requires a frozen boundary input"
+        );
+        let mut facts = self
+            .state
+            .facts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("listing fixture lock poisoned"))?;
+        ensure!(
+            facts.audit.active_listing_requests == 0,
+            "listing fixture phase still has active responses"
+        );
+        *facts = Facts {
+            object_store_list_body_bytes: Some(bytes),
+            ..Default::default()
+        };
+        Ok(())
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -193,6 +220,34 @@ async fn serve(State(state): State<Arc<FixtureState>>, method: Method, uri: Uri)
 
 async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Response> {
     let segments = uri.path().trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.as_slice() == ["cl-fixture"] {
+        ensure!(
+            method == Method::GET
+                && uri
+                    .query()
+                    .unwrap_or("")
+                    .split('&')
+                    .any(|part| part == "list-type=2"),
+            "object-store fixture serves only S3 listing"
+        );
+        let bytes = {
+            let mut facts = state
+                .facts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("listing fixture lock poisoned"))?;
+            let bytes = facts
+                .object_store_list_body_bytes
+                .context("S3 listing not armed")?;
+            facts.audit.object_store_list_requests += 1;
+            facts.audit.object_store_list_body_bytes += bytes as u64;
+            bytes
+        };
+        return Ok((
+            [("content-type", "application/xml")],
+            empty_s3_list_body(bytes)?,
+        )
+            .into_response());
+    }
     if segments.as_slice() == ["v1", "config"] {
         return Ok(axum::Json(json!({"defaults":{},"overrides":{}})).into_response());
     }
@@ -201,6 +256,15 @@ async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Res
         "unknown fixture route"
     );
     let namespace = segments.get(2).copied().unwrap_or("");
+    if method == Method::POST && segments.len() == 5 && segments[3] == "tables" {
+        state
+            .facts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("listing fixture lock poisoned"))?
+            .audit
+            .table_commits += 1;
+        anyhow::bail!("boundary fixture must not receive a table commit");
+    }
     if method == Method::HEAD {
         let facts = state
             .facts
@@ -350,6 +414,20 @@ async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Res
     Ok(axum::Json(body).into_response())
 }
 
+fn empty_s3_list_body(bytes: usize) -> Result<Vec<u8>> {
+    let prefix = b"<ListBucketResult><Name>cl-fixture</Name><Prefix>warehouse/source/</Prefix><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated>";
+    let suffix = b"</ListBucketResult>";
+    ensure!(
+        bytes >= prefix.len() + suffix.len(),
+        "S3 boundary body is too short"
+    );
+    let mut body = Vec::with_capacity(bytes);
+    body.extend_from_slice(prefix);
+    body.resize(bytes - suffix.len(), b' ');
+    body.extend_from_slice(suffix);
+    Ok(body)
+}
+
 fn listing_page(
     mode: ListingMode,
     kind: &str,
@@ -440,6 +518,35 @@ fn listing_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn controlled_s3_listener_emits_exact_frozen_body_lengths() {
+        let fixture = ListingRestFixture::start().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for bytes in [
+            OBJECT_STORE_LIST_BODY_BYTES,
+            OBJECT_STORE_LIST_BODY_BYTES + 1,
+        ] {
+            fixture.set_object_store_list_body_bytes(bytes).unwrap();
+            let response = client
+                .get(format!("{}/cl-fixture?list-type=2", fixture.endpoint()))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert_eq!(response.headers()["content-type"], "application/xml");
+            let body = response.bytes().unwrap();
+            assert_eq!(body.len(), bytes);
+            let audit = fixture.snapshot().unwrap();
+            assert_eq!(audit.object_store_list_requests, 1);
+            assert_eq!(audit.object_store_list_body_bytes, bytes as u64);
+            assert_eq!(audit.table_commits, 0);
+        }
+    }
+
     #[test]
     fn controlled_rest_listener_serves_catalog_and_load_protocols() {
         let fixture = ListingRestFixture::start().unwrap();

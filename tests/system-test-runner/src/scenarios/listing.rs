@@ -22,7 +22,7 @@ use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::CrossProcessConfigOverlay;
 use novarocks_cluster_harness::listing_rest::{
-    ListingMode, ListingRestFixture, MEMBERS, NAMESPACES,
+    ListingMode, ListingRestFixture, MEMBERS, NAMESPACES, OBJECT_STORE_LIST_BODY_BYTES,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -310,6 +310,79 @@ fn listing_catalog_sql(fixture: &ListingRestFixture, name: &str) -> String {
 }
 
 pub struct CatalogListingCancellation;
+
+pub struct ObjectStoreListingBoundary;
+
+impl Scenario for ObjectStoreListingBoundary {
+    fn name(&self) -> &'static str {
+        "catalog/mem-1-m07-opendal-listing-boundary"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn launch_config(&self, root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        CatalogListing.launch_config(root)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let fixture = ListingRestFixture::start()?;
+        let timeout = context
+            .remaining("OpenDAL listing boundary")?
+            .min(Duration::from_secs(120));
+        let mut control =
+            mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+        control.query_drop(listing_catalog_sql(&fixture, "cl_opendal"))?;
+        await_fixture(&fixture, timeout, |audit| {
+            audit.namespace_pages == 1 && audit.active_listing_requests == 0
+        })?;
+        for bytes in [
+            OBJECT_STORE_LIST_BODY_BYTES,
+            OBJECT_STORE_LIST_BODY_BYTES + 1,
+        ] {
+            fixture.set_object_store_list_body_bytes(bytes)?;
+            measure(context, "opendal-list-body-boundary", || {
+                let error = control
+                    .query_drop("ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 ADD FILES FROM 's3://cl-fixture/warehouse/source/'")
+                    .err()
+                    .context("empty or oversized source listing must not commit ADD FILES")?;
+                let diagnostic = error.to_string();
+                if bytes == OBJECT_STORE_LIST_BODY_BYTES {
+                    ensure!(
+                        diagnostic.contains("no visible Parquet files")
+                            && !diagnostic.contains("ResourceExhausted"),
+                        "exact-bound list did not reach the empty-source semantic check: {diagnostic}"
+                    );
+                } else {
+                    ensure!(
+                        diagnostic.contains("ResourceExhausted"),
+                        "oversized OpenDAL list lost its error classification: {diagnostic}"
+                    );
+                }
+                let audit = fixture.snapshot()?;
+                ensure!(
+                    audit.object_store_list_requests == 1
+                        && audit.object_store_list_body_bytes == bytes as u64,
+                    "OpenDAL boundary was retried or did not consume the frozen response"
+                );
+                ensure!(
+                    audit.table_commits == 0 && audit.destructive_mutations == 0,
+                    "ADD FILES attempted an external effect before complete source discovery"
+                );
+                ensure!(
+                    control.query_first::<u64, _>("SELECT 1")? == Some(1),
+                    "listing refusal left the connection unusable"
+                );
+                Ok(json!({"response_bytes":bytes,"error":diagnostic,"provider":audit}))
+            })?;
+        }
+        await_resource_convergence(context, &baseline, "OpenDAL listing boundary")?;
+        Ok(())
+    }
+}
 
 impl Scenario for CatalogListingCancellation {
     fn name(&self) -> &'static str {
