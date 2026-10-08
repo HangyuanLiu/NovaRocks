@@ -170,6 +170,8 @@ mod string_sha2;
 mod string_sha2_owner;
 mod string_sm3;
 mod string_sm3_owner;
+pub mod string_split;
+mod string_split_owner;
 mod string_split_part;
 mod string_split_part_owner;
 mod string_substring;

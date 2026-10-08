@@ -2578,6 +2578,7 @@ pub(super) fn scalar_definition_parts(
                         Some(super::string_hex_owner::effects())
                     }
                     "md5sum" => Some(super::md5sum_owner::effects()),
+                    "split" => Some(super::string_split_owner::effects()),
                     name if super::string_md5_owner::operation(name).is_some() => {
                         Some(super::string_md5_owner::effects())
                     }
@@ -2877,6 +2878,7 @@ pub fn contribute_builtin_functions(
                 super::string_hex_owner::definition(name, declaration, resolver)?
             }
             "md5sum" => super::md5sum_owner::definition(&name, declaration, resolver)?,
+            "split" => super::string_split_owner::definition(&name, declaration, resolver)?,
             name if super::string_md5_owner::operation(name).is_some() => {
                 super::string_md5_owner::definition(name, declaration, resolver)?
             }
