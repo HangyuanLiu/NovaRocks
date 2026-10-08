@@ -1312,3 +1312,7 @@ mod legacy_regexp_count_long_error_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_sha2_additional_baseline_tests.rs"]
 mod legacy_sha2_additional_baseline_tests;
+
+#[cfg(test)]
+#[path = "legacy_sm3_additional_baseline_tests.rs"]
+mod legacy_sm3_additional_baseline_tests;

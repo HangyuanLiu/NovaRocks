@@ -1720,3 +1720,6 @@ mod regexp_count_tests;
 
 #[path = "pure_differential_sha2_shared_tests.rs"]
 mod sha2_shared_differential;
+
+#[path = "pure_differential_sm3_shared_tests.rs"]
+mod sm3_shared_differential;
