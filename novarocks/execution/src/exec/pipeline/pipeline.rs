@@ -150,7 +150,8 @@ impl Pipeline {
                 operator_profiles,
                 std::sync::Arc::clone(ctx.runtime_state()),
                 ctx.fragment_instance_id(),
-                PipelineDriverBindings::new(ctx.event_sink(), Some(operator_mem_trackers)),
+                PipelineDriverBindings::new(ctx.event_sink(), Some(operator_mem_trackers))
+                    .with_query_memory(ctx.runtime_state().query_memory().cloned()),
             ));
         }
         Ok(drivers)

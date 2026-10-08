@@ -33,6 +33,8 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
     pub(crate) runtime_filter_session: Option<RuntimeFilterSessionRef>,
     pub(crate) execution_runtime: Option<Arc<ExecutionRuntime>>,
+    pub(crate) query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
+    pub(crate) task_identity: Option<novarocks_execution_contract::TaskIdentity>,
 }
 
 pub(crate) fn apply_query_option_overrides(
@@ -55,6 +57,24 @@ pub(crate) fn apply_query_option_overrides(
 }
 
 pub(crate) fn build_runtime_state(inputs: RuntimeStateInputs) -> Result<Arc<RuntimeState>, String> {
+    if let Some(memory) = inputs.query_memory.as_ref() {
+        use crate::runtime::query_memory::QueryMemoryBindingError;
+        if inputs.query_id != Some(memory.execution().query_id()) {
+            return Err(QueryMemoryBindingError::QueryIdentityMismatch.to_string());
+        }
+        let identity = inputs
+            .task_identity
+            .ok_or(QueryMemoryBindingError::MissingTaskIdentity)
+            .map_err(|error| error.to_string())?;
+        let runtime = inputs
+            .execution_runtime
+            .as_ref()
+            .ok_or(QueryMemoryBindingError::MissingExecutionRuntime)
+            .map_err(|error| error.to_string())?;
+        memory
+            .validate_task(identity, runtime.memory_authority())
+            .map_err(|error| error.to_string())?;
+    }
     let cache_options = crate::runtime::cache::ExecutionCacheOptions::from_query_options(
         inputs.query_options.as_ref(),
     )?;
@@ -68,6 +88,7 @@ pub(crate) fn build_runtime_state(inputs: RuntimeStateInputs) -> Result<Arc<Runt
             inputs.mem_tracker,
             inputs.execution_runtime,
         )
-        .with_runtime_filter_session(inputs.runtime_filter_session),
+        .with_runtime_filter_session(inputs.runtime_filter_session)
+        .with_query_memory(inputs.query_memory),
     ))
 }

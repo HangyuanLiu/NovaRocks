@@ -13,6 +13,7 @@ pub mod mem_tracker;
 pub mod observable;
 pub mod operator_statistics;
 pub mod profile;
+pub mod query_memory;
 pub mod query_options;
 pub mod runtime_state;
 pub mod scan_stream_metrics;

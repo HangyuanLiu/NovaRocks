@@ -359,6 +359,8 @@ pub fn prepare_compiled_fragment(
             mem_tracker: context.mem_tracker.clone(),
             runtime_filter_session: context.runtime_filter.clone(),
             execution_runtime: context.execution_runtime.clone(),
+            query_memory: context.query_memory.clone(),
+            task_identity: context.result_identity,
         })
         .map_err(|error| {
             FragmentLaunchError::new(

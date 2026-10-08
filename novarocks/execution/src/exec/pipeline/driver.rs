@@ -213,6 +213,7 @@ pub struct PipelineDriver {
     driver_dependency_wait_time: Option<CounterRef>,
     operator_counters: Vec<OperatorCounters>,
     runtime_state: Arc<RuntimeState>,
+    query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     fragment_instance_id: Option<(i64, i64)>,
     event_sink: Arc<dyn FragmentEventSink>,
     state: DriverState,
@@ -251,6 +252,7 @@ pub struct PipelineDriver {
 /// positional argument for every service that must be installed before an
 /// asynchronous operator can start.
 pub(crate) struct PipelineDriverBindings {
+    query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     event_sink: Arc<dyn FragmentEventSink>,
     prebound_operator_mem_trackers: Option<Vec<Option<Arc<MemTracker>>>>,
 }
@@ -263,7 +265,22 @@ impl PipelineDriverBindings {
         Self {
             event_sink,
             prebound_operator_mem_trackers,
+            query_memory: None,
         }
+    }
+    pub(crate) fn with_query_memory(
+        mut self,
+        binding: Option<crate::runtime::query_memory::QueryMemoryBinding>,
+    ) -> Self {
+        self.query_memory = binding;
+        self
+    }
+    #[allow(
+        dead_code,
+        reason = "Formal invocation scope installation is a separate accepted slice."
+    )]
+    pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
+        self.query_memory.as_ref()
     }
 }
 
@@ -307,6 +324,13 @@ fn record_dictionary_carrier_stats(counters: &OperatorCounters, stats: Dictionar
 }
 
 impl PipelineDriver {
+    #[allow(
+        dead_code,
+        reason = "Formal invocation scope installation is a separate accepted slice."
+    )]
+    pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
+        self.query_memory.as_ref()
+    }
     pub fn new(
         driver_id: i32,
         operators: Vec<Box<dyn Operator>>,
@@ -315,6 +339,7 @@ impl PipelineDriver {
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
     ) -> Self {
+        let query_memory = runtime_state.query_memory().cloned();
         Self::new_with_event_sink(
             driver_id,
             operators,
@@ -322,7 +347,8 @@ impl PipelineDriver {
             operator_profiles,
             runtime_state,
             fragment_instance_id,
-            PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), None),
+            PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), None)
+                .with_query_memory(query_memory),
         )
     }
 
@@ -336,6 +362,7 @@ impl PipelineDriver {
         bindings: PipelineDriverBindings,
     ) -> Self {
         let PipelineDriverBindings {
+            query_memory,
             event_sink,
             prebound_operator_mem_trackers,
         } = bindings;
@@ -482,6 +509,7 @@ impl PipelineDriver {
             driver_dependency_wait_time,
             operator_counters,
             runtime_state,
+            query_memory,
             fragment_instance_id,
             event_sink,
             state: DriverState::Ready,

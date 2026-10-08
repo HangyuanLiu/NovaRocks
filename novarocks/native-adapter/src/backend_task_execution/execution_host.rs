@@ -662,7 +662,7 @@ impl NativeTaskExecutionHost {
             })?;
         let admission = self
             .queries
-            .prepare_admission_execution(
+            .prepare_admission_execution_typed(
                 execution,
                 kernel_key,
                 delivery_expire,
@@ -670,9 +670,7 @@ impl NativeTaskExecutionHost {
                 exec_mem_limit,
                 runtime_filter,
             )
-            .map_err(|error| {
-                resource_exhausted(format!("task {identity} could not be admitted: {error}"))
-            })?;
+            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
         // Scan sources open their providers only when preparation binds them,
         // which needs the admitted fragment tracker installed first.
         typed_runtime
@@ -1135,7 +1133,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             })?;
         let admission = self
             .queries
-            .prepare_admission_execution(
+            .prepare_admission_execution_typed(
                 execution,
                 kernel_key,
                 delivery_expire,
@@ -1143,9 +1141,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 exec_mem_limit,
                 runtime_filter,
             )
-            .map_err(|error| {
-                resource_exhausted(format!("task {identity} could not be admitted: {error}"))
-            })?;
+            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
         typed_runtime
             .install_connector_resource_tracker(admission.fragment_mem_tracker())
             .map_err(|error| {
@@ -2027,6 +2023,15 @@ fn internal(detail: impl AsRef<str>) -> HostRejection {
 /// Content that arrived well-formed and says something illegal.
 fn protocol(detail: impl AsRef<str>) -> HostRejection {
     HostRejection::new(TaskFailureCategory::Protocol, detail)
+}
+
+/// Admission already uses the preparation resource category. Keep the exact
+/// typed memory cause through this boundary without guessing from its text.
+fn memory_admission_failure_to_host(
+    identity: TaskIdentity,
+    error: &crate::native_fragment_query::NativeFragmentAdmissionError,
+) -> HostRejection {
+    resource_exhausted(format!("task {identity} could not be admitted: {error}"))
 }
 
 /// This process cannot supply what the task needs right now.
@@ -6159,3 +6164,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "memory_admission_projection_tests.rs"]
+mod memory_admission_projection_tests;
