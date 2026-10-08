@@ -426,7 +426,7 @@ impl PreparedAggregateKernel for SumKernel {
                             SumState::Empty => None,
                             SumState::Narrow(sum) => Some(
                                 i64::try_from(*sum)
-                                    .map_err(|_| operational("SUM result overflows BIGINT"))?,
+                                    .map_err(|_| operational("sum result overflows BIGINT"))?,
                             ),
                             _ => return Err(internal("SUM state differs from its domain")),
                         });
@@ -442,7 +442,7 @@ impl PreparedAggregateKernel for SumKernel {
                             SumState::Empty => None,
                             SumState::Wide(sum) => Some(
                                 sum.to_i128()
-                                    .ok_or_else(|| operational("SUM result overflows LARGEINT"))?
+                                    .ok_or_else(|| operational("sum result overflows LARGEINT"))?
                                     .to_be_bytes(),
                             ),
                             _ => return Err(internal("SUM state differs from its domain")),
@@ -470,7 +470,7 @@ impl PreparedAggregateKernel for SumKernel {
                                 None => match policy {
                                     DecimalOverflowPolicy::ReportError => {
                                         return Err(operational(
-                                            "SUM result overflows DECIMAL(38)",
+                                            "sum result overflows DECIMAL(38)",
                                         ));
                                     }
                                     DecimalOverflowPolicy::OutputNull => None,

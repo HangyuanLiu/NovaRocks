@@ -798,16 +798,8 @@ fn pure_differential_sum_overflow_is_a_failure_on_both_paths() {
         .partitions(2, 1);
     let summary = assert_aggregate_matches_v1(spec.clone().ignore_error_messages());
     assert_eq!(summary.matched_failures, 2, "{summary:?}");
-    // Recorded divergence: both paths fail, but the pure diagnostic spells
-    // `SUM` where the legacy one spells `sum`, so the strict default check
-    // reports it rather than accepting a different user-visible message.
-    let failure = super::aggregate::run_aggregate_differential(&spec).unwrap_err();
-    assert!(
-        failure
-            .to_string()
-            .contains("does not contain pure `SUM result overflows BIGINT`"),
-        "{failure}"
-    );
+    let strict = assert_aggregate_matches_v1(spec);
+    assert_eq!(strict.matched_failures, 2, "{strict:?}");
 }
 
 // ---------------------------------------------------------------------------

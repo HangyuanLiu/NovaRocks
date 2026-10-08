@@ -589,7 +589,7 @@ fn sum_overflow_fails_only_a_frame_whose_own_result_overflows() {
     let values = int64s(&[Some(i64::MAX), Some(1), Some(-1)]);
     let fixture = Fixture::new("sum", nullable(&values), DecimalOverflowPolicy::ReportError);
     let window = fixture.window();
-    let overflow = KernelFailure::Operational(KernelDiagnostic::new("SUM result overflows BIGINT"));
+    let overflow = KernelFailure::Operational(KernelDiagnostic::new("sum result overflows BIGINT"));
     // The running frame [0, 2) holds MAX + 1.
     let running = ranges(&[(0, 1), (0, 2), (0, 3)]);
     assert_eq!(
@@ -629,7 +629,7 @@ fn sum_overflow_fails_only_a_frame_whose_own_result_overflows() {
     let fixture = Fixture::new("sum", nullable(&values), DecimalOverflowPolicy::ReportError);
     assert_eq!(
         check(&fixture, &fixture.window(), &values, &running).unwrap_err(),
-        KernelFailure::Operational(KernelDiagnostic::new("SUM result overflows DECIMAL(38)"))
+        KernelFailure::Operational(KernelDiagnostic::new("sum result overflows DECIMAL(38)"))
     );
 }
 
