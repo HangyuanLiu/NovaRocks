@@ -31,6 +31,7 @@ struct Manifest {
     topology: String,
     segment_bytes: u64,
     mysql_u24_payload_bytes: u64,
+    mysql_client_max_packet_bytes: u32,
     scope: String,
     cases: Vec<WireCase>,
 }
@@ -68,13 +69,14 @@ impl Scenario for WireBoundary {
             "wire boundary requires native 1FE+3BE"
         );
         let manifest: Manifest = serde_json::from_str(include_str!(
-            "../../../../docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v1.json"
+            "../../../../docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v2.json"
         ))?;
         ensure!(
             manifest.schema_version == 1
                 && manifest.topology == "1FE+3BE"
                 && manifest.segment_bytes == 1_048_576
                 && manifest.mysql_u24_payload_bytes == 0x00ff_ffff
+                && manifest.mysql_client_max_packet_bytes == 67_108_864
                 && !manifest.scope.is_empty()
                 && manifest.cases.len() == 2,
             "unsupported frozen wire boundary manifest"
@@ -102,7 +104,13 @@ impl Scenario for WireBoundary {
             .enable_all()
             .build()?;
         let observation = runtime.block_on(async {
-            let mut stream = AsyncMysqlStream::connect(&user, port, timeout).await?;
+            let mut stream = AsyncMysqlStream::connect_with_max_packet_bytes(
+                &user,
+                port,
+                timeout,
+                manifest.mysql_client_max_packet_bytes,
+            )
+            .await?;
             Ok::<_, anyhow::Error>(stream.observe_text_query(&case.sql, Duration::ZERO).await)
         })?;
         std::fs::write(

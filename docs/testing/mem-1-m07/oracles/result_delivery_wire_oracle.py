@@ -29,7 +29,7 @@ def expected_large_row():
 
 if __name__ == "__main__":
     manifest = json.loads(
-        (Path(__file__).parent.parent / "inputs/result-delivery-wire-boundary-v1.json").read_text()
+        (Path(__file__).parent.parent / "inputs/result-delivery-wire-boundary-v2.json").read_text()
     )
     for case, expected in zip(manifest["cases"], [expected_small_rows(), expected_large_row()], strict=True):
         actual = tuple(case[key] for key in [

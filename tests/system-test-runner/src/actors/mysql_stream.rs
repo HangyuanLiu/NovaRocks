@@ -409,6 +409,21 @@ impl AsyncMysqlStream {
     }
 
     pub async fn connect(user: &str, port: u16, timeout: Duration) -> Result<Self> {
+        Self::connect_with_max_packet_bytes(user, port, timeout, 16 * 1024 * 1024).await
+    }
+
+    /// Advertise the scenario's explicit logical packet allowance, including
+    /// rows that span multiple physical U24 packets.
+    pub async fn connect_with_max_packet_bytes(
+        user: &str,
+        port: u16,
+        timeout: Duration,
+        max_packet_bytes: u32,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=1 << 30).contains(&max_packet_bytes),
+            "invalid client packet allowance"
+        );
         const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
         const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
         const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
@@ -437,7 +452,7 @@ impl AsyncMysqlStream {
             | CLIENT_PLUGIN_AUTH;
         let mut response = Vec::with_capacity(user.len() + 64);
         response.extend_from_slice(&client_flags.to_le_bytes());
-        response.extend_from_slice(&(16_u32 * 1024 * 1024).to_le_bytes());
+        response.extend_from_slice(&max_packet_bytes.to_le_bytes());
         response.push(45);
         response.extend_from_slice(&[0u8; 23]);
         response.extend_from_slice(user.as_bytes());
