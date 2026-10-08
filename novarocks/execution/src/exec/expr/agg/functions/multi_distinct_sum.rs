@@ -14,11 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder};
+#[cfg(test)]
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Decimal128Array, Decimal256Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    BooleanArray, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array,
 };
 use arrow::datatypes::DataType;
+#[cfg(test)]
 use arrow_buffer::i256;
 
 use crate::exec::node::aggregate::AggFunction;
@@ -26,6 +29,50 @@ use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
+use novarocks_functions::builtin::aggregate_distinct_numeric as numeric_core;
+use novarocks_functions::{EvaluationCheckpoints, KernelEvaluationControl, KernelFailure};
+struct NumericControl;
+impl KernelEvaluationControl for NumericControl {
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        Err(KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new("numeric distinct requested a wait"),
+        ))
+    }
+}
+fn numeric_work<T>(
+    f: impl FnOnce(&mut EvaluationCheckpoints<'_>) -> Result<T, numeric_core::DistinctComputationError>,
+) -> Result<T, String> {
+    let mut w = EvaluationCheckpoints::new(&NumericControl);
+    let result = f(&mut w);
+    w.finish().map_err(|e| e.to_string())?;
+    result.map_err(numeric_core::DistinctComputationError::into_legacy_message)
+}
+impl numeric_core::NumericDistinctSet for DistinctSet {
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.iter().map(|v| v.as_slice())
+    }
+}
+struct NumericBuffer<'a> {
+    out: &'a mut AggregateVec<u8>,
+    allocator: &'a AggregateAllocator,
+}
+impl numeric_core::NumericDistinctBuffer for NumericBuffer<'_> {
+    fn reserve_exact(&mut self, size: usize) -> Result<(), String> {
+        self.out.try_reserve_exact(size).map_err(|_| {
+            self.allocator
+                .allocation_error("reserve distinct serialization")
+        })
+    }
+    fn append(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
+    }
+}
 
 // Hash the borrowed key exactly as the allocator-owned byte vector.
 struct DistinctLookup<'a>(&'a [u8]);
@@ -93,325 +140,48 @@ unsafe fn get_set<'a>(ptr: *const u8) -> &'a DistinctSet {
     unsafe { &*(ptr.cast::<DistinctSet>()) }
 }
 
-struct NumericKey {
-    bytes: [u8; 32],
-    len: usize,
-}
-impl NumericKey {
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-fn encode_le<const N: usize>(value: [u8; N]) -> NumericKey {
-    let mut bytes = [0u8; 32];
-    bytes[..N].copy_from_slice(&value);
-    NumericKey { bytes, len: N }
-}
-
 fn serialize_set(set: &DistinctSet) -> Result<AggregateVec<u8>, String> {
-    let count = u32::try_from(set.len()).map_err(|_| "distinct set count overflow".to_string())?;
-    let size = set.iter().try_fold(4usize, |size, value| {
-        u32::try_from(value.len()).map_err(|_| "distinct key length overflow".to_string())?;
-        size.checked_add(4)
-            .and_then(|size| size.checked_add(value.len()))
-            .ok_or_else(|| "distinct set payload overflow".to_string())
-    })?;
-    if size > i32::MAX as usize {
-        return Err("distinct state payload exceeds the Binary offset domain".to_string());
-    }
     let mut out = AggregateVec::new_in(set.allocator.clone());
-    out.try_reserve_exact(size).map_err(|_| {
-        set.allocator
-            .allocation_error("reserve distinct serialization")
+    numeric_work(|w| {
+        numeric_core::serialize_set_into(
+            set,
+            &mut NumericBuffer {
+                out: &mut out,
+                allocator: &set.allocator,
+            },
+            w,
+        )
     })?;
-    out.extend_from_slice(&count.to_le_bytes());
-    for value in set.iter() {
-        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        out.extend_from_slice(value.as_slice());
-    }
     Ok(out)
 }
-
-fn numeric_key_width(data_type: &DataType) -> Result<usize, String> {
-    match data_type {
-        DataType::Boolean | DataType::Int8 => Ok(1),
-        DataType::Int16 => Ok(2),
-        DataType::Int32 | DataType::Float32 => Ok(4),
-        DataType::Int64 | DataType::Float64 => Ok(8),
-        DataType::Decimal128(..) => Ok(16),
-        DataType::Decimal256(..) => Ok(32),
-        other => Err(format!("distinct numeric key type unsupported: {other:?}")),
-    }
+fn numeric_key_width(t: &DataType) -> Result<usize, String> {
+    numeric_core::numeric_key_width(t)
+        .map_err(numeric_core::DistinctComputationError::into_legacy_message)
 }
-
-// Validate the complete payload before mutation, then visit borrowed keys.
-// Keep the existing SUM state-v1 bytes: count:u32, then (length:u32, bytes)*.
 fn visit_serialized_keys(
     bytes: &[u8],
     width: usize,
     mut visit: impl FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), String> {
-    let read = |at: usize| -> Result<u32, String> {
-        let end = at
-            .checked_add(4)
-            .ok_or_else(|| "distinct set offset overflow".to_string())?;
-        let word = bytes
-            .get(at..end)
-            .ok_or_else(|| "invalid distinct set encoding".to_string())?;
-        Ok(u32::from_le_bytes(word.try_into().unwrap()))
-    };
-    let count = read(0)? as usize;
-    let stride = 4usize
-        .checked_add(width)
-        .ok_or_else(|| "distinct key width overflow".to_string())?;
-    let expected = count
-        .checked_mul(stride)
-        .and_then(|length| length.checked_add(4))
-        .ok_or_else(|| "distinct set length overflow".to_string())?;
-    if bytes.len() != expected {
-        return Err("invalid distinct set payload length".to_string());
-    }
-    for index in 0..count {
-        if read(4 + index * stride)? as usize != width {
-            return Err("distinct set key width differs from selected input type".to_string());
-        }
-    }
-    for index in 0..count {
-        let start = 8 + index * stride;
-        visit(&bytes[start..start + width])?;
-    }
-    Ok(())
+    numeric_work(|w| {
+        numeric_core::visit_serialized_keys(bytes, width, w, |value| {
+            visit(value).map_err(Into::into)
+        })
+    })
 }
-
 fn sum_from_set(
     set: &DistinctSet,
-    input_type: &DataType,
-    output_type: &DataType,
+    input: &DataType,
+    output: &DataType,
 ) -> Result<ArrayRef, String> {
-    if set.is_empty() {
-        // Return null
-        return match output_type {
-            DataType::Int64 => Ok(std::sync::Arc::new(Int64Array::from(vec![None]))),
-            DataType::Float64 => Ok(std::sync::Arc::new(Float64Array::from(vec![None]))),
-            DataType::Decimal128(precision, scale) => {
-                let array = Decimal128Array::from(vec![None])
-                    .with_precision_and_scale(*precision, *scale)
-                    .map_err(|e| e.to_string())?;
-                Ok(std::sync::Arc::new(array))
-            }
-            DataType::Decimal256(precision, scale) => {
-                let array = Decimal256Array::from(vec![None])
-                    .with_precision_and_scale(*precision, *scale)
-                    .map_err(|e| e.to_string())?;
-                Ok(std::sync::Arc::new(array))
-            }
-            other => Err(format!(
-                "multi_distinct_sum output type unsupported: {:?}",
-                other
-            )),
-        };
-    }
-
-    match output_type {
-        DataType::Int64 => {
-            let mut sum: i128 = 0;
-            for v in set.iter() {
-                let value = match input_type {
-                    DataType::Int8 => i8::from_le_bytes(v[..1].try_into().unwrap()) as i128,
-                    DataType::Int16 => i16::from_le_bytes(v[..2].try_into().unwrap()) as i128,
-                    DataType::Int32 => i32::from_le_bytes(v[..4].try_into().unwrap()) as i128,
-                    DataType::Int64 => i64::from_le_bytes(v[..8].try_into().unwrap()) as i128,
-                    DataType::Boolean => i8::from_le_bytes(v[..1].try_into().unwrap()) as i128,
-                    other => {
-                        return Err(format!(
-                            "multi_distinct_sum unsupported input type for int output: {:?}",
-                            other
-                        ));
-                    }
-                };
-                sum += value;
-            }
-            let sum_i64 =
-                i64::try_from(sum).map_err(|_| "multi_distinct_sum overflow".to_string())?;
-            Ok(std::sync::Arc::new(Int64Array::from(vec![Some(sum_i64)])))
-        }
-        DataType::Float64 => {
-            let mut sum = 0.0f64;
-            for v in set.iter() {
-                let value = match input_type {
-                    DataType::Float32 => f32::from_le_bytes(v[..4].try_into().unwrap()) as f64,
-                    DataType::Float64 => f64::from_le_bytes(v[..8].try_into().unwrap()),
-                    other => {
-                        return Err(format!(
-                            "multi_distinct_sum unsupported input type for float output: {:?}",
-                            other
-                        ));
-                    }
-                };
-                sum += value;
-            }
-            Ok(std::sync::Arc::new(Float64Array::from(vec![Some(sum)])))
-        }
-        DataType::Decimal128(precision, scale) => {
-            let mut sum: i128 = 0;
-            for v in set.iter() {
-                let value = match input_type {
-                    DataType::Decimal128(_, _) => i128::from_le_bytes(v[..16].try_into().unwrap()),
-                    other => {
-                        return Err(format!(
-                            "multi_distinct_sum unsupported input type for decimal output: {:?}",
-                            other
-                        ));
-                    }
-                };
-                sum += value;
-            }
-            let array = Decimal128Array::from(vec![Some(sum)])
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
-            Ok(std::sync::Arc::new(array))
-        }
-        DataType::Decimal256(precision, scale) => {
-            let mut sum = i256::ZERO;
-            for v in set.iter() {
-                let value = match input_type {
-                    DataType::Decimal256(_, _) => i256::from_le_bytes(
-                        v[..32]
-                            .try_into()
-                            .map_err(|_| "invalid Decimal256 distinct value bytes".to_string())?,
-                    ),
-                    other => {
-                        return Err(format!(
-                            "multi_distinct_sum unsupported input type for decimal output: {:?}",
-                            other
-                        ));
-                    }
-                };
-                sum = sum
-                    .checked_add(value)
-                    .ok_or_else(|| "multi_distinct_sum decimal overflow".to_string())?;
-            }
-            let array = Decimal256Array::from(vec![Some(sum)])
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
-            Ok(std::sync::Arc::new(array))
-        }
-        other => Err(format!(
-            "multi_distinct_sum output type unsupported: {:?}",
-            other
-        )),
-    }
+    numeric_work(|w| numeric_core::sum_from_set(set, input, output, w))
 }
-
 fn avg_from_set(
     set: &DistinctSet,
-    input_type: &DataType,
-    output_type: &DataType,
+    input: &DataType,
+    output: &DataType,
 ) -> Result<ArrayRef, String> {
-    if set.is_empty() {
-        return Ok(arrow::array::new_null_array(output_type, 1));
-    }
-    match output_type {
-        DataType::Float64 => {
-            let mut sum = 0.0f64;
-            for value in set.iter() {
-                sum += match input_type {
-                    DataType::Int8 => i8::from_le_bytes(value[..1].try_into().unwrap()) as f64,
-                    DataType::Int16 => i16::from_le_bytes(value[..2].try_into().unwrap()) as f64,
-                    DataType::Int32 => i32::from_le_bytes(value[..4].try_into().unwrap()) as f64,
-                    DataType::Int64 => i64::from_le_bytes(value[..8].try_into().unwrap()) as f64,
-                    DataType::Float32 => f32::from_le_bytes(value[..4].try_into().unwrap()) as f64,
-                    DataType::Float64 => f64::from_le_bytes(value[..8].try_into().unwrap()),
-                    other => {
-                        return Err(format!("distinct avg numeric input unsupported: {other:?}"));
-                    }
-                };
-            }
-            Ok(Arc::new(Float64Array::from(vec![Some(
-                sum / set.len() as f64,
-            )])))
-        }
-        DataType::Decimal128(precision, scale) => {
-            let DataType::Decimal128(_, input_scale) = input_type else {
-                return Err("distinct avg decimal input signature mismatch".to_string());
-            };
-            let mut sum = i256::ZERO;
-            for value in set.iter() {
-                let coefficient = i128::from_le_bytes(value[..16].try_into().unwrap());
-                sum = sum
-                    .checked_add(i256::from_i128(coefficient))
-                    .ok_or_else(|| "distinct avg decimal sum overflow".to_string())?;
-            }
-            let difference = i32::from(*scale) - i32::from(*input_scale);
-            let factor =
-                crate::exec::expr::decimal::pow10_i256(difference.unsigned_abs() as usize)?;
-            if difference >= 0 {
-                sum = sum
-                    .checked_mul(factor)
-                    .ok_or_else(|| "distinct avg decimal rescale overflow".to_string())?;
-            } else {
-                sum = sum / factor;
-            }
-            let coefficient = crate::exec::expr::decimal::div_round_i256(
-                sum,
-                i256::from_i128(set.len() as i128),
-            )?
-            .to_i128()
-            .ok_or_else(|| "distinct avg decimal output overflow".to_string())?;
-            let result = Decimal128Array::from(vec![Some(coefficient)])
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|error| error.to_string())?;
-            result
-                .validate_decimal_precision(*precision)
-                .map_err(|error| error.to_string())?;
-            Ok(Arc::new(result))
-        }
-        DataType::Decimal256(precision, scale) => {
-            if input_type != output_type {
-                return Err("distinct avg decimal256 bound precision/scale mismatch".to_string());
-            }
-            // Divide each coefficient before accumulation. A valid DECIMAL256
-            // mean can fit even when the sum of its inputs exceeds i256.
-            let count = i256::from_i128(set.len() as i128);
-            let mut quotient = i256::ZERO;
-            let mut remainder = i256::ZERO;
-            for value in set.iter() {
-                let coefficient = i256::from_le_bytes(value[..32].try_into().unwrap());
-                quotient = quotient
-                    .checked_add(coefficient / count)
-                    .ok_or_else(|| "distinct avg decimal256 quotient overflow".to_string())?;
-                remainder = remainder
-                    .checked_add(coefficient % count)
-                    .ok_or_else(|| "distinct avg decimal256 remainder overflow".to_string())?;
-            }
-            quotient = quotient
-                .checked_add(remainder / count)
-                .ok_or_else(|| "distinct avg decimal256 quotient overflow".to_string())?;
-            remainder = remainder % count;
-            // Normalize to the truncated quotient of the complete sum so that
-            // half-up rounding also handles opposite-sign coefficients.
-            if quotient > i256::ZERO && remainder < i256::ZERO {
-                quotient = quotient - i256::ONE;
-                remainder = remainder + count;
-            } else if quotient < i256::ZERO && remainder > i256::ZERO {
-                quotient = quotient + i256::ONE;
-                remainder = remainder - count;
-            }
-            let rounded = quotient
-                .checked_add(crate::exec::expr::decimal::div_round_i256(
-                    remainder, count,
-                )?)
-                .ok_or_else(|| "distinct avg decimal256 rounding overflow".to_string())?;
-            let result = Decimal256Array::from(vec![Some(rounded)])
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|error| error.to_string())?;
-            result
-                .validate_decimal_precision(*precision)
-                .map_err(|error| error.to_string())?;
-            Ok(Arc::new(result))
-        }
-        other => Err(format!("distinct avg output unsupported: {other:?}")),
-    }
+    numeric_work(|w| numeric_core::avg_from_set(set, input, output, w))
 }
 
 impl AggregateFunction for MultiDistinctNumericAgg {
@@ -575,91 +345,16 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         let AggInputView::Any(array) = input else {
             return Err("numeric distinct batch input type mismatch".to_string());
         };
-        for (row, &base) in state_ptrs.iter().enumerate() {
-            if array.is_null(row) {
-                continue;
+        numeric_work(|work| {
+            for (row, &base) in state_ptrs.iter().enumerate() {
+                if let Some(encoded) = numeric_core::encode_numeric_row(array.as_ref(), row, work)?
+                {
+                    let set = unsafe { get_set_mut((base as *mut u8).add(offset)) };
+                    set.insert(encoded.as_bytes())?;
+                }
             }
-            let encoded = match array.data_type() {
-                DataType::Int8 => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Int8Array>()
-                        .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
-                    encode_le(arr.value(row).to_le_bytes())
-                }
-                DataType::Int16 => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Int16Array>()
-                        .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
-                    encode_le(arr.value(row).to_le_bytes())
-                }
-                DataType::Int32 => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
-                    encode_le(arr.value(row).to_le_bytes())
-                }
-                DataType::Int64 => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-                    encode_le(arr.value(row).to_le_bytes())
-                }
-                DataType::Boolean => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-                    encode_le([u8::from(arr.value(row))])
-                }
-                DataType::Float32 => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Float32Array>()
-                        .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-                    encode_le(
-                        crate::exec::hash_table::hash::canonical_f32_bits(arr.value(row))
-                            .to_le_bytes(),
-                    )
-                }
-                DataType::Float64 => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-                    encode_le(
-                        crate::exec::hash_table::hash::canonical_f64_bits(arr.value(row))
-                            .to_le_bytes(),
-                    )
-                }
-                DataType::Decimal128(_, _) => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Decimal128Array>()
-                        .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-                    encode_le(arr.value(row).to_le_bytes())
-                }
-                DataType::Decimal256(_, _) => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<Decimal256Array>()
-                        .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-                    encode_le(arr.value(row).to_le_bytes())
-                }
-                other => {
-                    return Err(format!(
-                        "multi_distinct_sum unsupported input type: {:?}",
-                        other
-                    ));
-                }
-            };
-            let set = unsafe { get_set_mut((base as *mut u8).add(offset)) };
-            set.insert(encoded.as_bytes())?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn merge_batch(
