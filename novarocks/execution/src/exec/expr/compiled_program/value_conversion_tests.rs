@@ -75,13 +75,14 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     builder
         .register(value_conversion_definition().unwrap())
         .unwrap();
-    // This independent installed manifest covers all five real implementations
+    // This independent installed manifest covers all six real implementations
     // of the original hidden definition, without claiming a Server catalogue.
     for stem in [
         "json_text_same_structure",
         "signed_to_largeint",
         "largeint_to_signed_null_overflow",
         "largeint_to_float_round",
+        "largeint_to_utf8_text",
         "null_to_typed_nullable",
     ] {
         manifest.push(InstalledPureKernel {
@@ -822,3 +823,6 @@ fn actual_compiled_value_conversion_every_selected_callback_preserves_primary_ca
         }
     }
 }
+
+#[path = "value_conversion_largeint_text_tests.rs"]
+mod largeint_text_tests;

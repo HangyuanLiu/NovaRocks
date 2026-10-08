@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact selected computation for the five hidden value-domain conversions.
+//! Exact selected computation for the six hidden value-domain conversions.
 //! Shared-buffer metadata reconstruction and Arrow copy remain opaque library
 //! work bracketed by the original control. No allocation grant is claimed.
 
 use super::value_conversion::{
-    JSON_TEXT, LARGEINT_FLOAT, LARGEINT_SIGNED, NULL_LIFT, SIGNED_LARGEINT,
+    JSON_TEXT, LARGEINT_FLOAT, LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, SIGNED_LARGEINT,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
@@ -69,6 +69,7 @@ enum Operation {
     LargeIntSigned(Signed),
     LargeIntF32,
     LargeIntF64,
+    LargeIntText,
     NullLift,
 }
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +123,7 @@ impl ConversionRecipe {
                     DataType::Float64 => Operation::LargeIntF64,
                     _ => return Err(invalid("conversion has a foreign frozen float target")),
                 },
+                LARGEINT_TEXT => Operation::LargeIntText,
                 NULL_LIFT => Operation::NullLift,
                 _ => return Err(invalid("conversion has an unknown canonical overload")),
             };
@@ -313,6 +315,7 @@ impl ConversionRecipe {
                             value as f64
                         })?
                     }
+                    Operation::LargeIntText => largeint_text(*argument, selection, &mut work)?,
                     Operation::NullLift => {
                         return Err(internal("NULL lift active domain was not excluded"));
                     }
@@ -594,6 +597,49 @@ fn signed_largeint(
         Signed::I64 => run!(Int64Type),
     }
 }
+fn largeint_text(
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let source = large_source(argument)?;
+    // Offset slots follow the exact selected rows. Text bytes are counted from
+    // the ONE formatted result below, without a conservative per-row type cap.
+    extent(
+        selection
+            .len()
+            .checked_add(1)
+            .ok_or(KernelFailure::ResourceExhausted)?,
+        4,
+    )?;
+    let mut bytes = 0usize;
+    work.flush()?;
+    let mut output = arrow_array::builder::StringBuilder::new();
+    work.flush()?;
+    for (ordinal, row) in selection.iter().enumerate() {
+        let row = argument.value_row(ordinal, row);
+        work.step()?;
+        if source.is_null(row) {
+            output.append_null();
+        } else {
+            work.flush()?;
+            let text =
+                crate::largeint_text::value_text(source, row).map_err(|error| internal(&error))?;
+            work.flush()?;
+            bytes = bytes
+                .checked_add(text.len())
+                .ok_or(KernelFailure::ResourceExhausted)?;
+            i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+            output.append_value(text);
+        }
+        work.step()?;
+    }
+    work.flush()?;
+    let result = Arc::new(output.finish()) as ArrayRef;
+    work.flush()?;
+    Ok(result)
+}
+
 fn largeint_signed(
     width: Signed,
     argument: EvaluatedArgument<'_>,

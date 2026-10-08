@@ -742,3 +742,6 @@ fn direct_format_extent_failure_is_primary_before_builder_and_finish_control() {
         KernelFailure::ResourceExhausted
     );
 }
+
+#[path = "largeint_text_tests.rs"]
+mod largeint_text_tests;

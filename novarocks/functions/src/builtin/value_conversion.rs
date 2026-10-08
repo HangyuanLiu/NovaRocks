@@ -53,6 +53,8 @@ pub(super) const LARGEINT_SIGNED: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_signed_null_overflow/v1";
 pub(super) const LARGEINT_FLOAT: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_float_round/v1";
+pub(super) const LARGEINT_TEXT: &str =
+    "builtin.scalar/value_domain_conversion/largeint_to_utf8_text/v1";
 pub(super) const NULL_LIFT: &str =
     "builtin.scalar/value_domain_conversion/null_to_typed_nullable/v1";
 
@@ -90,6 +92,7 @@ pub(super) fn definition_parts()
         (SIGNED_LARGEINT, "Physical(Int8|Int16|Int32|Int64)->LargeInt(FixedSizeBinary16)", "explicit exact LargeInt target; signed i128 extension; NULL preserved"),
         (LARGEINT_SIGNED, "LargeInt(FixedSizeBinary16)->Physical(Int8|Int16|Int32|Int64)", "explicit nullable exact target; out-of-range value returns NULL; NULL preserved"),
         (LARGEINT_FLOAT, "LargeInt(FixedSizeBinary16)->Physical(Float32|Float64)", "explicit exact target; existing i128 as float rounding; NULL preserved"),
+        (LARGEINT_TEXT, "LargeInt(FixedSizeBinary16)->Physical(Utf8)", "explicit exact target; original signed big-endian i128 text; NULL preserved"),
         (NULL_LIFT, "Physical Null(nullable=true)->explicit complete nullable target", "evaluate child eagerly; strict NULL protocol produces typed NULL without row implementation"),
     ]
     .into_iter()
@@ -166,6 +169,7 @@ pub(super) fn recipe_selection(
         SIGNED_LARGEINT,
         LARGEINT_SIGNED,
         LARGEINT_FLOAT,
+        LARGEINT_TEXT,
         NULL_LIFT,
     ]
     .into_iter()
@@ -459,6 +463,12 @@ fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType
                 && target.logical_type == ValueLogicalType::Physical
                 && matches!(target.data_type, DataType::Float32 | DataType::Float64)
         }
+        LARGEINT_TEXT => {
+            source.logical_type == ValueLogicalType::LargeInt
+                && source.data_type == DataType::FixedSizeBinary(16)
+                && target.logical_type == ValueLogicalType::Physical
+                && target.data_type == DataType::Utf8
+        }
         NULL_LIFT => {
             source.logical_type == ValueLogicalType::Physical
                 && source.data_type == DataType::Null
@@ -573,6 +583,7 @@ impl FunctionBindingResolver for ValueConversionResolver {
                 SIGNED_LARGEINT,
                 LARGEINT_SIGNED,
                 LARGEINT_FLOAT,
+                LARGEINT_TEXT,
                 NULL_LIFT,
             ] {
                 work.step()?;
@@ -796,7 +807,7 @@ mod tests {
         let definition = value_conversion_definition().unwrap();
         let declaration = definition.binding_declaration().unwrap();
         declaration.validate_complete_effects().unwrap();
-        assert_eq!(declaration.overloads().len(), 5);
+        assert_eq!(declaration.overloads().len(), 6);
         for overload in declaration.overloads() {
             assert_eq!(overload.effects.as_ref().unwrap(), &effects());
         }

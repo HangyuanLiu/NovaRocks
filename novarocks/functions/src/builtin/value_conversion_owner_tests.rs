@@ -142,7 +142,7 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
 }
 
 #[test]
-fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_five_implementation_records() {
+fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_six_implementation_records() {
     let owner = owner();
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
     let actual = catalog
@@ -170,6 +170,10 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_five_implementati
         (
             value_conversion::LARGEINT_FLOAT,
             "builtin.scalar/value_domain_conversion/largeint_to_float_round/selected-v1",
+        ),
+        (
+            value_conversion::LARGEINT_TEXT,
+            "builtin.scalar/value_domain_conversion/largeint_to_utf8_text/selected-v1",
         ),
         (
             value_conversion::NULL_LIFT,
