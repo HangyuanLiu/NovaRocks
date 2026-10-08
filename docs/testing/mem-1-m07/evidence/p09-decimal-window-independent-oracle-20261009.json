@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "stage": "P09 independent Decimal window fixture golden correction",
+  "source_revision": "12c0a262c7b593ed520587bf1ac7e0b03d2076af",
+  "outcome": "independent oracle passed on both native versions; reviewed golden corrected",
+  "topology": "1FE+3BE",
+  "oracle": {
+    "path": "docs/testing/mem-1-m07/oracles/decimal-window-v1.py",
+    "sha256": "b8598b2290c8faebd045a64589c71a522eeaab50deb7b56387c884756accdf86"
+  },
+  "audit": {
+    "schema_version": 1,
+    "sql_sha256": "764b3b708201c35d7a3b7bea3651254b0be49e3fddc3df1f61aecb59d210735a",
+    "oracle_sha256": "b8598b2290c8faebd045a64589c71a522eeaab50deb7b56387c884756accdf86",
+    "result_sha256": "0ff381b094a6596809c4d194f2b364d5dcd58992b784b78402c0c628fcbb9912",
+    "queries": 6,
+    "rows": 72,
+    "basis": "Exact literals; independent rank/frame/group/lag/lead evaluation; Decimal precision 128 and existing HALF_UP average scale; existing nullable product intermediate overflow. No database output used."
+  },
+  "expected": {
+    "path": "logs/mem-1-m07/p09-decimal-window-oracle-20261009/test_decimal256_window_functions.result",
+    "sha256": "0ff381b094a6596809c4d194f2b364d5dcd58992b784b78402c0c628fcbb9912"
+  },
+  "previous_golden": {
+    "path": "logs/mem-1-m07/p09-decimal-window-oracle-20261009/legacy-golden-before.result",
+    "sha256": "505d9663d20b56a846593ab3d61f552ca404505cab29fcc0a00adc3e61df9fa3"
+  },
+  "sql": {
+    "path": "tests/sql/correctness/decimal/sql/test_decimal256_window_functions.sql",
+    "sha256": "764b3b708201c35d7a3b7bea3651254b0be49e3fddc3df1f61aecb59d210735a"
+  },
+  "review": {
+    "queries": 6,
+    "rows": 72,
+    "changed_queries": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "changed_cells": 160,
+    "headers_unchanged": true,
+    "row_counts_unchanged": true,
+    "null_cells_unchanged": true,
+    "sql_unchanged": true
+  },
+  "mutation_checks": {
+    "changed_window_frame": {
+      "rejected": true,
+      "reason": "frozen SQL changed; oracle review required"
+    }
+  },
+  "native_runs": [
+    {
+      "label": "candidate",
+      "matrix": {
+        "source_revision": "12c0a262c7b593ed520587bf1ac7e0b03d2076af",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+        "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+        "launch_profile": "fault-scenario",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_decimal256_window_functions.sql",
+            "exit_code": 0,
+            "duration_seconds": 1.015
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "63f16c67e6bb41df711d0758a793ca9753f2a5a3",
+      "passed_steps": 7,
+      "raw": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-window-candidate-20261009/matrix-status.json",
+          "sha256": "5f585ca0781a8e174db828dd9379392444c55669a444c101db661945cc2e8924"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-window-candidate-20261009/decimal.log",
+          "sha256": "6ccde938ef3ffb36717651a8f21f3dc80d61873a6ee457ba80b6987e4a566ba3"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-window-candidate-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    },
+    {
+      "label": "old-main",
+      "matrix": {
+        "source_revision": "12c0a262c7b593ed520587bf1ac7e0b03d2076af",
+        "source_dirty": false,
+        "fixture_entry": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-mem-1-m07--3c6dfb66",
+        "fixture_project": "nr-isolated-rest-mem-1-m07-79d9e2eb76",
+        "server_binary": "/Users/harbor/.codex/worktrees/mem-1-m07-main-baseline/NovaRocks/target/release/novarocks",
+        "server_sha256": "5c5bdea5490f209cc0140c1b1e73a30f6ce32c48052673e5fee23ea1300f5756",
+        "launch_profile": "performance",
+        "results": [
+          {
+            "suite": "decimal",
+            "sql_glob": "test_decimal256_window_functions.sql",
+            "exit_code": 0,
+            "duration_seconds": 0.386
+          }
+        ],
+        "fixture_startup_exit_code": 0,
+        "fixture_cleanup_exit_code": 0
+      },
+      "actual_server_build_identity": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+      "passed_steps": 7,
+      "raw": [
+        {
+          "path": "logs/mem-1-m07/p09-decimal-window-old-main-20261009/matrix-status.json",
+          "sha256": "1b18d0f5680d2a806b962e1d7d9fc20186815176cce3873e3043bb2482229fd3"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-window-old-main-20261009/decimal.log",
+          "sha256": "243c146820d4d1ab579783921e68a57f09224883db83039088076219b5178831"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-decimal-window-old-main-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        }
+      ]
+    }
+  ],
+  "pids": [
+    5518,
+    5519,
+    5520,
+    5521,
+    5728,
+    5729,
+    5730,
+    5731
+  ],
+  "all_pids_absent": true,
+  "scope": "Only this fixture; original nullable product intermediate overflow retained. Two remaining legacy Decimal goldens, full SQL/CL/performance/final gates remain open.",
+  "local_only": true,
+  "corrected_golden": {
+    "path": "tests/sql/correctness/decimal/result/test_decimal256_window_functions.result",
+    "sha256": "0ff381b094a6596809c4d194f2b364d5dcd58992b784b78402c0c628fcbb9912"
+  }
+}
