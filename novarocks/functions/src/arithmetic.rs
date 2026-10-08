@@ -425,7 +425,7 @@ impl PreparedArithmeticRecipe {
     }
 }
 
-fn checked_row(
+pub(crate) fn checked_row(
     argument: EvaluatedArgument<'_>,
     ordinal: usize,
     logical_row: usize,

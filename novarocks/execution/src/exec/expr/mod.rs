@@ -69,31 +69,7 @@ use self::function::FunctionKind;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExprId(pub usize);
 
-#[derive(Clone, Debug)]
-pub enum LiteralValue {
-    Null,
-    Int8(i8),
-    Int16(i16),
-    Int32(i32),
-    Int64(i64),
-    LargeInt(i128),
-    Float32(f32),
-    Float64(f64),
-    Bool(bool),
-    Utf8(String),
-    Binary(Vec<u8>),
-    Date32(i32),
-    Decimal128 {
-        value: i128,
-        precision: u8,
-        scale: i8,
-    },
-    Decimal256 {
-        value: i256,
-        precision: u8,
-        scale: i8,
-    },
-}
+pub use novarocks_functions::legacy_literal::LegacyLiteralValue as LiteralValue;
 
 #[derive(Clone, Debug)]
 pub enum ExprNode {

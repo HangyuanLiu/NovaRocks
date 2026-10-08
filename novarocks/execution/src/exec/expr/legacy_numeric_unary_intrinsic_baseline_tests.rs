@@ -229,3 +229,7 @@ fn numeric_unary_raw_largeint_minimum_original_wrapping_and_null() {
     assert!(out.is_null(2));
     assert_eq!(largeint::value_at(out, 3).unwrap(), 0);
 }
+
+#[cfg(test)]
+#[path="numeric_unary_intrinsic_oracle_tests.rs"]
+mod oracle_tests;

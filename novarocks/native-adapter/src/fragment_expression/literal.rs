@@ -298,30 +298,7 @@ pub(super) fn push_zero_literal(
     arena: &mut ExprArena,
     data_type: &DataType,
 ) -> Result<ExprId, String> {
-    let literal = match data_type {
-        DataType::Int8 => LiteralValue::Int8(0),
-        DataType::Int16 => LiteralValue::Int16(0),
-        DataType::Int32 => LiteralValue::Int32(0),
-        DataType::Int64 => LiteralValue::Int64(0),
-        DataType::Float32 => LiteralValue::Float32(0.0),
-        DataType::Float64 => LiteralValue::Float64(0.0),
-        DataType::Decimal128(precision, scale) => LiteralValue::Decimal128 {
-            value: 0,
-            precision: *precision,
-            scale: *scale,
-        },
-        DataType::Decimal256(precision, scale) => LiteralValue::Decimal256 {
-            value: i256::ZERO,
-            precision: *precision,
-            scale: *scale,
-        },
-        dt if novarocks_types::largeint::is_largeint_data_type(dt) => LiteralValue::LargeInt(0),
-        _ => {
-            return Err(format!(
-                "NEGATE is not supported for data type {data_type:?}"
-            ));
-        }
-    };
+    let literal = novarocks_functions::legacy_literal::native_negate_zero(data_type)?;
     Ok(arena.push_typed(ExprNode::Literal(literal), data_type.clone()))
 }
 

@@ -2642,3 +2642,9 @@ mod tests {
 pub mod date_float_cast;
 
 pub mod float_date_cast;
+
+pub mod legacy_arithmetic;
+pub mod legacy_decimal;
+pub mod legacy_literal;
+mod native_negate;
+pub use native_negate::*;
