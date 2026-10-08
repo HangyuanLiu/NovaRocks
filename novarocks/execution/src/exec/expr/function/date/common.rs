@@ -25,7 +25,7 @@ pub use novarocks_functions::datetime_value::{
 };
 
 pub fn naive_to_date32(date: NaiveDate) -> i32 {
-    date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET
+    novarocks_functions::datetime_value::naive_to_date32(date)
 }
 
 pub use novarocks_functions::builtin::calendar_time_text_shared::parse_time;

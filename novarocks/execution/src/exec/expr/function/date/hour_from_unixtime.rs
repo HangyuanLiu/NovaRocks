@@ -17,13 +17,14 @@
 use super::common::extract_i64_array;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, Int64Array};
-use chrono::{Local, TimeZone, Timelike};
-use std::sync::Arc;
-
-const MIN_FROM_UNIXTIME_SECONDS: i64 = 0;
-const MAX_FROM_UNIXTIME_SECONDS: i64 = 253_402_243_199;
-
+use arrow::array::ArrayRef;
+use chrono::{Local, NaiveDateTime, TimeZone};
+fn project_local(seconds: i64) -> Option<NaiveDateTime> {
+    Local
+        .timestamp_opt(seconds, 0)
+        .single()
+        .map(|dt| dt.naive_local())
+}
 pub fn eval_hour_from_unixtime(
     arena: &ExprArena,
     _expr: ExprId,
@@ -32,19 +33,10 @@ pub fn eval_hour_from_unixtime(
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
     let values = extract_i64_array(&arr, "hour_from_unixtime")?;
-    let len = values.len();
-    let mut out = Vec::with_capacity(len);
-    for secs in values.iter().copied().take(len) {
-        let Some(secs) = secs else {
-            out.push(None);
-            continue;
-        };
-        if !(MIN_FROM_UNIXTIME_SECONDS..=MAX_FROM_UNIXTIME_SECONDS).contains(&secs) {
-            out.push(None);
-            continue;
-        }
-        let local = Local.timestamp_opt(secs, 0).single();
-        out.push(local.map(|dt| dt.hour() as i64));
-    }
-    Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+    Ok(
+        novarocks_functions::builtin::calendar_unixtime::evaluate_legacy_hour_from_unixtime(
+            &values,
+            project_local,
+        ),
+    )
 }

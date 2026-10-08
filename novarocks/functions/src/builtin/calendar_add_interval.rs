@@ -48,7 +48,7 @@ fn decimal128_to_i64(value: i128, scale: i8) -> Option<i64> {
     i64::try_from(integral).ok()
 }
 
-fn parse_i64_from_utf8(s: &str) -> Option<i64> {
+pub(super) fn parse_i64_from_utf8(s: &str) -> Option<i64> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return None;

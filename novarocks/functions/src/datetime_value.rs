@@ -20,9 +20,14 @@
 //! the existing execution date helpers. Parsing library work is not a resource grant.
 
 use arrow_schema::TimeUnit;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
 
 pub const UNIX_EPOCH_DAY_OFFSET: i32 = 719163; // 1970-01-01 in Julian days
+
+/// Original v1 Date32 projection, shared without changing its epoch arithmetic.
+pub fn naive_to_date32(date: NaiveDate) -> i32 {
+    date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET
+}
 
 pub fn date32_to_naive(days: i32) -> Option<NaiveDate> {
     NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET.checked_add(days)?)
