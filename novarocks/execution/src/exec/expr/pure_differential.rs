@@ -1704,3 +1704,6 @@ mod map_keys_values_tests;
 mod time_text_tests;
 
 mod string_measure_shared_tests;
+
+#[path = "pure_differential/regexp_count_tests.rs"]
+mod regexp_count_tests;

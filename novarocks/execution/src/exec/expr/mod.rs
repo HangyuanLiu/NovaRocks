@@ -1302,3 +1302,6 @@ mod legacy_map_keys_values_baseline_tests;
 
 #[cfg(test)]
 mod legacy_string_measure_additional_baseline_tests;
+
+#[cfg(test)]
+mod legacy_regexp_count_extended_baseline_tests;
