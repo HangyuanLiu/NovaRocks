@@ -19,7 +19,7 @@
 //! Legacy projection preserves its existing raw carrier and diagnostic surface.
 
 use super::{
-    calendar_extended::{self, CalendarExtendedOp},
+    calendar_extended::{self, CalendarCarrierError, CalendarExtendedOp},
     calendar_extended_parse::CalendarParseOp,
 };
 use crate::{
@@ -38,6 +38,7 @@ pub(super) struct CalendarInput<'call, 'batch> {
     pub arguments: &'batch [EvaluatedArgument<'batch>],
     pub selected: Selection<'batch>,
     pub row_error_boundary: Option<&'call dyn Fn(usize, &str) -> Result<(), KernelFailure>>,
+    pub carrier_error_boundary: Option<&'call dyn Fn(CalendarCarrierError<'_>) -> KernelFailure>,
     pub legacy: bool,
 }
 impl<'call, 'batch> CalendarInput<'call, 'batch> {
@@ -57,6 +58,13 @@ impl<'call, 'batch> CalendarInput<'call, 'batch> {
         }
         Ok(crate::RowDataError::new(ordinal, message))
     }
+    pub(super) fn carrier_error(self, error: CalendarCarrierError<'_>) -> KernelFailure {
+        if let Some(boundary) = self.carrier_error_boundary {
+            boundary(error)
+        } else {
+            crate::kernel_control::invalid(&error.legacy_message())
+        }
+    }
     pub fn owner(input: ScalarCallInput<'call, 'batch>) -> Self {
         Self {
             types: &input.contract().selected().argument_types,
@@ -66,12 +74,15 @@ impl<'call, 'batch> CalendarInput<'call, 'batch> {
             selected: input.selection(),
             legacy: false,
             row_error_boundary: None,
+            carrier_error_boundary: None,
         }
     }
 }
 #[derive(Clone, Copy, Debug)]
 pub enum CalendarOperation {
     Trunc,
+    TimestampDiff,
+    DaysShift(i64),
     Timestamp,
     WeeksDiff,
     HoursDiff,
@@ -88,6 +99,8 @@ impl CalendarOperation {
     fn operation(self) -> CalendarExtendedOp {
         match self {
             Self::Trunc => CalendarExtendedOp::Trunc,
+            Self::TimestampDiff => CalendarExtendedOp::TimestampDiff,
+            Self::DaysShift(factor) => CalendarExtendedOp::DaysShift(factor),
             Self::Timestamp => CalendarExtendedOp::Timestamp,
             Self::WeeksDiff => CalendarExtendedOp::WeeksDiff,
             Self::HoursDiff => CalendarExtendedOp::HoursDiff,
@@ -150,17 +163,33 @@ pub fn evaluate_legacy_calendar(
             FunctionArgumentType::Value(FunctionValueType::new(array.data_type().clone(), true))
         })
         .collect();
-    let arguments_view: Vec<_> = arguments.iter().map(EvaluatedArgument::Column).collect();
+    let arguments_view: Vec<_> = arguments
+        .iter()
+        .map(|argument| {
+            // The original day/week family explicitly broadcasts a one-row child.
+            if matches!(operation, CalendarOperation::DaysShift(_)) && argument.len() == 1 {
+                EvaluatedArgument::Scalar(argument)
+            } else {
+                EvaluatedArgument::Column(argument)
+            }
+        })
+        .collect();
     // A short legacy array is an invalid caller and keeps the old indexing panic
     // at the adapter boundary. The selected core retains its own bounds checks.
     for argument in arguments {
-        assert!(argument.len() >= rows, "legacy calendar row out of bounds");
+        assert!(
+            argument.len() >= rows
+                || (matches!(operation, CalendarOperation::DaysShift(_)) && argument.len() == 1),
+            "legacy calendar row out of bounds"
+        );
     }
     let target = FunctionValueType::new(output_type.clone(), true);
     let carrier = if matches!(operation, CalendarOperation::Timestamp)
         || (matches!(
             operation,
-            CalendarOperation::Trunc | CalendarOperation::StrToDate
+            CalendarOperation::Trunc
+                | CalendarOperation::StrToDate
+                | CalendarOperation::DaysShift(_)
         ) && *output_type != DataType::Date32)
     {
         DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
@@ -196,6 +225,10 @@ pub fn evaluate_legacy_calendar(
             "legacy calendar row failure",
         ))
     };
+    let carrier_error_boundary = |error: CalendarCarrierError<'_>| {
+        *row_failure.borrow_mut() = Some(error.legacy_message());
+        crate::kernel_control::internal("legacy calendar carrier failure")
+    };
     let output = calendar_extended::evaluate_calendar_input(
         operation.operation(),
         CalendarInput {
@@ -206,6 +239,7 @@ pub fn evaluate_legacy_calendar(
             selected: Selection::all(rows),
             legacy: true,
             row_error_boundary: Some(&row_error_boundary),
+            carrier_error_boundary: Some(&carrier_error_boundary),
         },
         &LegacyControl,
     )
@@ -228,7 +262,8 @@ fn legacy_kernel_error(error: KernelFailure) -> String {
 pub fn legacy_extract_datetimes(
     array: &ArrayRef,
 ) -> Result<Vec<Option<chrono::NaiveDateTime>>, String> {
-    let reader = calendar_extended::DateInput::raw(array.as_ref()).map_err(legacy_kernel_error)?;
+    let reader = calendar_extended::DateInput::raw(array.as_ref())
+        .map_err(CalendarCarrierError::legacy_message)?;
     let mut work = crate::kernel_input::EvaluationCheckpoints::new(&LegacyControl);
     let mut values = Vec::with_capacity(array.len());
     for row in 0..array.len() {
@@ -495,6 +530,55 @@ mod legacy_projection_tests {
                 1
             )))
             .is_err()
+        );
+    }
+}
+
+/// Validate only the original raw input carrier before another child conversion.
+pub fn legacy_validate_datetime_source(array: &ArrayRef) -> Result<(), String> {
+    calendar_extended::DateInput::raw(array.as_ref())
+        .map(|_| ())
+        .map_err(CalendarCarrierError::legacy_message)
+}
+
+#[cfg(test)]
+mod carrier_diagnostic_tests {
+    use super::*;
+    use arrow_array::{Int64Array, StructArray};
+    use arrow_schema::Field;
+
+    #[test]
+    fn legacy_carrier_admission_retains_the_complete_nested_type_diagnostic() {
+        let field = Arc::new(Field::new("raw_field_".repeat(512), DataType::Int64, true));
+        let source: ArrayRef = Arc::new(StructArray::new(
+            vec![field].into(),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+            None,
+        ));
+        let expected = format!("unsupported datetime input type: {:?}", source.data_type());
+        assert!(expected.len() > 4096);
+        assert_eq!(legacy_extract_datetimes(&source).unwrap_err(), expected);
+        assert_eq!(
+            legacy_validate_datetime_source(&source).unwrap_err(),
+            expected
+        );
+        let units: ArrayRef = Arc::new(StringArray::from(vec!["day"]));
+        assert_eq!(
+            evaluate_legacy_calendar(
+                CalendarOperation::Trunc,
+                &[units, Arc::clone(&source)],
+                &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                1
+            )
+            .unwrap_err(),
+            expected
+        );
+        let expected_date = format!("unsupported date input type: {:?}", source.data_type());
+        assert_eq!(legacy_extract_dates(&source).unwrap_err(), expected_date);
+        assert_eq!(
+            evaluate_legacy_calendar(CalendarOperation::LastDay, &[source], &DataType::Date32, 1)
+                .unwrap_err(),
+            expected_date
         );
     }
 }

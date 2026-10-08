@@ -42,6 +42,11 @@ use crate::{
 pub(super) fn operation(name: &str) -> Option<CalendarExtendedOp> {
     match name {
         "date_trunc" => Some(CalendarExtendedOp::Trunc),
+        "timestampdiff" => Some(CalendarExtendedOp::TimestampDiff),
+        "date_add" | "adddate" | "days_add" => Some(CalendarExtendedOp::DaysShift(1)),
+        "date_sub" | "subdate" | "days_sub" => Some(CalendarExtendedOp::DaysShift(-1)),
+        "weeks_add" => Some(CalendarExtendedOp::DaysShift(7)),
+        "weeks_sub" => Some(CalendarExtendedOp::DaysShift(-7)),
         "date_format" => Some(CalendarExtendedOp::DateFormat),
         "str_to_date" => Some(CalendarExtendedOp::Parse(
             super::calendar_extended_parse::CalendarParseOp::StrToDate,
@@ -75,6 +80,7 @@ pub(super) fn effects(operation: CalendarExtendedOp) -> FunctionEffectDeclaratio
         own_row_error: if matches!(
             operation,
             CalendarExtendedOp::Trunc
+                | CalendarExtendedOp::TimestampDiff
                 | CalendarExtendedOp::Parse(
                     super::calendar_extended_parse::CalendarParseOp::LastDay
                         | super::calendar_extended_parse::CalendarParseOp::NextDay
@@ -86,7 +92,10 @@ pub(super) fn effects(operation: CalendarExtendedOp) -> FunctionEffectDeclaratio
             FunctionIntrinsicRowError::NoRowError
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: if operation == CalendarExtendedOp::Trunc {
+        null_behavior: if matches!(
+            operation,
+            CalendarExtendedOp::Trunc | CalendarExtendedOp::DaysShift(_)
+        ) {
             FunctionNullBehavior::CalledOnNull
         } else {
             FunctionNullBehavior::Strict

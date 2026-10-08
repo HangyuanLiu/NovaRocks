@@ -816,7 +816,7 @@ fn column_argument(data_type: DataType) -> DiffArgument {
 fn pure_differential_reports_missing_owners_for_the_census() {
     let scalar_census: Vec<(&str, Vec<DiffArgument>)> = vec![
         (
-            "days_add",
+            "months_add",
             vec![
                 column_argument(timestamp()),
                 column_argument(DataType::Int64),

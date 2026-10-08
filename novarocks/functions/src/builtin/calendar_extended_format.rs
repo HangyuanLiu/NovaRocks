@@ -116,7 +116,7 @@ pub(super) fn evaluate_date_format<'a>(
                 "date_format differs from its exact installed profile",
             ));
         }
-        let dates = DateInput::for_input(date_type, date_arg.array().as_ref(), input.legacy)?;
+        let dates = DateInput::for_input(date_type, date_arg.array().as_ref(), input)?;
         let formats = format_arg
             .array()
             .as_any()

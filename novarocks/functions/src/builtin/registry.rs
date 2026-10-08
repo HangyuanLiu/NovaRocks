@@ -869,7 +869,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // Diff family -> Int64.
     for name in [
         "datediff",
-        "timestampdiff",
         "months_diff",
         "years_diff",
         "weeks_diff",
@@ -895,6 +894,18 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             m,
             name,
             Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int64),
+        );
+    }
+
+    // TIMESTAMPDIFF reads the unit before its two temporal operands.
+    for source in [TypeSpec::Datetime, TypeSpec::Date, TypeSpec::Utf8] {
+        add(
+            m,
+            "timestampdiff",
+            Signature::new(
+                vec![TypeSpec::Utf8, source.clone(), source],
+                TypeSpec::Int64,
+            ),
         );
     }
 

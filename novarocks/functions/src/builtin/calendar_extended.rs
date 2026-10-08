@@ -38,6 +38,8 @@ use std::{alloc::Layout, sync::Arc};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CalendarExtendedOp {
     Trunc,
+    TimestampDiff,
+    DaysShift(i64),
     DateFormat,
     Parse(super::calendar_extended_parse::CalendarParseOp),
     WeeksDiff,
@@ -45,6 +47,26 @@ pub(super) enum CalendarExtendedOp {
     MinutesDiff,
     SecondsDiff,
     Timestamp,
+}
+
+/// Carrier admission facts; the legacy boundary retains the complete raw type diagnostic.
+pub(super) enum CalendarCarrierError<'a> {
+    UnsupportedDatetime(&'a DataType),
+    UnsupportedDate(&'a DataType),
+    Downcast(&'static str),
+}
+impl CalendarCarrierError<'_> {
+    pub(super) fn legacy_message(self) -> String {
+        match self {
+            Self::UnsupportedDatetime(data_type) => {
+                format!("unsupported datetime input type: {data_type:?}")
+            }
+            Self::UnsupportedDate(data_type) => {
+                format!("unsupported date input type: {data_type:?}")
+            }
+            Self::Downcast(message) => message.to_string(),
+        }
+    }
 }
 
 pub(super) enum DateInput<'a> {
@@ -83,53 +105,59 @@ impl<'a> DateInput<'a> {
     pub(super) fn for_input(
         source: &FunctionValueType,
         array: &'a dyn Array,
-        legacy: bool,
+        input: super::calendar_extended_shared::CalendarInput<'_, '_>,
     ) -> Result<Self, KernelFailure> {
-        if !legacy {
+        if !input.legacy {
             return Self::checked(source, array);
         }
-        Self::raw(array)
+        Self::raw(array).map_err(|error| input.carrier_error(error))
     }
     pub(super) fn date_for_input(
         source: &FunctionValueType,
         array: &'a dyn Array,
-        legacy: bool,
+        input: super::calendar_extended_shared::CalendarInput<'_, '_>,
     ) -> Result<Self, KernelFailure> {
-        if legacy
+        if input.legacy
             && !matches!(
                 array.data_type(),
                 DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8
             )
         {
-            return Err(invalid(&format!(
-                "unsupported date input type: {:?}",
-                array.data_type()
-            )));
+            return Err(
+                input.carrier_error(CalendarCarrierError::UnsupportedDate(array.data_type()))
+            );
         }
-        Self::for_input(source, array, legacy)
+        Self::for_input(source, array, input)
     }
-    pub(super) fn raw(array: &'a dyn Array) -> Result<Self, KernelFailure> {
+    pub(super) fn raw(array: &'a dyn Array) -> Result<Self, CalendarCarrierError<'a>> {
         match array.data_type() {
-            DataType::Date32 => array
-                .as_any()
-                .downcast_ref()
-                .map(Self::Date)
-                .ok_or_else(|| invalid("failed to downcast to Date32Array")),
+            DataType::Date32 => {
+                array
+                    .as_any()
+                    .downcast_ref()
+                    .map(Self::Date)
+                    .ok_or(CalendarCarrierError::Downcast(
+                        "failed to downcast to Date32Array",
+                    ))
+            }
             DataType::Timestamp(unit, _) => Ok(Self::RawTimestamp(array, unit.clone())),
-            DataType::Utf8 => array
-                .as_any()
-                .downcast_ref()
-                .map(Self::Text)
-                .ok_or_else(|| invalid("failed to downcast to StringArray")),
-            DataType::FixedSizeBinary(16) => array
-                .as_any()
-                .downcast_ref()
-                .map(Self::RawLargeInt)
-                .ok_or_else(|| invalid("datetime LARGEINT input: expected FixedSizeBinaryArray")),
-            other => Err(invalid(&format!(
-                "unsupported datetime input type: {:?}",
-                other
-            ))),
+            DataType::Utf8 => {
+                array
+                    .as_any()
+                    .downcast_ref()
+                    .map(Self::Text)
+                    .ok_or(CalendarCarrierError::Downcast(
+                        "failed to downcast to StringArray",
+                    ))
+            }
+            DataType::FixedSizeBinary(16) => {
+                array.as_any().downcast_ref().map(Self::RawLargeInt).ok_or(
+                    CalendarCarrierError::Downcast(
+                        "datetime LARGEINT input: expected FixedSizeBinaryArray",
+                    ),
+                )
+            }
+            other => Err(CalendarCarrierError::UnsupportedDatetime(other)),
         }
     }
     pub(super) fn read(
@@ -341,6 +369,12 @@ pub(super) fn evaluate_calendar_input<'a>(
     input: super::calendar_extended_shared::CalendarInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
+    if op == CalendarExtendedOp::TimestampDiff {
+        return super::calendar_extended_timestampdiff::evaluate_timestampdiff(input, control);
+    }
+    if let CalendarExtendedOp::DaysShift(factor) = op {
+        return super::calendar_add::evaluate_day_shift(factor, input, control);
+    }
     if let CalendarExtendedOp::Parse(operation) = op {
         return super::calendar_extended_parse::evaluate_calendar_parse(operation, input, control);
     }
@@ -390,7 +424,7 @@ pub(super) fn evaluate_calendar_input<'a>(
         let date_reader = DateInput::for_input(
             sources[date_index],
             arguments[date_index].array().as_ref(),
-            input.legacy,
+            input,
         )?;
         let other_reader = if matches!(
             op,
@@ -409,7 +443,7 @@ pub(super) fn evaluate_calendar_input<'a>(
             Some(DateInput::for_input(
                 sources[1],
                 arguments[1].array().as_ref(),
-                input.legacy,
+                input,
             )?)
         } else {
             None

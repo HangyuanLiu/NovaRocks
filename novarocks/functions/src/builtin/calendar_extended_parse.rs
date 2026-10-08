@@ -273,7 +273,7 @@ pub(super) fn evaluate_calendar_parse<'a>(
             Some(DateInput::date_for_input(
                 sources[0],
                 arguments[0].array().as_ref(),
-                input.legacy,
+                input,
             )?)
         };
         let tokens = if arguments.len() == 2 {
