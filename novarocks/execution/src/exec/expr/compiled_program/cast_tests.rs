@@ -258,6 +258,7 @@ fn fixture(
                 LiteralValue::Null
             } else {
                 match ty.data_type {
+                    DataType::Binary => LiteralValue::Binary(b"native producer".to_vec().into_boxed_slice()),
                     DataType::Boolean => LiteralValue::Boolean(false),
                     DataType::Date32 => LiteralValue::Date32(0),
                     DataType::Int64 => LiteralValue::Int64(0),
@@ -315,6 +316,7 @@ fn fixture(
                 .unwrap()
         } else {
             let value = match source_type.data_type {
+                DataType::Binary => LiteralValue::Binary(b"native\0producer".to_vec().into_boxed_slice()),
                 DataType::Boolean => LiteralValue::Boolean(true),
                 DataType::Date32 => LiteralValue::Date32(71),
                 DataType::Int64 => LiteralValue::Int64(71),
@@ -1105,3 +1107,6 @@ mod float_date_profile_tests;
 
 #[path = "cast_date_float_review_tests.rs"]
 mod date_float_review_probe_tests;
+
+#[path = "cast_binary_text_tests.rs"]
+mod binary_text_profile_tests;

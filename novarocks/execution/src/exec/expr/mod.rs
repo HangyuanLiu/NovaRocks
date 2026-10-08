@@ -1323,3 +1323,11 @@ mod legacy_to_base64_source_baseline_tests;
 
 #[cfg(test)]
 mod legacy_to_binary_metadata_baseline_tests;
+
+#[cfg(test)]
+mod legacy_binary_text_cast_baseline_tests;
+#[cfg(test)]
+mod legacy_binary_text_hidden_null_baseline_tests;
+
+#[cfg(test)]
+mod cast_binary_text_oracle_tests;
