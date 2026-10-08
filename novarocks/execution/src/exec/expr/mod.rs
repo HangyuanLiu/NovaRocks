@@ -1226,3 +1226,9 @@ mod legacy_regexp_position_baseline_tests;
 
 #[cfg(test)]
 mod legacy_md5_family_baseline_tests;
+
+#[cfg(test)]
+mod legacy_decimal_text_baseline_tests;
+
+#[cfg(test)]
+mod legacy_decimal_text_arena_baseline_tests;

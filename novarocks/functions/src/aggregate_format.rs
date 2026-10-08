@@ -154,63 +154,9 @@ fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
 }
 
 fn format_decimal(unscaled: i128, scale: i8) -> String {
-    let scale = scale as i32;
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-
-    let unscaled_str = unscaled.abs().to_string();
-    let scale_usize = scale as usize;
-
-    if unscaled_str.len() <= scale_usize {
-        let padded = format!("{:0>width$}", unscaled_str, width = scale_usize);
-        if unscaled < 0 {
-            format!("-0.{}", padded)
-        } else {
-            format!("0.{}", padded)
-        }
-    } else {
-        let split_pos = unscaled_str.len() - scale_usize;
-        let integer_part = &unscaled_str[..split_pos];
-        let fractional_part = &unscaled_str[split_pos..];
-        if unscaled < 0 {
-            format!("-{}.{}", integer_part, fractional_part)
-        } else {
-            format!("{}.{}", integer_part, fractional_part)
-        }
-    }
+    crate::decimal_text::format_decimal_with_scale(unscaled, scale)
 }
 
 fn format_decimal256(unscaled: i256, scale: i8) -> String {
-    let scale = scale as i32;
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-
-    let negative = unscaled.is_negative();
-    let abs = if negative {
-        unscaled.checked_neg().unwrap_or(unscaled)
-    } else {
-        unscaled
-    };
-    let abs_str = abs.to_string();
-    let scale_usize = scale as usize;
-
-    if abs_str.len() <= scale_usize {
-        let padded = format!("{:0>width$}", abs_str, width = scale_usize);
-        if negative {
-            format!("-0.{}", padded)
-        } else {
-            format!("0.{}", padded)
-        }
-    } else {
-        let split_pos = abs_str.len() - scale_usize;
-        let integer_part = &abs_str[..split_pos];
-        let fractional_part = &abs_str[split_pos..];
-        if negative {
-            format!("-{}.{}", integer_part, fractional_part)
-        } else {
-            format!("{}.{}", integer_part, fractional_part)
-        }
-    }
+    crate::decimal_text::format_decimal256_with_scale(unscaled, scale)
 }

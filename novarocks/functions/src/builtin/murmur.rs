@@ -334,59 +334,11 @@ fn normalize_float_string_for_varchar(formatted: &str) -> String {
 }
 
 pub fn format_decimal_with_scale(unscaled: i128, scale: i8) -> String {
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-    let scale = scale as usize;
-    let abs = unscaled.abs().to_string();
-    if abs.len() <= scale {
-        let frac = format!("{:0>width$}", abs, width = scale);
-        if unscaled < 0 {
-            format!("-0.{}", frac)
-        } else {
-            format!("0.{}", frac)
-        }
-    } else {
-        let split = abs.len() - scale;
-        let int_part = &abs[..split];
-        let frac_part = &abs[split..];
-        if unscaled < 0 {
-            format!("-{}.{}", int_part, frac_part)
-        } else {
-            format!("{}.{}", int_part, frac_part)
-        }
-    }
+    crate::decimal_text::format_decimal_with_scale(unscaled, scale)
 }
 
 pub fn format_decimal256_with_scale(unscaled: i256, scale: i8) -> String {
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-    let scale = scale as usize;
-    let negative = unscaled.is_negative();
-    let abs = if negative {
-        unscaled.checked_neg().unwrap_or(unscaled)
-    } else {
-        unscaled
-    };
-    let abs_str = abs.to_string();
-    if abs_str.len() <= scale {
-        let frac = format!("{:0>width$}", abs_str, width = scale);
-        if negative {
-            format!("-0.{}", frac)
-        } else {
-            format!("0.{}", frac)
-        }
-    } else {
-        let split = abs_str.len() - scale;
-        let int_part = &abs_str[..split];
-        let frac_part = &abs_str[split..];
-        if negative {
-            format!("-{}.{}", int_part, frac_part)
-        } else {
-            format!("{}.{}", int_part, frac_part)
-        }
-    }
+    crate::decimal_text::format_decimal256_with_scale(unscaled, scale)
 }
 
 pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str>) -> String {

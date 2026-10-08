@@ -53,6 +53,7 @@ mod cast;
 mod comparison;
 pub mod control_values;
 pub mod datetime_value;
+pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
