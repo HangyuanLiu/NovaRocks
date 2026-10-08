@@ -485,13 +485,13 @@ pub(super) fn await_idle(
             snapshot["query_epoch_micros"] = serde_json::json!(epoch.elapsed().as_micros());
             snapshots.push(snapshot);
             consecutive = if idle { consecutive + 1 } else { 0 };
-            if consecutive == 2 {
-                return Ok(());
-            }
             ensure!(
                 Instant::now() < deadline && snapshots.len() < 301,
                 "result owners did not converge before {window} {phase} barrier deadline"
             );
+            if consecutive == 2 {
+                return Ok(());
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     })();

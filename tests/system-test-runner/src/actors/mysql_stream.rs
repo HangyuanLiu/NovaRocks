@@ -59,6 +59,7 @@ pub struct TextResultObservation {
     pub wire_bytes: u64,
     pub packets: u64,
     pub columns: u64,
+    pub schema: Vec<TextColumnObservation>,
     pub metadata_sha256: String,
     pub wire_prefix_sha256: String,
     pub first_payload_chunk_micros: Option<u128>,
@@ -66,6 +67,13 @@ pub struct TextResultObservation {
     pub elapsed_micros: u128,
     pub row_sha256: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextColumnObservation {
+    pub name: String,
+    pub mysql_type: u8,
 }
 
 impl MysqlPacket {
@@ -291,6 +299,7 @@ impl AsyncMysqlStream {
                     "server metadata error {}",
                     observation_error(&column)
                 );
+                observation.schema.push(parse_text_column(&column)?);
             }
             let end = self
                 .observation_metadata_packet(
@@ -579,6 +588,56 @@ fn validate_observation_eof(payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Parse ColumnDefinition41 independently of the server metadata encoder.
+/// These probes use ordinary COM_QUERY, whose definition has no default-value
+/// suffix. Lengths are checked before any field copy.
+fn parse_text_column(mut payload: &[u8]) -> Result<TextColumnObservation> {
+    fn field<'a>(payload: &mut &'a [u8]) -> Result<&'a [u8]> {
+        let marker = *payload.first().context("truncated column definition")?;
+        let prefix = match marker {
+            0..=250 => 1,
+            0xfc => 3,
+            0xfd => 4,
+            0xfe => 9,
+            _ => bail!("invalid column definition string length"),
+        };
+        let length = usize::try_from(decode_column_count(
+            payload
+                .get(..prefix)
+                .context("truncated column definition length")?,
+        )?)?;
+        ensure!(
+            length <= 65536,
+            "column definition string exceeds probe bound"
+        );
+        *payload = &payload[prefix..];
+        let value = payload
+            .get(..length)
+            .context("truncated column definition string")?;
+        *payload = &payload[length..];
+        Ok(value)
+    }
+    ensure!(
+        field(&mut payload)? == b"def",
+        "invalid column definition catalog"
+    );
+    for _ in 0..3 {
+        field(&mut payload)?;
+    }
+    let name = field(&mut payload)?;
+    field(&mut payload)?;
+    ensure!(
+        payload.len() == 13 && payload[0] == 0x0c && payload[11..] == [0, 0],
+        "invalid column definition fixed section or trailing bytes"
+    );
+    Ok(TextColumnObservation {
+        name: std::str::from_utf8(name)
+            .context("invalid column name UTF-8")?
+            .to_owned(),
+        mysql_type: payload[7],
+    })
+}
+
 #[derive(Default)]
 struct TextRowValidator {
     cells: u64,
@@ -771,6 +830,80 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
+    fn column_definition() -> Vec<u8> {
+        // Six length-encoded strings, followed by the exact fixed 12 bytes.
+        let mut column = b"\x03def\x00\x00\x00\x01v\x00".to_vec();
+        column.extend_from_slice(&[0x0c, 33, 0, 0xff, 0xff, 0xff, 0xff, 253, 0, 0, 0, 0, 0]);
+        column
+    }
+
+    #[test]
+    fn observation_rejects_malformed_column_definitions() {
+        let column = column_definition();
+        let parsed = super::parse_text_column(&column).unwrap();
+        assert_eq!(parsed.name, "v");
+        assert_eq!(parsed.mysql_type, 253);
+        for truncated in 0..column.len() {
+            assert!(super::parse_text_column(&column[..truncated]).is_err());
+        }
+        for invalid in [vec![3], vec![0xfe, 0, 0, 0, 0], vec![0xfb], vec![0xfe; 9]] {
+            assert!(super::parse_text_column(&invalid).is_err());
+        }
+        let mut extra = column.clone();
+        extra.push(0);
+        assert!(super::parse_text_column(&extra).is_err());
+        let mut wrong_fixed_length = column.clone();
+        wrong_fixed_length[10] = 11;
+        assert!(super::parse_text_column(&wrong_fixed_length).is_err());
+        let mut wrong_filler = column;
+        *wrong_filler.last_mut().unwrap() = 1;
+        assert!(super::parse_text_column(&wrong_filler).is_err());
+    }
+
+    #[tokio::test]
+    async fn observation_rejects_bad_metadata_even_with_valid_row_and_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            read_wire_packet_async(&mut peer, Duration::from_secs(2))
+                .await
+                .unwrap();
+            // The old observer accepted this malformed [3] definition as a
+            // complete one-column result, despite a correct row and EOF.
+            let mut wire = Vec::new();
+            for (sequence, payload) in [
+                (1, &[1][..]),
+                (2, &[3][..]),
+                (3, &[0xfe, 0, 0, 0, 0][..]),
+                (4, &[1, b'7'][..]),
+                (5, &[0xfe, 0, 0, 0, 0][..]),
+            ] {
+                wire.extend_from_slice(&[payload.len() as u8, 0, 0, sequence]);
+                wire.extend_from_slice(payload);
+            }
+            peer.write_all(&wire).await.unwrap();
+        });
+        let observation = AsyncMysqlStream {
+            stream: client,
+            timeout: Duration::from_secs(2),
+        }
+        .observe_text_query("SELECT 7", Duration::ZERO)
+        .await;
+        peer.await.unwrap();
+        assert!(
+            observation
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("truncated column definition")
+        );
+        assert!(observation.schema.is_empty());
+        assert_eq!(observation.rows, 0);
+    }
+
     #[test]
     fn observation_error_retains_the_server_reason_with_bounded_diagnostics() {
         let mut payload = vec![0xff, 0x51, 0x04, b'#', b'H', b'Y', b'0', b'0', b'0'];
@@ -800,9 +933,12 @@ mod tests {
             read_wire_packet_async(&mut peer, timeout)
                 .await
                 .expect("query");
-            for (sequence, payload) in [(1, &[1][..]), (2, &[3][..]), (3, &[0xfe, 0, 0, 0, 0][..])]
-            {
-                write_packet_async(&mut peer, sequence, payload, timeout)
+            for (sequence, payload) in [
+                (1, vec![1]),
+                (2, column_definition()),
+                (3, vec![0xfe, 0, 0, 0, 0]),
+            ] {
+                write_packet_async(&mut peer, sequence, &payload, timeout)
                     .await
                     .expect("metadata");
             }
@@ -842,9 +978,12 @@ mod tests {
             read_wire_packet_async(&mut peer, timeout)
                 .await
                 .expect("query");
-            for (sequence, payload) in [(1, &[1][..]), (2, &[3][..]), (3, &[0xfe, 0, 0, 0, 0][..])]
-            {
-                write_packet_async(&mut peer, sequence, payload, timeout)
+            for (sequence, payload) in [
+                (1, vec![1]),
+                (2, column_definition()),
+                (3, vec![0xfe, 0, 0, 0, 0]),
+            ] {
+                write_packet_async(&mut peer, sequence, &payload, timeout)
                     .await
                     .expect("metadata");
             }

@@ -54,8 +54,9 @@ pub struct RootArrayStorageLimits {
 pub const ARROW_BUFFER_OWNER_METADATA_BOUND: usize = 96;
 
 /// Sum full allocation capacities reported by upstream Arrow, including
-/// sliced-away backing and complete dictionary values. Aliases may be counted more than once, making
-/// the result a conservative upper bound. No growable identity table, Arrow
+/// sliced-away backing and complete dictionary values. A fixed identity cache
+/// counts shared payload backing once; uncached aliases remain conservative.
+/// Every buffer's owner metadata is still charged. No growable table, Arrow
 /// to_data(), hydration, or allocation is used. Variable DataType/Field/schema
 /// allocations are excluded and require a separate construction-origin proof.
 pub fn borrowed_root_array_storage(
@@ -74,6 +75,7 @@ pub fn borrowed_root_array_storage(
         limits,
         bytes: 0,
         nodes: 0,
+        backing: [None; 64],
         inspect_type: &mut no_types,
     };
     state.array(array, 0)?;
@@ -110,6 +112,7 @@ pub(crate) fn borrowed_root_batch_storage_with_types(
         limits,
         bytes: 0,
         nodes: 0,
+        backing: [None; 64],
         inspect_type,
     };
     state.charge(size_of::<RecordBatch>())?;
@@ -133,6 +136,10 @@ struct Inspection<'a> {
     limits: RootArrayStorageLimits,
     bytes: usize,
     nodes: usize,
+    // All inspected buffers remain borrowed and alive throughout inspection,
+    // so a nonempty allocation cannot be freed/reused under this identity.
+    // Cache overflow only increases the upper bound; it never skips capacity.
+    backing: [Option<(usize, usize)>; 64],
 }
 
 impl Inspection<'_> {
@@ -150,7 +157,13 @@ impl Inspection<'_> {
         // sliced away by this view. A custom allocation (for example an IPC
         // slice of a received message) reports its declared region; the
         // complete message backing is accounted by the owner that received it.
-        self.charge(buffer.capacity())?;
+        let identity = (buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        if !self.backing.contains(&Some(identity)) {
+            self.charge(identity.1)?;
+            if let Some(slot) = self.backing.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(identity);
+            }
+        }
         self.charge(ARROW_BUFFER_OWNER_METADATA_BOUND)
     }
 

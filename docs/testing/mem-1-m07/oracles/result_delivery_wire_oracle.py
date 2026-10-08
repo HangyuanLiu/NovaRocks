@@ -32,11 +32,15 @@ def expected_large_row():
 
 if __name__ == "__main__":
     manifest = json.loads(
-        (Path(__file__).parent.parent / "inputs/result-delivery-wire-boundary-v3.json").read_text()
+        (Path(__file__).parent.parent / "inputs/result-delivery-wire-boundary-v4.json").read_text()
     )
     for case, expected in zip(manifest["cases"], [expected_small_rows(), expected_large_row()], strict=True):
         actual = tuple(case[key] for key in [
             "expected_rows", "expected_row_payload_bytes", "expected_packets", "expected_row_sha256"
         ])
         assert actual == expected, case["name"]
-    print("Independent wire oracles match both frozen cases")
+    assert manifest["cases"][0]["expected_schema"] == [{"name": "generate_series", "mysql_type": 8}]
+    assert manifest["cases"][1]["expected_schema"] == [
+        {"name": f"c{i}", "mysql_type": 253} for i in range(17)
+    ]
+    print("Independent row and column-name/type oracles match both frozen cases")

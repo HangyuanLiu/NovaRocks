@@ -148,3 +148,10 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 2026-10-09 P09 result-delivery两wire场景预冻结/实现/registry/build/fmt PASS，native尚未运行；200000小行跨S和16777474B单行跨U24，独立oracle见oracles/result_delivery_wire_oracle.py。仅wire与public owner oracle范围，其他P09/CM/CP门保持OPEN。
 
 2026-10-09 result-delivery v2 native：200000小行准确wire与public owner barrier PASS（actual856）；大REPEAT超既有单字符串1MiB上限返回NULL，输入FAIL非编码结论，8PID退出，收据evidence/p09-result-wire-v2-diagnostics-20261009.json。v3在执行前冻结17合法1MiB列/17825860B大行，SQL功能目的及cap保持，native pending。
+
+### 2026-10-09：C9 合法跨 U24 输入与探针缺口修正
+
+- 干净 `54e850cfb`、实际产品 `856e28f52` 原生 1FE+3BE：200000 小行的行字节/行序/packet 与前后公开 owner 归零观察 PASS；17 个合法 1MiB 字符串组成的 17825860 B 单行在任何行发布前被 root original input backing 96MiB 检查拒绝，保持 FAIL。8 个启动 PID 均退出；收据 `p09-result-wire-v3-diagnostics-20261009.json` 保留原始观察与日志 hash。
+- Arrow 58.2 IPC 将 offsets/values 切成共享 message body 的 Buffer；原 borrowed inspector 每个 alias 再计完整 capacity。修正在该纯借用检查内使用固定 64 项 `data_ptr()+capacity()` 缓存，同一个 payload backing 只收一次，所有 Buffer owner metadata/scaffold 仍逐项保守计入。缓存满后继续重复收，不按 len() 漏掉 sliced-away 容量，不修改 96MiB/节点/深度界、owner 责任或 driver 交付。custom declared region 仍需原 source owner 的完整 backing receipt，缓存不认证其任意私有 owner。
+- 真正 IPC 17 列共享 backing、独立大 backing、缓存溢出三项反例与既有容量 introspection 共 23 PASS；检查区计数 allocator 均零分配。独立审查确认 fixed cache 有限结构工作及 custom source receipt 连续，尚未以此宣称原生修复 PASS。
+- 历史 raw actor 只排除 ERR，畸形 ColumnDefinition41 `[3]` 可被当作列定义；因此历史 schema 正确性不宣称 PASS。强化探针检查六个 length-encoded 字符串和准确 fixed 12 B 区、filler/尾部；v4 在原 v3 SQL/行摘要/packet/全部容量和期限不变下新增独立冻结列名及 MySQL type。收敛 barrier 的第二次 idle 成功也须发生在既定 deadline 内。新原生复跑仍待执行。

@@ -120,6 +120,112 @@ fn storage_limits(bytes: usize) -> novarocks_execution::exec::chunk::RootArraySt
 }
 
 #[test]
+fn borrowed_ipc_batch_counts_shared_full_backing_without_allocating() {
+    use arrow::array::{Array, StringArray};
+    use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+    use novarocks_execution::exec::chunk::{
+        ARROW_BUFFER_OWNER_METADATA_BOUND, RootArrayStorageError, borrowed_root_batch_storage,
+    };
+    let value = "q".repeat(1024 * 1024);
+    let fields: Vec<_> = (0..17)
+        .map(|i| Field::new(format!("c{i}"), DataType::Utf8, false))
+        .collect();
+    let columns: Vec<_> = (0..17)
+        .map(|_| Arc::new(StringArray::from(vec![value.as_str()])) as ArrayRef)
+        .collect();
+    let original = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let mut wire = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut wire, &original.schema()).unwrap();
+    writer.write(&original).unwrap();
+    writer.finish().unwrap();
+    drop(writer);
+    let batch = StreamReader::try_new(std::io::Cursor::new(wire), None)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let first = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let backing = first.values().capacity();
+    assert!(backing >= 17 * 1024 * 1024);
+    for column in batch.columns() {
+        let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(column.values().data_ptr(), first.values().data_ptr());
+        assert_eq!(
+            column.offsets().inner().inner().data_ptr(),
+            first.values().data_ptr()
+        );
+    }
+    let measured =
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(96 * 1024 * 1024)))
+            .expect("one legal shared IPC body must fit the original backing allowance");
+    assert!(measured >= backing + 34 * ARROW_BUFFER_OWNER_METADATA_BOUND);
+    assert!(measured < backing + 64 * 1024);
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(backing - 1))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+}
+
+#[test]
+fn borrowed_batch_rejects_independent_sliced_away_backings() {
+    use arrow::array::StringArray;
+    use arrow::buffer::OffsetBuffer;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_batch_storage};
+    let fields: Vec<_> = (0..17)
+        .map(|i| Field::new(format!("c{i}"), DataType::Utf8, false))
+        .collect();
+    let columns: Vec<_> = (0..17)
+        .map(|_| {
+            let mut bytes = Vec::with_capacity(6 * 1024 * 1024);
+            bytes.push(b'q');
+            Arc::new(StringArray::new(
+                OffsetBuffer::new(vec![0_i32, 1].into()),
+                Buffer::from_vec(bytes),
+                None,
+            )) as ArrayRef
+        })
+        .collect();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(96 * 1024 * 1024))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+}
+
+#[test]
+fn fixed_backing_cache_overflow_remains_conservative_without_allocating() {
+    use arrow::buffer::ScalarBuffer;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_batch_storage};
+    let mut columns: Vec<_> = (0..65)
+        .map(|_| {
+            let mut values = Vec::with_capacity(1024);
+            values.push(7_i32);
+            Arc::new(Int32Array::new(ScalarBuffer::from(values), None)) as ArrayRef
+        })
+        .collect();
+    columns.push(columns[64].clone());
+    columns.push(columns[64].clone());
+    let fields: Vec<_> = (0..columns.len())
+        .map(|i| Field::new(format!("c{i}"), DataType::Int32, false))
+        .collect();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let measured =
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(1024 * 1024))).unwrap();
+    assert!(
+        measured >= 67 * 4096,
+        "uncached aliases must not escape accounting"
+    );
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(67 * 4096 - 1))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+}
+
+#[test]
 fn borrowed_storage_rejects_sliced_away_standard_capacity_without_cell_scan() {
     use arrow::buffer::ScalarBuffer;
     use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};

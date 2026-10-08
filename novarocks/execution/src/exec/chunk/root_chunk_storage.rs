@@ -24,7 +24,8 @@ use novarocks_result_contract::RootProfileV1;
 
 /// Inspect this input's actual Arrow backing, immutable metadata owners, and
 /// Chunk scaffolds without allocation, hashing unknown maps, or touching rows.
-/// Shared aliases are conservatively counted again. The returned upper bound
+/// Shared payload aliases use the array inspector's fixed identity cache;
+/// metadata owners and uncached aliases remain conservative. The upper bound
 /// covers the original input allowance; it does not mint a funding grant or
 /// establish a bounded hydration/source-growth capability.
 ///

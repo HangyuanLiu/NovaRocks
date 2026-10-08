@@ -93,3 +93,5 @@ P04 真实 Tonic unary 的 post-admission metadata/初始 buffer/concrete Body/l
 P04 固定 H2 writer 与本地出站 frame cap 已完成可验证切片；[收据](evidence/p04-h2-fixed-writer/README.md)。68 项实际 H2/Hyper/Tonic 协议、Native574/Worker313共955非重复测试及独立物理分配/退出与Miri通过，五类负向验证真实失败并恢复。只闭合 writer Vec/Core 与相关转发；HeaderMap/HPACK/queue/framecopy/stream/task/socket/TLS和完整2MiB连接包络、Native安装继续，P04仍executing/V1未advertise。desktop-linux fixture完整BOM校验通过，无缺Docker image/JAR；Linux继续由用户手动测试。
 
 P04 本地出站HPACK表上限已完成切片；[收据](evidence/p04-h2-send-header-table/README.md)。fresh0在peer大设置下保留正确size-update/static/literal语义且Table两容器0分配，positive仅逻辑界、晚清零保留spare。75实际协议/Native574/Worker313共962非重复workspace tests、actualsource35/1ignored及7Miri通过；五类runtime负例实际失败/byteexact恢复。wholeheaderblock/HTTPmetadata与完整2MiBconnection/Native安装继续，P04executing/V1未advertise。
+
+线协议探针校验完整 ColumnDefinition41 结构，并比较执行前 v4 冻结的列名和 MySQL type。v3 的合法大行 root backing 拒绝已保留为 FAIL；历史行字节观察不证明列元数据正确。原生复跑须使用强化探针，全部输入与上限不变。

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 root shared backing and strict wire probe focused checks",
+  "base_revision": "54e850cfbcb166885039e2c1b0fe4bcf1005ca8f",
+  "scope": "Uncommitted local change focused checks; not native/performance/final acceptance",
+  "outcome": "passed",
+  "checks": {
+    "root_capacity_introspection": {
+      "passed": 23,
+      "failed": 0,
+      "ignored": 0,
+      "includes": "real 17-column IPC shared allocation; actual independent oversized capacities; fixed cache overflow; allocator-zero inspection and prior sliced-away/custom/schema/work counterexamples"
+    },
+    "mysql_stream_actor": {
+      "passed": 7,
+      "failed": 0,
+      "includes": "malformed complete response rejection; truncated length/fixed section/filler/trailing metadata; exact U24 zero terminal and sequence wrap"
+    },
+    "independent_python_oracle": "row count/bytes/hash/packet count and column names/types match frozen v4",
+    "independent_read_only_review": "No new correctness blocker. Custom full private owner backing remains an independent source-receipt prerequisite."
+  },
+  "unchanged": [
+    "96MiB original input backing cap",
+    "schema work/depth limits",
+    "v3 SQL, rows, payload and packet counts",
+    "query/client/write deadlines",
+    "producer owner and source backing receipts"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-root-shared-backing-tests-20261009.log",
+      "sha256": "db22b16b329da860785b2709bcd99b71717e6557389755aed521806b8991ddb2"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-column-observer-tests-20261009.log",
+      "sha256": "1be5dbd2eac0a901b3467b23c79367618b5a447886df4ef4c689becc7772ebba"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-column-observer-final-tests-20261009.log",
+      "sha256": "02df219b1cd8ced89699e680e728be02c3b22a1aa06fee16df4bece1044f27da"
+    }
+  ]
+}

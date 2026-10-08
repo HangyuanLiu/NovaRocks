@@ -16,7 +16,7 @@
 // under the License.
 
 use super::result_delivery_baseline::await_idle;
-use crate::actors::mysql_stream::AsyncMysqlStream;
+use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Result, ensure};
 use novarocks_cluster_harness::ServerHandle;
@@ -42,6 +42,7 @@ struct WireCase {
     name: String,
     sql: String,
     expected_columns: u64,
+    expected_schema: Vec<TextColumnObservation>,
     expected_rows: u64,
     expected_row_payload_bytes: u64,
     expected_packets: u64,
@@ -70,7 +71,7 @@ impl Scenario for WireBoundary {
             "wire boundary requires native 1FE+3BE"
         );
         let manifest: Manifest = serde_json::from_str(include_str!(
-            "../../../../docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v3.json"
+            "../../../../docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v4.json"
         ))?;
         ensure!(
             manifest.schema_version == 1
@@ -90,6 +91,10 @@ impl Scenario for WireBoundary {
         ensure!(
             case.expected_row_payload_bytes > manifest.segment_bytes,
             "wire boundary must cross a native segment"
+        );
+        ensure!(
+            case.expected_schema.len() as u64 == case.expected_columns,
+            "frozen schema count mismatch"
         );
         let epoch = Instant::now();
         await_idle(context, "wire-boundary", "before", epoch)?;
@@ -128,7 +133,9 @@ impl Scenario for WireBoundary {
             observation.error
         );
         ensure!(
-            observation.columns == case.expected_columns && observation.rows == case.expected_rows,
+            observation.columns == case.expected_columns
+                && observation.schema == case.expected_schema
+                && observation.rows == case.expected_rows,
             "wire result schema or row count disagrees with independent oracle"
         );
         ensure!(
