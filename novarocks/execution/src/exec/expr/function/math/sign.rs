@@ -14,10 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{NumericArrayView, value_at_f64};
+
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::ArrayRef;
+use novarocks_functions::builtin::numeric_elementary::{
+    NumericElementaryOp, evaluate_legacy_numeric_elementary,
+};
+#[cfg(test)]
 use std::sync::Arc;
 
 pub fn eval_sign(
@@ -26,24 +30,12 @@ pub fn eval_sign(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let array = arena.eval(args[0], chunk)?;
-    let view = NumericArrayView::new(&array)?;
-    let len = chunk.len();
-    let mut values = Vec::with_capacity(len);
-    for row in 0..len {
-        let v = value_at_f64(&view, row, len);
-        let out = v.map(|x| {
-            if x > 0.0 {
-                1
-            } else if x < 0.0 {
-                -1
-            } else {
-                0
-            }
-        });
-        values.push(out);
-    }
-    let out = Arc::new(Int64Array::from(values)) as ArrayRef;
+    let arguments = [arena.eval(args[0], chunk)?];
+    let out =
+        evaluate_legacy_numeric_elementary(NumericElementaryOp::Sign, &arguments, chunk.len())
+            .map_err(|error| error.to_string())?;
+    // The shared core returns the original Int64 SIGN carrier before this
+    // legacy cast; the selected owner separately projects the same value to f64.
     super::common::cast_output(out, arena.data_type(expr))
 }
 

@@ -14,25 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use super::common::cast_output;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, Float64Array};
+use arrow::array::ArrayRef;
+#[cfg(test)]
+use arrow::array::Float64Array;
+use novarocks_functions::builtin::numeric_elementary::{
+    NumericElementaryOp, evaluate_legacy_numeric_elementary,
+};
+#[cfg(test)]
 use std::sync::Arc;
-
-fn finite_or_null(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
-}
-
-fn eval_const_f64(
-    len: usize,
-    value: f64,
-    output_type: Option<&arrow::datatypes::DataType>,
-) -> Result<ArrayRef, String> {
-    let values = vec![finite_or_null(value); len];
-    let out = Arc::new(Float64Array::from(values)) as ArrayRef;
-    cast_output(out, output_type)
-}
 
 pub fn eval_e(
     arena: &ExprArena,
@@ -40,7 +33,9 @@ pub fn eval_e(
     _args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_const_f64(chunk.len(), std::f64::consts::E, arena.data_type(expr))
+    let out = evaluate_legacy_numeric_elementary(NumericElementaryOp::E, &[], chunk.len())
+        .map_err(|error| error.to_string())?;
+    cast_output(out, arena.data_type(expr))
 }
 
 pub fn eval_pi(
@@ -49,7 +44,9 @@ pub fn eval_pi(
     _args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_const_f64(chunk.len(), std::f64::consts::PI, arena.data_type(expr))
+    let out = evaluate_legacy_numeric_elementary(NumericElementaryOp::Pi, &[], chunk.len())
+        .map_err(|error| error.to_string())?;
+    cast_output(out, arena.data_type(expr))
 }
 
 #[cfg(test)]

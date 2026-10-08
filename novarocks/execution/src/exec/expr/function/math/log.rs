@@ -14,10 +14,16 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{NumericArrayView, value_at_f64};
+
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, Float64Array};
+use arrow::array::ArrayRef;
+#[cfg(test)]
+use arrow::array::Float64Array;
+use novarocks_functions::builtin::numeric_elementary::{
+    NumericElementaryOp, evaluate_legacy_numeric_elementary,
+};
+#[cfg(test)]
 use std::sync::Arc;
 
 pub fn eval_log(
@@ -26,25 +32,20 @@ pub fn eval_log(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if args.len() == 1 {
-        return super::unary_ops::eval_unary_f64(arena, expr, args, chunk, |v| v.ln());
-    }
-    let left = arena.eval(args[0], chunk)?;
-    let right = arena.eval(args[1], chunk)?;
-    let left_view = NumericArrayView::new(&left)?;
-    let right_view = NumericArrayView::new(&right)?;
-    let len = chunk.len();
-    let mut values = Vec::with_capacity(len);
-    for row in 0..len {
-        let base = value_at_f64(&left_view, row, len);
-        let v = value_at_f64(&right_view, row, len);
-        let out = match (base, v) {
-            (Some(b), Some(x)) if b > 0.0 && b != 1.0 && x > 0.0 => Some(x.log(b)),
-            _ => None,
-        };
-        values.push(out);
-    }
-    let out = Arc::new(Float64Array::from(values)) as ArrayRef;
+    let (op, arguments) = if args.len() == 1 {
+        (
+            NumericElementaryOp::LogNatural,
+            vec![arena.eval(args[0], chunk)?],
+        )
+    } else {
+        // Keep legacy child evaluation order and its first-two-arguments rule.
+        (
+            NumericElementaryOp::LogBase,
+            vec![arena.eval(args[0], chunk)?, arena.eval(args[1], chunk)?],
+        )
+    };
+    let out = evaluate_legacy_numeric_elementary(op, &arguments, chunk.len())
+        .map_err(|error| error.to_string())?;
     super::common::cast_output(out, arena.data_type(expr))
 }
 

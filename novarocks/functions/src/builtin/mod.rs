@@ -86,7 +86,7 @@ mod makedate_owner;
 mod murmur;
 mod numeric_binary;
 mod numeric_binary_owner;
-mod numeric_elementary;
+pub mod numeric_elementary;
 mod numeric_elementary_owner;
 mod numeric_mod;
 mod numeric_mod_owner;
