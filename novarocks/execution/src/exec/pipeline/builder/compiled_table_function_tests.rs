@@ -685,6 +685,7 @@ fn freeze(
             )
             .unwrap_or_else(|error| panic!("fixture table call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Table { node },
             context,
             effects: token.call_contract().effects().clone(),

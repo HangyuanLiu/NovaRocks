@@ -477,6 +477,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         .map(|id| {
             let ctx = context(id, 0);
             p::FrozenPhysicalCall {
+                temporal_source: None,
                 site: p::PhysicalCallSite::Expression(ctx.use_id),
                 context: ctx,
                 effects: effects(FunctionKind::Scalar, ctx),
@@ -503,6 +504,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
     ] {
         let ctx = context(use_id, 0);
         claims.push(p::FrozenPhysicalCall {
+            temporal_source: None,
             site,
             context: ctx,
             effects: effects(kind, ctx),
@@ -768,6 +770,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
                 let mut effect = effects(FunctionKind::Scalar, ctx);
                 effect.argument_control = ArgumentControl::Eager;
                 p::FrozenPhysicalCall {
+                    temporal_source: None,
                     site: p::PhysicalCallSite::Expression(ctx.use_id),
                     context: ctx,
                     effects: effect,

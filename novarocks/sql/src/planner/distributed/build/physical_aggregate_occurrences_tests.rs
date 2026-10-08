@@ -852,6 +852,7 @@ fn aggregate_occurrences_genuine_composed_arithmetic_child_error_survives_lifecy
     .unwrap();
     let e = author_physical_expression_effects_observed(
         PhysicalExpressionEffectsInput {
+            temporal_sources: None,
             fragment: &f.fragment,
             roots: &o.root_uses,
             constants: &f.pools,

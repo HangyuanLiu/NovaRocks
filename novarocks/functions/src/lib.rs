@@ -76,6 +76,7 @@ mod pure_catalogue;
 mod scalar_kernel;
 pub mod selected_copy;
 mod specialization;
+mod temporal_call;
 mod table_call;
 mod table_kernel;
 pub mod temporal_carrier;
@@ -114,6 +115,7 @@ pub use novarocks_type_contract::{
 pub use pure_catalogue::*;
 pub use scalar_kernel::*;
 pub use specialization::FunctionSpecializationFailure;
+pub use temporal_call::{TemporalSourceChannel, PreparedTemporalSource, TemporalCallContract};
 pub use table_call::*;
 pub use table_kernel::*;
 pub use window_call::*;

@@ -461,6 +461,7 @@ fn package() -> p::FragmentPackage {
         .map(|id| {
             let ctx = context(id, 0);
             p::FrozenPhysicalCall {
+                temporal_source: None,
                 site: p::PhysicalCallSite::Expression(ctx.use_id),
                 context: ctx,
                 effects: effects(FunctionKind::Scalar, ctx),
@@ -487,6 +488,7 @@ fn package() -> p::FragmentPackage {
     ] {
         let ctx = context(use_id, 0);
         claims.push(p::FrozenPhysicalCall {
+            temporal_source: None,
             site,
             context: ctx,
             effects: effects(kind, ctx),
@@ -1336,6 +1338,7 @@ fn wide_package() -> p::FragmentPackage {
         &fragment,
         &uses,
         vec![p::FrozenPhysicalCall {
+            temporal_source: None,
             site: p::PhysicalCallSite::Expression(ExpressionUseId::new(0)),
             context: context(0, 0),
             effects: claim,

@@ -1853,6 +1853,7 @@ mod statistics {
                     )
                     .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
                 FrozenPhysicalCall {
+                    temporal_source: None,
                     site,
                     context,
                     effects: token.call_contract().effects().clone(),

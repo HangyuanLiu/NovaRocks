@@ -876,17 +876,12 @@ fn lambda_parameter_slot(lambda: ExprId, ordinal: u32) -> Result<i32, String> {
 /// signature its own resolver answers. Both resolve by the same name on the
 /// backend, so both strip to the same thing here.
 pub(crate) fn wire_function_name(function: &FunctionId) -> Result<&str, String> {
-    let identity = function.as_str();
-    let name = identity
-        .strip_prefix("builtin.")
-        .or_else(|| identity.strip_prefix("parametric."))
-        .and_then(|identity| identity.split_once('/').map(|(_, rest)| rest))
-        .and_then(|identity| identity.strip_suffix("/v1"))
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            format!("native wire v1 cannot encode non-canonical function identity `{identity}`")
-        })?;
-    Ok(name)
+    novarocks_physical_plan::native_v1_function_name(function).map_err(|_| {
+        format!(
+            "native wire v1 cannot encode non-canonical function identity `{}`",
+            function.as_str()
+        )
+    })
 }
 
 pub(crate) fn encode_window_frame(

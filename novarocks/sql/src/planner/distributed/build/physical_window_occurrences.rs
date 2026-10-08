@@ -201,6 +201,7 @@ pub(crate) fn prepare_physical_window_occurrence_observed(
         .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
+        temporal_source: None,
         site: PhysicalCallSite::Expression(input.use_id),
         context: invocation.context,
         effects: preparation.call_contract().effects().clone(),

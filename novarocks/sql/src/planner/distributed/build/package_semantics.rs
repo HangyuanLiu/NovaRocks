@@ -46,7 +46,7 @@ use novarocks_type_contract::{
 };
 
 use super::expression_occurrences::{
-    ExpressionOccurrenceError, author_physical_occurrences_observed,
+    ExpressionOccurrenceError, author_physical_occurrences_from_journal_observed,
 };
 use super::lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError};
 use super::physical_expression_effects::PhysicalCallSourceScope;
@@ -149,8 +149,7 @@ fn author_one(
     policy: ConstantPolicy,
     control: &dyn PureCompileControl,
 ) -> Result<FragmentPackageSemantics, PackageSemanticsError> {
-    let occurrences =
-        author_physical_occurrences_observed(fragment, owner.function_catalog().as_ref(), control)?;
+    let occurrences = author_physical_occurrences_from_journal_observed(owner, fragment, control)?;
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let environments = (|| {
         let mut aggregate_environments = BTreeMap::new();

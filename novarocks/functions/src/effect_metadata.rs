@@ -72,6 +72,13 @@ pub(crate) fn digest_effect_declaration(hasher: &mut Sha256, effects: &FunctionE
         ArgumentControl::Aggregate => hasher.update([8]),
         ArgumentControl::Window => hasher.update([9]),
         ArgumentControl::Table => hasher.update([10]),
+        ArgumentControl::TemporalSource(kind) => hasher.update([
+            11,
+            match kind {
+                novarocks_type_contract::TemporalSourceKind::TimeToSec => 1,
+                novarocks_type_contract::TemporalSourceKind::TimeFormat => 2,
+            },
+        ]),
     }
     hasher.update([match instance_state {
         FunctionInstanceState::None => 1,

@@ -31,6 +31,7 @@ mod frozen_pruning;
 mod identity;
 mod package;
 mod plan;
+mod physical_temporal_source;
 mod predicate;
 mod pruning_structure;
 mod relation;
@@ -63,6 +64,10 @@ pub use novarocks_type_contract::{
 };
 pub use package::*;
 pub use plan::*;
+pub use physical_temporal_source::{
+    native_v1_function_name, NonCanonicalNativeV1FunctionName, temporal_source_definitions_observed,
+    TemporalSourceProjectionError,
+};
 pub use predicate::*;
 pub use pruning_structure::*;
 pub use relation::*;
@@ -86,3 +91,6 @@ pub const PLAN_CONTRACT_REVISION: u32 = 11;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod physical_temporal_source_tests;

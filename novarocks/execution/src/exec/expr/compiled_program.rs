@@ -398,7 +398,9 @@ impl CompiledExpressionInstance {
                                 != FunctionNullBehavior::ControlDefined
                         }
                         (
-                            ControlShape::If | ControlShape::Coalesce,
+                            ControlShape::If
+                            | ControlShape::Coalesce
+                            | ControlShape::TemporalSource(_),
                             PreparedPureKernel::ControlIntrinsic(_),
                         ) => {
                             call.call_contract().effects().null_behavior
@@ -790,7 +792,7 @@ mod copy_tests;
 mod guarded;
 
 #[cfg(test)]
-mod guarded_tests;
+pub(crate) mod guarded_tests;
 
 mod boolean_region;
 

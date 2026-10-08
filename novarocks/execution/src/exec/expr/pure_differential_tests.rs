@@ -817,7 +817,6 @@ fn pure_differential_reports_missing_owners_for_the_census() {
     let scalar_census: Vec<(&str, Vec<DiffArgument>)> = vec![
         ("to_datetime", vec![column_argument(DataType::Int64)]),
         ("hour_from_unixtime", vec![column_argument(DataType::Int64)]),
-        ("time_to_sec", vec![column_argument(timestamp())]),
     ];
     let mut inventory = Vec::new();
     for (name, arguments) in scalar_census {

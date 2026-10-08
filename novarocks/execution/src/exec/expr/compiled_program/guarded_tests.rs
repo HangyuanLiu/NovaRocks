@@ -154,14 +154,14 @@ fn options() -> LocalCompileOptions {
         },
     }
 }
-struct Author {
+pub(crate) struct Author {
     function: BoundFunction,
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     logical_argument_count: usize,
     constant_policy: ConstantPolicy,
     expected_result_type: Option<FunctionValueType>,
-    shape: ControlShape,
+    pub(crate) shape: ControlShape,
 }
 impl Author {
     fn request(&self) -> FunctionBindingRequest<'_> {
@@ -171,7 +171,7 @@ impl Author {
             expected_result_type: self.expected_result_type.as_ref(),
         }
     }
-    fn result(&self) -> FunctionValueType {
+    pub(crate) fn result(&self) -> FunctionValueType {
         let FunctionResultType::Scalar(result) = &self.selected.result_type else {
             panic!("scalar owner")
         };
@@ -266,7 +266,7 @@ fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionA
         constant,
     }
 }
-fn author(
+pub(crate) fn author(
     functions: &PureEngineFunctionCatalog,
     name: &str,
     arguments: Vec<FunctionArgument>,
@@ -342,7 +342,7 @@ fn author_with_target(
         shape,
     }
 }
-fn call(
+pub(crate) fn call(
     builder: &mut FragmentBuilder,
     authors: &mut BTreeMap<ExprId, Author>,
     owner: Author,
@@ -393,9 +393,42 @@ impl FlowAuthor {
         self.next_use += 17;
         let definition = fragment.expressions().get(expr).unwrap();
         let mut case_args = Vec::new();
+        let temporal = if let ExprKind::FunctionCall { args, .. } = &definition.kind {
+            if let ControlShape::TemporalSource(shape) = authors[&expr].shape {
+                let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                    &Control,
+                    CompilePhase::FunctionSpecialization,
+                )
+                .unwrap();
+                Some(
+                    novarocks_physical_plan::temporal_source_definitions_observed(
+                        shape.kind(),
+                        fragment.expressions(),
+                        args,
+                        &mut work,
+                    )
+                    .unwrap(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let (shape, args) = match &definition.kind {
-            ExprKind::FunctionCall { args, .. } => (authors[&expr].shape, args.as_ref()),
-            ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, &[][..]),
+            ExprKind::FunctionCall { args, .. } => {
+                temporal
+                    .as_ref()
+                    .map_or((authors[&expr].shape, args.as_ref()), |source| {
+                        (
+                            ControlShape::TemporalSource(source.facts.shape()),
+                            source.definitions.as_ref(),
+                        )
+                    })
+            }
+            ExprKind::Value(_) | ExprKind::Literal(_) | ExprKind::Constant(_) => {
+                (ControlShape::Eager, &[][..])
+            }
             ExprKind::Binary { left, right, .. } => {
                 case_args.extend([*left, *right]);
                 (ControlShape::Eager, case_args.as_slice())
@@ -693,6 +726,21 @@ fn compile_checked_fragment(
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
 ) -> Arc<LocalProgram> {
+    compile_checked_fragment_with_parameters(
+        functions,
+        fragment,
+        authors,
+        result,
+        SemanticParameters::try_new([]).unwrap(),
+    )
+}
+pub(crate) fn compile_checked_fragment_with_parameters(
+    functions: &PureEngineFunctionCatalog,
+    fragment: Fragment,
+    authors: &BTreeMap<ExprId, Author>,
+    result: ResultPort,
+    parameters: SemanticParameters,
+) -> Arc<LocalProgram> {
     let (fragment, constants) = original_request_sources(fragment, authors);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
@@ -718,7 +766,6 @@ fn compile_checked_fragment(
     )
     .unwrap();
     let uses = PhysicalRootUses::try_new(&fragment, flow.clone(), bindings, &Control).unwrap();
-    let parameters = SemanticParameters::try_new([]).unwrap();
     let mut summaries = BTreeMap::new();
     let mut frozen = vec![];
     for invocation in ordered_uses {
@@ -726,7 +773,10 @@ fn compile_checked_fragment(
         let scoped = if let Some(owner) = authors.get(&invocation.definition) {
             let mut children = ScopedExpressionEffects::pure_value(context);
             for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                children = if matches!(owner.shape, ControlShape::If | ControlShape::Coalesce) {
+                children = if matches!(
+                    owner.shape,
+                    ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
+                ) {
                     children
                         .join_control_argument(summaries[child], &flow, ordinal)
                         .unwrap()
@@ -739,7 +789,10 @@ fn compile_checked_fragment(
                 .iter()
                 .map(|id| Some(*id))
                 .collect::<Vec<_>>();
-            let preparation = if matches!(owner.shape, ControlShape::If | ControlShape::Coalesce) {
+            let preparation = if matches!(
+                owner.shape,
+                ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
+            ) {
                 PureCallPreparation::ControlIntrinsic {
                     arguments: children,
                 }
@@ -748,13 +801,71 @@ fn compile_checked_fragment(
                     arguments: children,
                 }
             };
+            let source_plan = if let ControlShape::TemporalSource(shape) = invocation.control {
+                let source = fragment.expressions().get(invocation.definition).unwrap();
+                let ExprKind::FunctionCall { args, .. } = &source.kind else {
+                    panic!("source call");
+                };
+                let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                    &Control,
+                    CompilePhase::FunctionSpecialization,
+                )
+                .unwrap();
+                let projected = novarocks_physical_plan::temporal_source_definitions_observed(
+                    shape.kind(),
+                    fragment.expressions(),
+                    args,
+                    &mut work,
+                )
+                .unwrap();
+                Some(novarocks_type_contract::TemporalSourcePlan {
+                    facts: projected.facts,
+                    sources: projected
+                        .definitions
+                        .iter()
+                        .zip(&invocation.arguments)
+                        .enumerate()
+                        .map(|(ordinal, (&definition, &use_id))| {
+                            novarocks_type_contract::TemporalSourceOccurrence {
+                                role: shape.roles()[ordinal].unwrap(),
+                                definition,
+                                use_id,
+                            }
+                        })
+                        .collect(),
+                })
+            } else {
+                None
+            };
+            let source_channels = source_plan
+                .as_ref()
+                .map(|source| {
+                    source
+                        .sources
+                        .iter()
+                        .map(|channel| novarocks_functions::TemporalSourceChannel {
+                            role: channel.role,
+                            context: flow.uses()[&channel.use_id].context,
+                            value_type: &fragment.expressions().get(channel.definition).unwrap().ty,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let token = functions
                 .prepare_fresh(
                     CallEffectInput {
                         context,
-                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                            &argument_uses,
-                        ),
+                        argument_uses: match &source_plan {
+                            Some(source) => {
+                                novarocks_functions::CallArgumentUses::TemporalSources {
+                                    facts: &source.facts,
+                                    channels: &source_channels,
+                                }
+                            }
+                            None => novarocks_functions::CallArgumentUses::SelectedChannels(
+                                &argument_uses,
+                            ),
+                        },
                         function_id: &owner.function.function_id,
                         kind: FunctionKind::Scalar,
                         selected: owner.selected.as_ref(),
@@ -774,6 +885,7 @@ fn compile_checked_fragment(
                 context,
                 effects: token.call_contract().effects().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                temporal_source: source_plan,
             });
             token.effects()
         } else {
@@ -1210,4 +1322,66 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
             max_projection_work: 16 * 1024 * 1024,
         },
     }
+}
+
+#[path = "temporal_tests.rs"]
+mod temporal_tests;
+
+/// A real executed InvocationData phase, captured before bounded row projection.
+/// The journal is thread local and enabled only by an independent differential.
+#[derive(Clone, Debug)]
+pub(crate) struct TemporalInvocationDataProbe {
+    pub shape: novarocks_type_contract::TemporalSourceShape,
+    pub stage: usize,
+    pub message: String,
+    pub invocation_rows: Vec<usize>,
+    pub affected_rows: Vec<usize>,
+    pub prior_errors: Vec<(usize, String)>,
+}
+thread_local! {
+    static TEMPORAL_DATA_PROBES: std::cell::RefCell<Option<Vec<TemporalInvocationDataProbe>>> =
+        const { std::cell::RefCell::new(None) };
+}
+pub(crate) struct TemporalProbeScope(Option<Vec<TemporalInvocationDataProbe>>);
+impl TemporalProbeScope {
+    pub(crate) fn enter() -> Self {
+        Self(TEMPORAL_DATA_PROBES.with(|slot| slot.replace(Some(Vec::new()))))
+    }
+    pub(crate) fn take(&self) -> Vec<TemporalInvocationDataProbe> {
+        TEMPORAL_DATA_PROBES.with(|slot| std::mem::take(slot.borrow_mut().as_mut().unwrap()))
+    }
+}
+impl Drop for TemporalProbeScope {
+    fn drop(&mut self) {
+        TEMPORAL_DATA_PROBES.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+pub(crate) fn record_temporal_invocation_data(
+    shape: novarocks_type_contract::TemporalSourceShape,
+    stage: usize,
+    message: &str,
+    invocation_rows: &[usize],
+    affected_ordinals: &[usize],
+    prior_errors: &BTreeMap<usize, novarocks_functions::RowDataError>,
+) {
+    TEMPORAL_DATA_PROBES.with(|slot| {
+        if let Some(journal) = slot.borrow_mut().as_mut() {
+            journal.push(TemporalInvocationDataProbe {
+                shape,
+                stage,
+                message: message.to_owned(),
+                invocation_rows: invocation_rows.to_vec(),
+                affected_rows: affected_ordinals
+                    .iter()
+                    .map(|i| invocation_rows[*i])
+                    .collect(),
+                prior_errors: prior_errors
+                    .iter()
+                    .map(|(i, e)| (invocation_rows[*i], e.message().to_owned()))
+                    .collect(),
+            });
+        }
+    });
 }

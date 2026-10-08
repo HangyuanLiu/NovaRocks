@@ -77,6 +77,7 @@ struct Frame {
     choices: Vec<Option<(usize, usize)>>,
     errors: BTreeMap<usize, RowDataError>,
     boolean: Option<BooleanRows>,
+    temporal: Option<TemporalValues>,
 }
 impl Frame {
     fn new(
@@ -122,6 +123,11 @@ impl Frame {
                 work.step()?;
             }
         }
+        let temporal = if matches!(shape, ControlShape::TemporalSource(_)) {
+            Some(TemporalValues::new(rows.len(), work)?)
+        } else {
+            None
+        };
         Ok(Self {
             occurrence,
             rows,
@@ -135,6 +141,7 @@ impl Frame {
             choices,
             errors: BTreeMap::new(),
             boolean: None,
+            temporal,
         })
     }
     fn next_ordinals(
@@ -142,6 +149,7 @@ impl Frame {
         shape: ControlShape,
         arity: usize,
         next_is_pure: bool,
+        batch_rows: usize,
         work: &mut Work<'_>,
     ) -> Result<Option<Vec<usize>>, KernelFailure> {
         if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction)
@@ -165,6 +173,32 @@ impl Frame {
         }
         let mut ordinals = Vec::new();
         match shape {
+            ControlShape::TemporalSource(source_shape) => {
+                if source_shape == novarocks_type_contract::TemporalSourceShape::SecondsCastOther
+                    && self.next == 2
+                {
+                    let state = self
+                        .temporal
+                        .as_ref()
+                        .ok_or_else(|| internal("missing temporal source continuation"))?;
+                    let invocation_domain =
+                        Selection::try_sparse_observed(batch_rows, &self.rows, || work.step())?;
+                    if !state.needs_fallback(&self.errors, invocation_domain, work)? {
+                        return Ok(None);
+                    }
+                }
+                // Later source phases demand all successful invocation rows.
+                // A NULL predicate guards the invocation, never just its NULL rows.
+                for ordinal in 0..self.rows.len() {
+                    if !self.errors.contains_key(&ordinal) {
+                        ordinals.push(ordinal);
+                    }
+                    work.step()?;
+                }
+                if ordinals.is_empty() {
+                    return Ok(None);
+                }
+            }
             ControlShape::Case { simple, arms, .. } => {
                 let offset = usize::from(simple);
                 let then = self.next >= offset
@@ -203,6 +237,90 @@ impl Frame {
         }
         Ok(Some(ordinals))
     }
+    fn attach_temporal(
+        &mut self,
+        child: Child,
+        source_shape: novarocks_type_contract::TemporalSourceShape,
+        batch_rows: usize,
+        work: &mut Work<'_>,
+    ) -> Result<(), KernelFailure> {
+        let mut rows = Vec::with_capacity(child.ordinals.len());
+        for &ordinal in &child.ordinals {
+            rows.push(self.rows[ordinal]);
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        let value = child.value.into_value(selection, work)?;
+        let ty = value.argument().array().data_type().clone();
+        let output = value.materialize(selection, &ty, work)?;
+        let mut good = Vec::with_capacity(child.ordinals.len());
+        let mut ordinals = Vec::with_capacity(child.ordinals.len());
+        let mut errors = output.errors().iter().peekable();
+        for (local, &parent) in child.ordinals.iter().enumerate() {
+            work.step()?;
+            if errors
+                .peek()
+                .is_some_and(|error| error.selected_ordinal() == local)
+            {
+                let error = errors
+                    .next()
+                    .ok_or_else(|| internal("missing temporal child error"))?;
+                self.errors
+                    .entry(parent)
+                    .or_insert_with(|| RowDataError::new(parent, error.message()));
+            } else {
+                good.push(Some(local as u64));
+                ordinals.push(parent);
+            }
+        }
+        if !ordinals.is_empty() {
+            let array = if good.len() == output.values().len() {
+                Arc::clone(output.values())
+            } else {
+                gather(output.values(), &good, work)?
+            };
+            let mut good_rows = Vec::with_capacity(ordinals.len());
+            for &ordinal in &ordinals {
+                good_rows.push(self.rows[ordinal]);
+                work.step()?;
+            }
+            let good_domain =
+                Selection::try_sparse_observed(batch_rows, &good_rows, || work.step())?;
+            let data_error = self
+                .temporal
+                .as_mut()
+                .ok_or_else(|| internal("missing temporal continuation"))?
+                .consume(
+                    source_shape,
+                    self.next - 1,
+                    good_domain,
+                    &ordinals,
+                    array,
+                    work,
+                )?;
+            if let Some(message) = data_error {
+                #[cfg(test)]
+                super::guarded_tests::record_temporal_invocation_data(
+                    source_shape,
+                    self.next - 1,
+                    &message,
+                    &self.rows,
+                    &ordinals,
+                    &self.errors,
+                );
+                for &parent in &ordinals {
+                    work.step()?;
+                    self.errors
+                        .entry(parent)
+                        .or_insert_with(|| RowDataError::new(parent, &message));
+                }
+            }
+        }
+        work.flush()?;
+        drop(output);
+        work.flush()?;
+        Ok(())
+    }
     #[expect(
         clippy::too_many_arguments,
         reason = "Keep the immutable recipe owner, selected child, parent semantics and work scope explicit"
@@ -217,6 +335,9 @@ impl Frame {
         batch_rows: usize,
         work: &mut Work<'_>,
     ) -> Result<(), KernelFailure> {
+        if let ControlShape::TemporalSource(source_shape) = shape {
+            return self.attach_temporal(child, source_shape, batch_rows, work);
+        }
         if !matches!(
             shape,
             ControlShape::If
@@ -571,6 +692,7 @@ pub(super) fn evaluate_tree<'a>(
                 invocation.control,
                 invocation.arguments.len(),
                 next_is_pure,
+                input.num_rows(),
                 work,
             )?
         };
@@ -803,6 +925,19 @@ pub(super) fn evaluate_tree<'a>(
                                 instances,
                                 work,
                             )?)
+                        }
+                        PreparedPureKernel::ControlIntrinsic(_)
+                            if matches!(invocation.control, ControlShape::TemporalSource(_)) =>
+                        {
+                            let state = frame.temporal.take().ok_or_else(|| {
+                                internal("missing temporal continuation at completion")
+                            })?;
+                            state.finish(
+                                invocation.control,
+                                &mut frame.errors,
+                                local_selection,
+                                work,
+                            )?
                         }
                         PreparedPureKernel::ControlIntrinsic(_) => assemble(
                             &frame.children,
@@ -1391,3 +1526,306 @@ fn evaluate_cast<'a>(
         work.step()
     })
 }
+
+// Pure values from ordered, separately evaluated source occurrences. Scheduling
+// stays in Frame/evaluate_tree; no source definition or arena enters the math.
+struct TemporalValues {
+    seconds: Vec<Option<i64>>,
+    normal: Option<(ArrayRef, Vec<usize>)>,
+    result: Option<(ArrayRef, Vec<usize>)>,
+}
+fn temporal_math<T>(
+    work: &mut Work<'_>,
+    body: impl FnOnce(
+        &mut novarocks_functions::EvaluationCheckpoints<'_>,
+    ) -> Result<
+        T,
+        novarocks_functions::builtin::calendar_time_text_shared::TimeTextError,
+    >,
+) -> Result<T, KernelFailure> {
+    use novarocks_functions::builtin::calendar_time_text_shared::TimeTextError;
+    work.flush()?;
+    let mut scope = novarocks_functions::EvaluationCheckpoints::new(work.control);
+    let value = body(&mut scope);
+    // A primary callback refusal never reaches a second checkpoint.
+    if let Err(TimeTextError::Kernel(cause)) = value {
+        return Err(cause);
+    }
+    scope.finish()?;
+    let value = value.map_err(|error| match error {
+        TimeTextError::Kernel(cause) => cause,
+        TimeTextError::Legacy(message) => internal(&message),
+        TimeTextError::InvocationData(_) => {
+            invalid("invocation data escaped its demanded temporal source phase")
+        }
+    })?;
+    work.flush()?;
+    Ok(value)
+}
+impl TemporalValues {
+    fn new(rows: usize, work: &mut Work<'_>) -> Result<Self, KernelFailure> {
+        work.flush()?;
+        let mut seconds = Vec::new();
+        seconds
+            .try_reserve_exact(rows)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        for _ in 0..rows {
+            seconds.push(None);
+            work.step()?;
+        }
+        Ok(Self {
+            seconds,
+            normal: None,
+            result: None,
+        })
+    }
+    fn set_seconds(
+        &mut self,
+        ordinals: &[usize],
+        values: &[Option<i64>],
+        fill_null: bool,
+        work: &mut Work<'_>,
+    ) -> Result<(), KernelFailure> {
+        if ordinals.len() != values.len() {
+            return Err(invalid("temporal dense source length differs"));
+        }
+        // Routing projects dense current values; the ONE original merge core
+        // owns override/fill-NULL value decisions for both v1 and this host.
+        let mut current = Vec::with_capacity(ordinals.len());
+        for &parent in ordinals {
+            work.step()?;
+            current.push(
+                *self
+                    .seconds
+                    .get(parent)
+                    .ok_or_else(|| invalid("temporal source ordinal is outside its invocation"))?,
+            );
+        }
+        temporal_math(work, |scope| {
+            novarocks_functions::builtin::calendar_time_text_shared::merge_source(
+                &mut current,
+                values,
+                if fill_null {
+                    novarocks_functions::builtin::calendar_time_text_shared::MergeMode::FillNull
+                } else {
+                    novarocks_functions::builtin::calendar_time_text_shared::MergeMode::Override
+                },
+                scope,
+            )
+        })?;
+        for (&parent, value) in ordinals.iter().zip(current) {
+            self.seconds[parent] = value;
+            work.step()?;
+        }
+        Ok(())
+    }
+    fn consume(
+        &mut self,
+        shape: novarocks_type_contract::TemporalSourceShape,
+        stage: usize,
+        domain: Selection<'_>,
+        ordinals: &[usize],
+        array: ArrayRef,
+        work: &mut Work<'_>,
+    ) -> Result<Option<String>, KernelFailure> {
+        use novarocks_functions::builtin::calendar_time_text_shared as math;
+        use novarocks_type_contract::{TemporalSourceRole as R, TemporalSourceShape as S};
+        if array.len() != domain.len() || domain.len() != ordinals.len() {
+            return Err(invalid(
+                "temporal source is not compact for its exact invocation",
+            ));
+        }
+        let role = shape
+            .roles()
+            .get(stage)
+            .copied()
+            .flatten()
+            .ok_or_else(|| invalid("unknown temporal source phase"))?;
+        match role {
+            R::RawOverride => {
+                let strings = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        invalid("raw temporal override differs from its frozen Utf8 carrier")
+                    })?;
+                let values = temporal_math(work, |scope| math::clock_strings(strings, scope))?;
+                self.set_seconds(ordinals, &values, false, work)?;
+            }
+            R::OriginalSeconds => {
+                let values = temporal_math(work, |scope| math::sec_to_time_source(&array, scope))?;
+                self.set_seconds(ordinals, &values, false, work)?;
+            }
+            R::Normal if shape.kind() == novarocks_type_contract::TemporalSourceKind::TimeToSec => {
+                let values = temporal_math(work, |scope| {
+                    if let Some(strings) =
+                        array.as_any().downcast_ref::<arrow::array::StringArray>()
+                    {
+                        math::duration_strings(strings, scope)
+                    } else {
+                        math::datetime_seconds(&array, scope)
+                    }
+                })?;
+                self.set_seconds(ordinals, &values, false, work)?;
+            }
+            R::Normal => {
+                if shape == S::FormatOrdinary {
+                    self.normal = Some((array, ordinals.to_vec()));
+                }
+                // The UTF8 override branch still evaluates normal, but its type
+                // and value do not enter the original formatter computation.
+            }
+            R::ImmediateCastSource => {
+                if shape == S::SecondsCastString {
+                    let strings = array
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .ok_or_else(|| {
+                            invalid(
+                                "immediate temporal source differs from its frozen Utf8 carrier",
+                            )
+                        })?;
+                    let values =
+                        temporal_math(work, |scope| math::duration_strings(strings, scope))?;
+                    self.set_seconds(ordinals, &values, false, work)?;
+                }
+            }
+            R::DeepestCastSource => {
+                work.flush()?;
+                let mut scope = novarocks_functions::EvaluationCheckpoints::new(work.control);
+                let result = math::duration_cast_source(&array, &mut scope);
+                if let Err(math::TimeTextError::Kernel(cause)) = result {
+                    return Err(cause);
+                }
+                scope.finish()?;
+                match result {
+                    Ok(Some(values)) => self.set_seconds(ordinals, &values, true, work)?,
+                    Ok(None) => {}
+                    Err(math::TimeTextError::InvocationData(message)) => return Ok(Some(message)),
+                    Err(math::TimeTextError::Legacy(message)) => return Err(invalid(&message)),
+                    Err(math::TimeTextError::Kernel(cause)) => return Err(cause),
+                }
+                work.flush()?;
+            }
+            R::Format => {
+                // Format admission precedes ordinary normal argument parsing,
+                // preserving the original error/panic and evaluation order.
+                let formats = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        invalid("temporal format differs from its frozen Utf8 carrier")
+                    })?;
+                let seconds = if shape == S::FormatOrdinary {
+                    let (normal, normal_ordinals) = self
+                        .normal
+                        .take()
+                        .ok_or_else(|| internal("missing evaluated temporal normal argument"))?;
+                    let mut indices = Vec::with_capacity(ordinals.len());
+                    for parent in ordinals {
+                        let index = normal_ordinals
+                            .binary_search(parent)
+                            .map_err(|_| invalid("format demanded an absent normal source row"))?;
+                        indices.push(Some(index as u64));
+                        work.step()?;
+                    }
+                    let normal = gather(&normal, &indices, work)?;
+                    temporal_math(work, |scope| math::format_argument(&normal, scope))?
+                } else {
+                    let mut seconds = Vec::with_capacity(ordinals.len());
+                    for &parent in ordinals {
+                        seconds.push(self.seconds[parent]);
+                        work.step()?;
+                    }
+                    seconds
+                };
+                let result = temporal_math(work, |scope| {
+                    math::format_output(&seconds, formats, ordinals.len(), scope)
+                })?;
+                self.result = Some((result, ordinals.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+    fn needs_fallback(
+        &self,
+        errors: &BTreeMap<usize, RowDataError>,
+        domain: Selection<'_>,
+        work: &mut Work<'_>,
+    ) -> Result<bool, KernelFailure> {
+        use novarocks_functions::builtin::calendar_time_text_shared as math;
+        if self.seconds.len() != domain.len() {
+            return Err(invalid(
+                "temporal guard differs from its current invocation domain",
+            ));
+        }
+        let mut seconds = Vec::with_capacity(self.seconds.len());
+        for (ordinal, value) in self.seconds.iter().enumerate() {
+            if !errors.contains_key(&ordinal) {
+                seconds.push(*value);
+            }
+            work.step()?;
+        }
+        temporal_math(work, |scope| math::any_null(&seconds, scope))
+    }
+    fn finish(
+        mut self,
+        shape: ControlShape,
+        errors: &mut BTreeMap<usize, RowDataError>,
+        domain: Selection<'_>,
+        work: &mut Work<'_>,
+    ) -> Result<OwnedValue, KernelFailure> {
+        use novarocks_functions::builtin::calendar_time_text_shared as math;
+        let ControlShape::TemporalSource(shape) = shape else {
+            return Err(invalid("temporal continuation has an ordinary shape"));
+        };
+        let output =
+            if shape.kind() == novarocks_type_contract::TemporalSourceKind::TimeToSec {
+                for &ordinal in errors.keys() {
+                    self.seconds[ordinal] = None;
+                    work.step()?;
+                }
+                temporal_math(work, |scope| math::seconds_output(self.seconds, scope))?
+            } else if let Some((result, ordinals)) = self.result {
+                let mut indices = Vec::with_capacity(domain.len());
+                for parent in 0..domain.len() {
+                    let index =
+                        if errors.contains_key(&parent) {
+                            None
+                        } else {
+                            Some(ordinals.binary_search(&parent).map_err(|_| {
+                                internal("successful temporal format row has no result")
+                            })? as u64)
+                        };
+                    indices.push(index);
+                    work.step()?;
+                }
+                gather(&result, &indices, work)?
+            } else if errors.len() == domain.len() {
+                work.flush()?;
+                let output = arrow::array::new_null_array(&DataType::Utf8, domain.len());
+                work.flush()?;
+                output
+            } else {
+                return Err(internal(
+                    "temporal format completed without its demanded format source",
+                ));
+            };
+        let mut row_errors = Vec::with_capacity(errors.len());
+        for error in std::mem::take(errors).into_values() {
+            row_errors.push(error);
+            work.step()?;
+        }
+        Ok(OwnedValue::from_selected(SelectedValues::try_new_observed(
+            domain,
+            output.data_type(),
+            Arc::clone(&output),
+            row_errors.into_boxed_slice(),
+            || work.step(),
+        )?))
+    }
+}
+
+#[cfg(test)]
+#[path = "temporal_phase_tests.rs"]
+mod temporal_phase_tests;

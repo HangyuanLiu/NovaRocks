@@ -32,6 +32,7 @@ mod physical_expression_effects;
 mod physical_fragment_effects;
 mod physical_relational_effects;
 mod physical_scalar_occurrences;
+mod physical_temporal_sources;
 mod physical_scalar_requests;
 mod physical_table_occurrences;
 mod physical_table_requests;
@@ -48,3 +49,6 @@ pub(crate) use contract_lowering::{
     lower_final_change_stream_write_plan, lower_final_physical_plan,
     lower_final_physical_plan_with_provider_reads, lower_final_physical_write_plan,
 };
+
+#[cfg(test)]
+mod physical_temporal_journal_tests;

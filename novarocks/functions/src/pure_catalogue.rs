@@ -119,8 +119,11 @@ impl PureKernelAbi {
                             | ArgumentControl::Coalesce
                             | ArgumentControl::SimpleCase
                             | ArgumentControl::SearchedCase
+                            | ArgumentControl::TemporalSource(_)
                     )
-                    && base.own_row_error == FunctionIntrinsicRowError::NoRowError
+                    && (base.own_row_error == FunctionIntrinsicRowError::NoRowError
+                        || (matches!(base.argument_control, ArgumentControl::TemporalSource(_))
+                            && base.own_row_error == FunctionIntrinsicRowError::MayRaise))
                     && base.instance_state == FunctionInstanceState::None
                     && base.observable_effects == ObservableEffects::NONE
                     && base.environment_dependencies.is_empty()

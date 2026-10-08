@@ -308,6 +308,7 @@ fn package_with_case(
                 )
                 .unwrap();
             calls.push(FrozenPhysicalCall {
+                temporal_source: None,
                 site: PhysicalCallSite::Expression(use_id),
                 context,
                 effects: authored.call_contract().effects().clone(),

@@ -61,6 +61,9 @@ pub struct FrozenPhysicalCall {
     /// Authored by this call's SQL scope, independently of effect claims and
     /// environment parameters. Compilation must not infer a package default.
     pub decimal_overflow_policy: DecimalOverflowPolicy,
+    /// Exact original emitted source roles and independent use occurrences.
+    /// Required only by nominal TemporalSource controls; absence is no fact.
+    pub temporal_source: Option<novarocks_type_contract::TemporalSourcePlan<crate::ExprId>>,
 }
 
 /// Borrow the real binding; this table never copies a second signature DSL.
@@ -398,6 +401,71 @@ impl FrozenFragmentCalls {
                     }
                     match binding {
                         PhysicalCallBinding::Scalar(_) => {
+                            match (invocation.control, &call.temporal_source) {
+                                (
+                                    novarocks_type_contract::ControlShape::TemporalSource(shape),
+                                    Some(plan),
+                                ) => {
+                                    let source = fragment
+                                        .expressions()
+                                        .get(invocation.definition)
+                                        .ok_or(FrozenCallError::WrongControl)?;
+                                    let ExprKind::FunctionCall { args, .. } = &source.kind else {
+                                        return Err(FrozenCallError::WrongControl);
+                                    };
+                                    if admit.is_some() {
+                                        // Projector scratch is fixed stack. Its published
+                                        // trace/definition buffers are bounded by the
+                                        // closed grammar, never an unverified wire claim.
+                                        resources
+                                            .buffer::<novarocks_type_contract::TemporalCastKind>(
+                                                novarocks_type_contract::MAX_CONTROL_DEPTH,
+                                                1,
+                                            )
+                                            .map_err(resource_error)?;
+                                        resources
+                                            .buffer::<crate::ExprId>(3, 1)
+                                            .map_err(resource_error)?;
+                                        admit_resources(&resources, &mut admit)?;
+                                    }
+                                    let definitions = crate::temporal_source_definitions_observed(
+                                        shape.kind(),
+                                        fragment.expressions(),
+                                        args,
+                                        work,
+                                    )
+                                    .map_err(|error| match error {
+                                        crate::TemporalSourceProjectionError::Control(cause) => {
+                                            FrozenCallError::Control(cause)
+                                        }
+                                        crate::TemporalSourceProjectionError::Invalid(_) => {
+                                            FrozenCallError::WrongControl
+                                        }
+                                    })?;
+                                    plan.validate(&definitions)
+                                        .map_err(|_| FrozenCallError::WrongControl)?;
+                                    if plan.sources.len() != invocation.arguments.len() {
+                                        return Err(FrozenCallError::WrongControl);
+                                    }
+                                    for (source, edge) in
+                                        plan.sources.iter().zip(&invocation.arguments)
+                                    {
+                                        if source.use_id != *edge
+                                            || source.definition
+                                                != uses.flow().uses()[edge].definition
+                                        {
+                                            return Err(FrozenCallError::WrongControl);
+                                        }
+                                        work.step()?;
+                                    }
+                                }
+                                (
+                                    novarocks_type_contract::ControlShape::TemporalSource(_),
+                                    None,
+                                ) => return Err(FrozenCallError::WrongControl),
+                                (_, Some(_)) => return Err(FrozenCallError::WrongControl),
+                                (_, None) => {}
+                            }
                             if !call
                                 .effects
                                 .argument_control
@@ -407,6 +475,9 @@ impl FrozenFragmentCalls {
                             }
                         }
                         PhysicalCallBinding::Window { .. } => {
+                            if call.temporal_source.is_some() {
+                                return Err(FrozenCallError::WrongControl);
+                            }
                             if !matches!(
                                 call.effects.argument_control,
                                 ArgumentControl::Aggregate | ArgumentControl::Window
@@ -424,6 +495,9 @@ impl FrozenFragmentCalls {
                 | PhysicalCallSite::WriterPartial { .. }
                 | PhysicalCallSite::WriterFinal { .. }
                 | PhysicalCallSite::Table { .. } => {
+                    if call.temporal_source.is_some() {
+                        return Err(FrozenCallError::WrongControl);
+                    }
                     references = references
                         .checked_add(1)
                         .ok_or(FrozenCallError::TooManyItems)?;

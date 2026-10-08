@@ -625,6 +625,7 @@ fn package(
         &fragment,
         &root_uses,
         vec![FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Table { node: TABLE },
             context,
             effects: token.call_contract().effects().clone(),

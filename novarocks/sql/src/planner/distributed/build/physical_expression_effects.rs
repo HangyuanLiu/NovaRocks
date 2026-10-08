@@ -79,6 +79,8 @@ pub(crate) struct PhysicalExpressionEffectsInput<'a> {
     pub constants: &'a ConstantPools,
     pub parameters: &'a SemanticParameters,
     pub literal_policy: ConstantPolicy,
+    pub temporal_sources:
+        Option<&'a BTreeMap<ExpressionUseId, novarocks_type_contract::TemporalSourcePlan<ExprId>>>,
     pub call_scopes: &'a BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>>,
 }
 
@@ -403,6 +405,10 @@ fn compose_expression_effects_observed<'source>(
                             let fresh = prepare_physical_scalar_occurrence_observed(
                                 PhysicalScalarOccurrenceInput {
                                     source,
+                                    definitions: Some(definitions),
+                                    temporal_source: input
+                                        .temporal_sources
+                                        .and_then(|sources| sources.get(&id)),
                                     request,
                                     flow,
                                     use_id: id,

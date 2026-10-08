@@ -239,6 +239,7 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
         .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
+        temporal_source: None,
         site,
         context,
         effects: preparation.call_contract().effects().clone(),

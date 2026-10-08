@@ -39,6 +39,7 @@ message DomainGuard {
     uint32 coalesce_after_null_ordinal = 3;
     uint32 case_when_arm = 4;
     uint32 case_then_arm = 5;
+    uint32 temporal_after_source_ordinal = 6;
   }
 }
 enum SimpleGuard {
@@ -47,6 +48,7 @@ enum SimpleGuard {
   SIMPLE_GUARD_IF_ELSE = 2;
   SIMPLE_GUARD_CASE_ELSE = 3;
   SIMPLE_GUARD_LAMBDA_INVOCATION = 4;
+  SIMPLE_GUARD_TEMPORAL_INVOCATION_NULL = 5;
 }
 enum EvaluationDemand {
   EVALUATION_DEMAND_UNSPECIFIED = 0;
@@ -67,6 +69,7 @@ message ControlShape {
     SimpleControl simple = 1;
     CaseControl case_control = 2;
     HigherOrderControl higher_order = 3;
+    TemporalSourceShape temporal_source = 4;
   }
 }
 enum SimpleControl {
@@ -138,4 +141,15 @@ message RootSite {
     ChangeAssignmentRoot change_assignment = 28;
     MappingConstantRoot finish_unpivot_constant = 29;
   }
+}
+
+// Explicit emitted-source grammar; UNSPECIFIED is always rejected.
+enum TemporalSourceShape {
+  TEMPORAL_SOURCE_SHAPE_UNSPECIFIED = 0;
+  TEMPORAL_SOURCE_SHAPE_FORMAT_ORDINARY = 1;
+  TEMPORAL_SOURCE_SHAPE_FORMAT_UTF8_OVERRIDE = 2;
+  TEMPORAL_SOURCE_SHAPE_SECONDS_DIRECT = 3;
+  TEMPORAL_SOURCE_SHAPE_SECONDS_CAST_STRING = 4;
+  TEMPORAL_SOURCE_SHAPE_SECONDS_CAST_OTHER = 5;
+  TEMPORAL_SOURCE_SHAPE_SECONDS_ROUNDTRIP = 6;
 }

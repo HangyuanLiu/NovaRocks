@@ -438,12 +438,14 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
     assert_eq!(context.use_id, ExpressionUseId::new(2));
     assert_ne!(context.domain, scalar_context.domain);
     let scalar_call = FrozenPhysicalCall {
+        temporal_source: None,
         site: PhysicalCallSite::Expression(scalar_use),
         context: scalar_context,
         effects: effects(ArgumentControl::Eager, scalar_context.domain),
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
     };
     let aggregate_call = FrozenPhysicalCall {
+        temporal_source: None,
         site,
         context,
         effects: effects(ArgumentControl::Aggregate, context.domain),

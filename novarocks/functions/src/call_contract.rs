@@ -41,6 +41,7 @@ pub struct FunctionCallContract {
     selected: Arc<FunctionBindingSelection>,
     effects: CallEffects,
     parameters: SemanticParameters,
+    temporal_source: Option<crate::TemporalCallContract>,
 }
 impl FunctionCallContract {
     pub fn from_refined(
@@ -115,9 +116,10 @@ impl FunctionCallContract {
                         invalid("call environment is not frozen")
                     }
                 })?;
-            Ok(parameters)
+            let temporal_source = crate::temporal_call::own_temporal_call(input, &mut work)?;
+            Ok((parameters, temporal_source))
         })();
-        let parameters = match result {
+        let (parameters, temporal_source) = match result {
             Err(
                 error @ (KernelFailure::Cancelled
                 | KernelFailure::DeadlineExceeded
@@ -137,7 +139,11 @@ impl FunctionCallContract {
             selected,
             effects: receipt.facts().clone(),
             parameters,
+            temporal_source,
         })
+    }
+    pub fn temporal_source(&self) -> Option<&crate::TemporalCallContract> {
+        self.temporal_source.as_ref()
     }
     pub const fn function_id(&self) -> &FunctionId {
         &self.function_id

@@ -259,6 +259,7 @@ fn run(
 ) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
     author_physical_expression_effects_observed(
         PhysicalExpressionEffectsInput {
+            temporal_sources: None,
             fragment,
             roots,
             constants: pools,

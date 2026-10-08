@@ -137,7 +137,9 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
         ControlShape::Disjunction => Some(wire::SimpleControl::Disjunction),
         ControlShape::If => Some(wire::SimpleControl::If),
         ControlShape::Coalesce => Some(wire::SimpleControl::Coalesce),
-        ControlShape::Case { .. } | ControlShape::HigherOrder { .. } => None,
+        ControlShape::Case { .. }
+        | ControlShape::HigherOrder { .. }
+        | ControlShape::TemporalSource(_) => None,
     };
     let kind = match (simple, shape) {
         (Some(simple), _) => Kind::Simple(simple as i32),
@@ -163,6 +165,9 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
             body_ordinal,
             body_demand: encode_demand(body_demand),
         }),
+        (None, ControlShape::TemporalSource(shape)) => {
+            Kind::TemporalSource(encode_temporal_shape(shape))
+        }
         (None, _) => unreachable!("all fixed control shapes have simple encoding"),
     };
     wire::ControlShape { kind: Some(kind) }
@@ -186,6 +191,9 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
                 "unknown or unspecified control shape",
             )),
         },
+        Kind::TemporalSource(value) => {
+            decode_temporal_shape(*value).map(ControlShape::TemporalSource)
+        }
         Kind::CaseControl(case) => Ok(ControlShape::Case {
             simple: case.simple,
             arms: case.arms,
@@ -207,6 +215,10 @@ fn encode_guard(guard: DomainGuard) -> wire::DomainGuard {
         GuardKind::CoalesceAfterNull { ordinal } => Kind::CoalesceAfterNullOrdinal(ordinal),
         GuardKind::CaseWhen { arm } => Kind::CaseWhenArm(arm),
         GuardKind::CaseThen { arm } => Kind::CaseThenArm(arm),
+        GuardKind::TemporalAfterSource { ordinal } => Kind::TemporalAfterSourceOrdinal(ordinal),
+        GuardKind::TemporalInvocationNull => {
+            Kind::Simple(wire::SimpleGuard::TemporalInvocationNull as i32)
+        }
     };
     wire::DomainGuard {
         owner_use_id: Some(guard.owner.get()),
@@ -226,6 +238,7 @@ fn decode_guard(guard: &wire::DomainGuard) -> Result<DomainGuard, ControlCodecEr
             Ok(wire::SimpleGuard::IfElse) => GuardKind::IfElse,
             Ok(wire::SimpleGuard::CaseElse) => GuardKind::CaseElse,
             Ok(wire::SimpleGuard::LambdaInvocation) => GuardKind::LambdaInvocation,
+            Ok(wire::SimpleGuard::TemporalInvocationNull) => GuardKind::TemporalInvocationNull,
             _ => {
                 return Err(ControlCodecError::InvalidShape(
                     "unknown or unspecified guard kind",
@@ -237,6 +250,9 @@ fn decode_guard(guard: &wire::DomainGuard) -> Result<DomainGuard, ControlCodecEr
         }
         Kind::CaseWhenArm(arm) => GuardKind::CaseWhen { arm: *arm },
         Kind::CaseThenArm(arm) => GuardKind::CaseThen { arm: *arm },
+        Kind::TemporalAfterSourceOrdinal(ordinal) => {
+            GuardKind::TemporalAfterSource { ordinal: *ordinal }
+        }
     };
     Ok(DomainGuard { owner, kind })
 }
@@ -856,3 +872,35 @@ mod tests;
 #[cfg(test)]
 #[path = "physical_control_v2/owned_tests.rs"]
 mod owned_tests;
+
+pub(crate) fn encode_temporal_shape(shape: novarocks_type_contract::TemporalSourceShape) -> i32 {
+    use novarocks_type_contract::TemporalSourceShape as S;
+    use wire::TemporalSourceShape as W;
+    (match shape {
+        S::FormatOrdinary => W::FormatOrdinary,
+        S::FormatUtf8Override => W::FormatUtf8Override,
+        S::SecondsDirect => W::SecondsDirect,
+        S::SecondsCastString => W::SecondsCastString,
+        S::SecondsCastOther => W::SecondsCastOther,
+        S::SecondsRoundtrip => W::SecondsRoundtrip,
+    }) as i32
+}
+pub(crate) fn decode_temporal_shape(
+    value: i32,
+) -> Result<novarocks_type_contract::TemporalSourceShape, ControlCodecError> {
+    use novarocks_type_contract::TemporalSourceShape as S;
+    use wire::TemporalSourceShape as W;
+    Ok(match W::try_from(value) {
+        Ok(W::FormatOrdinary) => S::FormatOrdinary,
+        Ok(W::FormatUtf8Override) => S::FormatUtf8Override,
+        Ok(W::SecondsDirect) => S::SecondsDirect,
+        Ok(W::SecondsCastString) => S::SecondsCastString,
+        Ok(W::SecondsCastOther) => S::SecondsCastOther,
+        Ok(W::SecondsRoundtrip) => S::SecondsRoundtrip,
+        _ => {
+            return Err(ControlCodecError::InvalidShape(
+                "unknown or missing temporal source shape",
+            ));
+        }
+    })
+}

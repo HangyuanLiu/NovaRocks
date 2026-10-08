@@ -2510,6 +2510,12 @@ pub(super) fn scalar_definition_parts(
                     }
                     "abs" => Some(super::abs_owner::effects()),
                     "nullif" => Some(super::nullif_owner::effects()),
+                    name if super::calendar_time_text_owner::operation(name).is_some() => {
+                        Some(super::calendar_time_text_owner::effects(
+                            super::calendar_time_text_owner::operation(name)
+                                .expect("matched TIME source owner"),
+                        ))
+                    }
                     name if super::control_owner::operation(name).is_some() => {
                         Some(super::control_owner::effects(
                             super::control_owner::operation(name)
@@ -2836,6 +2842,9 @@ pub fn contribute_builtin_functions(
             }
             "abs" => super::abs_owner::definition(declaration, resolver)?,
             "nullif" => super::nullif_owner::definition(&name, declaration, resolver)?,
+            name if super::calendar_time_text_owner::operation(name).is_some() => {
+                super::calendar_time_text_owner::definition(name, declaration, resolver)?
+            }
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }

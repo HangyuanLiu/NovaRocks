@@ -130,6 +130,14 @@ fn encode_argument_control(value: ArgumentControl) -> wire::ArgumentControl {
         ArgumentControl::Aggregate => Kind::Simple(W::Aggregate as i32),
         ArgumentControl::Window => Kind::Simple(W::Window as i32),
         ArgumentControl::Table => Kind::Simple(W::Table as i32),
+        ArgumentControl::TemporalSource(kind) => Kind::TemporalSource(match kind {
+            novarocks_type_contract::TemporalSourceKind::TimeToSec => {
+                wire::TemporalSourceKind::TimeToSec
+            }
+            novarocks_type_contract::TemporalSourceKind::TimeFormat => {
+                wire::TemporalSourceKind::TimeFormat
+            }
+        } as i32),
     };
     wire::ArgumentControl { kind: Some(kind) }
 }
@@ -142,6 +150,21 @@ fn decode_argument_control(input: &wire::ArgumentControl) -> Result<ArgumentCont
             .as_ref()
             .ok_or(E::InvalidShape("missing argument control kind"))?
         {
+            Kind::TemporalSource(value) => {
+                ArgumentControl::TemporalSource(match wire::TemporalSourceKind::try_from(*value) {
+                    Ok(wire::TemporalSourceKind::TimeToSec) => {
+                        novarocks_type_contract::TemporalSourceKind::TimeToSec
+                    }
+                    Ok(wire::TemporalSourceKind::TimeFormat) => {
+                        novarocks_type_contract::TemporalSourceKind::TimeFormat
+                    }
+                    _ => {
+                        return Err(E::InvalidShape(
+                            "unknown or missing temporal source owner kind",
+                        ));
+                    }
+                })
+            }
             Kind::HigherOrder(value) => ArgumentControl::HigherOrder {
                 body_ordinal: value.body_ordinal,
                 body_demand: decode_demand(value.body_demand)?,
@@ -373,6 +396,26 @@ fn encode_calls_core(
     resources.known::<(PhysicalCallSite, FrozenPhysicalCall)>(input.entries().len())?;
     // Guard the cumulative component footprint before output allocation.
     for call in input.entries().values() {
+        if let Some(source) = &call.temporal_source {
+            count = count_references(
+                count,
+                source
+                    .facts
+                    .cast_chain()
+                    .len()
+                    .checked_add(source.sources.len())
+                    .ok_or(E::InvalidShape("temporal source footprint overflow"))?,
+            )?;
+            resources.items(source.sources.len() + source.facts.cast_chain().len())?;
+            resources.buffers::<wire::TemporalSourceOccurrence>(source.sources.len(), 1)?;
+            resources.buffers::<i32>(source.facts.cast_chain().len(), 1)?;
+            resources.known::<novarocks_type_contract::TemporalSourceOccurrence<
+                novarocks_physical_plan::ExprId,
+            >>(source.sources.len())?;
+            resources.known::<novarocks_type_contract::TemporalCastKind>(
+                source.facts.cast_chain().len(),
+            )?;
+        }
         count = count_references(count, call.effects.environment.len())?;
         resources.items(call.effects.environment.len())?;
         resources.buffers::<wire::SemanticParameterRef>(call.effects.environment.len(), 1)?;
@@ -390,6 +433,11 @@ fn encode_calls_core(
             context: Some(encode_context(&call.context)),
             effects: Some(encode_effects(&call.effects, resources, work)?),
             decimal_overflow_policy: Some(encode_policy(call.decimal_overflow_policy)),
+            temporal_source: call
+                .temporal_source
+                .as_ref()
+                .map(|source| encode_temporal_source(source, resources, work))
+                .transpose()?,
         });
     }
     Ok(wire::FrozenCalls { entries })
@@ -441,6 +489,18 @@ fn decode_calls_core(
             .effects
             .as_ref()
             .ok_or(E::InvalidShape("missing call effects"))?;
+        if let Some(source) = &call.temporal_source {
+            validate_wire_source_extent(source)?;
+            count = count_references(count, source.cast_chain.len() + source.sources.len())?;
+            resources.items(source.sources.len() + source.cast_chain.len())?;
+            resources.buffers::<novarocks_type_contract::TemporalSourceOccurrence<
+                novarocks_physical_plan::ExprId,
+            >>(source.sources.len(), 2)?;
+            resources
+                .buffers::<novarocks_type_contract::TemporalCastKind>(source.cast_chain.len(), 2)?;
+            resources.known::<wire::TemporalSourceOccurrence>(source.sources.capacity())?;
+            resources.known::<i32>(source.cast_chain.capacity())?;
+        }
         count = count_references(count, effects.environment.len())?;
         resources.items(effects.environment.len())?;
         resources.buffers::<novarocks_type_contract::SemanticParameterRef>(
@@ -472,6 +532,11 @@ fn decode_calls_core(
                 resources,
                 work,
             )?,
+            temporal_source: call
+                .temporal_source
+                .as_ref()
+                .map(|source| decode_temporal_source(source, resources, work))
+                .transpose()?,
             decimal_overflow_policy: decode_policy(
                 call.decimal_overflow_policy
                     .ok_or(E::InvalidShape("missing call decimal overflow policy"))?,
@@ -765,6 +830,7 @@ mod tests {
             .uses()
             .values()
             .map(|invocation| FrozenPhysicalCall {
+                temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(invocation.context.use_id),
                 context: invocation.context,
@@ -947,6 +1013,7 @@ mod tests {
         for (call, use_id) in [(0, special_base), (1, special_base + 1)] {
             let context = context(use_id, 0, EvaluationDemand::Value);
             calls.push(FrozenPhysicalCall {
+                temporal_source: None,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Aggregate {
                     node: aggregate,
@@ -964,6 +1031,7 @@ mod tests {
             .unwrap()
             .context;
         calls.push(FrozenPhysicalCall {
+            temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Expression(window_use.use_id),
             context: window_use,
@@ -971,6 +1039,7 @@ mod tests {
         });
         let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            temporal_source: None,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Table { node: table },
             context,
@@ -1534,3 +1603,129 @@ mod tests {
         include!("owned_resources/tests.rs");
     }
 }
+
+fn validate_wire_source_extent(source: &wire::TemporalSourcePlan) -> Result<(), E> {
+    if source.sources.len() > 3
+        || source.cast_chain.len() > novarocks_type_contract::MAX_CONTROL_DEPTH
+    {
+        return Err(E::InvalidShape(
+            "temporal source component exceeds exact bounds",
+        ));
+    }
+    Ok(())
+}
+fn encode_temporal_source(
+    source: &novarocks_type_contract::TemporalSourcePlan<novarocks_physical_plan::ExprId>,
+    resources: &mut Projection<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::TemporalSourcePlan, E> {
+    use novarocks_type_contract::{TemporalCastKind as C, TemporalSourceRole as R};
+    source
+        .validate_structure()
+        .map_err(|_| E::InvalidShape("invalid temporal source structure"))?;
+    let mut cast_chain = resources.reserve(source.facts.cast_chain().len(), work)?;
+    for kind in source.facts.cast_chain() {
+        work.step()?;
+        cast_chain.push(match kind {
+            C::Ordinary => wire::TemporalCastKind::Ordinary,
+            C::Time => wire::TemporalCastKind::Time,
+            C::TimeFromDatetime => wire::TemporalCastKind::TimeFromDatetime,
+        } as i32);
+    }
+    let mut sources = resources.reserve(source.sources.len(), work)?;
+    for channel in &source.sources {
+        work.step()?;
+        let role = match channel.role {
+            R::Normal => wire::TemporalSourceRole::Normal,
+            R::Format => wire::TemporalSourceRole::Format,
+            R::RawOverride => wire::TemporalSourceRole::RawOverride,
+            R::OriginalSeconds => wire::TemporalSourceRole::OriginalSeconds,
+            R::ImmediateCastSource => wire::TemporalSourceRole::ImmediateCastSource,
+            R::DeepestCastSource => wire::TemporalSourceRole::DeepestCastSource,
+        };
+        sources.push(wire::TemporalSourceOccurrence {
+            role: role as i32,
+            use_id: Some(channel.use_id.get()),
+            definition_id: Some(channel.definition.get()),
+        });
+    }
+    Ok(wire::TemporalSourcePlan {
+        shape: crate::physical_control_v2::encode_temporal_shape(source.facts.shape()),
+        cast_chain,
+        sources,
+    })
+}
+fn decode_temporal_source(
+    source: &wire::TemporalSourcePlan,
+    resources: &mut Projection<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_type_contract::TemporalSourcePlan<novarocks_physical_plan::ExprId>, E> {
+    use novarocks_type_contract::{
+        TemporalCastKind as C, TemporalSourceFacts as F, TemporalSourceRole as R,
+        TemporalSourceShape as S,
+    };
+    validate_wire_source_extent(source)?;
+    let shape = crate::physical_control_v2::decode_temporal_shape(source.shape)?;
+    if source.sources.len() != shape.source_count() {
+        return Err(E::InvalidShape("wrong temporal source channel count"));
+    }
+    let mut cast_chain = resources.reserve(source.cast_chain.len(), work)?;
+    for kind in &source.cast_chain {
+        work.step()?;
+        cast_chain.push(match wire::TemporalCastKind::try_from(*kind) {
+            Ok(wire::TemporalCastKind::Ordinary) => C::Ordinary,
+            Ok(wire::TemporalCastKind::Time) => C::Time,
+            Ok(wire::TemporalCastKind::TimeFromDatetime) => C::TimeFromDatetime,
+            _ => return Err(E::InvalidShape("unknown or missing temporal cast kind")),
+        });
+    }
+    if matches!(shape, S::FormatOrdinary | S::FormatUtf8Override) && !cast_chain.is_empty() {
+        return Err(E::InvalidShape("cast trace on TIME_FORMAT source grammar"));
+    }
+    work.flush()?;
+    let cast_chain = cast_chain.into_boxed_slice();
+    work.flush()?;
+    let facts = match shape {
+        S::FormatOrdinary => F::FormatOrdinary,
+        S::FormatUtf8Override => F::FormatUtf8Override,
+        S::SecondsDirect => F::SecondsDirect { cast_chain },
+        S::SecondsCastString => F::SecondsCastString { cast_chain },
+        S::SecondsCastOther => F::SecondsCastOther { cast_chain },
+        S::SecondsRoundtrip => F::SecondsRoundtrip { cast_chain },
+    };
+    let mut sources = resources.reserve(source.sources.len(), work)?;
+    for channel in &source.sources {
+        work.step()?;
+        let role = match wire::TemporalSourceRole::try_from(channel.role) {
+            Ok(wire::TemporalSourceRole::Normal) => R::Normal,
+            Ok(wire::TemporalSourceRole::Format) => R::Format,
+            Ok(wire::TemporalSourceRole::RawOverride) => R::RawOverride,
+            Ok(wire::TemporalSourceRole::OriginalSeconds) => R::OriginalSeconds,
+            Ok(wire::TemporalSourceRole::ImmediateCastSource) => R::ImmediateCastSource,
+            Ok(wire::TemporalSourceRole::DeepestCastSource) => R::DeepestCastSource,
+            _ => return Err(E::InvalidShape("unknown or missing temporal source role")),
+        };
+        sources.push(novarocks_type_contract::TemporalSourceOccurrence {
+            role,
+            use_id: ExpressionUseId::new(required_id(
+                channel.use_id,
+                "missing temporal source use ID",
+            )?),
+            definition: novarocks_physical_plan::ExprId::new(required_id(
+                channel.definition_id,
+                "missing temporal source definition ID",
+            )?),
+        });
+    }
+    work.flush()?;
+    let sources = sources.into_boxed_slice();
+    work.flush()?;
+    let plan = novarocks_type_contract::TemporalSourcePlan { facts, sources };
+    plan.validate_structure()
+        .map_err(|_| E::InvalidShape("invalid temporal source structure"))?;
+    Ok(plan)
+}
+
+#[cfg(test)]
+#[path = "temporal_source_codec_tests.rs"]
+mod temporal_source_codec_tests;

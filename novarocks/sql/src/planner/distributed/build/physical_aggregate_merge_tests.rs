@@ -103,6 +103,7 @@ fn setup<'a>(
         author_physical_occurrences_observed(entry.fragment(), catalog, &control).unwrap();
     let expressions = author_physical_expression_effects_observed(
         PhysicalExpressionEffectsInput {
+            temporal_sources: None,
             fragment: entry.fragment(),
             roots: &occurrences.root_uses,
             constants: owner.plan().constants(),

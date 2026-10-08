@@ -62,7 +62,8 @@ impl FunctionSemantics {
             | ArgumentControl::HigherOrder { .. }
             | ArgumentControl::Aggregate
             | ArgumentControl::Window
-            | ArgumentControl::Table => FunctionArgumentEvaluation::Eager,
+            | ArgumentControl::Table
+            | ArgumentControl::TemporalSource(_) => FunctionArgumentEvaluation::Eager,
         };
         Self {
             volatility: effects.value_stability,

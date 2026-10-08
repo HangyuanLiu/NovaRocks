@@ -346,6 +346,8 @@ fn input<'a>(
     policy: DecimalOverflowPolicy,
 ) -> PhysicalScalarOccurrenceInput<'a> {
     PhysicalScalarOccurrenceInput {
+        definitions: None,
+        temporal_source: None,
         source,
         request,
         flow,

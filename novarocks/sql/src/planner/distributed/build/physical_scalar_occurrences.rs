@@ -74,6 +74,8 @@ impl From<EffectContractError> for PhysicalScalarOccurrenceError {
 /// environment-key list or frozen-call claim supplies these inputs.
 pub(crate) struct PhysicalScalarOccurrenceInput<'a> {
     pub source: &'a ExprNode,
+    pub definitions: Option<&'a novarocks_physical_plan::ExprArena>,
+    pub temporal_source: Option<&'a novarocks_type_contract::TemporalSourcePlan<ExprId>>,
     pub request: &'a AuthoredPhysicalScalarRequest<'a>,
     pub flow: &'a ExpressionControlFlow<ExprId>,
     pub use_id: ExpressionUseId,
@@ -141,14 +143,62 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     ) {
         return Err(PhysicalScalarOccurrenceError::UnsupportedAbi(abi));
     }
-    let shape = scalar_shape(declaration.effects().argument_control, args.len());
+    let shape = match declaration.effects().argument_control {
+        novarocks_type_contract::ArgumentControl::TemporalSource(kind) => {
+            let source =
+                input
+                    .temporal_source
+                    .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                        "missing same-emission temporal source facts",
+                    ))?;
+            let definitions = novarocks_physical_plan::temporal_source_definitions_observed(
+                kind,
+                input
+                    .definitions
+                    .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                        "missing original temporal source arena",
+                    ))?,
+                args,
+                work,
+            )
+            .map_err(|error| match error {
+                novarocks_physical_plan::TemporalSourceProjectionError::Control(cause) => {
+                    PhysicalScalarOccurrenceError::Control(cause)
+                }
+                _ => PhysicalScalarOccurrenceError::InvalidSource(
+                    "invalid original temporal source projection",
+                ),
+            })?;
+            source.validate(&definitions).map_err(|_| {
+                PhysicalScalarOccurrenceError::InvalidSource(
+                    "stale temporal source roles, definitions or facts",
+                )
+            })?;
+            Some(ControlShape::TemporalSource(source.facts.shape()))
+        }
+        control => {
+            if input.temporal_source.is_some() {
+                return Err(PhysicalScalarOccurrenceError::InvalidSource(
+                    "temporal sources on an ordinary scalar call",
+                ));
+            }
+            scalar_shape(control, args.len())
+        }
+    };
     work.step()?;
     let shape = shape.ok_or(PhysicalScalarOccurrenceError::InvalidSource(
         "installed scalar owner has no scalar control shape",
     ))?;
     let type_only = shape == ControlShape::TypeOnly;
     let correct_shape = invocation.control == shape
-        && invocation.arguments.len() == if type_only { 0 } else { args.len() };
+        && invocation.arguments.len()
+            == if type_only {
+                0
+            } else {
+                input
+                    .temporal_source
+                    .map_or(args.len(), |source| source.sources.len())
+            };
     work.step()?;
     if !correct_shape {
         return Err(PhysicalScalarOccurrenceError::InvalidSource(
@@ -160,8 +210,22 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     argument_uses
         .try_reserve_exact(args.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
+    let mut source_channels = Vec::new();
+    if let Some(source) = input.temporal_source {
+        source_channels
+            .try_reserve_exact(source.sources.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        work.flush()?;
+    }
     let mut children = ScopedExpressionEffects::pure_value(invocation.context);
-    for (ordinal, &definition) in args.iter().enumerate() {
+    let count = input
+        .temporal_source
+        .map_or(args.len(), |source| source.sources.len());
+    for ordinal in 0..count {
+        let definition = input.temporal_source.map_or_else(
+            || args[ordinal],
+            |source| source.sources[ordinal].definition,
+        );
         if type_only {
             argument_uses.push(None);
         } else {
@@ -183,6 +247,28 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
                 input.flow,
                 ordinal,
             )?;
+            if let Some(source) = input.temporal_source {
+                let channel = &source.sources[ordinal];
+                if channel.use_id != child_id {
+                    return Err(PhysicalScalarOccurrenceError::InvalidSource(
+                        "temporal source use differs from its ordered argument edge",
+                    ));
+                }
+                let node = input
+                    .definitions
+                    .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                        "missing temporal source arena",
+                    ))?
+                    .get(definition)
+                    .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                        "missing temporal source definition",
+                    ))?;
+                source_channels.push(novarocks_functions::TemporalSourceChannel {
+                    role: channel.role,
+                    context: child.context,
+                    value_type: &node.ty,
+                });
+            }
             argument_uses.push(Some(child_id));
         }
         work.step()?;
@@ -198,7 +284,13 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     };
     let call = CallEffectInput {
         context: invocation.context,
-        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
+        argument_uses: match input.temporal_source {
+            Some(source) => novarocks_functions::CallArgumentUses::TemporalSources {
+                facts: &source.facts,
+                channels: &source_channels,
+            },
+            None => novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
+        },
         function_id: &function.function_id,
         kind: function.kind,
         selected: input.request.selected().as_ref(),
@@ -223,6 +315,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         context: invocation.context,
         effects: preparation.call_contract().effects().clone(),
         decimal_overflow_policy: input.decimal_overflow_policy,
+        temporal_source: input.temporal_source.cloned(),
     };
     work.flush()?;
     Ok(FreshPhysicalScalarOccurrence {

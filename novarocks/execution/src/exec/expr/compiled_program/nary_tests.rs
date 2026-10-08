@@ -952,6 +952,7 @@ fn dual_demand_program() -> Arc<LocalProgram> {
         &fixture.fragment,
         &expression_uses,
         vec![FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Expression(context.use_id),
             context,
             effects: token.call_contract().effects().clone(),

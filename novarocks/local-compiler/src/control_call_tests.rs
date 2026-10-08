@@ -500,12 +500,14 @@ fn package(
         &expression_uses,
         vec![
             FrozenPhysicalCall {
+                temporal_source: None,
                 site: PhysicalCallSite::Expression(parent_context.use_id),
                 context: parent_context,
                 effects: parent_effects,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
             FrozenPhysicalCall {
+                temporal_source: None,
                 site: PhysicalCallSite::Expression(rng_context.use_id),
                 context: rng_context,
                 effects: rng_token.call_contract().effects().clone(),

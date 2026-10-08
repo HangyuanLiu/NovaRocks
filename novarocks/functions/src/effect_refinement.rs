@@ -32,6 +32,10 @@ pub const MAX_CALL_EFFECT_ARGUMENTS: usize = 4096;
 #[derive(Clone, Copy, Debug)]
 pub enum CallArgumentUses<'a> {
     SelectedChannels(&'a [Option<novarocks_type_contract::ExpressionUseId>]),
+    TemporalSources {
+        facts: &'a novarocks_type_contract::TemporalSourceFacts,
+        channels: &'a [crate::TemporalSourceChannel<'a>],
+    },
     AggregateMerge {
         phase: crate::AggregateKernelPhase,
         state_context: novarocks_type_contract::ExpressionEffectContext,
@@ -44,6 +48,16 @@ impl CallArgumentUses<'_> {
             (Self::SelectedChannels(left), Self::SelectedChannels(right)) => {
                 std::ptr::eq(left, right)
             }
+            (
+                Self::TemporalSources {
+                    facts: left,
+                    channels: lc,
+                },
+                Self::TemporalSources {
+                    facts: right,
+                    channels: rc,
+                },
+            ) => std::ptr::eq(left, right) && std::ptr::eq(lc, rc),
             (
                 Self::AggregateMerge {
                     phase: left_phase,
@@ -159,6 +173,11 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         }
         let selected_shape = match input.argument_uses {
             CallArgumentUses::SelectedChannels(uses) => uses.len() == input.request.arguments.len(),
+            CallArgumentUses::TemporalSources { facts, channels } => {
+                input.kind == FunctionKind::Scalar
+                    && facts.validate().is_ok()
+                    && channels.len() == facts.shape().source_count()
+            }
             CallArgumentUses::AggregateMerge {
                 phase,
                 state_context,
@@ -198,7 +217,9 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         // infer a legacy literal payload's type.
         validate_input_types(input, &mut work)?;
         let merge_state = match input.argument_uses {
-            CallArgumentUses::SelectedChannels(_) => None,
+            CallArgumentUses::SelectedChannels(_) | CallArgumentUses::TemporalSources { .. } => {
+                None
+            }
             CallArgumentUses::AggregateMerge {
                 state_input_type, ..
             } => {
@@ -275,6 +296,14 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         }
         match input.argument_uses {
             CallArgumentUses::SelectedChannels(uses) => {
+                if matches!(
+                    declaration.argument_control,
+                    novarocks_type_contract::ArgumentControl::TemporalSource(_)
+                ) {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "temporal source fact is absent",
+                    ));
+                }
                 for use_id in uses {
                     if use_id.is_none()
                         != (declaration.argument_control
@@ -284,6 +313,53 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                             "call argument demand differs from its exact owner control",
                         ));
                     }
+                    work.step().map_err(CallEffectRefinementError::Control)?;
+                }
+            }
+            CallArgumentUses::TemporalSources { facts, channels } => {
+                if declaration.argument_control
+                    != novarocks_type_contract::ArgumentControl::TemporalSource(
+                        facts.shape().kind(),
+                    )
+                {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "temporal source channels require their exact owner control",
+                    ));
+                }
+                let roles = facts.shape().roles();
+                for (ordinal, channel) in channels.iter().enumerate() {
+                    if roles[ordinal] != Some(channel.role)
+                        || channel.context.use_id == input.context.use_id
+                        || channel.context.demand
+                            != novarocks_type_contract::EvaluationDemand::Value
+                        || (ordinal == 0) != (channel.context.domain == input.context.domain)
+                        || channels[..ordinal]
+                            .iter()
+                            .any(|other| other.context.use_id == channel.context.use_id)
+                    {
+                        return Err(CallEffectRefinementError::InvalidInput(
+                            "invalid temporal source occurrence roles or domains",
+                        ));
+                    }
+                    crate::kernel_input::validate_type_observed(channel.value_type, &mut work)
+                        .map_err(|error| match error {
+                            crate::KernelFailure::Cancelled => {
+                                CallEffectRefinementError::Control(CompileControlError::Cancelled)
+                            }
+                            crate::KernelFailure::DeadlineExceeded => {
+                                CallEffectRefinementError::Control(
+                                    CompileControlError::DeadlineExceeded,
+                                )
+                            }
+                            crate::KernelFailure::ResourceExhausted => {
+                                CallEffectRefinementError::Control(
+                                    CompileControlError::ResourceExhausted,
+                                )
+                            }
+                            _ => CallEffectRefinementError::InvalidInput(
+                                "invalid temporal source value type",
+                            ),
+                        })?;
                     work.step().map_err(CallEffectRefinementError::Control)?;
                 }
             }

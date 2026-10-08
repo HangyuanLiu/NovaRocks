@@ -235,6 +235,7 @@ pub mod regexp_position;
 mod regexp_position_owner;
 
 pub mod calendar_time_text_shared;
+mod calendar_time_text_owner;
 
 #[cfg(test)]
 mod calendar_time_text_shared_tests;

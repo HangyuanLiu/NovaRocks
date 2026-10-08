@@ -273,6 +273,7 @@ fn table_fixture() -> Fixture {
         fragment,
         uses,
         calls: vec![FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Table { node: table },
             context: current,
             effects: effects(FunctionKind::Table, current.domain),

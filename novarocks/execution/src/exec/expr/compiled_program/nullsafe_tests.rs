@@ -104,6 +104,7 @@ fn checked_package(
                 )
                 .unwrap();
             frozen.push(FrozenPhysicalCall {
+                temporal_source: None,
                 site: PhysicalCallSite::Expression(context.use_id),
                 context,
                 effects: token.call_contract().effects().clone(),

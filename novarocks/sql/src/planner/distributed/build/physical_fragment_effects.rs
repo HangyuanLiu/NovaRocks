@@ -274,6 +274,7 @@ fn compose_fragment_effects_observed(
             parameters: input.parameters,
             literal_policy: input.literal_policy,
             call_scopes: input.expression_scopes,
+            temporal_sources: Some(&input.occurrences.temporal_sources),
         };
         let expressions = match &sources {
             PhysicalCallSources::DirectPhysical => {

@@ -25,6 +25,8 @@ use std::{sync::Arc, time::Duration};
 #[derive(Debug)]
 pub enum TimeTextError {
     Legacy(String),
+    /// Original Arrow fallback verdict applies to its entire invocation.
+    InvocationData(String),
     Kernel(KernelFailure),
 }
 impl From<KernelFailure> for TimeTextError {
@@ -35,7 +37,7 @@ impl From<KernelFailure> for TimeTextError {
 impl TimeTextError {
     pub fn into_legacy(self) -> String {
         match self {
-            Self::Legacy(s) => s,
+            Self::Legacy(s) | Self::InvocationData(s) => s,
             Self::Kernel(
                 KernelFailure::Internal(d)
                 | KernelFailure::InvalidProgram(d)
@@ -337,7 +339,7 @@ pub fn duration_cast_source(
     }
     work.flush()?;
     let source = arrow_cast::cast(array, &DataType::Utf8)
-        .map_err(|e| TimeTextError::Legacy(e.to_string()))?;
+        .map_err(|e| TimeTextError::InvocationData(e.to_string()))?;
     work.flush()?;
     match source.as_any().downcast_ref::<StringArray>() {
         Some(source) => duration_strings(source, work).map(Some),

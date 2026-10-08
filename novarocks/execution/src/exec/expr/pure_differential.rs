@@ -84,6 +84,7 @@
 
 pub(crate) mod aggregate;
 pub(crate) mod generate;
+pub(crate) mod temporal;
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -369,6 +370,9 @@ pub(crate) struct ScalarDiffSpec {
     /// Random sparse selections checked after the full selection.
     pub sparse_selections: usize,
     pub selection_seed: u64,
+    /// Exact original source expression; binding arguments remain the resolved
+    /// normal call channels. The compiled host never reuses their cached values.
+    pub temporal_source: Option<temporal::SourceExpression>,
 }
 
 impl ScalarDiffSpec {
@@ -384,6 +388,7 @@ impl ScalarDiffSpec {
             legacy_constants: LegacyConstantForm::Literal,
             sparse_selections: 3,
             selection_seed: 0x5EED,
+            temporal_source: None,
         }
     }
 
@@ -477,6 +482,11 @@ impl ScalarDiffSpec {
     pub(crate) fn sparse_selections(mut self, count: usize, seed: u64) -> Self {
         self.sparse_selections = count;
         self.selection_seed = seed;
+        self
+    }
+
+    pub(crate) fn temporal_source(mut self, source: temporal::SourceExpression) -> Self {
+        self.temporal_source = Some(source);
         self
     }
 
@@ -698,6 +708,9 @@ pub(crate) fn run_scalar_differential(
             expected: expected.clone(),
             selected: format!("{result_type:?}"),
         });
+    }
+    if abi == PureKernelAbi::ControlIntrinsicV1 {
+        return temporal::run(spec, &bound, &legacy_name, legacy_kind, rows, &result_type);
     }
     if abi != PureKernelAbi::ScalarV1 {
         return Err(DifferentialFailure::UnsupportedPureAbi {
@@ -1137,7 +1150,14 @@ impl ScalarCall<'_> {
         let mut slots = Vec::new();
         let mut arguments = Vec::with_capacity(spec.arguments.len());
         for (index, argument) in spec.arguments.iter().enumerate() {
-            let id = match argument {
+            let argument = if index == 0 {
+                spec.temporal_source
+                    .as_ref()
+                    .map_or(argument, |source| &source.input)
+            } else {
+                argument
+            };
+            let mut id = match argument {
                 DiffArgument::Column { value_type, values } => {
                     let values = match &indices {
                         Some(indices) => take(values.as_ref(), indices, None)
@@ -1158,6 +1178,11 @@ impl ScalarCall<'_> {
                     legacy_constant(&mut arena, value, spec.legacy_constants)
                 }
             };
+            if index == 0
+                && let Some(source) = &spec.temporal_source
+            {
+                id = source.wrap_legacy(&mut arena, id, spec.semantics.decimal_overflow_policy);
+            }
             arguments.push(id);
         }
         if columns.is_empty() {
@@ -1651,7 +1676,7 @@ mod unixtime_tests;
 #[path = "pure_differential/time_slice_tests.rs"]
 mod time_slice_tests;
 
-#[path="pure_differential_array_append_tests.rs"]
+#[path = "pure_differential_array_append_tests.rs"]
 mod array_append_tests;
 
 #[path = "pure_differential/mod_pmod_shared_tests.rs"]
@@ -1660,8 +1685,8 @@ mod mod_pmod_shared_tests;
 #[path = "pure_differential/numeric_binary_shared_tests.rs"]
 mod numeric_binary_shared_tests;
 
-mod round_expanded_tests;
 mod round_disagreement_tests;
+mod round_expanded_tests;
 
 #[cfg(test)]
 #[path = "pure_differential_array_append_multi_tests.rs"]
@@ -1674,3 +1699,6 @@ mod map_size_tests;
 #[cfg(test)]
 #[path = "pure_differential_map_keys_values_tests.rs"]
 mod map_keys_values_tests;
+
+#[path = "pure_differential_time_text_tests.rs"]
+mod time_text_tests;

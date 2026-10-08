@@ -53,6 +53,8 @@ pub enum ArgumentControl {
     TypeOnly,
     If,
     Coalesce,
+    /// The exact installed owner demands original emitted source occurrences.
+    TemporalSource(crate::TemporalSourceKind),
     SimpleCase,
     SearchedCase,
     /// The exact overload owner declares the lambda argument and the body's
@@ -104,6 +106,22 @@ impl ArgumentControl {
                         )
                     )
             }
+            (
+                Self::TemporalSource(crate::TemporalSourceKind::TimeFormat),
+                ControlShape::TemporalSource(
+                    crate::TemporalSourceShape::FormatOrdinary
+                    | crate::TemporalSourceShape::FormatUtf8Override,
+                ),
+            )
+            | (
+                Self::TemporalSource(crate::TemporalSourceKind::TimeToSec),
+                ControlShape::TemporalSource(
+                    crate::TemporalSourceShape::SecondsDirect
+                    | crate::TemporalSourceShape::SecondsCastString
+                    | crate::TemporalSourceShape::SecondsCastOther
+                    | crate::TemporalSourceShape::SecondsRoundtrip,
+                ),
+            ) => true,
             _ => false,
         }
     }
@@ -182,6 +200,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::TypeOnly
                         | ArgumentControl::If
                         | ArgumentControl::Coalesce
+                        | ArgumentControl::TemporalSource(_)
                         | ArgumentControl::SimpleCase
                         | ArgumentControl::SearchedCase
                         | ArgumentControl::HigherOrder { .. }
@@ -210,6 +229,7 @@ impl FunctionEffectDeclaration {
             self.argument_control,
             ArgumentControl::If
                 | ArgumentControl::Coalesce
+                | ArgumentControl::TemporalSource(_)
                 | ArgumentControl::SimpleCase
                 | ArgumentControl::SearchedCase
         ) && self.null_behavior != FunctionNullBehavior::ControlDefined

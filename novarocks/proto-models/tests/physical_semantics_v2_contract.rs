@@ -203,6 +203,7 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
             .into_iter()
             .enumerate()
             .map(|(ordinal, site)| v2::FrozenCall {
+                temporal_source: None,
                 site: Some(v2::CallSite { kind: Some(site) }),
                 context: Some(v2::EffectContext {
                     use_id: Some(if ordinal == 0 { 0 } else { u32::MAX }),

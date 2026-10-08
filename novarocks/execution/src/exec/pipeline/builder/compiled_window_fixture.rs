@@ -727,6 +727,7 @@ pub(super) fn package(
         let call_context = context(use_id.get());
         if call.uninstalled {
             frozen.push(FrozenPhysicalCall {
+                temporal_source: None,
                 site: PhysicalCallSite::Expression(use_id),
                 context: call_context,
                 effects: declared_aggregate_effects(CallProofScope::Domain(domain)),
@@ -799,6 +800,7 @@ pub(super) fn package(
             )
             .unwrap_or_else(|error| panic!("fixture window call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Expression(use_id),
             context: call_context,
             effects: token.call_contract().effects().clone(),

@@ -610,7 +610,38 @@ fn validate_expression(
         return Err(ProgramResolvedCallsError::WrongArguments);
     }
     let definitions = &snapshot.roots().arenas()[&occurrence.arena];
-    if invocation.control == ControlShape::TypeOnly {
+    if let ControlShape::TemporalSource(shape) = invocation.control {
+        let source = call
+            .temporal_source()
+            .ok_or(ProgramResolvedCallsError::WrongArguments)?;
+        source
+            .facts
+            .validate()
+            .map_err(|_| ProgramResolvedCallsError::WrongArguments)?;
+        if source.facts.shape() != shape || source.sources.len() != invocation.arguments.len() {
+            return Err(ProgramResolvedCallsError::WrongArguments);
+        }
+        let roles = shape.roles();
+        for (ordinal, (use_id, source)) in
+            invocation.arguments.iter().zip(&source.sources).enumerate()
+        {
+            work.step()?;
+            let child = &flow.uses()[use_id];
+            if Some(source.role) != roles[ordinal] || source.context != child.context {
+                return Err(ProgramResolvedCallsError::WrongArguments);
+            }
+            check_arrow(
+                definitions
+                    .node(child.definition)
+                    .ok_or(ProgramResolvedCallsError::InvalidSite)?
+                    .data_type(),
+                &source.value_type.data_type,
+                work,
+            )?;
+        }
+    } else if call.temporal_source().is_some() {
+        return Err(ProgramResolvedCallsError::WrongArguments);
+    } else if invocation.control == ControlShape::TypeOnly {
         if !invocation.arguments.is_empty() {
             return Err(ProgramResolvedCallsError::WrongArguments);
         }

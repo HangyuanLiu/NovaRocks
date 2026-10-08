@@ -1148,13 +1148,53 @@ fn validate_definition_correspondence(
         {
             return Err(RootUseBindingError::WrongControl);
         }
+        let temporal =
+            if let (ExprKind::FunctionCall { args, .. }, ControlShape::TemporalSource(shape)) =
+                (&definition.kind, invocation.control)
+            {
+                let source = crate::temporal_source_definitions_observed(
+                    shape.kind(),
+                    fragment.expressions(),
+                    args,
+                    work,
+                )
+                .map_err(|error| match error {
+                    crate::TemporalSourceProjectionError::Control(cause) => {
+                        RootUseBindingError::Control(cause)
+                    }
+                    crate::TemporalSourceProjectionError::Invalid(_) => {
+                        RootUseBindingError::WrongArguments
+                    }
+                })?;
+                if source.facts.shape() != shape {
+                    return Err(RootUseBindingError::WrongControl);
+                }
+                Some(source)
+            } else {
+                None
+            };
         let mut ordinal = 0usize;
+        if let Some(source) = &temporal {
+            for definition in &source.definitions {
+                let argument = invocation
+                    .arguments
+                    .get(ordinal)
+                    .ok_or(RootUseBindingError::WrongArguments)?;
+                if flow.uses()[argument].definition != *definition {
+                    return Err(RootUseBindingError::WrongArguments);
+                }
+                ordinal += 1;
+                work.step()?;
+            }
+        }
         // TypeOnly static arguments still belong to the checked definition,
         // but they are not runtime argument invocations.
-        if !matches!(
-            (&definition.kind, invocation.control),
-            (ExprKind::FunctionCall { .. }, ControlShape::TypeOnly)
-        ) {
+        if temporal.is_none()
+            && !matches!(
+                (&definition.kind, invocation.control),
+                (ExprKind::FunctionCall { .. }, ControlShape::TypeOnly)
+            )
+        {
             definition
                 .kind
                 .expression_references_observed(|definition| {

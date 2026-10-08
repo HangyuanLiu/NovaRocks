@@ -481,6 +481,7 @@ fn package_with_outputs(
             )
             .unwrap();
         call_entries.push(FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Expression(*call_use),
             context,
             effects: authored.call_contract().effects().clone(),

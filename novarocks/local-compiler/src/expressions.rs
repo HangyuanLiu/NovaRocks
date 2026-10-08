@@ -1584,11 +1584,23 @@ fn prepare_core(
                             (ControlShape::TypeOnly, ArgumentControl::TypeOnly) => (true, false),
                             (ControlShape::If, ArgumentControl::If)
                             | (ControlShape::Coalesce, ArgumentControl::Coalesce) => (false, true),
+                            (
+                                ControlShape::TemporalSource(shape),
+                                ArgumentControl::TemporalSource(kind),
+                            ) if shape.kind() == kind => (false, true),
                             _ => return Err(ExpressionLoweringError::UnsupportedCall(site)),
                         };
                     if args.len() != local_args.len()
                         || function.argument_types.len() != args.len()
-                        || invocation.arguments.len() != if type_only { 0 } else { args.len() }
+                        || invocation.arguments.len()
+                            != if type_only {
+                                0
+                            } else {
+                                frozen
+                                    .temporal_source
+                                    .as_ref()
+                                    .map_or(args.len(), |source| source.sources.len())
+                            }
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "call argument arity differs",
@@ -1607,8 +1619,23 @@ fn prepare_core(
                                 "call selection was not statically validated",
                             ))?;
                     let mut argument_uses = Vec::with_capacity(args.len());
+                    let mut source_channels = Vec::new();
+                    if let Some(source) = &frozen.temporal_source {
+                        source_channels
+                            .try_reserve_exact(source.sources.len())
+                            .map_err(|_| CompileControlError::ResourceExhausted)?;
+                        work.flush()?;
+                    }
                     let mut children = ScopedExpressionEffects::pure_value(invocation.context);
-                    for (ordinal, &child) in args.iter().enumerate() {
+                    let count = frozen
+                        .temporal_source
+                        .as_ref()
+                        .map_or(args.len(), |source| source.sources.len());
+                    for ordinal in 0..count {
+                        let child = frozen.temporal_source.as_ref().map_or_else(
+                            || args[ordinal],
+                            |source| source.sources[ordinal].definition,
+                        );
                         if type_only {
                             argument_uses.push(None);
                         } else {
@@ -1632,15 +1659,42 @@ fn prepare_core(
                                 flow,
                                 ordinal,
                             )?;
+                            if let Some(source_plan) = &frozen.temporal_source {
+                                let source = &source_plan.sources[ordinal];
+                                if source.use_id != child_use {
+                                    return Err(ExpressionLoweringError::Invalid(
+                                        "temporal source use differs from ordered child edge",
+                                    ));
+                                }
+                                let source_node =
+                                    package.fragment().expressions().get(child).ok_or(
+                                        ExpressionLoweringError::Invalid(
+                                            "missing temporal source definition",
+                                        ),
+                                    )?;
+                                source_channels.push(novarocks_functions::TemporalSourceChannel {
+                                    role: source.role,
+                                    context: child_invocation.context,
+                                    value_type: &source_node.ty,
+                                });
+                            }
                             argument_uses.push(Some(child_use));
                         }
                         work.step()?;
                     }
                     let input = CallEffectInput {
                         context: frozen.context,
-                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                            &argument_uses,
-                        ),
+                        argument_uses: match &frozen.temporal_source {
+                            Some(source) => {
+                                novarocks_functions::CallArgumentUses::TemporalSources {
+                                    facts: &source.facts,
+                                    channels: &source_channels,
+                                }
+                            }
+                            None => novarocks_functions::CallArgumentUses::SelectedChannels(
+                                &argument_uses,
+                            ),
+                        },
                         function_id: &function.function_id,
                         kind: function.kind,
                         selected: selection.as_ref(),

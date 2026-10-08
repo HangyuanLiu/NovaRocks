@@ -36,6 +36,7 @@ pub mod owned_resources;
 mod partition;
 mod schema;
 mod semantics;
+mod temporal_source;
 mod type_fingerprint;
 mod value_arithmetic;
 mod value_projection;
@@ -62,6 +63,7 @@ pub use compile_control::{
     PureCompileControl,
 };
 pub use control_flow::*;
+pub use temporal_source::*;
 pub use effects::*;
 pub use function::{
     AggregateStateArgumentContract, AggregateStateFormatId, FunctionArgumentEvaluation,
@@ -101,3 +103,6 @@ pub use value_arithmetic::{
 pub use value_projection::{arrow_type_equals_ignoring_metadata, variant_get_target_type};
 
 pub use window::{WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits};
+
+#[cfg(test)]
+mod temporal_source_control_tests;

@@ -776,6 +776,7 @@ fn table_occurrences_genuine_case_arithmetic_child_error_is_not_erased_by_called
     .unwrap();
     let scoped = author_physical_expression_effects_observed(
         PhysicalExpressionEffectsInput {
+            temporal_sources: None,
             fragment: &f.fragment,
             roots: &occ.root_uses,
             constants: &f.pools,

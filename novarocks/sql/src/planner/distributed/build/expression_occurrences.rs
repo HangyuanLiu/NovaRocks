@@ -33,7 +33,13 @@ use novarocks_type_contract::{
     control_argument_semantics,
 };
 
+use super::lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError};
+use super::physical_temporal_sources::{self, SourceError};
 use crate::compiler::SqlFunctionCatalog;
+use novarocks_type_contract::{
+    TemporalSourceDefinitions, TemporalSourceOccurrence, TemporalSourcePlan,
+};
+use std::collections::BTreeMap;
 
 #[derive(Debug)]
 pub(crate) enum ExpressionOccurrenceError {
@@ -47,6 +53,8 @@ pub(crate) enum ExpressionOccurrenceError {
     TooManyItems,
     Calls(FrozenCallError),
     InvalidRelationalControl(PhysicalCallSite),
+    TemporalSource(&'static str),
+    Journal(SqlSourceJournalError),
 }
 impl From<CompileControlError> for ExpressionOccurrenceError {
     fn from(value: CompileControlError) -> Self {
@@ -70,6 +78,7 @@ pub(crate) struct AuthoredPhysicalOccurrences<'a> {
     pub relational_contexts: Vec<(PhysicalCallSite, ExpressionEffectContext)>,
     fragment: &'a Fragment,
     writer_values: Vec<WriterValueUse<'a>>,
+    pub(crate) temporal_sources: BTreeMap<ExpressionUseId, TemporalSourcePlan<ExprId>>,
 }
 
 /// Materialized values have actual use/domain facts, without expression
@@ -132,9 +141,34 @@ pub(crate) fn author_physical_occurrences_observed<'a>(
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalOccurrences<'a>, ExpressionOccurrenceError> {
+    author_physical_occurrences_in(fragment, functions, None, control)
+}
+
+/// Temporal facts are authored only from a call authenticated by the original
+/// same-emission journal. Raw physical test helpers grant no default facts.
+pub(crate) fn author_physical_occurrences_from_journal_observed<'a>(
+    owner: &SqlAuthoredPhysicalPlan,
+    fragment: &'a Fragment,
+    control: &dyn PureCompileControl,
+) -> Result<AuthoredPhysicalOccurrences<'a>, ExpressionOccurrenceError> {
+    author_physical_occurrences_in(
+        fragment,
+        owner.function_catalog().as_ref(),
+        Some(owner),
+        control,
+    )
+}
+fn author_physical_occurrences_in<'a>(
+    fragment: &'a Fragment,
+    functions: &dyn SqlFunctionCatalog,
+    source_owner: Option<&SqlAuthoredPhysicalPlan>,
+    control: &dyn PureCompileControl,
+) -> Result<AuthoredPhysicalOccurrences<'a>, ExpressionOccurrenceError> {
     let mut author = Author {
         fragment,
         functions,
+        source_owner,
+        temporal_sources: BTreeMap::new(),
         work: CompileCheckpoints::try_new(control, CompilePhase::Validate)?,
         domains: Vec::new(),
         uses: Vec::new(),
@@ -320,6 +354,7 @@ pub(crate) fn author_physical_occurrences_observed<'a>(
             relational_contexts,
             fragment,
             writer_values,
+            temporal_sources: std::mem::take(&mut author.temporal_sources),
         })
     })();
     if matches!(&result, Err(ExpressionOccurrenceError::Control(_))) {
@@ -341,6 +376,8 @@ fn author_expression_occurrences_observed(
 struct Author<'a> {
     fragment: &'a Fragment,
     functions: &'a dyn SqlFunctionCatalog,
+    source_owner: Option<&'a SqlAuthoredPhysicalPlan>,
+    temporal_sources: BTreeMap<ExpressionUseId, TemporalSourcePlan<ExprId>>,
     work: CompileCheckpoints<'a>,
     domains: Vec<ExpressionEvaluationDomain>,
     uses: Vec<ExpressionInvocation<ExprId>>,
@@ -388,6 +425,7 @@ impl Author<'_> {
         let node = self.fragment.expressions().get(definition);
         self.work.step()?;
         let node = node.ok_or(ExpressionOccurrenceError::MissingDefinition(definition))?;
+        let mut source_definitions: Option<TemporalSourceDefinitions<ExprId>> = None;
         let shape = if let Some(shape) = node
             .kind
             .intrinsic_control_shape()
@@ -410,7 +448,41 @@ impl Author<'_> {
                     self.work.control(),
                 )
                 .map_err(ExpressionOccurrenceError::function)?;
-            let shape = scalar_shape(declaration.effects().argument_control, args.len());
+            let shape = if let ArgumentControl::TemporalSource(kind) =
+                declaration.effects().argument_control
+            {
+                let owner = self
+                    .source_owner
+                    .ok_or(ExpressionOccurrenceError::TemporalSource(
+                        "temporal source control has no original SQL emission owner",
+                    ))?;
+                self.work.flush()?;
+                owner
+                    .checked_expression_call_source_observed(self.fragment, node, &mut self.work)
+                    .map_err(|error| match error {
+                        SqlSourceJournalError::Control(cause) => {
+                            ExpressionOccurrenceError::Control(cause)
+                        }
+                        error => ExpressionOccurrenceError::Journal(error),
+                    })?;
+                let definitions = physical_temporal_sources::author(
+                    kind,
+                    self.fragment.expressions(),
+                    args,
+                    &mut self.work,
+                )
+                .map_err(|error| match error {
+                    SourceError::Control(cause) => ExpressionOccurrenceError::Control(cause),
+                    SourceError::Invalid(message) => {
+                        ExpressionOccurrenceError::TemporalSource(message)
+                    }
+                })?;
+                let shape = ControlShape::TemporalSource(definitions.facts.shape());
+                source_definitions = Some(definitions);
+                Some(shape)
+            } else {
+                scalar_shape(declaration.effects().argument_control, args.len())
+            };
             self.work.step()?;
             shape.ok_or(ExpressionOccurrenceError::InvalidFunctionControl(
                 definition,
@@ -432,7 +504,18 @@ impl Author<'_> {
         });
         self.work.step()?;
         let mut children = Vec::new();
-        if shape != ControlShape::TypeOnly {
+        if let Some(definitions) = &source_definitions {
+            self.work.flush()?;
+            children
+                .try_reserve_exact(definitions.definitions.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            self.work.flush()?;
+            for definition in &definitions.definitions {
+                self.reference()?;
+                children.push(*definition);
+                self.work.step()?;
+            }
+        } else if shape != ControlShape::TypeOnly {
             node.kind.expression_references_observed(|child| {
                 self.reference()?;
                 children
@@ -458,6 +541,41 @@ impl Author<'_> {
             let child_use = self.invocation(*child, child_domain, child_demand, depth + 1)?;
             arguments.push(child_use);
             self.work.step()?;
+        }
+        if let Some(definitions) = source_definitions {
+            self.work.flush()?;
+            let mut sources = Vec::new();
+            sources
+                .try_reserve_exact(arguments.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            self.work.flush()?;
+            let roles = definitions.facts.shape().roles();
+            for (ordinal, (&definition, &use_id)) in
+                definitions.definitions.iter().zip(&arguments).enumerate()
+            {
+                sources.push(TemporalSourceOccurrence {
+                    role: roles[ordinal].ok_or(ExpressionOccurrenceError::TemporalSource(
+                        "temporal source role is absent",
+                    ))?,
+                    definition,
+                    use_id,
+                });
+                self.work.step()?;
+            }
+            self.work.flush()?;
+            let plan = TemporalSourcePlan {
+                facts: definitions.facts,
+                sources: sources.into_boxed_slice(),
+            };
+            self.work.flush()?;
+            plan.validate_structure().map_err(|_| {
+                ExpressionOccurrenceError::TemporalSource(
+                    "temporal source occurrence grammar is invalid",
+                )
+            })?;
+            self.work.flush()?;
+            self.temporal_sources.insert(id, plan);
+            self.work.flush()?;
         }
         self.uses[id.get() as usize].arguments = arguments.into_boxed_slice();
         self.work.step()?;
@@ -489,7 +607,10 @@ pub(super) fn scalar_shape(control: ArgumentControl, count: usize) -> Option<Con
             body_ordinal,
             body_demand,
         },
-        ArgumentControl::Aggregate | ArgumentControl::Window | ArgumentControl::Table => {
+        ArgumentControl::TemporalSource(_)
+        | ArgumentControl::Aggregate
+        | ArgumentControl::Window
+        | ArgumentControl::Table => {
             return None;
         }
     })

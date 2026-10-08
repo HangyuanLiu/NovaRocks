@@ -284,6 +284,7 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
             )
         })
         .map(|invocation| FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
             context: invocation.context,
             effects: effects(FunctionKind::Scalar, invocation.context.domain),
@@ -293,6 +294,7 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
     if matches!(operator, Operator::Table) {
         let current = context(777, 0, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            temporal_source: None,
             site: PhysicalCallSite::Table { node: target },
             context: current,
             effects: effects(FunctionKind::Table, current.domain),
