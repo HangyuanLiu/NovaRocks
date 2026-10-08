@@ -21,6 +21,10 @@ use arrow::array::{
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
+use novarocks_functions::{
+    Selection,
+    bit_numeric::{BitwiseOp, ShiftOp},
+};
 use novarocks_types::largeint;
 use std::sync::Arc;
 
@@ -166,7 +170,7 @@ where
     let values = to_i64_array(&array, fn_name, 0)?;
 
     let mut out = Vec::with_capacity(values.len());
-    for row in 0..values.len() {
+    for row in Selection::all(values.len()).iter() {
         if values.is_null(row) {
             out.push(None);
         } else {
@@ -212,7 +216,7 @@ where
     let right = to_i64_array(&right, fn_name, 1)?;
 
     let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
+    for row in Selection::all(chunk.len()).iter() {
         if left.is_null(row) || right.is_null(row) {
             out.push(None);
         } else {
@@ -241,7 +245,7 @@ where
     let right = to_i128_values(&right, fn_name, 1)?;
 
     let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
+    for row in Selection::all(chunk.len()).iter() {
         out.push(match (left[row], right[row]) {
             (Some(l), Some(r)) => Some(func(l, r)),
             _ => None,
@@ -268,7 +272,7 @@ where
     let right = to_i64_array(&right, fn_name, 1)?;
 
     let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
+    for row in Selection::all(chunk.len()).iter() {
         if left.is_null(row) || right.is_null(row) {
             out.push(None);
         } else {
@@ -297,7 +301,7 @@ where
     let right = to_i128_values(&right, fn_name, 1)?;
 
     let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
+    for row in Selection::all(chunk.len()).iter() {
         out.push(match (left[row], right[row]) {
             (Some(l), Some(r)) => Some(func(l, r as u32)),
             _ => None,
@@ -315,11 +319,11 @@ pub fn eval_bit_shift_left(
 ) -> Result<ArrayRef, String> {
     if use_largeint_path(arena, expr, args) {
         return eval_shift_i128("bit_shift_left", arena, expr, args, chunk, |a, b| {
-            a.wrapping_shl(b)
+            ShiftOp::Left.apply_i128(a, i64::from(b))
         });
     }
     eval_shift_i64("bit_shift_left", arena, expr, args, chunk, |a, b| {
-        a.wrapping_shl(b)
+        ShiftOp::Left.apply_i64(a, i64::from(b))
     })
 }
 
@@ -331,11 +335,11 @@ pub fn eval_bit_shift_right(
 ) -> Result<ArrayRef, String> {
     if use_largeint_path(arena, expr, args) {
         return eval_shift_i128("bit_shift_right", arena, expr, args, chunk, |a, b| {
-            a.wrapping_shr(b)
+            ShiftOp::Right.apply_i128(a, i64::from(b))
         });
     }
     eval_shift_i64("bit_shift_right", arena, expr, args, chunk, |a, b| {
-        a.wrapping_shr(b)
+        ShiftOp::Right.apply_i64(a, i64::from(b))
     })
 }
 
@@ -352,7 +356,7 @@ pub fn eval_bit_shift_right_logical(
             expr,
             args,
             chunk,
-            |a, b| ((a as u128).wrapping_shr(b)) as i128,
+            |a, b| ShiftOp::RightLogical.apply_i128(a, i64::from(b)),
         );
     }
     eval_shift_i64(
@@ -361,7 +365,7 @@ pub fn eval_bit_shift_right_logical(
         expr,
         args,
         chunk,
-        |a, b| ((a as u64).wrapping_shr(b)) as i64,
+        |a, b| ShiftOp::RightLogical.apply_i64(a, i64::from(b)),
     )
 }
 
@@ -372,9 +376,13 @@ pub fn eval_bitand(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     if use_largeint_path(arena, expr, args) {
-        return eval_binary_i128("bitand", arena, expr, args, chunk, |a, b| a & b);
+        return eval_binary_i128("bitand", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::And.apply_i128(a, b)
+        });
     }
-    eval_binary_i64("bitand", arena, expr, args, chunk, |a, b| a & b)
+    eval_binary_i64("bitand", arena, expr, args, chunk, |a, b| {
+        BitwiseOp::And.apply_i64(a, b)
+    })
 }
 
 pub fn eval_bitnot(
@@ -384,9 +392,13 @@ pub fn eval_bitnot(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     if use_largeint_path(arena, expr, args) {
-        return eval_unary_i128("bitnot", arena, expr, args, chunk, |a| !a);
+        return eval_unary_i128("bitnot", arena, expr, args, chunk, |a| {
+            BitwiseOp::Not.apply_i128(a, 0)
+        });
     }
-    eval_unary_i64("bitnot", arena, expr, args, chunk, |a| !a)
+    eval_unary_i64("bitnot", arena, expr, args, chunk, |a| {
+        BitwiseOp::Not.apply_i64(a, 0)
+    })
 }
 
 pub fn eval_bitor(
@@ -396,9 +408,13 @@ pub fn eval_bitor(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     if use_largeint_path(arena, expr, args) {
-        return eval_binary_i128("bitor", arena, expr, args, chunk, |a, b| a | b);
+        return eval_binary_i128("bitor", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::Or.apply_i128(a, b)
+        });
     }
-    eval_binary_i64("bitor", arena, expr, args, chunk, |a, b| a | b)
+    eval_binary_i64("bitor", arena, expr, args, chunk, |a, b| {
+        BitwiseOp::Or.apply_i64(a, b)
+    })
 }
 
 pub fn eval_bitxor(
@@ -408,9 +424,13 @@ pub fn eval_bitxor(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     if use_largeint_path(arena, expr, args) {
-        return eval_binary_i128("bitxor", arena, expr, args, chunk, |a, b| a ^ b);
+        return eval_binary_i128("bitxor", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::Xor.apply_i128(a, b)
+        });
     }
-    eval_binary_i64("bitxor", arena, expr, args, chunk, |a, b| a ^ b)
+    eval_binary_i64("bitxor", arena, expr, args, chunk, |a, b| {
+        BitwiseOp::Xor.apply_i64(a, b)
+    })
 }
 
 #[cfg(test)]

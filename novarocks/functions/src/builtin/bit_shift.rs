@@ -35,34 +35,7 @@ use crate::{
     kernel_input::EvaluationCheckpoints,
 };
 
-/// Frozen by the exact owner, independently of a runtime function name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ShiftOp {
-    Left,
-    Right,
-    RightLogical,
-}
-impl ShiftOp {
-    fn apply_i64(self, value: i64, count: i64) -> i64 {
-        // The original signed-width profiles first widen to BIGINT. The count
-        // conversion and wrapping operation mask modulo 64, even for Int8.
-        let count = count as u32;
-        match self {
-            Self::Left => value.wrapping_shl(count),
-            Self::Right => value.wrapping_shr(count),
-            Self::RightLogical => (value as u64).wrapping_shr(count) as i64,
-        }
-    }
-
-    fn apply_i128(self, value: i128, count: i64) -> i128 {
-        let count = count as u32;
-        match self {
-            Self::Left => value.wrapping_shl(count),
-            Self::Right => value.wrapping_shr(count),
-            Self::RightLogical => (value as u128).wrapping_shr(count) as i128,
-        }
-    }
-}
+pub(super) use crate::bit_numeric::ShiftOp;
 
 pub(super) fn evaluate_shift<'a>(
     operation: ShiftOp,

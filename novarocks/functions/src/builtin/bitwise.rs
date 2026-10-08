@@ -35,38 +35,7 @@ use crate::{
     kernel_input::EvaluationCheckpoints,
 };
 
-/// Frozen by the exact owner, never selected from runtime names.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BitwiseOp {
-    And,
-    Or,
-    Xor,
-    Not,
-}
-impl BitwiseOp {
-    pub(super) const fn arity(self) -> usize {
-        match self {
-            Self::Not => 1,
-            _ => 2,
-        }
-    }
-    fn apply_i64(self, left: i64, right: i64) -> i64 {
-        match self {
-            Self::And => left & right,
-            Self::Or => left | right,
-            Self::Xor => left ^ right,
-            Self::Not => !left,
-        }
-    }
-    fn apply_i128(self, left: i128, right: i128) -> i128 {
-        match self {
-            Self::And => left & right,
-            Self::Or => left | right,
-            Self::Xor => left ^ right,
-            Self::Not => !left,
-        }
-    }
-}
+pub(super) use crate::bit_numeric::BitwiseOp;
 
 pub(super) fn evaluate_bitwise<'a>(
     operation: BitwiseOp,

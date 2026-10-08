@@ -965,3 +965,49 @@ fn pure_differential_rejects_uncoerced_arguments_and_wrong_pins() {
         "{failure}"
     );
 }
+
+#[test]
+fn pure_differential_bit_family_matches_v1_every_integer_profile() {
+    let profile = InputProfile::default();
+    for (index, source) in [
+        value(DataType::Int8),
+        value(DataType::Int16),
+        value(DataType::Int32),
+        value(DataType::Int64),
+        largeint(true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for nullable in [true, false] {
+            let source = FunctionValueType {
+                nullable,
+                ..source.clone()
+            };
+            let left = generated(0xb170 + index as u64, &source, &profile);
+            let right = generated(0xb270 + index as u64, &source, &profile);
+            for name in ["bitand", "bitor", "bitxor", "bitnot"] {
+                let mut spec = ScalarDiffSpec::new(name)
+                    .typed_column(source.clone(), left.clone())
+                    .sparse_selections(3, index as u64);
+                if name != "bitnot" {
+                    spec = spec.typed_column(source.clone(), right.clone());
+                }
+                scalar_ledger(assert_scalar_matches_v1(spec));
+            }
+            let counts = generated(0xb370 + index as u64, &value(DataType::Int64), &profile);
+            for name in [
+                "bit_shift_left",
+                "bit_shift_right",
+                "bit_shift_right_logical",
+            ] {
+                scalar_ledger(assert_scalar_matches_v1(
+                    ScalarDiffSpec::new(name)
+                        .typed_column(source.clone(), left.clone())
+                        .typed_column(value(DataType::Int64), counts.clone())
+                        .sparse_selections(3, index as u64),
+                ));
+            }
+        }
+    }
+}
