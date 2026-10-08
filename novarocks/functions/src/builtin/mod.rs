@@ -85,6 +85,7 @@ mod calendar_extended_format;
 mod calendar_extended_parse;
 mod calendar_extended_owner;
 mod calendar_parts;
+pub mod calendar_parts_shared;
 mod calendar_parts_owner;
 mod calendar_period_diff;
 mod calendar_period_diff_owner;

@@ -32,47 +32,11 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
 use arrow_schema::{DataType, TimeUnit};
-use chrono::{Datelike, NaiveDateTime, Timelike};
+use chrono::NaiveDateTime;
 use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CalendarPartOp {
-    Year,
-    Month,
-    Day,
-    Hour,
-    Minute,
-    Second,
-    DayOfWeek,
-    YearWeek,
-    DayOfYear,
-    WeekOfYear,
-    Quarter,
-}
-
-impl CalendarPartOp {
-    fn extract(self, value: NaiveDateTime) -> Result<i32, KernelFailure> {
-        let result = match self {
-            Self::Year => i64::from(value.year()),
-            Self::Month => i64::from(value.month()),
-            Self::Day => i64::from(value.day()),
-            Self::Hour => i64::from(value.hour()),
-            Self::Minute => i64::from(value.minute()),
-            Self::Second => i64::from(value.second()),
-            Self::DayOfWeek => i64::from(value.weekday().number_from_sunday()),
-            Self::YearWeek => {
-                let iso = value.iso_week();
-                i64::from(iso.year()) * 100 + i64::from(iso.week())
-            }
-            Self::DayOfYear => i64::from(value.ordinal()),
-            Self::WeekOfYear => i64::from(value.iso_week().week()),
-            Self::Quarter => i64::from((value.month() - 1) / 3 + 1),
-        };
-        i32::try_from(result)
-            .map_err(|_| internal("bounded calendar part exceeds its installed Int32 result"))
-    }
-}
+pub(super) use super::calendar_parts_shared::CalendarPartOp;
 
 enum CalendarInput<'a> {
     Timestamp(&'a TimestampMicrosecondArray),
