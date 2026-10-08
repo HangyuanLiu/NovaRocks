@@ -1656,3 +1656,6 @@ mod array_append_tests;
 
 #[path = "pure_differential/mod_pmod_shared_tests.rs"]
 mod mod_pmod_shared_tests;
+
+#[path = "pure_differential/numeric_binary_shared_tests.rs"]
+mod numeric_binary_shared_tests;
