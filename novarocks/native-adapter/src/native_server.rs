@@ -51,7 +51,7 @@ use crate::native_incoming_key_capacity::NativeIncomingKey;
 use crate::native_ingress::NativeIngressService;
 use crate::native_transport_admission::{
     NativeHandshakePermit, NativeIncomingConnectionBinding, NativeTransportAdmission,
-    TransportClass,
+    TransportClass, TransportRole,
 };
 
 /// How long a stopping listener lets its already-accepted connections finish.
@@ -141,18 +141,18 @@ impl NativeRpcServerHandle {
         clippy::too_many_arguments,
         reason = "role identity and its authentication metric remain explicit composition inputs"
     )]
-    pub fn start<S, F, H>(
+    pub fn start_frontend_membership<S, F, H>(
         host: &str,
         port: u16,
         service: S,
         native_trust: Arc<NativeTrust>,
         incoming_adapter: NativeIncomingAdapter,
         role_label: &'static str,
-        domain: NativeEndpointDomain,
         thread_name: &'static str,
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
         ingress_config: NativeIngressConfig,
+        admission: NativeTransportAdmission,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
@@ -166,12 +166,16 @@ impl NativeRpcServerHandle {
             native_trust,
             incoming_adapter,
             role_label,
-            domain,
+            NativeEndpointDomain::FrontendMembership,
             thread_name,
             on_authentication_failure,
             on_transport_handshake_failure,
             ingress_config,
-            None,
+            ListenerAdmission {
+                admission,
+                class: TransportClass::Membership,
+                root_results: None,
+            },
         )
     }
 
@@ -212,11 +216,11 @@ impl NativeRpcServerHandle {
             on_authentication_failure,
             on_transport_handshake_failure,
             ingress_config,
-            Some(ListenerAdmission {
+            ListenerAdmission {
                 admission,
                 class,
                 root_results,
-            }),
+            },
         )
     }
 
@@ -236,21 +240,34 @@ impl NativeRpcServerHandle {
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
         ingress_config: NativeIngressConfig,
-        admission: Option<ListenerAdmission>,
+        admission: ListenerAdmission,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
         F: Fn() + Send + Sync + 'static,
         H: Fn() + Send + Sync + 'static,
     {
-        if let Some(listener_admission) = admission.as_ref() {
+        {
+            let listener_admission = &admission;
             let compatible = matches!(
-                (domain, listener_admission.class),
-                (NativeEndpointDomain::BackendData, TransportClass::Data)
-                    | (
-                        NativeEndpointDomain::BackendControl,
-                        TransportClass::Control
-                    )
+                (
+                    domain,
+                    listener_admission.class,
+                    listener_admission.admission.role()
+                ),
+                (
+                    NativeEndpointDomain::BackendData,
+                    TransportClass::Data,
+                    TransportRole::Backend
+                ) | (
+                    NativeEndpointDomain::BackendControl,
+                    TransportClass::Control,
+                    TransportRole::Backend
+                ) | (
+                    NativeEndpointDomain::FrontendMembership,
+                    TransportClass::Membership,
+                    TransportRole::Frontend
+                )
             );
             if !compatible {
                 return Err("native endpoint domain and transport admission class disagree".into());
@@ -342,9 +359,7 @@ impl NativeRpcServerHandle {
                         // Bounded root reads bypass the generated service: the
                         // root reader keeps each response body's owner until
                         // the body exits.
-                        if let Some(reader) = admission
-                            .as_ref()
-                            .and_then(|listener| listener.root_results.clone())
+                        if let Some(reader) = admission.root_results.clone()
                         {
                             router = router.route_service(
                                 novarocks_proto_codec::native_rpc::NativeRpcMethod::FetchRootResult
@@ -367,9 +382,7 @@ impl NativeRpcServerHandle {
                             domain,
                         )
                         .with_lane_streams(
-                            admission
-                                .as_ref()
-                                .map(|listener| listener.admission.clone()),
+                            Some(admission.admission.clone()),
                         );
                         let app = NativeListenerAuthService::new(
                             app,
@@ -383,7 +396,7 @@ impl NativeRpcServerHandle {
                             shutdown_rx,
                             transport_handshake_failure,
                             role_label,
-                            admission,
+                            Some(admission),
                             Some((native_trust.server_admission(), domain)),
                         )
                         .await
@@ -599,8 +612,8 @@ where
             let stream = novarocks_native_trust::OwnedNativeIo::with_guard(stream, connection);
             (stream, Some(head))
         }
-        // The Frontend's membership listener has no accept admission yet, but
-        // its connections take the same public HTTP/2 limits.
+        // Only private generic listener tests omit admission. Production
+        // composition requires role-matched admission before listener startup.
         None => (novarocks_native_trust::OwnedNativeIo::new(stream), None),
     };
     let mut builder = http2::Builder::new(TokioExecutor::new());

@@ -115,7 +115,14 @@
     },
     "structural_envelope": "transport-envelope-v1.json",
     "measured_coefficients_status": "NOT_FROZEN",
-    "measurement_evidence_status": "NOT_RUN"
+    "measurement_evidence_status": "NOT_RUN",
+    "frontend_membership_admission": {
+      "connection_positions": 96,
+      "handshake_positions": 32,
+      "incoming_stream_positions": 12288,
+      "enforcement_status": "IMPLEMENTED_TARGETED_SOCKET_AND_LIBRARY_TESTS_PASS;NATIVE_CLUSTER_AND_MEASUREMENT_PENDING",
+      "release_authority": "authenticated bootstrap or actual IO/body exit; independent of FE outgoing lanes"
+    }
   },
   "linux_verification": "USER_MANUAL_AFTER_LOCAL_IMPLEMENTATION",
   "local_source": {

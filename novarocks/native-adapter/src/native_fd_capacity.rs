@@ -57,6 +57,7 @@ pub struct NativeFileDescriptorCapacityReport {
     pub frontend_outgoing_socket_positions: u64,
     pub frontend_membership_socket_positions: u64,
     pub frontend_listener_positions: u64,
+    pub frontend_refusal_positions: u64,
     pub frontend_native_socket_positions: u64,
     /// The FE baseline minus the complete Native socket envelope.
     pub frontend_baseline_headroom: u64,
@@ -154,15 +155,11 @@ fn add(a: u64, b: u64) -> io::Result<u64> {
         .ok_or_else(|| io::ErrorKind::InvalidInput.into())
 }
 
-fn mul(a: u64, b: u64) -> io::Result<u64> {
-    a.checked_mul(b)
-        .ok_or_else(|| io::ErrorKind::InvalidInput.into())
-}
-
 const BACKEND_LISTENERS: u64 = 2;
 /// One accepted socket per listener may be open while it is being refused.
 const BACKEND_REFUSALS: u64 = 2;
 const FRONTEND_LISTENERS: u64 = 1;
+const FRONTEND_REFUSALS: u64 = 1;
 
 fn dns_positions() -> io::Result<u64> {
     u64::try_from(novarocks_native_trust::NATIVE_DNS_RESOLUTION_POSITIONS)
@@ -192,16 +189,8 @@ pub fn backend_socket_positions(g: &NativeResultSupportGeometry) -> io::Result<u
 /// The Backends' announcement connections to one Frontend's report listener,
 /// with their connecting and closing headroom.
 fn frontend_membership_positions(g: &NativeResultSupportGeometry) -> io::Result<u64> {
-    mul(
-        g.transport_maximum_live_backends,
-        add(
-            1,
-            add(
-                g.transport_connecting_positions_per_lane,
-                g.transport_closing_positions_per_lane,
-            )?,
-        )?,
-    )
+    u64::try_from(AdmissionDimensions::frontend_membership(g)?.0)
+        .map_err(|_| io::ErrorKind::InvalidInput.into())
 }
 
 /// Every Native descriptor a Frontend can hold: its outgoing lane positions,
@@ -213,7 +202,10 @@ pub fn frontend_socket_positions(g: &NativeResultSupportGeometry) -> io::Result<
         add(data, control)?,
         add(
             frontend_membership_positions(g)?,
-            add(FRONTEND_LISTENERS, dns_positions()?)?,
+            add(
+                add(FRONTEND_LISTENERS, FRONTEND_REFUSALS)?,
+                dns_positions()?,
+            )?,
         )?,
     )
 }
@@ -268,6 +260,7 @@ fn validate_limits(
         frontend_outgoing_socket_positions: add(frontend_data, frontend_control)?,
         frontend_membership_socket_positions: frontend_membership_positions(&g)?,
         frontend_listener_positions: FRONTEND_LISTENERS,
+        frontend_refusal_positions: FRONTEND_REFUSALS,
         frontend_native_socket_positions,
         frontend_baseline_headroom,
     })
@@ -297,14 +290,18 @@ mod tests {
             assert_eq!(report.backend_control_socket_positions, 20);
             assert_eq!(report.backend_listener_positions, 2);
             assert_eq!(report.backend_refusal_positions, 2);
+            assert_eq!(report.frontend_refusal_positions, 1);
             assert_eq!(report.dns_resolution_positions, 4);
             assert_eq!(report.backend_native_socket_positions, 546);
             assert_eq!(report.backend_baseline_headroom, 478);
             // 32 BEs * (10 data + 3 lanes * 2 tails) + 32 * (1 control + 2 tails).
             assert_eq!(report.frontend_outgoing_socket_positions, 512 + 96);
             assert_eq!(report.frontend_membership_socket_positions, 96);
-            assert_eq!(report.frontend_native_socket_positions, 608 + 96 + 1 + 4);
-            assert_eq!(report.frontend_baseline_headroom, 2048 - 709);
+            assert_eq!(
+                report.frontend_native_socket_positions,
+                608 + 96 + 1 + 1 + 4
+            );
+            assert_eq!(report.frontend_baseline_headroom, 2048 - 710);
             assert_eq!(report.soft_limit, 1024);
             assert!(!report.soft_unlimited);
             assert_eq!(report.hard_limit, u64::MAX);

@@ -3,8 +3,9 @@
 当前只复核公开配置推导的结构项。`c_conn/c_stream/c_handshake/c_queue` 尚未测量或冻结；
 完整 E_native_transport、repeatability、soak、P09 测量门均未通过。JSON 中 coefficients 与
 total_bytes 为 null，禁止把结构项或空系数当成完整容量承诺。
-生产 FE Membership incoming 的数量准入尚未接入，见
-[具体缺口](evidence/p00b-membership-ingress-gap.md)；其96连接项只是目标，不是当前已实施硬界。
+FE Membership incoming 已接共享数量准入并通过定向socket/库测试，见
+[实现收据](evidence/p07-membership-ingress.md)；[原缺口](evidence/p00b-membership-ingress-gap.md)
+保留为历史审查。96连接数量准入的实现不替代transport系数或原生cluster测量。
 
 规范来自 accepted spec revision 6 §5.8/§5.9、approved plan §2.4/§2.8/P00b。
 代码事实为 `native-adapter/src/native_transport_geometry.rs` 的 `envelope` 与
@@ -31,7 +32,7 @@ tonic 0.12.3 Endpoint 没有公开 client send-buffer 设置，按批准的 hype
 | Membership incoming | 96 | 4,128 |
 | 合计 | 704 | 103,232 |
 
-FE 对应 90,112 个配置 stream positions、128 handshake positions、4,864 queued requests。
+FE 对应 90,112 个配置 stream positions、160 handshake positions（outgoing 128 + incoming Membership 32）、4,864 queued requests。
 结构小计为 100.8125GiB；自有 FE 结果/input/local/internal/control/nonroot workspace 目标小计
 10.5GiB，二者合计 111.3125GiB，尚不含 c_*。这既不是 RSS 预测，也不是默认硬件要求或 MEM
 容量 grant；它如实展示当前保守结构公式的大小。旧 3GiB Native 附加与“总量≤16GiB”已退休，

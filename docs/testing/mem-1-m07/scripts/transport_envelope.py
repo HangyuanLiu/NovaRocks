@@ -72,7 +72,7 @@ def envelope(profile):
             })
         outgoing = add(*(lane['connections'] for lane in lanes
                          if lane['direction'] == 'outgoing'))
-        handshakes = (mul(backends, mul(4, t['connecting_positions_per_lane']))
+        handshakes = (mul(backends, mul(5, t['connecting_positions_per_lane']))
                       if role == 'frontend' else
                       add(t['data_handshake_positions'], t['control_handshake_positions']))
         roles[role] = {

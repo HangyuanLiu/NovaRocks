@@ -150,6 +150,78 @@ fn ingress(
     (service, senders)
 }
 
+#[tokio::test]
+async fn membership_ingress_holds_stream_positions_through_eof_reset_drop_and_refuses_before_dispatch()
+ {
+    let recorder = Arc::new(Recorder::default());
+    let admission = NativeTransportAdmission::frontend(Some(recorder.clone())).unwrap();
+    let (senders_tx, mut senders) = mpsc::unbounded_channel();
+    let service = NativeIngressService::new(
+        DrivenHandler(senders_tx),
+        NativeIngressConfig::default(),
+        "membership",
+        false,
+        NativeEndpointDomain::FrontendMembership,
+    )
+    .with_lane_streams(Some(admission.clone()));
+    let method = NativeRpcMethod::AnnounceBackend;
+    let lane = NativeLane::Membership;
+    for exit in ["eof", "reset", "drop"] {
+        let response = bounded(service.clone().oneshot(request(method)))
+            .await
+            .unwrap();
+        let frames = senders.recv().await.unwrap();
+        assert_eq!(
+            held(&admission, lane),
+            1,
+            "handler return cannot release the stream"
+        );
+        let mut body = response.into_body();
+        match exit {
+            "eof" => {
+                drop(frames);
+                assert!(next_frame(&mut body).await.is_none());
+            }
+            "reset" => {
+                frames.send(Err(tonic::Status::cancelled("reset"))).unwrap();
+                assert!(next_frame(&mut body).await.unwrap().is_err());
+            }
+            "drop" => drop(body),
+            _ => unreachable!(),
+        }
+        assert_eq!(held(&admission, lane), 0, "{exit}");
+    }
+    let mut pending_service = service.clone();
+    let pending = pending_service.call(request(method));
+    assert_eq!(held(&admission, lane), 1);
+    drop(pending);
+    assert_eq!(held(&admission, lane), 0);
+    let gate = admission.incoming_streams(lane);
+    let positions: Vec<_> = (0..gate.limit())
+        .map(|_| gate.try_acquire().unwrap())
+        .collect();
+    assert_eq!(positions.len(), 12_288);
+    let response = bounded(service.oneshot(request(method))).await.unwrap();
+    assert_eq!(response.headers()["grpc-status"], "8");
+    assert_eq!(
+        response.headers()["x-novarocks-ingress-rejection"],
+        "lane_streams"
+    );
+    assert!(
+        senders.try_recv().is_err(),
+        "capacity refusal never reaches the handler"
+    );
+    assert_eq!(
+        admission.available_positions(TransportClass::Data),
+        admission.positions(TransportClass::Data)
+    );
+    drop(positions);
+    assert_eq!(held(&admission, lane), 0);
+    let events = recorder.events();
+    assert!(events.contains(&"streams:membership:incoming:1".to_string()));
+    assert!(events.contains(&"streams:membership:incoming:-1".to_string()));
+}
+
 fn request(method: NativeRpcMethod) -> Request<Body> {
     Request::builder()
         .uri(method.contract().path)
@@ -562,6 +634,142 @@ fn data_listener(
         None,
     )
     .unwrap()
+}
+
+fn membership_listener(
+    admission: &NativeTransportAdmission,
+    trust: &Arc<NativeTrust>,
+) -> Result<NativeRpcServerHandle, String> {
+    NativeRpcServerHandle::start_frontend_membership(
+        "127.0.0.1",
+        0,
+        LaneProbe,
+        trust.clone(),
+        NativeIncomingAdapter::plaintext(),
+        "membership-test",
+        "native-membership-test",
+        || {},
+        || {},
+        NativeIngressConfig {
+            worker_threads: 1,
+            control_worker_threads: 1,
+            ..NativeIngressConfig::default()
+        },
+        admission.clone(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn membership_listener_saturates_bootstrap_without_consuming_outgoing_lanes() {
+    let trust = crate::backend_test_support::test_backend_native_trust();
+    trust
+        .bind_process_identity(NativeProcessIdentity::Backend(
+            novarocks_types::BackendProcessId::new_v7(),
+        ))
+        .unwrap();
+    assert!(
+        membership_listener(&NativeTransportAdmission::new().unwrap(), &trust).is_err(),
+        "a Backend admission cannot protect a Frontend listener"
+    );
+    let admission = NativeTransportAdmission::frontend(None).unwrap();
+    let mut listener = membership_listener(&admission, &trust).unwrap();
+    let class = TransportClass::Membership;
+    let mut live = H2Client::connect(listener.bound_addr()).await;
+    let response = bounded(live.send(&trust, NativeRpcMethod::AnnounceBackend).await)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let header_status = response.headers().get("grpc-status").cloned();
+    let mut body = response.into_body();
+    while let Some(frame) = bounded(body.data()).await {
+        let frame = frame.unwrap();
+        body.flow_control().release_capacity(frame.len()).unwrap();
+    }
+    let trailers = bounded(body.trailers()).await.unwrap();
+    drop(body);
+    let status = header_status
+        .or_else(|| trailers.and_then(|trailers| trailers.get("grpc-status").cloned()));
+    assert_eq!(
+        status.unwrap(),
+        "12",
+        "the authenticated announcement reaches the probe handler"
+    );
+    eventually(
+        || admission.available_handshakes(class) == 32,
+        "authenticated membership returns its bootstrap position",
+    )
+    .await;
+    assert_eq!(admission.available_positions(class), 95);
+    let mut pending = tokio::task::JoinSet::new();
+    let opened = tokio::time::Instant::now();
+    for _ in 0..32 {
+        let address = listener.bound_addr();
+        pending.spawn(async move { tokio::net::TcpStream::connect(address).await.unwrap() });
+    }
+    let mut silent = Vec::new();
+    while let Some(socket) = bounded(pending.join_next()).await {
+        silent.push(socket.unwrap());
+    }
+    assert!(
+        opened.elapsed()
+            < Duration::from_millis(
+                NativeResultSupportGeometry::V1.transport_handshake_deadline_ms
+            ),
+        "the fixture must establish concurrent sockets before their bootstrap expires"
+    );
+    eventually(
+        || admission.available_handshakes(class) == 0,
+        "all membership bootstrap positions are held by real sockets",
+    )
+    .await;
+    let mut refused = bounded(tokio::net::TcpStream::connect(listener.bound_addr()))
+        .await
+        .unwrap();
+    let mut byte = [0; 1];
+    use tokio::io::AsyncReadExt;
+    match bounded(refused.read(&mut byte)).await {
+        Ok(count) => assert_eq!(count, 0),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+    assert_eq!(
+        admission.available_positions(TransportClass::Data),
+        admission.positions(TransportClass::Data)
+    );
+    assert_eq!(
+        admission.available_positions(TransportClass::Control),
+        admission.positions(TransportClass::Control)
+    );
+    assert_eq!(admission.refused_connections(class), 1);
+    eventually(
+        || {
+            admission.available_handshakes(class) == 32
+                && admission.available_positions(class) == 95
+        },
+        "bootstrap deadlines close silent IO and return positions",
+    )
+    .await;
+    drop(silent);
+    let response = bounded(live.send(&trust, NativeRpcMethod::AnnounceBackend).await)
+        .await
+        .unwrap();
+    drain(response.into_body()).await;
+    assert_eq!(
+        admission.available_positions(class),
+        95,
+        "authenticated connection survives the bootstrap deadline"
+    );
+    drop(live.sender);
+    let _ = bounded(live.connection).await;
+    eventually(
+        || admission.available_positions(class) == 96,
+        "authenticated IO exit returns the physical position",
+    )
+    .await;
+    bounded(tokio::task::spawn_blocking(move || {
+        listener.stop().unwrap()
+    }))
+    .await
+    .unwrap();
 }
 
 struct H2Client {

@@ -23,7 +23,7 @@
 
 按 [第 6 版结构算术](transport-envelope-v1.md) 与 JSON 复算，Native 不再承诺逐连接全部内部
 backing≤2MiB，也不通过第三方 vendor 接缝逐字节授权。FE outgoing live/dial/closing 总608个，
-另含96个 incoming Membership连接；各连接最多128 stream位置，公开 receive window、
+另含96个 incoming Membership连接及独立32个bootstrap位置（FE总handshake160）；各连接最多128 stream位置，公开 receive window、
 header list 与服务端 send buffer 有限。客户端 send buffer使用批准的hyper默认1MiB/stream。
 
 `E_native_transport = Σ N_conn × [conn_window + N_stream × (stream_window + send_buf + header_list)]

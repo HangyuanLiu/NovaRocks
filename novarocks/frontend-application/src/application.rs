@@ -1781,6 +1781,7 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             native_ingress,
+            self.data_runtime.transport_admission().clone(),
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -1804,6 +1805,7 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             native_ingress,
+            self.data_runtime.transport_admission().clone(),
         )
         .map_err(FrontendApplicationError::server)
     }

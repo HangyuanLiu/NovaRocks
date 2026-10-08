@@ -31,7 +31,7 @@ static FRONTEND_NATIVE_TRANSPORT_POSITIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
             "novarocks_frontend_native_transport_positions",
-            "Outgoing Native connection admission positions by class and kind: live \
+            "Process Native connection admission positions by class and kind: live \
              connections (until their IO is dropped) and dials still connecting, used and limit.",
         ),
         &["class", "kind", "dimension"],
@@ -43,7 +43,7 @@ static FRONTEND_NATIVE_TRANSPORT_REFUSED: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
             "novarocks_frontend_native_transport_refused_connections_total",
-            "Outgoing Native dials refused for lack of a connection or handshake position.",
+            "Native connections refused for lack of a connection or handshake position.",
         ),
         &["class"],
     )
@@ -54,7 +54,7 @@ static FRONTEND_NATIVE_LANE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
             "novarocks_frontend_native_lane_connections",
-            "Established outgoing Native connections by lane, until their IO is dropped.",
+            "Established Native connections by lane, until their IO is dropped.",
         ),
         &["lane"],
     )
@@ -65,7 +65,7 @@ static FRONTEND_NATIVE_LANE_STREAMS: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
             "novarocks_frontend_native_lane_streams",
-            "Outgoing Native stream positions in use by lane, held until the response body \
+            "Outgoing lane and incoming Membership stream positions in use by lane, held until the response body \
              ends or is dropped.",
         ),
         &["lane"],
@@ -78,7 +78,11 @@ pub(crate) fn register_collectors(registry: &Registry) -> Result<(), String> {
         let _ = FRONTEND_NATIVE_LANE_CONNECTIONS.get_metric_with_label_values(&[lane.label()]);
         let _ = FRONTEND_NATIVE_LANE_STREAMS.get_metric_with_label_values(&[lane.label()]);
     }
-    for class in [TransportClass::Data, TransportClass::Control] {
+    for class in [
+        TransportClass::Data,
+        TransportClass::Control,
+        TransportClass::Membership,
+    ] {
         let _ = FRONTEND_NATIVE_TRANSPORT_REFUSED.get_metric_with_label_values(&[class.label()]);
     }
     for collector in [
@@ -120,7 +124,7 @@ impl NativeTransportObserver for FrontendNativeTransportMetrics {
     }
 
     fn lane_streams(&self, lane: NativeLane, direction: StreamDirection, delta: i64) {
-        if direction == StreamDirection::Outgoing {
+        if direction == StreamDirection::Outgoing || lane == NativeLane::Membership {
             FRONTEND_NATIVE_LANE_STREAMS
                 .with_label_values(&[lane.label()])
                 .add(delta);
@@ -128,7 +132,7 @@ impl NativeTransportObserver for FrontendNativeTransportMetrics {
     }
 }
 
-/// The observer a Frontend installs on its outgoing transport admission.
+/// The observer a Frontend installs on its process-scoped transport admission.
 pub(crate) fn frontend_native_transport_observer() -> Arc<dyn NativeTransportObserver> {
     Arc::new(FrontendNativeTransportMetrics)
 }
@@ -154,6 +158,17 @@ mod tests {
             before + 1
         );
         observer.lane_streams(NativeLane::Observation, StreamDirection::Outgoing, -1);
+        let membership_before = FRONTEND_NATIVE_LANE_STREAMS
+            .with_label_values(&["membership"])
+            .get();
+        observer.lane_streams(NativeLane::Membership, StreamDirection::Incoming, 1);
+        assert_eq!(
+            FRONTEND_NATIVE_LANE_STREAMS
+                .with_label_values(&["membership"])
+                .get(),
+            membership_before + 1
+        );
+        observer.lane_streams(NativeLane::Membership, StreamDirection::Incoming, -1);
         observer.positions(TransportClass::Control, PositionKind::Handshake, 3, 32);
         let names: Vec<_> = registry
             .gather()

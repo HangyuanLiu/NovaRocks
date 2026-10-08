@@ -48,7 +48,7 @@
       ],
       "connections": 704,
       "streams": 90112,
-      "handshake_positions": 128,
+      "handshake_positions": 160,
       "queued_requests": 4864,
       "structural_bytes": 108246597632,
       "coefficients": null,

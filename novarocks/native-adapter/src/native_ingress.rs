@@ -419,30 +419,22 @@ where
             .into_http();
             return Box::pin(async move { Ok(response) });
         };
-        if self.domain == NativeEndpointDomain::FrontendMembership {
-            // FE membership keeps the baseline service path and does not
-            // consume BE-local task admission.
-            let mut inner = self.inner.clone();
-            return Box::pin(async move { inner.ready().await?.call(request).await });
-        }
         // Record arrival synchronously: an async worker may not poll the
         // returned future immediately, and that delay consumes the request's
         // original ingress deadline, including response capacity preparation.
         let arrival = Instant::now();
-        let class = self.classify(method);
-        let gate = match class {
-            MethodClass::Control => self.control.clone(),
-            MethodClass::Ordinary | MethodClass::Stream => self.ordinary.clone(),
-        };
-        let config = self.config;
-        let backend_metrics = self.backend_metrics;
         // The stream position precedes every execution gate and decoder; a
         // refusal holds nothing.
         let stream = match &self.lane_streams {
             Some(admission) => match admission.try_incoming_stream(method) {
                 Some(stream) => stream,
                 None => {
-                    gate.reject("lane_streams");
+                    match self.classify(method) {
+                        MethodClass::Control => self.control.reject("lane_streams"),
+                        MethodClass::Ordinary | MethodClass::Stream => {
+                            self.ordinary.reject("lane_streams")
+                        }
+                    }
                     drop(request);
                     let response = IngressFailure::capacity(
                         "native lane stream positions exhausted",
@@ -454,6 +446,22 @@ where
             },
             None => None,
         };
+        if self.domain == NativeEndpointDomain::FrontendMembership {
+            // Membership has no BE task gate. Its transport stream position
+            // still precedes dispatch and follows the response body's exit.
+            let mut inner = self.inner.clone();
+            return Box::pin(async move {
+                let response = inner.ready().await?.call(request).await?;
+                Ok(response.map(|body| NativeLaneStreamBody::boxed(body, stream)))
+            });
+        }
+        let class = self.classify(method);
+        let gate = match class {
+            MethodClass::Control => self.control.clone(),
+            MethodClass::Ordinary | MethodClass::Stream => self.ordinary.clone(),
+        };
+        let config = self.config;
+        let backend_metrics = self.backend_metrics;
         let mut inner = self.inner.clone();
         let admitted = async move {
             if backend_metrics {

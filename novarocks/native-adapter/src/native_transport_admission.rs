@@ -52,13 +52,15 @@ use crate::native_lane::{
     PositionKind, SharedObserver, StreamDirection,
 };
 
-/// Independent admission domains; Control never consumes or lends Data positions.
+/// Independent admission domains; incoming Membership never borrows outgoing positions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportClass {
     /// Incoming FE data and both directions of peer exchange/runtime filters.
     Data,
     /// Incoming FE lifecycle, conservative outgoing reports, and handshakes.
     Control,
+    /// Frontend incoming Backend announcements, including bootstrap and closing tails.
+    Membership,
 }
 
 impl TransportClass {
@@ -66,6 +68,7 @@ impl TransportClass {
         match self {
             Self::Data => 0,
             Self::Control => 1,
+            Self::Membership => 2,
         }
     }
 
@@ -74,6 +77,7 @@ impl TransportClass {
         match self {
             Self::Data => "data",
             Self::Control => "control",
+            Self::Membership => "membership",
         }
     }
 }
@@ -209,23 +213,27 @@ impl AdmissionDimensions {
         add(self.data_positions, self.control_positions)
     }
 
-    const fn positions(&self, class: TransportClass) -> usize {
-        match class {
-            TransportClass::Data => self.data_positions,
-            TransportClass::Control => self.control_positions,
+    /// Frontend incoming membership (physical, handshake) counts, independent of outgoing lanes.
+    pub fn frontend_membership(g: &NativeResultSupportGeometry) -> io::Result<(usize, usize)> {
+        let backends = value(g.transport_maximum_live_backends)?;
+        let connecting = value(g.transport_connecting_positions_per_lane)?;
+        let positions = mul(
+            backends,
+            add(
+                1,
+                add(connecting, value(g.transport_closing_positions_per_lane)?)?,
+            )?,
+        )?;
+        let handshakes = mul(backends, connecting)?;
+        if positions == 0 || handshakes == 0 {
+            return Err(invalid());
         }
-    }
-
-    const fn handshakes(&self, class: TransportClass) -> usize {
-        match class {
-            TransportClass::Data => self.data_handshakes,
-            TransportClass::Control => self.control_handshakes,
-        }
+        Ok((positions, handshakes))
     }
 }
 
 /// Which role's lanes an admission serves. A Backend serves Native lanes and
-/// dials peers and its Frontend; a Frontend only dials Backend lanes.
+/// dials peers and its Frontend; a Frontend dials Backend lanes and serves membership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportRole {
     Backend,
@@ -233,6 +241,8 @@ pub enum TransportRole {
 }
 
 struct ClassState {
+    physical_limit: usize,
+    handshake_limit: usize,
     physical: Arc<Semaphore>,
     handshake: Arc<Semaphore>,
     refused: AtomicU64,
@@ -241,6 +251,8 @@ struct ClassState {
 impl ClassState {
     fn new(positions: usize, handshakes: usize) -> Self {
         Self {
+            physical_limit: positions,
+            handshake_limit: handshakes,
             physical: Arc::new(Semaphore::new(positions)),
             handshake: Arc::new(Semaphore::new(handshakes)),
             refused: AtomicU64::new(0),
@@ -251,7 +263,7 @@ impl ClassState {
 struct Core {
     role: TransportRole,
     dimensions: AdmissionDimensions,
-    classes: [ClassState; 2],
+    classes: [ClassState; 3],
     connection_keys: NativeConnectionKeyCapacity,
     incoming_keys: NativeIncomingKeyCapacity,
     incoming_streams: [NativeLaneStreamGate; NativeLane::COUNT],
@@ -259,15 +271,22 @@ struct Core {
 }
 
 /// Stream positions a Backend serves per lane: every legal connection of the
-/// lane times the per-connection stream limit H2 advertises. A Frontend's
-/// admission serves no lane.
+/// lane times the per-connection stream limit H2 advertises. A Frontend
+/// serves only the Membership lane.
 pub fn incoming_lane_stream_limit(
     role: TransportRole,
     lane: NativeLane,
     g: &NativeResultSupportGeometry,
 ) -> io::Result<usize> {
     if role == TransportRole::Frontend {
-        return Ok(0);
+        return if lane == NativeLane::Membership {
+            mul(
+                AdmissionDimensions::frontend_membership(g)?.0,
+                value(g.transport_streams_per_connection)?,
+            )
+        } else {
+            Ok(0)
+        };
     }
     let frontends = value(g.transport_authenticated_live_frontends_per_backend)?;
     let backends = value(g.transport_maximum_live_backends)?;
@@ -330,7 +349,7 @@ impl NativeTransportAdmission {
         )
     }
 
-    /// The Frontend role's outgoing admission from the frozen geometry.
+    /// The Frontend role's outgoing and incoming membership admission from the frozen geometry.
     pub fn frontend(observer: Option<Arc<dyn NativeTransportObserver>>) -> io::Result<Self> {
         Self::with_parts(
             TransportRole::Frontend,
@@ -349,6 +368,11 @@ impl NativeTransportAdmission {
         observer: SharedObserver,
     ) -> io::Result<Self> {
         let g = NativeResultSupportGeometry::V1;
+        let (membership_positions, membership_handshakes) = if role == TransportRole::Frontend {
+            AdmissionDimensions::frontend_membership(&g)?
+        } else {
+            (0, 0)
+        };
         let mut limits = [0; NativeLane::COUNT];
         for lane in NativeLane::ALL {
             limits[lane.index()] = incoming_lane_stream_limit(role, lane, &g)?;
@@ -368,6 +392,7 @@ impl NativeTransportAdmission {
                 classes: [
                     ClassState::new(dimensions.data_positions, dimensions.data_handshakes),
                     ClassState::new(dimensions.control_positions, dimensions.control_handshakes),
+                    ClassState::new(membership_positions, membership_handshakes),
                 ],
                 connection_keys: NativeConnectionKeyCapacity::new()?,
                 incoming_keys: NativeIncomingKeyCapacity::new()?,
@@ -375,7 +400,11 @@ impl NativeTransportAdmission {
                 observer,
             }),
         };
-        for class in [TransportClass::Data, TransportClass::Control] {
+        for class in [
+            TransportClass::Data,
+            TransportClass::Control,
+            TransportClass::Membership,
+        ] {
             admission.publish(class, PositionKind::Connection);
             admission.publish(class, PositionKind::Handshake);
         }
@@ -391,7 +420,7 @@ impl NativeTransportAdmission {
     }
 
     pub fn positions(&self, class: TransportClass) -> usize {
-        self.core.dimensions.positions(class)
+        self.core.classes[class.index()].physical_limit
     }
 
     pub fn available_positions(&self, class: TransportClass) -> usize {
@@ -401,7 +430,7 @@ impl NativeTransportAdmission {
     }
 
     pub fn handshake_positions(&self, class: TransportClass) -> usize {
-        self.core.dimensions.handshakes(class)
+        self.core.classes[class.index()].handshake_limit
     }
 
     pub fn available_handshakes(&self, class: TransportClass) -> usize {
@@ -443,14 +472,8 @@ impl NativeTransportAdmission {
         };
         let state = &self.core.classes[class.index()];
         let (limit, available) = match kind {
-            PositionKind::Connection => (
-                self.core.dimensions.positions(class),
-                state.physical.available_permits(),
-            ),
-            PositionKind::Handshake => (
-                self.core.dimensions.handshakes(class),
-                state.handshake.available_permits(),
-            ),
+            PositionKind::Connection => (state.physical_limit, state.physical.available_permits()),
+            PositionKind::Handshake => (state.handshake_limit, state.handshake.available_permits()),
         };
         observer.positions(class, kind, limit.saturating_sub(available), limit);
     }
@@ -775,6 +798,112 @@ mod tests {
         assert!(dimensions.control_positions > dimensions.control_handshakes);
         assert_eq!(dimensions.data_handshakes, 32);
         assert_eq!(dimensions.control_handshakes, 8);
+    }
+
+    #[test]
+    fn membership_saturation_never_borrows_outgoing_positions_and_returns_on_exit() {
+        let admission = NativeTransportAdmission::frontend(None).unwrap();
+        let class = TransportClass::Membership;
+        assert_eq!(admission.positions(class), 96);
+        assert_eq!(admission.handshake_positions(class), 32);
+        assert_eq!(
+            incoming_lane_stream_limit(
+                TransportRole::Frontend,
+                NativeLane::Membership,
+                &NativeResultSupportGeometry::V1
+            )
+            .unwrap(),
+            12_288
+        );
+        let outgoing = (
+            admission.available_positions(TransportClass::Data),
+            admission.available_positions(TransportClass::Control),
+        );
+        let mut held = Vec::new();
+        for _ in 0..32 {
+            held.push(admission.try_accept(class).unwrap());
+        }
+        assert_eq!(
+            admission.try_accept(class).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            admission.available_positions(class),
+            64,
+            "failed handshake rolls back its physical position"
+        );
+        for connection in &held {
+            connection.handshake.release();
+        }
+        for _ in 32..96 {
+            let connection = admission.try_accept(class).unwrap();
+            connection.handshake.release();
+            held.push(connection);
+        }
+        assert_eq!(
+            admission.try_accept(class).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            (
+                admission.available_positions(TransportClass::Data),
+                admission.available_positions(TransportClass::Control)
+            ),
+            outgoing
+        );
+        assert_eq!(admission.refused_connections(class), 2);
+        drop(held);
+        assert_eq!(admission.available_positions(class), 96);
+        assert_eq!(admission.available_handshakes(class), 32);
+        assert_eq!(NativeTransportAdmission::new().unwrap().positions(class), 0);
+    }
+
+    #[test]
+    fn membership_key_reuse_waits_for_the_original_connection_exit() {
+        use novarocks_native_trust::NativeProcessIdentity;
+        use novarocks_proto_codec::native_rpc::{NativeEndpointDomain, NativeTrafficClass};
+        let admission = NativeTransportAdmission::frontend(None).unwrap();
+        let key = NativeIncomingKey::new(
+            NativeProcessIdentity::Backend(novarocks_types::BackendProcessId::new_v7()),
+            NativeEndpointDomain::FrontendMembership,
+            NativeTrafficClass::Membership,
+        )
+        .unwrap();
+        let other = NativeIncomingKey::new(
+            NativeProcessIdentity::Backend(novarocks_types::BackendProcessId::new_v7()),
+            NativeEndpointDomain::FrontendMembership,
+            NativeTrafficClass::Membership,
+        )
+        .unwrap();
+        let first = admission.try_accept(TransportClass::Membership).unwrap();
+        first.binding.seal(key).unwrap();
+        first.handshake.release();
+        first.binding.seal(key).unwrap();
+        assert_eq!(
+            first.binding.seal(other).err().unwrap().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        let replacement = admission.try_accept(TransportClass::Membership).unwrap();
+        assert_eq!(
+            replacement.binding.seal(key).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Dropping a handler alias cannot retire the original socket's identity.
+        let AcceptedConnection {
+            connection,
+            handshake,
+            binding,
+        } = first;
+        drop(binding);
+        drop(handshake);
+        assert!(replacement.binding.seal(key).is_err());
+        drop(connection);
+        replacement.binding.seal(key).unwrap();
+        drop(replacement);
+        assert_eq!(
+            admission.available_positions(TransportClass::Membership),
+            96
+        );
     }
 
     #[test]

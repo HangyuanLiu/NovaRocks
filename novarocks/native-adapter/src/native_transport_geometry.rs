@@ -437,10 +437,19 @@ fn envelope(
             structural_bytes,
         });
     }
-    let handshake_positions = add(
+    let outgoing_handshake_positions = add(
         u64::try_from(admission.data_handshakes).map_err(|_| refuse("handshakes overflow"))?,
         u64::try_from(admission.control_handshakes).map_err(|_| refuse("handshakes overflow"))?,
     )?;
+    let handshake_positions = if role == TransportRole::Frontend {
+        add(
+            outgoing_handshake_positions,
+            u64::try_from(AdmissionDimensions::frontend_membership(g)?.1)
+                .map_err(|_| refuse("membership handshakes overflow"))?,
+        )?
+    } else {
+        outgoing_handshake_positions
+    };
     Ok(NativeTransportEnvelope {
         role,
         lanes: out,
@@ -502,6 +511,7 @@ mod tests {
                 .sum::<u64>()
         );
         assert_eq!(report.backend.handshake_positions, 40);
+        assert_eq!(report.frontend.handshake_positions, 160);
         assert!(report.backend_socket_positions <= 1024);
         assert!(report.frontend_socket_positions <= 2048);
     }

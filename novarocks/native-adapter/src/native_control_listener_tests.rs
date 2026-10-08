@@ -456,6 +456,7 @@ async fn saturated(blocked: TransportClass, expected: usize) {
             &mut data_client,
             &data_observation,
         ),
+        TransportClass::Membership => panic!("Backend has no membership listener"),
     };
     assert_eq!(factory.handshake_positions(blocked), expected);
     // Every position below is an actual accepted TCP socket withholding the
@@ -510,6 +511,7 @@ async fn saturated(blocked: TransportClass, expected: usize) {
             );
             assert_eq!(observation.data.load(Ordering::SeqCst), 2);
         }
+        TransportClass::Membership => panic!("Backend has no membership listener"),
     }
     // Both entrypoints receive their stop signal before either actor join.
     data.begin_stop();
