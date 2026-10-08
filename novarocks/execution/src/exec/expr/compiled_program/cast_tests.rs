@@ -256,6 +256,7 @@ fn fixture(
             } else {
                 match ty.data_type {
                     DataType::Boolean => LiteralValue::Boolean(false),
+                    DataType::Date32 => LiteralValue::Date32(0),
                     DataType::Int64 => LiteralValue::Int64(0),
                     DataType::UInt64 => LiteralValue::UInt64(0),
                     DataType::Timestamp(_, None) => LiteralValue::Timestamp(0),
@@ -312,6 +313,7 @@ fn fixture(
         } else {
             let value = match source_type.data_type {
                 DataType::Boolean => LiteralValue::Boolean(true),
+                DataType::Date32 => LiteralValue::Date32(71),
                 DataType::Int64 => LiteralValue::Int64(71),
                 DataType::UInt64 => LiteralValue::UInt64(u64::MAX),
                 DataType::Timestamp(_, None) => LiteralValue::Timestamp(71),
@@ -1081,3 +1083,7 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
 #[cfg(test)]
 #[path = "cast_timestamp_tests.rs"]
 mod cast_timestamp_tests;
+
+#[cfg(test)]
+#[path = "cast_temporal_carrier_tests.rs"]
+mod cast_temporal_carrier_tests;

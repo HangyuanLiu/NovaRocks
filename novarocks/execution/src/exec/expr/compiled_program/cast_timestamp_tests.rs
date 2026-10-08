@@ -33,7 +33,7 @@ const UNITS: [TimeUnit; 4] = [
 fn timestamp_type(unit: TimeUnit, nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Timestamp(unit, None), nullable)
 }
-fn timestamp_array(unit: TimeUnit, values: Vec<Option<i64>>) -> ArrayRef {
+pub(super) fn timestamp_array(unit: TimeUnit, values: Vec<Option<i64>>) -> ArrayRef {
     match unit {
         TimeUnit::Second => Arc::new(TimestampSecondArray::from(values)),
         TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(values)),
