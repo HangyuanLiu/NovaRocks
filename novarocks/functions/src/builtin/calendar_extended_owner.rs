@@ -42,6 +42,7 @@ use crate::{
 pub(super) fn operation(name: &str) -> Option<CalendarExtendedOp> {
     match name {
         "date_trunc" => Some(CalendarExtendedOp::Trunc),
+        "convert_tz" => Some(CalendarExtendedOp::ConvertTz),
         "unix_timestamp" => Some(CalendarExtendedOp::UnixTimestamp),
         "to_datetime_ntz" => Some(CalendarExtendedOp::EpochNtz),
         "timestampdiff" => Some(CalendarExtendedOp::TimestampDiff),

@@ -815,14 +815,7 @@ fn column_argument(data_type: DataType) -> DiffArgument {
 #[test]
 fn pure_differential_reports_missing_owners_for_the_census() {
     let scalar_census: Vec<(&str, Vec<DiffArgument>)> = vec![
-        (
-            "convert_tz",
-            vec![
-                column_argument(timestamp()),
-                column_argument(DataType::Utf8),
-                column_argument(DataType::Utf8),
-            ],
-        ),
+        ("from_unixtime", vec![column_argument(DataType::Int64)]),
         ("hour_from_unixtime", vec![column_argument(DataType::Int64)]),
         ("time_to_sec", vec![column_argument(timestamp())]),
     ];

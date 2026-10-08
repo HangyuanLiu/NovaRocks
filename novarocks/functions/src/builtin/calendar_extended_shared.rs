@@ -83,6 +83,7 @@ impl<'call, 'batch> CalendarInput<'call, 'batch> {
 #[derive(Clone, Copy, Debug)]
 pub enum CalendarOperation {
     Trunc,
+    ConvertTz,
     UnixTimestamp,
     EpochNtz,
     TimestampDiff,
@@ -105,6 +106,7 @@ impl CalendarOperation {
     fn operation(self) -> CalendarExtendedOp {
         match self {
             Self::Trunc => CalendarExtendedOp::Trunc,
+            Self::ConvertTz => CalendarExtendedOp::ConvertTz,
             Self::UnixTimestamp => CalendarExtendedOp::UnixTimestamp,
             Self::EpochNtz => CalendarExtendedOp::EpochNtz,
             Self::TimestampDiff => CalendarExtendedOp::TimestampDiff,
@@ -208,6 +210,7 @@ pub fn evaluate_legacy_calendar(
     let carrier = if matches!(
         operation,
         CalendarOperation::Timestamp
+            | CalendarOperation::ConvertTz
             | CalendarOperation::EpochNtz
             | CalendarOperation::MonthsShift(_)
             | CalendarOperation::DurationShift(_)

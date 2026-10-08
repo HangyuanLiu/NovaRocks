@@ -38,6 +38,7 @@ use std::{alloc::Layout, sync::Arc};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CalendarExtendedOp {
     Trunc,
+    ConvertTz,
     UnixTimestamp,
     EpochNtz,
     TimestampDiff,
@@ -387,6 +388,9 @@ pub(super) fn evaluate_calendar_input<'a>(
     }
     if op == CalendarExtendedOp::EpochNtz {
         return super::calendar_epoch_ntz::evaluate_epoch_ntz(input, control);
+    }
+    if op == CalendarExtendedOp::ConvertTz {
+        return super::calendar_convert_tz::evaluate_convert_tz(input, control);
     }
     if let CalendarExtendedOp::Parse(operation) = op {
         return super::calendar_extended_parse::evaluate_calendar_parse(operation, input, control);

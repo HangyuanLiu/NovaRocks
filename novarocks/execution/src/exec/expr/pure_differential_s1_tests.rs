@@ -1097,3 +1097,54 @@ fn pure_differential_s1_unix_zero_argument_clock_form_is_explicitly_refused() {
         "{message}"
     );
 }
+#[test]
+fn pure_differential_s1_convert_tz_explicit_offsets_named_dst_null_and_invalid_domains() {
+    for source in temporal_sources(0x7A01u64)
+        .into_iter()
+        .filter(|source| source.data_type() == &DataType::Timestamp(TimeUnit::Microsecond, None))
+    {
+        for (from, to) in [
+            ("UTC", "+08:00"),
+            ("Asia/Shanghai", "America/New_York"),
+            ("America/New_York", "UTC"),
+            ("utc", "UTC"),
+            ("local", "UTC"),
+            ("UTC", "unknown"),
+        ] {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new("convert_tz")
+                    .column(Arc::clone(&source))
+                    .constant_array(Arc::new(StringArray::from(vec![from])))
+                    .constant_array(Arc::new(StringArray::from(vec![to]))),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_convert_tz_profile_has_nonnull_and_constant_coverage() {
+    let date: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0; 8]));
+    let from: ArrayRef = Arc::new(StringArray::from(vec!["UTC"; 8]));
+    let to: ArrayRef = Arc::new(StringArray::from(vec!["Asia/Shanghai"; 8]));
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("convert_tz")
+            .typed_column(
+                FunctionValueType::new(date.data_type().clone(), false),
+                Arc::clone(&date),
+            )
+            .typed_column(
+                FunctionValueType::new(DataType::Utf8, false),
+                Arc::clone(&from),
+            )
+            .typed_column(
+                FunctionValueType::new(DataType::Utf8, false),
+                Arc::clone(&to),
+            ),
+    );
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("convert_tz")
+            .constant_rows(8)
+            .constant_array(date.slice(0, 1))
+            .constant_array(from.slice(0, 1))
+            .constant_array(to.slice(0, 1)),
+    );
+}
