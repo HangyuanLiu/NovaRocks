@@ -1201,3 +1201,7 @@ mod tests {
         assert_eq!(destination_tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "max_by_baseline_tests.rs"]
+mod max_by_baseline_tests;
