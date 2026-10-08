@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "status": "PASS_CARGO_ONLY_NOT_PRODUCT_NATIVE_OR_PERFORMANCE_ACCEPTANCE",
+  "head": "55d61a84a616e64429d21b60f324cf2ed32bd94f",
+  "clean_source_at_start_and_end": true,
+  "profile": "dev",
+  "command": "CARGO_INCREMENTAL=0 NOVA_CI_CARGO_PROFILE=dev tools/ci/local-full-ci.sh --cargo-only",
+  "run_dir": "logs/ci-full/20261008-173130",
+  "duration_seconds": 595,
+  "test_counts": {
+    "cargo-test-component.log": {
+      "passed": 12149,
+      "failed": 0,
+      "ignored": 7
+    },
+    "cargo-test-server-owner.log": {
+      "passed": 178,
+      "failed": 0,
+      "ignored": 0
+    },
+    "cargo-test-server-smoke.log": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "totals": {
+    "passed": 12331,
+    "failed": 0,
+    "ignored": 7
+  },
+  "logs": {
+    "application-domain-dependency-boundary-test.log": "7e1f93ebf3d1d9a814a3c61155b1e0a200ee2e6f90229d2c0eb5b43628921b00",
+    "application-domain-dependency-boundary.log": "ca81667ce52af5b5f9b8613a652355d8ba757eb31c2c90b61f26117f4b766d4b",
+    "cargo-build.log": "31c23c91893f6fd445b0da0d43df9920ffa254971539e211353e2334c9336dd1",
+    "cargo-check-all-targets.log": "b23e8cd6dc384c8c0460854cfc9a2ba1b1406ca410300f951695c75bbfbec04b",
+    "cargo-check-server-system-allocator.log": "585aad35766d30867e4d272ab3123044bbb43799fc98057b257d3f919fd751da",
+    "cargo-clippy.log": "cc083bab906cddf354c2a9b02861c0929690b2995d918e410b5bf22215988d94",
+    "cargo-deny.log": "27c3bc20f1e5f2017989973ebd4c82e6c8abc983a78af8e4a6412ca01f08df1f",
+    "cargo-fmt.log": "25293c8809a4971b7ad97551d7900c3289770c2e95b4372b44fe03db1359093a",
+    "cargo-metadata.log": "71b898607d8d818f5849e00a7b1627440f2dbd28e6b0802f293c12a310377dbf",
+    "cargo-test-component.log": "f27b7f4b7649cc688fa1e693fb8adc6527cf1be77fe0d505b97610e4079ce78d",
+    "cargo-test-server-owner.log": "6a0480e526f34f78fac49d6fd4b349f0cdcbac47035cfcef95cb7c420ee7d594",
+    "cargo-test-server-smoke.log": "76bf31776c421d77c3ec6a2aab2ffd53e96ff89758b6c8f2566992575a75ba66",
+    "connector-role-binding-boundary-test.log": "c4a85d5ea6058bda3dd76731973593eaaa3752a2a7552f5fc5083b4fa99d8c8a",
+    "connector-role-binding-boundary.log": "048e8e08d57aff46ecf298be6177a2dc535d88718bc0892eff8be90c74dff749",
+    "datasketches-source-test.log": "0986d4b1602aa389a50a669a7bb291e0d84d720bc4dc5005104770c6998315e5",
+    "datasketches-source.log": "8118501ffb6fd327ab4ce9c13bc60804360552646120b48ff2dd76beeb879ffb",
+    "error-manifest-check.log": "acfc6f8d24846a48385360b87e32ff66047b9f853ed981bc3fef2e9edc5a1a00",
+    "generated-artifact-hygiene.log": "ab4ae276af81cd6a4f1ce4bff4d6b3a6532242e692ad715e37f4b7c7a6a97f33",
+    "isolated-fixture-current-link.log": "5a0927a55d3a4adfe312b2ac06061b35420dc34f020dd0442d569e30d25f4dcb",
+    "legacy-branding-test.log": "9689a9cc4e2ada9cef5b690109f044ad56315d64eb4275c1ee22b1ba908ede09",
+    "legacy-branding.log": "8073cfe9f0f5606237c7b9276449e5ad0fdd6c552d93b2dadc214f4b94b3fa23",
+    "local-program-dependency-boundary-test.log": "4981562de5aacd1ee1cfffeda0514371e638403440c05023cee4e1bfa9f16a33",
+    "local-program-dependency-boundary.log": "25f001b325e31dc2f99a8948c179800aa271e81f64dc5c70eba2300ebb5c0835",
+    "memory-dependency-boundary-test.log": "6531f455590a0167913a5ddad2f0f20940dedf924a2a7989f260205a697c74a3",
+    "memory-dependency-boundary.log": "5d6f7c470c0a6e8f4e87c7f26b72aa3626a126f213a302a72d29a1a808395991",
+    "native-trust-dependency-boundary-test.log": "b0646c129ac077cddb2744fe4138b6481182fbe09c997c0e957975c86ee24aa0",
+    "native-trust-dependency-boundary.log": "86ab6b328e65a3b3d721ac2457d55c8816a691c79ac22cc8afa83bf8f011305d",
+    "native-wire-dependency-boundary-test.log": "432116548d78562baed81388fb7e143da65801aaacf86e9f163493efebd2e2a3",
+    "native-wire-dependency-boundary.log": "49206e456a02a375f0f07f7e311c1a452d3ea4ae41491d3611c91b6ea2892a76",
+    "ncp8-statistics-boundary-test.log": "b9e7c475f341dec57a4ecb0c7332e7164b34f037c4efba43f63316e1a2622148",
+    "ncp8-statistics-boundary.log": "416f80f5d8cb6ddb21988728ff589dd22535f5dae88c50c11b7cc3f1a4f9b2b5",
+    "physical-plan-dependency-boundary-test.log": "34fbffee3ca1de3e9afdfac07c956a86c661447291b98af1e2c26f5f26a820ec",
+    "physical-plan-dependency-boundary.log": "72b4953a0519ee0760d34ef381c8da2d9c13c29277ff1dcc34354ef27cc823d7",
+    "shared-benchmark-environment.log": "84d0d094983a1a10b66c3dbc12a378fd675e1a4d464754d6964393ea4ff6d002",
+    "shared-benchmark-fixture-contract.log": "f9ab137254142b7e5b276045ad297c2d77182dfe7d8ae33085386612ff12d830",
+    "shared-benchmark-fixture-lifecycle.log": "efab0eaa34e967391b2648647c70b6a566a0773695da5236f1d32e06b1bd1847",
+    "spi-dependency-boundary-test.log": "78080eb31c0cc02a1cb80ef1c47c860f1548bb43d7d691f8a05de1205947ab71",
+    "spi-dependency-boundary.log": "e7a45113da2d557f9d582a95e41a67298b1aabb0b5ca9d2043c97965958dbb3d",
+    "sql-helper-env-file.log": "980acf24d46a84f5955b253adb6ab658d7ed345dadd17d74b27eaf3971c42c7e",
+    "state-store-dependency-boundary-test.log": "8bd19b5f371ad4cbaff9700759e42bf38198fe2fbdfac5ddf51eea2c20e9ea15",
+    "state-store-dependency-boundary.log": "fc74536e0d6e210ace130f7806d36314dcc74909dc60a3c3b981ee296efa4655",
+    "system-scenarios-stage-test.log": "2cfa94d698d66eae7eadcec39ad74eb09714e275d258a89f5c4cd98effc14900"
+  },
+  "unrun": [
+    "SQL",
+    "native 1FE+3BE",
+    "system scenarios",
+    "release performance",
+    "transport grid measurements"
+  ]
+}
