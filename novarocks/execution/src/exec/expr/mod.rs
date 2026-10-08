@@ -1299,3 +1299,6 @@ mod legacy_map_size_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_map_keys_values_baseline_tests.rs"]
 mod legacy_map_keys_values_baseline_tests;
+
+#[cfg(test)]
+mod legacy_string_measure_additional_baseline_tests;

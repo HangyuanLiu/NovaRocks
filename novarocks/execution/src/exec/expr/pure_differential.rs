@@ -1702,3 +1702,5 @@ mod map_keys_values_tests;
 
 #[path = "pure_differential_time_text_tests.rs"]
 mod time_text_tests;
+
+mod string_measure_shared_tests;
