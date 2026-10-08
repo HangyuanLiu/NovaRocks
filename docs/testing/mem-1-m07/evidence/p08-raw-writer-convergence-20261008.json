@@ -1,0 +1,259 @@
+{
+  "status": "PASS_C0_AND_NATIVE_RAW_WRITER_RETIREMENT_NOT_FINAL_ACCEPTANCE",
+  "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+  "source_dirty": false,
+  "c0": {
+    "duration_seconds": 370,
+    "test_totals": [
+      12248,
+      0,
+      7
+    ],
+    "validation": [
+      {
+        "path": "logs/ci-full/20261008-214039/cargo-test-component.log",
+        "sha256": "f94f467833065cb0d6eeb854b8921f24d175fb0a1fe469ee989a65da2833db99",
+        "test_totals": [
+          12066,
+          0,
+          7
+        ]
+      },
+      {
+        "path": "logs/ci-full/20261008-214039/cargo-test-server-owner.log",
+        "sha256": "a320e274e4f15962b89f2f7b48ad8c9fb859f555b06bdc24d4cd6dbbec42f5d3",
+        "test_totals": [
+          178,
+          0,
+          0
+        ]
+      },
+      {
+        "path": "logs/ci-full/20261008-214039/cargo-test-server-smoke.log",
+        "sha256": "d718305e5aa8c3487c7d592a8d22a87dd5efc3d7c43ebd55c96fa9a073edd6cb",
+        "test_totals": [
+          4,
+          0,
+          0
+        ]
+      }
+    ],
+    "summary_path": "logs/ci-full/20261008-214039/summary.md",
+    "summary_sha256": "9c2d9c25d75e37d63bf3f827dcdb323321d0d505510dd4632d2419fd938d1d59",
+    "scope": "cargo-only: boundaries/mutations, fmt, all-targets, System allocator, Clippy, workspace build, error manifest, components, server owner/binary smoke"
+  },
+  "native_scenarios": [
+    {
+      "scenario": "query-output/schema-once",
+      "exit_code": 0,
+      "duration_seconds": 2.356,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/query-output-schema-once/scenario-evidence.json",
+      "sha256": "f0316cbae78538675b8b34fc62d7aafc59e8989ba81aa498008dd4f73a737b4d",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "captured query-output resource baseline",
+        "sent one-column two-row query through raw public MySQL stream",
+        "verified one schema prefix, two rows, and one terminal success packet",
+        "verified query-output resources converged after terminal packet",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-output/non-negotiated-multi-statement",
+      "exit_code": 0,
+      "duration_seconds": 0.439,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/query-output-non-negotiated-multi-statement/scenario-evidence.json",
+      "sha256": "5513af8bc4d7c5a965ce550bf96150578c663a14925709eeb1cce68adf309e45",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "verified unnegotiated multi-statement COM_QUERY is rejected",
+        "verified rejected multi-statement resources converged",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-output/negotiated-multi-result",
+      "exit_code": 0,
+      "duration_seconds": 0.463,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/query-output-negotiated-multi-result/scenario-evidence.json",
+      "sha256": "0ce24e444208720ab60757c84f646dc821eaf0a46252f3a6e7e9149cc29c14ea",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "verified negotiated multi-result wire order and terminal status flags",
+        "verified negotiated multi-result resources converged",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-output/scalar-session",
+      "exit_code": 0,
+      "duration_seconds": 0.586,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/query-output-scalar-session/scenario-evidence.json",
+      "sha256": "3840dc214d37ba09838dfa03921007f8e8950ac4c8d790d37b637a3eef5a2220",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "verified native Scalar numeric, aggregate, empty, and failed session publication",
+        "verified Scalar session resources converged after success and failure",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "connector/distributed-writer-dataflow",
+      "exit_code": 0,
+      "duration_seconds": 1.372,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/connector-distributed-writer-dataflow/scenario-evidence.json",
+      "sha256": "09eaab56784c68220ef45642f112fe1e8f3031d039e0c236f5091281f658d74b",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "seed one committed source file per backend",
+        "append through the distributed write dataflow",
+        "await query-execution resource convergence after distributed writer dataflow",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "connector/distributed-writer-row-level",
+      "exit_code": 0,
+      "duration_seconds": 3.029,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/connector-distributed-writer-row-level/scenario-evidence.json",
+      "sha256": "e2ce7e424ed29e6b91d2cc22fab2640b56dba14dac3aaaf69bbbcadd3b0be039",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "delete rows through the deletion-vector branch",
+        "merge a second delete into the existing deletion vectors",
+        "delete rows through the position-delete branch",
+        "update rows through the copy-on-write data branch",
+        "merge matched and unmatched rows in one statement",
+        "await query-execution resource convergence after distributed row-level writes",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "statistics/native-aggregate-and-collect-on-write",
+      "exit_code": 0,
+      "duration_seconds": 115.338,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/statistics-native-aggregate-and-collect-on-write/scenario-evidence.json",
+      "sha256": "82422566e78f2bf023422938ab9e45cd5f724a2490d98481563ebd4abff2f830",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "seed six source files for a three-backend statistics scan",
+        "run ordinary ANALYZE across all three backend processes",
+        "wait for the submitted ANALYZE job to reach SUCCEEDED",
+        "collect statistics from the same pages written on all three backends",
+        "seed a 1024-field source with twelve independently splittable files",
+        "collect 1024 writer aggregates through sparse multi-batch output on all backends",
+        "await query-execution resource convergence after native statistics dataflow",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "connector/iceberg-typed-read-data",
+      "exit_code": 0,
+      "duration_seconds": 1.588,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/connector-iceberg-typed-read-data/scenario-evidence.json",
+      "sha256": "7b99a4ebe5e9f0b34b118a16373259259b69901d49fb4183eea960a734986ad4",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "create three independent Iceberg data files",
+        "warm the enabled role-local cache through a typed connector read",
+        "repeat the same typed connector read from the role-local cache",
+        "read every row through the typed connector stack",
+        "assert splits reached more than one backend process",
+        "await query-execution resource convergence after typed connector read",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-concurrency/warehouse-admission",
+      "exit_code": 0,
+      "duration_seconds": 5.587,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/query-concurrency-warehouse-admission/scenario-evidence.json",
+      "sha256": "c5c468378454766ae89860575e0ec4a064a50aee09f2b8844836a1246d6a03a8",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "tier 4 reached exact root admission with execution=0 waiting=1 peak_waiting=2 result_window_positions=Some([3, 0, 0, 0])",
+        "tier 4 deadline terminals received: 4",
+        "observed one warehouse queue behind 3 admitted queries in native 1FE+3BE",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    },
+    {
+      "scenario": "query-concurrency/terminal-releases-slot",
+      "exit_code": 0,
+      "duration_seconds": 10.793,
+      "path": "logs/mem-1-m07/p08-raw-writer-native-20261008/query-concurrency-terminal-releases-slot/scenario-evidence.json",
+      "sha256": "5c72ccfd1e3703e4d44675b5fe1e0e9af9027a1da045f3df95fe7f037c512b05",
+      "outcome": "passed",
+      "source_revision": "ebafe44571b0c712e08cfb94345e45a5ab61861e",
+      "source_dirty": false,
+      "cluster_size": 3,
+      "actions": [
+        "cluster launched and topology barrier passed",
+        "verified native 1FE+3BE topology",
+        "paused an admitted q1 on BE[1] while retaining process identity 33522",
+        "observed q2 in the sole warehouse admission queue",
+        "received q1 terminal and observed q2 hold the released permit while q1 BE work remained live",
+        "observed real Worker resource convergence",
+        "q2 completed before q1's delayed Worker cleanup; restoring Native transport then converged real resources",
+        "scenario assertions passed",
+        "cluster and fixture cleanup passed"
+      ]
+    }
+  ],
+  "remaining": [
+    "P00b valid old-main relative baseline and measured c_conn/c_stream/c_handshake/c_queue",
+    "P08 checked startup transport envelope convergence",
+    "P09 concentrated roots/multi-FE/full functional/performance/external SDK gates",
+    "P10 final same-HEAD evidence and handoff; Linux manual acceptance remains separate"
+  ]
+}
