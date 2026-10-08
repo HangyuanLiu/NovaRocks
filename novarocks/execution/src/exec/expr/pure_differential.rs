@@ -1519,3 +1519,6 @@ mod regexp_replace_tests;
 
 #[path = "pure_differential_distinct_numeric_tests.rs"]
 mod distinct_numeric_tests;
+
+#[path = "pure_differential_numeric_elementary_tests.rs"]
+mod numeric_elementary_tests;

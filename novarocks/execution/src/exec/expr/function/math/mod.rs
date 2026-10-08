@@ -56,3 +56,6 @@ pub use unary_ops::{
     eval_sin, eval_sqrt, eval_square, eval_tan,
 };
 pub use vector_ops::{eval_cosine_similarity, eval_cosine_similarity_norm, eval_l2_distance};
+
+#[cfg(test)]
+mod legacy_elementary_raw_contract_tests;
