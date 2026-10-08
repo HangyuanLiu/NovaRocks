@@ -141,6 +141,57 @@ produced at the default task transport budget without a capacity probe. That
 cross-target admission is therefore checked by the frontend's real admission
 pass and transport supervisor composition tests, not by these scenarios.
 
+### JSON value membership
+
+Three default scenarios drive the JSON `IN` / `NOT IN` value-subquery owner
+(`novarocks/execution/src/exec/operators/membership`) on native 1FE+3BE. Each
+creates its own local Hadoop Iceberg warehouse with persisted JSON columns: a
+60 000-row probe in three files (two object key orders, an array shape and an
+SQL NULL every 97th row) and a nine-row RHS in two files whose matches are
+split across both files and which holds one SQL NULL. Every expected value is
+derived in the scenario from those fixed inputs by the three-valued membership
+table; nothing is recorded. Run each one alone with an exact `--only`, for
+example:
+
+```bash
+target/dev-opt/novarocks-system-tests --binary target/dev-opt/novarocks \
+  --config tools/ci/fixtures/system-scenarios-base.toml \
+  --artifact-root "$(mktemp -d)" --cluster-size 3 --timeout-secs 300 \
+  --only query-lifecycle/json-membership-full-eos
+```
+
+- `query-lifecycle/json-membership-full-eos` checks the RHS with its SQL NULL,
+  without it, and with a filter that selects nothing, each as `IN` and
+  `NOT IN`. The per-row form compares all 60 000 probe rows; the grouped form
+  compares count, sum and sum of squares per result and must show a
+  `MEMBERSHIP` fed by a `BROADCAST EXCHANGE`, with at least two stages placed
+  on every backend. Iceberg scans place one task per backend, so the two RHS
+  files leave at least one of the three RHS producers without a split: it
+  contributes only its EOS. Each statement must be a single attempt whose
+  established contexts all released.
+- `query-lifecycle/json-membership-cancel` sleeps 60 seconds per RHS row, so
+  every producer with a split stays short of EOS while each broadcast-fed
+  probe task waits on the `Building` RHS. Once every created task of the
+  attempt has installed, `KILL QUERY` goes through the harness control
+  session. The statement must end with MySQL 1317 before any producer could
+  have finished, every established context must record
+  `NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED` and
+  `NOVAROCKS_TASK_CONTEXT_TERMINATION_COMPLETED` for that execution, the
+  resource oracle must converge, and the next statement on the same
+  connection must return its exact groups.
+- `query-lifecycle/json-membership-capacity` freezes the existing
+  `/*+ SET_VAR(query_mem_limit=33554432) */` hint, which installs that limit
+  on each backend's query memory tracker. It adds a 400 000-row RHS in eight
+  files whose values each carry 150 bytes, so one RHS copy retains at least
+  60 000 000 bytes. Under the same limit a streaming read of every large-RHS
+  value and the grouped membership over the small RHS must succeed first.
+  The grouped membership over the large RHS must then fail with MySQL 1105
+  carrying the `CAPACITY_REFUSED` task-failure category on its only attempt;
+  every established context must leave `Active`, resources must converge,
+  and the next statement on the same connection must return its exact groups.
+  The case proves the typed refusal and its release under a limit the
+  streaming path fits; it does not attribute which allocation crossed it.
+
 ### 内存归属观测
 
 默认场景 `memory-attribution/observation-families` 启动原生 1FE+3BE，验证分布式查询及连接退出取消前后的每个 BE `/metrics`。证据写入场景目录的 `memory-attribution.json`，关联独立 PID 与 HTTP endpoint；两个进程尺寸段、固定归属分类、记录状态、故障与批量采样族均须存在。S1 未接生产 lane，query/residual/service 记录和事实为零，16 条 immortal unattributed 记录单独存在；unattributed 字节大于零，生命周期与孤儿故障为零。签名的对账及账本盲区为独立采样，不要求在并发 scrape 期间瞬时归零。

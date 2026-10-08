@@ -9,6 +9,7 @@ mod frontend_lifecycle;
 mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;
+mod json_membership;
 mod memory_attribution;
 mod mv_physical_corruption;
 mod mv_recovery;
@@ -41,6 +42,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
     scenarios.extend(backend_membership::scenarios());
     scenarios.extend(query_lifecycle::scenarios());
+    scenarios.extend(json_membership::scenarios());
     scenarios.extend(query_concurrency::scenarios());
     scenarios.extend(query_output::scenarios());
     scenarios.extend(memory_attribution::scenarios());
