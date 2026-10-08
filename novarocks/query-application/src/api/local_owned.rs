@@ -204,6 +204,21 @@ impl OwnedLocalResult {
             window,
         })
     }
+    /// Scalar compatibility fact only; the guarded graph cannot escape to the
+    /// transitional LRA adapter. Remove this with P08's old-credit retirement.
+    pub(crate) fn legacy_governance_charge(&self) -> Result<u64, String> {
+        self.result
+            .batches
+            .iter()
+            .try_fold(0_u64, |sum, batch| {
+                sum.checked_add(
+                    super::decoded_result_batch_governance_charge(batch)
+                        .map_err(|error| error.to_string())?,
+                )
+                .ok_or_else(|| "Local legacy governance charge overflows".to_owned())
+            })
+            .map(|bytes| bytes.max(1))
+    }
     pub fn row_count(&self) -> usize {
         self.result.row_count()
     }

@@ -56,7 +56,7 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
             .await
             .map(crate::MysqlStatementWriteOutcome::Continue),
         StatementResult::GovernedQuery(result) => {
-            crate::write_governed_query_result_one(result, results).await
+            crate::local_result_writer::write_local_result_one(result, results, more_results).await
         }
         StatementResult::StreamingQuery(result) => {
             crate::governed_result_writer::write_streaming_query_result_with_more(

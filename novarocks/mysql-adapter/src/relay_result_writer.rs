@@ -37,11 +37,11 @@ use crate::governed_result_writer::{
     MysqlStatementWriteOutcome, is_terminal_cancellation, wait_terminal_result_failure,
 };
 
-const ACTIVE_WRITE_DEADLINE: Duration = Duration::from_secs(30);
-const CLOSING_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const ACTIVE_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const CLOSING_DEADLINE: Duration = Duration::from_secs(5);
 // Frozen complete object allowance: metadata, coalescer/index, diagnostic,
 // current segment and a compacted tail coexist during the transfer.
-const CLOSING_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const CLOSING_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
 
 enum WriteInterruption {
     Query(QueryExecutionError),
@@ -242,7 +242,9 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
     }
     // The accepted cut stops further result work and releases only computation
     // capacity. Pool exhaustion never waits while holding this payload.
-    let capacity = match result.try_closing_capacity(is_terminal_cancellation(&error)) {
+    let capacity = match result.try_closing_capacity(
+        is_terminal_cancellation(&error) && result.cancellation().is_cancelled(),
+    ) {
         Ok(capacity) => capacity,
         Err(_) => {
             if let Some(delivery) = delivery {
@@ -350,7 +352,7 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
     }
 }
 
-fn resident_tail<'a>(
+pub(crate) fn resident_tail<'a>(
     cursor: opensrv_mysql::FramingCursor,
     buffered_row_bytes: usize,
     current: Option<&ValidatedClientBody<'a>>,
@@ -409,7 +411,7 @@ fn resident_tail<'a>(
     Some(parts)
 }
 
-async fn write_body<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_body<W: AsyncWrite + Unpin>(
     writer: &mut OwnedStreamingMysqlWriter<W>,
     body: &ValidatedClientBody<'_>,
 ) -> io::Result<()> {
@@ -437,7 +439,7 @@ async fn write_body<W: AsyncWrite + Unpin>(
     writer.flush_socket().await
 }
 
-fn success_payload(capabilities: CapabilityFlags, more: bool) -> Vec<u8> {
+pub(crate) fn success_payload(capabilities: CapabilityFlags, more: bool) -> Vec<u8> {
     let status = if more {
         StatusFlags::SERVER_MORE_RESULTS_EXISTS.bits()
     } else {
@@ -459,7 +461,7 @@ fn success_payload(capabilities: CapabilityFlags, more: bool) -> Vec<u8> {
         vec![0xfe, 0, 0, status as u8, (status >> 8) as u8]
     }
 }
-fn error_payload(error: &QueryExecutionError, limit: usize) -> Vec<u8> {
+pub(crate) fn error_payload(error: &QueryExecutionError, limit: usize) -> Vec<u8> {
     let kind = if is_terminal_cancellation(error) {
         ErrorKind::ER_QUERY_INTERRUPTED
     } else {
@@ -474,13 +476,13 @@ fn error_payload(error: &QueryExecutionError, limit: usize) -> Vec<u8> {
     payload.extend_from_slice(&message.as_bytes()[..message.len().min(limit)]);
     payload
 }
-fn invalid(message: impl Into<String>) -> QueryExecutionError {
+pub(crate) fn invalid(message: impl Into<String>) -> QueryExecutionError {
     QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, message.into())
 }
-fn io_error(error: QueryExecutionError) -> io::Error {
+pub(crate) fn io_error(error: QueryExecutionError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
-fn timeout_error() -> io::Error {
+pub(crate) fn timeout_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
         "MySQL response write deadline expired",

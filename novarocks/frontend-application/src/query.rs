@@ -1205,14 +1205,9 @@ impl FrontendQuerySession {
                 ))
             }
             Ok(StatementResult::Query(result)) => {
-                governed.complete_execution();
-                Ok(StatementResult::GovernedQuery(
-                    GovernedImmediateStatementResult::new(
-                        result,
-                        self.service.workload_resources.clone(),
-                        governed,
-                    ),
-                ))
+                // Local delivery may still use transitional LRA credits under
+                // this exact scope. Its root exits at the protocol terminal.
+                Ok(self.governed_local_result(result, governed))
             }
             Ok(
                 StatementResult::GovernedQuery(_)
@@ -1224,6 +1219,21 @@ impl FrontendQuerySession {
                 governed,
             )),
             Err(error) => Ok(self.governed_typed_error(error, governed)),
+        }
+    }
+
+    fn governed_local_result(
+        &self,
+        result: QueryResult,
+        statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
+    ) -> StatementResult {
+        match GovernedImmediateStatementResult::try_new(
+            result,
+            self.service.workload_resources.clone(),
+            statement,
+        ) {
+            Ok(result) => StatementResult::GovernedQuery(result),
+            Err((error, statement)) => self.governed_typed_error(internal_error(error), statement),
         }
     }
 
@@ -1689,13 +1699,9 @@ impl FrontendQuerySession {
         let read = match prepared {
             PreparedQueryOperation::Immediate(operation) => {
                 return match operation.into_result() {
-                    StatementResult::Query(result) => Ok(StatementResult::GovernedQuery(
-                        GovernedImmediateStatementResult::new(
-                            result,
-                            self.service.workload_resources.clone(),
-                            statement,
-                        ),
-                    )),
+                    StatementResult::Query(result) => {
+                        Ok(self.governed_local_result(result, statement))
+                    }
                     StatementResult::GovernedQuery(_)
                     | StatementResult::StreamingQuery(_)
                     | StatementResult::GovernedCompletion(_)
@@ -2453,13 +2459,7 @@ impl FrontendQuerySession {
             ));
         }
         match result {
-            Ok(StatementResult::Query(result)) => Ok(StatementResult::GovernedQuery(
-                GovernedImmediateStatementResult::new(
-                    result,
-                    self.service.workload_resources.clone(),
-                    statement,
-                ),
-            )),
+            Ok(StatementResult::Query(result)) => Ok(self.governed_local_result(result, statement)),
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
                 GovernedCompletionStatementResult::new(
                     self.service.workload_resources.clone(),

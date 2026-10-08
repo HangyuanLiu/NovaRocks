@@ -114,3 +114,7 @@ FeatureUnsupported，不制造空列表。先前裁决审查 `evidence/p06-sdk-l
 12288个stream到response body public exit；role/domain/class启动前核对，peer live quota等实际IO退出。
 FE FD含accept拒绝瞬时socket共710；handshake总量160。定向与完整Native/Frontend库通过，
 见 [Membership收据](evidence/p07-membership-ingress.md)。不构成Native cluster/测量或P08切换。
+
+### P07 Local governed 接线（2026-10-08）
+
+封闭Local source→原statement window→opaque graph→pure cursor→MySQL finite writer已接生产；旧decoded/protocol LRA随普通及closing实际writer保留。TCP半header驻留补尾/缺尾断连/初始取消/前序pending OK转交及下一generation反例通过；Query525、Frontend1446、MySQL71、opaque doctest1 PASS。见 `evidence/p07-local-delivery.md`。不将此结果扩展为ordinary terminal/全部Internal领域或原生1FE+3BE验收；P07/P08与后续门保持OPEN。

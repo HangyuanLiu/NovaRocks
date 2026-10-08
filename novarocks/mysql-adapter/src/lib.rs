@@ -24,6 +24,7 @@ mod error_mapping;
 mod governed_result_writer;
 mod listener;
 mod listener_settings;
+mod local_result_writer;
 mod query_application_shim;
 mod relay_metadata;
 mod relay_result_writer;

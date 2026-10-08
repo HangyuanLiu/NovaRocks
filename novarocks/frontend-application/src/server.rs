@@ -1284,7 +1284,8 @@ mod tests {
         let StatementResult::GovernedQuery(result) = result else {
             panic!("query result must retain its owner through terminal EOF");
         };
-        let (_result, mut protocol) = result.into_parts();
+        let (result, _legacy_charge, mut protocol) = result.into_parts();
+        drop(result);
         let _ = protocol.seal_success_visibility();
         let _ = protocol.complete();
         terminal.complete();

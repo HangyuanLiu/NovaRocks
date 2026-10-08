@@ -18,9 +18,9 @@
 //! Move-only protocol settlement for governed query application output.
 
 use crate::api::{
-    ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, QueryResult,
-    QueryResultStream, ResultDelivery, ResultFailureView, SchemaDelivery,
-    decoded_result_batch_governance_charge,
+    ExecutionHandle, ExecutionOutput, LocalResultProducer, OwnedLocalResult, QueryExecutionError,
+    QueryExecutionErrorKind, QueryResult, QueryResultStream, ResultDelivery, ResultFailureView,
+    SchemaDelivery, decoded_result_batch_governance_charge,
 };
 use crate::cancellation::QueryCancellationView;
 use crate::session_control::{
@@ -245,6 +245,46 @@ impl GovernedProtocolOwner {
             .try_acquire_closing(statement.scope(), cut)
     }
 
+    pub fn try_closing_capacity(
+        &mut self,
+        cancelled: bool,
+    ) -> Result<ResultWindowGrant, WorkError> {
+        let cut = if cancelled {
+            self.accept_cancel_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::AcceptedCancellation
+        } else {
+            self.accept_failed_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::OriginatingFailure
+        };
+        self.closing_capacity(cut)
+    }
+
+    /// A Local caller destroys its renderer/source and transfers only the
+    /// bounded writer tail. Any still-live ordinary backing keeps its alias.
+    #[allow(clippy::result_large_err)]
+    pub fn into_closing_delivery<W>(
+        self,
+        writer: W,
+        capacity: ResultWindowGrant,
+        simultaneously_live_backing_bytes: u64,
+    ) -> Result<ClosingDelivery<W>, (Self, W, ResultWindowGrant)> {
+        match ClosingDelivery::try_new(writer, self, capacity, simultaneously_live_backing_bytes) {
+            Ok(mut closing) => {
+                std::sync::Arc::get_mut(closing.tail.as_mut().expect("new closing tail"))
+                    .expect("new closing has no aliases")
+                    .protocol
+                    .as_mut()
+                    .expect("closing protocol")
+                    .statement
+                    .as_mut()
+                    .expect("closing statement")
+                    .release_transferred_result_window();
+                Ok(closing)
+            }
+            Err((writer, protocol, capacity)) => Err((protocol, writer, capacity)),
+        }
+    }
+
     pub fn complete(&mut self) -> GovernedStatementFinishOutcome {
         self.settled = true;
         self.statement
@@ -449,24 +489,43 @@ impl std::fmt::Debug for QuerySessionOutput {
 /// final protocol outcome.
 #[must_use = "the governed query result must be settled by its protocol owner"]
 pub struct GovernedImmediateStatementResult {
-    result: QueryResult,
+    result: OwnedLocalResult,
+    // Transitional LRA protection stays until the complete P08 switch.
+    legacy_decoded_bytes: u64,
     protocol: GovernedProtocolOwner,
 }
 
 impl GovernedImmediateStatementResult {
-    pub fn new(
+    /// Transfer a freshly produced, closed Local graph while the admitted
+    /// statement still retains the exact producer window. The application
+    /// source audit, not the graph's runtime shape, establishes exclusivity.
+    #[allow(clippy::result_large_err)]
+    pub fn try_new(
         result: QueryResult,
         resources: LocalResourceAuthority,
         statement: GovernedQueryStatementOwner,
-    ) -> Self {
-        Self {
-            result,
-            protocol: GovernedProtocolOwner::new(statement, resources),
+    ) -> Result<Self, (String, GovernedQueryStatementOwner)> {
+        let sealed = (|| {
+            let window = statement
+                .result_window_alias()
+                .ok_or("Local result has no admitted producer window")?;
+            let producer = LocalResultProducer::try_new(statement.scope(), window)?;
+            let result = producer.produce(|| Ok(result))?;
+            let bytes = result.legacy_governance_charge()?;
+            Ok::<_, String>((result, bytes.max(1)))
+        })();
+        match sealed {
+            Ok((result, legacy_decoded_bytes)) => Ok(Self {
+                result,
+                legacy_decoded_bytes,
+                protocol: GovernedProtocolOwner::new(statement, resources),
+            }),
+            Err(error) => Err((error, statement)),
         }
     }
 
-    pub fn into_parts(self) -> (QueryResult, GovernedProtocolOwner) {
-        (self.result, self.protocol)
+    pub fn into_parts(self) -> (OwnedLocalResult, u64, GovernedProtocolOwner) {
+        (self.result, self.legacy_decoded_bytes, self.protocol)
     }
 }
 

@@ -27,11 +27,11 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, QueryResult, ResultDelivery, ResultFailureView,
-    ResultField as QueryResultColumn, ResultSchema, decoded_result_batch_governance_charge,
+    ResultField as QueryResultColumn, ResultSchema,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::protocol_delivery::{
-    GovernedImmediateStatementResult, ImmediateResultBatch, StreamingStatementResult,
+    GovernedImmediateStatementResult, StreamingStatementResult,
 };
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_types::FieldRenderSchema;
@@ -110,322 +110,7 @@ pub async fn write_governed_query_result_one<'writer, W: AsyncWrite + Unpin>(
     result: GovernedImmediateStatementResult,
     results: QueryResultWriter<'writer, W>,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
-    let (result, mut protocol) = result.into_parts();
-    let schema_bytes = match mysql_query_result_schema_protocol_bytes_upper_bound(&result.columns) {
-        Ok(bytes) => bytes,
-        Err(message) => {
-            let error = invalid_query_result_delivery(message);
-            let _ = protocol.fail();
-            let message = error.to_string().into_bytes();
-            return results
-                .error(ErrorKind::ER_UNKNOWN_ERROR, &message)
-                .await
-                .map(|_| MysqlStatementWriteOutcome::Terminated);
-        }
-    };
-    let cancellation = protocol.cancellation();
-    let (resources, scope) = protocol.reservation_inputs();
-    let reserve = reserve_data_when_available(resources, scope, schema_bytes);
-    tokio::pin!(reserve);
-    let schema_reservation = match tokio::select! {
-        biased;
-        reason = cancellation.cancelled() => {
-            Err(cancelled_query_result_delivery(reason))
-        }
-        reservation = &mut reserve => reservation.map_err(|error| {
-            failed_query_result_delivery(format!("reserve MySQL result schema bytes: {error}"))
-        })
-    } {
-        Ok(reservation) => reservation,
-        Err(error) => {
-            if error.kind() == QueryExecutionErrorKind::Cancelled {
-                let _ = protocol.settle_cancellation();
-            } else {
-                let _ = protocol.fail();
-            }
-            let message = error.to_string().into_bytes();
-            return results
-                .error(ErrorKind::ER_UNKNOWN_ERROR, &message)
-                .await
-                .map(|_| MysqlStatementWriteOutcome::Terminated);
-        }
-    };
-    let mysql_columns = match crate::mysql_columns_for_result_fields(&result.columns) {
-        Ok(columns) => columns,
-        Err(error) => {
-            let error = invalid_query_result_delivery(error.to_string());
-            let _ = protocol.fail();
-            let message = error.to_string().into_bytes();
-            return results
-                .error(ErrorKind::ER_UNKNOWN_ERROR, &message)
-                .await
-                .map(|_| MysqlStatementWriteOutcome::Terminated);
-        }
-    };
-    let cancellation = protocol.cancellation();
-    let mut writer = match crate::start_cancellable_result(
-        results,
-        mysql_columns.as_slice(),
-        cancellation,
-    )
-    .await
-    {
-        Ok(writer) => writer,
-        Err(crate::MysqlResultStartError::Cancelled(error)) => {
-            let _ = protocol.settle_cancellation();
-            return Err(interrupted_error(error.to_string()));
-        }
-        Err(crate::MysqlResultStartError::Io(error)) => {
-            let _ = protocol.client_disconnected();
-            return Err(error);
-        }
-    };
-    drop(schema_reservation);
-
-    for raw_batch in result.batches {
-        let decoded_bytes = match decoded_result_batch_governance_charge(&raw_batch) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = protocol.fail();
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        let cancellation = protocol.cancellation();
-        let (resources, scope) = protocol.reservation_inputs();
-        let reserve_fetch = resources.reserve_result_credit_when_available(&scope, decoded_bytes);
-        tokio::pin!(reserve_fetch);
-        let credit = match tokio::select! {
-            biased;
-            reason = cancellation.cancelled() => {
-                Err(cancelled_query_result_delivery(reason))
-            }
-            credit = &mut reserve_fetch => credit.map_err(|error| {
-                failed_query_result_delivery(format!("reserve immediate result fetch bytes: {error}"))
-            })
-        } {
-            Ok(credit) => credit,
-            Err(error) => {
-                if error.kind() == QueryExecutionErrorKind::Cancelled {
-                    let _ = protocol.settle_cancellation();
-                } else {
-                    let _ = protocol.fail();
-                }
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        // The result batch is already materialized by the synchronous command
-        // executor. Account it through the normal fetch/decode transitions
-        // before handing that exact Arrow backing to the protocol writer.
-        let credit = match credit.begin_fetch() {
-            Ok(credit) => credit,
-            Err(error) => {
-                let error = failed_query_result_delivery(format!(
-                    "begin immediate result credit fetch: {error}"
-                ));
-                let _ = protocol.fail();
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        let credit = match credit.retain_raw(decoded_bytes) {
-            Ok(credit) => credit,
-            Err(error) => {
-                let (error, _credit) = error.into_parts();
-                let error =
-                    failed_query_result_delivery(format!("retain immediate result bytes: {error}"));
-                let _ = protocol.fail();
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        let cancellation = protocol.cancellation();
-        let resources = protocol.reservation_inputs().0;
-        let reserve_decode = credit.reserve_decode_when_available(&resources, decoded_bytes);
-        tokio::pin!(reserve_decode);
-        let credit = match tokio::select! {
-            biased;
-            reason = cancellation.cancelled() => {
-                Err(cancelled_query_result_delivery(reason))
-            }
-            credit = &mut reserve_decode => credit.map_err(|error| {
-                let (error, _credit) = error.into_parts();
-                failed_query_result_delivery(format!("reserve immediate result decode bytes: {error}"))
-            })
-        } {
-            Ok(credit) => credit,
-            Err(error) => {
-                if error.kind() == QueryExecutionErrorKind::Cancelled {
-                    let _ = protocol.settle_cancellation();
-                } else {
-                    let _ = protocol.fail();
-                }
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        let credit = match credit.queue_decoded(decoded_bytes) {
-            Ok(credit) => credit,
-            Err(error) => {
-                let (error, _credit) = error.into_parts();
-                let error = failed_query_result_delivery(format!(
-                    "queue immediate decoded result bytes: {error}"
-                ));
-                let _ = protocol.fail();
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        let batch = match ImmediateResultBatch::try_new(raw_batch, credit) {
-            Ok(batch) => batch,
-            Err(error) => {
-                let _ = protocol.fail();
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        let protocol_bytes =
-            match mysql_text_batch_protocol_bytes_upper_bound(batch.batch(), &result.columns) {
-                Ok(bytes) => bytes,
-                Err(message) => {
-                    let error = invalid_query_result_delivery(message);
-                    let _ = protocol.fail();
-                    return finish_stream_error_terminated(
-                        writer,
-                        ErrorKind::ER_UNKNOWN_ERROR,
-                        &error,
-                    )
-                    .await;
-                }
-            };
-        let cancellation = protocol.cancellation();
-        let resources = protocol.reservation_inputs().0;
-        let reserve = batch.reserve_protocol_when_available(&resources, protocol_bytes);
-        tokio::pin!(reserve);
-        let batch = match tokio::select! {
-            biased;
-            reason = cancellation.cancelled() => {
-                Err(cancelled_query_result_delivery(reason))
-            }
-            batch = &mut reserve => batch.map_err(|error| {
-                failed_query_result_delivery(format!("reserve MySQL result bytes: {}", error.error()))
-            })
-        } {
-            Ok(batch) => batch,
-            Err(error) => {
-                if error.kind() == QueryExecutionErrorKind::Cancelled {
-                    let _ = protocol.settle_cancellation();
-                } else {
-                    let _ = protocol.fail();
-                }
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        let batch = match batch.begin_protocol_write(protocol_bytes) {
-            Ok(batch) => batch,
-            Err(error) => {
-                let _ = protocol.fail();
-                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                    .await;
-            }
-        };
-        if let Err(error) = write_governed_batch(
-            &mut writer,
-            batch.batch(),
-            &result.columns,
-            protocol.cancellation(),
-        )
-        .await
-        {
-            let settlement = error.settlement();
-            match error {
-                ProtocolWriteFailure::Cancelled(error) => {
-                    debug_assert_eq!(settlement, ProtocolWriteSettlement::Cancellation);
-                    batch.fail();
-                    let _ = protocol.settle_cancellation();
-                    return Err(interrupted_error(error.to_string()));
-                }
-                ProtocolWriteFailure::Encoding(error) => {
-                    debug_assert_eq!(settlement, ProtocolWriteSettlement::ProtocolFailed);
-                    batch.fail();
-                    let _ = protocol.fail();
-                    return Err(error);
-                }
-                ProtocolWriteFailure::Io(error) => {
-                    debug_assert_eq!(settlement, ProtocolWriteSettlement::ClientDisconnected);
-                    // An I/O error, including `Interrupted`, is evidence about
-                    // the socket only. Cancellation is settled exclusively by
-                    // the cancellation branch above.
-                    batch.fail();
-                    let _ = protocol.client_disconnected();
-                    return Err(error);
-                }
-                ProtocolWriteFailure::Native(_) => {
-                    unreachable!("immediate results have no native failure view")
-                }
-            }
-        }
-        if let Err(error) = batch.complete() {
-            let _ = protocol.fail();
-            return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                .await;
-        }
-    }
-
-    let cancellation = protocol.cancellation();
-    let (resources, scope) = protocol.reservation_inputs();
-    let reserve = reserve_terminal_protocol_when_available(resources, scope);
-    tokio::pin!(reserve);
-    let terminal_reservation = match tokio::select! {
-        biased;
-        reason = cancellation.cancelled() => Err(cancelled_query_result_delivery(reason)),
-        reservation = &mut reserve => reservation.map_err(|error| {
-            failed_query_result_delivery(format!("reserve MySQL result EOF bytes: {error}"))
-        }),
-    } {
-        Ok(reservation) => reservation,
-        Err(error) => {
-            if error.kind() == QueryExecutionErrorKind::Cancelled {
-                let _ = protocol.settle_cancellation();
-            } else {
-                let _ = protocol.fail();
-            }
-            return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                .await;
-        }
-    };
-    match protocol.seal_success_visibility() {
-        GovernedStatementVisibilitySealOutcome::Sealed => {}
-        GovernedStatementVisibilitySealOutcome::Cancelled(reason) => {
-            let error = governed_cancelled_query_result_delivery(reason);
-            let _ = protocol.settle_cancellation();
-            return finish_stream_error_terminated(writer, ErrorKind::ER_QUERY_INTERRUPTED, &error)
-                .await;
-        }
-        GovernedStatementVisibilitySealOutcome::Stale
-        | GovernedStatementVisibilitySealOutcome::Failed => {
-            let error = failed_query_result_delivery(
-                "governed query lost its statement generation before success visibility",
-            );
-            let _ = protocol.fail();
-            return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                .await;
-        }
-    }
-    match crate::finish_result_one(writer).await {
-        Ok(writer) => {
-            drop(terminal_reservation);
-            let _ = protocol.complete();
-            Ok(MysqlStatementWriteOutcome::Continue(writer))
-        }
-        Err(error) => {
-            drop(terminal_reservation);
-            let _ = protocol.client_disconnected();
-            Err(error)
-        }
-    }
+    crate::local_result_writer::write_local_result_one(result, results, false).await
 }
 
 /// Writes one Query Application result without detaching its delivery and
@@ -933,22 +618,6 @@ async fn write_streaming_batch<W: AsyncWrite + Unpin>(
         })
 }
 
-async fn write_governed_batch<W: AsyncWrite + Unpin>(
-    writer: &mut opensrv_mysql::RowWriter<'_, '_, W>,
-    batch: &RecordBatch,
-    columns: &[QueryResultColumn],
-    cancellation: QueryCancellationView,
-) -> Result<(), ProtocolWriteFailure> {
-    crate::write_cancellable_batch(writer, batch, columns, cancellation)
-        .await
-        .map_err(|error| match error {
-            crate::MysqlBatchWriteError::Cancelled(error) => ProtocolWriteFailure::Cancelled(error),
-            crate::MysqlBatchWriteError::Native(error) => ProtocolWriteFailure::Native(error),
-            crate::MysqlBatchWriteError::Encoding(error) => ProtocolWriteFailure::Encoding(error),
-            crate::MysqlBatchWriteError::Io(error) => ProtocolWriteFailure::Io(error),
-        })
-}
-
 pub(crate) fn result_schema_to_query_result_columns(
     schema: &ResultSchema,
 ) -> Vec<QueryResultColumn> {
@@ -959,15 +628,6 @@ fn mysql_result_schema_protocol_bytes_upper_bound(schema: &ResultSchema) -> Resu
     mysql_schema_protocol_bytes_upper_bound(
         schema.fields().iter().map(|field| field.name()),
         schema.fields().len(),
-    )
-}
-
-fn mysql_query_result_schema_protocol_bytes_upper_bound(
-    columns: &[QueryResultColumn],
-) -> Result<u64, String> {
-    mysql_schema_protocol_bytes_upper_bound(
-        columns.iter().map(QueryResultColumn::name),
-        columns.len(),
     )
 }
 
@@ -1434,7 +1094,9 @@ fn normalize_terminal_cancellation(
     }
 }
 
-fn cancelled_query_result_delivery(reason: QueryCancellationReason) -> QueryExecutionError {
+pub(crate) fn cancelled_query_result_delivery(
+    reason: QueryCancellationReason,
+) -> QueryExecutionError {
     let message = match reason {
         QueryCancellationReason::DeadlineExceeded { timeout_ms } => {
             format!("query timed out after {timeout_ms} ms")
@@ -1464,7 +1126,7 @@ fn cancelled_query_result_delivery(reason: QueryCancellationReason) -> QueryExec
     QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, message)
 }
 
-fn governed_cancelled_query_result_delivery(
+pub(crate) fn governed_cancelled_query_result_delivery(
     reason: novarocks_workload_control::CancellationReason,
 ) -> QueryExecutionError {
     let message = match reason {

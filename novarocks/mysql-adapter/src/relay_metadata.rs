@@ -42,8 +42,20 @@ pub(crate) fn preflight_result_schema(
     capabilities: CapabilityFlags,
     limits: ProtocolLimits,
 ) -> io::Result<()> {
+    preflight_column_names(
+        schema.fields().iter().map(|field| field.name()),
+        capabilities,
+        limits,
+    )
+}
+
+pub(crate) fn preflight_column_names<'a>(
+    names: impl ExactSizeIterator<Item = &'a str>,
+    capabilities: CapabilityFlags,
+    limits: ProtocolLimits,
+) -> io::Result<()> {
     let limits = limits.validate()?;
-    let count = schema.fields().len();
+    let count = names.len();
     let refused = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -58,10 +70,10 @@ pub(crate) fn preflight_result_schema(
         .checked_mul(std::mem::size_of::<std::sync::Arc<[u8]>>())
         .and_then(|total| total.checked_add(lenenc_size(count as u64) + overhead))
         .ok_or_else(refused)?;
-    for field in schema.fields() {
+    for name in names {
         let size = 21usize
-            .checked_add(lenenc_size(field.name().len() as u64))
-            .and_then(|size| size.checked_add(field.name().len()))
+            .checked_add(lenenc_size(name.len() as u64))
+            .and_then(|size| size.checked_add(name.len()))
             .ok_or_else(refused)?;
         total = total
             .checked_add(size + overhead)

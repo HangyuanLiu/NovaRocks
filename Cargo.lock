@@ -4055,6 +4055,7 @@ dependencies = [
  "novarocks-parser",
  "novarocks-query-application",
  "novarocks-result-contract",
+ "novarocks-result-render",
  "novarocks-sql",
  "novarocks-types",
  "novarocks-user-error",
