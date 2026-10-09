@@ -16,7 +16,7 @@ core-pipeline-integration = []
 [dependencies]
 arrow.workspace = true
 arrow-buffer.workspace = true
-arrow-data = { version = "58.2.0" }
+arrow-data.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
