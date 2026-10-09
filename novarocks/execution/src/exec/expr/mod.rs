@@ -1634,3 +1634,9 @@ mod e08s1_logical_environment_tests;
 
 #[cfg(test)]
 mod e08s1_table_fold_parent_tests;
+
+#[cfg(test)]
+mod e08s1_append_original_static_tests;
+
+#[cfg(test)]
+mod e08s1_append_static_tests;

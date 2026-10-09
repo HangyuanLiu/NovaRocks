@@ -124,6 +124,58 @@ impl crate::append_trailing_core::OutputWriter for CompactWriter<'_, '_> {
     }
 }
 
+/// Original static contract failures. Only the CPU wrapper builds its original diagnostic;
+/// metadata admission borrows the predicate without allocating a temporary runtime error.
+#[derive(Clone, Copy)]
+pub(super) enum StaticProfileFailure {
+    ArgumentCount,
+    ValueArgument,
+    SourceType,
+    ResultType,
+}
+impl StaticProfileFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ArgumentCount => "append_trailing differs from its installed argument count",
+            Self::ValueArgument => "append_trailing requires checked value arguments",
+            Self::SourceType => "append_trailing selected source is outside its installed profile",
+            Self::ResultType => "append_trailing differs from its installed result profile",
+        }
+    }
+}
+
+pub(super) fn check_argument_count(
+    types: usize,
+    arguments: usize,
+) -> Result<(), StaticProfileFailure> {
+    if types != 2 || arguments != 2 {
+        return Err(StaticProfileFailure::ArgumentCount);
+    }
+    Ok(())
+}
+
+pub(super) fn check_argument_type(ty: &FunctionArgumentType) -> Result<(), StaticProfileFailure> {
+    let FunctionArgumentType::Value(source) = ty else {
+        return Err(StaticProfileFailure::ValueArgument);
+    };
+    if source.logical_type != ValueLogicalType::Physical || source.data_type != DataType::Utf8 {
+        return Err(StaticProfileFailure::SourceType);
+    }
+    Ok(())
+}
+
+pub(super) fn check_result_type(
+    target: &crate::FunctionValueType,
+) -> Result<(), StaticProfileFailure> {
+    if target.logical_type != ValueLogicalType::Physical
+        || target.data_type != DataType::Utf8
+        || !target.nullable
+    {
+        return Err(StaticProfileFailure::ResultType);
+    }
+    Ok(())
+}
+
 pub(super) fn evaluate_string_append_trailing<'a>(
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
@@ -133,33 +185,14 @@ pub(super) fn evaluate_string_append_trailing<'a>(
     let result = (|| {
         let types = input.contract().selected().argument_types.as_ref();
         let arguments = input.arguments();
-        if types.len() != 2 || arguments.len() != 2 {
-            return Err(invalid(
-                "append_trailing differs from its installed argument count",
-            ));
-        }
+        check_argument_count(types.len(), arguments.len())
+            .map_err(|error| invalid(error.message()))?;
         for ty in types {
-            let FunctionArgumentType::Value(source) = ty else {
-                return Err(invalid("append_trailing requires checked value arguments"));
-            };
-            if source.logical_type != ValueLogicalType::Physical
-                || source.data_type != DataType::Utf8
-            {
-                return Err(invalid(
-                    "append_trailing selected source is outside its installed profile",
-                ));
-            }
+            check_argument_type(ty).map_err(|error| invalid(error.message()))?;
             work.step()?;
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
-        {
-            return Err(invalid(
-                "append_trailing differs from its installed result profile",
-            ));
-        }
+        check_result_type(target).map_err(|error| invalid(error.message()))?;
         let source = arguments[0]
             .array()
             .as_any()
