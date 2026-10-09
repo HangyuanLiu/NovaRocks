@@ -20,6 +20,10 @@
 #[path = "result_delivery_root_held_response.rs"]
 pub(crate) mod held_response;
 
+#[path = "result_delivery_root_owned_probe.rs"]
+mod owned_probe;
+pub(super) use owned_probe::probe_owned;
+
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;

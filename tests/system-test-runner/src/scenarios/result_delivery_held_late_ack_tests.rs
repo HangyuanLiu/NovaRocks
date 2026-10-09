@@ -1,0 +1,185 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// Pure predicates and typed submitted-request checks, not Native acceptance.
+use super::*;
+use sha2::{Digest, Sha256};
+fn roots(sealed: bool, holder: bool) -> [BTreeMap<String, u64>; 3] {
+    let mut roots: [_; 3] = std::array::from_fn(|_| {
+        ROOT_FIELDS
+            .iter()
+            .map(|name| (name.to_string(), 0))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let row = &mut roots[1];
+    for name in [
+        "channels",
+        "terminal_task_records",
+        "producers_exited",
+        "ends_published",
+    ] {
+        row.insert(name.into(), 1);
+    }
+    row.insert("sealed".into(), u64::from(sealed));
+    row.insert("data_positions".into(), if sealed { 0 } else { 2 });
+    row.insert("payload_bytes".into(), if sealed { 0 } else { S + 8 });
+    row.insert("segments".into(), if holder { 1 } else { 2 });
+    if holder {
+        for name in [
+            "deliveries",
+            "retained_reservations",
+            "metadata_holders",
+            "metadata_bytes",
+        ] {
+            row.insert(name.into(), 1);
+        }
+    }
+    roots
+}
+#[test]
+fn genuine_w2_quiet_and_sealed_positive_holder_have_distinct_facts() {
+    assert!(roots_match(&roots(false, false), 1, false, false).unwrap());
+    assert!(!roots_match(&roots(false, false), 1, false, true).unwrap());
+    assert!(roots_match(&roots(false, true), 1, false, true).unwrap());
+    assert!(roots_match(&roots(true, true), 1, true, true).unwrap());
+    assert!(!roots_match(&roots(true, true), 1, false, true).unwrap());
+}
+#[test]
+fn zero_census_or_released_context_never_substitutes_for_sealed_holder() {
+    let mut roots = roots(true, true);
+    roots[1].values_mut().for_each(|value| *value = 0);
+    assert!(!roots_match(&roots, 1, true, true).unwrap());
+    roots[1].insert("deliveries".into(), 1);
+    roots[1].insert("retained_reservations".into(), 1);
+    assert!(!roots_match(&roots, 1, true, true).unwrap());
+}
+#[test]
+fn every_required_physical_holder_dimension_and_end_frontier_must_be_positive() {
+    for name in [
+        "deliveries",
+        "retained_reservations",
+        "metadata_holders",
+        "metadata_bytes",
+        "segments",
+    ] {
+        let mut roots = roots(true, true);
+        roots[1].insert(name.into(), 0);
+        assert!(!roots_match(&roots, 1, true, true).unwrap(), "{name}");
+    }
+    let mut roots = roots(true, true);
+    roots[1].insert("ends_acknowledged".into(), 1);
+    assert!(!roots_match(&roots, 1, true, true).unwrap());
+}
+#[test]
+fn foreign_root_wrong_backend_missing_or_extra_projection_field_refuse() {
+    assert!(!roots_match(&roots(true, true), 0, true, true).unwrap());
+    assert!(roots_match(&roots(true, true), 3, true, true).is_err());
+    let mut rows = roots(true, true);
+    rows[0].insert("channels".into(), 1);
+    assert!(!roots_match(&rows, 1, true, true).unwrap());
+    let mut rows = roots(true, true);
+    rows[1].remove("metadata_holders");
+    assert!(roots_match(&rows, 1, true, true).is_err());
+    let mut rows = roots(true, true);
+    rows[1].insert("unfrozen".into(), 1);
+    assert!(roots_match(&rows, 1, true, true).is_err());
+}
+fn root() -> TaskIdentity {
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    TaskIdentity::new(
+        QueryExecutionId::new(QueryId::new(-7, 23), AttemptId::new(2).unwrap()).unwrap(),
+        StageId::new(9).unwrap(),
+        TaskId::new(17).unwrap(),
+        "019a0203-0405-7000-8000-000000000001"
+            .parse::<BackendProcessId>()
+            .unwrap(),
+    )
+}
+#[test]
+fn actual_request_encodes_full_identity_nonzero_wait_and_proven_ack_only_frontier() {
+    let original = root();
+    for ack in [false, true] {
+        let read = request(original, ack).unwrap();
+        let mut wire = encode_read(&read);
+        assert_eq!(
+            decode_read(&wire, FieldPath::root("component_actual_request")).unwrap(),
+            read
+        );
+        assert_eq!(read.root_task(), original);
+        assert_eq!(
+            read.wanted().map(NonZeroU64::get),
+            if ack { None } else { Some(1) }
+        );
+        assert_eq!(read.consumed(), u64::from(ack));
+        wire.max_wait_millis = 0;
+        assert!(decode_read(&wire, FieldPath::root("component_zero_wait")).is_err());
+    }
+}
+#[test]
+fn row_and_data1_oracles_are_independent_literals_and_original_bounds_remain_fixed() {
+    let mut row = Sha256::new();
+    row.update([0xfd, 0, 0, 0x10]);
+    let scratch = [b'x'; 4096];
+    for _ in 0..256 {
+        row.update(scratch);
+    }
+    row.update((S + 4).to_le_bytes());
+    assert_eq!(format!("{:x}", row.finalize()), ROW_SHA);
+    let mut data = Sha256::new();
+    data.update([4, 0, 0x10, 0, 0xfd, 0, 0, 0x10]);
+    for _ in 0..255 {
+        data.update(scratch);
+    }
+    data.update(&scratch[..4088]);
+    assert_eq!(
+        format!("{:x}", data.finalize()),
+        "e1778a1a63f0deff423d34c267bbc2be60c018adde82cf23dfcc9926582d0b42"
+    );
+    assert_eq!(
+        (WHOLE.as_millis(), PROTOCOL.as_millis(), SAMPLES),
+        (20000, 5000, 51)
+    );
+}
+#[test]
+fn original_1317_is_structural_and_unknown_io_or_zero_rows_never_health_pass() {
+    let mut result = OwnedTextResultObservation {
+        observation: TextResultObservation::default(),
+        actual_failure: Some(anyhow::anyhow!("actual IO")),
+        server_result_error_code: None,
+    };
+    result.observation.columns = 1;
+    result.observation.rows = 1;
+    result.observation.packets = 5;
+    result
+        .observation
+        .schema
+        .push(crate::actors::mysql_stream::TextColumnObservation {
+            name: "payload".into(),
+            mysql_type: 253,
+        });
+    result.observation.row_payload_bytes = S + 4;
+    result.observation.row_sha256 = ROW_SHA.into();
+    result.observation.error = Some("finite class".into());
+    assert!(validate_mysql(&result, false).is_err());
+    result.server_result_error_code = Some(1317);
+    assert!(validate_mysql(&result, false).is_ok());
+    result.observation.rows = 0;
+    assert!(validate_mysql(&result, false).is_err());
+    assert!(validate_mysql(&result, true).is_err());
+}

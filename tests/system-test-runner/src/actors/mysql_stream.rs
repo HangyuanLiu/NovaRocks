@@ -82,6 +82,13 @@ pub struct TextColumnObservation {
     pub mysql_type: u8,
 }
 
+/// Opt-in scenario result; arbitrary actual sources are never serialized.
+pub(crate) struct OwnedTextResultObservation {
+    pub observation: TextResultObservation,
+    pub actual_failure: Option<anyhow::Error>,
+    pub server_result_error_code: Option<u16>,
+}
+
 /// A full bounded ERR packet; no dynamic error message is frozen as an oracle.
 #[derive(Debug, Serialize)]
 pub struct BoundedMysqlError {
@@ -478,13 +485,55 @@ impl AsyncMysqlStream {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     ) -> TextResultObservation {
+        self.observe_text_query_kernel_until(
+            sql,
+            read_delay,
+            pause,
+            std::time::Instant::now() + self.timeout,
+            false,
+        )
+        .await
+        .observation
+    }
+    /// One caller-owned absolute clock covers metadata pause, rows and terminal.
+    pub(crate) async fn observe_text_query_owned_until(
+        &mut self,
+        sql: &str,
+        read_delay: Duration,
+        pause: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+        original_deadline: std::time::Instant,
+    ) -> OwnedTextResultObservation {
+        self.observe_text_query_kernel_until(sql, read_delay, pause, original_deadline, true)
+            .await
+    }
+    async fn observe_text_query_kernel_until(
+        &mut self,
+        sql: &str,
+        read_delay: Duration,
+        pause: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+        original_deadline: std::time::Instant,
+        strict_owned: bool,
+    ) -> OwnedTextResultObservation {
         let started = std::time::Instant::now();
         let mut observation = TextResultObservation::default();
         let mut digest = Sha256::new();
         let mut committed_digest = digest.clone();
         let mut wire_digest = Sha256::new();
         let mut metadata_digest = Sha256::new();
-        let result = async_timeout(self.timeout, async {
+        let mut server_result_error_code = None;
+        let result = tokio::time::timeout_at(original_deadline.into(), async {
+            if strict_owned {
+                ensure!(
+                    std::time::Instant::now() < original_deadline,
+                    "original absolute deadline expired before query send"
+                );
+            }
             self.send_query(sql).await?;
             let mut expected_sequence = 1u8;
             let first = self
@@ -504,6 +553,12 @@ impl AsyncMysqlStream {
                 (1..=4096).contains(&columns),
                 "invalid text-result column count"
             );
+            if strict_owned {
+                ensure!(
+                    columns == 1,
+                    "owned original observer requires one frozen column"
+                );
+            }
             observation.columns = columns;
             metadata_digest.update(&first);
             for _ in 0..columns {
@@ -561,6 +616,19 @@ impl AsyncMysqlStream {
                     .await?;
                     if first_chunk && !continuation {
                         if scratch[0] == 0xff {
+                            if strict_owned {
+                                ensure!(
+                                    length <= 4096
+                                        && count == length
+                                        && count >= 9
+                                        && scratch[3] == b'#'
+                                        && scratch[4..9].iter().all(u8::is_ascii_alphanumeric),
+                                    "original result ERR packet is not complete bounded protocol-41"
+                                );
+                                server_result_error_code =
+                                    Some(u16::from_le_bytes([scratch[1], scratch[2]]));
+                                bail!("original server result ERR retained");
+                            }
                             bail!(
                                 "server result error {}",
                                 observation_error(&scratch[..count])
@@ -603,16 +671,30 @@ impl AsyncMysqlStream {
             }
         })
         .await;
-        observation.error = match result {
+        let actual_failure = match result {
             Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("{error:#}").chars().take(512).collect()),
-            Err(_) => Some("absolute query deadline exceeded".to_string()),
+            Ok(Err(error)) => {
+                observation.error = Some(if strict_owned {
+                    "original result failure; actual source retained".to_string()
+                } else {
+                    format!("{error:#}").chars().take(512).collect()
+                });
+                Some(error)
+            }
+            Err(error) => {
+                observation.error = Some("absolute query deadline exceeded".to_string());
+                Some(error.into())
+            }
         };
         observation.elapsed_micros = started.elapsed().as_micros();
         observation.row_sha256 = format!("{:x}", committed_digest.finalize());
         observation.wire_prefix_sha256 = format!("{:x}", wire_digest.finalize());
         observation.metadata_sha256 = format!("{:x}", metadata_digest.finalize());
-        observation
+        OwnedTextResultObservation {
+            observation,
+            actual_failure,
+            server_result_error_code,
+        }
     }
 
     async fn observation_header(
@@ -1738,3 +1820,7 @@ pub(crate) mod root_reply_test_peer {
         assert!(observed.terminal.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "mysql_stream_owned_until_tests.rs"]
+mod owned_until_tests;

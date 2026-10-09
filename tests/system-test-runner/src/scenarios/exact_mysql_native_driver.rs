@@ -42,6 +42,15 @@ use std::time::{Duration, Instant};
 mod prepared_config;
 use prepared_config::OriginalPreparedConfig;
 
+#[path = "result_delivery_held_late_ack.rs"]
+mod held_late_ack;
+/// Only the separate admitted new selector may call this. Old ten cases are unchanged.
+pub(crate) fn held_late_ack_from_admitted(
+    run: AdmittedExactNativeRun,
+) -> Result<Box<dyn Scenario>> {
+    held_late_ack::from_admitted(run)
+}
+
 const S: u64 = 1_048_576;
 const SOCKET_ENV: &str = "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_SOCKET";
 const NONCE_ENV: &str = "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX";

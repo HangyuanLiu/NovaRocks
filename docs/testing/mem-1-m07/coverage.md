@@ -643,3 +643,14 @@ Worker实际1MiB Vec可见4B、最后1B slice：非末alias退出后原credit仍
 actual Worker完整7 PASS、Native reader完整27 PASS，均0FAIL/0ignored/terminal0；包含五项新增和所有原probe，不用新测试替代旧回归。fmt/diffcheckPASS；收据 `docs/testing/mem-1-m07/evidence/p07-physical-backing-components-20261009.json` pin两actualsource、未改productionowner/lock、原finaldraft/pins和logs；dev unoptimized/jobs1/incremental0/threads1。component-only，无Native/stock服务。
 
 只证明选定same-thread System Layout/capacity与post-return实际free，非usable size/RSS/cache或全部allocator；native credit退出顺序仍同时依据未改GuardedOwner字段序，Bytes wrapper固定metadata例外保持ADR-0168。Closing old+new copy峰值/returnable失败回滚、fixed-core完整backing、其它domain/window/Arrow及跨线程最后alias、held-response Native/fullClosing64/P08/P00b/P09/P10/final同SHA仍OPEN。两个人工语义门与IRU-7 HMS非只读excluded不改，无push/PR/归档。
+
+
+### 2026-10-09：P09 held-response / late ACK 场景组件 PASS
+
+前一physical backing组件checkpoint为 `601a0ebf1`。接入新explicit factory与具体held-response-late-ACK场景，保原S+8 SQL、W2、原FE/source与一次prelaunch20s；discovery前仅一次protocol5s覆盖fullData1验证/heldreplay/KILL/两次typedACK/census及actualactor settle。取消前后同闭合context必须有正delivery/reservation/metadata/segment holder；seal后logicalData/payload0、End published1/ack0、两ACK consumed1 accepted0/AwaitTerminalControl。零census或releasedroot不代正holder。新CLI/admission尚未接，factory shape校验不冒充真实准入。
+
+原actor/runtime/MySQLjob/resume均在primary外，Result失败也先actualactor settle、resume并borrow actualawait同MySQLhandle，再关闭原TCP/收敛/保存有限receipt，保primary/cleanup原对象。ownedobserver只有完整<=4096 protocol41 ERR才暴露actualcode1317，还须完整S+4行/hash；同TCP5050健康核真实task增长。原probe handle在timeout外，abort→actualawait→take，原三slot primary/cleanup/late提取私有组合便于真实反例，不改settle资格。新增source检查actual原task ID、future析构、Elapsed/h2/IO object pointer与Arc identity/formatter canary；deadline后actualOk仍FAIL。locked h2可能stringify内部IO内因，本测试保实际返回h2对象，不伪称库内IO源不失。
+
+actual ownedTCP observer7 PASS（原5＋metadatapause timeout原jobjoin/fullS行ERR2）、scene pure7 PASS、probe6 PASS（原2＋extra4），完整runner里程碑299 PASS/0FAIL/2既有ignored/17.60s；各filter含在299，不累加。non-test runnercheck、fmt/diffcheckPASS；初次错误bin target在编译前拒绝、随后两KILL缺ServerHandle import的编译失败日志保留，补原traitimport后通过。收据 `docs/testing/mem-1-m07/evidence/p09-held-scene-components-20261009.json` pin实际七source、未改actor/exact/旧inputs/lock、原stable草稿/独立review/extra draft与实际logs。dev unoptimized/jobs1/incremental0/threads1；Native/stock服务0。
+
+尚须new immutableinput/exclusive selector、clean source/build/binary/neutralfeature/config准入、完整target contexts/descriptors/loganchors与closedACK事实保存、外部independent final verifier，以及实际1FE+3BE/四role ESRCH。loopback H2和纯predicate不证明认证BE alias，RST只方法调用，zero census不证明allocator最后alias；中间receipt状态须配实际runner wait0和最终clock/source核验。场景失败注入、fullClosing64/P06s大providerCL/P08/P00b/P09/P10/final同SHA及两个人工语义门均OPEN。IRU-7 HMS非只读excluded，cap/deadline/旧exactfinish gate不改，无push/PR/归档。
