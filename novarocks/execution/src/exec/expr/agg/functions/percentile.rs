@@ -581,3 +581,7 @@ impl AggregateFunction for PercentileAgg {
 #[cfg(test)]
 #[path = "weighted_prepared_tests.rs"]
 mod weighted_prepared_tests;
+
+#[cfg(test)]
+#[path = "approx_percentile_original_baseline_tests.rs"]
+mod approx_percentile_original_baseline_tests;

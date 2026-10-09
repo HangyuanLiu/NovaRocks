@@ -1807,3 +1807,7 @@ mod exact_percentile_rate_tests;
 
 #[path = "pure_differential_field_tests.rs"]
 mod field_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_approx_percentile_tests.rs"]
+mod approx_percentile_tests;
