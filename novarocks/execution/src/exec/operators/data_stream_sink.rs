@@ -1817,7 +1817,10 @@ impl DataStreamSinkOperator {
             .error_state
             .as_ref()
             .ok_or("compiled partition keys require the fragment error state")?;
-        let control = RuntimeKernelControl::new(Arc::clone(error));
+        let mut control = RuntimeKernelControl::new(Arc::clone(error));
+        if let Some(tracker) = &self.pending_chunks_mem_tracker {
+            control.bind_mem_tracker(Arc::clone(tracker));
+        }
         compiled_instances(
             &mut state.instances,
             &state.keys.program,

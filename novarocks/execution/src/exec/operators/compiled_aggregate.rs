@@ -88,6 +88,13 @@ struct TrackedStateAllocator {
     tracker: Arc<MemTracker>,
 }
 
+/// Actual expression and aggregate backing share the same tracker adapter.
+pub(crate) fn expression_allocation_host(
+    tracker: Arc<MemTracker>,
+) -> Arc<dyn AggregateStateAllocator> {
+    Arc::new(TrackedStateAllocator { tracker })
+}
+
 /// Differential probes borrow the actual production allocator and explicit
 /// tracker authority. The unaccounted allocator's default remains unchanged.
 #[cfg(test)]
@@ -716,6 +723,7 @@ impl Operator for CompiledAggregateProcessor {
         &self.name
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.tracker = Some(tracker);
     }
     fn is_finished(&self) -> bool {

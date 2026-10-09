@@ -66,9 +66,7 @@ use super::join_hash_map::gather::{
 };
 use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
 use super::join_hash_map::search::{JoinSelection, append_cross_selection};
-use super::native_runtime_filter::{
-    NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet,
-};
+use super::native_runtime_filter::{NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::join::JoinType;
@@ -311,6 +309,7 @@ impl Operator for CompiledHashJoinBuildSink {
         Ok(self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)?)
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.control.bind_mem_tracker(Arc::clone(&tracker));
         let chunks = MemTracker::new_child("BuildInputChunks", &tracker);
         for chunk in self.input_chunks.iter_mut() {
             chunk.transfer_to(&chunks);
@@ -597,6 +596,9 @@ struct CompiledHashJoinProbe {
 }
 
 impl Operator for CompiledHashJoinProbe {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.control.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }

@@ -315,7 +315,7 @@ impl<'input> LambdaBodyOutput<'input> {
         Ok(Some(RequiredLambdaBodyError {
             contract: Arc::clone(&self.contract),
             outer: self.row_map.outer_selection(),
-            error: RowDataError::new(parent, error.message()),
+            error: error.with_selected_ordinal(parent),
         }))
     }
 }

@@ -501,6 +501,9 @@ fn evaluate_call(
 }
 
 impl Operator for CompiledWindowProcessor {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.control.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }

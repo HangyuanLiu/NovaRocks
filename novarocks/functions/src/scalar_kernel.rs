@@ -149,6 +149,20 @@ pub trait PreparedScalarKernel: Send + Sync + fmt::Debug {
     /// allocation; post-call checking cannot recover an exceeded hard limit.
     fn instance_retained_upper_bound(&self) -> usize;
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure>;
+    /// Exact requested Layout size of the instance's real std Box. Zero
+    /// preserves existing owners; a nonzero owner requires actual opaque
+    /// admission before construction and retains it until Box deallocation.
+    fn instance_inline_allocation_bytes(&self) -> usize {
+        0
+    }
+    /// Borrow a real host capability. Existing fixed instances preserve their
+    /// original construction; owners requiring backing refuse a missing host.
+    fn create_instance_with_allocator(
+        &self,
+        _allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+    ) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
+        self.create_instance()
+    }
 }
 
 /// One exact immutable owner supplies binding validation, effect refinement
@@ -265,16 +279,49 @@ pub struct ScalarEvaluationInstance {
     contract: Arc<ScalarCallContract>,
     retained_upper_bound: usize,
     failed: bool,
+    // The instance Box is destroyed before its actual opaque charge.
+    inline_charge: Option<crate::opaque_memory::OpaqueRetainedCharge>,
 }
 impl ScalarEvaluationInstance {
     pub fn instantiate(prepared: Arc<dyn PreparedScalarKernel>) -> Result<Self, KernelFailure> {
+        Self::instantiate_with_allocator(prepared, None)
+    }
+    pub fn instantiate_with_allocator(
+        prepared: Arc<dyn PreparedScalarKernel>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+    ) -> Result<Self, KernelFailure> {
         let contract = Arc::clone(prepared.contract());
         let retained_upper_bound = prepared.instance_retained_upper_bound();
         // Reject an unrepresentable lifetime charge before creating state.
         std::mem::size_of::<Self>()
             .checked_add(retained_upper_bound)
             .ok_or(KernelFailure::ResourceExhausted)?;
-        let instance = prepared.create_instance()?;
+        let inline_bytes = prepared.instance_inline_allocation_bytes();
+        let mut inline_charge = if inline_bytes == 0 {
+            None
+        } else {
+            let actual = allocator.as_ref().cloned().ok_or_else(|| {
+                invalid(&format!(
+                    "{} requires an actual scalar opaque allocation host",
+                    contract.function_id().as_str(),
+                ))
+            })?;
+            if actual.opaque_allocation_host().is_none() {
+                return Err(invalid(&format!(
+                    "{} requires an actual scalar opaque allocation host",
+                    contract.function_id().as_str(),
+                )));
+            }
+            Some(crate::opaque_memory::OpaqueRetainedCharge::try_new(actual)?)
+        };
+        let mut reservation = inline_charge
+            .as_ref()
+            .map(|charge| charge.reserve_operation(inline_bytes))
+            .transpose()?;
+        let instance = prepared.create_instance_with_allocator(allocator)?;
+        if let (Some(charge), Some(reservation)) = (&mut inline_charge, &mut reservation) {
+            charge.reconcile_under_reservation(inline_bytes, reservation)?;
+        }
         if instance.retained_bytes() > retained_upper_bound {
             return Err(internal(
                 "new scalar instance exceeded its authorized bound",
@@ -286,6 +333,7 @@ impl ScalarEvaluationInstance {
             retained_upper_bound,
             instance,
             failed: false,
+            inline_charge,
         })
     }
     pub fn contract(&self) -> &ScalarCallContract {

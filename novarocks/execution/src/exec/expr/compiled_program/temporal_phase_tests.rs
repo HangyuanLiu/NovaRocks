@@ -92,6 +92,7 @@ fn error_placeholders_never_trigger_whole_invocation_null_guard() {
     let observed = ObservedControl {
         original: &ctl,
         refused: AtomicBool::new(false),
+        operation_aborted: AtomicBool::new(false),
     };
     let mut work = Work {
         control: &observed,
@@ -120,6 +121,7 @@ fn demanded_deepest_data_error_projects_all_successes_preserving_prior_child_err
     let observed = ObservedControl {
         original: &ctl,
         refused: AtomicBool::new(false),
+        operation_aborted: AtomicBool::new(false),
     };
     let mut work = Work {
         control: &observed,
@@ -164,6 +166,7 @@ fn binary_safe_null_is_data_not_control_failure_for_exact_sparse_domain() {
     let observed = ObservedControl {
         original: &ctl,
         refused: AtomicBool::new(false),
+        operation_aborted: AtomicBool::new(false),
     };
     let mut work = Work {
         control: &observed,
@@ -198,6 +201,7 @@ fn long_zone_data_error_is_full_until_owner_row_projection() {
     let observed = ObservedControl {
         original: &ctl,
         refused: AtomicBool::new(false),
+        operation_aborted: AtomicBool::new(false),
     };
     let mut work = Work {
         control: &observed,
@@ -255,6 +259,7 @@ fn deepest(control: &Control) -> Result<(), KernelFailure> {
     let observed = ObservedControl {
         original: control,
         refused: AtomicBool::new(false),
+        operation_aborted: AtomicBool::new(false),
     };
     let mut work = Work {
         control: &observed,

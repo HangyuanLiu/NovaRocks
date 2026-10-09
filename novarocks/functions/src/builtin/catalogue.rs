@@ -2619,6 +2619,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::map_size_owner::operation(name) => {
                         Some(super::map_size_owner::effects())
                     }
+                    name if super::ds_hll_state_owner::operation(name) => {
+                        Some(super::ds_hll_state_owner::effects())
+                    }
                     name if super::array_match_owner::operation(name).is_some() => {
                         Some(super::array_match_owner::effects())
                     }
@@ -2963,6 +2966,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::map_size_owner::operation(name) => {
                 super::map_size_owner::definition(name, declaration, resolver)?
+            }
+            name if super::ds_hll_state_owner::operation(name) => {
+                super::ds_hll_state_owner::definition(name, declaration, resolver)?
             }
             name if super::array_match_owner::operation(name).is_some() => {
                 super::array_match_owner::definition(name, declaration, resolver)?
@@ -5057,6 +5063,34 @@ fn observed_all<T>(
 #[cfg(test)]
 #[path = "constant_binding_tests.rs"]
 pub(super) mod constant_binding_tests;
+
+/// Construct the actual private DS scalar definition for cross-crate runtime
+/// tests before public catalogue registration. No production caller enables
+/// this feature; binding, metadata and installed declarations keep one author.
+#[cfg(feature = "test-support")]
+pub fn ds_hll_scalar_private_test_catalog() -> EngineFunctionCatalog {
+    let original = build_builtin_engine_function_catalog().unwrap();
+    let (name, signatures) = registry::builtin_scalar_declarations()
+        .into_iter()
+        .find(|(name, _)| name == "ds_hll_count_distinct_state")
+        .expect("original DS scalar declaration");
+    let (declaration, resolver) =
+        scalar_definition_parts(&name, &signatures, FunctionKind::Scalar).unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(super::ds_hll_state_owner::definition(&name, declaration, resolver).unwrap())
+        .unwrap();
+    // The compact child fixture also borrows the actual installed IF owner.
+    builder
+        .register(
+            original
+                .definition("if", FunctionKind::Scalar)
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    builder.seal().unwrap()
+}
 
 #[cfg(test)]
 pub(super) fn ndv_invocation_data_test_catalog() -> EngineFunctionCatalog {

@@ -295,6 +295,8 @@ pub mod aggregate_ds_hll_state;
 mod aggregate_ds_hll_kernel;
 mod aggregate_ds_hll_owner;
 pub mod ds_hll_state_core;
+mod ds_hll_state_selected;
+mod ds_hll_state_owner;
 pub mod aes_primitive;
 pub mod aes_rows;
 pub mod bytes_output;

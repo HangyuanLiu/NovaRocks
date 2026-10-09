@@ -132,6 +132,14 @@ impl ScanOutputFilter {
 }
 
 impl ScanDriverFilter {
+    pub(super) fn bind_mem_tracker(
+        &mut self,
+        tracker: std::sync::Arc<crate::runtime::mem_tracker::MemTracker>,
+    ) {
+        if let Some(keys) = &mut self.compiled_keys {
+            keys.bind_mem_tracker(tracker);
+        }
+    }
     pub(super) fn ordered_live(&self) -> Option<&NativeOrderedLiveConsumerSet> {
         self.filter.ordered_live.as_ref()
     }

@@ -1129,8 +1129,12 @@ impl ScalarCall<'_> {
             }
         };
         let run = catch_unwind(AssertUnwindSafe(|| {
-            let mut instance = ScalarEvaluationInstance::instantiate(Arc::clone(prepared))
-                .map_err(|error| error.to_string())?;
+            let mut instance = ScalarEvaluationInstance::instantiate_with_allocator(
+                Arc::clone(prepared),
+                Some(crate::exec::operators::compiled_aggregate::differential_aggregate_state_allocator(
+                    crate::runtime::mem_tracker::MemTracker::new_root("pure-differential-scalar-state"),
+                )),
+            ).map_err(|error| error.to_string())?;
             let output = instance
                 .evaluate(selection, &arguments, &HarnessControl)
                 .map_err(|error| error.to_string())?;

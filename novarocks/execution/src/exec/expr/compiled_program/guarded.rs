@@ -267,7 +267,7 @@ impl Frame {
                     .ok_or_else(|| internal("missing temporal child error"))?;
                 self.errors
                     .entry(parent)
-                    .or_insert_with(|| RowDataError::new(parent, error.message()));
+                    .or_insert_with(|| error.with_selected_ordinal(parent));
             } else {
                 good.push(Some(local as u64));
                 ordinals.push(parent);
@@ -377,7 +377,7 @@ impl Frame {
                             .next()
                             .ok_or_else(|| internal("missing CASE operand error"))?;
                         self.errors
-                            .insert(parent, RowDataError::new(parent, error.message()));
+                            .insert(parent, error.with_selected_ordinal(parent));
                     } else {
                         remaining.push(parent);
                     }
@@ -454,7 +454,7 @@ impl Frame {
                             .next()
                             .ok_or_else(|| internal("missing CASE WHEN error"))?;
                         self.errors
-                            .insert(parent, RowDataError::new(parent, error.message()));
+                            .insert(parent, error.with_selected_ordinal(parent));
                     } else {
                         let matches = if let (Some(recipe), Some(operand)) =
                             (recipe, operand.as_ref())
@@ -498,7 +498,7 @@ impl Frame {
                         .next()
                         .ok_or_else(|| internal("missing CASE result error"))?;
                     self.errors
-                        .insert(parent, RowDataError::new(parent, error.message()));
+                        .insert(parent, error.with_selected_ordinal(parent));
                 } else {
                     self.choices[parent] = Some((child_index, local));
                 }
@@ -553,7 +553,7 @@ impl Frame {
                         .next()
                         .ok_or_else(|| internal("missing IF condition error"))?;
                     self.errors
-                        .insert(ordinal, RowDataError::new(ordinal, error.message()));
+                        .insert(ordinal, error.with_selected_ordinal(ordinal));
                     None
                 } else {
                     Some(!booleans.is_null(ordinal) && booleans.value(ordinal))
@@ -577,7 +577,7 @@ impl Frame {
                             .next()
                             .ok_or_else(|| internal("missing guarded child error"))?;
                         self.errors
-                            .insert(parent, RowDataError::new(parent, error.message()));
+                            .insert(parent, error.with_selected_ordinal(parent));
                     } else if shape == ControlShape::Coalesce && is_null {
                         remaining.push(parent);
                     } else {
@@ -609,6 +609,7 @@ pub(super) fn evaluate_tree<'a>(
     input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
     selection: Selection<'a>,
     instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     work: &mut Work<'_>,
 ) -> Result<Value<'a>, KernelFailure> {
@@ -969,6 +970,7 @@ pub(super) fn evaluate_tree<'a>(
                                 &children,
                                 local_selection,
                                 instances,
+                                allocator,
                                 work,
                             )?)
                         }
@@ -1294,7 +1296,7 @@ fn evaluate_arithmetic<'a>(
         };
         let result = match result {
             R::RowError(error) => {
-                errors.push(RowDataError::new(ordinal, error.message()));
+                errors.push(error.with_selected_ordinal(ordinal));
                 R::Null
             }
             result => result,
@@ -1488,7 +1490,7 @@ fn evaluate_cast<'a>(
         };
         let value = match value {
             R::RowError(error) => {
-                errors.push(RowDataError::new(ordinal, error.message()));
+                errors.push(error.with_selected_ordinal(ordinal));
                 R::Null
             }
             other => other,

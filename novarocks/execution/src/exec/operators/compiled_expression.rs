@@ -50,10 +50,27 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 /// interruptible by the same state.
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
+    allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
 }
 impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
-        Self { error }
+        Self {
+            error,
+            allocator: None,
+        }
+    }
+    pub(crate) fn bind_mem_tracker(
+        &mut self,
+        tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    ) {
+        self.allocator = Some(super::compiled_aggregate::expression_allocation_host(
+            tracker,
+        ));
+    }
+    pub(crate) fn allocator(
+        &self,
+    ) -> Option<Arc<dyn novarocks_functions::AggregateStateAllocator>> {
+        self.allocator.clone()
     }
 }
 impl KernelEvaluationControl for RuntimeKernelControl {
@@ -131,17 +148,18 @@ pub(crate) fn instances(
     slot: &mut Option<Vec<CompiledExpressionInstance>>,
     program: &Arc<LocalProgram>,
     sites: &[ProgramExpressionRootSite],
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<()> {
     if slot.is_some() {
         return Ok(());
     }
     let mut created = Vec::with_capacity(sites.len());
     for site in sites {
-        created.push(CompiledExpressionInstance::try_new(
+        created.push(CompiledExpressionInstance::try_new_with_allocator(
             Arc::clone(program),
             *site,
             control,
+            control.allocator(),
         )?);
     }
     *slot = Some(created);
@@ -241,6 +259,9 @@ struct CompiledProjectProcessor {
     finished: bool,
 }
 impl Operator for CompiledProjectProcessor {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.control.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -402,6 +423,9 @@ enum CompiledFilterEvaluation {
     Scan(Vec<CompiledExpressionInstance>),
 }
 impl Operator for CompiledFilterProcessor {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.control.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -429,7 +453,7 @@ impl ProcessorOperator for CompiledFilterProcessor {
         if self.instance.is_none() {
             let created = match self.site {
                 ProgramExpressionRootSite::Node { node, role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 } } =>
-                    CompiledFilterEvaluation::Filter(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new(Arc::clone(&self.program), node, &self.control)?),
+                    CompiledFilterEvaluation::Filter(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new_with_allocator(Arc::clone(&self.program), node, &self.control, self.control.allocator())?),
                 _ => {
                     let mut instances_slot = None;
                     instances(&mut instances_slot, &self.program, std::slice::from_ref(&self.site), &self.control)?;

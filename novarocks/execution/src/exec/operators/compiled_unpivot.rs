@@ -543,6 +543,7 @@ impl Operator for CompiledUnpivotProcessor {
         &self.name
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.mem_tracker = Some(tracker);
     }
     fn is_finished(&self) -> bool {

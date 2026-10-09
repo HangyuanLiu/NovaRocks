@@ -32,9 +32,18 @@ impl CompiledFilterConjunctionInstance {
         node: ProgramNodeId,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
+        Self::try_new_with_allocator(program, node, control, None)
+    }
+    pub(crate) fn try_new_with_allocator(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        control: &dyn KernelEvaluationControl,
+        allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<Self, KernelFailure> {
         let observed = ObservedControl {
             original: control,
             refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
         };
         let mut work = Work {
             control: &observed,
@@ -102,8 +111,12 @@ impl CompiledFilterConjunctionInstance {
                         "Filter predicate is not its original physical Boolean",
                     ));
                 }
-                let instance =
-                    CompiledExpressionInstance::try_new(Arc::clone(&program), site, work.control)?;
+                let instance = CompiledExpressionInstance::try_new_with_allocator(
+                    Arc::clone(&program),
+                    site,
+                    work.control,
+                    allocator.clone(),
+                )?;
                 if let Some(previous) = actual_input {
                     if instance.input != Some(previous) {
                         return Err(invalid(
@@ -254,6 +267,7 @@ impl CompiledFilterConjunctionInstance {
         let observed = ObservedControl {
             original: control,
             refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
         };
         let mut work = Work {
             control: &observed,

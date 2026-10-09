@@ -1010,19 +1010,86 @@ pub fn tracked_scalar_heap_capacity<A: ScalarStateAllocator>(
 
 /// The original owned scalar reader. Legacy callers keep their original
 /// temporary materialization; selected callers borrow the same work scope.
+/// Original untracked reader failures borrow the actual source carrier.
+pub enum ScalarReadFailure<'a> {
+    Static(&'static str),
+    Unsupported(&'a DataType),
+    Existing(&'a str),
+}
+impl std::fmt::Display for ScalarReadFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(message) => f.write_str(message),
+            Self::Existing(message) => f.write_str(message),
+            Self::Unsupported(ty) => write!(f, "unsupported scalar type: {:?}", ty),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub enum ScalarReadObservation {
+    Step,
+    OpaqueBoundary,
+}
+/// Requests name the actual original std allocation that follows, not a
+/// placeholder allocation. A pure host admits it before that operation.
+pub trait ScalarReadFailureSink {
+    type Error;
+    fn read_data(&mut self, failure: ScalarReadFailure<'_>) -> Self::Error;
+    fn observe(&mut self, observation: ScalarReadObservation) -> Result<(), Self::Error>;
+    fn reserve_scalar_copy(
+        &mut self,
+        elements: usize,
+        width: usize,
+        alignment: usize,
+    ) -> Result<(), Self::Error>;
+}
+struct LegacyScalarReadSink<'borrow, 'control, 'scope> {
+    work: &'borrow mut ScalarWork<'control, 'scope>,
+}
+impl ScalarReadFailureSink for LegacyScalarReadSink<'_, '_, '_> {
+    type Error = ScalarStateError;
+    fn read_data(&mut self, failure: ScalarReadFailure<'_>) -> ScalarStateError {
+        ScalarStateError::Legacy(failure.to_string())
+    }
+    fn observe(&mut self, event: ScalarReadObservation) -> Result<(), ScalarStateError> {
+        match event {
+            ScalarReadObservation::Step => self.work.step(),
+            ScalarReadObservation::OpaqueBoundary => self.work.flush(),
+        }
+    }
+    fn reserve_scalar_copy(
+        &mut self,
+        _: usize,
+        _: usize,
+        _: usize,
+    ) -> Result<(), ScalarStateError> {
+        Ok(())
+    }
+}
 pub fn scalar_from_array(
     array: &ArrayRef,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<Option<AggScalarValue>, ScalarStateError> {
-    work.step()?;
+    scalar_from_array_with_failure(array, row, &mut LegacyScalarReadSink { work })
+}
+pub fn scalar_from_array_with_failure<F: ScalarReadFailureSink>(
+    array: &ArrayRef,
+    row: usize,
+    sink: &mut F,
+) -> Result<Option<AggScalarValue>, F::Error> {
+    sink.observe(ScalarReadObservation::Step)?;
     match array.data_type() {
         DataType::Null => Ok(None),
         DataType::Boolean => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to BooleanArray",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1030,10 +1097,9 @@ pub fn scalar_from_array(
             }
         }
         DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                sink.read_data(ScalarReadFailure::Static("failed to downcast to Int8Array"))
+            })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1041,10 +1107,11 @@ pub fn scalar_from_array(
             }
         }
         DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                sink.read_data(ScalarReadFailure::Static(
+                    "failed to downcast to Int16Array",
+                ))
+            })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1052,10 +1119,11 @@ pub fn scalar_from_array(
             }
         }
         DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                sink.read_data(ScalarReadFailure::Static(
+                    "failed to downcast to Int32Array",
+                ))
+            })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1063,10 +1131,11 @@ pub fn scalar_from_array(
             }
         }
         DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                sink.read_data(ScalarReadFailure::Static(
+                    "failed to downcast to Int64Array",
+                ))
+            })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1077,7 +1146,11 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to Float32Array",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1088,7 +1161,11 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to Float64Array",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1099,16 +1176,21 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to StringArray",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
                 for _ in arr.value(row).as_bytes() {
-                    work.step()?;
+                    sink.observe(ScalarReadObservation::Step)?;
                 }
-                work.flush()?;
+                sink.observe(ScalarReadObservation::OpaqueBoundary)?;
+                sink.reserve_scalar_copy(arr.value(row).len(), 1, 1)?;
                 let value = arr.value(row).to_string();
-                work.flush()?;
+                sink.observe(ScalarReadObservation::OpaqueBoundary)?;
                 Ok(Some(AggScalarValue::Utf8(value)))
             }
         }
@@ -1116,16 +1198,21 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to BinaryArray",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
                 for _ in arr.value(row) {
-                    work.step()?;
+                    sink.observe(ScalarReadObservation::Step)?;
                 }
-                work.flush()?;
+                sink.observe(ScalarReadObservation::OpaqueBoundary)?;
+                sink.reserve_scalar_copy(arr.value(row).len(), 1, 1)?;
                 let value = arr.value(row).to_vec();
-                work.flush()?;
+                sink.observe(ScalarReadObservation::OpaqueBoundary)?;
                 Ok(Some(AggScalarValue::Binary(value)))
             }
         }
@@ -1133,16 +1220,21 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to LargeBinaryArray",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
                 for _ in arr.value(row) {
-                    work.step()?;
+                    sink.observe(ScalarReadObservation::Step)?;
                 }
-                work.flush()?;
+                sink.observe(ScalarReadObservation::OpaqueBoundary)?;
+                sink.reserve_scalar_copy(arr.value(row).len(), 1, 1)?;
                 let value = arr.value(row).to_vec();
-                work.flush()?;
+                sink.observe(ScalarReadObservation::OpaqueBoundary)?;
                 Ok(Some(AggScalarValue::Binary(value)))
             }
         }
@@ -1150,7 +1242,11 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to Date32Array",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1162,7 +1258,11 @@ pub fn scalar_from_array(
                 let arr = array
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        sink.read_data(ScalarReadFailure::Static(
+                            "failed to downcast to TimestampSecondArray",
+                        ))
+                    })?;
                 if arr.is_null(row) {
                     Ok(None)
                 } else {
@@ -1173,7 +1273,11 @@ pub fn scalar_from_array(
                 let arr = array
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        sink.read_data(ScalarReadFailure::Static(
+                            "failed to downcast to TimestampMillisecondArray",
+                        ))
+                    })?;
                 if arr.is_null(row) {
                     Ok(None)
                 } else {
@@ -1184,7 +1288,11 @@ pub fn scalar_from_array(
                 let arr = array
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        sink.read_data(ScalarReadFailure::Static(
+                            "failed to downcast to TimestampMicrosecondArray",
+                        ))
+                    })?;
                 if arr.is_null(row) {
                     Ok(None)
                 } else {
@@ -1195,7 +1303,11 @@ pub fn scalar_from_array(
                 let arr = array
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?;
+                    .ok_or_else(|| {
+                        sink.read_data(ScalarReadFailure::Static(
+                            "failed to downcast to TimestampNanosecondArray",
+                        ))
+                    })?;
                 if arr.is_null(row) {
                     Ok(None)
                 } else {
@@ -1207,7 +1319,11 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to Decimal128Array",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1218,7 +1334,11 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to Decimal256Array",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
@@ -1229,19 +1349,23 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to FixedSizeBinaryArray",
+                    ))
+                })?;
             if arr.is_null(row) {
                 Ok(None)
             } else {
-                let v = largeint::value_at(arr, row)?;
+                let v = largeint::value_at(arr, row)
+                    .map_err(|message| sink.read_data(ScalarReadFailure::Existing(&message)))?;
                 Ok(Some(AggScalarValue::Decimal128(v)))
             }
         }
         DataType::List(_item) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+            let arr = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                sink.read_data(ScalarReadFailure::Static("failed to downcast to ListArray"))
+            })?;
             if arr.is_null(row) {
                 return Ok(None);
             }
@@ -1249,10 +1373,15 @@ pub fn scalar_from_array(
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = arr.values();
+            sink.reserve_scalar_copy(
+                end.saturating_sub(start),
+                std::mem::size_of::<Option<AggScalarValue>>(),
+                std::mem::align_of::<Option<AggScalarValue>>(),
+            )?;
             let mut out = Vec::with_capacity(end.saturating_sub(start));
             for idx in start..end {
-                work.step()?;
-                out.push(scalar_from_array(values, idx, work)?);
+                sink.observe(ScalarReadObservation::Step)?;
+                out.push(scalar_from_array_with_failure(values, idx, sink)?);
             }
             Ok(Some(AggScalarValue::List(out)))
         }
@@ -1260,22 +1389,30 @@ pub fn scalar_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+                .ok_or_else(|| {
+                    sink.read_data(ScalarReadFailure::Static(
+                        "failed to downcast to StructArray",
+                    ))
+                })?;
             if arr.is_null(row) {
                 return Ok(None);
             }
+            sink.reserve_scalar_copy(
+                fields.len(),
+                std::mem::size_of::<Option<AggScalarValue>>(),
+                std::mem::align_of::<Option<AggScalarValue>>(),
+            )?;
             let mut out = Vec::with_capacity(fields.len());
             for col in arr.columns() {
-                work.step()?;
-                out.push(scalar_from_array(col, row, work)?);
+                sink.observe(ScalarReadObservation::Step)?;
+                out.push(scalar_from_array_with_failure(col, row, sink)?);
             }
             Ok(Some(AggScalarValue::Struct(out)))
         }
         DataType::Map(_, _) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<MapArray>()
-                .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+            let arr = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                sink.read_data(ScalarReadFailure::Static("failed to downcast to MapArray"))
+            })?;
             if arr.is_null(row) {
                 return Ok(None);
             }
@@ -1284,16 +1421,21 @@ pub fn scalar_from_array(
             let end = offsets[row + 1] as usize;
             let keys = arr.keys();
             let values = arr.values();
+            sink.reserve_scalar_copy(
+                end.saturating_sub(start),
+                std::mem::size_of::<(Option<AggScalarValue>, Option<AggScalarValue>)>(),
+                std::mem::align_of::<(Option<AggScalarValue>, Option<AggScalarValue>)>(),
+            )?;
             let mut out = Vec::with_capacity(end.saturating_sub(start));
             for idx in start..end {
-                work.step()?;
+                sink.observe(ScalarReadObservation::Step)?;
                 out.push((
-                    scalar_from_array(keys, idx, work)?,
-                    scalar_from_array(values, idx, work)?,
+                    scalar_from_array_with_failure(keys, idx, sink)?,
+                    scalar_from_array_with_failure(values, idx, sink)?,
                 ));
             }
             Ok(Some(AggScalarValue::Map(out)))
         }
-        other => Err(format!("unsupported scalar type: {:?}", other).into()),
+        other => Err(sink.read_data(ScalarReadFailure::Unsupported(other))),
     }
 }

@@ -94,10 +94,10 @@ impl BooleanRows {
                 if pure {
                     self.pending
                         .entry(parent)
-                        .or_insert_with(|| RowDataError::new(parent, error.message()));
+                        .or_insert_with(|| error.with_selected_ordinal(parent));
                     remaining.push(parent);
                 } else {
-                    terminal.insert(parent, RowDataError::new(parent, error.message()));
+                    terminal.insert(parent, error.with_selected_ordinal(parent));
                 }
             } else if values.is_null(ordinal) {
                 if shape == ControlShape::Conjunction && demand == EvaluationDemand::TruthOnly {

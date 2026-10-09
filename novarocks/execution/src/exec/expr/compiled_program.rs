@@ -62,6 +62,7 @@ pub struct CompiledExpressionInstance {
     instances: BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     failed: bool,
+    allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
 }
 
 fn invalid(message: &str) -> KernelFailure {
@@ -76,6 +77,9 @@ fn internal(message: &str) -> KernelFailure {
 struct ObservedControl<'a> {
     original: &'a dyn KernelEvaluationControl,
     refused: AtomicBool,
+    // A real leaf Kernel Err is atomic even when it originated at a host
+    // allocator rather than a cooperative control checkpoint.
+    operation_aborted: AtomicBool,
 }
 impl KernelEvaluationControl for ObservedControl<'_> {
     fn checkpoint(&self, work: u32) -> Result<(), KernelFailure> {
@@ -112,6 +116,7 @@ impl Work<'_> {
     }
     fn finish<T>(&mut self, result: Result<T, KernelFailure>) -> Result<T, KernelFailure> {
         if self.control.refused.load(Ordering::Relaxed)
+            || self.control.operation_aborted.load(Ordering::Relaxed)
             || matches!(
                 &result,
                 Err(KernelFailure::Cancelled
@@ -192,6 +197,7 @@ impl CompiledExpressionInstance {
         let observed = ObservedControl {
             original: control,
             refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
         };
         observed.checkpoint(0)?;
         let mut work = Work {
@@ -200,6 +206,16 @@ impl CompiledExpressionInstance {
         };
         let result = Self::prepare(program, root, &mut work);
         work.finish(result)
+    }
+    pub fn try_new_with_allocator(
+        program: Arc<LocalProgram>,
+        root: ProgramExpressionRootSite,
+        control: &dyn KernelEvaluationControl,
+        allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<Self, KernelFailure> {
+        let mut instance = Self::try_new(program, root, control)?;
+        instance.allocator = allocator;
+        Ok(instance)
     }
     fn prepare(
         program: Arc<LocalProgram>,
@@ -460,6 +476,7 @@ impl CompiledExpressionInstance {
             instances: BTreeMap::new(),
             effects,
             failed: false,
+            allocator: None,
         })
     }
     /// The caller supplies this root's actual input port, retaining the full
@@ -477,6 +494,7 @@ impl CompiledExpressionInstance {
         let observed = ObservedControl {
             original: control,
             refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
         };
         let mut work = Work {
             control: &observed,
@@ -579,6 +597,7 @@ impl CompiledExpressionInstance {
             input_node,
             selection,
             &mut self.instances,
+            self.allocator.as_ref(),
             &self.effects,
             work,
         )?;
@@ -623,6 +642,7 @@ fn evaluate_scalar<'a>(
     children: &[Value<'a>],
     selection: Selection<'a>,
     instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     let mut blocked = Vec::with_capacity(selection.len());
@@ -728,18 +748,41 @@ fn evaluate_scalar<'a>(
     if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence) {
         // The actual host must authorize this instance's immutable lifetime
         // bound before entry. Representability/postchecks are not that grant.
-        let instance = ScalarEvaluationInstance::instantiate(Arc::clone(prepared))?;
+        let instance = match ScalarEvaluationInstance::instantiate_with_allocator(
+            Arc::clone(prepared),
+            allocator.cloned(),
+        ) {
+            Ok(instance) => instance,
+            Err(cause) => {
+                work.control
+                    .operation_aborted
+                    .store(true, Ordering::Relaxed);
+                return Err(cause);
+            }
+        };
         work.control.checkpoint(0)?;
         entry.insert(instance);
     }
-    let output = instances
+    let output = match instances
         .get_mut(&occurrence)
         .ok_or_else(|| internal("scalar instance was not installed"))?
-        .evaluate(call_selection, &arguments, work.control)?;
+        .evaluate(call_selection, &arguments, work.control)
+    {
+        Ok(output) => output,
+        Err(cause) => {
+            // A real typed leaf failure owns the first cause. Do not add a
+            // completion callback that can replace it. Row Data stays Ok and
+            // retains the original lawful downstream masking path.
+            work.control
+                .operation_aborted
+                .store(true, Ordering::Relaxed);
+            return Err(cause);
+        }
+    };
     let (_, array, own_errors) = output.into_parts();
     for error in own_errors {
         let original = active_ordinals[error.selected_ordinal()];
-        inherited.insert(original, RowDataError::new(original, error.message()));
+        inherited.insert(original, error.with_selected_ordinal(original));
         work.step()?;
     }
     let array = if full_call {

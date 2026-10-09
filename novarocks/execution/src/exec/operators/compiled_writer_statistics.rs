@@ -677,7 +677,10 @@ impl CompiledFinishStatistics {
     /// Evaluate every scalar constant root once over one row of the Root
     /// port: an `ARTIFACT_DRAFT` kind and NULL in every other field. A
     /// constant reads no channel, so the row only gives it its one row.
-    fn evaluate_constants(&self) -> ExecutionResult<Vec<ArrayRef>> {
+    fn evaluate_constants(
+        &self,
+        tracker: Option<&Arc<MemTracker>>,
+    ) -> ExecutionResult<Vec<ArrayRef>> {
         if self.constant_sites.is_empty() {
             return Ok(Vec::new());
         }
@@ -701,7 +704,10 @@ impl CompiledFinishStatistics {
         let row = RecordBatch::try_new(Arc::clone(&self.root_port), columns).map_err(|error| {
             ExecutionFailure::from(format!("compiled grouped Unpivot constant row: {error}"))
         })?;
-        let control = RuntimeKernelControl::new(Arc::clone(&self.error));
+        let mut control = RuntimeKernelControl::new(Arc::clone(&self.error));
+        if let Some(tracker) = tracker {
+            control.bind_mem_tracker(Arc::clone(tracker));
+        }
         let mut created: Option<Vec<CompiledExpressionInstance>> = None;
         instances(&mut created, &self.program, &self.constant_sites, &control)?;
         let created = created.as_mut().expect("instances were created");
@@ -779,7 +785,7 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
             rows.push((target.get(), row));
         }
         let constants = self
-            .evaluate_constants()
+            .evaluate_constants(tracker.as_ref())
             .map_err(|error| error.to_string())?;
         // Expanded channels: the target ordinal, the value, then each literal.
         let mut output_slots = vec![

@@ -31,9 +31,7 @@ use novarocks_functions::{
     KernelFailure, PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
 };
-use novarocks_local_compiler::{
-    LocalCompileOptions, compile_fragment, validate_fragment_providers,
-};
+use novarocks_local_compiler::{LocalCompileOptions, compile_fragment, validate_fragment_providers};
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
     ProgramNodeId,
@@ -1460,3 +1458,9 @@ mod to_base64_tests;
 
 #[path = "to_binary_after_tests.rs"]
 mod to_binary_after_tests;
+
+#[path = "ds_hll_state_frame_tests.rs"]
+mod ds_hll_state_frame_tests;
+
+#[path = "ds_hll_state_private_frame_tests.rs"]
+mod ds_hll_state_private_frame_tests;

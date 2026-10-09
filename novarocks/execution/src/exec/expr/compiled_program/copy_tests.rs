@@ -76,6 +76,7 @@ fn copy(
     let observed = ObservedControl {
         original: control,
         refused: AtomicBool::new(false),
+        operation_aborted: AtomicBool::new(false),
     };
     let mut work = Work {
         control: &observed,

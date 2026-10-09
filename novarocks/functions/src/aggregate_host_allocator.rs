@@ -63,9 +63,12 @@ impl HostAggregateAllocator {
         // cannot be destroyed for the lifetime of the returned borrow.
         unsafe { self.inner.as_ref() }
     }
+    pub(crate) const fn metadata_allocation_bytes() -> usize {
+        Layout::new::<HostAllocatorInner>().size()
+    }
     /// Count the one actual metadata block once per state, not per clone.
     pub(super) fn metadata_bytes(&self) -> usize {
-        Layout::new::<HostAllocatorInner>().size()
+        Self::metadata_allocation_bytes()
     }
     /// Borrow the originating allocator refusal without consuming its journal.
     /// serde's custom error carrier must not erase the distinct Kernel cause.

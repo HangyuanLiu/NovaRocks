@@ -96,6 +96,7 @@ fn run<T>(
     let observed = ObservedControl {
         original: control,
         refused: AtomicBool::new(false),
+        operation_aborted: AtomicBool::new(false),
     };
     observed.checkpoint(0)?;
     let mut work = Work {

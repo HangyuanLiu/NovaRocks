@@ -61,9 +61,7 @@ use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema,
 };
 #[cfg(debug_assertions)]
-use crate::exec::node::table_write_relation::{
-    TableWriteAggregateBoundary, TableWriteAggregateGuard,
-};
+use crate::exec::node::table_write_relation::{TableWriteAggregateBoundary, TableWriteAggregateGuard};
 use crate::exec::node::table_writer::{
     TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
     TableWriterRuntimeBinding,
@@ -107,6 +105,7 @@ struct TableWriterPlan {
 /// How one driver projects an input page onto the exact provider schema its
 /// writer and every embedded aggregate share.
 pub(crate) trait WriterPageProjection: Send {
+    fn set_mem_tracker(&mut self, _tracker: Arc<MemTracker>) {}
     fn project(&mut self, chunk: &Chunk) -> ExecutionResult<Chunk>;
 }
 
@@ -568,6 +567,7 @@ impl Operator for TableWriterOperator {
     }
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.projection.set_mem_tracker(Arc::clone(&tracker));
         self.writer.set_mem_tracker(Arc::clone(&tracker));
         let result_tracker = MemTracker::new_child("ConnectorWriterResult", &tracker);
         *self

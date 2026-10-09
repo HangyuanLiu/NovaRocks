@@ -210,11 +210,22 @@ impl<'a> EvaluatedArgument<'a> {
 /// Only errors explicitly classified by the implementation as row data errors
 /// enter this channel. Resource, cancellation, deadline, plan and internal
 /// failures remain outer failures and cannot be masked by Boolean decisions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
+enum RowDiagnostic {
+    Bounded(Box<str>),
+    Host(crate::aggregate_invocation_backing::HostDiagnostic),
+}
+#[derive(Clone, Debug)]
 pub struct RowDataError {
     selected_ordinal: usize,
-    message: Box<str>,
+    message: RowDiagnostic,
 }
+impl PartialEq for RowDataError {
+    fn eq(&self, other: &Self) -> bool {
+        self.selected_ordinal == other.selected_ordinal && self.message() == other.message()
+    }
+}
+impl Eq for RowDataError {}
 
 pub const MAX_ROW_ERROR_MESSAGE_BYTES: usize = 512;
 
@@ -226,7 +237,7 @@ impl RowDataError {
         }
         Self {
             selected_ordinal,
-            message: message[..end].into(),
+            message: RowDiagnostic::Bounded(message[..end].into()),
         }
     }
 
@@ -235,7 +246,32 @@ impl RowDataError {
     }
 
     pub fn message(&self) -> &str {
-        &self.message
+        match &self.message {
+            RowDiagnostic::Bounded(message) => message,
+            RowDiagnostic::Host(message) => message.message(),
+        }
+    }
+    /// Remap the true selected ordinal without clipping or reformatting the
+    /// diagnostic. A host-backed diagnostic loans its actual shared block.
+    pub fn with_selected_ordinal(&self, selected_ordinal: usize) -> Self {
+        Self {
+            selected_ordinal,
+            message: self.message.clone(),
+        }
+    }
+    pub(crate) fn prepare_host(
+        selected_ordinal: usize,
+        allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
+        work: &mut crate::kernel_input::EvaluationCheckpoints<'_>,
+        formatter: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+    ) -> Result<Self, crate::KernelFailure> {
+        let diagnostic = crate::aggregate_invocation_backing::HostDiagnostic::prepare(
+            allocator, work, formatter,
+        )?;
+        Ok(Self {
+            selected_ordinal,
+            message: RowDiagnostic::Host(diagnostic),
+        })
     }
 }
 

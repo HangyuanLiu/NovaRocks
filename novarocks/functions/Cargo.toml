@@ -27,6 +27,9 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 datasketches = { workspace = true, features = ["hll"] }
 openssl = "0.10"

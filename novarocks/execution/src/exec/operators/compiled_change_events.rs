@@ -42,9 +42,7 @@ use novarocks_local_program::{
     ProgramNodeKind,
 };
 
-use super::compiled_expression::{
-    RuntimeKernelControl, evaluate_all, evaluate_selected, instances,
-};
+use super::compiled_expression::{RuntimeKernelControl, evaluate_all, evaluate_selected, instances};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -288,6 +286,9 @@ impl CompiledChangeEventProcessor {
 }
 
 impl Operator for CompiledChangeEventProcessor {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.control.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }

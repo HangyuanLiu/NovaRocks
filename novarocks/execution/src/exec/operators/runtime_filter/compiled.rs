@@ -130,6 +130,14 @@ pub(crate) struct CompiledRuntimeFilterKeys {
     instances: Option<Vec<CompiledExpressionInstance>>,
 }
 
+impl CompiledRuntimeFilterKeys {
+    pub(crate) fn bind_mem_tracker(
+        &mut self,
+        tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    ) {
+        self.control.bind_mem_tracker(tracker);
+    }
+}
 impl RuntimeFilterKeyProvider for CompiledRuntimeFilterKeys {
     type Error = ExecutionFailure;
 

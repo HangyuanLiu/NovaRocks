@@ -317,6 +317,9 @@ impl StreamScanSourceOperator {
 }
 
 impl Operator for StreamScanSourceOperator {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.filter.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }
