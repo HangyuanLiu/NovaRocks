@@ -1830,3 +1830,12 @@ mod percentile_hash_native_n1_tests;
 #[cfg(test)]
 #[path = "pure_differential_bitmap_to_string_tests.rs"]
 mod bitmap_to_string_tests;
+
+#[path = "pure_differential_hll_hash_tests.rs"]
+mod hll_hash_tests;
+
+#[path = "pure_differential_bitmap_union_int_tests.rs"]
+mod bitmap_union_int_tests;
+
+#[path = "pure_differential_map_agg_tests.rs"]
+mod pure_differential_map_agg_tests;

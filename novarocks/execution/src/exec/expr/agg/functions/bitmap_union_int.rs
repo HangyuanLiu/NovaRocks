@@ -809,3 +809,7 @@ mod tests {
         assert!(arr.is_null(0));
     }
 }
+
+#[cfg(test)]
+#[path = "bitmap_union_int_original_baseline_tests.rs"]
+mod original_baseline;

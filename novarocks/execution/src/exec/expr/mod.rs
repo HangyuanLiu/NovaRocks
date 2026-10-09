@@ -1523,3 +1523,20 @@ mod inlist_signed_actual_after_tests;
 
 #[cfg(test)]
 mod scan_ordered_required_actual_tests;
+
+#[cfg(test)]
+mod legacy_hll_hash_original_tests;
+#[cfg(test)]
+mod hll_hash_actual_sql_source_tests;
+
+#[cfg(test)]
+mod bitmap_union_int_actual_sql_source_tests;
+
+#[cfg(test)]
+mod legacy_like_required_baseline_tests;
+#[cfg(test)]
+mod like_required_actual_sql_tests;
+
+#[cfg(test)]
+#[path = "map_agg_actual_sql_source_tests.rs"]
+mod map_agg_actual_sql_source_tests;

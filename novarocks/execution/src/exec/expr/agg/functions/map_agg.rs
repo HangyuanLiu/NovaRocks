@@ -565,3 +565,7 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_map_agg_baseline_tests.rs"]
+mod legacy_map_agg_baseline_tests;
