@@ -34,6 +34,7 @@ use crate::scenarios::result_delivery_root_protocol::{
     probe_owned,
 };
 use anyhow::{Context, Result, ensure};
+use novarocks_cluster_harness::process_resources::ProcessLaunchIdentity;
 use novarocks_cluster_harness::{LaunchProfile, ServerHandle};
 use novarocks_execution_contract::{TaskIdentity, root_result::RootResultRead};
 use novarocks_proto_codec::FieldPath;
@@ -438,6 +439,28 @@ fn validate_mysql(value: &OwnedTextResultObservation, health: bool) -> Result<()
     Ok(())
 }
 
+fn original_role_inventory(
+    (frontend, backends): (&ProcessLaunchIdentity, &[ProcessLaunchIdentity]),
+) -> Result<Value> {
+    ensure!(
+        frontend.role == "fe"
+            && backends.len() == 3
+            && backends
+                .iter()
+                .zip(["be-0", "be-1", "be-2"])
+                .all(|(role, name)| role.role == name),
+        "original held role inventory differs from the admitted topology"
+    );
+    // The harness API returns (FE, BE slice). Serialize the same four original
+    // launch identities in order, not that tuple's nested JSON representation.
+    Ok(serde_json::to_value([
+        frontend,
+        &backends[0],
+        &backends[1],
+        &backends[2],
+    ])?)
+}
+
 fn run_owned(
     context: &mut ScenarioContext,
     runtime: &Runtime,
@@ -445,6 +468,7 @@ fn run_owned(
     admitted: &AdmittedExactNativeRun,
     source_fences: &Mutex<Option<crate::held_live_source_fence::SourceFenceOwner>>,
 ) -> Result<()> {
+    let original_roles = original_role_inventory(context.process_launch_identities())?;
     // Every original handle stays outside the primary operation and all fallible writes.
     let mut actor: Option<HeldRootResponse> = None;
     let mut job: Option<MysqlJob> = None;
@@ -764,7 +788,7 @@ fn run_owned(
             "clean_revision":admitted.clean_revision,"source_tree_sha256":admitted.source_tree_sha256,
             "server_binary_sha256":admitted.server_binary_sha256,"runner_binary_sha256":admitted.runner_binary_sha256,
             "base_config_sha256":admitted.base_config_sha256,"execution_binding_sha256":admitted.frozen_execution_binding_sha256},
-        "original_roles":context.process_launch_identities(),"selected_root":facts.root,
+        "original_roles":original_roles,"selected_root":facts.root,
         "independent_target_source":facts.target_source,"closed_acks":facts.closed_acks,
         "mysql_terminal_code":facts.mysql_terminal_code,
         "health_before_tasks_created":facts.health_before_tasks_created,

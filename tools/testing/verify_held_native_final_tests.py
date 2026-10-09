@@ -284,6 +284,16 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
                 with self.subTest(phase=label,field=field),self.assertRaises(old.VerificationFailure):
                     self.verify_component(receipt)
 
+    def test_nested_harness_role_tuple_is_rejected_by_independent_verifier(self):
+        for key in ("receipt", "target"):
+            _,_,receipt=self.receipt()
+            owner=receipt if key=="receipt" else receipt["independent_target_source"]
+            roles=owner["original_roles"]
+            owner["original_roles"]=[roles[0],roles[1:]]
+            with self.subTest(key=key),self.assertRaises(old.VerificationFailure) as failure:
+                self.verify_component(receipt)
+            self.assertEqual(failure.exception.code,"four_original_roles")
+
     def test_wire_numeric_hash_timestamp_and_schema_fields_strict(self):
         for health in (False,True):
             for key in ("rows","row_payload_bytes","wire_bytes","packets","columns"):

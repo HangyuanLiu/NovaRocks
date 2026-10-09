@@ -18,6 +18,31 @@
 // Pure predicates and typed submitted-request checks, not Native acceptance.
 use super::*;
 use sha2::{Digest, Sha256};
+#[test]
+fn original_harness_role_tuple_serializes_four_flat_exact_identities() {
+    let roles: [_; 4] = std::array::from_fn(|index| ProcessLaunchIdentity {
+        role: ["fe", "be-0", "be-1", "be-2"][index].into(),
+        pid: 100 + index as u32,
+        process_start_token: format!("macos:1791559530:{}", 100 + index),
+    });
+    let actual = original_role_inventory((&roles[0], &roles[1..])).unwrap();
+    let flat = actual.as_array().unwrap();
+    assert_eq!(flat.len(), 4);
+    for (row, original) in flat.iter().zip(&roles) {
+        assert_eq!(row, &serde_json::to_value(original).unwrap());
+    }
+    // The historical tuple wire shape has two positions and must never be
+    // emitted as a substitute for the independently observed four roles.
+    assert_ne!(
+        actual,
+        serde_json::to_value((&roles[0], &roles[1..])).unwrap()
+    );
+    assert!(original_role_inventory((&roles[0], &roles[1..3])).is_err());
+    assert!(original_role_inventory((&roles[1], &roles[1..])).is_err());
+    let mut reordered = roles[1..].to_vec();
+    reordered.swap(0, 1);
+    assert!(original_role_inventory((&roles[0], &reordered)).is_err());
+}
 fn roots(sealed: bool, holder: bool) -> [BTreeMap<String, u64>; 3] {
     let mut roots: [_; 3] = std::array::from_fn(|_| {
         ROOT_FIELDS
