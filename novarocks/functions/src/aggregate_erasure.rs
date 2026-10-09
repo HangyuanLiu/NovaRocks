@@ -642,6 +642,9 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             Some(&context),
             control,
         );
+        if self.invocation_data && result.is_err() {
+            return finish_observation(&observed, result, self.invocation_data);
+        }
         if matches!(
             &result,
             Err(EvaluationFailure::InvocationData(_)
@@ -651,7 +654,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
                         | KernelFailure::ResourceExhausted
                 ))
         ) {
-            return finish_observation(&observed, result);
+            return finish_observation(&observed, result, self.invocation_data);
         }
         let post = (|| {
             self.validate_metadata()?;
@@ -662,15 +665,22 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             }
             work.finish()
         })();
-        finish_observation(&observed, finish_evaluation_lifecycle(result, || post))
+        finish_observation(
+            &observed,
+            finish_evaluation_lifecycle(result, || post),
+            self.invocation_data,
+        )
     }
 }
 
 fn finish_observation<T>(
     observed: &crate::kernel_control::KernelControlObservation<'_>,
     result: Result<T, EvaluationFailure>,
+    invocation_data: bool,
 ) -> Result<T, EvaluationFailure> {
     match result {
+        // The real immutable metadata routes only the new lossless protocol.
+        Err(error) if invocation_data => Err(error),
         Err(data @ EvaluationFailure::InvocationData(_)) => Err(data),
         Ok(value) => observed.finish(Ok(value)).map_err(Into::into),
         Err(EvaluationFailure::Kernel(cause)) => observed.finish(Err(cause)).map_err(Into::into),

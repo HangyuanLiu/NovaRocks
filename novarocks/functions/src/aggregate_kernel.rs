@@ -867,6 +867,9 @@ where
     match result {
         Err(data @ crate::EvaluationFailure::InvocationData(_)) => Err(data),
         Ok(value) => observed.finish(Ok(value)).map_err(Into::into),
+        // The lossless operation already returned its originating failure.
+        // Its error exit has no optional observation or lifecycle footer.
+        Err(error) if kernel.has_invocation_data() => Err(error),
         Err(crate::EvaluationFailure::Kernel(cause)) => {
             observed.finish(Err(cause)).map_err(Into::into)
         }
@@ -905,6 +908,11 @@ where
         (true, None) => kernel.build_final_evaluation(states.clone(), control),
         (false, None) => kernel.build_intermediate_evaluation(states.clone(), control),
     };
+    // Lossless owners publish an atomic originating Data or Kernel failure.
+    // In particular a host refusal need not have passed through control.
+    if kernel.has_invocation_data() && result.is_err() {
+        return result;
+    }
     // Interrupted output is terminal. The host still owns reconciliation and
     // destruction; another observed state traversal cannot complete this call.
     if matches!(

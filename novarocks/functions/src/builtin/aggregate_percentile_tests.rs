@@ -551,3 +551,6 @@ fn exact_percentile_owner_compile_three_causes_preserved() {
         assert!(matches!(result,Err(FunctionBindingError::Control(actual)) if actual==cause));
     }
 }
+
+#[path = "aggregate_lossless_emission_no_footer_tests.rs"]
+mod lossless_emission_no_footer_tests;
