@@ -72,25 +72,28 @@ impl ConnectorDocumentStorageManagement for IcebergDocumentStorage {
         request: ConnectorDocumentManagementAdmissionRequest,
     ) -> Result<Bytes, ConnectorError> {
         super::io::check_context(request.context())?;
-        if self.runtime.control_state().configuration().kind
-            != crate::catalog_config::IcebergCatalogKind::Rest
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "application-document management requires an Iceberg REST catalog",
-            ));
-        }
-        if request.operation() == ConnectorDocumentManagementOperation::Create {
-            self.runtime
-                .novarocks_catalog()
-                .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
-                .map_err(|unsupported| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::Unsupported,
-                        unsupported.message().to_string(),
-                    )
-                })?;
-        }
+        use crate::catalog::admission::{
+            CatalogAdmissionRequest, CatalogOperation, connector_unsupported,
+        };
+        let operation = match request.operation() {
+            ConnectorDocumentManagementOperation::Create => CatalogOperation::CreateDocuments,
+            ConnectorDocumentManagementOperation::SingleTargetUpdate => {
+                CatalogOperation::UpdateDocuments
+            }
+            ConnectorDocumentManagementOperation::Publication => CatalogOperation::PublishDocuments,
+            ConnectorDocumentManagementOperation::Drop => CatalogOperation::DropDocuments,
+        };
+        self.runtime
+            .novarocks_catalog()
+            .admit(&CatalogAdmissionRequest::new(
+                operation,
+                crate::catalog::CatalogTableName::new(
+                    Arc::clone(&request.target().namespace),
+                    Arc::clone(&request.target().table),
+                ),
+                request.context().initiation(),
+            ))
+            .map_err(connector_unsupported)?;
         let operation = match request.operation() {
             ConnectorDocumentManagementOperation::Create => "create",
             ConnectorDocumentManagementOperation::SingleTargetUpdate => "single-target-update",
@@ -296,17 +299,27 @@ mod tests {
             resources.clone(),
         )
         .unwrap();
-        // These catalogs still support ordinary empty-table creation. This
-        // test narrows document management, not all catalog write semantics.
-        native_runtime
-            .novarocks_catalog()
-            .admit_create(CatalogCreateIntent::EmptyTable)
-            .expect("native catalog still admits an empty table");
+        let empty_admission = native_runtime.novarocks_catalog().admit(
+            &crate::catalog::admission::CatalogAdmissionRequest::statement(
+                crate::catalog::admission::CatalogOperation::CreateTable(
+                    CatalogCreateIntent::EmptyTable,
+                ),
+                crate::catalog::CatalogTableName::new("db", "t"),
+            ),
+        );
+        assert_eq!(empty_admission.is_ok(), catalog_kind == "hadoop");
         assert!(
             native_runtime
                 .novarocks_catalog()
-                .admit_create(CatalogCreateIntent::CreateTableAsSelect)
-                .is_err(),
+                .admit(
+                    &crate::catalog::admission::CatalogAdmissionRequest::statement(
+                        crate::catalog::admission::CatalogOperation::CreateTable(
+                            CatalogCreateIntent::CreateTableAsSelect
+                        ),
+                        crate::catalog::CatalogTableName::new("db", "t"),
+                    )
+                )
+                .is_err()
         );
         let catalog = Arc::new(AdmissionCatalogSpy::new(Arc::clone(
             native_runtime.novarocks_catalog(),

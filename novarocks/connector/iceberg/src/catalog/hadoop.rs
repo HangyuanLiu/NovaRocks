@@ -24,6 +24,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::ConnectorError;
 
+use super::admission::{
+    CatalogAdmission, CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogInitiation,
+    CatalogOperation,
+};
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
@@ -96,13 +100,46 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         Arc::clone(self.delegate.client())
     }
 
-    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported> {
-        match intent {
-            CatalogCreateIntent::EmptyTable => Ok(()),
-            CatalogCreateIntent::CreateTableAsSelect => Err(CatalogUnsupported::new(
-                "Hadoop Iceberg catalog has no staged-create protocol, so CREATE TABLE AS \
-                     SELECT cannot publish its target atomically",
+    fn admit_operation(
+        &self,
+        operation: &CatalogOperation,
+        target: &CatalogAdmissionTarget,
+    ) -> Result<(), CatalogUnsupported> {
+        operation.validate_target(target)?;
+        match operation {
+            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect) => {
+                Err(CatalogUnsupported::new(
+                    "Hadoop Iceberg catalog has no standard staged-create protocol, so CREATE TABLE AS SELECT cannot publish its target atomically",
+                ))
+            }
+            CatalogOperation::CreateView
+            | CatalogOperation::ReplaceView
+            | CatalogOperation::DropView => Err(CatalogUnsupported::new(
+                "Hadoop Iceberg catalog does not support views",
             )),
+            CatalogOperation::CreateDocuments
+            | CatalogOperation::UpdateDocuments
+            | CatalogOperation::PublishDocuments
+            | CatalogOperation::DropDocuments => Err(CatalogUnsupported::new(
+                "application-document management requires an Iceberg REST catalog",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn admit_initiation(
+        &self,
+        request: &CatalogAdmissionRequest,
+    ) -> Result<CatalogAdmission, CatalogUnsupported> {
+        match request.initiation {
+            CatalogInitiation::Background => Err(CatalogUnsupported::new(format!(
+                "Hadoop Iceberg catalog requires a single writer: background {} is not supported",
+                request.operation.name()
+            ))),
+            CatalogInitiation::StatementJob => Ok(CatalogAdmission::AdmittedAwaitingCompletion),
+            CatalogInitiation::Statement | CatalogInitiation::JobAttempt => {
+                Ok(CatalogAdmission::Admitted)
+            }
         }
     }
 
@@ -243,6 +280,12 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         &self,
         namespace: CatalogNamespaceName,
     ) -> CatalogOutcome<CatalogNamespaceName> {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateNamespace,
+            &namespace.clone().into(),
+        ) {
+            return CatalogOutcome::Unsupported(reason);
+        }
         self.delegate.create_namespace(namespace).await
     }
 
@@ -250,10 +293,20 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         &self,
         namespace: CatalogNamespaceName,
     ) -> CatalogOutcome<CatalogNamespaceName> {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::DropNamespace, &namespace.clone().into())
+        {
+            return CatalogOutcome::Unsupported(reason);
+        }
         self.delegate.drop_namespace(namespace).await
     }
 
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::DropTable, &table.clone().into())
+        {
+            return CatalogOutcome::Unsupported(reason);
+        }
         self.delegate.drop_table(table).await
     }
 
@@ -262,6 +315,11 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         table: CatalogTableName,
         metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::BootstrapSnapshot, &table.clone().into())
+        {
+            return CatalogOutcome::Unsupported(reason);
+        }
         // The namespace has to exist before the table can be anchored under it.
         // The previous helper created it with `let _ =`, so a namespace that
         // failed to appear surfaced later as a confusing registration failure
@@ -322,6 +380,17 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         &self,
         request: ConditionalCreateRequest,
     ) -> CatalogOutcome<ConditionalCreateAttempt> {
+        let target = CatalogTableName::new(
+            Arc::clone(&request.namespace.namespace),
+            request.creation.name.clone(),
+        );
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            &target.clone().into(),
+        ) {
+            return CatalogOutcome::Unsupported(reason);
+        }
+
         let namespace = match super::delegate::namespace_ident(&request.namespace) {
             Ok(ident) => ident,
             Err(error) => {
@@ -339,7 +408,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             Ok(attempt) => {
                 let facts = facts_from_hadoop(attempt.facts());
                 CatalogOutcome::committed(
-                    ConditionalCreateAttempt::hadoop(attempt, facts),
+                    ConditionalCreateAttempt::hadoop(attempt, facts, target),
                     novarocks_spi::connector::ExternalMutationEffect::NoOp,
                 )
             }
@@ -354,6 +423,13 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         &self,
         attempt: ConditionalCreateAttempt,
     ) -> CatalogOutcome<ConditionalCreateReceipt> {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            &attempt.target.clone().into(),
+        ) {
+            return CatalogOutcome::Unsupported(reason);
+        }
+
         let facts = attempt.facts.clone();
         let Some(attempt) = attempt.into_hadoop() else {
             return CatalogOutcome::uncommitted(
@@ -416,6 +492,11 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     }
 
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::Append, &request.target.clone().into())
+        {
+            return CatalogTransactionStart::Unsupported(reason);
+        }
         super::start_update_table_transaction(&self.delegate, request)
     }
 
@@ -423,6 +504,12 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         &self,
         request: CreateTableTransactionRequest,
     ) -> CatalogTransactionStart {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateTable(request.intent),
+            &request.target.clone().into(),
+        ) {
+            return CatalogTransactionStart::Unsupported(reason);
+        }
         match request.intent {
             CatalogCreateIntent::EmptyTable => {
                 // This catalog's create is a conditional metadata write, not a
@@ -482,7 +569,10 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                     .with_admission_facts(admission),
                 ))
             }
-            CatalogCreateIntent::CreateTableAsSelect => match self.admit_create(request.intent) {
+            CatalogCreateIntent::CreateTableAsSelect => match self.admit_operation(
+                &CatalogOperation::CreateTable(request.intent),
+                &request.target.clone().into(),
+            ) {
                 Ok(()) => super::start_create_table_transaction(&self.delegate, request),
                 Err(reason) => CatalogTransactionStart::Unsupported(reason),
             },

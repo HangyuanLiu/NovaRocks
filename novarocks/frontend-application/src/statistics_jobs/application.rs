@@ -64,6 +64,7 @@ pub enum StatisticsColumnIntent {
 /// persisted: an attempt derives its own column set after identity-gated rebind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsTargetCapture {
+    pub job_admission: novarocks_spi::connector::ConnectorTableJobAdmission,
     pub connector_instance_id: String,
     pub namespace: String,
     pub table: String,
@@ -154,10 +155,27 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
                 },
                 resolution: ConnectorTableResolution::StrictBaseTable,
                 selector: ConnectorTableObjectSelector::Current,
-                context,
+                context: context.clone(),
             })
             .map_err(StatisticsApplicationError::from_connector_error)?;
+        let job_admission = lease
+            .binding()
+            .metadata()
+            .admit_table_job(
+                novarocks_spi::connector::ConnectorTableJobAdmissionRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: ConnectorInstanceId::parse(&target.catalog)
+                            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
+                        namespace: Arc::from(target.namespace.as_str()),
+                        table: Arc::from(target.table.as_str()),
+                    },
+                    job: novarocks_spi::connector::ConnectorTableJobKind::Statistics,
+                    context: context.clone(),
+                },
+            )
+            .map_err(StatisticsApplicationError::from_connector_error)?;
         Ok(StatisticsTargetCapture {
+            job_admission,
             connector_instance_id: captured.metadata.table.owner().as_str().to_string(),
             namespace: target.namespace.clone(),
             table: target.table.clone(),

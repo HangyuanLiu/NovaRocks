@@ -37,12 +37,14 @@ under the License.
 - ✅ 需要 SSB / TPC-H / TPC-DS 级别的分析查询性能（三套基准全部通过）
 - ✅ 需要在 Iceberg 上跑 INSERT / DELETE / UPDATE / MERGE INTO 全套 DML
 - ✅ 需要时间旅行（snapshot id / timestamp / branch / tag）
+- ✅ 需要通过 HMS 读取 Spark 等外部引擎写入的 Iceberg 表、元数据表与时间旅行，具体边界见 [Catalog 接入](catalog.md)
 - ✅ 需要在 Iceberg 上做物化视图，且关心 IVM（增量刷新）能跟上基表的 MERGE / UPDATE 变化
 - ✅ 已支持 EXPIRE SNAPSHOTS / REMOVE ORPHAN FILES / REWRITE MANIFESTS（同步执行，v2+v3）
 
 ## 当前不适合的场景
 
-- ❌ 需要走 Glue / HMS / Nessie / JDBC catalog（仅 Hadoop / In-memory / REST 基础）
+- ❌ 需要通过 HMS catalog 写入或维护 Iceberg 表（HMS 是只读兼容入口；写入请使用 REST 或 Hadoop catalog）
+- ❌ 需要走 Glue / Nessie / JDBC catalog（仅 Hadoop / In-memory / REST 基础）
 - ❌ 需要写 Azure / GCS / 腾讯 COS / 华为 OBS（仅本地 / HDFS / S3 / OSS）
 - ❌ 需要 V1 表读 / V1→V2 / V2→V3 升级
 - ❌ 需要写 Iceberg variant / geometry / geography（variant 仅读）

@@ -53,6 +53,10 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 Hadoop 实现入口为 `novarocks/connector/iceberg/src/hadoop_catalog.rs`；使用 `iceberg.catalog.type=hadoop` 和明确 warehouse。它的 metadata/commit 约定由该实现管理，不应把 warehouse 当作可以绕过原 catalog 协调直接写入的路径。
 
+**Hive Metastore（HMS）是永久只读兼容入口。** NovaRocks 可以读取由 Spark 等外部引擎写入的表，查询元数据表并进行 branch 或 snapshot ID 时间旅行。HMS 上的建库、建表、ALTER、ref/view 变更、CTAS、DML、TRUNCATE、ADD FILES、维护、ANALYZE、OPTIMIZE 与 MV 管理均在第一次外部副作用之前拒绝；不会因为这些请求写出数据或规划文件，也不会建立统计或 OPTIMIZE 作业。`CREATE / DROP CATALOG` 只管理 NovaRocks 自身配置，不属于 HMS 湖侧 mutation。
+
+被拒绝时，错误会说明 `Hive Metastore catalog is a read-only compatibility entry`，列出操作并提示使用 Iceberg REST 或 Hadoop catalog 写入。需要写入时请选择这两类 catalog；HMS 不提供恢复写入的开关。长期边界见 [ADR-0169](../../adr/ADR-0169-read-only-hms-and-single-writer-admission.md)。
+
 Hive 的 provider 实现与 runtime 构造入口为 `catalog/hive.rs` 和 `catalog_runtime::build_hms_catalog`。本地 HMS fixture 由 `docker/iceberg-hive/` 管理，连接选定的版本化 REST fixture 网络供 Spark/对象存储访问。运行 `iceberg-hms` 前先按该目录操作说明启动 HMS。HMS 等外部 endpoint 尚在时，普通与 force catalog 删除均拒绝；先退出 HMS 自己的精确项目与连接。
 
 ## 生命周期与边界

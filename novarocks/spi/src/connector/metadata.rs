@@ -1201,6 +1201,28 @@ pub struct ConnectorTableRequest {
     pub context: ConnectorRequestContext,
 }
 
+/// A statement-submitted mutation job that must be admitted before its root
+/// is created. Running attempts retain their own request-context initiation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorTableJobKind {
+    Statistics,
+    RewriteDataFiles,
+}
+
+#[derive(Clone)]
+pub struct ConnectorTableJobAdmissionRequest {
+    pub table: ConnectorTableIdentity,
+    pub job: ConnectorTableJobKind,
+    pub context: ConnectorRequestContext,
+}
+
+/// Whether the submitting statement may return before its admitted job exits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorTableJobAdmission {
+    Detached,
+    AwaitTerminal,
+}
+
 /// A current metadata binding paired with the provider's physical table object
 /// identity from the same catalog observation.
 #[derive(Clone)]
@@ -1384,6 +1406,19 @@ impl ConnectorReadReferenceFacts {
 pub trait ConnectorMetadata: Send + Sync {
     fn instance_id(&self) -> &ConnectorInstanceId;
 
+    /// Admit a statement-submitted table job before any job state or external
+    /// mutation is created. AwaitTerminal requires waiting for actual exit,
+    /// including when cancellation is requested by the submitting statement.
+    fn admit_table_job(
+        &self,
+        _request: ConnectorTableJobAdmissionRequest,
+    ) -> Result<ConnectorTableJobAdmission, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector metadata does not support table job admission",
+        ))
+    }
+
     /// Derive a process-independent semantic revision from this exact admitted
     /// table handle and selector. Providers must not perform another catalog
     /// lookup here: the result has to describe the same metadata observation
@@ -1549,6 +1584,31 @@ mod tests {
                 super::super::ConnectorErrorKind::Unsupported,
                 "test metadata does not load tables",
             ))
+        }
+    }
+
+    #[test]
+    fn table_job_admission_is_unsupported_unless_the_provider_implements_it() {
+        let instance_id = ConnectorInstanceId::parse("job-admission").expect("instance");
+        let metadata = MetadataWithoutObjectBinding {
+            instance_id: instance_id.clone(),
+        };
+        for job in [
+            ConnectorTableJobKind::Statistics,
+            ConnectorTableJobKind::RewriteDataFiles,
+        ] {
+            let error = metadata
+                .admit_table_job(ConnectorTableJobAdmissionRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("table"),
+                    },
+                    job,
+                    context: context(4_096),
+                })
+                .expect_err("default admission must fail closed");
+            assert_eq!(error.kind(), super::super::ConnectorErrorKind::Unsupported);
         }
     }
 

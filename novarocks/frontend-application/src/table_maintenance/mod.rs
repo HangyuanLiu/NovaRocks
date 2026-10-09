@@ -195,9 +195,58 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 }
             }
             ParsedMaintenanceStatement::SubmitOptimize { name_parts } => {
-                engine.reject_user_action_on_mv(&engine.resolve_target(&name_parts, context)?)?;
-                self.submit_optimize(engine, engine.resolve_target(&name_parts, context)?)
-                    .map(|_| MaintenanceStatementResult::Ok)
+                let target = engine.resolve_target(&name_parts, context)?;
+                engine.reject_user_action_on_mv(&target)?;
+                let capture = FrontendOptimizeTargetCapturePort::for_statement(engine);
+                let submission = self.block_on(self.product.submit_optimize(target, &capture))?;
+                if matches!(
+                    submission,
+                    OptimizeSubmission::Submitted {
+                        completion:
+                            novarocks_table_maintenance::OptimizeCompletionMode::AwaitTerminal,
+                        ..
+                    }
+                ) {
+                    if let Some(handle) = submission.handle() {
+                        let control = engine
+                            .statement_cancellation()
+                            .expect("AwaitTerminal verified statement control before submission");
+                        let wait = self.product.wait_optimize(handle);
+                        tokio::pin!(wait);
+                        let mut cancelled = false;
+                        let mut cancellation_error = None;
+                        let terminal = tokio::select! {
+                            terminal = &mut wait => terminal,
+                            _ = control.0.stopped() => {
+                                cancelled = true;
+                                cancellation_error = self.product.request_cancel_optimize(handle).await.err();
+                                wait.await
+                            },
+                            _ = tokio::time::sleep_until(control.1.into()) => {
+                                cancelled = true;
+                                cancellation_error = self.product.request_cancel_optimize(handle).await.err();
+                                wait.await
+                            },
+                        }?;
+                        if let Some(error) = cancellation_error {
+                            return Err(error);
+                        }
+                        if cancelled {
+                            return Err(
+                                "OPTIMIZE statement cancelled; optimize job has actually exited"
+                                    .to_string(),
+                            );
+                        }
+                        if terminal != MaintenanceJobState::Finished {
+                            return Err(format!(
+                                "optimize job {} completed with terminal state {}",
+                                handle.job_id(),
+                                terminal.as_str()
+                            ));
+                        }
+                    }
+                }
+                Ok(MaintenanceStatementResult::Ok)
             }
             ParsedMaintenanceStatement::ShowOptimize => Err(
                 "SHOW ALTER TABLE OPTIMIZE belongs to the read-only maintenance owner".to_string(),

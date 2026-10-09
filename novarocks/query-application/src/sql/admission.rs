@@ -352,6 +352,18 @@ mod tests {
             typed_statement_work_class(&management),
             WorkClass::Management
         );
+        // A waiting submitting statement must not hold the warehouse query
+        // slot needed by its independently governed statistics/optimize job.
+        for sql in [
+            "ANALYZE TABLE lake.db.events",
+            "ALTER TABLE lake.db.events OPTIMIZE",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse job-submitting statement");
+            assert_eq!(
+                typed_statement_work_class(&statement),
+                WorkClass::Management
+            );
+        }
     }
 
     #[test]

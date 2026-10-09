@@ -46,7 +46,7 @@ authoritative current list.
 | `iceberg-compatibility` / `spark_rest_delete_applicability` | 同提交 position/DV/equality 的序号边界与独立 Java 行袋 | `novarocks/connector/iceberg/src/delete_semantics/**`、`typed_read/**` | 真实 Java writer + manifest 闭包；native 1FE+3BE |
 | `iceberg-ddl` | Iceberg DDL, schema evolution, CREATE TABLE LIKE | `novarocks/connector/iceberg/**`, `novarocks/sql/src/planning/**` | — |
 | `iceberg-dml` | INSERT / DELETE / UPDATE / MERGE against Iceberg, type round-trips | `novarocks/connector/iceberg/**`, `novarocks/execution/src/exec/operators/table_writer.rs` | — |
-| `iceberg-hms` | Native Hive Metastore catalog admission for document-managed MVs | `novarocks/connector/iceberg/src/document_storage/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; start the separate `docker/iceberg-hive/` fixture |
+| `iceberg-hms` | Spark-written HMS read compatibility and refusal integrity for every reachable mutation family | `novarocks/connector/iceberg/src/{catalog,catalog_control,commit}/**`, table-job admission | `explicit_only`; cross-process, 3 BE, `-j 1`; start `docker/iceberg-hive/`; Spark owns writes/cleanup and paginated inventory evidence |
 | `iceberg-ivm` | Incremental MV maintenance over Iceberg (COW / MOR, projections, PK) | `novarocks/mv-application/**`, `novarocks/execution/src/exec/mv/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |

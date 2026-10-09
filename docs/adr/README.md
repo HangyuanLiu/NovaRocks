@@ -150,6 +150,7 @@ code-anchors:
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
+- ADR-0169 — catalog owner 为何在零副作用点统一准入、HMS 永久只读，并让单写者作业留在提交语句生命周期内（active；延伸 ADR-0118）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
 - ADR-0158 — Parquet 扫描为何由共享 Range 服务派发，并由单一 B/N 后继窗口维持顺序与责任（active；其「同步 reader 占用扫描线程」的妥协已由 ADR-0159 兑现，Range 服务与 B/N 规则不变）
