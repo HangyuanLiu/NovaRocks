@@ -1568,3 +1568,13 @@ mod join_probe_filter_actual_sql_tests;
 
 #[cfg(test)]
 mod bitmap_agg_actual_sql_source_tests;
+
+#[cfg(test)]
+mod original_float_arithmetic_baseline_tests;
+#[cfg(test)]
+mod float_arithmetic_required_oracle_tests;
+#[cfg(test)]
+mod float_arithmetic_statistics_actual_sql_tests;
+
+#[cfg(test)]
+mod float_arithmetic_conversion_author_tests;

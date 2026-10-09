@@ -926,11 +926,25 @@ fn is_integer_type(dt: &DataType) -> bool {
     )
 }
 
+/// Sole original division zero-mask carrier classification. The per-width
+/// readers remain in nullify_zeros; F32/Decimal128 omissions are intentional.
+pub(crate) fn division_masks_zeros(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Float64
+    )
+}
+
 /// Replace zero values in a numeric array with NULLs for safe division.
 fn nullify_zeros(arr: &ArrayRef) -> ArrayRef {
     use arrow_array::BooleanArray;
     let len = arr.len();
     let mut is_zero_buf = vec![false; len];
+    // Keep the original vector allocation before unsupported-type return.
+    // The shared classification owns admission; the match below owns readers.
+    if !division_masks_zeros(arr.data_type()) {
+        return arr.clone();
+    }
     match arr.data_type() {
         DataType::Int8 => {
             if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Int8Array>() {

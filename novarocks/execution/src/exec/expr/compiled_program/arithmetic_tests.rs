@@ -837,3 +837,6 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         },
     }
 }
+
+#[path = "float_arithmetic_required_frame_tests.rs"]
+mod float_required;

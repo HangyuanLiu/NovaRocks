@@ -26,6 +26,8 @@ use arrow_schema::DataType;
 mod decimal;
 #[path = "arithmetic_largeint.rs"]
 mod largeint;
+#[path = "arithmetic_float.rs"]
+mod float;
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, CompileControlError, CompilePhase,
     DecimalOverflowPolicy, ExpressionEffectContext, ExpressionEffects, FunctionValueType,
@@ -171,6 +173,7 @@ enum ArithmeticAlgorithm {
     },
     Decimal(decimal::DecimalArithmetic),
     LargeInt(largeint::LargeIntArithmetic),
+    Float(float::FloatArithmetic),
 }
 impl ArithmeticAlgorithm {
     fn validate(&self, array: &dyn Array, left: bool) -> Result<(), KernelFailure> {
@@ -198,6 +201,9 @@ impl ArithmeticAlgorithm {
                     recipe.validate_right(array)
                 }
             }
+            Self::Float(_) => unreachable!(
+                "floating arithmetic validates through its original CAST author"
+            ),
         }
     }
 }
@@ -238,6 +244,10 @@ impl PreparedArithmeticRecipe {
                 (SignedWidth::from_type(left), SignedWidth::from_type(right))
             {
                 ArithmeticAlgorithm::Signed { left, right }
+            } else if let Some(recipe) = float::FloatArithmetic::prepare(
+                operator, left, right, decimal_policy, allow_throw_exception, control,
+            )? {
+                ArithmeticAlgorithm::Float(recipe)
             } else if let Some(recipe) = decimal::DecimalArithmetic::prepare(
                 operator,
                 left,
@@ -317,6 +327,7 @@ impl PreparedArithmeticRecipe {
             },
             ArithmeticAlgorithm::Decimal(recipe) => recipe.own_effects(),
             ArithmeticAlgorithm::LargeInt(recipe) => recipe.own_effects(),
+            ArithmeticAlgorithm::Float(_) => ExpressionEffects::PURE_VALUE,
         };
         ScopedExpressionEffects::primitive(context, effects)
     }
@@ -338,6 +349,12 @@ impl PreparedArithmeticRecipe {
         right_logical_row: usize,
         control: &dyn KernelEvaluationControl,
     ) -> Result<ArithmeticRowResult, KernelFailure> {
+        if let ArithmeticAlgorithm::Float(recipe) = &self.algorithm {
+            return recipe.evaluate_row(
+                left, left_ordinal, left_logical_row,
+                right, right_ordinal, right_logical_row, control,
+            );
+        }
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
@@ -415,6 +432,9 @@ impl PreparedArithmeticRecipe {
                     left_ordinal,
                     &mut work,
                 )?,
+                ArithmeticAlgorithm::Float(_) => unreachable!(
+                    "floating arithmetic uses its original CAST scalar entry"
+                ),
             };
             Ok(output)
         })();

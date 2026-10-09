@@ -520,8 +520,6 @@ fn preparation_refuses_other_domains_and_wrong_result_or_nonnullable_output() {
     let signed = ty(DataType::Int64, false);
     for other in [
         ty(DataType::UInt64, false),
-        ty(DataType::Float32, false),
-        ty(DataType::Float64, false),
         ty(DataType::FixedSizeBinary(16), false),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
@@ -544,6 +542,8 @@ fn preparation_refuses_other_domains_and_wrong_result_or_nonnullable_output() {
         ));
     }
     for other in [
+        ty(DataType::Float32, false),
+        ty(DataType::Float64, false),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             false,

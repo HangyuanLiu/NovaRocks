@@ -132,7 +132,29 @@ fn frozen_reads(
                 derived_values,
             } = &node.kind
             {
-                assert!(residuals.is_empty() && derived_values.is_empty());
+                // Local residuals and derived values stay in the same original
+                // physical fragment. They are not provider recipe fields and
+                // this fixture must not clear them before package extraction.
+                for residual in residuals {
+                    let expression = fragment
+                        .expressions()
+                        .get(*residual)
+                        .expect("original scan residual definition exists");
+                    assert_eq!(expression.ty.data_type, DataType::Boolean);
+                }
+                for derived in derived_values {
+                    assert!(
+                        fragment.values().contains_key(derived),
+                        "original derived scan value exists"
+                    );
+                }
+                eprintln!(
+                    "actual frozen read source fragment={:?} scan={:?} residuals={:?} derived_values={:?}",
+                    fragment.id(),
+                    node.id,
+                    residuals,
+                    derived_values
+                );
                 // The source fixture's provider negotiates exact predicate
                 // coverage. Package extraction preserves those physical facts;
                 // this identity compile port does not execute provider rows.
