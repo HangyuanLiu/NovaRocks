@@ -78,7 +78,7 @@
   "protocol_phase_begins": "once before discovery; covers fullFetch1, replay, KILL, both ACKs, all context census and actor actual settle",
   "expected_fe_source": "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE actual original NativeTrust FrontendProcessId; default-off distinct root-observation feature",
   "config_policy": "freeze_original_prepared_before_role_spawn",
-  "evidence_scope": "positive delivery/reservation/metadata/segment holders on sole context-held root in closed original inventory, sealed lateACK frontier0; not lastalias, released root census, allocator physical dealloc or fullClosing64",
+  "evidence_scope": "positive Native full-copy delivery/reservation/metadata holders on sole context-held root in closed original inventory; original Worker segments exactly2 before seal and0 after seal, sealed lateACK frontier0; not lastalias, released root census, allocator physical dealloc or fullClosing64",
   "open": [
     "Native clean source/build/binary/neutral-feature/config admission before execution",
     "native scenario execution with independent live launch/birth and settled role evidence",
@@ -88,5 +88,7 @@
   "root_profile_id": 1,
   "root_output_kind": "ClientRows",
   "mysql_write_deadline_ms": 30000,
-  "closing_deadline_ms": 5000
+  "closing_deadline_ms": 5000,
+  "original_segments_before_seal": 2,
+  "original_segments_after_seal": 0
 }

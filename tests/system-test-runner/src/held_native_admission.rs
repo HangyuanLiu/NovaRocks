@@ -19,11 +19,11 @@
 //! No runtime role, Root authority or scene clock is created by this module.
 use super::*;
 use serde::Deserialize;
-const INPUT_PATH: &str = "docs/testing/mem-1-m07/inputs/held-late-ack-freeze-v2.json";
+const INPUT_PATH: &str = "docs/testing/mem-1-m07/inputs/held-late-ack-freeze-v3.json";
 const NEUTRAL_ARGUMENT: &str = "--mem-1-m07-root-observation-build-identity";
 const CASE: &str = "result-delivery/held-response-late-ack";
 const SQL: &str = "SELECT REPEAT('x', 1048576) AS payload FROM generate_series(1, 1)";
-const INPUT_SHA: &str = "fd8f6d0d12eb4fb69ab08626672351ac5a89df1eee8ef33eb2997883ae2ca94c";
+const INPUT_SHA: &str = "5c8975f987c9ece83cbae75c582e91535439d763557d0d5285060dacbb827812";
 const INSTALLED_SHA: &str = "60425f90a0f7f6da0f81f85702e967d093c1360dcbbfc162e5c4d301c41054d8";
 const RETENTION_SHA: &str = "3f8813c8c8205ba724ad8c3dc6eeecae4562681244e46d12910de360a1c45752";
 #[derive(Deserialize)]
@@ -220,6 +220,8 @@ fn input(bytes: &[u8]) -> Result<()> {
         ("root_profile_id", 1),
         ("segment_bytes", 1048576),
         ("window_positions", 2),
+        ("original_segments_before_seal", 2),
+        ("original_segments_after_seal", 0),
         ("native_row_bytes", 1048584),
         ("data1_bytes", 1048576),
         ("data2_bytes", 8),

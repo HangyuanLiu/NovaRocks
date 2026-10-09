@@ -37,7 +37,7 @@ fn roots(sealed: bool, holder: bool) -> [BTreeMap<String, u64>; 3] {
     row.insert("sealed".into(), u64::from(sealed));
     row.insert("data_positions".into(), if sealed { 0 } else { 2 });
     row.insert("payload_bytes".into(), if sealed { 0 } else { S + 8 });
-    row.insert("segments".into(), if holder { 1 } else { 2 });
+    row.insert("segments".into(), if sealed { 0 } else { 2 });
     if holder {
         for name in [
             "deliveries",
@@ -74,7 +74,6 @@ fn every_required_physical_holder_dimension_and_end_frontier_must_be_positive() 
         "retained_reservations",
         "metadata_holders",
         "metadata_bytes",
-        "segments",
     ] {
         let mut roots = roots(true, true);
         roots[1].insert(name.into(), 0);
@@ -83,6 +82,27 @@ fn every_required_physical_holder_dimension_and_end_frontier_must_be_positive() 
     let mut roots = roots(true, true);
     roots[1].insert("ends_acknowledged".into(), 1);
     assert!(!roots_match(&roots, 1, true, true).unwrap());
+}
+#[test]
+fn native_full_copy_holder_is_independent_of_original_segment_release() {
+    // The encoded unary DATA has an independent full-copy grant. Original
+    // Worker segments remain queued before seal and exit after seal; neither
+    // their presence nor their absence substitutes for the Native send owner.
+    for sealed in [false, true] {
+        let expected = if sealed { 0 } else { 2 };
+        assert!(roots_match(&roots(sealed, true), 1, sealed, true).unwrap());
+        for segments in [0, 1, 2, 3] {
+            let mut rows = roots(sealed, true);
+            rows[1].insert("segments".into(), segments);
+            assert_eq!(
+                roots_match(&rows, 1, sealed, true).unwrap(),
+                segments == expected
+            );
+        }
+        let mut rows = roots(sealed, true);
+        rows[1].insert("deliveries".into(), 0);
+        assert!(!roots_match(&rows, 1, sealed, true).unwrap());
+    }
 }
 #[test]
 fn foreign_root_wrong_backend_missing_or_extra_projection_field_refuse() {

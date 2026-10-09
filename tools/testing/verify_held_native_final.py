@@ -34,7 +34,7 @@ from dataclasses import dataclass
 import verify_exact_native_final as old
 
 CASE = "result-delivery/held-response-late-ack"
-INPUT_SHA = "fd8f6d0d12eb4fb69ab08626672351ac5a89df1eee8ef33eb2997883ae2ca94c"
+INPUT_SHA = "5c8975f987c9ece83cbae75c582e91535439d763557d0d5285060dacbb827812"
 LARGE_SHA = "d4bbd8c0cd3c3d647c6a0c948692db381360406584f25e3f6653fc91b73feff2"
 TINY_SHA = "a250875085fd54bc3c35e0c1e7a08173d2f36920bc7dc6ab83ba6dbf2745d127"
 ROW_SHA = "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8"
@@ -217,8 +217,9 @@ def _root_sample(sample,slot,sealed,holder):
     if any(any(n!=0 for n in root.values()) for i,root in enumerate(sample["roots"]) if i!=slot): return False
     root=sample["roots"][slot]
     common=root["channels"]==1 and root["terminal_task_records"]==1 and root["producers_running"]==0 and root["producers_exited"]==1 and root["ends_published"]==1 and root["ends_acknowledged"]==0 and root["sealed"]==int(sealed)
-    geometry=(root["data_positions"],root["payload_bytes"])==((0,0) if sealed else (2,1048584))
-    holds=all(root[k]>0 for k in ("deliveries","retained_reservations","metadata_holders","metadata_bytes","segments")) if holder else root["deliveries"]==root["retained_reservations"]==root["metadata_holders"]==0 and root["segments"]==2
+    # Native DATA retains a full encoded copy, independent of Worker segments.
+    geometry=(root["data_positions"],root["payload_bytes"],root["segments"])==((0,0,0) if sealed else (2,1048584,2))
+    holds=all(root[k]>0 for k in ("deliveries","retained_reservations","metadata_holders","metadata_bytes")) if holder else root["deliveries"]==root["retained_reservations"]==root["metadata_holders"]==0
     return common and geometry and holds
 
 def _wire_dto(row):

@@ -131,7 +131,7 @@ fn neutral_diagnostic_is_exact_one_line_and_full_actual_clean_revision() {
 #[test]
 fn immutable_input_rejects_unknown_duplicate_or_oracle_mutation_before_projection() {
     let bytes =
-        include_bytes!("../../../docs/testing/mem-1-m07/inputs/held-late-ack-freeze-v2.json");
+        include_bytes!("../../../docs/testing/mem-1-m07/inputs/held-late-ack-freeze-v3.json");
     assert!(input(bytes).is_ok());
     let text = std::str::from_utf8(bytes).unwrap();
     for changed in [

@@ -319,24 +319,26 @@ fn roots_match(
     if !common {
         return Ok(false);
     }
+    // The completed unary encode copies the body into its own backing. A held
+    // Native send keeps that copy's grant, delivery and metadata alive, while
+    // seal retires the two original Worker segments. These are separate facts.
     if sealed {
-        if root["data_positions"] != 0 || root["payload_bytes"] != 0 {
+        if root["data_positions"] != 0 || root["payload_bytes"] != 0 || root["segments"] != 0 {
             return Ok(false);
         }
-    } else if root["data_positions"] != 2 || root["payload_bytes"] != S + 8 {
+    } else if root["data_positions"] != 2 || root["payload_bytes"] != S + 8 || root["segments"] != 2
+    {
         return Ok(false);
     }
     if positive_holder {
         Ok(root["deliveries"] > 0
             && root["retained_reservations"] > 0
             && root["metadata_holders"] > 0
-            && root["metadata_bytes"] > 0
-            && root["segments"] > 0)
+            && root["metadata_bytes"] > 0)
     } else {
         Ok(root["deliveries"] == 0
             && root["retained_reservations"] == 0
-            && root["metadata_holders"] == 0
-            && root["segments"] == 2)
+            && root["metadata_holders"] == 0)
     }
 }
 fn same_target(

@@ -92,7 +92,7 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
         root=roots[1]
         root.update(channels=1,terminal_task_records=1,producers_exited=1,ends_published=1,
             sealed=int(sealed),data_positions=0 if sealed else 2,
-            payload_bytes=0 if sealed else 1048584,segments=1 if holder else 2)
+            payload_bytes=0 if sealed else 1048584,segments=0 if sealed else 2)
         if holder: root.update(deliveries=1,retained_reservations=1,metadata_holders=1,metadata_bytes=1)
         return dict(phase=label,roots=roots,tasks_created=[0,1,0],observed_from_original_prelaunch_us=us)
 
@@ -140,7 +140,7 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
         # Share the actual Rust test fixture; execution templates stay outside Git.
         repository=Path(old.__file__).resolve().parents[2]
         inputs=repository/"docs/testing/mem-1-m07/inputs"
-        held_input=(inputs/"held-late-ack-freeze-v2.json").read_bytes()
+        held_input=(inputs/"held-late-ack-freeze-v3.json").read_bytes()
         binding=json.loads((repository/"tests/system-test-runner/src/held_native_admission_test_binding.json").read_bytes())
         commit="a"*40
         provenance={key:"b"*64 for key in old.PROVENANCE_FIELDS}
@@ -268,6 +268,21 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
                 with self.subTest(key=key,value=value),self.assertRaises(old.VerificationFailure):held._samples_dto([sample])
         for count in (0,52):
             with self.assertRaises(old.VerificationFailure): held._samples_dto([self.sample("W2",1000)]*count)
+
+    def test_native_copy_holder_and_original_segments_have_distinct_phase_contracts(self):
+        self.verify_component(self.receipt()[2])
+        for label,sealed in (("held_open",False),("sealed_held",True),("ACK1_first",True),("ACK1_repeat",True)):
+            expected=0 if sealed else 2
+            for segments in (0,1,2,3):
+                sample=self.sample(label,1000,sealed,True)
+                sample["roots"][1]["segments"]=segments
+                self.assertEqual(held._root_sample(sample,1,sealed,True),segments==expected)
+            for field in ("deliveries","retained_reservations","metadata_holders","metadata_bytes"):
+                _,_,receipt=self.receipt()
+                sample=next(s for s in receipt["root_samples"] if s["phase"]==label)
+                sample["roots"][1][field]=0
+                with self.subTest(phase=label,field=field),self.assertRaises(old.VerificationFailure):
+                    self.verify_component(receipt)
 
     def test_wire_numeric_hash_timestamp_and_schema_fields_strict(self):
         for health in (False,True):
