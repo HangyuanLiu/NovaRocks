@@ -833,3 +833,7 @@ mod tests {
         assert_eq!(prepared_binary_hll_parts(vec![values], false).0, 5);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_ds_hll_aggregate_baseline_tests.rs"]
+mod legacy_ds_hll_aggregate_baseline_tests;

@@ -1798,6 +1798,10 @@ mod exact_percentile_tests;
 mod ndv_invocation_data_tests;
 
 #[cfg(test)]
+#[path = "pure_differential_ds_hll_family_tests.rs"]
+mod ds_hll_family_tests;
+
+#[cfg(test)]
 #[path = "pure_differential_exact_percentile_rate_tests.rs"]
 mod exact_percentile_rate_tests;
 

@@ -114,3 +114,7 @@ pub fn eval_ds_hll_count_distinct_state(
 
     Ok(Arc::new(builder.finish()))
 }
+
+#[cfg(test)]
+#[path = "legacy_ds_hll_scalar_baseline_tests.rs"]
+mod legacy_ds_hll_scalar_baseline_tests;
