@@ -2447,6 +2447,15 @@ mod tests {
         root.business.release();
         drop(window);
         drop(job);
+        // The callback's start precedes its original blocking join. Establish
+        // the actual unclaimed failure before testing Host payload retirement,
+        // so another shutdown phase cannot consume this fixture's deadline.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            host.connector_blocking_io_supervisor().wait_failure(),
+        )
+        .await
+        .expect("original panic join published its unclaimed failure");
         // A real external releaser makes the former synchronous-Drop path a
         // bounded failing test instead of leaving the original barrier held.
         let (disarm_watchdog, watch) = std::sync::mpsc::channel();
