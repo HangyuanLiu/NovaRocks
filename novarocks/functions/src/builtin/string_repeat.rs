@@ -60,6 +60,68 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
 // semantic per-row successful-NULL cap, not a resource budget or default.
 const MAX_ROW_BYTES: usize = 1_048_576;
 
+/// Original static failures are shared without constructing CPU diagnostics during admission.
+#[derive(Clone, Copy)]
+pub(super) enum StaticProfileFailure {
+    Count,
+    Value,
+    Source,
+    Result,
+}
+impl StaticProfileFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Count => "repeat/space requires its exact checked argument count",
+            Self::Value => "repeat/space requires value arguments",
+            Self::Source => "repeat/space differs from its exact installed argument profile",
+            Self::Result => "repeat/space differs from its exact installed result profile",
+        }
+    }
+}
+pub(super) fn check_count(
+    op: StringRepeatOp,
+    types: usize,
+    arguments: usize,
+) -> Result<usize, StaticProfileFailure> {
+    let arity = match op {
+        StringRepeatOp::Repeat => 2,
+        StringRepeatOp::Space => 1,
+    };
+    if types != arity || types != arguments {
+        return Err(StaticProfileFailure::Count);
+    }
+    Ok(arity)
+}
+pub(super) fn check_argument(
+    op: StringRepeatOp,
+    index: usize,
+    ty: &FunctionArgumentType,
+) -> Result<(), StaticProfileFailure> {
+    let FunctionArgumentType::Value(ty) = ty else {
+        return Err(StaticProfileFailure::Value);
+    };
+    if ty.logical_type != ValueLogicalType::Physical
+        || ty.data_type
+            != if op == StringRepeatOp::Repeat && index == 0 {
+                DataType::Utf8
+            } else {
+                DataType::Int64
+            }
+    {
+        return Err(StaticProfileFailure::Source);
+    }
+    Ok(())
+}
+pub(super) fn check_result(target: &crate::FunctionValueType) -> Result<(), StaticProfileFailure> {
+    if target.logical_type != ValueLogicalType::Physical
+        || target.data_type != DataType::Utf8
+        || !target.nullable
+    {
+        return Err(StaticProfileFailure::Result);
+    }
+    Ok(())
+}
+
 pub(super) fn evaluate_string_repeat<'a>(
     op: StringRepeatOp,
     input: ScalarCallInput<'_, 'a>,
@@ -70,42 +132,14 @@ pub(super) fn evaluate_string_repeat<'a>(
     let result = (|| {
         let types = input.contract().selected().argument_types.as_ref();
         let arguments = input.arguments();
-        let arity = match op {
-            StringRepeatOp::Repeat => 2,
-            StringRepeatOp::Space => 1,
-        };
-        if types.len() != arity || types.len() != arguments.len() {
-            return Err(invalid(
-                "repeat/space requires its exact checked argument count",
-            ));
-        }
+        let arity = check_count(op, types.len(), arguments.len())
+            .map_err(|error| invalid(error.message()))?;
         for (index, ty) in types.iter().enumerate() {
-            let FunctionArgumentType::Value(ty) = ty else {
-                return Err(invalid("repeat/space requires value arguments"));
-            };
-            if ty.logical_type != ValueLogicalType::Physical
-                || ty.data_type
-                    != if op == StringRepeatOp::Repeat && index == 0 {
-                        DataType::Utf8
-                    } else {
-                        DataType::Int64
-                    }
-            {
-                return Err(invalid(
-                    "repeat/space differs from its exact installed argument profile",
-                ));
-            }
+            check_argument(op, index, ty).map_err(|error| invalid(error.message()))?;
             work.step()?;
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
-        {
-            return Err(invalid(
-                "repeat/space differs from its exact installed result profile",
-            ));
-        }
+        check_result(target).map_err(|error| invalid(error.message()))?;
         let strings = if op == StringRepeatOp::Repeat {
             Some(
                 arguments[0]

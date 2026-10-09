@@ -1640,3 +1640,12 @@ mod e08s1_append_original_static_tests;
 
 #[cfg(test)]
 mod e08s1_append_static_tests;
+
+#[cfg(test)]
+mod e08s1_string_batch_original_tests;
+
+#[cfg(test)]
+mod e08s1_string_batch_static_tests;
+
+#[cfg(test)]
+mod e08s1_string_batch_differential_tests;

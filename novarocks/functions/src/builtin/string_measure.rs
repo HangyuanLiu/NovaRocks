@@ -118,21 +118,37 @@ fn length_int32(values: Vec<Option<i64>>) -> Result<ArrayRef, MeasureFailure> {
     }
     Ok(Arc::new(Int32Array::from(out)))
 }
-pub(super) fn evaluate_string_measure<'a>(
-    op: StringMeasureOp,
-    input: ScalarCallInput<'_, 'a>,
-    control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
-    control.checkpoint(0)?;
-    let ([FunctionArgumentType::Value(source)], [argument]) = (
-        input.contract().selected().argument_types.as_ref(),
-        input.arguments(),
-    ) else {
-        return Err(invalid(
-            "string measurement requires exactly one checked value argument",
-        ));
+/// Original static failures are shared without constructing CPU diagnostics during admission.
+#[derive(Clone, Copy)]
+pub(super) enum StaticProfileFailure {
+    Argument,
+    Type,
+}
+impl StaticProfileFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Argument => "string measurement requires exactly one checked value argument",
+            Self::Type => "string measurement differs from its exact installed profile",
+        }
+    }
+}
+pub(super) fn check_source(
+    types: &[FunctionArgumentType],
+    arguments: usize,
+) -> Result<&crate::FunctionValueType, StaticProfileFailure> {
+    if arguments != 1 {
+        return Err(StaticProfileFailure::Argument);
+    }
+    let [FunctionArgumentType::Value(source)] = types else {
+        return Err(StaticProfileFailure::Argument);
     };
-    let target = input.contract().result_type();
+    Ok(source)
+}
+pub(super) fn check_types(
+    op: StringMeasureOp,
+    source: &crate::FunctionValueType,
+    target: &crate::FunctionValueType,
+) -> Result<(), StaticProfileFailure> {
     let nullable = if op == StringMeasureOp::Ascii {
         true
     } else {
@@ -144,10 +160,25 @@ pub(super) fn evaluate_string_measure<'a>(
         || target.data_type != DataType::Int32
         || target.nullable != nullable
     {
-        return Err(invalid(
-            "string measurement differs from its exact installed profile",
-        ));
+        return Err(StaticProfileFailure::Type);
     }
+    Ok(())
+}
+
+pub(super) fn evaluate_string_measure<'a>(
+    op: StringMeasureOp,
+    input: ScalarCallInput<'_, 'a>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    control.checkpoint(0)?;
+    let source = check_source(
+        input.contract().selected().argument_types.as_ref(),
+        input.arguments().len(),
+    )
+    .map_err(|error| invalid(error.message()))?;
+    let argument = &input.arguments()[0];
+    let target = input.contract().result_type();
+    check_types(op, source, target).map_err(|error| invalid(error.message()))?;
     if argument.array().data_type() != &DataType::Utf8 {
         return Err(internal(
             "string measurement carrier differs from its checked argument",

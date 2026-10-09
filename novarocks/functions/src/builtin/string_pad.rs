@@ -153,6 +153,60 @@ fn write_plan(
     Ok(())
 }
 
+/// Original static failures are shared without constructing CPU diagnostics during admission.
+#[derive(Clone, Copy)]
+pub(super) enum StaticProfileFailure {
+    Count,
+    Value,
+    Source,
+    Result,
+}
+impl StaticProfileFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Count => "lpad/rpad requires its exact three checked arguments",
+            Self::Value => "lpad/rpad requires value arguments",
+            Self::Source => "lpad/rpad differs from its exact installed argument profile",
+            Self::Result => "lpad/rpad differs from its exact installed result profile",
+        }
+    }
+}
+pub(super) fn check_count(types: usize, arguments: usize) -> Result<(), StaticProfileFailure> {
+    let arity = 3;
+    if types != arity || types != arguments {
+        return Err(StaticProfileFailure::Count);
+    }
+    Ok(())
+}
+pub(super) fn check_argument(
+    index: usize,
+    ty: &FunctionArgumentType,
+) -> Result<(), StaticProfileFailure> {
+    let FunctionArgumentType::Value(ty) = ty else {
+        return Err(StaticProfileFailure::Value);
+    };
+    if ty.logical_type != ValueLogicalType::Physical
+        || ty.data_type
+            != if index != 1 {
+                DataType::Utf8
+            } else {
+                DataType::Int64
+            }
+    {
+        return Err(StaticProfileFailure::Source);
+    }
+    Ok(())
+}
+pub(super) fn check_result(target: &crate::FunctionValueType) -> Result<(), StaticProfileFailure> {
+    if target.logical_type != ValueLogicalType::Physical
+        || target.data_type != DataType::Utf8
+        || !target.nullable
+    {
+        return Err(StaticProfileFailure::Result);
+    }
+    Ok(())
+}
+
 pub(super) fn evaluate_string_pad<'a>(
     op: StringPadOp,
     input: ScalarCallInput<'_, 'a>,
@@ -163,38 +217,13 @@ pub(super) fn evaluate_string_pad<'a>(
     let result = (|| {
         let types = input.contract().selected().argument_types.as_ref();
         let arguments = input.arguments();
-        if types.len() != 3 || types.len() != arguments.len() {
-            return Err(invalid(
-                "lpad/rpad requires its exact three checked arguments",
-            ));
-        }
+        check_count(types.len(), arguments.len()).map_err(|error| invalid(error.message()))?;
         for (index, ty) in types.iter().enumerate() {
-            let FunctionArgumentType::Value(ty) = ty else {
-                return Err(invalid("lpad/rpad requires value arguments"));
-            };
-            if ty.logical_type != ValueLogicalType::Physical
-                || ty.data_type
-                    != if index != 1 {
-                        DataType::Utf8
-                    } else {
-                        DataType::Int64
-                    }
-            {
-                return Err(invalid(
-                    "lpad/rpad differs from its exact installed argument profile",
-                ));
-            }
+            check_argument(index, ty).map_err(|error| invalid(error.message()))?;
             work.step()?;
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
-        {
-            return Err(invalid(
-                "lpad/rpad differs from its exact installed result profile",
-            ));
-        }
+        check_result(target).map_err(|error| invalid(error.message()))?;
         let strings = arguments[0]
             .array()
             .as_any()

@@ -181,6 +181,36 @@ impl PureFunctionMetadataOwner for StringMeasureOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_selected_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        self.declaration.effect_declaration(&selected.overload)?;
+        let unavailable =
+            || FunctionBindingError::UnavailableImplementation(selected.overload.clone());
+        let result = (|| {
+            let source = super::string_measure::check_source(
+                &selected.argument_types,
+                logical_argument_count,
+            )
+            .map_err(|_| unavailable())?;
+            work.step()?;
+            let crate::FunctionResultType::Scalar(target) = &selected.result_type else {
+                return Err(unavailable());
+            };
+            super::string_measure::check_types(self.operation, source, target)
+                .map_err(|_| unavailable())?;
+            Ok(())
+        })();
+        if matches!(&result, Err(FunctionBindingError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
 }
 
 impl FunctionEffectOwner for StringMeasureOwner {

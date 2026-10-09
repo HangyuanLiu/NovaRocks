@@ -179,6 +179,40 @@ impl PureFunctionMetadataOwner for StringRepeatOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_selected_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        self.declaration.effect_declaration(&selected.overload)?;
+        let unavailable =
+            || FunctionBindingError::UnavailableImplementation(selected.overload.clone());
+        let result = (|| {
+            super::string_repeat::check_count(
+                self.operation,
+                selected.argument_types.len(),
+                logical_argument_count,
+            )
+            .map_err(|_| unavailable())?;
+            for (index, ty) in selected.argument_types.iter().enumerate() {
+                super::string_repeat::check_argument(self.operation, index, ty)
+                    .map_err(|_| unavailable())?;
+                work.step()?;
+            }
+            let crate::FunctionResultType::Scalar(target) = &selected.result_type else {
+                return Err(unavailable());
+            };
+            super::string_repeat::check_result(target).map_err(|_| unavailable())?;
+            Ok(())
+        })();
+        if matches!(&result, Err(FunctionBindingError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
 }
 
 impl FunctionEffectOwner for StringRepeatOwner {
