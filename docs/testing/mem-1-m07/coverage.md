@@ -267,3 +267,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - 私有stock REST/MinIO owner启动成功；实际canonical镜像digest及运行容器image均严格匹配。helper在任何HTTP前拒绝owner image alias假设：render_isolated_stack先存alias，isolated_start:423之后将image_id替换为Docker实际digest，tag保持alias。不是服务Unsupported或views失败。
 - 原helper/freeze/bound input/launcher与失败hash保留；exact project全部containers消失/private MinIO volume消失、canonical cleanup0，共享fixture未改。收据p09-real-rest-cl-preflight-v1-refusal-20261009.json。v2只修正test producer actualimage字段，全部32/512/512/数值期限不变；10纯本地parser测试PASS，真实preflight待重跑。未发布bulk READY/未运行native CL；其它门和两个裁决仍OPEN。
+
+
+### 2026-10-09：真实REST private capability preflight PASS
+
+- 干净d28682f9ca81b17d0368c0d6db5d5295d204ea43，无FE/native启动，实际task-private stock REST/MinIO实例；image/container digest精确匹配canonical f7d679d...。14实际HTTP完成fresh namespace、真table/view create、独立metadata load、pageSize1 exactlist、DELETE200+emptybody、最后namespace恢复empty；PREFLIGHT_PASS真实落盘。3.095s含启动；cleanup0，exact project全部container/private MinIO volume消失，共享fixture未改。
+- 收据p09-real-rest-cl-preflight-v2-pass-20261009.json保留source/helper/freeze/actualowner/sourceimage、实际provider ledger与全部raw hashes。标准metadata位置按server warehouse事实，client warehouse独立保存；不假造metadata/空views。不发布bulk READY，不声称native CL、并发peak或真实跨provider完成。下一原32×512table+512view真实外部producer及透明observer接入尚待，其他门及两个裁决仍OPEN，无push/PR/归档。

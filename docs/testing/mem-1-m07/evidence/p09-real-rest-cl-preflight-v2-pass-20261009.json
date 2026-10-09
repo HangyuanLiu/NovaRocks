@@ -1,0 +1,136 @@
+{
+  "source_revision": "d28682f9ca81b17d0368c0d6db5d5295d204ea43",
+  "source_dirty": false,
+  "phase": "private-real-rest-preflight",
+  "run_id": "isolated-rest-m07-real-cl-0bed175915eb",
+  "compose_project": "nr-isolated-rest-m07-real-cl-0bed175915eb",
+  "workspace": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/isolated-rest-m07-real-cl-0bed175915eb",
+  "launcher_sha256": "1c68a860104a9c2f78b5517a5c4601a8f863449ab13cadff114984801ff23ef7",
+  "helper_sha256": "bdbca40c11049aafc6c7b860a0058828da1ba84e64abf18a8b29931eb91f1fe1",
+  "freeze_template_sha256": "6c4dc0f9fb4e7367f4bbc85c47a9e82d96d14e91585d80e6f0c1a1b9fccbd9e8",
+  "outcome": "real-private-rest-capability-preflight-passed",
+  "scope": "14 actual stock REST HTTP requests; true table/view creation, independent metadata loads, pageSize1 exact list results, DELETE200 empty-body and fresh namespaces before/after. Exact actual image/container/private owner observed and canonical cleanup0. External capability preflight only; no bulk input READY, native CL, provider peak or cross-provider acceptance.",
+  "startup_exit_code": 0,
+  "actual_rest_image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+  "actual_rest_container": "1c41ff488d23",
+  "bound_freeze_sha256": "2e8294d0643f86156753fe551c11ef27c4d763cacf06f0dbaf3cdf2e6b585ecf",
+  "private_manifest_sha256": "2edc9cdaaea33fc7c1dad888669fa0d192112ed1a7b292e2ea78183605a738ef",
+  "private_entry_id": "isolated-rest-m07-real-c-4d99a214",
+  "preflight_exit_code": 0,
+  "duration_seconds": 3.095,
+  "cleanup_exit_code": 0,
+  "remaining_exact_project_containers": [],
+  "exact_private_volume_gone": true,
+  "task": "MEM-1-M07",
+  "provider_receipt": {
+    "acceptance_scope": "external preparation only; no native/provider CL acceptance",
+    "binding": {
+      "compose_project": "nr-isolated-rest-m07-real-cl-0bed175915eb",
+      "fixture_id": "isolated-rest-m07-real-c-4d99a214",
+      "owner_manifest_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-m07-real-c-4d99a214/manifest.json",
+      "owner_manifest_sha256": "2edc9cdaaea33fc7c1dad888669fa0d192112ed1a7b292e2ea78183605a738ef",
+      "owner_mode": "task-private",
+      "rest_image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "rest_uri": "http://127.0.0.1:21077",
+      "server_default_warehouse": "s3://warehouse/isolated-rest-m07-real-c-4d99a214/rest",
+      "warehouse": "s3://warehouse/isolated-rest-m07-real-c-4d99a214/rest"
+    },
+    "bounds": {
+      "bulk_deadline_seconds": 7200,
+      "max_request_bytes": 65536,
+      "max_response_bytes": 16777216,
+      "page_size": 256,
+      "preflight_deadline_seconds": 300,
+      "request_timeout_seconds": 30
+    },
+    "details": {
+      "actual_tables_loaded": 1,
+      "actual_views_loaded": 1,
+      "capabilities": {
+        "capability_proof": "actual preflight create/load/page/delete required",
+        "endpoints_present": true,
+        "endpoints_sha256": "64be1ec1700ac42aff634942f7fc5126da92f1724eed2d35f38007b1f3d4de78"
+      },
+      "deleted_namespace": "cl_preflight",
+      "fresh_namespaces_before_and_after": true,
+      "page_size": 1
+    },
+    "elapsed_seconds": 0.445874,
+    "freeze_sha256": "2e8294d0643f86156753fe551c11ef27c4d763cacf06f0dbaf3cdf2e6b585ecf",
+    "http_audit_sha256": "ccbe53e8dd0dfaf6cb45e4178926e72cc4e03819d37ff827e4f197b96f493d6a",
+    "http_requests": 14,
+    "http_response_bytes": 5160,
+    "listing_pages": 5,
+    "metadata_oracle_sha256": "2850f6ba0f06a5220ff7c604e0f5888f4871bb3cd3435745e272b2680f5e68d8",
+    "mutations_attempted": 6,
+    "original_input": {
+      "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docs/testing/mem-1-m07/inputs/cl-listing-freeze-v3.json",
+      "sha256": "e279724dc4ab2ce34dfdef5f3a939ad3f0f05ed076c36c5c60a7b7d7c6c1a3d3"
+    },
+    "phase": "preflight",
+    "producer_sha256": "bdbca40c11049aafc6c7b860a0058828da1ba84e64abf18a8b29931eb91f1fe1",
+    "schema_version": 1,
+    "source": {
+      "canonical_lock_sha256": "9f720cb5dfb932edbef57e34a08f9cbcb717664b70917790283660be482c9181",
+      "iceberg_build_version": "1.11.0-SNAPSHOT",
+      "iceberg_commit": "ccb8bc435062171e64bc8b7e5f56e6aed9c5b934",
+      "iceberg_tag": "apache-iceberg-1.10.1",
+      "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
+      "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "image_source": "apache/iceberg-rest-fixture",
+      "jar_bytes": 211889894,
+      "jar_sha256": "49d01ec8e0995001a92b4c880adfe184d602541ba39d135f105511101da4db7d",
+      "platform": "linux/arm64"
+    },
+    "state": "PREFLIGHT_PASS",
+    "task": "MEM-1-M07"
+  },
+  "raw_files": [
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/cleanup.log",
+      "sha256": "fa8270fffbdbcb3500ab68e38e7ceadd94ace0abcc05a489ec2f43577fa81603"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/launch-input.json",
+      "sha256": "069eab669fc45be280d4b837a0886a63cd9474804e046b6ad0c98a8915a7a2cf"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/preflight/PREFLIGHT_PASS.json",
+      "sha256": "7a6425f97ac5ddc3fa4fd249ef754f954201b01c226c331da9f516b412ea7560"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/preflight/http-audit.jsonl",
+      "sha256": "ccbe53e8dd0dfaf6cb45e4178926e72cc4e03819d37ff827e4f197b96f493d6a"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/preflight/metadata-oracle.jsonl",
+      "sha256": "2850f6ba0f06a5220ff7c604e0f5888f4871bb3cd3435745e272b2680f5e68d8"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/preflight-driver.log",
+      "sha256": "aaf5f40bd09b0714427d8f23ffa093c9652ecdfb6b0eaa6df0eae91a965fc3cf"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/preflight-status.json",
+      "sha256": "4bae659b8204d3cd500b4b667238fc3bab1dc603fc0d99f8d9d5378b1d3c94aa"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/producer-freeze-bound.json",
+      "sha256": "2e8294d0643f86156753fe551c11ef27c4d763cacf06f0dbaf3cdf2e6b585ecf"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v2-20261009/startup.log",
+      "sha256": "f00a520b3a86b556fb3e03f5ebe6350adb47df1f00b45aa9f61c494e310a2edc"
+    }
+  ],
+  "source_scripts": [
+    {
+      "path": "logs/mem-1-m07/real_rest_cl_producer_v2.py",
+      "sha256": "bdbca40c11049aafc6c7b860a0058828da1ba84e64abf18a8b29931eb91f1fe1"
+    },
+    {
+      "path": "logs/mem-1-m07/run_real_rest_cl_preflight_v2.py",
+      "sha256": "1c68a860104a9c2f78b5517a5c4601a8f863449ab13cadff114984801ff23ef7"
+    }
+  ]
+}
