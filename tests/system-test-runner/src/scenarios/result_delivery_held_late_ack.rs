@@ -185,6 +185,12 @@ struct Facts {
     samples: Vec<Value>, // admission on every push: at most the original 51 positions
     actor: Option<HeldObservation>,
     root: Option<Value>,
+    target_source: Option<Value>,
+    closed_acks: Vec<Value>, // checked before each push: at most two
+    original_prelaunch: Option<Instant>,
+    mysql_terminal_code: Option<u16>,
+    health_before_tasks_created: Option<[u64; 3]>,
+    health_after_tasks_created: Option<[u64; 3]>,
     protocol_complete: bool,
     actor_actual_join: bool,
     mysql_actual_join: bool,
@@ -334,9 +340,17 @@ fn sample(
         "original sample positions exhausted"
     );
     let value = runtime.block_on(census(context, deadline))?;
-    facts
-        .samples
-        .push(json!({"phase":label,"roots":value.roots,"tasks_created":value.created}));
+    let observed_us = Instant::now()
+        .saturating_duration_since(
+            facts
+                .original_prelaunch
+                .context("original census clock origin absent")?,
+        )
+        .as_micros();
+    facts.samples.push(
+        json!({"phase":label,"roots":value.roots,"tasks_created":value.created,
+        "observed_from_original_prelaunch_us":observed_us}),
+    );
     check(deadline)?;
     Ok(value)
 }
@@ -405,7 +419,10 @@ fn run_owned(
     let mut stream: Option<AsyncMysqlStream> = None;
     let mut cid: Option<u32> = None;
     let mut protocol_deadline = None;
-    let mut facts = Facts::default();
+    let mut facts = Facts {
+        original_prelaunch: Some(deadline - WHOLE),
+        ..Facts::default()
+    };
     let mut errors: [Option<anyhow::Error>; 8] = std::array::from_fn(|_| None);
     let mut expected_server_error: Option<anyhow::Error> = None;
     let mut expected_driver_exit: Option<tokio::task::JoinError> = None;
@@ -478,6 +495,7 @@ fn run_owned(
         );
         let target = observer.observe_until(context, phase)?;
         facts.root = Some(identity(target.root));
+        facts.target_source = Some(observer.source_evidence(&target)?);
         // Same closed whole-cluster inventory and two genuine retained Data positions.
         qualify(
             context, runtime, &mut facts, &observer, &target, phase, false, false, "W2",
@@ -566,6 +584,18 @@ fn run_owned(
                 phase,
             )?;
             actor.as_ref().unwrap().require_closed_ack(&ack, &reply)?;
+            ensure!(
+                facts.closed_acks.len() < 2,
+                "closed ACK observation positions exhausted"
+            );
+            facts
+                .closed_acks
+                .push(json!({"label":label,"root":identity(reply.root_task),
+                "profile":reply.profile.get(),"kind":"ClientRows", // actual typed proof checked above
+                "wanted":ack.wanted().map(|n| n.get()),"consumed":ack.consumed(),
+                "accepted_consumed":reply.accepted_consumed,"outcome":"AwaitTerminalControl",
+                "observed_from_original_prelaunch_us":Instant::now()
+                    .saturating_duration_since(deadline-WHOLE).as_micros()}));
             qualify(
                 context, runtime, &mut facts, &observer, &target, phase, true, true, label,
             )?;
@@ -620,6 +650,7 @@ fn run_owned(
         match runtime.block_on(handle) {
             Ok((client, mut value)) => {
                 facts.mysql_actual_join = true;
+                facts.mysql_terminal_code = value.server_result_error_code;
                 if let Err(error) = validate_mysql(&value, false) {
                     retain_secondary(&mut errors[3], error);
                 }
@@ -640,6 +671,7 @@ fn run_owned(
     if errors.iter().all(Option::is_none) {
         let recovery = (|| -> Result<()> {
             let before = runtime.block_on(census(context, deadline))?.created;
+            facts.health_before_tasks_created = Some(before);
             let client = stream
                 .as_mut()
                 .context("original client disappeared before health")?;
@@ -656,6 +688,7 @@ fn run_owned(
             }
             validation?;
             let after = runtime.block_on(census(context, deadline))?.created;
+            facts.health_after_tasks_created = Some(after);
             ensure!(
                 after
                     .iter()
@@ -683,6 +716,10 @@ fn run_owned(
             "server_binary_sha256":admitted.server_binary_sha256,"runner_binary_sha256":admitted.runner_binary_sha256,
             "base_config_sha256":admitted.base_config_sha256,"execution_binding_sha256":admitted.frozen_execution_binding_sha256},
         "original_roles":context.process_launch_identities(),"selected_root":facts.root,
+        "independent_target_source":facts.target_source,"closed_acks":facts.closed_acks,
+        "mysql_terminal_code":facts.mysql_terminal_code,
+        "health_before_tasks_created":facts.health_before_tasks_created,
+        "health_after_tasks_created":facts.health_after_tasks_created,
         "protocol_complete":facts.protocol_complete,"actor":facts.actor,
         "actor_actual_join":facts.actor_actual_join,"mysql_actual_join":facts.mysql_actual_join,
         "kill_attempted":facts.kill_attempted,"kill_returned":facts.kill_returned,

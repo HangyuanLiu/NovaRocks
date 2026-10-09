@@ -9,7 +9,8 @@ use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHa
 use std::fs;
 
 pub fn run(cli: Cli) -> Result<()> {
-    let exact = cli.exact_mysql_execution_binding.is_some();
+    let exact =
+        cli.exact_mysql_execution_binding.is_some() || cli.held_native_execution_binding.is_some();
     let result = run_dispatch(cli);
     if exact {
         finish_exact_mysql_scenario(result.err(), Ok(()), Ok(()))
@@ -33,6 +34,42 @@ fn run_dispatch(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let config = RunnerConfig::from_cli(&cli)?;
+    if let Some(binding) = &config.held_native_execution_binding {
+        #[cfg(unix)]
+        {
+            use crate::exact_native_admission::held_native_admission;
+            anyhow::ensure!(
+                config.cluster_size == 3
+                    && config.launch_profile
+                        == novarocks_cluster_harness::LaunchProfile::FaultScenario,
+                "held native admission requires fault-scenario 1FE+3BE"
+            );
+            let admitted =
+                held_native_admission::admit(binding, &config.binary, &config.base_config_path)?;
+            let scene = scenarios::exact_mysql_native_driver::held_late_ack_from_admitted(
+                admitted.for_scene(),
+            )?;
+            anyhow::ensure!(
+                cli.only.is_empty() || (cli.only.len() == 1 && cli.only[0] == scene.name()),
+                "held native selector differs from admitted case"
+            );
+            let primary = run_one(scene.as_ref(), &config);
+            // Re-admission is preparation only, never a renewed scene20/protocol5.
+            // All role cleanup has already settled through original run_one ownership.
+            let postrun =
+                held_native_admission::admit(binding, &config.binary, &config.base_config_path)
+                    .and_then(|after| {
+                        anyhow::ensure!(
+                            after == admitted,
+                            "held admission changed during original scene"
+                        );
+                        Ok(())
+                    });
+            return finish_exact_mysql_scenario(primary.err(), postrun, Ok(()));
+        }
+        #[cfg(not(unix))]
+        bail!("held native admission requires Unix original role ownership");
+    }
     if let Some(binding) = &config.exact_mysql_execution_binding {
         #[cfg(unix)]
         {
@@ -826,6 +863,7 @@ mod exact_mysql_prelaunch_teardown_tests {
             launch_profile: LaunchProfile::FaultScenario,
             uea1_workload_manifest: None,
             exact_mysql_execution_binding: None,
+            held_native_execution_binding: None,
         };
         let mut observations = Vec::new();
         for (profile, count, frontend, backends) in [
@@ -981,6 +1019,7 @@ mod neutral_root_prelaunch_tests {
             launch_profile: LaunchProfile::FaultScenario,
             uea1_workload_manifest: None,
             exact_mysql_execution_binding: None,
+            held_native_execution_binding: None,
         }
     }
     fn assert_source(error: &anyhow::Error, expected: &Arc<u8>) {

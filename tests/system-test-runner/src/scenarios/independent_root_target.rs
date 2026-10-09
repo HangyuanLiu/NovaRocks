@@ -70,6 +70,7 @@ pub(crate) struct IndependentRootTarget {
     pub marker_counts: [usize; BACKENDS],
     pub baseline_sha256: [[u8; 32]; BACKENDS],
     pub after_sha256: [[u8; 32]; BACKENDS],
+    pub after_log_bytes: [u64; BACKENDS],
 }
 
 fn before_deadline(deadline: Instant) -> Result<()> {
@@ -123,6 +124,55 @@ impl IndependentRootObserver {
             original_roles,
             before: snapshots.map(|snapshot| snapshot.anchor),
         })
+    }
+    /// Scalar source observations only; no reply/body/guard or Root authority.
+    /// The caller must use the freshly observed target, never reconstruct it from census.
+    pub(crate) fn source_evidence(
+        &self,
+        target: &IndependentRootTarget,
+    ) -> Result<serde_json::Value> {
+        ensure!(
+            target.root_backend_index < BACKENDS
+                && target.frontend == self.expected_frontend
+                && target.backend_process_from_descriptor
+                    == self.actual_backends[target.root_backend_index]
+                && target.root.backend_process_id() == target.backend_process_from_descriptor
+                && target.fresh_tasks.len() <= BACKENDS * MARKERS
+                && target.marker_counts.iter().all(|n| *n <= MARKERS)
+                && target.baseline_sha256 == self.before.map(|a| a.sha256)
+                && target.after_log_bytes.iter().all(|n| *n <= LOG_BYTES),
+            "target source evidence differs from original bounded observer"
+        );
+        let identity = |task: TaskIdentity| {
+            let e = task.query_execution_id();
+            serde_json::json!({"query_hi":e.query_id().high(),"query_lo":e.query_id().low(),
+                "attempt":e.attempt_id().get(),"stage":task.stage_id().get(),"task":task.task_id().get(),
+                "backend":task.backend_process_id().to_string()})
+        };
+        let contexts = target.contexts.map(|ctx| {
+            ctx.map(|ctx| {
+                let e = ctx.query_execution_id();
+                serde_json::json!({"query_hi":e.query_id().high(),"query_lo":e.query_id().low(),
+                "attempt":e.attempt_id().get(),"frontend":ctx.frontend_process_id().to_string(),
+                "backend":ctx.backend_process_id().to_string()})
+            })
+        });
+        let tasks:Vec<_>=target.fresh_tasks.iter().map(|(backend,task)|
+            serde_json::json!({"backend_index":backend,"identity":identity(*task)})).collect();
+        Ok(
+            serde_json::json!({"schema_version":1,"source":match self.source {
+            FrontendIdentitySource::ExactMysqlFixture=>"ExactMysqlFixture",
+            FrontendIdentitySource::RootObservation=>"RootObservation"},
+            "frontend":target.frontend.to_string(),"root":identity(target.root),
+            "root_backend_index":target.root_backend_index,
+            "backend_process_from_descriptor":target.backend_process_from_descriptor.to_string(),
+            "actual_backend_descriptors":self.actual_backends.map(|id| id.to_string()),
+            "original_roles":self.original_roles,"contexts":contexts,"fresh_tasks":tasks,
+            "marker_counts":target.marker_counts,
+            "baseline_log_bytes":self.before.map(|a| a.bytes),
+            "baseline_sha256":target.baseline_sha256,"after_log_bytes":target.after_log_bytes,
+            "after_sha256":target.after_sha256}),
+        )
     }
     /// Call once the original gate is actually held, before cancellation/health SQL.
     /// This emits no SQL target, Root RPC, proxy, registry entry, ACK or authority.
@@ -454,6 +504,7 @@ fn resolve(
         marker_counts: std::array::from_fn(|i| snapshots[i].markers.len()),
         baseline_sha256,
         after_sha256: std::array::from_fn(|i| snapshots[i].anchor.sha256),
+        after_log_bytes: std::array::from_fn(|i| snapshots[i].anchor.bytes),
     })
 }
 
@@ -462,6 +513,58 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::time::Duration;
+    #[test]
+    fn source_evidence_retains_all_descriptors_contexts_and_original_log_anchors() {
+        let (logs, ids) = fixtures(&[1, 2]);
+        let mut target = resolve(&logs, frontend(), &ids, [empty_sha(); BACKENDS]).unwrap();
+        let observer = IndependentRootObserver {
+            source: FrontendIdentitySource::RootObservation,
+            original_deadline: Instant::now() + Duration::from_secs(1),
+            expected_frontend: frontend(),
+            actual_backends: ids,
+            original_roles: Vec::new(),
+            before: [LogAnchor {
+                bytes: 0,
+                sha256: empty_sha(),
+            }; BACKENDS],
+        };
+        let evidence = observer.source_evidence(&target).unwrap();
+        assert_eq!(evidence["source"], "RootObservation");
+        assert_eq!(
+            evidence["actual_backend_descriptors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            evidence["contexts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| !v.is_null())
+                .count(),
+            2
+        );
+        assert_eq!(evidence["fresh_tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            evidence["baseline_sha256"],
+            serde_json::json!(([empty_sha(); BACKENDS]))
+        );
+        assert_eq!(
+            evidence["after_log_bytes"],
+            serde_json::json!(logs.each_ref().map(|log| log.anchor.bytes))
+        );
+        target.baseline_sha256[0] = [1; 32];
+        assert!(observer.source_evidence(&target).is_err());
+        target.baseline_sha256[0] = empty_sha();
+        target.marker_counts[0] = MARKERS + 1;
+        assert!(observer.source_evidence(&target).is_err());
+        target.marker_counts[0] = 0;
+        target.backend_process_from_descriptor = ids[0];
+        assert!(observer.source_evidence(&target).is_err());
+    }
+
     fn processes() -> [BackendProcessId; BACKENDS] {
         [
             "01900000-0000-7000-8000-000000000001",

@@ -688,7 +688,21 @@ pub(crate) fn admit(
     server: &Path,
     base_config: &Path,
 ) -> Result<AdmittedExactNativeRun> {
-    let deadline = Instant::now() + Duration::from_millis(PREP_MS);
+    admit_until(
+        binding_path,
+        server,
+        base_config,
+        Instant::now() + Duration::from_millis(PREP_MS),
+    )
+}
+// The held gate shares this one preparation clock. Cleanup-only reap does not admit late success.
+fn admit_until(
+    binding_path: &Path,
+    server: &Path,
+    base_config: &Path,
+    deadline: Instant,
+) -> Result<AdmittedExactNativeRun> {
+    check(deadline)?;
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -772,3 +786,6 @@ pub(crate) fn admit(
 #[cfg(test)]
 #[path = "exact_native_admission_tests.rs"]
 mod tests;
+
+#[path = "held_native_admission.rs"]
+pub(crate) mod held_native_admission;
