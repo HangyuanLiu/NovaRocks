@@ -152,7 +152,12 @@ pub fn preflight_zip(
     falsy: &dyn Array,
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe, None);
+    let mut work = CopyObservation(
+        &mut observe,
+        None,
+        super::ScratchCoverage::ChildTables,
+        None,
+    );
     work.boundary()?;
     let result = (|| {
         let shape = truthy.len() == mask.len() && falsy.len() == mask.len();

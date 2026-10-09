@@ -99,3 +99,6 @@ fn by_window_source_custody_actual_metadata_refusal_drops_original_chunk_owner()
     assert_eq!(wrap_tracker.current(), 0);
     assert_eq!(query.current(), 0);
 }
+
+#[path = "compiled_window_copy_entry_custody_tests.rs"]
+mod copy_entry_custody_tests;

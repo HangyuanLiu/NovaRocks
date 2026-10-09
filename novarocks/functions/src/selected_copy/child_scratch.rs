@@ -21,13 +21,65 @@
 use super::CopyError;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use allocator_api2::vec::Vec as HostVec;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 pub(super) enum ChildScratchVec<T> {
     Original(Vec<T>),
     Hosted(HostVec<T, HostAggregateAllocator>),
 }
+impl<T> From<Vec<T>> for ChildScratchVec<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self::Original(values)
+    }
+}
+impl<T> FromIterator<T> for ChildScratchVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(values: I) -> Self {
+        Self::Original(values.into_iter().collect())
+    }
+}
 impl<T> ChildScratchVec<T> {
+    pub(super) fn try_with_capacity(
+        capacity: usize,
+        allocator: Option<&HostAggregateAllocator>,
+    ) -> Result<Self, CopyError> {
+        match allocator {
+            None => Ok(Self::Original(Vec::with_capacity(capacity))),
+            Some(allocator) => {
+                let mut values = HostVec::new_in(allocator.clone());
+                if values.try_reserve_exact(capacity).is_err() {
+                    return Err(match values.allocator().recorded_failure() {
+                        Some(cause) => CopyError::Control(cause),
+                        None => CopyError::Extent,
+                    });
+                }
+                Ok(Self::Hosted(values))
+            }
+        }
+    }
+    pub(super) fn try_collect<I: Iterator<Item = Result<T, CopyError>>>(
+        values: I,
+        allocator: Option<&HostAggregateAllocator>,
+    ) -> Result<Self, CopyError> {
+        match allocator {
+            None => values
+                .collect::<Result<Vec<_>, CopyError>>()
+                .map(Self::Original),
+            Some(allocator) => {
+                let mut result = Self::new(Some(allocator));
+                for value in values {
+                    result.try_push(value?)?;
+                }
+                Ok(result)
+            }
+        }
+    }
+    pub(super) fn remove(&mut self, index: usize) -> T {
+        match self {
+            Self::Original(values) => values.remove(index),
+            Self::Hosted(values) => values.remove(index),
+        }
+    }
+
     pub(super) fn new(allocator: Option<&HostAggregateAllocator>) -> Self {
         match allocator {
             None => Self::Original(Vec::new()),
@@ -60,6 +112,14 @@ impl<T> Deref for ChildScratchVec<T> {
         match self {
             Self::Original(values) => values.as_slice(),
             Self::Hosted(values) => values.as_slice(),
+        }
+    }
+}
+impl<T> DerefMut for ChildScratchVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            Self::Original(values) => values.as_mut_slice(),
+            Self::Hosted(values) => values.as_mut_slice(),
         }
     }
 }

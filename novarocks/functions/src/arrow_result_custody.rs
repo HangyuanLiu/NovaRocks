@@ -101,6 +101,23 @@ pub(crate) fn custody_metadata_upper_bound(
     data: &ArrayData,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<usize, KernelFailure> {
+    custody_metadata_with_backing(data, work, None)
+}
+
+/// Optional actual backing observation extends the SAME table visitor. It is
+/// used only after an earlier opaque operation grant, never to authorize work.
+trait CustodyBackingObservation {
+    fn buffer(
+        &mut self,
+        buffer: &Buffer,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<(), KernelFailure>;
+}
+fn custody_metadata_with_backing(
+    data: &ArrayData,
+    work: &mut EvaluationCheckpoints<'_>,
+    mut backing: Option<&mut dyn CustodyBackingObservation>,
+) -> Result<usize, KernelFailure> {
     work.step()?;
     let mut bytes = custody_typed_node_metadata_upper_bound(
         data.data_type(),
@@ -108,8 +125,20 @@ pub(crate) fn custody_metadata_upper_bound(
         data.nulls().is_some(),
         data.child_data().len(),
     )?;
+    if let Some(observer) = backing.as_deref_mut() {
+        for buffer in data.buffers() {
+            observer.buffer(buffer, work)?;
+        }
+        if let Some(nulls) = data.nulls() {
+            observer.buffer(nulls.buffer(), work)?;
+        }
+    }
     for child in data.child_data() {
-        bytes = checked_add(bytes, custody_metadata_upper_bound(child, work)?)?;
+        let child_bytes = match backing.as_deref_mut() {
+            None => custody_metadata_with_backing(child, work, None)?,
+            Some(observer) => custody_metadata_with_backing(child, work, Some(observer))?,
+        };
+        bytes = checked_add(bytes, child_bytes)?;
     }
     Ok(bytes)
 }
@@ -289,21 +318,192 @@ pub(crate) fn retain_result_backing(
     let retained = checked_add(original_carrier_stock, metadata)?;
     work.flush()?;
     charge.reconcile_under_reservation(retained, reservation)?;
-    let owner = HostShared::try_new(
-        OriginalBacking {
-            original,
-            data,
-            custody: charge,
-        },
-        allocator,
-        work,
-    )?;
+    let owner = granted_original_group(original, data, charge, allocator, work)?;
     let retained_envelope = checked_add(retained, owner.block_bytes())?;
     let values = wrap_original_group(owner, work)?;
     Ok(RetainedArrowResult {
         values,
         original_carrier_stock,
         retained_envelope,
+    })
+}
+
+/// Allocate the shared owner through the same real host, without selecting
+/// value math or inferring any admission from stock. The caller has already
+/// granted the opaque metadata/payload envelope before constructing `data`.
+fn granted_original_group<C: Send + Sync + 'static>(
+    original: ArrayRef,
+    data: ArrayData,
+    custody: C,
+    allocator: HostAggregateAllocator,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<HostShared<OriginalBacking<C>>, KernelFailure> {
+    HostShared::try_new(
+        OriginalBacking {
+            original,
+            data,
+            custody,
+        },
+        allocator,
+        work,
+    )
+}
+
+/// New copy backing and already-owned source have distinct owners. Retaining
+/// the source preserves its original lease; it never authorizes fresh payload.
+struct CopiedBacking<C: Send + Sync + 'static> {
+    source: C,
+    charge: OpaqueRetainedCharge,
+}
+
+pub(crate) struct RetainedCopiedArrowResult {
+    pub(crate) values: ArrayRef,
+    pub(crate) new_backing_envelope: usize,
+    pub(crate) new_buffer_stock: usize,
+}
+
+/// One real buffer-identity table for post-copy settlement under an ALREADY
+/// admitted peak. Source identities are not bytes, grants, or value decoders.
+/// The actual HostVec owns each Layout; no observation replaces admission.
+pub(crate) trait CopyInputBacking {
+    fn source_array(&self) -> &dyn Array;
+    fn index_array(&self) -> Option<&dyn Array>;
+}
+struct CopyInputPacket<C> {
+    original: ArrayRef,
+    source: C,
+}
+
+struct CopyBackingSettlement {
+    identities: allocator_api2::vec::Vec<usize, HostAggregateAllocator>,
+    source_phase: bool,
+    new_bytes: usize,
+}
+impl CopyBackingSettlement {
+    fn new(allocator: HostAggregateAllocator) -> Self {
+        Self {
+            identities: allocator_api2::vec::Vec::new_in(allocator),
+            source_phase: true,
+            new_bytes: 0,
+        }
+    }
+}
+impl CustodyBackingObservation for CopyBackingSettlement {
+    fn buffer(
+        &mut self,
+        buffer: &Buffer,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<(), KernelFailure> {
+        work.step()?;
+        let address = buffer.data_ptr().as_ptr().addr();
+        for known in &self.identities {
+            work.step()?;
+            if *known == address {
+                return Ok(());
+            }
+        }
+        // A zero-capacity buffer owns no newly allocated payload. Source custom
+        // Buffers remain pinned by their original input owner independently.
+        if self.identities.try_reserve(1).is_err() {
+            return Err(self
+                .identities
+                .allocator()
+                .recorded_failure()
+                .unwrap_or_else(|| {
+                    invalid("copy backing identity table exceeds its representable Layout")
+                }));
+        }
+        self.identities.push(address);
+        if !self.source_phase {
+            self.new_bytes = checked_add(self.new_bytes, buffer.capacity())?;
+        }
+        Ok(())
+    }
+}
+
+/// The resource author must have granted the whole copy/transient/metadata
+/// envelope BEFORE the original Arrow copy. Its immutable retained bound
+/// excludes already-owned source payload, including Dictionary/View buffers.
+/// Facts are sealed by the SAME selected-copy traversal and bound to the actual
+/// original take result once. No caller-supplied byte estimate can enter here.
+pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + 'static>(
+    original: ArrayRef,
+    source: C,
+    mut charge: OpaqueRetainedCharge,
+    reservation: &mut OpaqueReservation,
+    allocator: HostAggregateAllocator,
+    facts: &crate::selected_copy::CopyOperationFacts,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<RetainedCopiedArrowResult, KernelFailure> {
+    // Failed exits destroy output aliases before their source lease. No
+    // temporary caller Arc loan can outlive and invalidate this custody order.
+    let packet = CopyInputPacket { original, source };
+    if !facts.matches_original_copy(&packet.original) {
+        return Err(invalid(
+            "copy custody received facts for another actual Arrow result",
+        ));
+    }
+    if !reservation.belongs_to_allocator(&allocator) {
+        return Err(invalid(
+            "copy custody uses a different actual reservation host",
+        ));
+    }
+    // Reservation remains live across original to_data construction. This is
+    // not post-copy grant: its amount came from the pre-copy resource author.
+    work.flush()?;
+    let data = packet.original.to_data();
+    work.flush()?;
+    // Source/index loans are created inside the SAME earlier metadata/peak
+    // reservation. Their identities classify aliases, never infer a grant.
+    let source_data = packet.source.source_array().to_data();
+    work.flush()?;
+    let index_data = match packet.source.index_array() {
+        Some(indices) => {
+            let data = indices.to_data();
+            work.flush()?;
+            Some(data)
+        }
+        None => None,
+    };
+    let mut settlement = CopyBackingSettlement::new(allocator.clone());
+    custody_metadata_with_backing(&source_data, work, Some(&mut settlement))?;
+    if let Some(index_data) = &index_data {
+        custody_metadata_with_backing(index_data, work, Some(&mut settlement))?;
+    }
+    settlement.source_phase = false;
+    let metadata = custody_metadata_with_backing(&data, work, Some(&mut settlement))?;
+    let new_buffer_stock = settlement.new_bytes;
+    if new_buffer_stock > facts.retained_new_backing_upper() {
+        return Err(invalid(
+            "copy output backing exceeds its earlier selected-copy envelope",
+        ));
+    }
+    drop(settlement);
+    drop(index_data);
+    drop(source_data);
+    let retained = checked_add(new_buffer_stock, metadata)?;
+    if retained > reservation.remaining_bytes() {
+        return Err(invalid(
+            "copy custody exceeds its actual operation reservation",
+        ));
+    }
+    charge.reconcile_under_reservation(retained, reservation)?;
+    let owner = granted_original_group(
+        packet.original,
+        data,
+        CopiedBacking {
+            source: packet.source,
+            charge,
+        },
+        allocator,
+        work,
+    )?;
+    let envelope = checked_add(retained, owner.block_bytes())?;
+    let values = wrap_original_group(owner, work)?;
+    Ok(RetainedCopiedArrowResult {
+        values,
+        new_backing_envelope: envelope,
+        new_buffer_stock,
     })
 }
 

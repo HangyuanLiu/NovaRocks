@@ -20,6 +20,17 @@
 
 #[path = "selected_copy/zip.rs"]
 mod zip;
+
+#[path = "selected_copy/take_host.rs"]
+mod take_host;
+pub use take_host::{
+    CopyIndices, CopyOperationError, CopyOperationFacts, RetainedTakeResult, take_copy_in,
+};
+#[path = "selected_copy/copy_buffer_peak.rs"]
+mod copy_buffer_peak;
+#[path = "selected_copy/slice_host.rs"]
+mod slice_host;
+pub use slice_host::{RetainedSliceResult, slice_copy_in};
 pub use zip::preflight_zip;
 
 #[path = "selected_copy/root_scratch_host.rs"]
@@ -32,12 +43,17 @@ pub use root_scratch_host::{
 mod child_scratch;
 use child_scratch::ChildScratchVec;
 
+#[path = "selected_copy/copy_diagnostic.rs"]
+mod copy_diagnostic;
+pub use copy_diagnostic::OriginalCopyData;
+
 use crate::KernelFailure;
 use arrow_array::types::{ByteArrayType, Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, GenericByteArray, GenericListArray, GenericListViewArray,
     MapArray, OffsetSizeTrait, RunArray, StructArray, UnionArray, make_array,
 };
+use arrow_array::cast::AsArray;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, UnionMode};
 use std::ops::Range;
@@ -72,11 +88,27 @@ impl std::error::Error for CopyError {
         }
     }
 }
+#[derive(Clone, Copy)]
+enum ScratchCoverage {
+    ChildTables,
+    RecursiveSelections,
+}
 struct CopyObservation<'a>(
     &'a mut dyn FnMut(bool) -> Result<(), KernelFailure>,
     Option<&'a crate::aggregate_host_allocator::HostAggregateAllocator>,
+    ScratchCoverage,
+    Option<&'a mut take_host::CopyInvoiceTotals>,
 );
-impl CopyObservation<'_> {
+impl<'a> CopyObservation<'a> {
+    fn selection_allocator(
+        &self,
+    ) -> Option<&'a crate::aggregate_host_allocator::HostAggregateAllocator> {
+        match self.2 {
+            ScratchCoverage::ChildTables => None,
+            ScratchCoverage::RecursiveSelections => self.1,
+        }
+    }
+
     fn step(&mut self) -> Result<(), CopyError> {
         (self.0)(false).map_err(CopyError::Control)
     }
@@ -115,15 +147,17 @@ fn offset_max(large: bool) -> usize {
     }
 }
 
-#[derive(Clone)]
 struct Block {
     source: usize,
-    ranges: Vec<Range<usize>>,
+    ranges: ChildScratchVec<Range<usize>>,
     repeats: usize,
+    // Only the raw-index entry can create an invalid block. Its numeric source
+    // indices remain ordered for Arrow Run/Union semantics.
+    raw_null: bool,
+    raw_outside: usize,
 }
-#[derive(Clone)]
 struct Selection {
-    blocks: Vec<Block>,
+    blocks: ChildScratchVec<Block>,
     nulls: usize,
     null_ops: usize,
 }
@@ -135,7 +169,7 @@ impl Selection {
                 work.step()?;
                 add(len, range.len())
             })?;
-            add(total, mul(one, block.repeats)?)
+            add(total, mul(add(one, block.raw_outside)?, block.repeats)?)
         })
     }
     fn check(
@@ -150,6 +184,17 @@ impl Selection {
                 let source = sources.get(block.source).ok_or(CopyError::Invalid(
                     "mutable copy source index is outside its constructor sources",
                 ))?;
+                if block.raw_null && block.repeats == 0 {
+                    continue;
+                }
+                if block.raw_null
+                    && !matches!(
+                        source.data_type(),
+                        DataType::RunEndEncoded(..) | DataType::Union(..)
+                    )
+                {
+                    continue;
+                }
                 if range.start > range.end || range.end > source.len() {
                     return Err(CopyError::Invalid(
                         "constant broadcast selected range is outside its source",
@@ -165,43 +210,47 @@ impl Selection {
         mut map: impl FnMut(
             usize,
             &Range<usize>,
-            &mut Vec<Range<usize>>,
+            bool,
+            &mut ChildScratchVec<Range<usize>>,
             &mut CopyObservation<'_>,
         ) -> Result<(), CopyError>,
     ) -> Result<Self, CopyError> {
-        self.blocks
-            .iter()
-            .map(|block| {
+        let allocator = work.selection_allocator();
+        let mapped = self.blocks.iter().map(|block| {
+            work.step()?;
+            let mut ranges = ChildScratchVec::new(allocator);
+            for range in &block.ranges {
                 work.step()?;
-                let mut ranges = Vec::new();
-                for range in &block.ranges {
-                    work.step()?;
-                    map(block.source, range, &mut ranges, work)?;
-                }
-                Ok(Block {
-                    source: block.source,
-                    ranges,
-                    repeats: block.repeats,
-                })
+                map(block.source, range, block.raw_null, &mut ranges, work)?;
+            }
+            Ok(Block {
+                source: block.source,
+                ranges,
+                repeats: block.repeats,
+                raw_null: block.raw_null,
+                raw_outside: block.raw_outside,
             })
-            .collect::<Result<Vec<_>, CopyError>>()
-            .map(|blocks| Self {
-                blocks,
-                nulls: 0,
-                null_ops: 0,
-            })
+        });
+        ChildScratchVec::try_collect(mapped, allocator).map(|blocks| Self {
+            blocks,
+            nulls: 0,
+            null_ops: 0,
+        })
     }
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum CopyMode {
-    Take { index_maximum: usize },
+    Take { index_maximum: usize, raw: bool },
     Extend,
 }
 
 impl CopyMode {
     fn is_take(self) -> bool {
         matches!(self, Self::Take { .. })
+    }
+    fn is_raw_take(self) -> bool {
+        matches!(self, Self::Take { raw: true, .. })
     }
 }
 
@@ -216,7 +265,7 @@ pub fn preflight_broadcast(
     rows: usize,
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe, None);
+    let mut work = CopyObservation(&mut observe, None, ScratchCoverage::ChildTables, None);
     work.boundary()?;
     let result = (|| {
         let start = ordinal as usize;
@@ -232,7 +281,10 @@ pub fn preflight_broadcast(
                 source: 0,
                 ranges: std::iter::once(start..add(start, 1)?).collect(),
                 repeats: rows,
-            }],
+                raw_null: false,
+                raw_outside: 0,
+            }]
+            .into(),
             nulls: 0,
             null_ops: 0,
         };
@@ -241,6 +293,7 @@ pub fn preflight_broadcast(
             &selection,
             CopyMode::Take {
                 index_maximum: u32::MAX as usize,
+                raw: false,
             },
             &mut work,
         )
@@ -275,6 +328,9 @@ fn mutable_capacity_many(
         "mutable copy requires constructor sources",
     ))?;
     let ty = data.data_type();
+    if let Some(invoice) = work.3.as_deref_mut() {
+        invoice.constructor(data, sources.len(), capacity)?;
+    }
     mutable_buffer_extent(add(capacity, 1)?, 8)?;
     if let Some(width) = ty.primitive_width() {
         return mutable_buffer_extent(capacity, width);
@@ -353,8 +409,10 @@ fn mutable_capacity_many(
                     work.boundary()?;
                     blocks.push(Block {
                         source,
-                        ranges: vec![0..dictionary.len()],
+                        ranges: vec![0..dictionary.len()].into(),
                         repeats: 1,
+                        raw_null: false,
+                        raw_outside: 0,
                     });
                 }
                 let mut refs = Vec::new();
@@ -365,7 +423,7 @@ fn mutable_capacity_many(
                 visit(
                     &refs,
                     &Selection {
-                        blocks,
+                        blocks: blocks.into(),
                         nulls: 0,
                         null_ops: 0,
                     },
@@ -462,6 +520,7 @@ fn visit(
     selection.check(sources, work)?;
     let rows = selection.len(work)?;
     if mode.is_take()
+        && !mode.is_raw_take()
         && matches!(array.data_type(), DataType::RunEndEncoded(..))
         && selection.nulls != 0
     {
@@ -469,14 +528,24 @@ fn visit(
             "Arrow run-end take requires non-null indices",
         ));
     }
-    if mode.is_take() && matches!(array.data_type(), DataType::Union(..)) && selection.nulls != 0 {
+    if mode.is_take()
+        && !mode.is_raw_take()
+        && matches!(array.data_type(), DataType::Union(..))
+        && selection.nulls != 0
+    {
         return Err(CopyError::Invalid(
             "Arrow union take requires non-null indices",
         ));
     }
-    if rows == 0 {
+    if let Some(invoice) = work.3.as_deref_mut() {
+        invoice.selected_node(array, rows, mode)?;
+    }
+    if rows == 0 && work.3.is_none() {
         return Ok(());
     }
+    // Original take(empty) invokes new_empty_array at the root, including all
+    // nested offset constructors. Only the optional operation invoice must
+    // visit those children; legacy preflight keeps its original early return.
     // The outer take has UInt32 or UInt64 indices; recursive kernels may use other
     // widths, so eight bytes conservatively bounds their index buffers.
     buffer_extent(rows, 8)?;
@@ -513,7 +582,21 @@ fn visit(
         // take_dict and single-source MutableArrayData retain the dictionary
         // values unchanged; only keys expand, never its encoded value domain.
         DataType::Dictionary(key, _) => {
-            mutable_buffer_extent(rows, key.primitive_width().ok_or(CopyError::Extent)?)
+            mutable_buffer_extent(rows, key.primitive_width().ok_or(CopyError::Extent)?)?;
+            if rows == 0 && mode.is_take() && work.3.is_some() {
+                // ArrayData::new_empty creates an empty values child, instead
+                // of retaining the source dictionary domain as nonempty take.
+                let children = child_sources(sources, work, |source| {
+                    source
+                        .as_any_dictionary_opt()
+                        .map(|source| source.values().as_ref())
+                        .ok_or(CopyError::Invalid(
+                            "mutable copy requires its exact Arrow carrier",
+                        ))
+                })?;
+                visit(&children, selection, mode, work)?;
+            }
+            Ok(())
         }
         DataType::Struct(_) => {
             let first: &StructArray = downcast(array)?;
@@ -529,20 +612,76 @@ fn visit(
         DataType::FixedSizeList(_, width) => {
             let _array: &FixedSizeListArray = downcast(array)?;
             let width = usize::try_from(*width).map_err(|_| CopyError::Extent)?;
-            let mut child = selection.map_ranges(work, |_, range, output, _work| {
-                let range = mul(range.start, width)?..mul(range.end, width)?;
-                if mode.is_take() {
-                    limit(range.end, u32::MAX as usize)?;
+            let mut child =
+                selection.map_ranges(work, |source, range, raw_null, output, _work| {
+                    let range = if mode.is_raw_take() && raw_null {
+                        0..1
+                    } else if mode.is_raw_take() && !range.is_empty() {
+                        let array: &FixedSizeListArray = downcast(sources[source])?;
+                        for row in range.clone() {
+                            _work.step()?;
+                            // Original Arrow take generates UInt32 child indices:
+                            // value_offset returns i32, then is cast to u32. The
+                            // signed bit pattern is not a representability gate.
+                            let start = array.value_offset(row) as u32;
+                            if let Some(end) = start.checked_add(width as u32) {
+                                output.try_push(start as usize..end as usize)?;
+                            }
+                            // Overflow remains the original start+length panic
+                            // (or original release-mode empty range) under the
+                            // granted operation. No child copy occurs beforehand.
+                        }
+                        return Ok(());
+                    } else {
+                        mul(range.start, width)?..mul(range.end, width)?
+                    };
+                    if mode.is_take() && !mode.is_raw_take() {
+                        limit(range.end, u32::MAX as usize)?;
+                    }
+                    output.try_push(range)?;
+                    Ok(())
+                })?;
+            if mode.is_raw_take() {
+                for (original, mapped) in selection.blocks.iter().zip(child.blocks.iter_mut()) {
+                    work.step()?;
+                    if original.raw_null {
+                        // Arrow UInt32Builder::append_nulls stores zero for EVERY
+                        // child index, rather than a contiguous 0..width range.
+                        while !mapped.ranges.is_empty() {
+                            mapped.ranges.remove(0);
+                        }
+                        let array: &FixedSizeListArray = downcast(sources[original.source])?;
+                        if array.values().is_empty() {
+                            mapped.raw_outside = 1;
+                        } else {
+                            mapped.ranges.try_push(0..1)?;
+                            mapped.raw_outside = 0;
+                        }
+                        let count = original.ranges.iter().try_fold(
+                            original.raw_outside,
+                            |sum, range| {
+                                work.step()?;
+                                add(sum, range.len())
+                            },
+                        )?;
+                        mapped.repeats = mul(mul(count, original.repeats)?, width)?;
+                    }
                 }
-                output.push(range);
-                Ok(())
-            })?;
+            }
+            if mode.is_raw_take() {
+                for (original, mapped) in selection.blocks.iter().zip(child.blocks.iter_mut()) {
+                    if !original.raw_null {
+                        mapped.raw_outside = mul(original.raw_outside, width)?;
+                    }
+                }
+            }
             child.nulls = mul(selection.nulls, width)?;
             child.null_ops = if width != 0 { selection.null_ops } else { 0 };
             // Fixed-list take copies children even under a NULL parent.
             let child_mode = if mode.is_take() {
                 CopyMode::Take {
                     index_maximum: u32::MAX as usize,
+                    raw: mode.is_raw_take(),
                 }
             } else {
                 mode
@@ -588,17 +727,38 @@ fn visit(
                 }
             } else {
                 for (child_index, (id, _)) in fields.iter().enumerate() {
-                    let mut child = selection.map_ranges(work, |source, range, output, work| {
-                        let array: &UnionArray = downcast(sources[source])?;
-                        for row in range.clone() {
-                            work.step()?;
-                            if array.type_id(row) == id {
-                                let offset = array.value_offset(row);
-                                output.push(offset..add(offset, 1)?);
+                    let mut child =
+                        selection.map_ranges(work, |source, range, _raw_null, output, work| {
+                            let array: &UnionArray = downcast(sources[source])?;
+                            for row in range.clone() {
+                                work.step()?;
+                                if array.type_id(row) == id {
+                                    let offset = array.value_offset(row);
+                                    output.try_push(offset..add(offset, 1)?)?;
+                                }
                             }
+                            Ok(())
+                        })?;
+                    if mode.is_raw_take() {
+                        for (original, block) in
+                            selection.blocks.iter().zip(child.blocks.iter_mut())
+                        {
+                            block.raw_null = false;
+                            block.raw_outside = 0;
+                            if original.raw_null && original.raw_outside != 0 && id == 0 {
+                                let array: &UnionArray = downcast(sources[original.source])?;
+                                // Original take_native supplies type-id zero and
+                                // offset zero, independently of source row zero.
+                                if array.child(id).is_empty() {
+                                    block.raw_outside = original.raw_outside;
+                                } else {
+                                    block.ranges.try_push(0..1)?;
+                                    block.repeats = mul(original.repeats, original.raw_outside)?;
+                                }
+                            }
+                            work.step()?;
                         }
-                        Ok(())
-                    })?;
+                    }
                     // MutableArrayData appends NULLs to the first declared child
                     // and casts its end offset to i32. Include that padding in
                     // both the offset bound and the child's recursive extent.
@@ -607,10 +767,13 @@ fn visit(
                         child.null_ops = selection.null_ops;
                     }
                     // Both take and MutableArrayData write signed i32 offsets.
-                    limit(child.len(work)?, i32::MAX as usize)?;
+                    if !mode.is_raw_take() {
+                        limit(child.len(work)?, i32::MAX as usize)?;
+                    }
                     let child_mode = if mode.is_take() {
                         CopyMode::Take {
                             index_maximum: i32::MAX as usize,
+                            raw: mode.is_raw_take(),
                         }
                     } else {
                         mode
@@ -646,6 +809,9 @@ fn bytes<T: ByteArrayType>(
     let mut total = 0;
     for block in &selection.blocks {
         work.step()?;
+        if mode.is_take() && block.raw_null {
+            continue;
+        }
         let array: &GenericByteArray<T> = downcast(sources[block.source])?;
         let mut one = 0;
         for range in &block.ranges {
@@ -661,7 +827,12 @@ fn bytes<T: ByteArrayType>(
         }
         total = add(total, mul(one, block.repeats)?)?;
     }
-    limit(total, offset_max(large))?;
+    if !mode.is_raw_take() {
+        limit(total, offset_max(large))?;
+    }
+    if let Some(invoice) = work.3.as_deref_mut() {
+        invoice.selected_payload(total, mode)?;
+    }
     if mode == CopyMode::Extend {
         mutable_buffer_extent(total, 1)
     } else {
@@ -680,24 +851,37 @@ fn offset_selection<O: OffsetSizeTrait>(
     work: &mut CopyObservation<'_>,
     mut offsets: impl for<'a> FnMut(&'a dyn Array) -> Result<&'a [O], CopyError>,
 ) -> Result<Selection, CopyError> {
-    let child = selection.map_ranges(work, |source, range, output, work| {
+    let child = selection.map_ranges(work, |source, range, raw_null, output, work| {
+        if mode.is_raw_take() && raw_null {
+            return Ok(());
+        }
         let array = sources[source];
         let offsets = offsets(array)?;
         if mode == CopyMode::Extend {
-            output.push(offset_value(offsets[range.start])?..offset_value(offsets[range.end])?);
+            output
+                .try_push(offset_value(offsets[range.start])?..offset_value(offsets[range.end])?)?;
         } else {
             for row in range.clone() {
                 work.step()?;
                 // take_list omits NULL parent ranges; MutableArrayData::extend
                 // copies offsets/payload even when a copied parent is NULL.
                 if array.is_valid(row) {
-                    output.push(offset_value(offsets[row])?..offset_value(offsets[row + 1])?);
+                    output
+                        .try_push(offset_value(offsets[row])?..offset_value(offsets[row + 1])?)?;
                 }
             }
         }
         Ok(())
     })?;
-    limit(child.len(work)?, offset_max(large))?;
+    let mut child = child;
+    if mode.is_raw_take() {
+        for block in child.blocks.iter_mut() {
+            block.raw_outside = 0;
+        }
+    }
+    if !mode.is_raw_take() {
+        limit(child.len(work)?, offset_max(large))?;
+    }
     Ok(child)
 }
 fn list<O: OffsetSizeTrait>(
@@ -737,20 +921,32 @@ fn list_view<O: OffsetSizeTrait>(
 ) -> Result<(), CopyError> {
     let _array: &GenericListViewArray<O> = downcast(sources[0])?;
     if mode.is_take() {
-        // take_list_view retains the original child backing and copies views.
-        return buffer_extent(selection.len(work)?, if large { 16 } else { 8 });
+        // Nonempty take_list_view retains its original child. Empty take uses
+        // new_empty_array and recursively creates empty child offset buffers.
+        let rows = selection.len(work)?;
+        buffer_extent(rows, if large { 16 } else { 8 })?;
+        if rows == 0 && work.3.is_some() {
+            let children = child_sources(sources, work, |source| {
+                let source: &GenericListViewArray<O> = downcast(source)?;
+                Ok(source.values().as_ref())
+            })?;
+            visit(&children, selection, mode, work)?;
+        }
+        return Ok(());
     }
-    let child = selection.map_ranges(work, |source, range, output, work| {
+    let child = selection.map_ranges(work, |source, range, _raw_null, output, work| {
         let array: &GenericListViewArray<O> = downcast(sources[source])?;
         for row in range.clone() {
             work.step()?;
             let start = offset_value(array.value_offsets()[row])?;
             let size = offset_value(array.value_sizes()[row])?;
-            output.push(start..add(start, size)?);
+            output.try_push(start..add(start, size)?)?;
         }
         Ok(())
     })?;
-    limit(child.len(work)?, offset_max(large))?;
+    if !mode.is_raw_take() {
+        limit(child.len(work)?, offset_max(large))?;
+    }
     let children = child_sources(sources, work, |source| {
         let source: &GenericListViewArray<O> = downcast(source)?;
         Ok(source.values().as_ref())
@@ -758,7 +954,7 @@ fn list_view<O: OffsetSizeTrait>(
     visit(&children, &child, CopyMode::Extend, work)
 }
 
-fn remove_first(ranges: &mut Vec<Range<usize>>) {
+fn remove_first(ranges: &mut ChildScratchVec<Range<usize>>) {
     if let Some(first) = ranges.first_mut() {
         first.start += 1;
         if first.start == first.end {
@@ -773,8 +969,10 @@ fn run<R: RunEndIndexType>(
     maximum: usize,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
-    limit(selection.len(work)?, maximum)?;
-    let mut output = Vec::new();
+    if !mode.is_raw_take() {
+        limit(selection.len(work)?, maximum)?;
+    }
+    let mut output = ChildScratchVec::new(work.selection_allocator());
     let mut previous = None;
     for block in &selection.blocks {
         work.step()?;
@@ -782,7 +980,8 @@ fn run<R: RunEndIndexType>(
         if block.repeats == 0 {
             continue;
         }
-        let mut ranges: Vec<Range<usize>> = Vec::new();
+        let mut ranges: ChildScratchVec<Range<usize>> =
+            ChildScratchVec::new(work.selection_allocator());
         for range in &block.ranges {
             work.step()?;
             if range.is_empty() {
@@ -794,7 +993,11 @@ fn run<R: RunEndIndexType>(
             work.boundary()?;
             // take_run casts physical value indices back to its input index
             // carrier (UInt32 normally; Int32 under a dense Union).
-            if let CopyMode::Take { index_maximum } = mode {
+            if let CopyMode::Take {
+                index_maximum,
+                raw: false,
+            } = mode
+            {
                 limit(end - 1, index_maximum)?;
             }
             let start = if mode.is_take() && ranges.last().is_some_and(|last| last.end - 1 == start)
@@ -804,44 +1007,51 @@ fn run<R: RunEndIndexType>(
                 start
             };
             if start < end {
-                ranges.push(start..end);
+                ranges.try_push(start..end)?;
             }
         }
         if ranges.is_empty() {
             continue;
         }
         if mode == CopyMode::Extend {
-            output.push(Block {
+            output.try_push(Block {
                 source: block.source,
                 ranges,
                 repeats: block.repeats,
-            });
+                raw_null: false,
+                raw_outside: 0,
+            })?;
             continue;
         }
         let first = ranges[0].start;
         let last = ranges.last().expect("nonempty physical range").end - 1;
-        let mut initial = Vec::with_capacity(ranges.len());
+        let mut initial =
+            ChildScratchVec::try_with_capacity(ranges.len(), work.selection_allocator())?;
         for range in &ranges {
-            initial.push(range.clone());
+            initial.try_push(range.clone())?;
             work.step()?;
         }
         if previous == Some((block.source, first)) {
             remove_first(&mut initial);
         }
-        output.push(Block {
+        output.try_push(Block {
             source: block.source,
             ranges: initial,
             repeats: 1,
-        });
+            raw_null: false,
+            raw_outside: 0,
+        })?;
         if block.repeats > 1 {
             if first == last {
                 remove_first(&mut ranges);
             }
-            output.push(Block {
+            output.try_push(Block {
                 source: block.source,
                 ranges,
                 repeats: block.repeats - 1,
-            });
+                raw_null: false,
+                raw_outside: 0,
+            })?;
         }
         previous = Some((block.source, last));
     }
@@ -869,6 +1079,56 @@ fn run<R: RunEndIndexType>(
     )
 }
 
+// Raw numeric carrier source for the standalone original Arrow operation.
+// The same child/extent visitor receives ordered NULL and outside occurrences;
+// old Option-based entry points retain their exact original shape and gates.
+fn preflight_original_take_with_invoice(
+    array: &dyn Array,
+    indices: &take_host::CopyIndices,
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+    allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
+    invoice: &mut take_host::CopyInvoiceTotals,
+) -> Result<(), CopyError> {
+    let mut work = CopyObservation(
+        &mut observe,
+        Some(allocator),
+        ScratchCoverage::RecursiveSelections,
+        Some(invoice),
+    );
+    let mut blocks = ChildScratchVec::try_with_capacity(indices.len(), Some(allocator))?;
+    for ordinal in 0..indices.len() {
+        work.step()?;
+        let index = indices.raw_value(ordinal);
+        let mut ranges = ChildScratchVec::new(Some(allocator));
+        let outside = index >= array.len();
+        if !outside {
+            let start = index;
+            ranges.try_push(start..add(start, 1)?)?;
+        }
+        blocks.try_push(Block {
+            source: 0,
+            ranges,
+            repeats: 1,
+            raw_null: !indices.as_array().is_valid(ordinal),
+            raw_outside: usize::from(outside),
+        })?;
+    }
+    let selection = Selection {
+        blocks,
+        nulls: 0,
+        null_ops: 0,
+    };
+    visit(
+        &[array],
+        &selection,
+        CopyMode::Take {
+            index_maximum: indices.index_maximum(),
+            raw: true,
+        },
+        &mut work,
+    )
+}
+
 /// Validate the actual UInt64 nullable take plan before the opaque Arrow copy.
 /// NULL indices count toward output reservation, never toward source payload.
 /// The caller flushes the same original work at entry and on success or ordinary
@@ -890,18 +1150,46 @@ fn preflight_take_with_root_scope<S>(
     observe: impl FnMut(bool) -> Result<(), KernelFailure>,
     admit_root: impl FnOnce(usize) -> Result<S, CopyError>,
 ) -> Result<(), CopyError> {
-    preflight_take_with_child_tables(array, indices, observe, admit_root, None)
+    preflight_take_with_child_tables(
+        array,
+        indices,
+        observe,
+        admit_root,
+        None,
+        ScratchCoverage::ChildTables,
+    )
 }
 
 fn preflight_take_with_child_tables<S>(
     array: &dyn Array,
     indices: &[Option<u64>],
+    observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+    admit_root: impl FnOnce(usize) -> Result<S, CopyError>,
+    child_allocator: Option<&crate::aggregate_host_allocator::HostAggregateAllocator>,
+    coverage: ScratchCoverage,
+) -> Result<(), CopyError> {
+    preflight_take_with_invoice(
+        array,
+        indices,
+        observe,
+        admit_root,
+        child_allocator,
+        coverage,
+        None,
+    )
+}
+
+fn preflight_take_with_invoice<S>(
+    array: &dyn Array,
+    indices: &[Option<u64>],
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
     admit_root: impl FnOnce(usize) -> Result<S, CopyError>,
     child_allocator: Option<&crate::aggregate_host_allocator::HostAggregateAllocator>,
+    coverage: ScratchCoverage,
+    invoice: Option<&mut take_host::CopyInvoiceTotals>,
 ) -> Result<(), CopyError> {
     let root_scope = admit_root(indices.len())?;
-    let mut work = CopyObservation(&mut observe, child_allocator);
+    let mut work = CopyObservation(&mut observe, child_allocator, coverage, invoice);
     let mut ranges = Vec::with_capacity(indices.len());
     let mut nulls = 0;
     for index in indices {
@@ -916,9 +1204,12 @@ fn preflight_take_with_child_tables<S>(
     let selection = Selection {
         blocks: vec![Block {
             source: 0,
-            ranges,
+            ranges: ranges.into(),
             repeats: 1,
-        }],
+            raw_null: false,
+            raw_outside: 0,
+        }]
+        .into(),
         nulls,
         null_ops: usize::from(nulls != 0),
     };
@@ -927,6 +1218,7 @@ fn preflight_take_with_child_tables<S>(
         &selection,
         CopyMode::Take {
             index_maximum: usize::MAX,
+            raw: false,
         },
         &mut work,
     );
@@ -948,7 +1240,7 @@ pub fn preflight_extend(
     capacity: usize,
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe, None);
+    let mut work = CopyObservation(&mut observe, None, ScratchCoverage::ChildTables, None);
     work.boundary()?;
     let result = (|| {
         let end = add(start, len)?;
@@ -968,7 +1260,10 @@ pub fn preflight_extend(
                 source: 0,
                 ranges: std::iter::once(start..end).collect(),
                 repeats: 1,
-            }],
+                raw_null: false,
+                raw_outside: 0,
+            }]
+            .into(),
             nulls,
             null_ops: usize::from(nulls != 0),
         };
@@ -1002,7 +1297,7 @@ pub fn preflight_extend_multi(
     constructor_capacity: usize,
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe, None);
+    let mut work = CopyObservation(&mut observe, None, ScratchCoverage::ChildTables, None);
     work.boundary()?;
     let result = (|| {
         let first = *sources.first().ok_or(CopyError::Invalid(
@@ -1054,14 +1349,16 @@ pub fn preflight_extend_multi(
             }
             blocks.push(Block {
                 source: segment.source,
-                ranges: vec![segment.start..end],
+                ranges: vec![segment.start..end].into(),
                 repeats: segment.repeats,
+                raw_null: false,
+                raw_outside: 0,
             });
         }
         visit(
             sources,
             &Selection {
-                blocks,
+                blocks: blocks.into(),
                 nulls,
                 null_ops,
             },
@@ -1191,7 +1488,7 @@ pub fn preflight_guarded_interleave(
     ) {
         return preflight_fixed_interleave(ty, sources, choices, observe);
     }
-    let mut work = CopyObservation(&mut observe, None);
+    let mut work = CopyObservation(&mut observe, None, ScratchCoverage::ChildTables, None);
     work.boundary()?;
     let result = (|| {
         guarded_interleave_extent(ty, choices.len())?;
@@ -1232,7 +1529,7 @@ pub fn preflight_fixed_interleave(
     choices: &[(usize, usize)],
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe, None);
+    let mut work = CopyObservation(&mut observe, None, ScratchCoverage::ChildTables, None);
     work.boundary()?;
     let result = (|| {
         fixed_interleave_extent(ty, choices.len())?;

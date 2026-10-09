@@ -1157,3 +1157,11 @@ mod copy_root_scratch_host_tests;
 #[cfg(test)]
 #[path = "copy_child_scratch_host_tests.rs"]
 mod copy_child_scratch_host_tests;
+
+#[cfg(test)]
+#[path = "copy_joint_take_host_tests.rs"]
+mod copy_joint_take_host_tests;
+
+#[cfg(test)]
+#[path = "copy_original_concat_baseline_tests.rs"]
+mod original_concat_baseline_tests;

@@ -46,6 +46,7 @@ fn plus(a: usize, b: usize) -> Result<usize, KernelFailure> {
 fn source_metadata_graph(
     array: &dyn Array,
     work: &mut EvaluationCheckpoints<'_>,
+    copy_nulls: bool,
 ) -> Result<usize, KernelFailure> {
     work.step()?;
     let mut child_bytes = 0;
@@ -53,7 +54,10 @@ fn source_metadata_graph(
     let children;
     macro_rules! child {
         ($array:expr) => {{
-            child_bytes = plus(child_bytes, source_metadata_graph($array.as_ref(), work)?)?;
+            child_bytes = plus(
+                child_bytes,
+                source_metadata_graph($array.as_ref(), work, copy_nulls)?,
+            )?;
         }};
     }
     macro_rules! dictionary {
@@ -114,7 +118,8 @@ fn source_metadata_graph(
         DataType::Map(_, _) => {
             buffers = 1;
             children = 1;
-            child_bytes = source_metadata_graph(concrete::<MapArray>(array)?.entries(), work)?;
+            child_bytes =
+                source_metadata_graph(concrete::<MapArray>(array)?.entries(), work, copy_nulls)?;
         }
         DataType::Dictionary(key, _) => {
             buffers = 1;
@@ -184,7 +189,7 @@ fn source_metadata_graph(
     let own = crate::arrow_result_custody::custody_typed_node_metadata_upper_bound(
         array.data_type(),
         buffers,
-        array.nulls().is_some(),
+        copy_nulls || array.nulls().is_some(),
         children,
     )?;
     plus(own, child_bytes)
@@ -197,7 +202,20 @@ pub(crate) fn source_metadata_bytes(
     // Four envelopes cover pinned Arrow to_data transient table growth,
     // clone/into_builder/make_array coexistence, and custom-buffer metadata.
     // Apply it ONCE to the complete actual graph, not exponentially by depth.
-    source_metadata_graph(array, work)?
+    source_metadata_graph(array, work, false)?
+        .checked_mul(4)
+        .ok_or(KernelFailure::ResourceExhausted)
+}
+
+/// The SAME actual source graph bounds copy metadata. Any copied node may gain
+/// validity from actual nullable indices even when its source has no bitmap.
+/// Dictionary/View children remain source-owned; counting their metadata does
+/// not admit or charge their already-owned payload.
+pub(crate) fn copy_metadata_bytes(
+    array: &dyn Array,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<usize, KernelFailure> {
+    source_metadata_graph(array, work, true)?
         .checked_mul(4)
         .ok_or(KernelFailure::ResourceExhausted)
 }

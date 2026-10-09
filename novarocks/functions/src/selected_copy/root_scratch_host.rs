@@ -19,7 +19,7 @@
 //! The facts are Layouts, not grants. Recursive scratch and Arrow output need
 //! their separate exact invoice and admission; this entry does not run take.
 use super::{
-    Block, CopyError, add, buffer_extent, mul, preflight_take_with_root_scope,
+    Block, CopyError, ScratchCoverage, add, buffer_extent, mul, preflight_take_with_root_scope,
     preflight_take_with_child_tables,
 };
 use crate::opaque_memory::OpaqueRetainedCharge;
@@ -135,6 +135,7 @@ pub fn preflight_take_child_tables_in(
             Ok(reservation)
         },
         Some(&allocator),
+        ScratchCoverage::ChildTables,
     );
     // All recursive reference tables and root plan have already dropped. The
     // original metadata block survives until this final allocator handle Drop.
