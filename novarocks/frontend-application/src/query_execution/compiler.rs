@@ -1413,12 +1413,8 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     }
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },

@@ -18,12 +18,12 @@
 //! Immutable request state captured exactly once at statement admission.
 // Design: ADR-0011 (docs/adr/ADR-0011-immutable-request-execution-context.md)
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use crate::api::BackendTopologySnapshot;
 use crate::cancellation::QueryCancellationView;
 use crate::request_session::RequestSessionContext;
-use novarocks_sql::compiler::SessionOptimizerSettings;
+use novarocks_sql::compiler::{SessionOptimizerSettings, SqlFoldDependencyObserver};
 use novarocks_types::ClusterRole;
 
 /// All inputs accepted at the frontend statement-admission boundary.
@@ -80,6 +80,7 @@ pub struct StatementAdmissionContext {
     role: ClusterRole,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
+    fold_dependency_observer: Option<Arc<dyn SqlFoldDependencyObserver>>,
 }
 
 impl StatementAdmissionContext {
@@ -102,24 +103,50 @@ impl StatementAdmissionContext {
             role,
             deadline,
             cancellation,
+            fold_dependency_observer: None,
         }
+    }
+
+    /// Attach the admitted statement's observer without changing its control facts.
+    pub fn with_fold_dependency_observer(
+        mut self,
+        observer: Arc<dyn SqlFoldDependencyObserver>,
+    ) -> Self {
+        self.fold_dependency_observer = Some(observer);
+        self
+    }
+
+    /// Borrow the same query-owned observer; absence preserves the original path.
+    pub fn fold_dependency_observer(&self) -> Option<&Arc<dyn SqlFoldDependencyObserver>> {
+        self.fold_dependency_observer.as_ref()
+    }
+
+    /// Retain an already admitted observer across a topology/retry projection.
+    pub fn with_optional_fold_dependency_observer(
+        mut self,
+        observer: Option<Arc<dyn SqlFoldDependencyObserver>>,
+    ) -> Self {
+        self.fold_dependency_observer = observer;
+        self
     }
 
     /// Derive the compiler/coordinator projection for exactly one frozen
     /// topology round.  Semantic session state, deadline, and cancellation
     /// identity remain those admitted for the original statement.
     pub fn for_topology(&self, topology: BackendTopologySnapshot) -> RequestContext {
-        RequestContext::new(
-            self.session.clone(),
-            QueryExecutionContext::new(
-                self.role,
-                topology,
-                self.deadline,
-                self.cancellation.clone(),
-                self.session.optimizer_settings().clone(),
-                self.session.sql_semantics().clone(),
-            ),
-        )
+        let execution = QueryExecutionContext::new(
+            self.role,
+            topology,
+            self.deadline,
+            self.cancellation.clone(),
+            self.session.optimizer_settings().clone(),
+            self.session.sql_semantics().clone(),
+        );
+        let execution = match &self.fold_dependency_observer {
+            Some(observer) => execution.with_fold_dependency_observer(Arc::clone(observer)),
+            None => execution,
+        };
+        RequestContext::new(self.session.clone(), execution)
     }
 
     pub fn session(&self) -> &RequestSessionContext {
@@ -154,6 +181,7 @@ pub struct QueryExecutionContext {
     cancellation: QueryCancellationView,
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+    fold_dependency_observer: Option<Arc<dyn SqlFoldDependencyObserver>>,
 }
 
 impl QueryExecutionContext {
@@ -178,7 +206,22 @@ impl QueryExecutionContext {
             cancellation,
             optimizer_settings,
             sql_semantics,
+            fold_dependency_observer: None,
         }
+    }
+
+    /// Attach the admitted statement's observer without changing its control facts.
+    pub fn with_fold_dependency_observer(
+        mut self,
+        observer: Arc<dyn SqlFoldDependencyObserver>,
+    ) -> Self {
+        self.fold_dependency_observer = Some(observer);
+        self
+    }
+
+    /// Borrow the same query-owned observer; absence preserves the original path.
+    pub fn fold_dependency_observer(&self) -> Option<&Arc<dyn SqlFoldDependencyObserver>> {
+        self.fold_dependency_observer.as_ref()
     }
 
     pub const fn role(&self) -> ClusterRole {
@@ -223,6 +266,15 @@ pub struct RequestContext {
 impl RequestContext {
     pub fn new(session: RequestSessionContext, execution: QueryExecutionContext) -> Self {
         Self { session, execution }
+    }
+
+    /// Attach only this request's diagnostic observer; session facts remain admitted.
+    pub fn with_fold_dependency_observer(
+        mut self,
+        observer: Arc<dyn SqlFoldDependencyObserver>,
+    ) -> Self {
+        self.execution = self.execution.with_fold_dependency_observer(observer);
+        self
     }
 
     /// Freeze one statement's context.

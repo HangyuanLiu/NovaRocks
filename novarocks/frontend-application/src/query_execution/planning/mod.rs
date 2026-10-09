@@ -55,10 +55,14 @@ pub fn sql_cancellation_observation(
 pub(crate) fn sql_compile_control_from_execution(
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
 ) -> novarocks_sql::compiler::SqlCompileControl {
-    novarocks_sql::compiler::SqlCompileControl::new(
+    let control = novarocks_sql::compiler::SqlCompileControl::new(
         execution.deadline(),
         sql_cancellation_observation(execution.cancellation().clone()),
-    )
+    );
+    match execution.fold_dependency_observer() {
+        Some(observer) => control.with_fold_dependency_observer(Arc::clone(observer)),
+        None => control,
+    }
 }
 
 struct ConnectorCancellationObservation {
@@ -135,6 +139,66 @@ mod tests {
         assert_eq!(
             control.checkpoint(CompilePhase::Validate, 0),
             Err(CompileControlError::DeadlineExceeded)
+        );
+    }
+}
+
+#[cfg(test)]
+mod dependency_projection_tests {
+    use super::sql_compile_control_from_execution;
+    use novarocks_query_application::{
+        admitted_query_context::QueryExecutionContext,
+        api::BackendTopologySnapshot,
+        cancellation::{QueryCancellationReason, QueryCancellationSource},
+    };
+    use novarocks_sql::compiler::{
+        SessionOptimizerSettings, SqlFoldDependencyInput, SqlFoldDependencyObserver,
+        SqlFoldEvaluationOutcome,
+    };
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct Observer;
+    impl SqlFoldDependencyObserver for Observer {
+        fn before_fold_dependency_observed(
+            &self,
+            _: SqlFoldDependencyInput<'_>,
+            _: &dyn PureCompileControl,
+        ) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+        fn after_fold_dependency_observed(
+            &self,
+            _: SqlFoldDependencyInput<'_>,
+            _: SqlFoldEvaluationOutcome<'_>,
+        ) {
+        }
+    }
+
+    #[test]
+    fn sql_dependency_execution_projector_keeps_original_deadline_and_cancellation() {
+        let cancellation = QueryCancellationSource::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let context = QueryExecutionContext::new(
+            novarocks_types::ClusterRole::Fe,
+            BackendTopologySnapshot::empty(3),
+            Some(deadline),
+            cancellation.view(),
+            SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .with_fold_dependency_observer(Arc::new(Observer));
+        let control = sql_compile_control_from_execution(&context);
+        assert_eq!(control.deadline(), Some(deadline));
+        assert_eq!(
+            control.checkpoint(CompilePhase::CarrierPreflight, 0),
+            Ok(())
+        );
+        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        assert_eq!(
+            control.checkpoint(CompilePhase::CarrierPreflight, 0),
+            Err(CompileControlError::Cancelled)
         );
     }
 }

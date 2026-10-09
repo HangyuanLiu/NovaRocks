@@ -363,12 +363,8 @@ fn bind_incremental_write_dataflow(
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_mv_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalRefreshAnalyzeContext {
  emission_mode:query_kernel.static_plan_carrier().sql_emission_mode(),
@@ -467,12 +463,8 @@ fn bind_incremental_write_dataflow(
                 base_overlays,
             );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
  emission_mode:query_kernel.static_plan_carrier().sql_emission_mode(),

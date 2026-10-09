@@ -425,12 +425,8 @@ fn compile_dml_change_stream_write(
         );
     }
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
@@ -3025,12 +3021,8 @@ fn execute_exact_cow_match_query(
             state.catalog_application().map(Arc::as_ref),
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,

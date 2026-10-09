@@ -38,7 +38,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
 };
-use crate::query_execution::planning::sql_cancellation_observation;
+use crate::query_execution::planning::sql_compile_control_from_execution;
 use crate::query_execution::planning::time_travel::{
     TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
 };
@@ -55,8 +55,8 @@ use novarocks_query_application::view::ViewRequestContext;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
-    ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent,
-    SqlCompiler, SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    ExplainLevel, SqlAnalyzeRequest, SqlCompileError, SqlCompileIntent, SqlCompiler,
+    SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
 use novarocks_sql::planning::catalog::TableLookupMode;
 
@@ -541,10 +541,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
             self.query.static_plan_carrier().sql_emission_mode(),
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
@@ -629,10 +626,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
             self.query.static_plan_carrier().sql_emission_mode(),
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
@@ -774,10 +768,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
             self.query.static_plan_carrier().sql_emission_mode(),
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
@@ -862,6 +853,9 @@ impl FrontendQueryCompiler {
                         execution.cancellation().clone(),
                         execution.optimizer_settings().clone(),
                         execution.sql_semantics().clone(),
+                    )
+                    .with_optional_fold_dependency_observer(
+                        execution.fold_dependency_observer().cloned(),
                     ),
                     profile_plan: plan,
                     profile_annotations: annotations,
@@ -897,10 +891,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::constant_eval::constant_evaluator(),
             mv_definitions,
             self.constant_policy(),
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            sql_compile_control_from_execution(execution),
         ))
     }
 

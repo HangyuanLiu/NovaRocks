@@ -295,12 +295,8 @@ fn bind_first_refresh_write_dataflow(
                     ),
                 );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = analyze_mv_first_refresh_connector_write(
                 physical_sql,
                 SqlMvFirstRefreshAnalyzeContext {
@@ -404,12 +400,8 @@ fn bind_first_refresh_write_dataflow(
                 frozen_base_overlays,
             );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed =
                 analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
                     emission_mode: query_kernel.static_plan_carrier().sql_emission_mode(),

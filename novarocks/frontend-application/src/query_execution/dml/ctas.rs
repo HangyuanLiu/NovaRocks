@@ -633,12 +633,8 @@ fn plan_query_for_ctas_source(
     let table_bindings = analyzer_provider.query_table_bindings();
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
