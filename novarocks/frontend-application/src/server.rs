@@ -26,6 +26,8 @@ use tracing::info;
 
 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
 mod exact_mysql_write_fixture;
+#[cfg(feature = "mem-1-m07-root-observation")]
+mod root_observation_identity;
 
 use crate::capabilities as core_capabilities;
 use crate::workload_lifecycle::{
@@ -922,7 +924,10 @@ where
         }
     };
     let server_result = run_mysql_with_listener_supervision(
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-root-observation"
+        ))]
         Arc::clone(&config.native_trust),
         config.mysql_listener,
         session_factory,
@@ -950,7 +955,11 @@ where
 }
 
 async fn run_mysql_with_listener_supervision<F>(
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")] native_trust: Arc<NativeTrust>,
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-root-observation"
+    ))]
+    native_trust: Arc<NativeTrust>,
     mysql_listener: ResolvedMysqlListenerSettings,
     session_factory: Arc<dyn QuerySessionFactory>,
     client_connections: Arc<MysqlClientConnectionRegistry>,
@@ -964,6 +973,8 @@ async fn run_mysql_with_listener_supervision<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    root_observation_identity::emit(&native_trust)?;
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     if let Some(fixture) = exact_mysql_write_fixture::bind_from_environment(&native_trust)? {
         return exact_mysql_write_fixture::serve(
@@ -1180,9 +1191,15 @@ fn combine_server_and_shutdown(
         (Err(server_error), Ok(())) => Err(server_error),
         (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
         (Err(server_error), Err(shutdown_error)) => {
-            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-root-observation"
+            ))]
             return Err(server_error.with_role_cleanup(shutdown_error));
-            #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
+            #[cfg(not(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-root-observation"
+            )))]
             Err(server_error.with_cleanup_context(shutdown_error))
         }
     }

@@ -22,6 +22,7 @@ mod exact_mysql_fixture_exit;
 mod exact_mysql_fixture_identity;
 #[cfg(unix)]
 mod exact_mysql_fixture_sources;
+mod root_observation_identity;
 
 pub use effective_launch_config::EffectiveLaunchConfigEvidence;
 pub mod delayed_s3;
@@ -4120,6 +4121,16 @@ impl CrossProcessServerHandle {
     ) -> Result<novarocks_types::FrontendProcessId> {
         self.with_original_frontend_log_snapshot(original_deadline, |reader, length| {
             exact_mysql_fixture_identity::scan(reader, length, original_deadline)
+        })
+    }
+    /// Neutral, selected stdout source; never falls back to an exact gate marker.
+    #[cfg(unix)]
+    pub fn original_root_observation_frontend_identity(
+        &self,
+        deadline: Instant,
+    ) -> Result<novarocks_types::FrontendProcessId> {
+        self.with_original_frontend_log_snapshot(deadline, |reader, length| {
+            root_observation_identity::scan(reader, length, deadline)
         })
     }
     /// Explicit fixture-only success gate, using the original four role owners.

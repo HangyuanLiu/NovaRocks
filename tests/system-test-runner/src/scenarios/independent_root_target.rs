@@ -47,7 +47,13 @@ struct LogDelta {
     markers: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FrontendIdentitySource {
+    ExactMysqlFixture,
+    RootObservation,
+}
 pub(crate) struct IndependentRootObserver {
+    source: FrontendIdentitySource,
     original_deadline: Instant,
     expected_frontend: FrontendProcessId,
     actual_backends: [BackendProcessId; BACKENDS],
@@ -81,6 +87,20 @@ impl IndependentRootObserver {
         expected_frontend: FrontendProcessId,
     ) -> Result<Self> {
         let original_deadline = context.exact_mysql_deadline()?;
+        Self::capture_baseline_until(
+            context,
+            expected_frontend,
+            original_deadline,
+            FrontendIdentitySource::ExactMysqlFixture,
+        )
+    }
+    pub(crate) fn capture_baseline_until(
+        context: &mut ScenarioContext,
+        expected_frontend: FrontendProcessId,
+        original_deadline: Instant,
+        source: FrontendIdentitySource,
+    ) -> Result<Self> {
+        before_deadline(original_deadline)?;
         let original_roles = context.recheck_live_process_launch_identities()?;
         ensure!(
             original_roles.len() == BACKENDS + 1,
@@ -96,6 +116,7 @@ impl IndependentRootObserver {
         );
         before_deadline(original_deadline)?;
         Ok(Self {
+            source,
             original_deadline,
             expected_frontend,
             actual_backends,
@@ -106,10 +127,24 @@ impl IndependentRootObserver {
     /// Call once the original gate is actually held, before cancellation/health SQL.
     /// This emits no SQL target, Root RPC, proxy, registry entry, ACK or authority.
     pub(crate) fn observe(&self, context: &mut ScenarioContext) -> Result<IndependentRootTarget> {
+        self.observe_until(context, self.original_deadline)
+    }
+    pub(crate) fn observe_until(
+        &self,
+        context: &mut ScenarioContext,
+        step_deadline: Instant,
+    ) -> Result<IndependentRootTarget> {
         ensure!(
-            context.exact_mysql_deadline()? == self.original_deadline,
-            "root observer was given a different original clock"
+            step_deadline <= self.original_deadline,
+            "root observer step renews original clock"
         );
+        before_deadline(step_deadline)?;
+        if matches!(self.source, FrontendIdentitySource::ExactMysqlFixture) {
+            ensure!(
+                context.exact_mysql_deadline()? == self.original_deadline,
+                "root observer was given a different original exact clock"
+            );
+        }
         ensure!(
             context.recheck_live_process_launch_identities()? == self.original_roles,
             "original role instance changed before root observation"
@@ -117,11 +152,11 @@ impl IndependentRootObserver {
         ensure!(
             context
                 .handle()
-                .original_exact_mysql_backend_process_ids(self.original_deadline)?
+                .original_exact_mysql_backend_process_ids(step_deadline)?
                 == self.actual_backends,
             "actual live backend descriptor UUID changed"
         );
-        let snapshots = read_logs(context, self.before.map(Some), self.original_deadline)?;
+        let snapshots = read_logs(context, self.before.map(Some), step_deadline)?;
         let target = resolve(
             &snapshots,
             self.expected_frontend,
@@ -132,7 +167,7 @@ impl IndependentRootObserver {
             context.recheck_live_process_launch_identities()? == self.original_roles,
             "original role instance changed during root observation"
         );
-        before_deadline(self.original_deadline)?;
+        before_deadline(step_deadline)?;
         Ok(target)
     }
 }

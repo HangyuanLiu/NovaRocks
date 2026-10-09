@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "09cda0b5450c6339d1837520a3b2c03d5ec195f8",
+  "status": "P09_NEUTRAL_FE_SOURCE_PRELAUNCH_CLOCK_COMPONENT_PASS_NATIVE_OPEN",
+  "source_files": [
+    {
+      "path": "novarocks-server/Cargo.toml",
+      "bytes": 3392,
+      "sha256": "00b86521ae8be59facf1105513ae27510a29d163dc3024295745f6177ca7961e"
+    },
+    {
+      "path": "novarocks-server/src/main.rs",
+      "bytes": 21591,
+      "sha256": "9e6482b0518dd02031703fad6077e42780195958a1b41f0128a5f4cbfd8c5a51"
+    },
+    {
+      "path": "novarocks/frontend-application/Cargo.toml",
+      "bytes": 3009,
+      "sha256": "416c5cc70022caf31197aee220bc329f5e1653a28a10894b8226622aa704a92c"
+    },
+    {
+      "path": "novarocks/frontend-application/src/application.rs",
+      "bytes": 93452,
+      "sha256": "55fa1476e19126a7bf357ee18ef496679b28302fd9827e0e53c40bedb3051668"
+    },
+    {
+      "path": "novarocks/frontend-application/src/server.rs",
+      "bytes": 82676,
+      "sha256": "20fdb3e2412821dbe584d9c368330321d030556dfc00495773937f1ab8ce7f1d"
+    },
+    {
+      "path": "novarocks/frontend-application/src/server/root_observation_identity.rs",
+      "bytes": 4063,
+      "sha256": "b24cea0846c5b72dbf69a34d8fa9dc6c19b4fd1cd11d49963639e476537131ec"
+    },
+    {
+      "path": "tests/cluster-harness/src/lib.rs",
+      "bytes": 309969,
+      "sha256": "34293b4ff244e42addf072be1e629a57bad7bd708a13451dd845e414041b1a6a"
+    },
+    {
+      "path": "tests/cluster-harness/src/root_observation_identity.rs",
+      "bytes": 10170,
+      "sha256": "245b1a4ecb2d5aea28c33afdc77b26ed86cf9088bfb35babe2749cfca737bdc4"
+    },
+    {
+      "path": "tests/system-test-runner/src/runner.rs",
+      "bytes": 40185,
+      "sha256": "94d6a8214f80e6d8f6068084030c528ae965ee59a9a994c84486de29259e91f6"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenario.rs",
+      "bytes": 24649,
+      "sha256": "0f28d55342dc17281195ba5b01f09ac1e6203c07980ac1333b25000cb9449851"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenarios/independent_root_target.rs",
+      "bytes": 29024,
+      "sha256": "61c3a63d0884cc9b36a179359c7ff2a1dc94574b62b65e736bcccce1a0deaf40"
+    }
+  ],
+  "dependency_lock": {
+    "path": "Cargo.lock",
+    "bytes": 190820,
+    "sha256": "329758dab8450639028e5ca6d150f400de0c56930d16154afad0a356823f6e10"
+  },
+  "unchanged_exact_fixture": {
+    "path": "novarocks/mysql-adapter/src/exact_mysql_write_fixture.rs",
+    "bytes": 13235,
+    "sha256": "f82c19a3ed7e13cd9628ce34099a51684da249a8f27a90f84d9243dd43410a5c"
+  },
+  "verification": [
+    {
+      "path": "logs/mem-1-m07/p09-neutral-fe-source-harness-tests-20261009.log",
+      "bytes": 4450,
+      "sha256": "b2527467a198af0697949f3f4016a2f220c63b0904f45945cb3d369f4f4ba53d",
+      "scope": "neutral FE whole-source parser",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 20062,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-root-prelaunch-tests-v2-20261009.log",
+      "bytes": 11900,
+      "sha256": "9a83fe5d695ba8da7cba67d6c9805139db5d002fec2763705cb789e4c5ca166f",
+      "scope": "actual runner prelaunch refusal and original error identities",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 93384,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-source-runner-component-milestone-20261009.log",
+      "bytes": 42872,
+      "sha256": "b66e8898323f9cc4c99d8ad65bf37a25089b8ad22dd0d43ee6738e87a77321e2",
+      "scope": "full runner components including prelaunch tests",
+      "passed": 279,
+      "failed": 0,
+      "ignored": 2,
+      "actual_session": 18043,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-fe-marker-tests-20261009.log",
+      "bytes": 150077,
+      "sha256": "70bc3f5fbc891e87b01a2521cd8570eb1118d1ad8067edb5d02abc17d82175c5",
+      "scope": "neutral-only FE marker emitter",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 6784,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-source-fe-server-both-tests-20261009.log",
+      "bytes": 155275,
+      "sha256": "57ee58cd90aa8ec613251d4bd4bcdfad1e8cb8f1a98eff75eaa2b7e66363ff87",
+      "scope": "FE server tests with both features",
+      "passed": 24,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 95725,
+      "actual_terminal_exit_code": 0
+    }
+  ],
+  "verification_overlap": "The 279 runner components include the three new prelaunch tests; FE 24 includes the two marker tests. Counts are not summed.",
+  "non_test_checks": [
+    {
+      "path": "logs/mem-1-m07/p09-neutral-source-server-feature-check-20261009.log",
+      "bytes": 184321,
+      "sha256": "2f3ea94089c81a9d98293238ffa3277b3efe6390bc07202e3f3c1904aca49a66",
+      "scope": "non-test Server lib and binary, neutral only",
+      "actual_session": 29010,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-source-server-both-feature-check-20261009.log",
+      "bytes": 187224,
+      "sha256": "8a57b8db0bb118db0a93aabc2318df1c4292a52a0a38a743828ca56b4659c993",
+      "scope": "non-test Server lib and binary, both features",
+      "actual_session": 16771,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-source-server-default-check-20261009.log",
+      "bytes": 184321,
+      "sha256": "a204586eb09de4892cca8e21442059c4fc3098703a00d75d11f3afc39ffd3bd5",
+      "scope": "non-test Server lib and binary, default",
+      "actual_session": 2339,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-source-runner-check-20261009.log",
+      "bytes": 22831,
+      "sha256": "bb8a76cbca8986bee5bf851da14d55cb98113ab3364379ee147a98be2d66f14e",
+      "scope": "non-test system runner",
+      "actual_session": 79551,
+      "actual_terminal_exit_code": 0
+    }
+  ],
+  "format_check": {
+    "path": "logs/mem-1-m07/p09-neutral-source-fmt-check-v2-20261009.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actual_session": 77267,
+    "actual_terminal_exit_code": 0
+  },
+  "preserved_initial_failures": [
+    {
+      "path": "logs/mem-1-m07/p09-neutral-root-prelaunch-tests-20261009.log",
+      "bytes": 74,
+      "sha256": "207b9f7b95e864e7990aff7e7d79d0c0e71e110c67895e99ff8f1ec426c50101",
+      "actual_terminal_exit_code": 101,
+      "cause": "The package is binary-only; --lib was rejected before compilation or tests. The corrected bin command passed."
+    },
+    {
+      "path": "logs/mem-1-m07/p09-neutral-source-fmt-check-20261009.log",
+      "bytes": 501,
+      "sha256": "77a17010b291d60786807384d6aba89d7a3ddf77ee668af38f64206960e7729e",
+      "actual_session": 18959,
+      "actual_terminal_exit_code": 1,
+      "cause": "A corrected Display assertion needed rustfmt wrapping; formatting was applied and the check passed."
+    }
+  ],
+  "draft_and_review_provenance": [
+    {
+      "path": "logs/mem-1-m07/late-ack-held-native-scene-draft-v1/part-a.patch",
+      "bytes": 30912,
+      "sha256": "740df805eda2e7107c2fcdadb2527d8f8dd79c6f0d35a1ab2aa1232143d3c020"
+    },
+    {
+      "path": "logs/mem-1-m07/late-ack-held-native-scene-draft-v1/part-a-v1-to-v2.patch",
+      "bytes": 3341,
+      "sha256": "76f2e7ef35d03691d95d516d9dd8794a1bbe0068b3b9ccab92991df2bc2a57e6"
+    },
+    {
+      "path": "logs/mem-1-m07/late-ack-held-native-scene-draft-v1/part-a-v2-display-correction.patch",
+      "bytes": 157,
+      "sha256": "914ecca731232873c1f65cad76321b6d06bd589933ab922606481bc04a226bf7"
+    },
+    {
+      "path": "logs/mem-1-m07/late-ack-part-a-independent-review-v1/review.md",
+      "bytes": 9357,
+      "sha256": "9ac5b423b5973f6b78bbe1b7376c0d8c11c46400aed9a6414d8d7f5b2d6517e7"
+    },
+    {
+      "path": "logs/mem-1-m07/late-ack-part-a-independent-review-v1/review-pins.json",
+      "bytes": 3300,
+      "sha256": "10395e9e58664a6ddbfcab21dd93c2d9178d2e7eea5119a97c02d0e0ab00c1d0"
+    },
+    {
+      "path": "logs/mem-1-m07/late-ack-part-a-independent-review-v2/review.md",
+      "bytes": 5686,
+      "sha256": "4f49fe163d6cb9967ece67eeeaa4ac3a4d7290d19caa7ac311a7073088b72b29"
+    },
+    {
+      "path": "logs/mem-1-m07/late-ack-part-a-independent-review-v2/review-pins.json",
+      "bytes": 4579,
+      "sha256": "e4bbf75ff30118c06dab7feb7de0da0111560e1a5192731f36cf0f3434f8ec23"
+    }
+  ],
+  "behavior": [
+    "Default-off neutral observation emits the original NativeTrust Frontend identity at the original MySQL supervision entry; no second UUID, Hub or listener is created.",
+    "The original managed FE durable-log source is checked before and after its bounded visitor, including original process birth and file identity.",
+    "Whole-source scanning rejects embedded, duplicate, malformed, truncated or overlong reserved candidates; no old exact marker fallback exists.",
+    "One scenario absolute deadline is consumed before first role spawn; exact and neutral clocks cannot be combined.",
+    "Actual prelaunch rejection retains original primary and teardown error objects and calls teardown exactly once.",
+    "Private finite Debug/Display wrappers preserve the original marker IO source; formatter-panic canaries verify that source is not formatted.",
+    "The original exact fixture finish gate and all four exact error source slots remain unchanged; neutral scenarios use original ordinary role shutdown."
+  ],
+  "component_boundary": [
+    "Parser, emitter, actual prelaunch negatives and non-test checks do not prove a successful Native launch, actual stdout emission or a held-response scene.",
+    "Original synchronous startup/source operations have deadline checks before and after; no claim of physical 20-second syscall preemption is made.",
+    "The runner writes intermediate artifacts before its final clock check; actual terminal exit zero plus independent final verification remain mandatory.",
+    "No stock services or Native roles were started in this slice; build-identity binary diagnostics and clean-source input admission remain unexecuted."
+  ],
+  "remaining_open": [
+    "Integrate the concrete held-response scene, owned probe settlement, executable input and original source/build/binary/feature admission.",
+    "Actual same-context positive BE holders, seal then two late ACK-only consumed-one replies accepted-zero, actual response owner settle, original MySQL recovery and four-role exit.",
+    "Full Closing64, complete allocator backing/fixed-core/last-alias, other P07/P08/P09/P00b/P10 and final same-SHA gates."
+  ],
+  "profile": "dev unoptimized; CARGO_BUILD_JOBS=1; CARGO_INCREMENTAL=0; --test-threads=1",
+  "native_or_stock_services_started_in_this_slice": 0,
+  "hms_non_readonly_correctness": "EXCLUDED_BY_USER_IRU7_SCOPE",
+  "publish_authorized": false,
+  "goal_complete": false
+}

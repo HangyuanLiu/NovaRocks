@@ -132,10 +132,21 @@ pub enum FrontendApplicationErrorKind {
     Shutdown,
 }
 
+#[cfg(feature = "mem-1-m07-root-observation")]
+struct RootObservationIoSource(std::io::Error);
+#[cfg(feature = "mem-1-m07-root-observation")]
+impl fmt::Debug for RootObservationIoSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OriginalRootObservationIo { source_retained: true }")
+    }
+}
+
 #[derive(Debug)]
 pub struct FrontendApplicationError {
     kind: FrontendApplicationErrorKind,
     message: String,
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    root_observation_io: Option<Box<RootObservationIoSource>>,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     fixture_failures: [Option<
         Box<novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixtureError>,
@@ -147,6 +158,8 @@ impl FrontendApplicationError {
         Self {
             kind,
             message: error.to_string(),
+            #[cfg(feature = "mem-1-m07-root-observation")]
+            root_observation_io: None,
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             fixture_failures: std::array::from_fn(|_| None),
         }
@@ -164,10 +177,26 @@ impl FrontendApplicationError {
         result.fixture_failures[0] = Some(Box::new(error));
         result
     }
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    pub(crate) fn server_root_observation(error: std::io::Error) -> Self {
+        let mut result = Self::server("root observation stdout IO failed");
+        result.root_observation_io = Some(Box::new(RootObservationIoSource(error)));
+        result
+    }
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-root-observation"
+    ))]
     pub(crate) fn with_role_cleanup(mut self, cleanup: Self) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup}"));
+        #[cfg(feature = "mem-1-m07-root-observation")]
+        if let Some(source) = cleanup.root_observation_io {
+            // Only the one startup emission can supply this original IO source.
+            assert!(self.root_observation_io.is_none());
+            self.root_observation_io = Some(source);
+        }
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         for source in cleanup.fixture_failures.into_iter().flatten() {
             // The fixture has exactly four possible verdict stages: control,
             // socket cleanup, registry verification and original-owner finish.
@@ -201,6 +230,10 @@ impl fmt::Display for FrontendApplicationError {
 
 impl std::error::Error for FrontendApplicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(feature = "mem-1-m07-root-observation")]
+        if let Some(error) = &self.root_observation_io {
+            return Some(&error.0);
+        }
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         if let Some(error) = self.fixture_failures.iter().flatten().next() {
             return Some(error.as_ref());

@@ -164,15 +164,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let launch_config = match scenario.launch_config(&scenario_root) {
         Ok(config) => config,
         Err(error) => {
-            return match scenario.teardown() {
-                Ok(()) => Err(error).with_context(|| {
-                    format!("prepare launch configuration for {}", scenario.name())
-                }),
-                Err(teardown) => Err(anyhow::anyhow!(
-                    "prepare launch configuration for {} failed: {error:#}; fixture teardown failed: {teardown:#}",
-                    scenario.name()
-                )),
-            };
+            return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
         }
     };
     // The explicit FE-child fixture pair is the existing activation contract.
@@ -185,13 +177,27 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
         }
     };
+    let root_observation_clock = match scenario.root_observation_deadline() {
+        Ok(clock) => clock,
+        Err(error) => return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown()),
+    };
+    if exact_mysql_clock.is_some() && root_observation_clock.is_some() {
+        return finish_exact_mysql_scenario(
+            Some(anyhow::anyhow!(
+                "neutral root source cannot activate an exact MySQL gate owner"
+            )),
+            Ok(()),
+            scenario.teardown(),
+        );
+    }
+    let bounded_original = exact_mysql_clock.is_some() || root_observation_clock.is_some();
     let uea1_preparation_diagnostic_secret = launch_config
         .child_environment
         .fe
         .get("NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET")
         .cloned();
     let preparation = (|| -> Result<_> {
-        if exact_mysql_clock.is_some() {
+        if bounded_original {
             crate::scenario::ExactMysqlPrelaunchClock::validate_launch(
                 config.launch_profile,
                 config.cluster_size,
@@ -213,7 +219,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     })();
     let (fe_binary, be_binaries) = match preparation {
         Ok(binaries) => binaries,
-        Err(error) if exact_mysql_clock.is_some() => {
+        Err(error) if bounded_original => {
             return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
         }
         Err(error) => return Err(error),
@@ -264,6 +270,36 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
                 Ok(())
             },
         )
+    } else if let Some(deadline) = root_observation_clock {
+        if launch_config.native_root_reply_fault.is_some()
+            || !launch_config
+                .native_fault_proxies
+                .backend_retained_byte_limits
+                .is_empty()
+        {
+            return finish_exact_mysql_scenario(
+                Some(anyhow::anyhow!(
+                    "neutral original source requires direct original roles"
+                )),
+                Ok(()),
+                scenario.teardown(),
+            );
+        }
+        CrossProcessServerHandle::launch_with_exact_mysql_prelaunch_check(
+            cluster_options,
+            &|artifact| {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "neutral original prelaunch clock expired"
+                );
+                scenario.freeze_prepared_exact_config(artifact, &scenario_root, deadline)?;
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "neutral original prepared freeze was late"
+                );
+                Ok(())
+            },
+        )
     } else {
         match launch_config.native_root_reply_fault {
             Some(root_fault) => CrossProcessServerHandle::launch_with_native_root_reply_fault(
@@ -281,7 +317,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let handle = match handle {
         Ok(handle) => handle,
         Err(error) => {
-            if exact_mysql_clock.is_some() {
+            if bounded_original {
                 return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
             }
             return match scenario.teardown() {
@@ -313,7 +349,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         context.retain_artifacts();
         let evidence_path = match context.write_evidence(ScenarioEvidenceOutcome::Failed) {
             Ok(path) => path.display().to_string(),
-            Err(_) if exact_mysql_clock.is_some() => {
+            Err(_) if bounded_original => {
                 "unavailable (exact fixture evidence write failed)".to_string()
             }
             Err(evidence_error) => format!("unavailable ({evidence_error:#})"),
@@ -358,7 +394,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             context.shutdown()
         };
         let fixture_cleanup = scenario.teardown();
-        if exact_mysql_clock.is_some() {
+        if bounded_original {
             return finish_exact_mysql_scenario(
                 Some(
                     result
@@ -396,7 +432,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     }
     .with_context(|| format!("cleanup system scenario {}", context.name()));
     let fixture_cleanup = scenario.teardown();
-    if exact_mysql_clock.is_some() {
+    if bounded_original {
         finish_exact_mysql_scenario(None, cluster_cleanup, fixture_cleanup)?;
     } else {
         match (cluster_cleanup, fixture_cleanup) {
@@ -419,6 +455,12 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         .with_context(|| format!("write passing scenario evidence for {}", context.name()))?;
     if let Some(clock) = exact_mysql_clock {
         clock.remaining("settled original role and final evidence completion")?;
+    }
+    if let Some(deadline) = root_observation_clock {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "neutral original role cleanup and final evidence exceeded prelaunch clock"
+        );
     }
     println!(
         "scenario={} PASS evidence={}",
@@ -833,6 +875,183 @@ mod exact_mysql_prelaunch_teardown_tests {
                 failure.primary.is_some() && failure.cluster.is_none() && failure.fixture.is_none()
             );
             assert_eq!(teardowns, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod neutral_root_prelaunch_tests {
+    use super::*;
+    use crate::scenario::{ScenarioBinary, ScenarioLaunchConfig};
+    use novarocks_cluster_harness::LaunchProfile;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        LaunchFailure,
+        ClockFailure,
+        BothClocks,
+        Neutral,
+    }
+    #[derive(Debug)]
+    struct OriginalSource(Arc<u8>);
+    impl std::fmt::Display for OriginalSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original prelaunch component source")
+        }
+    }
+    impl std::error::Error for OriginalSource {}
+    struct Fixture {
+        mode: Mode,
+        clock: Mutex<Option<Instant>>,
+        primary: Arc<u8>,
+        secondary: Arc<u8>,
+        teardowns: AtomicUsize,
+    }
+    impl Fixture {
+        fn new(mode: Mode) -> Self {
+            Self {
+                mode,
+                clock: Mutex::new(None),
+                primary: Arc::new(7),
+                secondary: Arc::new(9),
+                teardowns: AtomicUsize::new(0),
+            }
+        }
+        fn error(source: &Arc<u8>) -> anyhow::Error {
+            std::io::Error::other(OriginalSource(source.clone())).into()
+        }
+    }
+    impl Scenario for Fixture {
+        fn name(&self) -> &'static str {
+            "component/neutral-prelaunch-refusal"
+        }
+        fn launch_config(&self, _: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+            if matches!(self.mode, Mode::LaunchFailure) {
+                return Err(Self::error(&self.primary));
+            }
+            let mut clock = self.clock.lock().unwrap();
+            assert!(clock.is_none());
+            *clock = Some(Instant::now() + Duration::from_secs(20));
+            let mut config = ScenarioLaunchConfig::default();
+            // An absent compatible binary makes any missed early guard fail at
+            // a different branch without ever starting a role.
+            config.binary_layout.frontend = ScenarioBinary::Compatible;
+            if matches!(self.mode, Mode::BothClocks) {
+                config.child_environment.fe.insert(
+                    "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_SOCKET".into(),
+                    "unused-private-path".into(),
+                );
+                config.child_environment.fe.insert(
+                    "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX".into(),
+                    "synthetic-only".into(),
+                );
+            }
+            Ok(config)
+        }
+        fn root_observation_deadline(&self) -> Result<Option<Instant>> {
+            if matches!(self.mode, Mode::ClockFailure) {
+                return Err(Self::error(&self.primary));
+            }
+            Ok(*self.clock.lock().unwrap())
+        }
+        fn run(&self, _: &mut ScenarioContext) -> Result<()> {
+            panic!("prelaunch refusal must never enter a role-backed scenario");
+        }
+        fn teardown(&self) -> Result<()> {
+            self.teardowns.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.mode, Mode::LaunchFailure | Mode::ClockFailure) {
+                Err(Self::error(&self.secondary))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn configuration(root: &std::path::Path) -> RunnerConfig {
+        RunnerConfig {
+            binary: root.join("no-binary"),
+            compatible_binary: None,
+            other_island_binary: None,
+            base_config_path: root.join("no-config"),
+            artifact_root: root.into(),
+            cluster_size: 3,
+            timeout: Duration::from_secs(20),
+            launch_profile: LaunchProfile::FaultScenario,
+            uea1_workload_manifest: None,
+            exact_mysql_execution_binding: None,
+        }
+    }
+    fn assert_source(error: &anyhow::Error, expected: &Arc<u8>) {
+        let io = error.downcast_ref::<std::io::Error>().unwrap();
+        let source = io
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<OriginalSource>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&source.0, expected));
+    }
+    #[test]
+    fn actual_launch_and_clock_errors_retain_both_original_sources_and_teardown_once() {
+        let root =
+            std::env::temp_dir().join(format!("novarocks-neutral-source-{}", std::process::id()));
+        for mode in [Mode::LaunchFailure, Mode::ClockFailure] {
+            let fixture = Fixture::new(mode);
+            let outcome = run_one(&fixture, &configuration(&root));
+            let cleanup = std::fs::remove_dir_all(&root);
+            assert!(cleanup.is_ok());
+            let error = outcome.unwrap_err();
+            let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
+            assert_source(failure.primary.as_ref().unwrap(), &fixture.primary);
+            assert_source(failure.fixture.as_ref().unwrap(), &fixture.secondary);
+            assert!(failure.cluster.is_none());
+            assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[test]
+    fn conflicting_neutral_and_exact_clocks_refuse_before_binary_resolution() {
+        let root =
+            std::env::temp_dir().join(format!("novarocks-neutral-conflict-{}", std::process::id()));
+        let fixture = Fixture::new(Mode::BothClocks);
+        let outcome = run_one(&fixture, &configuration(&root));
+        let cleanup = std::fs::remove_dir_all(&root);
+        assert!(cleanup.is_ok());
+        let error = outcome.unwrap_err();
+        let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
+        assert!(
+            failure
+                .primary
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("neutral root source cannot activate")
+        );
+        assert!(failure.cluster.is_none() && failure.fixture.is_none());
+        assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn neutral_topology_and_binary_refusals_keep_one_original_teardown() {
+        let root =
+            std::env::temp_dir().join(format!("novarocks-neutral-topology-{}", std::process::id()));
+        for (profile, count) in [
+            (LaunchProfile::FaultScenario, 2),
+            (LaunchProfile::Performance, 3),
+            (LaunchProfile::FaultScenario, 3),
+        ] {
+            let fixture = Fixture::new(Mode::Neutral);
+            let mut config = configuration(&root);
+            config.launch_profile = profile;
+            config.cluster_size = count;
+            let outcome = run_one(&fixture, &config);
+            let cleanup = std::fs::remove_dir_all(&root);
+            assert!(cleanup.is_ok());
+            let error = outcome.unwrap_err();
+            let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
+            assert!(
+                failure.primary.is_some() && failure.cluster.is_none() && failure.fixture.is_none()
+            );
+            assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
         }
     }
 }

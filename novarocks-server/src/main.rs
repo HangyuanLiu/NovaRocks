@@ -508,6 +508,15 @@ fn main() {
         );
         return;
     }
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    if args.as_slice() == ["--mem-1-m07-root-observation-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_BUILD commit={} build_identity={} root_observation=true",
+            novarocks_version::build_git_commit(),
+            novarocks_version::native_build_identity()
+        );
+        return;
+    }
     if args
         .first()
         .is_none_or(|command| command == "--help" || command == "-h")

@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [features]
+mem-1-m07-root-observation = []
 mem-1-m07-exact-mysql-write = ["novarocks-mysql-adapter/mem-1-m07-exact-mysql-write"]
 
 [dependencies]

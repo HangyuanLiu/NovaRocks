@@ -159,3 +159,12 @@ clean `1fb1319df` 的原 x S−1/S/S+1、wide q17 S+1缺尾、tiny1..6，十个�
 actual admission13 PASS、内部3 PASS，feature catalog80 PASS/default catalog67 PASS，均0FAIL/0ignored/terminal0；前两filter包含在80中，不累加。feature非test connectorlib与默认Serverlib+binarycheck、fmt/diffcheckPASS。收据 `docs/testing/mem-1-m07/evidence/p06s-hms-sdk-object-observer-components-20261009.json` pin实际七source/lock、原draft/v1/v2独立review和初始失败/最终通过logs；dev unoptimized/jobs1/incremental0/threads1。旧draft/失败和review bytes不覆盖。
 
 这些是NO-I/O generic future/catalog组件，不是stock Java、真实Thrift或Native HMS退出证明。observer UUID只识别allocation，非原ConnectorControlBinding instance/epoch/FE/QueryExecutionId；每snapshot独立持1024heap records，真实导出owner必须限制并存份数和persist-before-idle-reset。实际FE/generation/request-stop关联、有界出口/phase精确调用预算、原32×512table＋512trueview/clients1,8,16 Native大CL/SDK8取消恢复/四role退出仍OPEN；SDK对象Drop不冒充RPC/连接/返回body最后alias。本slice Native/stock服务0；heldlateACK/fullClosing64/backing/P08/P00b/P09/P10/final及两人工语义门不闭合，无push/PR/归档。
+
+
+### 2026-10-09：P09 独立 FE 身份与启动前时钟接线组件 PASS
+
+前一 HMS observer 检查点为 `09cda0b5450c6339d1837520a3b2c03d5ec195f8`。新增 default-off `mem-1-m07-root-observation` 从原 NativeTrust 输出真实 Frontend UUID，原 FE managed durable log 保持 birth/file identity 前后核对；whole-source reserved-stem scanner 拒绝嵌入、重复、截断和超长候选，不借旧 exact marker。场景一次 absolute clock 在首个 role spawn 前消费，与 exact clock 互斥；原 exact Hub finish 和四 error 槽不改，neutral 用普通原 role shutdown。
+
+实际 marker IO 保原 io::Error，私有有限 Debug/Display wrapper 经 source formatter-panic canary 验证；实际 run_one 的 launch_config/clock 拒绝保原 primary＋teardown Arc 身份，teardown 一次。scanner6 PASS、新 runner 反例3 PASS、runner全组件279 PASS/0FAIL/2既有ignored、neutral marker2 PASS、双feature FE server24 PASS/0FAIL/0ignored；重叠计数不累加。non-test Server default/neutral/both 三配置与runner check、fmt/diff-check PASS。初次错误 --lib 调用在编译前拒绝和fmt单行换行失败均保留原日志。收据 `docs/testing/mem-1-m07/evidence/p09-neutral-fe-source-components-20261009.json` pin实际11 source、原exact/lock、草稿、v1/v2独立review与实际logs；dev unoptimized/jobs1/incremental0/threads1。
+
+本切片 Native/stock服务0，不把prelaunch拒绝当成功启动、source/marker组件当实际Native身份或20s物理syscall抢占。旧同步startup/source等待保持前后clock拒晚成功；中间Passed artifact须配原runner终态0与外部独立final verifier。实际build identity/clean source input admission、具体held-response scene/原handle全分支settle、同context正BE holder/seal后两次ACK-only consumed1 accepted0、释放后原MySQL恢复/四role退出仍OPEN。fullClosing64/完整backing-lastalias/P08/P00b/P09/P10/final同SHA及两个人工语义门不闭合；IRU-7 HMS非只读正确性excluded，caps/deadlines不改，无push/PR/归档。

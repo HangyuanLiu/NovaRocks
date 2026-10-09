@@ -65,6 +65,12 @@ pub trait Scenario: Send + Sync {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()>;
 
+    /// Opt-in independent neutral source; caller captures once before all role launch.
+    /// This is not an exact MySQL Hub activation or a renewed scene-entry clock.
+    fn root_observation_deadline(&self) -> Result<Option<Instant>> {
+        Ok(None)
+    }
+
     /// The explicit exact fixture freezes original prepared config facts before role launch.
     fn freeze_prepared_exact_config(
         &self,
