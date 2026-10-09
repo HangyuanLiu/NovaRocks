@@ -1431,3 +1431,8 @@ mod exact_percentile_actual_sql_rate_source_tests;
 
 #[cfg(test)]
 mod legacy_field_baseline_tests;
+
+#[cfg(test)]
+mod legacy_text_time_cast_baseline_tests;
+#[cfg(test)]
+mod cast_text_time_oracle_tests;
