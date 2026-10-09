@@ -247,7 +247,7 @@ impl SqlFoldDependencyObserver for Probe {
     }
 }
 // Deliberately no observer methods and no query-specific mutable state.
-struct ExistingEvaluator {
+pub(super) struct ExistingEvaluator {
     mode: Mode,
 }
 impl SqlConstantEvaluator for ExistingEvaluator {
@@ -259,7 +259,7 @@ impl SqlConstantEvaluator for ExistingEvaluator {
         calculate(&self.mode, request, control)
     }
 }
-static REAL: ExistingEvaluator = ExistingEvaluator {
+pub(super) static REAL: ExistingEvaluator = ExistingEvaluator {
     mode: Mode::LegacyKernel,
 };
 static DECLINE: ExistingEvaluator = ExistingEvaluator {
@@ -331,6 +331,18 @@ fn compile_typed(
     sql: &str,
     evaluator: &'static dyn SqlConstantEvaluator,
     observer: Option<Arc<Probe>>,
+) -> Result<SqlAuthoredPhysicalPlan, novarocks_sql::compiler::SqlCompileProgressError> {
+    compile_with_observer(
+        sql,
+        evaluator,
+        observer.map(|observer| observer as Arc<dyn SqlFoldDependencyObserver>),
+    )
+}
+
+pub(super) fn compile_with_observer(
+    sql: &str,
+    evaluator: &'static dyn SqlConstantEvaluator,
+    observer: Option<Arc<dyn SqlFoldDependencyObserver>>,
 ) -> Result<SqlAuthoredPhysicalPlan, novarocks_sql::compiler::SqlCompileProgressError> {
     let control = match observer {
         Some(observer) => SqlCompileControl::unbounded().with_fold_dependency_observer(observer),

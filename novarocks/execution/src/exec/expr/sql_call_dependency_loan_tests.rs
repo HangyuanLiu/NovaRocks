@@ -396,3 +396,6 @@ fn sql_call_dependency_loan_original_aggregate_all_phases_keep_source_and_state_
 
 #[path = "sql_dependency_request_host_abort_tests.rs"]
 mod sql_dependency_request_host_abort_tests;
+
+#[path = "sql_dependency_original_binding_record_tests.rs"]
+mod sql_dependency_original_binding_record_tests;

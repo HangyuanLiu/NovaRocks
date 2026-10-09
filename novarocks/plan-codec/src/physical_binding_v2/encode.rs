@@ -32,16 +32,29 @@ pub(super) fn add(left: usize, right: usize) -> Result<usize, BindingCodecError>
     left.checked_add(right)
         .ok_or_else(|| invalid("binding projection arithmetic overflow"))
 }
+// Both selected source forms use the one original nominal kind projection.
+fn scalar_kind(kind: FunctionKind) -> Result<wire::FunctionKind, BindingCodecError> {
+    match kind {
+        FunctionKind::Scalar => Ok(wire::FunctionKind::Scalar),
+        FunctionKind::Aggregate => Ok(wire::FunctionKind::Aggregate),
+        FunctionKind::Window => Ok(wire::FunctionKind::Window),
+        FunctionKind::Table => Err(invalid("scalar binding source has table kind")),
+    }
+}
 fn names<'a>(source: BindingSource<'a>) -> (&'a str, &'a str) {
     match source {
         BindingSource::Scalar(value) => (value.function_id.as_str(), value.overload.as_str()),
         BindingSource::Table(value) => (value.function_id.as_str(), value.overload.as_str()),
+        BindingSource::ResolvedScalar(value) => {
+            (value.function_id.as_str(), value.selected.overload.as_str())
+        }
     }
 }
 fn arguments<'a>(source: BindingSource<'a>) -> &'a [FunctionArgumentType] {
     match source {
         BindingSource::Scalar(value) => &value.argument_types,
         BindingSource::Table(value) => &value.argument_types,
+        BindingSource::ResolvedScalar(value) => &value.selected.argument_types,
     }
 }
 fn request<T>(
@@ -151,6 +164,7 @@ fn preflight<H>(
             return Err(invalid("binding argument ID shape differs from its source").into());
         }
         if matches!(input.source, BindingSource::Scalar(value) if value.kind == FunctionKind::Table)
+            || matches!(input.source, BindingSource::ResolvedScalar(value) if value.kind == FunctionKind::Table)
         {
             return Err(invalid("scalar binding source has table kind").into());
         }
@@ -160,6 +174,9 @@ fn preflight<H>(
         // summing every aliased source occurrence would invent retention.
         let mut known = match input.source {
             BindingSource::Scalar(_) => size_of::<BoundFunction>(),
+            BindingSource::ResolvedScalar(_) => {
+                size_of::<novarocks_functions::ResolvedFunctionBinding>()
+            }
             BindingSource::Table(value) => add(
                 size_of::<BoundTableFunction>(),
                 Layout::array::<FunctionValueType>(value.result_types.len())
@@ -228,6 +245,14 @@ fn preflight<H>(
         }
         let results = match (input.source, input.result) {
             (BindingSource::Scalar(_), ResultTypeIds::Scalar(_)) => 1,
+            (BindingSource::ResolvedScalar(value), ResultTypeIds::Scalar(_))
+                if matches!(
+                    value.selected.result_type,
+                    novarocks_functions::FunctionResultType::Scalar(_)
+                ) =>
+            {
+                1
+            }
             (BindingSource::Table(value), ResultTypeIds::Relation(ids))
                 if value.result_types.len() == ids.len() =>
             {
@@ -379,6 +404,14 @@ fn validate<H>(
             (BindingSource::Scalar(value), ResultTypeIds::Scalar(id)) => {
                 verify_id(types, id, &value.result_type, envelope, facts, admit, work)?
             }
+            (BindingSource::ResolvedScalar(value), ResultTypeIds::Scalar(id)) => {
+                let novarocks_functions::FunctionResultType::Scalar(result) =
+                    &value.selected.result_type
+                else {
+                    return Err(invalid("binding result ID shape differs from its source").into());
+                };
+                verify_id(types, id, result, envelope, facts, admit, work)?;
+            }
             (BindingSource::Table(value), ResultTypeIds::Relation(ids)) => {
                 for (value, id) in value.result_types.iter().zip(ids) {
                     verify_id(types, *id, value, envelope, facts, admit, work)?;
@@ -389,6 +422,66 @@ fn validate<H>(
         work.step()?;
     }
     Ok(())
+}
+pub(super) fn owned_backing_bytes(
+    definitions: &Vec<wire::FunctionBindingDefinition>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, BindingCodecError> {
+    // Invoice only the already-owned DTO's real allocation-request capacities.
+    // This never walks source IR, grants stock, validates a binding or emits data.
+    let policy = Policy(true);
+    let mut bytes = policy.bytes::<wire::FunctionBindingDefinition>(
+        definitions.capacity(),
+        "binding output layout is unrepresentable",
+    )?;
+    for definition in definitions {
+        bytes = policy.add(
+            bytes,
+            definition.function_id.capacity(),
+            "binding projection arithmetic overflow",
+        )?;
+        bytes = policy.add(
+            bytes,
+            definition.overload_id.capacity(),
+            "binding projection arithmetic overflow",
+        )?;
+        bytes = policy.add(
+            bytes,
+            policy.bytes::<wire::FunctionArgumentType>(
+                definition.arguments.capacity(),
+                "binding output layout is unrepresentable",
+            )?,
+            "binding projection arithmetic overflow",
+        )?;
+        work.step()?;
+        for argument in &definition.arguments {
+            if let Some(wire::function_argument_type::Kind::Lambda(lambda)) = &argument.kind {
+                bytes = policy.add(
+                    bytes,
+                    policy.bytes::<u32>(
+                        lambda.parameter_value_type_ids.capacity(),
+                        "binding output layout is unrepresentable",
+                    )?,
+                    "binding projection arithmetic overflow",
+                )?;
+            }
+            work.step()?;
+        }
+        if let Some(wire::function_binding_definition::Result::Relation(relation)) =
+            &definition.result
+        {
+            bytes = policy.add(
+                bytes,
+                policy.bytes::<u32>(
+                    relation.value_type_ids.capacity(),
+                    "binding output layout is unrepresentable",
+                )?,
+                "binding projection arithmetic overflow",
+            )?;
+        }
+        work.step()?;
+    }
+    Ok(bytes)
 }
 fn vector<T>(count: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, BindingCodecError> {
     work.flush()?;
@@ -489,14 +582,8 @@ pub(super) fn encode_with_host<H>(
             }
         };
         let kind = match input.source {
-            BindingSource::Scalar(value) => match value.kind {
-                FunctionKind::Scalar => wire::FunctionKind::Scalar,
-                FunctionKind::Aggregate => wire::FunctionKind::Aggregate,
-                FunctionKind::Window => wire::FunctionKind::Window,
-                FunctionKind::Table => {
-                    return Err(invalid("scalar binding source has table kind").into());
-                }
-            },
+            BindingSource::Scalar(value) => scalar_kind(value.kind)?,
+            BindingSource::ResolvedScalar(value) => scalar_kind(value.kind)?,
             BindingSource::Table(_) => wire::FunctionKind::Table,
         };
         let (function, overload) = names(input.source);

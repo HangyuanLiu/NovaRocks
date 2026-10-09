@@ -394,6 +394,11 @@ impl CaptureArtifact {
         self.file.take();
         Ok(())
     }
+    /// Loan the actual storage owner's pair. A record writer cannot invent
+    /// another authority/scope or substitute its artifact ceiling for stock.
+    pub(crate) fn resource_loan(&self) -> (&LocalResourceAuthority, &WorkScope) {
+        (&self.authority, &self.scope)
+    }
     pub(crate) fn bytes_written(&self) -> u64 {
         self.written
     }

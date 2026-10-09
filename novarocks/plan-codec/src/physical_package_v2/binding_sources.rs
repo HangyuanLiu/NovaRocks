@@ -111,9 +111,10 @@ impl<'source> Loan<'source> {
         }
     }
     fn arguments(self) -> &'source [p::FunctionArgumentType] {
-        match self.source() {
-            BindingSource::Scalar(function) => &function.argument_types,
-            BindingSource::Table(function) => &function.argument_types,
+        match self {
+            Self::Function(function) => &function.argument_types,
+            Self::Table(function) => &function.argument_types,
+            Self::Aggregate(binding) => &binding.function.argument_types,
         }
     }
 }
@@ -658,14 +659,20 @@ impl<'source> BindingSources<'source> {
             work.step()?;
         }
         let function_id = id(self.functions.len())?;
-        let result = match loan.source() {
-            BindingSource::Scalar(function) => ResultRow::Scalar(root(
+        let result = match loan {
+            Loan::Function(function) => ResultRow::Scalar(root(
                 Channel::Result(0),
                 &function.result_type,
                 budget,
                 work,
             )?),
-            BindingSource::Table(table) => {
+            Loan::Aggregate(binding) => ResultRow::Scalar(root(
+                Channel::Result(0),
+                &binding.function.result_type,
+                budget,
+                work,
+            )?),
+            Loan::Table(table) => {
                 let begin = self.relation_results.len();
                 for (ordinal, ty) in table.result_types.iter().enumerate() {
                     self.relation_results

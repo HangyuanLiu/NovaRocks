@@ -124,6 +124,8 @@ pub(crate) use encode::{verify_scalar_signature, verify_scalar_signature_admitte
 #[derive(Clone, Copy)]
 pub enum BindingSource<'a> {
     Scalar(&'a BoundFunction),
+    /// Original SQL selection loan; no Physical wrapper or legacy facts are manufactured.
+    ResolvedScalar(&'a novarocks_functions::ResolvedFunctionBinding),
     Table(&'a BoundTableFunction),
 }
 #[derive(Clone, Copy)]
@@ -172,6 +174,14 @@ pub struct EncodedFunctionBindings<'loan, 'source> {
 impl<'loan, 'source> EncodedFunctionBindings<'loan, 'source> {
     pub fn as_wire(&self) -> &[wire::FunctionBindingDefinition] {
         &self.definitions
+    }
+    /// Actual owned DTO allocation-request capacity, not encoded size, source
+    /// retained bytes or permission. The host already reserved before emission.
+    pub fn owned_backing_bytes_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, BindingCodecError> {
+        encode::owned_backing_bytes(&self.definitions, work)
     }
     pub fn into_wire(self) -> Vec<wire::FunctionBindingDefinition> {
         self.definitions
@@ -288,7 +298,7 @@ impl<'loan, 'source> EncodedFunctionBindings<'loan, 'source> {
             if matches {
                 return Ok(match input.source {
                     BindingSource::Table(source) => Some(source),
-                    BindingSource::Scalar(_) => None,
+                    BindingSource::Scalar(_) | BindingSource::ResolvedScalar(_) => None,
                 });
             }
         }

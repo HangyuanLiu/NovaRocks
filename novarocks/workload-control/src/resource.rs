@@ -585,15 +585,22 @@ fn register_decode_waiter(
 }
 
 impl LocalResourceAuthority {
+    /// Validate the original scope's authority without reserving any capacity.
+    /// This identity check proves neither scope liveness nor a resource grant.
+    pub fn validate_scope_authority(&self, scope: &WorkScope) -> Result<(), WorkError> {
+        if !Arc::ptr_eq(&self.inner, &scope.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        Ok(())
+    }
+
     pub fn reserve(
         &self,
         scope: &WorkScope,
         bytes: u64,
         class: ResourceClass,
     ) -> Result<Reservation, WorkError> {
-        if !Arc::ptr_eq(&self.inner, &scope.inner) {
-            return Err(WorkError::ForeignAuthority);
-        }
+        self.validate_scope_authority(scope)?;
         if bytes == 0 {
             return Err(WorkError::Capacity("zero-byte reservation"));
         }

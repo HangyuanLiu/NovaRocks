@@ -1472,3 +1472,6 @@ mod approx_percentile_actual_sql_source_tests;
 
 #[cfg(test)]
 mod legacy_observed_list_cast_baseline_tests;
+
+#[cfg(test)]
+mod sql_dependency_resolved_binding_source_tests;
