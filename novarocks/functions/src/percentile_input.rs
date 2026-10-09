@@ -38,59 +38,105 @@ impl std::fmt::Display for PercentileInputDiagnostic<'_> {
         })
     }
 }
+pub enum PercentileNumericFailure<'a> {
+    Downcast(&'static str),
+    Unsupported(&'a DataType),
+    // The sole LARGEINT byte reader owns this original raw diagnostic. The
+    // accurately selected FSB16 carrier cannot encounter a width mismatch.
+    LargeInt(String),
+}
+impl PercentileNumericFailure<'_> {
+    pub fn message<'a>(
+        &'a self,
+        context: PercentileInputDiagnostic<'a>,
+    ) -> PercentileNumericMessage<'a> {
+        PercentileNumericMessage {
+            failure: self,
+            context,
+        }
+    }
+}
+pub struct PercentileNumericMessage<'a> {
+    failure: &'a PercentileNumericFailure<'a>,
+    context: PercentileInputDiagnostic<'a>,
+}
+impl std::fmt::Display for PercentileNumericMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.failure {
+            PercentileNumericFailure::Downcast(kind) => {
+                write!(f, "{}: failed to downcast {}", self.context, kind)
+            }
+            PercentileNumericFailure::Unsupported(ty) => write!(
+                f,
+                "{}: unsupported numeric input type {:?}",
+                self.context, ty
+            ),
+            PercentileNumericFailure::LargeInt(error) => f.write_str(error),
+        }
+    }
+}
 pub fn numeric_value_at(
     array: &ArrayRef,
     row: usize,
     context: PercentileInputDiagnostic<'_>,
 ) -> Result<Option<f64>, String> {
+    numeric_value_at_with_failure(array, row, &mut |failure| {
+        failure.message(context).to_string()
+    })
+}
+pub fn numeric_value_at_with_failure<E>(
+    array: &ArrayRef,
+    row: usize,
+    fail: &mut impl FnMut(PercentileNumericFailure<'_>) -> E,
+) -> Result<Option<f64>, E> {
     match array.data_type() {
         DataType::Int8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int8Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int8Array"))?;
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("Int8Array")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
         }
         DataType::Int16 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int16Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int16Array"))?;
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("Int16Array")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
         }
         DataType::Int32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int32Array"))?;
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("Int32Array")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
         }
         DataType::Int64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("Int64Array")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
         }
         DataType::Float32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Float32Array"))?;
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("Float32Array")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
         }
         DataType::Float64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Float64Array"))?;
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("Float64Array")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row)))
         }
         DataType::Decimal128(_, scale) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Decimal128Array"))?;
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("Decimal128Array")))?;
             let divisor = 10_f64.powi(*scale as i32);
             Ok((!arr.is_null(row)).then_some(arr.value(row) as f64 / divisor))
         }
@@ -98,13 +144,14 @@ pub fn numeric_value_at(
             let arr = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast FixedSizeBinaryArray"))?;
-            Ok((!arr.is_null(row)).then_some(largeint::value_at(arr, row)? as f64))
+                .ok_or_else(|| fail(PercentileNumericFailure::Downcast("FixedSizeBinaryArray")))?;
+            Ok((!arr.is_null(row)).then_some(
+                largeint::value_at(arr, row)
+                    .map_err(|error| fail(PercentileNumericFailure::LargeInt(error)))?
+                    as f64,
+            ))
         }
-        other => Err(format!(
-            "{context}: unsupported numeric input type {:?}",
-            other
-        )),
+        other => Err(fail(PercentileNumericFailure::Unsupported(other))),
     }
 }
 

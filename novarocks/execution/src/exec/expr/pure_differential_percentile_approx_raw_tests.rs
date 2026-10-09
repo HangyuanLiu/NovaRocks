@@ -129,7 +129,8 @@ fn pure_differential_percentile_approx_raw_nulls_do_not_hide_unsupported_input_s
         check(
             unsupported.slice(0, 0),
             Arc::new(Float64Array::from(Vec::<f64>::new())),
-            false,
+            // Frozen NULL lift requires nullable source and target even when empty.
+            ty == DataType::Null,
         );
     }
 }

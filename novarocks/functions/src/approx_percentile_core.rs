@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::approx_percentile_failure::{
+    ApproxPercentileDataRecipe as DataRecipe, ApproxPercentileFailureSink,
+    ApproxPercentileObservation as WorkObservation, LegacyApproxPercentileFailure,
+};
 use allocator_api2::alloc::{Allocator, Global};
 use allocator_api2::vec::Vec as AllocVec;
 use serde::{Deserialize, Serialize};
@@ -54,6 +58,9 @@ struct Centroid {
     mean: f32,
     weight: f32,
 }
+
+// The actual original element author pins the selected sort extent recipe.
+const _: () = assert!(std::mem::size_of::<Centroid>() == std::mem::size_of::<[f32; 2]>());
 
 impl Centroid {
     fn new(mean: f32, weight: f32) -> Self {
@@ -126,6 +133,13 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn try_clone(&self) -> Result<Self, String> {
+        self.try_clone_with_sink(&mut LegacyApproxPercentileFailure)
+    }
+
+    fn try_clone_with_sink<S: ApproxPercentileFailureSink>(
+        &self,
+        sink: &mut S,
+    ) -> Result<Self, S::Error> {
         Ok(Self {
             allocator: self.allocator.clone(),
             compression: self.compression,
@@ -135,20 +149,23 @@ impl<A: Allocator + Clone> TDigest<A> {
             max_unprocessed: self.max_unprocessed,
             processed_weight: self.processed_weight,
             unprocessed_weight: self.unprocessed_weight,
-            processed: try_copy_slice_in(
+            processed: try_copy_slice_with_sink(
                 &self.processed,
                 self.allocator.clone(),
                 "TDigest processed centroids",
+                sink,
             )?,
-            unprocessed: try_copy_slice_in(
+            unprocessed: try_copy_slice_with_sink(
                 &self.unprocessed,
                 self.allocator.clone(),
                 "TDigest unprocessed centroids",
+                sink,
             )?,
-            cumulative: try_copy_slice_in(
+            cumulative: try_copy_slice_with_sink(
                 &self.cumulative,
                 self.allocator.clone(),
                 "TDigest cumulative weights",
+                sink,
             )?,
         })
     }
@@ -198,13 +215,21 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn quantile(&mut self, q: f32) -> Result<Option<f32>, String> {
+        self.quantile_with_sink(q, &mut LegacyApproxPercentileFailure)
+    }
+
+    fn quantile_with_sink<S: ApproxPercentileFailureSink>(
+        &mut self,
+        q: f32,
+        sink: &mut S,
+    ) -> Result<Option<f32>, S::Error> {
         if !(0.0..=1.0).contains(&q) {
             return Ok(None);
         }
         if self.have_unprocessed() || self.is_dirty() {
-            self.process()?;
+            self.process_with_sink(sink)?;
         }
-        Ok(self.quantile_processed(q))
+        self.quantile_processed_with_sink(q, sink)
     }
 
     fn serialize_binary(&self) -> Vec<u8> {
@@ -241,84 +266,115 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn deserialize_binary_in(payload: &[u8], allocator: A) -> Result<Self, String> {
+        Self::deserialize_binary_with_sink(payload, allocator, &mut LegacyApproxPercentileFailure)
+    }
+
+    fn deserialize_binary_with_sink<S: ApproxPercentileFailureSink>(
+        payload: &[u8],
+        allocator: A,
+        sink: &mut S,
+    ) -> Result<Self, S::Error> {
         let mut offset = 0usize;
-        let compression = read_f32(payload, &mut offset, "tdigest compression")?;
-        let min = read_f32(payload, &mut offset, "tdigest min")?;
-        let max = read_f32(payload, &mut offset, "tdigest max")?;
-        let max_processed = read_u64(payload, &mut offset, "tdigest max_processed")? as usize;
-        let max_unprocessed = read_u64(payload, &mut offset, "tdigest max_unprocessed")? as usize;
-        let processed_weight = read_f32(payload, &mut offset, "tdigest processed_weight")?;
-        let unprocessed_weight = read_f32(payload, &mut offset, "tdigest unprocessed_weight")?;
+        let compression = read_f32_with_sink(payload, &mut offset, "tdigest compression", sink)?;
+        let min = read_f32_with_sink(payload, &mut offset, "tdigest min", sink)?;
+        let max = read_f32_with_sink(payload, &mut offset, "tdigest max", sink)?;
+        let max_processed =
+            read_u64_with_sink(payload, &mut offset, "tdigest max_processed", sink)? as usize;
+        let max_unprocessed =
+            read_u64_with_sink(payload, &mut offset, "tdigest max_unprocessed", sink)? as usize;
+        let processed_weight =
+            read_f32_with_sink(payload, &mut offset, "tdigest processed_weight", sink)?;
+        let unprocessed_weight =
+            read_f32_with_sink(payload, &mut offset, "tdigest unprocessed_weight", sink)?;
 
         if !compression.is_finite() || compression <= 0.0 || compression > MAX_COMPRESSION as f32 {
-            return Err(format!("tdigest compression out of bounds: {compression}"));
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
+                "tdigest compression out of bounds: {compression}"
+            ))));
         }
         if max_processed > MAX_DECODED_PROCESSED {
-            return Err(format!(
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "tdigest max_processed {max_processed} exceeds {MAX_DECODED_PROCESSED}"
-            ));
+            ))));
         }
         if max_unprocessed > MAX_DECODED_UNPROCESSED {
-            return Err(format!(
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "tdigest max_unprocessed {max_unprocessed} exceeds {MAX_DECODED_UNPROCESSED}"
-            ));
+            ))));
         }
 
-        let processed_len = read_u32(payload, &mut offset, "tdigest processed len")? as usize;
+        let processed_len =
+            read_u32_with_sink(payload, &mut offset, "tdigest processed len", sink)? as usize;
         if processed_len > MAX_DECODED_PROCESSED {
-            return Err(format!(
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "tdigest processed length {processed_len} exceeds {MAX_DECODED_PROCESSED}"
-            ));
+            ))));
         }
         let mut processed = AllocVec::new_in(allocator.clone());
         processed.try_reserve_exact(processed_len).map_err(|_| {
-            "ResourceExhausted: reserve decoded TDigest processed centroids".to_string()
+            sink.allocation(DataRecipe::Static(
+                "ResourceExhausted: reserve decoded TDigest processed centroids",
+            ))
         })?;
         for _ in 0..processed_len {
+            sink.observe(WorkObservation::Step)?;
             processed.push(Centroid::new(
-                read_f32(payload, &mut offset, "tdigest processed mean")?,
-                read_f32(payload, &mut offset, "tdigest processed weight")?,
+                read_f32_with_sink(payload, &mut offset, "tdigest processed mean", sink)?,
+                read_f32_with_sink(payload, &mut offset, "tdigest processed weight", sink)?,
             ));
         }
 
-        let unprocessed_len = read_u32(payload, &mut offset, "tdigest unprocessed len")? as usize;
+        let unprocessed_len =
+            read_u32_with_sink(payload, &mut offset, "tdigest unprocessed len", sink)? as usize;
         if unprocessed_len > MAX_DECODED_UNPROCESSED {
-            return Err(format!(
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "tdigest unprocessed length {unprocessed_len} exceeds {MAX_DECODED_UNPROCESSED}"
-            ));
+            ))));
         }
         let mut unprocessed = AllocVec::new_in(allocator.clone());
         unprocessed
             .try_reserve_exact(unprocessed_len)
             .map_err(|_| {
-                "ResourceExhausted: reserve decoded TDigest unprocessed centroids".to_string()
+                sink.allocation(DataRecipe::Static(
+                    "ResourceExhausted: reserve decoded TDigest unprocessed centroids",
+                ))
             })?;
         for _ in 0..unprocessed_len {
+            sink.observe(WorkObservation::Step)?;
             unprocessed.push(Centroid::new(
-                read_f32(payload, &mut offset, "tdigest unprocessed mean")?,
-                read_f32(payload, &mut offset, "tdigest unprocessed weight")?,
+                read_f32_with_sink(payload, &mut offset, "tdigest unprocessed mean", sink)?,
+                read_f32_with_sink(payload, &mut offset, "tdigest unprocessed weight", sink)?,
             ));
         }
 
-        let cumulative_len = read_u32(payload, &mut offset, "tdigest cumulative len")? as usize;
+        let cumulative_len =
+            read_u32_with_sink(payload, &mut offset, "tdigest cumulative len", sink)? as usize;
         if cumulative_len > MAX_DECODED_CUMULATIVE {
-            return Err(format!(
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "tdigest cumulative length {cumulative_len} exceeds {MAX_DECODED_CUMULATIVE}"
-            ));
+            ))));
         }
         let mut cumulative = AllocVec::new_in(allocator.clone());
         cumulative.try_reserve_exact(cumulative_len).map_err(|_| {
-            "ResourceExhausted: reserve decoded TDigest cumulative weights".to_string()
+            sink.allocation(DataRecipe::Static(
+                "ResourceExhausted: reserve decoded TDigest cumulative weights",
+            ))
         })?;
         for _ in 0..cumulative_len {
-            cumulative.push(read_f32(payload, &mut offset, "tdigest cumulative value")?);
+            sink.observe(WorkObservation::Step)?;
+            cumulative.push(read_f32_with_sink(
+                payload,
+                &mut offset,
+                "tdigest cumulative value",
+                sink,
+            )?);
         }
         if offset != payload.len() {
-            return Err(format!(
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "tdigest payload has trailing bytes: consumed={} total={}",
                 offset,
                 payload.len()
-            ));
+            ))));
         }
         let mut digest = Self {
             allocator,
@@ -337,7 +393,7 @@ impl<A: Allocator + Clone> TDigest<A> {
         // Rebuild them from the retained centroids once on state admission,
         // including clean states produced before mass normalization.
         if !digest.processed.is_empty() {
-            digest.update_cumulative()?;
+            digest.update_cumulative_with_sink(sink)?;
         }
         Ok(digest)
     }
@@ -358,15 +414,24 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn process(&mut self) -> Result<(), String> {
+        self.process_with_sink(&mut LegacyApproxPercentileFailure)
+    }
+
+    fn process_with_sink<S: ApproxPercentileFailureSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
         if self.unprocessed.is_empty() && self.processed.is_empty() {
             return Ok(());
         }
 
+        sink.observe(WorkObservation::SortBegin(self.unprocessed.len()))?;
         self.unprocessed.sort_by(|left, right| {
             left.mean
                 .partial_cmp(&right.mean)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        sink.observe(WorkObservation::SortEnd)?;
         let processed = std::mem::replace(
             &mut self.processed,
             AllocVec::new_in(self.allocator.clone()),
@@ -376,14 +441,21 @@ impl<A: Allocator + Clone> TDigest<A> {
                 .unprocessed
                 .len()
                 .checked_add(processed.len())
-                .ok_or_else(|| "TDigest merged centroid length overflow".to_string())?;
+                .ok_or_else(|| {
+                    sink.data(DataRecipe::Static(
+                        "TDigest merged centroid length overflow",
+                    ))
+                })?;
             let mut merged = AllocVec::new_in(self.allocator.clone());
-            merged
-                .try_reserve_exact(merged_capacity)
-                .map_err(|_| "ResourceExhausted: reserve sorted TDigest merge".to_string())?;
+            merged.try_reserve_exact(merged_capacity).map_err(|_| {
+                sink.allocation(DataRecipe::Static(
+                    "ResourceExhausted: reserve sorted TDigest merge",
+                ))
+            })?;
             let mut left_idx = 0usize;
             let mut right_idx = 0usize;
             while left_idx < self.unprocessed.len() && right_idx < processed.len() {
+                sink.observe(WorkObservation::Step)?;
                 if self.unprocessed[left_idx].mean <= processed[right_idx].mean {
                     merged.push(self.unprocessed[left_idx]);
                     left_idx += 1;
@@ -392,8 +464,14 @@ impl<A: Allocator + Clone> TDigest<A> {
                     right_idx += 1;
                 }
             }
-            merged.extend_from_slice(&self.unprocessed[left_idx..]);
-            merged.extend_from_slice(&processed[right_idx..]);
+            for value in &self.unprocessed[left_idx..] {
+                sink.observe(WorkObservation::Step)?;
+                merged.push(*value);
+            }
+            for value in &processed[right_idx..] {
+                sink.observe(WorkObservation::Step)?;
+                merged.push(*value);
+            }
             self.unprocessed = merged;
         }
 
@@ -403,8 +481,10 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.processed_weight = self
             .unprocessed
             .iter()
-            .map(|centroid| f64::from(centroid.weight))
-            .sum::<f64>() as f32;
+            .try_fold(-0.0_f64, |sum, centroid| {
+                sink.observe(WorkObservation::Step)?;
+                Ok::<_, S::Error>(sum + f64::from(centroid.weight))
+            })? as f32;
         self.unprocessed_weight = 0.0;
 
         let Some(first) = self.unprocessed.first().copied() else {
@@ -413,13 +493,18 @@ impl<A: Allocator + Clone> TDigest<A> {
         let mut processed = AllocVec::new_in(self.allocator.clone());
         processed
             .try_reserve_exact(self.max_processed.max(1))
-            .map_err(|_| "ResourceExhausted: reserve processed TDigest centroids".to_string())?;
+            .map_err(|_| {
+                sink.allocation(DataRecipe::Static(
+                    "ResourceExhausted: reserve processed TDigest centroids",
+                ))
+            })?;
         self.processed = processed;
         self.processed.push(first);
         let mut w_so_far = f64::from(first.weight);
         let mut w_limit = f64::from(self.processed_weight) * f64::from(self.integrated_q(1.0));
 
         for centroid in self.unprocessed.iter().skip(1).copied() {
+            sink.observe(WorkObservation::Step)?;
             let projected = w_so_far + f64::from(centroid.weight);
             if projected <= w_limit {
                 w_so_far = projected;
@@ -433,7 +518,9 @@ impl<A: Allocator + Clone> TDigest<A> {
                 w_limit = f64::from(self.processed_weight) * f64::from(self.integrated_q(k1 + 1.0));
                 w_so_far += f64::from(centroid.weight);
                 self.processed.try_reserve(1).map_err(|_| {
-                    "ResourceExhausted: grow processed TDigest centroids".to_string()
+                    sink.allocation(DataRecipe::Static(
+                        "ResourceExhausted: grow processed TDigest centroids",
+                    ))
                 })?;
                 self.processed.push(centroid);
             }
@@ -446,62 +533,91 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.max = self
             .max
             .max(self.processed.last().map(|c| c.mean).unwrap_or(self.max));
-        self.update_cumulative()
+        self.update_cumulative_with_sink(sink)
     }
 
     fn quantile_processed(&self, q: f32) -> Option<f32> {
+        self.quantile_processed_with_sink(q, &mut LegacyApproxPercentileFailure)
+            .expect("no fallible observation in original quantile search")
+    }
+
+    fn quantile_processed_with_sink<S: ApproxPercentileFailureSink>(
+        &self,
+        q: f32,
+        sink: &mut S,
+    ) -> Result<Option<f32>, S::Error> {
         if self.processed.is_empty() {
-            return None;
+            return Ok(None);
         }
         if self.processed.len() == 1 {
-            return Some(self.processed[0].mean);
+            return Ok(Some(self.processed[0].mean));
         }
 
         let n = self.processed.len();
         let index = q * self.processed_weight;
 
         if index <= self.weight(0) / 2.0 {
-            return Some(
+            return Ok(Some(
                 (f64::from(self.min)
                     + 2.0 * f64::from(index) / f64::from(self.weight(0))
                         * f64::from(self.mean(0) - self.min)) as f32,
-            );
+            ));
         }
 
-        if let Some(i) = self.cumulative.iter().position(|value| *value >= index)
+        let mut first = None;
+        for (i, value) in self.cumulative.iter().enumerate() {
+            sink.observe(WorkObservation::Step)?;
+            if *value >= index {
+                first = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = first
             && i > 0
             && i < self.cumulative.len() - 1
         {
             let z1 = index - self.cumulative[i - 1];
             let z2 = self.cumulative[i] - index;
-            return Some(Self::weighted_average(
+            return Ok(Some(Self::weighted_average(
                 self.mean(i - 1),
                 z2,
                 self.mean(i),
                 z1,
-            ));
+            )));
         }
 
         let z1 = f64::from(index - self.processed_weight) - f64::from(self.weight(n - 1)) / 2.0;
         let z2 = f64::from(self.weight(n - 1)) / 2.0 - z1;
-        Some(Self::weighted_average(
+        Ok(Some(Self::weighted_average(
             self.mean(n - 1),
             z1 as f32,
             self.max,
             z2 as f32,
-        ))
+        )))
     }
 
     fn update_cumulative(&mut self) -> Result<(), String> {
+        self.update_cumulative_with_sink(&mut LegacyApproxPercentileFailure)
+    }
+
+    fn update_cumulative_with_sink<S: ApproxPercentileFailureSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
         self.cumulative.clear();
         self.cumulative
             .try_reserve(self.processed.len() + 1)
-            .map_err(|_| "ResourceExhausted: reserve TDigest cumulative weights".to_string())?;
+            .map_err(|_| {
+                sink.allocation(DataRecipe::Static(
+                    "ResourceExhausted: reserve TDigest cumulative weights",
+                ))
+            })?;
         // The reference digest accumulates in double precision, then stores
         // each CDF center as a float. Repeated float accumulation loses small
         // weights after a large prefix and changes quantile interpolation.
         let mut previous = 0.0_f64;
         for centroid in &self.processed {
+            sink.observe(WorkObservation::Step)?;
             let weight = f64::from(centroid.weight);
             self.cumulative.push((previous + weight / 2.0) as f32);
             previous += weight;
@@ -865,29 +981,40 @@ pub fn encode_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Vec<u8>
 }
 
 pub fn decode_state(payload: &[u8]) -> Result<PercentileState, String> {
+    decode_state_with_sink(payload, Global, &mut LegacyApproxPercentileFailure)
+}
+
+pub fn decode_state_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFailureSink>(
+    payload: &[u8],
+    allocator: A,
+    sink: &mut S,
+) -> Result<PercentileState<A>, S::Error> {
     if payload.is_empty() {
-        return Ok(PercentileState::default());
+        return Ok(PercentileState::new_in(
+            DEFAULT_COMPRESSION_FACTOR,
+            allocator,
+        ));
     }
     if payload.len() < HEADER_LEN {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "percentile state payload too short: expected>={} actual={}",
             HEADER_LEN,
             payload.len()
-        ));
+        ))));
     }
     if payload[0] != PERCENTILE_STATE_MAGIC {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "unsupported percentile state payload magic: expected=0x{:02x} actual=0x{:02x}",
             PERCENTILE_STATE_MAGIC, payload[0]
-        ));
+        ))));
     }
     match payload[1] {
-        PERCENTILE_STATE_VERSION => decode_state_v4(payload),
-        3 => decode_state_v3(payload),
-        other => Err(format!(
+        PERCENTILE_STATE_VERSION => decode_state_v4_with_sink(payload, allocator, sink),
+        3 => decode_state_v3_with_sink(payload, allocator, sink),
+        other => Err(sink.data(DataRecipe::Arguments(format_args!(
             "unsupported percentile state payload version: expected={} actual={}",
             PERCENTILE_STATE_VERSION, other
-        )),
+        )))),
     }
 }
 
@@ -920,8 +1047,48 @@ pub fn quantile_value_with_policy<A: Allocator + Clone, P: TDigestClonePolicy<A>
     quantile: f64,
     policy: &mut P,
 ) -> Result<Option<f64>, String> {
-    let mut digest = policy.clone_digest(&state.digest)?;
-    Ok(digest.quantile(quantile as f32)?.map(|value| value as f64))
+    quantile_value_with_sink(
+        state,
+        quantile,
+        &mut OriginalCloneLoan(policy),
+        &mut LegacyApproxPercentileFailure,
+    )
+}
+pub trait ObservedTDigestClone<A: Allocator + Clone, S: ApproxPercentileFailureSink> {
+    fn clone_digest(&mut self, digest: &TDigest<A>, sink: &mut S) -> Result<TDigest<A>, S::Error>;
+}
+struct OriginalCloneLoan<'a, P>(&'a mut P);
+impl<A: Allocator + Clone, S: ApproxPercentileFailureSink, P: TDigestClonePolicy<A>>
+    ObservedTDigestClone<A, S> for OriginalCloneLoan<'_, P>
+{
+    fn clone_digest(&mut self, digest: &TDigest<A>, sink: &mut S) -> Result<TDigest<A>, S::Error> {
+        self.0
+            .clone_digest(digest)
+            .map_err(|error| sink.data(DataRecipe::Existing(&error)))
+    }
+}
+pub struct TrackedTDigestClone;
+impl<A: Allocator + Clone, S: ApproxPercentileFailureSink> ObservedTDigestClone<A, S>
+    for TrackedTDigestClone
+{
+    fn clone_digest(&mut self, digest: &TDigest<A>, sink: &mut S) -> Result<TDigest<A>, S::Error> {
+        digest.try_clone_with_sink(sink)
+    }
+}
+pub fn quantile_value_with_sink<
+    A: Allocator + Clone,
+    S: ApproxPercentileFailureSink,
+    P: ObservedTDigestClone<A, S>,
+>(
+    state: &PercentileState<A>,
+    quantile: f64,
+    policy: &mut P,
+    sink: &mut S,
+) -> Result<Option<f64>, S::Error> {
+    let mut digest = policy.clone_digest(&state.digest, sink)?;
+    Ok(digest
+        .quantile_with_sink(quantile as f32, sink)?
+        .map(|value| value as f64))
 }
 
 pub fn quantile_from_state<A: Allocator + Clone>(
@@ -935,6 +1102,24 @@ pub fn quantile_from_state_with_policy<A: Allocator + Clone, P: TDigestClonePoli
     quantile: Option<f64>,
     policy: &mut P,
 ) -> Result<Option<f64>, String> {
+    quantile_from_state_with_sink(
+        state,
+        quantile,
+        &mut OriginalCloneLoan(policy),
+        &mut LegacyApproxPercentileFailure,
+    )
+}
+
+pub fn quantile_from_state_with_sink<
+    A: Allocator + Clone,
+    S: ApproxPercentileFailureSink,
+    P: ObservedTDigestClone<A, S>,
+>(
+    state: &PercentileState<A>,
+    quantile: Option<f64>,
+    policy: &mut P,
+    sink: &mut S,
+) -> Result<Option<f64>, S::Error> {
     let q = match quantile {
         Some(q) => q,
         None => match &state.quantiles {
@@ -943,7 +1128,7 @@ pub fn quantile_from_state_with_policy<A: Allocator + Clone, P: TDigestClonePoli
             _ => return Ok(None),
         },
     };
-    quantile_value_with_policy(state, q, policy)
+    quantile_value_with_sink(state, q, policy, sink)
 }
 
 pub fn quantiles_from_state<A: Allocator + Clone>(
@@ -973,15 +1158,22 @@ pub fn quantiles_from_state_with_policy<A: Allocator + Clone, P: TDigestClonePol
 }
 
 pub fn validate_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Result<(), String> {
+    validate_state_with_sink(state, &mut LegacyApproxPercentileFailure)
+}
+
+pub fn validate_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    state: &PercentileState<A>,
+    sink: &mut S,
+) -> Result<(), S::Error> {
     let quantile_count = match &state.quantiles {
         Some(QuantileSpec::Array(values)) => values.len(),
         Some(QuantileSpec::Scalar(_)) => 1,
         None => 0,
     };
     if quantile_count > MAX_QUANTILE_COUNT {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "percentile quantile count {quantile_count} exceeds {MAX_QUANTILE_COUNT}"
-        ));
+        ))));
     }
     Ok(())
 }
@@ -1050,47 +1242,69 @@ fn decode_state_v4_in<A: Allocator + Clone>(
     payload: &[u8],
     allocator: A,
 ) -> Result<PercentileState<A>, String> {
+    decode_state_v4_with_sink(payload, allocator, &mut LegacyApproxPercentileFailure)
+}
+
+fn decode_state_v4_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    payload: &[u8],
+    allocator: A,
+    sink: &mut S,
+) -> Result<PercentileState<A>, S::Error> {
     if payload.len() < HEADER_LEN {
-        return Err("percentile state payload too short".to_string());
+        return Err(sink.data(DataRecipe::Static("percentile state payload too short")));
     }
     let quantile_kind = payload[2];
-    let compression = u32::from_le_bytes(
-        payload[3..7]
-            .try_into()
-            .map_err(|_| "percentile state compression decode failed".to_string())?,
-    ) as usize;
-    let quantile_count = u32::from_le_bytes(
-        payload[7..11]
-            .try_into()
-            .map_err(|_| "percentile state quantile count decode failed".to_string())?,
-    ) as usize;
+    let compression = u32::from_le_bytes(payload[3..7].try_into().map_err(|_| {
+        sink.data(DataRecipe::Static(
+            "percentile state compression decode failed",
+        ))
+    })?) as usize;
+    let quantile_count = u32::from_le_bytes(payload[7..11].try_into().map_err(|_| {
+        sink.data(DataRecipe::Static(
+            "percentile state quantile count decode failed",
+        ))
+    })?) as usize;
     if quantile_count > MAX_QUANTILE_COUNT {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "percentile state quantile count {quantile_count} exceeds {MAX_QUANTILE_COUNT}"
-        ));
+        ))));
     }
     if compression == 0 || compression > MAX_COMPRESSION as usize {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "percentile state compression {compression} exceeds bounded range"
-        ));
+        ))));
     }
     let quantile_bytes = quantile_count
         .checked_mul(std::mem::size_of::<f64>())
-        .ok_or_else(|| "percentile state quantile bytes overflow".to_string())?;
+        .ok_or_else(|| {
+            sink.data(DataRecipe::Static(
+                "percentile state quantile bytes overflow",
+            ))
+        })?;
     let quantile_end = HEADER_LEN
         .checked_add(quantile_bytes)
-        .ok_or_else(|| "percentile state quantile end overflow".to_string())?;
+        .ok_or_else(|| sink.data(DataRecipe::Static("percentile state quantile end overflow")))?;
     if payload.len() < quantile_end {
-        return Err("percentile state quantile payload truncated".to_string());
+        return Err(sink.data(DataRecipe::Static(
+            "percentile state quantile payload truncated",
+        )));
     }
 
     let mut quantiles = AllocVec::new_in(allocator.clone());
-    quantiles
-        .try_reserve_exact(quantile_count)
-        .map_err(|_| "ResourceExhausted: reserve decoded percentile quantiles".to_string())?;
+    quantiles.try_reserve_exact(quantile_count).map_err(|_| {
+        sink.allocation(DataRecipe::Static(
+            "ResourceExhausted: reserve decoded percentile quantiles",
+        ))
+    })?;
     let mut offset = HEADER_LEN;
     for _ in 0..quantile_count {
-        quantiles.push(read_f64(payload, &mut offset, "percentile state quantile")?);
+        sink.observe(WorkObservation::Step)?;
+        quantiles.push(read_f64_with_sink(
+            payload,
+            &mut offset,
+            "percentile state quantile",
+            sink,
+        )?);
     }
 
     let quantiles = match (quantile_kind, quantiles.len()) {
@@ -1098,17 +1312,17 @@ fn decode_state_v4_in<A: Allocator + Clone>(
         (QUANTILE_KIND_SCALAR, 1) => Some(QuantileSpec::Scalar(quantiles[0])),
         (QUANTILE_KIND_ARRAY, _) => Some(QuantileSpec::Array(quantiles)),
         _ => {
-            return Err(format!(
+            return Err(sink.data(DataRecipe::Arguments(format_args!(
                 "invalid percentile state quantile metadata: kind={} count={}",
                 quantile_kind, quantile_count
-            ));
+            ))));
         }
     };
 
     let digest = if payload.len() == quantile_end {
         TDigest::new_in(compression as f32, allocator.clone())
     } else {
-        TDigest::deserialize_binary_in(&payload[quantile_end..], allocator.clone())?
+        TDigest::deserialize_binary_with_sink(&payload[quantile_end..], allocator.clone(), sink)?
     };
     let state = PercentileState {
         allocator,
@@ -1116,7 +1330,7 @@ fn decode_state_v4_in<A: Allocator + Clone>(
         quantiles,
         compression,
     };
-    validate_state(&state)?;
+    validate_state_with_sink(&state, sink)?;
     Ok(state)
 }
 
@@ -1125,32 +1339,80 @@ fn try_copy_slice_in<T: Copy, A: Allocator + Clone>(
     allocator: A,
     label: &str,
 ) -> Result<AllocVec<T, A>, String> {
+    try_copy_slice_with_sink(values, allocator, label, &mut LegacyApproxPercentileFailure)
+}
+fn try_copy_slice_with_sink<T: Copy, A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    values: &[T],
+    allocator: A,
+    label: &str,
+    sink: &mut S,
+) -> Result<AllocVec<T, A>, S::Error> {
     let mut copied = AllocVec::new_in(allocator);
-    copied
-        .try_reserve_exact(values.len())
-        .map_err(|_| format!("ResourceExhausted: reserve {label}"))?;
-    copied.extend_from_slice(values);
+    copied.try_reserve_exact(values.len()).map_err(|_| {
+        sink.allocation(DataRecipe::Arguments(format_args!(
+            "ResourceExhausted: reserve {label}"
+        )))
+    })?;
+    for value in values {
+        sink.observe(WorkObservation::Step)?;
+        copied.push(*value);
+    }
     Ok(copied)
 }
 
-fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
-    let meta_len = u32::from_le_bytes(
-        payload[2..6]
-            .try_into()
-            .map_err(|_| "percentile state meta length decode failed".to_string())?,
-    ) as usize;
-    if payload.len() < 6 + meta_len {
-        return Err("percentile state meta payload truncated".to_string());
+/// Copies only already-decoded vectors. Global preserves original collect;
+/// execution storage may use the real fallible allocator at this same frontier.
+pub trait PercentileDecodeStorage: Allocator + Clone {
+    fn collect_decoded<T: Copy, S: ApproxPercentileFailureSink>(
+        &self,
+        values: Vec<T>,
+        sink: &mut S,
+    ) -> Result<AllocVec<T, Self>, S::Error>
+    where
+        Self: Sized;
+}
+impl PercentileDecodeStorage for Global {
+    fn collect_decoded<T: Copy, S: ApproxPercentileFailureSink>(
+        &self,
+        values: Vec<T>,
+        _sink: &mut S,
+    ) -> Result<AllocVec<T, Self>, S::Error> {
+        Ok(values.into_iter().collect())
     }
-    let meta: PercentileStateMeta =
-        serde_json::from_slice(&payload[6..6 + meta_len]).map_err(|e| e.to_string())?;
+}
+
+fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
+    decode_state_v3_with_sink(payload, Global, &mut LegacyApproxPercentileFailure)
+}
+
+fn decode_state_v3_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFailureSink>(
+    payload: &[u8],
+    allocator: A,
+    sink: &mut S,
+) -> Result<PercentileState<A>, S::Error> {
+    let meta_len = u32::from_le_bytes(payload[2..6].try_into().map_err(|_| {
+        sink.data(DataRecipe::Static(
+            "percentile state meta length decode failed",
+        ))
+    })?) as usize;
+    if payload.len() < 6 + meta_len {
+        return Err(sink.data(DataRecipe::Static(
+            "percentile state meta payload truncated",
+        )));
+    }
+    sink.observe(WorkObservation::JsonBegin(meta_len))?;
+    let meta: PercentileStateMeta = serde_json::from_slice(&payload[6..6 + meta_len])
+        .map_err(|e| sink.data(DataRecipe::Json(&e)))?;
+    sink.observe(WorkObservation::JsonEnd)?;
     let mut digest = if payload.len() == 6 + meta_len {
-        TDigest::new_in(meta.compression as f32, Global)
+        TDigest::new_in(meta.compression as f32, allocator.clone())
     } else {
-        let decoded: SerializableTDigest =
-            serde_json::from_slice(&payload[6 + meta_len..]).map_err(|e| e.to_string())?;
+        sink.observe(WorkObservation::JsonBegin(payload.len() - 6 - meta_len))?;
+        let decoded: SerializableTDigest = serde_json::from_slice(&payload[6 + meta_len..])
+            .map_err(|e| sink.data(DataRecipe::Json(&e)))?;
+        sink.observe(WorkObservation::JsonEnd)?;
         TDigest {
-            allocator: Global,
+            allocator: allocator.clone(),
             compression: decoded.compression,
             min: decoded.min,
             max: decoded.max,
@@ -1158,60 +1420,107 @@ fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
             max_unprocessed: decoded.max_unprocessed,
             processed_weight: decoded.processed_weight,
             unprocessed_weight: decoded.unprocessed_weight,
-            processed: decoded.processed.into_iter().collect(),
-            unprocessed: decoded.unprocessed.into_iter().collect(),
-            cumulative: decoded.cumulative.into_iter().collect(),
+            processed: allocator.collect_decoded(decoded.processed, sink)?,
+            unprocessed: allocator.collect_decoded(decoded.unprocessed, sink)?,
+            cumulative: allocator.collect_decoded(decoded.cumulative, sink)?,
         }
     };
     if !digest.processed.is_empty() {
-        digest.update_cumulative()?;
+        digest.update_cumulative_with_sink(sink)?;
     }
     Ok(PercentileState {
-        allocator: Global,
+        allocator: allocator.clone(),
         digest,
-        quantiles: meta.quantiles.map(|quantiles| match quantiles {
-            SerializableQuantileSpec::Scalar(value) => QuantileSpec::Scalar(value),
-            SerializableQuantileSpec::Array(values) => {
-                QuantileSpec::Array(values.into_iter().collect())
-            }
-        }),
+        quantiles: match meta.quantiles {
+            None => None,
+            Some(quantiles) => Some(match quantiles {
+                SerializableQuantileSpec::Scalar(value) => QuantileSpec::Scalar(value),
+                SerializableQuantileSpec::Array(values) => {
+                    QuantileSpec::Array(allocator.collect_decoded(values, sink)?)
+                }
+            }),
+        },
         compression: meta.compression,
     })
 }
 
 fn read_u32(payload: &[u8], offset: &mut usize, label: &str) -> Result<u32, String> {
+    read_u32_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+}
+
+fn read_u32_with_sink<S: ApproxPercentileFailureSink>(
+    payload: &[u8],
+    offset: &mut usize,
+    label: &str,
+    sink: &mut S,
+) -> Result<u32, S::Error> {
     let end = offset
         .checked_add(std::mem::size_of::<u32>())
-        .ok_or_else(|| format!("{label} offset overflow"))?;
+        .ok_or_else(|| {
+            sink.data(DataRecipe::Arguments(format_args!(
+                "{label} offset overflow"
+            )))
+        })?;
     let bytes: [u8; 4] = payload
         .get(*offset..end)
-        .ok_or_else(|| format!("{label} truncated"))?
+        .ok_or_else(|| sink.data(DataRecipe::Arguments(format_args!("{label} truncated"))))?
         .try_into()
-        .map_err(|_| format!("{label} decode failed"))?;
+        .map_err(|_| sink.data(DataRecipe::Arguments(format_args!("{label} decode failed"))))?;
     *offset = end;
     Ok(u32::from_le_bytes(bytes))
 }
 
 fn read_u64(payload: &[u8], offset: &mut usize, label: &str) -> Result<u64, String> {
+    read_u64_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+}
+
+fn read_u64_with_sink<S: ApproxPercentileFailureSink>(
+    payload: &[u8],
+    offset: &mut usize,
+    label: &str,
+    sink: &mut S,
+) -> Result<u64, S::Error> {
     let end = offset
         .checked_add(std::mem::size_of::<u64>())
-        .ok_or_else(|| format!("{label} offset overflow"))?;
+        .ok_or_else(|| {
+            sink.data(DataRecipe::Arguments(format_args!(
+                "{label} offset overflow"
+            )))
+        })?;
     let bytes: [u8; 8] = payload
         .get(*offset..end)
-        .ok_or_else(|| format!("{label} truncated"))?
+        .ok_or_else(|| sink.data(DataRecipe::Arguments(format_args!("{label} truncated"))))?
         .try_into()
-        .map_err(|_| format!("{label} decode failed"))?;
+        .map_err(|_| sink.data(DataRecipe::Arguments(format_args!("{label} decode failed"))))?;
     *offset = end;
     Ok(u64::from_le_bytes(bytes))
 }
 
 fn read_f32(payload: &[u8], offset: &mut usize, label: &str) -> Result<f32, String> {
-    let bits = read_u32(payload, offset, label)?;
+    read_f32_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+}
+
+fn read_f32_with_sink<S: ApproxPercentileFailureSink>(
+    payload: &[u8],
+    offset: &mut usize,
+    label: &str,
+    sink: &mut S,
+) -> Result<f32, S::Error> {
+    let bits = read_u32_with_sink(payload, offset, label, sink)?;
     Ok(f32::from_le_bytes(bits.to_le_bytes()))
 }
 
 fn read_f64(payload: &[u8], offset: &mut usize, label: &str) -> Result<f64, String> {
-    let bits = read_u64(payload, offset, label)?;
+    read_f64_with_sink(payload, offset, label, &mut LegacyApproxPercentileFailure)
+}
+
+fn read_f64_with_sink<S: ApproxPercentileFailureSink>(
+    payload: &[u8],
+    offset: &mut usize,
+    label: &str,
+    sink: &mut S,
+) -> Result<f64, S::Error> {
+    let bits = read_u64_with_sink(payload, offset, label, sink)?;
     Ok(f64::from_le_bytes(bits.to_le_bytes()))
 }
 

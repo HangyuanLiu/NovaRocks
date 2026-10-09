@@ -1464,3 +1464,6 @@ mod ds_hll_state_frame_tests;
 
 #[path = "ds_hll_state_private_frame_tests.rs"]
 mod ds_hll_state_private_frame_tests;
+
+#[path = "percentile_raw_private_frame_tests.rs"]
+mod percentile_raw_private_frame_tests;

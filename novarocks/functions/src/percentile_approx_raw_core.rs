@@ -16,7 +16,10 @@
 // under the License.
 //! Original PERCENTILE_APPROX_RAW per-row combination of the ONE readers and TDigest.
 //! No expression, argument demand, name dispatch or ambient host lives here.
-use crate::percentile_input::{PercentileInputDiagnostic, numeric_value_at, payload_bytes_at};
+use crate::percentile_input::{
+    PercentileInputDiagnostic, PercentileNumericFailure, PercentilePayloadFailure,
+    numeric_value_at_with_failure, payload_bytes_at_with_failure,
+};
 use arrow_array::{ArrayRef, builder::Float64Builder};
 use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +32,23 @@ pub enum Observation {
 /// The outer Result is host/control; the inner Result is original semantic Data.
 pub trait QuantileEvaluator {
     type Error;
+    fn payload_failure(
+        &mut self,
+        failure: PercentilePayloadFailure<'_>,
+    ) -> Result<String, Self::Error> {
+        Ok(failure
+            .message(PercentileInputDiagnostic::ApproxRaw)
+            .to_string())
+    }
+    fn numeric_failure(
+        &mut self,
+        failure: PercentileNumericFailure<'_>,
+    ) -> Result<String, Self::Error> {
+        Ok(failure
+            .message(PercentileInputDiagnostic::ApproxRaw)
+            .to_string())
+    }
+
     fn quantile(
         &mut self,
         payload: &[u8],
@@ -60,18 +80,17 @@ pub fn row_with_evaluator_observed<E: QuantileEvaluator>(
     evaluator: &mut E,
 ) -> Result<Result<Option<f64>, String>, E::Error> {
     observe(Observation::ReadBoundary)?;
-    let payload =
-        match payload_bytes_at(payloads, payload_row, PercentileInputDiagnostic::ApproxRaw) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
-    let quantile = match numeric_value_at(
-        quantiles,
-        quantile_row,
-        PercentileInputDiagnostic::ApproxRaw,
-    ) {
+    let payload = match payload_bytes_at_with_failure(payloads, payload_row, &mut |failure| {
+        evaluator.payload_failure(failure)
+    }) {
         Ok(value) => value,
-        Err(error) => return Ok(Err(error)),
+        Err(result) => return result.map(Err),
+    };
+    let quantile = match numeric_value_at_with_failure(quantiles, quantile_row, &mut |failure| {
+        evaluator.numeric_failure(failure)
+    }) {
+        Ok(value) => value,
+        Err(result) => return result.map(Err),
     };
     observe(Observation::ReadBoundary)?;
     observe(Observation::Step)?;

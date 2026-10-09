@@ -2712,3 +2712,5 @@ pub mod bitmap_aggregate_core;
 mod bitmap_decode_resources;
 
 pub mod percentile_approx_raw_core;
+
+pub mod approx_percentile_failure;

@@ -2625,6 +2625,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::ds_hll_state_owner::operation(name) => {
                         Some(super::ds_hll_state_owner::effects())
                     }
+                    name if super::percentile_approx_raw_owner::operation(name) => {
+                        Some(super::percentile_approx_raw_owner::effects())
+                    }
                     name if super::array_match_owner::operation(name).is_some() => {
                         Some(super::array_match_owner::effects())
                     }
@@ -2975,6 +2978,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::ds_hll_state_owner::operation(name) => {
                 super::ds_hll_state_owner::definition(name, declaration, resolver)?
+            }
+            name if super::percentile_approx_raw_owner::operation(name) => {
+                super::percentile_approx_raw_owner::definition(name, declaration, resolver)?
             }
             name if super::array_match_owner::operation(name).is_some() => {
                 super::array_match_owner::definition(name, declaration, resolver)?
@@ -5306,4 +5312,23 @@ pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
         .register(super::aggregate_map_owner::definition("map_agg", declaration, resolver).unwrap())
         .unwrap();
     builder.seal_bound().unwrap()
+}
+
+/// Actual complete original declaration and original binding/metadata authors.
+/// This test-only factory enables no public registration or binding fallback.
+#[cfg(feature = "test-support")]
+pub fn percentile_raw_private_test_catalog() -> EngineFunctionCatalog {
+    let (name, signatures) = registry::builtin_scalar_declarations()
+        .into_iter()
+        .find(|(name, _)| name == "percentile_approx_raw")
+        .expect("original ANY2 declaration");
+    let (declaration, resolver) =
+        scalar_definition_parts(&name, &signatures, FunctionKind::Scalar).unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(
+            super::percentile_approx_raw_owner::definition(&name, declaration, resolver).unwrap(),
+        )
+        .unwrap();
+    builder.seal().unwrap()
 }
