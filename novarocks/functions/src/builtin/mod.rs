@@ -341,3 +341,6 @@ mod aggregate_by_window;
 
 // Private transport/lifecycle probes; no scalar owner or ABI is registered.
 mod scalar_invocation_data;
+
+// Private original ARRAY diagnostic producer; no owner or ABI is registered.
+mod array_scalar_diagnostic_source;
