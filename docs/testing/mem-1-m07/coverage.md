@@ -455,3 +455,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - cleand1c2e7ca1原生v2 FAILED，finite receipt准确phase=show-tables/server1064；current parser没有SHOW TABLES（catalog只SHOW CREATE TABLE，未知SHOW被show_backends接收），这是新预检调用面错误，不能归因provider分类。四role/host PID与6实际containerID确认消失，freshJava未变/cleanup完整，收据p09-hms-small-native-v2-failed-20261009.json保留前轮失败。
 - 仅names查询改为既有 `{catalog}.information_schema.tables` 单列，type查询也准确同catalog qualified；原1table+1view、排序/准确集合/类型/refusal/input/caps/clock不变，不增加产品SHOW语义或缩小负载。focused3PASS/0FAIL，收据p09-hms-small-native-catalog-query-focused-20261009.json；下一cleanHEAD真实Native验证仍待验。其余门OPEN，无push/PR/归档。
+
+
+### 2026-10-09 P09：stock HMS小规模Native正确分类与精确拒绝PASS
+
+- clean055393db9fff02142df65e7affa779394ea828ae，同HEAD dev server+runner build64s、新reviewed freeze；实际1FE+3BE topology barrier/精确4role身份。FE catalog-qualified names准确{cap_table}、information_schema准确(cap_table,BASE TABLE)，真实Java cap_view未误归table；SHOW VIEWS和DROP DATABASE FORCE实际均1105/HY000、同准确Unsupported/list_views源原因hash。Native断言阶段0.315s（不包括集群启动与stock准备）。
+- 独立before/after stockJava新JVM oracle准确table/view/allObjects/namespace、schema/UUID/location/raw metadata hashes完全一致；五create/oracle/afterNative-oracle/drop/restored全0，原default namespace基线恢复。四role PID、60host commands原group/PID、6实际HMS/writer containerID、private HMS/catalog/objectstore ownerrecords均独立核对退出/消失；cleanup完整无error/retention。收据p09-hms-small-native-v3-pass-20261009.json绑定source/binary/build/freezes/actualfacts/raw hashes，v1/v2失败仍保留。
+- 仅small provider correctness preflight闭合；仍无intermediate mutation RPC observer，final unchanged不能冒充zero transient mutation。原32×512table+512view大CL、SDK硬byte界、performance/其余P09/P00b/P10/final及两人工语义门仍OPEN，无push/PR/归档。

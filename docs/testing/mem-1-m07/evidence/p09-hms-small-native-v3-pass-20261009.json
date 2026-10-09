@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "scope": "small stock HMS native FE classification and precise capability refusal only",
+  "source_revision": "055393db9fff02142df65e7affa779394ea828ae",
+  "source_dirty": false,
+  "status": "PASS",
+  "native_assertion_seconds": 0.315,
+  "native": {
+    "classification_passed": true,
+    "launch_identities": [
+      {
+        "pid": 9228,
+        "process_start_token": "macos:1791525289:263462",
+        "role": "fe"
+      },
+      {
+        "pid": 9229,
+        "process_start_token": "macos:1791525292:72376",
+        "role": "be-0"
+      },
+      {
+        "pid": 9230,
+        "process_start_token": "macos:1791525292:135060",
+        "role": "be-1"
+      },
+      {
+        "pid": 9231,
+        "process_start_token": "macos:1791525292:197499",
+        "role": "be-2"
+      }
+    ],
+    "mutation_rpc_count": "OPEN; source/component pre-first-mutation guarantee is separate",
+    "normal_runner_return": 0,
+    "role_settlement": "four exact PIDs independently absent",
+    "scenario_evidence_sha256": "85251738f36549a39515df1b94f5a7d6af5027e624a4aba32d85f49f47974464"
+  },
+  "assertion_facts": {
+    "assertions": "passed",
+    "drop_database_force": {
+      "code": 1105,
+      "reason_sha256": "6249d86464df425f3ae1b2f3803208237f3ad256040f102ca06a0b3f5c284f1c",
+      "state": "HY000"
+    },
+    "information_schema": [
+      [
+        "cap_table",
+        "BASE TABLE"
+      ]
+    ],
+    "launch_identities": [
+      {
+        "pid": 9228,
+        "process_start_token": "macos:1791525289:263462",
+        "role": "fe"
+      },
+      {
+        "pid": 9229,
+        "process_start_token": "macos:1791525292:72376",
+        "role": "be-0"
+      },
+      {
+        "pid": 9230,
+        "process_start_token": "macos:1791525292:135060",
+        "role": "be-1"
+      },
+      {
+        "pid": 9231,
+        "process_start_token": "macos:1791525292:197499",
+        "role": "be-2"
+      }
+    ],
+    "mutation_rpc_count": "unobserved; source/component pre-mutation guarantee only",
+    "parent_freeze_sha256": "8a022d321e413ffc502ac5c3acf937c78c89501005e383800a1d7ee278951a9f",
+    "phase": "complete",
+    "pre_native_oracle_sha256": "d357b0ea6e2c889b7651c4b0b8eb519f33327091c71548d09b21ca6c3e2a45b2",
+    "schema_version": 1,
+    "scope": "small-hms-classification-only",
+    "show_views": {
+      "code": 1105,
+      "reason_sha256": "6249d86464df425f3ae1b2f3803208237f3ad256040f102ca06a0b3f5c284f1c",
+      "state": "HY000"
+    },
+    "table_names": [
+      "cap_table"
+    ]
+  },
+  "fresh_java_provider_oracle": {
+    "tables": [
+      "cap_table"
+    ],
+    "views": [
+      "cap_view"
+    ],
+    "all_objects": [
+      "cap_table",
+      "cap_view"
+    ],
+    "table": {
+      "default_spec_id": 0,
+      "format_version": 2,
+      "location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_60fbd724dcca41febd0abe60ab485889/cap_table",
+      "metadata_location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_60fbd724dcca41febd0abe60ab485889/cap_table/metadata/00000-3e695d03-6b3f-4b41-b5cf-d27b1cc59494.metadata.json",
+      "partition_spec": {
+        "fields": [],
+        "spec-id": 0
+      },
+      "raw_metadata": {
+        "bytes": 724,
+        "sha256": "f774a0f250fd9a4a2d7849c005fb077383aac4a27c92677b706a6fbba1f447df"
+      },
+      "schema": {
+        "fields": [
+          {
+            "id": 1,
+            "name": "id",
+            "required": true,
+            "type": "long"
+          }
+        ],
+        "schema-id": 0,
+        "type": "struct"
+      },
+      "schema_count": 1,
+      "schema_id": 0,
+      "snapshot_count": 0,
+      "snapshot_id": null,
+      "spec_count": 1,
+      "uuid": "e7f1a93f-e929-41c0-a554-be67327c6e2d"
+    },
+    "view": {
+      "default_catalog": "m07_hms_preflight",
+      "default_namespace": [
+        "m07_cap_60fbd724dcca41febd0abe60ab485889"
+      ],
+      "format_version": 1,
+      "location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_60fbd724dcca41febd0abe60ab485889/cap_view",
+      "metadata_location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_60fbd724dcca41febd0abe60ab485889/cap_view/metadata/00000-b379f808-12b2-4e77-a537-2883edfe2435.gz.metadata.json",
+      "raw_metadata": {
+        "bytes": 441,
+        "sha256": "e1453de6c6898e1285bc643fd979aab3a4359ce2bead1efe78474d2ac3680556"
+      },
+      "representations": [
+        {
+          "dialect": "spark",
+          "sql": "SELECT id FROM cap_table"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "id": 1,
+            "name": "id",
+            "required": true,
+            "type": "long"
+          }
+        ],
+        "schema-id": 0,
+        "type": "struct"
+      },
+      "schema_count": 1,
+      "schema_id": 0,
+      "uuid": "bcdd3293-d286-4c9f-9d29-f4060705a221",
+      "version_count": 1,
+      "version_id": 1
+    },
+    "independent_new_jvm_exact_final_metadata_match": true,
+    "baseline_namespaces_restored": [
+      "default"
+    ]
+  },
+  "cleanup": {
+    "complete": true,
+    "four_role_pids_independently_absent": true,
+    "host_commands_actual_groups_and_pids_absent": 60,
+    "six_actual_container_ids_absent": [
+      "a3ced0db77b97b71754fc8668dcb266aafcc4972017de8d17a9aa81ecfa49f2e",
+      "10a1f1f555f49771a44fe857a2fbfa58647849ac1b7d0b09660dd156dcb6b0b0",
+      "fe1e118f18c3f3271d16d16031a703c3529176ce2607d08e7c8609db22b1d1c9",
+      "d43d9771a3a2acbfa9dc7e29e1072dba8e0d829aadcf87b66aea0d4accdd23d3",
+      "f41a681d45c8ae17a6d988a0e42afbc8af144cd18db15673bc4e577a8d1bc881",
+      "391f938c6cddd456408d9e9fe391f9442ef3f1f202b93d4fedfab497d3dbae1e"
+    ],
+    "private_owner_records_absent": [
+      "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/hms/cat-ff2bcfd3257a/manifest.json",
+      "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/cat-ff2bcfd3257a/record.json",
+      "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/os-eec671f90159/record.json"
+    ],
+    "errors": []
+  },
+  "evidence_scope": [
+    "Actual 1FE+3BE topology barrier and exact four role launch identities",
+    "FE catalog-qualified names and information_schema type enumerate only genuine Iceberg table; genuine Java Iceberg view excluded",
+    "Actual SHOW VIEWS and DROP DATABASE FORCE both return1105/HY000 with exact Unsupported/list_views source reason",
+    "Independent stock Java oracle before/after Native exact schema/UUID/location/raw metadata hashes and lists unchanged",
+    "Five stock JVM owners exit0; actual original namespace baseline restored and private owners cleaned"
+  ],
+  "limitations": [
+    "Small correctness preflight is not original32x512 table+512 view large CL or performance",
+    "No intermediate mutation RPC observer; final unchanged metadata does not prove zero transient mutations",
+    "No SDK internal hard bytes, full P09/P00b/P10/final sameHEAD or overall acceptance",
+    "No push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/status.json",
+      "bytes": 54282,
+      "sha256": "557bfc2abb7cbc42fe38f3f9c4a56c097ebaa5d5ffece2d66be29ef137e5300a"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/NATIVE_CLASSIFICATION_PREFLIGHT_PASS.json",
+      "bytes": 194,
+      "sha256": "d0acf2eca6f024074237b977dd731a69477b6df1d21473ffa691d8ac6cf20cbb"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/small-native-receipt.json",
+      "bytes": 613,
+      "sha256": "7f14bf72c35b120a6cc1a23d2c40d7226c7561da807f6c79dc24b8192fe4a634"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/create-receipt.json",
+      "bytes": 3913,
+      "sha256": "29aa447549de96af5d03ca5bb06f1b81eec01f4a9d867504501086c8be91504c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/oracle-receipt.json",
+      "bytes": 2868,
+      "sha256": "d357b0ea6e2c889b7651c4b0b8eb519f33327091c71548d09b21ca6c3e2a45b2"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/after-native/oracle-receipt.json",
+      "bytes": 2868,
+      "sha256": "47db612abea768852919318d5dbd759c57a5e7ce71de32be0f03a8c39b4690a6"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/drop-receipt.json",
+      "bytes": 2034,
+      "sha256": "da044f0977feeb12ebe57985f49ce3bfc41be0ac8d141a718f7c9a1712e0dddc"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/restored-receipt.json",
+      "bytes": 721,
+      "sha256": "372135413669f941099a29da9db506d74a7144259c3bfd86448aa28c88e4421e"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/native-artifacts/catalog-mem-1-m07-hms-classification-preflight/scenario-evidence.json",
+      "bytes": 29945,
+      "sha256": "85251738f36549a39515df1b94f5a7d6af5027e624a4aba32d85f49f47974464"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v3-20261009/native-artifacts/catalog-mem-1-m07-hms-classification-preflight/hms-classification-assertions.json",
+      "bytes": 1288,
+      "sha256": "3560694411817e2ed6c2ecd58f721233af7a5e38aae0fb596fe70f61693597a8"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-parent-freeze-v3-20261009.json",
+      "bytes": 4955,
+      "sha256": "8a022d321e413ffc502ac5c3acf937c78c89501005e383800a1d7ee278951a9f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-execution-freeze-v3-20261009.json",
+      "bytes": 2817,
+      "sha256": "31e95b08afa210c9f986feb4c90309468e6d320f05dc3fb0a187b36eecb26f92"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-build-receipt-v3-20261009.json",
+      "bytes": 551,
+      "sha256": "bf78f44b7b45a3cc7b81e5b9bdae82474455ce60c81ed0eec42864ce240bee4b"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-build-v3-20261009.log",
+      "bytes": 184444,
+      "sha256": "7887e16fe7db7f9eaa088903512327a896e2887a84b965da1e492383e852a06a"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-driver-v3-20261009.log",
+      "bytes": 173,
+      "sha256": "7a882aaa1007b12f924522dcbe8355b8a470b9c788f614ae83135a082a9640c5"
+    }
+  ]
+}
