@@ -33,10 +33,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, FixedSizeBinaryArray, Int8Array, Int16Array,
-    Int32Array, Int64Array, Int64Builder, ListArray, NullArray, UInt32Array, make_array,
-    new_empty_array,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Array, Int64Builder, ListArray, NullArray,
+    UInt32Array, make_array, new_empty_array,
 };
+#[cfg(test)]
+use arrow::array::{Int8Array, Int16Array, Int32Array};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field};
 use arrow_data::transform::MutableArrayData;
@@ -47,10 +48,13 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::SlotId;
+#[cfg(test)]
 use novarocks_types::largeint;
 use novarocks_types::value::bitmap;
 
-const MAX_TABLE_FUNCTION_OUTPUT_ROWS: usize = u32::MAX as usize;
+#[cfg(test)]
+const MAX_TABLE_FUNCTION_OUTPUT_ROWS: usize =
+    novarocks_functions::generate_series_core::MAX_TABLE_FUNCTION_OUTPUT_ROWS;
 
 /// Factory for table-function processors that expand each input row to variable output rows.
 pub struct TableFunctionProcessorFactory {
@@ -463,7 +467,7 @@ impl TableFunctionProcessorOperator {
         let mut row_counts = Vec::with_capacity(num_rows);
         let mut row_values: Vec<Option<Vec<Vec<u64>>>> = Vec::with_capacity(num_rows);
         for row in 0..num_rows {
-            let batch_size = self.int_like_arg_to_i128(&size_col, row, 1, "subdivide_bitmap")?;
+            let batch_size = self.int_like_arg_to_i128(&size_col, row, 1, novarocks_functions::generate_series_core::IntegerDiagnosticContext::SubdivideBitmap)?;
             if bitmap_arr.is_null(row) || batch_size.is_none() {
                 if self.is_left_join {
                     row_counts.push(1);
@@ -553,79 +557,23 @@ impl TableFunctionProcessorOperator {
             None
         };
 
-        let num_rows = chunk.len();
-        let mut row_counts = Vec::with_capacity(num_rows);
-        let mut series_values: Vec<Option<i128>> = Vec::new();
-        let mut total_output_rows = 0usize;
-        for row in 0..num_rows {
-            let start = self.int_like_arg_to_i128(&start_col, row, 0, "generate_series")?;
-            let end = self.int_like_arg_to_i128(&end_col, row, 1, "generate_series")?;
-            let step = match step_col.as_ref() {
-                Some(col) => self.int_like_arg_to_i128(col, row, 2, "generate_series")?,
-                None => Some(1),
-            };
-            match (start, end, step) {
-                (Some(start), Some(end), Some(step)) => {
-                    if step == 0 {
-                        return Err("table function generate_series step size cannot equal zero"
-                            .to_string());
-                    }
-                    let count = generate_series_count(start, end, step)?;
-                    if count == 0 {
-                        if self.is_left_join {
-                            checked_add_table_function_rows(&mut total_output_rows, 1)?;
-                            row_counts.push(1);
-                            series_values.push(None);
-                        } else {
-                            row_counts.push(0);
-                        }
-                        continue;
-                    }
-
-                    checked_add_table_function_rows(&mut total_output_rows, count)?;
-                    row_counts.push(count);
-                    let mut current = start;
-                    for _ in 0..count {
-                        series_values.push(Some(current));
-                        current = current.checked_add(step).ok_or_else(|| {
-                            format!(
-                                "table function generate_series value overflow: current={} step={}",
-                                current, step
-                            )
-                        })?;
-                    }
-                }
-                _ => {
-                    if self.is_left_join {
-                        checked_add_table_function_rows(&mut total_output_rows, 1)?;
-                        row_counts.push(1);
-                        series_values.push(None);
-                    } else {
-                        row_counts.push(0);
-                    }
-                }
-            }
-        }
-
-        if total_output_rows == 0 {
+        let expansion = novarocks_functions::generate_series_core::expand(
+            &start_col,
+            &end_col,
+            step_col.as_ref(),
+            chunk.len(),
+            self.is_left_join,
+        )?;
+        if expansion.total_rows == 0 {
             return self.empty_output_chunk();
         }
-        if series_values.len() != total_output_rows {
-            return Err(format!(
-                "table function generate_series internal output size mismatch: values={} rows={}",
-                series_values.len(),
-                total_output_rows
-            ));
-        }
-
-        let row_indices = build_row_indices(&row_counts)?;
+        let row_indices = build_row_indices(&expansion.row_counts)?;
         let outer_columns = self.build_outer_columns(chunk, &row_indices)?;
         let result_columns = if self.fn_result_required {
-            vec![self.generate_series_result_column(series_values)?]
+            vec![self.generate_series_result_column(expansion.values)?]
         } else {
             Vec::new()
         };
-
         self.assemble_output_chunk(outer_columns, result_columns)
     }
 
@@ -694,201 +642,13 @@ impl TableFunctionProcessorOperator {
         array: &ArrayRef,
         row: usize,
         arg_idx: usize,
-        fn_name: &str,
+        diagnostic: novarocks_functions::generate_series_core::IntegerDiagnosticContext,
     ) -> Result<Option<i128>, String> {
-        match array.data_type() {
-            DataType::Int8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| format!("table function {fn_name} downcast Int8Array failed"))?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::Int16 => {
-                let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
-                    format!("table function {fn_name} downcast Int16Array failed")
-                })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::Int32 => {
-                let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                    format!("table function {fn_name} downcast Int32Array failed")
-                })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::Int64 => {
-                let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    format!("table function {fn_name} downcast Int64Array failed")
-                })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::UInt8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt8Array>()
-                    .ok_or_else(|| {
-                        format!("table function {fn_name} downcast UInt8Array failed")
-                    })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::UInt16 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt16Array>()
-                    .ok_or_else(|| {
-                        format!("table function {fn_name} downcast UInt16Array failed")
-                    })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::UInt32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt32Array>()
-                    .ok_or_else(|| {
-                        format!("table function {fn_name} downcast UInt32Array failed")
-                    })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::UInt64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt64Array>()
-                    .ok_or_else(|| {
-                        format!("table function {fn_name} downcast UInt64Array failed")
-                    })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    Ok(Some(i128::from(arr.value(row))))
-                }
-            }
-            DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| {
-                        format!("table function {fn_name} downcast FixedSizeBinaryArray failed")
-                    })?;
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    let value = largeint::i128_from_be_bytes(arr.value(row)).map_err(|e| {
-                        format!("table function {fn_name} decode LARGEINT failed: {e}")
-                    })?;
-                    Ok(Some(value))
-                }
-            }
-            other => Err(format!(
-                "table function {fn_name} arg {arg_idx} expects TINYINT/SMALLINT/INT/BIGINT/LARGEINT, got {:?}",
-                other
-            )),
-        }
+        novarocks_functions::generate_series_core::integer_argument(array, row, arg_idx, diagnostic)
     }
 
     fn generate_series_result_column(&self, values: Vec<Option<i128>>) -> Result<ArrayRef, String> {
-        if self.ret_types.len() != 1 {
-            return Err(format!(
-                "table function generate_series expects 1 return type, got {}",
-                self.ret_types.len()
-            ));
-        }
-        match self
-            .ret_types
-            .first()
-            .ok_or_else(|| "table function generate_series missing return type".to_string())?
-        {
-            DataType::Int8 => {
-                let mut out_i8 = Vec::with_capacity(values.len());
-                for value in values {
-                    let v = match value {
-                        Some(v) => Some(i8::try_from(v).map_err(|_| {
-                            format!(
-                                "table function generate_series value out of TINYINT range: {v}"
-                            )
-                        })?),
-                        None => None,
-                    };
-                    out_i8.push(v);
-                }
-                Ok(Arc::new(Int8Array::from(out_i8)) as ArrayRef)
-            }
-            DataType::Int16 => {
-                let mut out_i16 = Vec::with_capacity(values.len());
-                for value in values {
-                    let v = match value {
-                        Some(v) => Some(i16::try_from(v).map_err(|_| {
-                            format!(
-                                "table function generate_series value out of SMALLINT range: {v}"
-                            )
-                        })?),
-                        None => None,
-                    };
-                    out_i16.push(v);
-                }
-                Ok(Arc::new(Int16Array::from(out_i16)) as ArrayRef)
-            }
-            DataType::Int32 => {
-                let mut out_i32 = Vec::with_capacity(values.len());
-                for value in values {
-                    let v = match value {
-                        Some(v) => Some(i32::try_from(v).map_err(|_| {
-                            format!("table function generate_series value out of INT range: {v}")
-                        })?),
-                        None => None,
-                    };
-                    out_i32.push(v);
-                }
-                Ok(Arc::new(Int32Array::from(out_i32)) as ArrayRef)
-            }
-            DataType::Int64 => {
-                let mut out_i64 = Vec::with_capacity(values.len());
-                for value in values {
-                    let v = match value {
-                        Some(v) => Some(i64::try_from(v).map_err(|_| {
-                            format!("table function generate_series value out of BIGINT range: {v}")
-                        })?),
-                        None => None,
-                    };
-                    out_i64.push(v);
-                }
-                Ok(Arc::new(Int64Array::from(out_i64)) as ArrayRef)
-            }
-            DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-                largeint::array_from_i128(&values)
-            }
-            other => Err(format!(
-                "table function generate_series return type expects TINYINT/SMALLINT/INT/BIGINT/LARGEINT, got {:?}",
-                other
-            )),
-        }
+        novarocks_functions::generate_series_core::result_column(values, &self.ret_types)
     }
 
     fn row_counts_single(&self, list: &ListArray) -> Result<Vec<usize>, String> {
@@ -1127,35 +887,14 @@ fn split_bitmap_values(values: &[u64], batch_size: usize) -> Vec<Vec<u64>> {
     out
 }
 
+#[cfg(test)]
 fn generate_series_count(start: i128, end: i128, step: i128) -> Result<usize, String> {
-    if step > 0 {
-        if start > end {
-            return Ok(0);
-        }
-        let diff = end - start;
-        let count = diff / step + 1;
-        usize::try_from(count)
-            .map_err(|_| format!("table function generate_series count overflow: {count}"))
-    } else {
-        if start < end {
-            return Ok(0);
-        }
-        let diff = start - end;
-        let step_abs = step.abs();
-        let count = diff / step_abs + 1;
-        usize::try_from(count)
-            .map_err(|_| format!("table function generate_series count overflow: {count}"))
-    }
+    novarocks_functions::generate_series_core::count(start, end, step)
 }
 
+#[cfg(test)]
 fn checked_add_table_function_rows(total: &mut usize, rows: usize) -> Result<(), String> {
-    *total = total
-        .checked_add(rows)
-        .ok_or_else(|| "table function output too large".to_string())?;
-    if *total > MAX_TABLE_FUNCTION_OUTPUT_ROWS {
-        return Err("table function output too large".to_string());
-    }
-    Ok(())
+    novarocks_functions::generate_series_core::checked_add_output_rows(total, rows)
 }
 
 #[cfg(test)]
@@ -1181,3 +920,7 @@ mod tests {
 #[cfg(test)]
 #[path = "generate_series_original_baseline_tests.rs"]
 mod generate_series_original_baseline_tests;
+
+#[cfg(test)]
+#[path = "generate_series_shared_differential_tests.rs"]
+mod generate_series_shared_differential_tests;

@@ -156,7 +156,7 @@ fn actual(array: &ArrayRef) -> Vec<Option<i128>> {
                 finished: false,
             };
             operator
-                .int_like_arg_to_i128(array, row, 0, "generate_series")
+                .int_like_arg_to_i128(array, row, 0, novarocks_functions::generate_series_core::IntegerDiagnosticContext::GenerateSeries)
                 .unwrap()
         })
         .collect()

@@ -63,6 +63,7 @@ mod evaluation;
 mod exact_installed_owner_selection_tests;
 #[cfg(test)]
 mod exact_overload_selection_tests;
+pub mod generate_series_core;
 mod higher_order_call;
 mod higher_order_kernel;
 mod kernel_control;
