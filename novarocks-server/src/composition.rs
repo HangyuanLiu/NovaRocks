@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -802,13 +802,9 @@ struct ComposedTaskExecutionBudgets {
     transport: FrontendTaskTransportBudget,
 }
 
-fn compose_frontend_workload_runtime(
+fn compose_frontend_workload_policy(
     runtime: &crate::app_config::RuntimeConfig,
-) -> anyhow::Result<(
-    LogicalExecutionSupervisorConfig,
-    WorkloadConfig,
-    NonZeroUsize,
-)> {
+) -> anyhow::Result<WorkloadConfig> {
     let input = &runtime.frontend_workload;
     let workload = WorkloadConfig {
         // These generic bookkeeping ceilings protect finite in-process state.
@@ -838,7 +834,32 @@ fn compose_frontend_workload_runtime(
     };
     workload
         .validate()
-        .map_err(|error| anyhow::anyhow!("construct frontend workload policy: {error}"))?;
+        .context("construct frontend workload policy")?;
+    Ok(workload)
+}
+
+/// Pure load-time check over the same policy projection used by composition.
+pub(crate) fn validate_frontend_joint_startup(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<crate::joint_startup_report::JointStartupReport> {
+    let workload = compose_frontend_workload_policy(runtime)?;
+    crate::joint_startup_report::validate_current(&workload)
+}
+
+fn compose_frontend_workload_runtime(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<(
+    LogicalExecutionSupervisorConfig,
+    WorkloadConfig,
+    NonZeroUsize,
+)> {
+    let input = &runtime.frontend_workload;
+    let workload = compose_frontend_workload_policy(runtime)?;
+    let report = crate::joint_startup_report::validate_current(&workload)?;
+    tracing::debug!(
+        ?report,
+        "Frontend joint startup number checks completed; owner projections remain open"
+    );
     let nonzero = |field: &'static str, value: usize| {
         NonZeroUsize::new(value)
             .ok_or_else(|| anyhow::anyhow!("runtime.frontend_workload.{field} must be nonzero"))
@@ -1513,4 +1534,46 @@ fn remote_effect_guarantee(
     )
     .map(Some)
     .map_err(|error| anyhow!("InvalidMvManagementConfig: [mv_management].{field}: {error}"))
+}
+
+#[cfg(test)]
+mod joint_startup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn load_check_and_composition_use_the_same_original_workload_projection() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.concurrency_limit = 16;
+        let projected = compose_frontend_workload_policy(&runtime).expect("original workload");
+        let report = validate_frontend_joint_startup(&runtime).expect("joint number check");
+        let (_, composed, _) =
+            compose_frontend_workload_runtime(&runtime).expect("pure composition");
+        assert_eq!(projected.query_concurrency_limit, 16);
+        assert_eq!(
+            composed.query_concurrency_limit,
+            projected.query_concurrency_limit
+        );
+        assert_eq!(report.computation_positions, 16);
+        assert_eq!(report.result_plus_native_declared_bytes, None);
+    }
+
+    #[test]
+    fn original_policy_projection_failure_preserves_the_owner_error() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.waiting_limit = 0;
+        let error = validate_frontend_joint_startup(&runtime).expect_err("invalid actual policy");
+        assert!(
+            error
+                .downcast_ref::<novarocks_workload_control::WorkError>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn beyond_supported_compute_is_rejected_by_both_pure_callers() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.concurrency_limit = 257;
+        assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+    }
 }

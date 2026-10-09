@@ -33,6 +33,11 @@ const MAX_GENERATION: u64 = u64::MAX;
 const ORDINARY_POSITIONS: usize = 512;
 const CONTROL_POSITIONS: usize = 32;
 
+/// The same frozen positions consumed by each original registry constructor.
+pub(crate) const fn frozen_connection_positions() -> [usize; 2] {
+    [ORDINARY_POSITIONS, CONTROL_POSITIONS]
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MysqlConnectionClass {
     Ordinary,
@@ -125,7 +130,7 @@ impl MysqlClientConnectionRegistry {
                 max_connection_id,
                 max_generation,
                 entries: BTreeMap::new(),
-                capacity: [ORDINARY_POSITIONS, CONTROL_POSITIONS],
+                capacity: frozen_connection_positions(),
                 held: [0; 2],
             })),
         }
@@ -535,5 +540,17 @@ mod tests {
                 .expect("second receives shutdown"),
             ClientConnectionTerminationReason::ServerShutdown
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_projection_tests {
+    use super::*;
+
+    #[test]
+    fn projection_positions_are_the_original_registry_constructor_values() {
+        let registry = MysqlClientConnectionRegistry::new();
+        assert_eq!(registry.lock().capacity, frozen_connection_positions());
+        assert_eq!(frozen_connection_positions(), [512, 32]);
     }
 }

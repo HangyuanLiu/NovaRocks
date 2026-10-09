@@ -152,6 +152,29 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
 /// application shutdown.
 pub const QUERY_APPLICATION_MYSQL_SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Pure settings shared by the original caller and its startup projection.
+/// Authentication starts at registry admission; command timing starts at the
+/// first byte inside the original intermediary. No clock is started here.
+pub(crate) struct MysqlInputPolicy {
+    pub(crate) limits: opensrv_mysql::ProtocolLimits,
+    pub(crate) auth_timeout: Duration,
+    pub(crate) command_timeout: Duration,
+    pub(crate) response_write_timeout: Duration,
+}
+
+pub(crate) fn mysql_input_policy(class: MysqlConnectionClass) -> MysqlInputPolicy {
+    let mut limits = opensrv_mysql::ProtocolLimits::default();
+    if class == MysqlConnectionClass::Control {
+        limits.command_bytes = limits.diagnostic_bytes;
+    }
+    MysqlInputPolicy {
+        limits,
+        auth_timeout: Duration::from_secs(10),
+        command_timeout: Duration::from_secs(10),
+        response_write_timeout: Duration::from_secs(30),
+    }
+}
+
 /// Runs a ready Query Application session factory until shutdown.
 ///
 /// The adapter owns protocol-task draining; the caller supplies the already
@@ -497,19 +520,16 @@ async fn serve_registered_mysql_connection(
         _ => FixtureMysqlWriter::Raw(writer),
     };
     let result = {
-        let mut limits = opensrv_mysql::ProtocolLimits::default();
-        if registration.class() == MysqlConnectionClass::Control {
-            limits.command_bytes = limits.diagnostic_bytes;
-        }
+        let input_policy = mysql_input_policy(registration.class());
         let intermediary = AsyncMysqlIntermediary::run_with_input_deadlines(
             shim,
             reader,
             writer,
             &crate::MYSQL_INTERMEDIARY_OPTIONS,
-            limits,
-            tokio::time::Instant::from_std(registration.admitted_at()) + Duration::from_secs(10),
-            Duration::from_secs(10),
-            Duration::from_secs(30),
+            input_policy.limits,
+            tokio::time::Instant::from_std(registration.admitted_at()) + input_policy.auth_timeout,
+            input_policy.command_timeout,
+            input_policy.response_write_timeout,
         );
         tokio::pin!(intermediary);
         tokio::select! {

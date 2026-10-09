@@ -35,6 +35,7 @@ mod query_application_shim;
 mod relay_metadata;
 mod relay_result_writer;
 mod result_encoding;
+mod startup_profile;
 mod terminal;
 
 use novarocks_query_application::session_error::QueryServiceErrorKind;
@@ -144,3 +145,8 @@ mod tests {
 
 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
 pub use query_application_shim::serve_query_application_mysql_until_drain_then_shutdown_fixture as query_application_fixture_listener;
+
+pub use startup_profile::{
+    MysqlInputLimits, MysqlInputStartupParameters, MysqlStartupParameters,
+    frozen_mysql_startup_parameters,
+};

@@ -21,6 +21,7 @@ pub mod catalog_source_config;
 pub mod cgroup_memory;
 pub mod composition;
 mod env_reference;
+mod joint_startup_report;
 pub mod launch;
 pub mod logging;
 pub mod memory_limit;
