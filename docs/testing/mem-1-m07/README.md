@@ -131,3 +131,12 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 首次clean63bb/v2 installed-root native失败（4.757s）：准确BE1/stage1/task1 typed零ACK定位成功，stage2/task2非root拒绝无法满足strict trailers-only；后者实为相同execution的第二个真实task，未猜root。失败仍resume/join，原1048580B row/独立schema/hash正常，4精确PID已退出；FinalAck场景未执行。收据 `p09-installed-root-native-fail-20261009.json`，不转换为PASS。
 - 根因是 `native_ingress.rs` 的OwnedResponseBody只poll_frame，未转发inner.is_end_stream/size_hint；内层Tonic空status response被默认false掩盖，Hyper产生empty EOS DATA，违反gRPC拒绝应在status HEADERS上结束的结构。真实Hyper+h2 duplex回归旧码0PASS/1FAIL，修正后Native lib720PASS/0FAIL；收据 `p09-empty-grpc-refusal-focused-20261009.json`。
 - 最小修法仅转发两个inner facts，ownership仍由实际Drop/last DATA alias退出，不主动释放permit、不改变status/容量/deadline/owner分类；strict probe保留。原生复跑待执行，跨共享Native响应包装器修正触发一次C0里程碑。两个待裁决语义与其它P09/P00b/P10/final仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09：原精确取消十场景 Native PASS
+
+clean `1fb1319df` 的原 x S−1/S/S+1、wide q17 S+1缺尾、tiny1..6，十个独立1FE+3BE全部PASS。actual原runner十次wait0、schema5 passed/0fail与40原role PID ESRCH均通过；原输入/SQL/cut/caps/deadlines未改。见[十场景收据](evidence/p09-exact-native-ten-cases-1fb1319df-20261009.json)和coverage最新追加记录。原ef0350 S-boundary失败保留。该矩阵不是Closing64/lateACK/backing最后alias或M07整体完成；其余P08/P00b/P09/P10和两人工语义决定仍OPEN。HMS非只读正确性按用户IRU-7 excluded。
+
+### 2026-10-09：P08 准确 Root support 完整绑定回归 PASS
+
+原完整 manifest 绑定在 access/Connector/TaskCreate 前拒绝准确 root 的缺失 V1 support；其它支持 BE 不能代替 root，legacy 非 root candidate 不妨碍支持 root。真实 whole-plan/freeze/encoder/bind_facts 回归及 artifact 共32 PASS，attempt owner12 PASS，fmt/diff-check通过。见[组件收据](evidence/p08-selected-root-support-components-20261009.json)。该组件采用有限 private request/schedule 事实，真实 QA ticket/公开 bind/Native 缺能力拒绝仍 OPEN；前一十场景 Native 早于新 guard。其它完整 M07 门和用户语义决定保持 OPEN，无发布。

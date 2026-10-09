@@ -579,3 +579,20 @@ clean `ef0350bc061ffa64222191b9f7e1b425128acaae` actual server+runner同HEAD fea
 接着原x S case FAILED beforeKILL：原cut1048576已让首S-byte native Data消费/退休，actual BE census只保留第二Data8B/segment1、producerExited1/terminal1/End1；driver误要求原整行2Data/S+8。失败operation/runner1与四原roleESRCH原样保留，收据 `evidence/p09-exact-native-resident-cut-1048576-ef0350bc0-20261009.json`，余case未启动，不把清理成功当case PASS。原one-row oracle早已覆盖S/S+1的seq2/currentbody8/Some(empty)；原immutable JSON未要求已消费Data永恒驻留。
 
 仅修正测试driver观察：原complete x cut<S严格2Data/S+8，cut>=S严格1Data/8；tiny仍1Data8，wide仍2Data/2S/running/noEnd。反例拒绝错误whole-row/one-S/producer状态；driver定向19 PASS/0FAIL/0.31s。生产窗口W2、SQL/cut/bytes/hash/30s/5s/20s/commands不改。下一cleanHEAD实际重跑完整十场景，当前原十case整体仍OPEN；剩余P09/P00b/P10/final及两个重大语义决定不闭合，HMS非只读继续IRU-7 excluded，无push/PR/归档。
+
+
+### P09 original exact ten-case Native matrix PASS (2026-10-09)
+
+clean `1fb1319dfca5b9141b79cbbe4008b7c617e86e54` 的 actual server/runner 同 HEAD feature build PASS（dev unoptimized，8m26s）。另新 immutable execution binding 关联实际 fullcommit、两个 build identity、binary/base/Cargo.lock/source hash；原 large/tiny 非 runnable 草稿和原输入字节保持。串行十个 fresh 1FE+3BE 全部 PASS：原 x S−1/S/S+1、原17列 wide S+1 missing-tail、tiny1..6。actual outer launcher exit0，十个原 runner actual wait0；每项 schema5 passed/0fail、原operation/source/config/wire恢复或准确partialEOF与同socket后续零response一致，40个原launch PID/birth的实际ESRCH通过。
+
+outer十case累计488.338s包含source/build哈希与独立prep，不替代/续期原scene20s、prep30s、command5s、productionClosing5s/write30s。原 ef0350 的 S 边界失败仍保留 FAIL，修正后是新clean十项证据，不覆盖历史。收据 `evidence/p09-exact-native-ten-cases-1fb1319df-20261009.json`；ignored artifact-index钉住272个原产物，binary/input/build/source/wrapper哈希另在收据中保存。
+
+本项只闭合原精确十场景矩阵；不证明process-group/descendants、fullClosing64、seal后late ACK-held Native send alias、fixed-core/完整allocator backing最后alias、其余P07/P08/大provider CL、P00b coefficients/CM/release CP、Linux或final同SHA C0/C10。两个用户语义决定未变；HMS非只读正确性按用户IRU-7 excluded，无push/PR/归档。
+
+### P08 selected Root support full-manifest component PASS (2026-10-09)
+
+在原 `TaskManifestBinding::bind_facts` 校验完整 root task/anchor 后，立即检查准确冻结 root BE descriptor 的现有 V1 support；位置先于 access.instantiate、Connector 初始化和 TaskCreate。支持的其它 BE 不能替无支持 root 放行；不按全体 candidate 过滤 topology，不增加 profile/wire 字段或 fallback。
+
+完整生产绑定回归用真实 Values(Int64) whole-plan validation、root freeze、Native encoder 与 bind_facts，覆盖 ClientRows/CountOnly 缺支持拒绝、支持 root 与 legacy 非 root candidate 共存、foreign attempt 完整 root identity 拒绝。artifact **32 PASS / 0 FAIL / 0 ignored，0.08s**，attempt owner **12 PASS / 0 FAIL / 0 ignored，0.11s**；实际两个命令 exit0，fmt/diff-check PASS。收据 `evidence/p08-selected-root-support-components-20261009.json` 固定 integrated source/diff、两项独立审查、原草稿与实际日志 pins。
+
+测试使用 private finite request-bound/schedule 事实，未伪造 QA 私有 move-only AttemptSchedule 或 Connector 启动计数；实际 literal access 集为空。真实 QA ticket→公开 bind/activation 观测与 Native 缺能力拒绝仍 OPEN。前一十场景 Native 绑定 clean 1fb1319df、早于此 guard，不挪作新代码证据。P08 完整启动包络/SDK联合校验/运行期增容/Host drain、其它 P09/P00b/P10/final 门仍 OPEN；两个人工语义、cap/deadline 与 HMS IRU-7 例外不改，无 push/PR/归档。

@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "1fb1319dfca5b9141b79cbbe4008b7c617e86e54",
+  "status": "P08_SELECTED_ROOT_SUPPORT_FULL_MANIFEST_COMPONENT_PASS_NATIVE_OPEN",
+  "source_files": [
+    {
+      "path": "novarocks/frontend-application/src/query_execution/artifact/task_manifest_binding.rs",
+      "bytes": 80656,
+      "sha256": "2d9a96eeb02467bdf4d3f7ad474f73da4250901cf38f60adaf86d4dcf7bb55ee"
+    },
+    {
+      "path": "novarocks/frontend-application/src/query_execution/artifact.rs",
+      "bytes": 114588,
+      "sha256": "ffb57250cb12820bb3b1b5109c8c6b2a7460d1cb2ba9be85b12e556051f4be41"
+    },
+    {
+      "path": "novarocks/frontend-application/src/query_execution/native_execution_adapter.rs",
+      "bytes": 116429,
+      "sha256": "463b2f53a26cbb6ada34bc87cbab7da3abe405f62795a54453cfc14a3b9f90ce"
+    },
+    {
+      "path": "novarocks/execution-contract/src/membership.rs",
+      "bytes": 11445,
+      "sha256": "c05e55369ecc2b720557e01581cb5168de7d125c8ad3e21a470ce697ad0098ce"
+    },
+    {
+      "path": "novarocks/execution-contract/src/native_result_support.rs",
+      "bytes": 9997,
+      "sha256": "0cae21486cab2c6ddba5623de0db410b55e97dcbf1734a84b0a2d82f65d05f57"
+    }
+  ],
+  "integrated_source_diff": {
+    "path": "logs/mem-1-m07/p08-full-bind-integrated-source-20261009.patch",
+    "bytes": 17898,
+    "sha256": "5fc48e9534f1eb62c48a26e79be86ab4b585622812b22d38c60de826b3dddc10"
+  },
+  "draft_and_review_provenance": [
+    {
+      "path": "logs/mem-1-m07/p08-final-owner-config-audit-v1/review.md",
+      "bytes": 13582,
+      "sha256": "977e3a00867d1e511296b5cec21f5b819b5801f47891c409d61b638f7bc486b7"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-root-support-guard-review-v1/review.md",
+      "bytes": 6913,
+      "sha256": "971496886c6921f8a71f959c99cf005f37eb5ea4e2fe1c4314b10d28671b2558"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-root-support-full-bind-test-draft-v1/audit.md",
+      "bytes": 6090,
+      "sha256": "ede166268b1b115fcf892c132381e2cb0bedd47829330d844eae5d6a6de52636"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-root-support-full-bind-test-draft-v1/source-pins.json",
+      "bytes": 3819,
+      "sha256": "5febd6b543773b472740f731310eb3ba7988e5e37a4631c976a03a38380516eb"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-root-support-full-bind-test-draft-v1/full-bind-tests.v1.draft.patch",
+      "bytes": 11915,
+      "sha256": "366ebf83e977fcd874b1ec2f55615e2c200f62f80835f37dbb0d1bf5c971a01e"
+    }
+  ],
+  "verification": [
+    {
+      "path": "logs/mem-1-m07/p08-full-bind-artifact-tests-20261009.log",
+      "bytes": 153697,
+      "sha256": "3f0103bb214a20a6d17d1a3f202d114c9e278d75702f75da872ad0780ebcb3ac",
+      "filter": "query_execution::artifact",
+      "passed": 32,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 6841,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p08-full-bind-attempt-owner-tests-20261009.log",
+      "bytes": 151271,
+      "sha256": "07c4979a69cc29d03794b7c4e403656c8e02d6e9aa28d39ab99d314bb260e932",
+      "filter": "query_execution::native_execution_adapter::tests",
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 36839,
+      "actual_terminal_exit_code": 0
+    }
+  ],
+  "format": {
+    "path": "logs/mem-1-m07/p08-full-bind-fmt-check-20261009.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actual_session": 76273,
+    "actual_terminal_exit_code": 0
+  },
+  "behavior": [
+    "Selected root support is checked at the original complete manifest binding before access instantiation or connector initialization.",
+    "Support from another frozen process cannot authorize the selected unsupported root.",
+    "A supported selected root remains usable with an unsupported non-root topology candidate.",
+    "A supported process cannot replace the complete scheduled root task identity.",
+    "ClientRows and CountOnly fixtures run production whole-plan validation, root freeze, native encoding and complete bind_facts."
+  ],
+  "component_boundary": [
+    "The component uses private finite request-bound and projected schedule facts, not a real QA request ticket or public AttemptSchedule.",
+    "The literal plan has an actually empty runtime access set; no fabricated connector-start counter is used.",
+    "No wire fields, topology eligibility filtering, fallback, clocks or capacity values change.",
+    "The ten-case Native receipt at 1fb1319df predates this guard and is not Native evidence for the new guard."
+  ],
+  "remaining_open": [
+    "Real QA ticket through public bind and before-activation access or dispatch observation.",
+    "Native missing-root-capability rejection.",
+    "Other P08 host, startup-envelope, runtime-capacity and SDK-joint-validation work.",
+    "Full Closing64, held send alias late ACK, complete backing last-alias and other P09 pressures.",
+    "HMS and Paimon large read-only listing, P00b coefficients, CM, release CP, Linux handoff, P10 and final same-SHA validation."
+  ],
+  "hms_non_readonly_correctness": "EXCLUDED_BY_USER_IRU7_SCOPE",
+  "publish_authorized": false,
+  "goal_complete": false
+}

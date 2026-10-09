@@ -1,0 +1,691 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "source_revision": "1fb1319dfca5b9141b79cbbe4008b7c617e86e54",
+  "source_tree_sha256": "3ac216f995edae49aee16643a2ffc613952165e7a72e0df621e714be4ae096f4",
+  "status": "PASS_SCOPE_ORIGINAL_EXACT_TEN_CASE_MATRIX",
+  "native_acceptance": true,
+  "topology": {
+    "frontend": 1,
+    "backends": 3,
+    "mode": "cross-process",
+    "fresh_cluster_per_case": true
+  },
+  "actual_outer_launcher_exit_code": 0,
+  "actual_original_runner_exit_codes": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "cases_attempted": 10,
+  "cases_passed": 10,
+  "original_role_absence_observations": 40,
+  "cases": [
+    {
+      "case": "exact-native-resident-cut-1048575",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "d00df9d7db690b08625dbebe3cc60abf522858d7561bef20f21cc44eb47b67f2",
+      "operation_observation_sha256": "65033620eb5639b2e31e8ef5d718250dd85db5655fba3d70cb5d33ae1cb0f729",
+      "original_runner_log_sha256": "6a1bf070f40473b465d141b3ef42e55e4394667da82644157f4d349cd4f9a1c2",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 58725,
+          "process_start_token": "macos:1791543136:622176",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 58726,
+          "process_start_token": "macos:1791543136:710569",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 58728,
+          "process_start_token": "macos:1791543136:775783",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 58729,
+          "process_start_token": "macos:1791543136:827966",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 50.75974837499962,
+      "cut_row_wire_bytes": 1048575,
+      "exact_sql_sha256": "3cf4353ce6c28949b09b6cb3ed0dc22447c500b0cb187f58e9e4918daad78fd2",
+      "expected_prefix_sha256": "3f295505e16bf4878e87e4f309298156482c30e5ebca6f9935518dca1a96ca9d",
+      "expected_row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+      "kill_started_us": 558079,
+      "kill_returned_us": 558808,
+      "resumed_us": 626605
+    },
+    {
+      "case": "exact-native-resident-cut-1048576",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "8edf5b1615780f42dc1f8b70fb55f62e5190bc76a49558edcb8b1283c5e61cfb",
+      "operation_observation_sha256": "583a2cad367ce906ebac5e226645d477a616473baf99631898e7ac8c4a8d297e",
+      "original_runner_log_sha256": "05079fe89e333833db2dfb3093c3bf6496fe4a05d29be1532cc7858ee5b80468",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 58970,
+          "process_start_token": "macos:1791543185:672051",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 58971,
+          "process_start_token": "macos:1791543185:742721",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 58972,
+          "process_start_token": "macos:1791543185:798535",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 58973,
+          "process_start_token": "macos:1791543185:852759",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 49.03941704200406,
+      "cut_row_wire_bytes": 1048576,
+      "exact_sql_sha256": "3cf4353ce6c28949b09b6cb3ed0dc22447c500b0cb187f58e9e4918daad78fd2",
+      "expected_prefix_sha256": "d6a7901bbaaaa42ba83d32f88d197c5da12280b23236f916090ded124215a5ae",
+      "expected_row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+      "kill_started_us": 550679,
+      "kill_returned_us": 551339,
+      "resumed_us": 619474
+    },
+    {
+      "case": "exact-native-resident-cut-1048577",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "275a872069650a028196f8de9ac3239dd6bc1a05533e67d281205a589661f810",
+      "operation_observation_sha256": "4044b204b0e5f317f5b6ffdfadd1c7c0c45d3914895a57083b16b10be451353a",
+      "original_runner_log_sha256": "336254628ff3207a0a3849be77cdfe3c0f15285f34acaee2ddc81a91c9916a56",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 59322,
+          "process_start_token": "macos:1791543234:469752",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 59323,
+          "process_start_token": "macos:1791543234:542621",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 59324,
+          "process_start_token": "macos:1791543234:593486",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 59325,
+          "process_start_token": "macos:1791543234:646166",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 48.83431350000319,
+      "cut_row_wire_bytes": 1048577,
+      "exact_sql_sha256": "3cf4353ce6c28949b09b6cb3ed0dc22447c500b0cb187f58e9e4918daad78fd2",
+      "expected_prefix_sha256": "7fba88713c8a50edfd46263480e04c0e1b7646f46d1c629a531584a08a3cec17",
+      "expected_row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+      "kill_started_us": 554553,
+      "kill_returned_us": 555297,
+      "resumed_us": 624774
+    },
+    {
+      "case": "exact-native-missing-tail-cut-1048577",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "9757a8b5742a8f235f53a5e5fc4091da30d1d38ee7c48a36adae2052f9361e20",
+      "operation_observation_sha256": "f70068b73d2b9bd2d1750ecb452296937ac6642463d39663d8c6b7c1f3b73950",
+      "original_runner_log_sha256": "a14511fa746ed0b8fdd83722ad285f907c2a537285e6a5a13f7c3619021e5d1b",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 59508,
+          "process_start_token": "macos:1791543283:488336",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 59509,
+          "process_start_token": "macos:1791543283:562414",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 59510,
+          "process_start_token": "macos:1791543283:615990",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 59511,
+          "process_start_token": "macos:1791543283:671915",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 48.62631587499345,
+      "cut_row_wire_bytes": 1048577,
+      "exact_sql_sha256": "6366beea12d3c9acf30f1f0ed89424734cbd63b790ba86a527ce07cc82f47236",
+      "expected_prefix_sha256": "859f61de598f4227197d13f83ebcdbb0a0f5289d983e8dce9975db7a56bf18fb",
+      "expected_row_sha256": "51433c7930844aec5dca09a6dcb7e13e1a98801a483a30b04f9f3be064c9ffb4",
+      "kill_started_us": 496550,
+      "kill_returned_us": 497287,
+      "resumed_us": 554363
+    },
+    {
+      "case": "exact-native-resident-cut-1",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "9c66549d27c8697c122ca59f2338e89f1b731f1cddbc9676c08baa9746e09175",
+      "operation_observation_sha256": "26b3a27f55a805aa6b057aa318059630a58bcb9c8d605fea46e4174fa9b6b8f3",
+      "original_runner_log_sha256": "bb7cee176da99f427b7ad34f9096c49f99126cc5a4136e85a6a815b52bdd1598",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 59702,
+          "process_start_token": "macos:1791543331:827399",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 59703,
+          "process_start_token": "macos:1791543331:890840",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 59704,
+          "process_start_token": "macos:1791543331:941435",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 59705,
+          "process_start_token": "macos:1791543332:6662",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 48.30069645900221,
+      "cut_row_wire_bytes": 1,
+      "exact_sql_sha256": "5bfdb7c3b0d51d81b665e38055b7cf5e298501b35c12d897393087cb38cfd140",
+      "expected_prefix_sha256": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71",
+      "expected_row_sha256": "658094aec4a81dfc97cb374a907ee41f74b1faf9a02f62bbf4f98d6d48c1219f",
+      "kill_started_us": 283146,
+      "kill_returned_us": 283878,
+      "resumed_us": 284111
+    },
+    {
+      "case": "exact-native-resident-cut-2",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "83cabd150261bb94c73a1ec34bc07be5a9be5dd73d1c983802b6da78046889e8",
+      "operation_observation_sha256": "de4daf835d7a5e5bf4737db97b71bb9331884a0f25a3049af75ef7dcd06d14f7",
+      "original_runner_log_sha256": "b1195c54fc0e520b58ae53c88374cfe739d651f5411dd095ff59dc0772a3824f",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 59959,
+          "process_start_token": "macos:1791543380:119684",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 59960,
+          "process_start_token": "macos:1791543380:188747",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 59961,
+          "process_start_token": "macos:1791543380:239457",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 59962,
+          "process_start_token": "macos:1791543380:298446",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 48.29230595800618,
+      "cut_row_wire_bytes": 2,
+      "exact_sql_sha256": "5bfdb7c3b0d51d81b665e38055b7cf5e298501b35c12d897393087cb38cfd140",
+      "expected_prefix_sha256": "c0ba8a33ac67f44abff5984dfbb6f56c46b880ac2b86e1f23e7fa9c402c53ae7",
+      "expected_row_sha256": "658094aec4a81dfc97cb374a907ee41f74b1faf9a02f62bbf4f98d6d48c1219f",
+      "kill_started_us": 279445,
+      "kill_returned_us": 280125,
+      "resumed_us": 280367
+    },
+    {
+      "case": "exact-native-resident-cut-3",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "48b610f3ba0e4a24246756e1bf3d0aaba7ba8b90043aa61dc0a23adca0f40a18",
+      "operation_observation_sha256": "32bd0768f2b40433fa804b363ff7fb45def2c13f06f6f9fa7958dba216cd6984",
+      "original_runner_log_sha256": "20b274234f4f2ce7683ca9e0849e08c48f88776c5991cae3efdcabeeb0f432fb",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 60350,
+          "process_start_token": "macos:1791543428:422358",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 60351,
+          "process_start_token": "macos:1791543428:493679",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 60352,
+          "process_start_token": "macos:1791543428:552942",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 60353,
+          "process_start_token": "macos:1791543428:612421",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 48.573815999989165,
+      "cut_row_wire_bytes": 3,
+      "exact_sql_sha256": "5bfdb7c3b0d51d81b665e38055b7cf5e298501b35c12d897393087cb38cfd140",
+      "expected_prefix_sha256": "3ee0d7c44a58950b18c1e01b912ed0e08549ff905fbf7010318a44d3e2efb8db",
+      "expected_row_sha256": "658094aec4a81dfc97cb374a907ee41f74b1faf9a02f62bbf4f98d6d48c1219f",
+      "kill_started_us": 279166,
+      "kill_returned_us": 279946,
+      "resumed_us": 280158
+    },
+    {
+      "case": "exact-native-resident-cut-4",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "dc3e9270f4c81b3d70955f9650164bb22a417b2569293c62a35dc6bb91285b2e",
+      "operation_observation_sha256": "9c9b329fba918131ff7ac96c22d29c7218896d6046924fc5cfc4fba29104f066",
+      "original_runner_log_sha256": "ad878a8da8c9acaa2c3a89cd04d0c74716727e5b981323922820e38b683ed706",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 61030,
+          "process_start_token": "macos:1791543476:948354",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 61031,
+          "process_start_token": "macos:1791543477:9445",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 61032,
+          "process_start_token": "macos:1791543477:63163",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 61033,
+          "process_start_token": "macos:1791543477:119293",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 48.20955212500121,
+      "cut_row_wire_bytes": 4,
+      "exact_sql_sha256": "5bfdb7c3b0d51d81b665e38055b7cf5e298501b35c12d897393087cb38cfd140",
+      "expected_prefix_sha256": "8a3044222ef06194ca6ec01b989000752c076c1c1aae1a0d81c82a5c94288b6d",
+      "expected_row_sha256": "658094aec4a81dfc97cb374a907ee41f74b1faf9a02f62bbf4f98d6d48c1219f",
+      "kill_started_us": 279556,
+      "kill_returned_us": 280169,
+      "resumed_us": 280409
+    },
+    {
+      "case": "exact-native-resident-cut-5",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "70d97f67204e02c2f9021bce24269bfab6212ee5e16b7bc567fbf08139ee74ce",
+      "operation_observation_sha256": "25d0eff148906c4ec70d54dec3f0911e4c343d21bcef8d8aa8ce93f33c8fe502",
+      "original_runner_log_sha256": "af55f09e1223309da8e765eb007a9d13c00c4c9e9307c37d75008579bba53e9e",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 61208,
+          "process_start_token": "macos:1791543525:861516",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 61209,
+          "process_start_token": "macos:1791543525:922905",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 61210,
+          "process_start_token": "macos:1791543525:977934",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 61211,
+          "process_start_token": "macos:1791543526:33713",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 49.20270554099989,
+      "cut_row_wire_bytes": 5,
+      "exact_sql_sha256": "5bfdb7c3b0d51d81b665e38055b7cf5e298501b35c12d897393087cb38cfd140",
+      "expected_prefix_sha256": "2bd5620604a8d6a6c1b0e76d94714b6b389b580b625632d1a00e1387a077ec9d",
+      "expected_row_sha256": "658094aec4a81dfc97cb374a907ee41f74b1faf9a02f62bbf4f98d6d48c1219f",
+      "kill_started_us": 283754,
+      "kill_returned_us": 284550,
+      "resumed_us": 284775
+    },
+    {
+      "case": "exact-native-resident-cut-6",
+      "native_acceptance": true,
+      "runner_returncode": 0,
+      "scenario_schema_version": 5,
+      "scenario_outcome": "passed",
+      "effective_launch_config_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_semantics_sha256": "8cc221f5d43cc79c506009e9cd9d0200f49b2c64d10c28ed5d116ca2c3df77d9",
+      "effective_launch_config_bytes": 14928,
+      "scenario_evidence_sha256": "e7381aa63d1f83bdca058cd92eb610f4341f5b2fc454b39ef3ca16382e4b595b",
+      "operation_observation_sha256": "4d1c62eb669f93bd0b308ec61a29cbf5be7b3234d174fdb183d9c7c846a12420",
+      "original_runner_log_sha256": "b981ff18d0ea2979dc4309213b68bedda7dcec9a8e4c322e3204ca83e0f8809c",
+      "original_role_absence_after_runner_settled": [
+        {
+          "role": "fe",
+          "pid": 61599,
+          "process_start_token": "macos:1791543574:516297",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-0",
+          "pid": 61600,
+          "process_start_token": "macos:1791543574:591593",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-1",
+          "pid": 61601,
+          "process_start_token": "macos:1791543574:644282",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        },
+        {
+          "role": "be-2",
+          "pid": 61602,
+          "process_start_token": "macos:1791543574:695349",
+          "probe": "kill(pid,0)",
+          "result": "ESRCH"
+        }
+      ],
+      "original_runner_actual_settled": true,
+      "original_runner_actual_returncode": 0,
+      "outer_elapsed_seconds": 48.499281790995155,
+      "cut_row_wire_bytes": 6,
+      "exact_sql_sha256": "5bfdb7c3b0d51d81b665e38055b7cf5e298501b35c12d897393087cb38cfd140",
+      "expected_prefix_sha256": "36dcb689dea90ebe81b1937491eeb7beec678b5b8bdaf36cd0d0724079900c14",
+      "expected_row_sha256": "658094aec4a81dfc97cb374a907ee41f74b1faf9a02f62bbf4f98d6d48c1219f",
+      "kill_started_us": 280997,
+      "kill_returned_us": 281759,
+      "resumed_us": 281973
+    }
+  ],
+  "actual_build": {
+    "server": {
+      "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+      "bytes": 435080760,
+      "sha256": "93dd82e8bdb22057d3d00454ff782a10cc0c20499260e3423429f4b64bb8a7a0",
+      "dev": 16777231,
+      "ino": 243355177,
+      "mtime_ns": 1791542842378848101,
+      "ctime_ns": 1791542842413491523
+    },
+    "runner": {
+      "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks-system-tests",
+      "bytes": 121842600,
+      "sha256": "827a42d903df927fb96813d2474f5b41b130f8552c5a5b03bea30a9cfe472cf6",
+      "dev": 16777231,
+      "ino": 243355148,
+      "mtime_ns": 1791542839733788338,
+      "ctime_ns": 1791542839776346332
+    },
+    "base_config": {
+      "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/tools/ci/fixtures/system-scenarios-base.toml",
+      "bytes": 3283,
+      "sha256": "e959dcbe9214e0a2d2348ac13bab609bf5ed778dd7da316fd92368ba9e83643b",
+      "dev": 16777231,
+      "ino": 242449018,
+      "mtime_ns": 1791431781328715139,
+      "ctime_ns": 1791431781328715139
+    },
+    "cargo_lock": {
+      "path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/Cargo.lock",
+      "bytes": 190805,
+      "sha256": "acfc730a94658877487d173fcf4026b5070b6d54aaef9c229437ed3e8cbb3270",
+      "dev": 16777231,
+      "ino": 242528029,
+      "mtime_ns": 1791539668843888657,
+      "ctime_ns": 1791539668843888657
+    },
+    "server_build_commit": "1fb1319dfca5b9141b79cbbe4008b7c617e86e54",
+    "server_build_identity": "1fb1319dfca5b9141b79cbbe4008b7c617e86e54",
+    "runner_build_commit": "1fb1319dfca5b9141b79cbbe4008b7c617e86e54",
+    "runner_build_identity": "1fb1319dfca5b9141b79cbbe4008b7c617e86e54",
+    "profile": "dev unoptimized",
+    "jobs": 1,
+    "incremental": false
+  },
+  "artifacts": [
+    {
+      "path": "logs/mem-1-m07/exact-native-run-1fb1319df-v1/matrix-result.json",
+      "bytes": 35450,
+      "sha256": "e04621933ac5cff771574cf8c382e880ecffc0c23aa1ff3e6c9d48b9138869b9"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-run-1fb1319df-v1/artifact-index.json",
+      "bytes": 63007,
+      "sha256": "a9136c3d4ee2c4e7f8542941456586456a708ce94935e978efbcb0e5f2574763"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-run-1fb1319df-v1/build-receipt.json",
+      "bytes": 3569,
+      "sha256": "e578d52e7ed36d953ad3030e3ec99544b7a3a2f8abd993f875f726fa9f05d7fc"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-run-1fb1319df-v1/execution-binding.json",
+      "bytes": 1785,
+      "sha256": "b054af789969832fb26663daf61d5eeffbe334d755fc5f127b408b6ea91969bb"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-run-1fb1319df-v1/server-build-identity.stdout",
+      "bytes": 153,
+      "sha256": "b9913550279a4d509bc129d834f7afe68ca8a469ea2c86b86394c097b74eedfd"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-run-1fb1319df-v1/run_original_cases.py",
+      "bytes": 6599,
+      "sha256": "8f6ee4392cfff8117f3f3b6f588afef654e6411bbe7ea7e2853b8ba19750a754"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-run-1fb1319df-v1/outer-all-cases.log",
+      "bytes": 1770,
+      "sha256": "d2cccae3b001845a736ae93f5a722a0d2775ad06842a15d4fb72bced773d994a"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-orchestration-v1/orchestrate_exact_native.draft.py",
+      "bytes": 31266,
+      "sha256": "385d03dd80b7236bd54f3958d34e68e59e41f7d4af8b2c1949c85313c3446af9"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-native-boundary-clean-build-20261009.log",
+      "bytes": 219900,
+      "sha256": "26bab421a6e037719a323b3fc699311104befd92cb50f0e0bef5d963d82616e2"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/root-cancel-closing-freeze-v1.json",
+      "bytes": 4232,
+      "sha256": "18a25f94a81006ae2920d97f184918cea1ed84484f273638a0ed73382da6f4a2"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-original-large-row-native-freeze.draft.json",
+      "bytes": 11135,
+      "sha256": "d4bbd8c0cd3c3d647c6a0c948692db381360406584f25e3f6653fc91b73feff2"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-new-tiny-row-native-freeze.draft.json",
+      "bytes": 11876,
+      "sha256": "a250875085fd54bc3c35e0c1e7a08173d2f36920bc7dc6ab83ba6dbf2745d127"
+    }
+  ],
+  "outer_elapsed_seconds_sum": 488.33815266599413,
+  "timing_scope": "outer timing includes source/build hashing and separate admission; it does not replace or renew original scene20s/preparation30s/command5s/Closing5s/write30s",
+  "no_product_caps_deadlines_sql_cuts_or_input_hashes_changed": true,
+  "prior_ef0350_s_boundary_failure": "retained as FAIL; corrected current held Data census after actual consumed-segment retirement and reran all original ten",
+  "scope": "original exact ten cases: actual handshake/source/Root/writer cut/freeze/wire/recovery or partial physical EOF; actual settled original runner and four original PID ESRCH per case",
+  "excluded_from_this_receipt": [
+    "process-group or descendant census",
+    "fullClosing64",
+    "late ACK after seal under held native send alias",
+    "fixed-core and complete allocator backing last-alias exit",
+    "remaining P07/P08/provider CL",
+    "transport coefficients, CM and release CP",
+    "Linux acceptance",
+    "final same-SHA C0/C10",
+    "full M07 completion"
+  ],
+  "hms_nonreadonly_correctness": "excluded by user-authorized IRU-7 read-only retirement; this matrix uses no HMS",
+  "remaining_human_decisions": [
+    "Ordinary lane saturation behavior",
+    "30s active-write budget inclusion of BE producer wait"
+  ]
+}
