@@ -29,10 +29,28 @@ fn handle() -> PreparedAggregateHandle {
     )
     .unwrap()
 }
-fn partial_run(control: &Control) -> Result<(), EvaluationFailure> {
+// Keep the exhaustive control matrix on an explicitly admitted small sketch.
+// The independent native/value oracle retains its original lgK=17 source.
+fn control_handle() -> PreparedAggregateHandle {
+    PreparedAggregateHandle::from_typed(
+        Arc::new(kernel(
+            "ds_hll_count_distinct",
+            &[
+                FunctionValueType::new(DataType::Int64, false),
+                FunctionValueType::new(DataType::Int64, false),
+                FunctionValueType::new(DataType::Utf8, false),
+            ],
+            AggregateKernelPhase::Single,
+        )),
+        &Compile,
+    )
+    .unwrap()
+}
+fn partial_run(
+    source: &PreparedAggregateHandle,
+    control: &Control,
+) -> Result<(), EvaluationFailure> {
     let host = Arc::new(Host::default());
-    let mut source = handle();
-    source.prepare_local_stages(&Compile).unwrap();
     let partial = source.local_stages().unwrap().partial().clone();
     let result;
     {
@@ -45,7 +63,13 @@ fn partial_run(control: &Control) -> Result<(), EvaluationFailure> {
         states.push(&Control::default()).unwrap();
         let array =
             Arc::new(arrow_array::Int64Array::from_iter_values(1..=321)) as arrow_array::ArrayRef;
-        let arguments = [EvaluatedArgument::Column(&array)];
+        let lg = Arc::new(arrow_array::Int64Array::from(vec![4])) as ArrayRef;
+        let target = Arc::new(arrow_array::StringArray::from(vec!["HLL_6"])) as ArrayRef;
+        let arguments = [
+            EvaluatedArgument::Column(&array),
+            EvaluatedArgument::Scalar(&lg),
+            EvaluatedArgument::Scalar(&target),
+        ];
         let input = SelectedAggregateUpdateInput::try_new(
             partial.contract(),
             Selection::all(321),
@@ -74,8 +98,13 @@ fn partial_run(control: &Control) -> Result<(), EvaluationFailure> {
 }
 #[test]
 fn ds_hll_local_stage_after_all_seven_actual_callback_causes_no_tail_drop() {
+    // The original immutable phase recipe is prepared once. Every trial still
+    // owns fresh state, allocator ledger, mapping, evaluated carriers and control.
+    let mut source = control_handle();
+    source.prepare_local_stages(&Compile).unwrap();
+
     let success = Control::default();
-    partial_run(&success).unwrap();
+    partial_run(&source, &success).unwrap();
     let callbacks = success.trace.lock().unwrap().len();
     assert!(callbacks > 1);
     for stop in 0..callbacks {
@@ -85,17 +114,15 @@ fn ds_hll_local_stage_after_all_seven_actual_callback_causes_no_tail_drop() {
                 refusal: Some((stop, cause.clone())),
             };
             assert!(
-                matches!(partial_run(&control), Err(EvaluationFailure::Kernel(actual)) if actual == cause)
+                matches!(partial_run(&source, &control), Err(EvaluationFailure::Kernel(actual)) if actual == cause)
             );
             assert_eq!(control.trace.lock().unwrap().len(), stop + 1);
         }
     }
 }
 
-fn merge_run(control: &Control) -> Result<(), EvaluationFailure> {
+fn merge_run(source: &PreparedAggregateHandle, control: &Control) -> Result<(), EvaluationFailure> {
     let host = Arc::new(Host::default());
-    let mut source = handle();
-    source.prepare_local_stages(&Compile).unwrap();
     let stages = source.local_stages().unwrap();
     let partial = stages.partial().clone();
     let final_stage = stages.final_stage().clone();
@@ -110,7 +137,13 @@ fn merge_run(control: &Control) -> Result<(), EvaluationFailure> {
         partial_states.push(&Control::default()).unwrap();
         let array =
             Arc::new(arrow_array::Int64Array::from_iter_values(1..=321)) as arrow_array::ArrayRef;
-        let arguments = [EvaluatedArgument::Column(&array)];
+        let lg = Arc::new(arrow_array::Int64Array::from(vec![4])) as ArrayRef;
+        let target = Arc::new(arrow_array::StringArray::from(vec!["HLL_6"])) as ArrayRef;
+        let arguments = [
+            EvaluatedArgument::Column(&array),
+            EvaluatedArgument::Scalar(&lg),
+            EvaluatedArgument::Scalar(&target),
+        ];
         let input = SelectedAggregateUpdateInput::try_new(
             partial.contract(),
             Selection::all(321),
@@ -161,8 +194,13 @@ fn merge_run(control: &Control) -> Result<(), EvaluationFailure> {
 }
 #[test]
 fn ds_hll_local_stage_after_final_merge_all_seven_callback_causes_no_tail_drop() {
+    // The original immutable phase recipe is prepared once. Every trial still
+    // owns fresh state, allocator ledger, mapping, evaluated carriers and control.
+    let mut source = control_handle();
+    source.prepare_local_stages(&Compile).unwrap();
+
     let success = Control::default();
-    merge_run(&success).unwrap();
+    merge_run(&source, &success).unwrap();
     let callbacks = success.trace.lock().unwrap().len();
     assert!(callbacks > 1);
     for stop in 0..callbacks {
@@ -172,7 +210,7 @@ fn ds_hll_local_stage_after_final_merge_all_seven_callback_causes_no_tail_drop()
                 refusal: Some((stop, cause.clone())),
             };
             assert!(
-                matches!(merge_run(&control), Err(EvaluationFailure::Kernel(actual)) if actual == cause)
+                matches!(merge_run(&source, &control), Err(EvaluationFailure::Kernel(actual)) if actual == cause)
             );
             assert_eq!(control.trace.lock().unwrap().len(), stop + 1);
         }
