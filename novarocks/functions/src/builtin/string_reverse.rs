@@ -140,15 +140,14 @@ pub(super) fn evaluate_string_reverse<'a>(
                         "string reversal exceeded its measured output extent",
                     ));
                 }
-                // The legacy body is str::chars().rev().collect::<String>().
-                // Reversing scalars preserves each scalar and total byte extent;
-                // combining marks and ZWJ sequences are deliberately not grouped.
-                for scalar in selected.chars().rev() {
-                    let mut encoded = [0u8; 4];
-                    for byte in scalar.encode_utf8(&mut encoded).bytes() {
-                        bytes.push(byte);
-                        work.step()?;
-                    }
+                // ONE original v1 renderer retains Unicode scalar (not grapheme)
+                // reversal. Its String allocation/collect internals are opaque;
+                // observing the rendered bytes preserves the original callback
+                // sequence without creating a second reversal algorithm.
+                let rendered = crate::string_reverse_shared::reverse_utf8(selected);
+                for byte in rendered.bytes() {
+                    bytes.push(byte);
+                    work.step()?;
                 }
                 validity.append(true);
             }

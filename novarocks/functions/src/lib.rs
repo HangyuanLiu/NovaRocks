@@ -2642,6 +2642,7 @@ mod tests {
 pub mod date_float_cast;
 
 pub mod float_date_cast;
+pub mod string_reverse_shared;
 
 pub mod legacy_arithmetic;
 pub mod legacy_decimal;

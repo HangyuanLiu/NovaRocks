@@ -687,3 +687,70 @@ fn string_reverse_compile_success_and_ordinary_tail_preserve_all_callback_causes
         }
     }
 }
+
+#[test]
+fn string_reverse_shared_all_actual_callbacks_preserve_seven_causes_and_failed_latch() {
+    for array in [
+        strings(vec![Some("aé中"), None, Some("👩\u{200d}💻"), Some("")]),
+        strings(vec![Some(&"é中\0".repeat(320))]),
+    ] {
+        let good = Control::default();
+        let mut kernel = instance("reverse", true);
+        kernel
+            .evaluate(
+                Selection::all(array.len()),
+                &[EvaluatedArgument::Column(&array)],
+                &good,
+            )
+            .unwrap();
+        let trace = good.trace.lock().unwrap().clone();
+        assert!(!trace.is_empty());
+        if array.len() == 1 {
+            assert!(trace.contains(&256));
+        }
+        for at in 0..trace.len() {
+            for cause in [
+                KernelFailure::Cancelled,
+                KernelFailure::DeadlineExceeded,
+                KernelFailure::ResourceExhausted,
+                KernelFailure::InvalidProgram(crate::KernelDiagnostic::new(
+                    "original invalid refusal",
+                )),
+                KernelFailure::Internal(crate::KernelDiagnostic::new("original internal refusal")),
+                KernelFailure::Operational(crate::KernelDiagnostic::new(
+                    "original operational refusal",
+                )),
+                KernelFailure::InstanceFailed,
+            ] {
+                let control = Control {
+                    trace: Mutex::new(vec![]),
+                    refusal: Some((at, cause.clone())),
+                };
+                let mut kernel = instance("reverse", true);
+                assert_eq!(
+                    kernel
+                        .evaluate(
+                            Selection::all(array.len()),
+                            &[EvaluatedArgument::Column(&array)],
+                            &control
+                        )
+                        .unwrap_err(),
+                    cause
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                let after = Control::default();
+                assert_eq!(
+                    kernel
+                        .evaluate(
+                            Selection::all(array.len()),
+                            &[EvaluatedArgument::Column(&array)],
+                            &after
+                        )
+                        .unwrap_err(),
+                    KernelFailure::InstanceFailed
+                );
+                assert!(after.trace.lock().unwrap().is_empty());
+            }
+        }
+    }
+}

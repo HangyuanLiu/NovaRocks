@@ -1364,3 +1364,6 @@ mod cast_decimal_float32_oracle_tests;
 mod legacy_decimal_float32_cast_baseline_tests;
 #[cfg(test)]
 mod decimal_float32_sql_own_null_tests;
+
+#[cfg(test)]
+mod legacy_reverse_shared_baseline_tests;

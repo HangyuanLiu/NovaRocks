@@ -1766,3 +1766,6 @@ mod array_match_tests;
 
 #[path = "pure_differential_array_difference_tests.rs"]
 mod array_difference_tests;
+
+#[path = "pure_differential/string_reverse_shared_tests.rs"]
+mod string_reverse_shared_tests;
