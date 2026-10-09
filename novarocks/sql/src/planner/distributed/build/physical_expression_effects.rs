@@ -456,7 +456,7 @@ fn compose_expression_effects_observed<'source>(
                     // Reuse the source's sole ordered child vocabulary, rather
                     // than reconstruct CASE ordinals or eager operand lists.
                     let mut next = 0;
-                    source.kind.expression_references_observed(|definition| {
+                    source.kind.invocation_references_observed(|definition| {
                         let child = invocation.arguments.get(next).copied();
                         work.step()?;
                         let child = child.ok_or(PhysicalExpressionEffectsError::InvalidSource(
@@ -546,6 +546,24 @@ fn primitive_own_effects(
                 work,
             )?;
             ScopedExpressionEffects::pure_value(context)
+        }
+        ExprKind::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            work.flush()?;
+            let recipe = novarocks_functions::PreparedNativeBetweenRecipe::try_new(
+                novarocks_type_contract::NativeBetweenPlan::new(*negated),
+                &operand(*expr)?.ty,
+                &operand(*low)?.ty,
+                &operand(*high)?.ty,
+                &source.ty,
+                control,
+            )?;
+            work.flush()?;
+            recipe.own_effects(context)
         }
         ExprKind::Unary {
             op: UnaryOperator::Minus,

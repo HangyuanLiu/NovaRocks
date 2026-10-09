@@ -32,6 +32,8 @@ use std::{collections::BTreeMap, fmt};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ProgramComparisonSite {
     Binary(ProgramUseRef),
+    BetweenLower(ProgramUseRef),
+    BetweenUpper(ProgramUseRef),
     CaseWhen { occurrence: ProgramUseRef, arm: u32 },
 }
 
@@ -122,6 +124,55 @@ fn compile_core(
                 ))?
                 .kind();
             match kind {
+                StaticExprKind::PreparedBetween {
+                    plan,
+                    operand,
+                    low,
+                    high,
+                } => {
+                    if invocation.control
+                        != (ControlShape::Between {
+                            negated: plan.negated(),
+                        })
+                        || invocation.arguments.len() != 4
+                    {
+                        return Err(ProgramPrimitiveError::Invalid(
+                            "BETWEEN differs from its four ordered uses",
+                        ));
+                    }
+                    for (ordinal, role) in plan.sources().into_iter().enumerate() {
+                        let expected = match role {
+                            novarocks_type_contract::BetweenSourceRole::Operand => *operand,
+                            novarocks_type_contract::BetweenSourceRole::Lower => *low,
+                            novarocks_type_contract::BetweenSourceRole::Upper => *high,
+                        };
+                        if flow.uses()[&invocation.arguments[ordinal]].definition != expected {
+                            return Err(ProgramPrimitiveError::Invalid(
+                                "BETWEEN source occurrence differs",
+                            ));
+                        }
+                        work.step()?;
+                    }
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedNativeBetweenRecipe::try_new(
+                        *plan,
+                        value(*operand)?,
+                        value(*low)?,
+                        value(*high)?,
+                        value(invocation.definition)?,
+                        control,
+                    )?;
+                    work.flush()?;
+                    recipes.insert(
+                        ProgramComparisonSite::BetweenLower(occurrence),
+                        recipe.lower().clone(),
+                    );
+                    recipes.insert(
+                        ProgramComparisonSite::BetweenUpper(occurrence),
+                        recipe.upper().clone(),
+                    );
+                    work.step()?;
+                }
                 kind if kind.ordinary_comparison().is_some() => {
                     let (operator, left, right) =
                         kind.ordinary_comparison().expect("checked comparison kind");

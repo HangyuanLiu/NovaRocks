@@ -785,6 +785,9 @@ fn validate_intrinsic_correspondence(
             StaticExprKind::FunctionCall { .. } | StaticExprKind::BoundCall { .. } => continue,
             StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. } => ControlShape::Conjunction,
             StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. } => ControlShape::Disjunction,
+            StaticExprKind::PreparedBetween { plan, .. } => ControlShape::Between {
+                negated: plan.negated(),
+            },
             StaticExprKind::LambdaFunction { .. } => ControlShape::LambdaBody,
             StaticExprKind::Case {
                 has_case_expr,
@@ -912,6 +915,20 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Or(a, b) => {
                 child(*a)?;
                 child(*b)?;
+            }
+            StaticExprKind::PreparedBetween {
+                operand,
+                low,
+                high,
+                plan,
+            } => {
+                for role in plan.sources() {
+                    child(match role {
+                        novarocks_type_contract::BetweenSourceRole::Operand => *operand,
+                        novarocks_type_contract::BetweenSourceRole::Lower => *low,
+                        novarocks_type_contract::BetweenSourceRole::Upper => *high,
+                    })?;
+                }
             }
             StaticExprKind::In {
                 child: definition,

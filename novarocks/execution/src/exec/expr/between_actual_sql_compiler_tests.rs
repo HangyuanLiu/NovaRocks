@@ -20,7 +20,7 @@
 use super::compiled_program::CompiledExpressionInstance;
 use super::legacy_between_observed_baseline_tests::original;
 use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
-use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
+use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_scan_residuals;
 use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Int64Array, UInt64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -112,7 +112,7 @@ fn evaluate(sql: &str, input: ArrayRef, low: ArrayRef, high: ArrayRef, negated: 
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
     // This original author call is deliberately permanent RED before support.
-    let programs = programs_with_catalogue(&source, &functions);
+    let programs = programs_with_catalogue_and_original_scan_residuals(&source, &functions);
     let mut found = None;
     for program in programs.values() {
         for node in program.graph().nodes() {
@@ -131,6 +131,13 @@ fn evaluate(sql: &str, input: ArrayRef, low: ArrayRef, high: ArrayRef, negated: 
                 ProgramNodeKind::Filter { .. } if truth => ProgramExpressionRootSite::Node {
                     node: node.local_id().unwrap(),
                     role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
+                },
+                ProgramNodeKind::Scan {
+                    conjunct_predicate: Some(_),
+                    ..
+                } if truth => ProgramExpressionRootSite::Node {
+                    node: node.local_id().unwrap(),
+                    role: ProgramNodeExpressionRole::ScanResidual,
                 },
                 _ => continue,
             };
@@ -235,6 +242,27 @@ fn between_actual_compiler_required_decimal_bound_source() {
         make(7, 2, vec![12000, 9000]),
         make(6, 1, vec![1000; 2]),
         make(4, 0, vec![150; 2]),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn between_actual_compiler_decimal_literals_without_integral_cast_source() {
+    let make = |values| {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(7, 2)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    // This separate fixture leaves the required mixed-bound test untouched.
+    // Decimal literals avoid the independently missing Int64-to-Decimal128 cast.
+    evaluate(
+        "SELECT k BETWEEN 100.0 AND 150.0 AS original_range FROM fixture.source",
+        make(vec![12000, 9000]),
+        make(vec![10000; 2]),
+        make(vec![15000; 2]),
         false,
         false,
     );

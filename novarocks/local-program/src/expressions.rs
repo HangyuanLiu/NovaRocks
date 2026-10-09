@@ -200,6 +200,13 @@ pub enum StaticExprKind {
     NaryOr {
         args: Vec<ProgramExprId>,
     },
+    /// Three checked definitions, four distinct ordered invocation edges.
+    PreparedBetween {
+        plan: novarocks_type_contract::NativeBetweenPlan,
+        operand: ProgramExprId,
+        low: ProgramExprId,
+        high: ProgramExprId,
+    },
     Not(ProgramExprId),
     IsNull(ProgramExprId),
     IsNotNull(ProgramExprId),
@@ -342,6 +349,13 @@ impl StaticExprKind {
             | Self::Or(a, b) => {
                 visit(*a)?;
                 visit(*b)?;
+            }
+            Self::PreparedBetween {
+                operand, low, high, ..
+            } => {
+                visit(*operand)?;
+                visit(*low)?;
+                visit(*high)?;
             }
             Self::In { child, values, .. } => {
                 visit(*child)?;

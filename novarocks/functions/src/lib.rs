@@ -2688,3 +2688,6 @@ pub mod decimal128_rescale;
 
 pub mod list_cast_core;
 mod list_cast_selected;
+
+mod native_between;
+pub use native_between::*;

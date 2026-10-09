@@ -20,6 +20,8 @@
 //! deliberately excludes Arrow arrays, casts, rendering, serialization and
 //! runtime kernels so contract consumers do not acquire those capabilities.
 
+mod between;
+pub use between::*;
 mod arithmetic;
 mod array_generate;
 mod carrier_parameters;

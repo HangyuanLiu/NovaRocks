@@ -286,6 +286,7 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::PreparedCast { .. }
                     | StaticExprKind::PreparedNativeNegate(_)
                     | StaticExprKind::PreparedNativeBitNot(_)
+                    | StaticExprKind::PreparedBetween { .. }
                     | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::PreparedNullSafeComparison { .. }
                     | StaticExprKind::Eq(..)
@@ -318,6 +319,34 @@ impl CompiledExpressionInstance {
                                         invalid("missing mandatory native BitwiseNot effect recipe")
                                     })?
                                     .own_effects(invocation.context)
+                            } else if let StaticExprKind::PreparedBetween { plan, .. } = node.kind()
+                            {
+                                let lower = program
+                                .comparison_recipe(
+                                    novarocks_local_program::ProgramComparisonSite::BetweenLower(
+                                        occurrence,
+                                    ),
+                                )
+                                .ok_or_else(|| {
+                                    invalid("missing mandatory BETWEEN lower effect recipe")
+                                })?;
+                                let upper = program
+                                .comparison_recipe(
+                                    novarocks_local_program::ProgramComparisonSite::BetweenUpper(
+                                        occurrence,
+                                    ),
+                                )
+                                .ok_or_else(|| {
+                                    invalid("missing mandatory BETWEEN upper effect recipe")
+                                })?;
+                                if lower.operator() != plan.lower()
+                                    || upper.operator() != plan.upper()
+                                {
+                                    return Err(invalid(
+                                        "BETWEEN comparison effects differ from original expansion",
+                                    ));
+                                }
+                                lower.own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
                                 program
                                     .cast_recipe(occurrence)
@@ -404,6 +433,26 @@ impl CompiledExpressionInstance {
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
                         && program.native_bitnot_recipe(occurrence).is_some() => {}
+                StaticExprKind::PreparedBetween { plan, .. }
+                    if invocation.control
+                        == (ControlShape::Between {
+                            negated: plan.negated(),
+                        })
+                        && invocation.arguments.len() == 4
+                        && program
+                            .comparison_recipe(
+                                novarocks_local_program::ProgramComparisonSite::BetweenLower(
+                                    occurrence,
+                                ),
+                            )
+                            .is_some()
+                        && program
+                            .comparison_recipe(
+                                novarocks_local_program::ProgramComparisonSite::BetweenUpper(
+                                    occurrence,
+                                ),
+                            )
+                            .is_some() => {}
                 StaticExprKind::PreparedArithmetic { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2

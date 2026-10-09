@@ -128,6 +128,11 @@ impl Frame {
         } else {
             None
         };
+        let boolean = if matches!(shape, ControlShape::Between { .. }) {
+            Some(BooleanRows::new(rows.len(), work)?)
+        } else {
+            None
+        };
         Ok(Self {
             occurrence,
             rows,
@@ -140,7 +145,7 @@ impl Frame {
             operand: None,
             choices,
             errors: BTreeMap::new(),
-            boolean: None,
+            boolean,
             temporal,
         })
     }
@@ -173,6 +178,23 @@ impl Frame {
         }
         let mut ordinals = Vec::new();
         match shape {
+            ControlShape::Between { .. } => {
+                // Original Value AND/OR demands the second comparison even
+                // after a deciding lower value. Only earlier data errors are
+                // terminal in this exact current invocation domain.
+                for ordinal in 0..self.rows.len() {
+                    if !self.errors.contains_key(&ordinal) {
+                        ordinals.push(ordinal);
+                    }
+                    work.step()?;
+                }
+                if !self.rows.is_empty() && ordinals.is_empty() {
+                    work.flush()?;
+                    self.children.clear();
+                    work.flush()?;
+                    return Ok(None);
+                }
+            }
             ControlShape::TemporalSource(source_shape) => {
                 if source_shape == novarocks_type_contract::TemporalSourceShape::SecondsCastOther
                     && self.next == 2
@@ -321,6 +343,125 @@ impl Frame {
         work.flush()?;
         Ok(())
     }
+    fn attach_between(
+        &mut self,
+        child: Child,
+        program: &novarocks_local_program::LocalProgram,
+        negated: bool,
+        batch_rows: usize,
+        work: &mut Work<'_>,
+    ) -> Result<(), KernelFailure> {
+        let ordinal = self
+            .next
+            .checked_sub(1)
+            .ok_or_else(|| internal("BETWEEN child completed before its continuation"))?;
+        if ordinal >= 4 {
+            return Err(invalid("BETWEEN has exactly four source uses"));
+        }
+        let mut child_rows = Vec::with_capacity(child.ordinals.len());
+        for &parent in &child.ordinals {
+            child_rows.push(self.rows[parent]);
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &child_rows, || work.step())?;
+        let value = child.value.into_value(selection, work)?;
+        let ty = value.argument().array().data_type().clone();
+        let output = value.materialize(selection, &ty, work)?;
+        for error in output.errors() {
+            let parent = *child
+                .ordinals
+                .get(error.selected_ordinal())
+                .ok_or_else(|| invalid("BETWEEN child error has no source ordinal"))?;
+            self.errors
+                .entry(parent)
+                .or_insert_with(|| error.with_selected_ordinal(parent));
+            work.step()?;
+        }
+        self.children.push(Child {
+            ordinals: child.ordinals,
+            value: OwnedValue::from_selected(output),
+        });
+        if ordinal.is_multiple_of(2) {
+            return Ok(());
+        }
+        if self.children.len() != 2 {
+            return Err(invalid(
+                "BETWEEN comparison requires its ordered operand and bound",
+            ));
+        }
+        // Finish the comparison before asking for the next use occurrence.
+        // Source addresses remain separate even when both definitions coincide.
+        let mut pair = std::mem::take(&mut self.children).into_iter();
+        let left = pair
+            .next()
+            .ok_or_else(|| internal("missing BETWEEN operand"))?;
+        let right = pair
+            .next()
+            .ok_or_else(|| internal("missing BETWEEN bound"))?;
+        let mut parent_ordinals = Vec::with_capacity(right.ordinals.len());
+        let mut rows = Vec::with_capacity(right.ordinals.len());
+        for &parent in &right.ordinals {
+            if !self.errors.contains_key(&parent) {
+                parent_ordinals.push(parent);
+                rows.push(self.rows[parent]);
+            }
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        let left = between_comparison_operand(
+            left,
+            &parent_ordinals,
+            &self.rows,
+            selection,
+            batch_rows,
+            work,
+        )?;
+        let right = between_comparison_operand(
+            right,
+            &parent_ordinals,
+            &self.rows,
+            selection,
+            batch_rows,
+            work,
+        )?;
+        let site = if ordinal == 1 {
+            novarocks_local_program::ProgramComparisonSite::BetweenLower(self.occurrence)
+        } else {
+            novarocks_local_program::ProgramComparisonSite::BetweenUpper(self.occurrence)
+        };
+        let recipe = program
+            .comparison_recipe(site)
+            .ok_or_else(|| invalid("missing exact BETWEEN bound comparison recipe"))?;
+        let output = evaluate_comparison(
+            ComparisonRecipe::Ordinary(recipe),
+            &left,
+            &right,
+            selection,
+            work,
+        )?;
+        let connective = novarocks_type_contract::NativeBetweenPlan::new(negated).connective();
+        let _ = self
+            .boolean
+            .as_mut()
+            .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?
+            .consume(
+                &output,
+                &parent_ordinals,
+                connective,
+                EvaluationDemand::Value,
+                true,
+                &mut self.errors,
+                work,
+            )?;
+        // The existing Boolean author owns 3VL. Its dominance result is not an
+        // authorization to suppress original upper/volatile source invocations.
+        work.flush()?;
+        drop(output);
+        drop(left);
+        drop(right);
+        work.flush()?;
+        Ok(())
+    }
     #[expect(
         clippy::too_many_arguments,
         reason = "Keep the immutable recipe owner, selected child, parent semantics and work scope explicit"
@@ -335,6 +476,9 @@ impl Frame {
         batch_rows: usize,
         work: &mut Work<'_>,
     ) -> Result<(), KernelFailure> {
+        if let ControlShape::Between { negated } = shape {
+            return self.attach_between(child, program, negated, batch_rows, work);
+        }
         if let ControlShape::TemporalSource(source_shape) = shape {
             return self.attach_temporal(child, source_shape, batch_rows, work);
         }
@@ -763,6 +907,28 @@ pub(super) fn evaluate_tree<'a>(
                             .ok_or_else(|| invalid("slot source ordinal is absent"))?,
                     ))
                 }
+                StaticExprKind::PreparedBetween { plan, .. } => {
+                    if !frame.children.is_empty() {
+                        return Err(invalid("BETWEEN comparison phase was not completed"));
+                    }
+                    let state = frame
+                        .boolean
+                        .take()
+                        .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?;
+                    let (array, errors) = state.finish(
+                        plan.connective(),
+                        invocation.context.demand,
+                        std::mem::take(&mut frame.errors),
+                        work,
+                    )?;
+                    OwnedValue::from_selected(SelectedValues::try_new_observed(
+                        local_selection,
+                        &result_type.data_type,
+                        array,
+                        errors,
+                        || work.step(),
+                    )?)
+                }
                 StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => {
                     let state = frame
                         .boolean
@@ -1082,6 +1248,49 @@ fn assemble(
     )?))
 }
 
+/// Re-address one retained phase result through the existing selected COPY
+/// author. Nothing reads an inactive original batch row or supplies a new FVT.
+fn between_comparison_operand<'a>(
+    child: Child,
+    parent_ordinals: &[usize],
+    parent_rows: &[usize],
+    selection: Selection<'a>,
+    batch_rows: usize,
+    work: &mut Work<'_>,
+) -> Result<Value<'a>, KernelFailure> {
+    let mut rows = Vec::with_capacity(child.ordinals.len());
+    for &parent in &child.ordinals {
+        rows.push(parent_rows[parent]);
+        work.step()?;
+    }
+    let source_selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+    let value = child.value.into_value(source_selection, work)?;
+    let ty = value.argument().array().data_type().clone();
+    let output = value.materialize(source_selection, &ty, work)?;
+    let mut indices = Vec::with_capacity(parent_ordinals.len());
+    for &parent in parent_ordinals {
+        let index = child
+            .ordinals
+            .binary_search(&parent)
+            .map_err(|_| invalid("BETWEEN comparison row is absent from its source phase"))?;
+        indices.push(Some(
+            u64::try_from(index).map_err(|_| KernelFailure::ResourceExhausted)?,
+        ));
+        work.step()?;
+    }
+    let array = gather(output.values(), &indices, work)?;
+    work.flush()?;
+    drop(output);
+    work.flush()?;
+    Ok(Value::Selected(SelectedValues::try_new_observed(
+        selection,
+        &ty,
+        array,
+        Box::default(),
+        || work.step(),
+    )?))
+}
+
 /// The shared Boolean journal/assembly is independent of the numeric algorithm.
 /// Null-safe comparison retains its own prepared recipe and scalar semantics.
 enum ComparisonRecipe<'a> {
@@ -1096,6 +1305,9 @@ fn evaluate_comparison<'a>(
     selection: Selection<'a>,
     work: &mut Work<'_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
+    // Borrow the original callback; a nested comparison's footer cannot
+    // observe again after any of its seven originating refusal categories.
+    let observed = novarocks_functions::KernelControlObservation::new(work.control);
     let mut left_errors = left.errors().iter().peekable();
     let mut right_errors = right.errors().iter().peekable();
     // Representation accounting precedes fallible reservations. It is not a
@@ -1155,7 +1367,7 @@ fn evaluate_comparison<'a>(
                     right.argument(),
                     ordinal,
                     row,
-                    work.control,
+                    &observed,
                 )?,
                 ComparisonRecipe::NullSafe(recipe) => Some(recipe.compare_rows(
                     left.argument(),
@@ -1164,7 +1376,7 @@ fn evaluate_comparison<'a>(
                     right.argument(),
                     ordinal,
                     row,
-                    work.control,
+                    &observed,
                 )?),
             };
             values.push(compared);
@@ -1931,3 +2143,7 @@ impl TemporalValues {
 #[cfg(test)]
 #[path = "temporal_phase_tests.rs"]
 mod temporal_phase_tests;
+
+#[cfg(test)]
+#[path = "between_comparison_control_tests.rs"]
+mod between_comparison_control_tests;

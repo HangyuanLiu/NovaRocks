@@ -185,6 +185,34 @@ impl ProgramTypedExpressions {
                             }
                             work.step()?;
                         }
+                        if let StaticExprKind::PreparedBetween {
+                            plan,
+                            operand,
+                            low,
+                            high,
+                        } = definition.kind()
+                        {
+                            let source = |id: ProgramExprId| match entries.get(id.index()) {
+                                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                                _ => Err(ProgramExpressionTypeError::WrongKind),
+                            };
+                            work.flush()?;
+                            novarocks_functions::PreparedNativeBetweenRecipe::try_new(
+                                *plan,
+                                source(*operand)?,
+                                source(*low)?,
+                                source(*high)?,
+                                value,
+                                work.control(),
+                            )
+                            .map_err(|error| {
+                                match error.control_error() {
+                                    Some(cause) => ProgramExpressionTypeError::Control(cause),
+                                    None => ProgramExpressionTypeError::TypeMismatch,
+                                }
+                            })?;
+                            work.step()?;
+                        }
                         if let StaticExprKind::PreparedNativeNegate(child) = definition.kind() {
                             let source = match entries.get(child.index()) {
                                 Some(FunctionArgumentType::Value(value)) => value,

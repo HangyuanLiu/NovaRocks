@@ -36,9 +36,7 @@ use novarocks_type_contract::{
 use super::lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError};
 use super::physical_temporal_sources::{self, SourceError};
 use crate::compiler::SqlFunctionCatalog;
-use novarocks_type_contract::{
-    TemporalSourceDefinitions, TemporalSourceOccurrence, TemporalSourcePlan,
-};
+use novarocks_type_contract::{TemporalSourceDefinitions, TemporalSourceOccurrence, TemporalSourcePlan};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -545,7 +543,7 @@ impl Author<'_> {
                 self.work.step()?;
             }
         } else if shape != ControlShape::TypeOnly {
-            node.kind.expression_references_observed(|child| {
+            node.kind.invocation_references_observed(|child| {
                 self.reference()?;
                 children
                     .try_reserve(1)

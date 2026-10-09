@@ -40,6 +40,7 @@ message DomainGuard {
     uint32 case_when_arm = 4;
     uint32 case_then_arm = 5;
     uint32 temporal_after_source_ordinal = 6;
+    uint32 between_after_source_ordinal = 7;
   }
 }
 enum SimpleGuard {
@@ -70,6 +71,7 @@ message ControlShape {
     CaseControl case_control = 2;
     HigherOrderControl higher_order = 3;
     TemporalSourceShape temporal_source = 4;
+    bool between_negated = 5;
   }
 }
 enum SimpleControl {

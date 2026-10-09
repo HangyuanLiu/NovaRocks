@@ -1197,7 +1197,7 @@ fn validate_definition_correspondence(
         {
             definition
                 .kind
-                .expression_references_observed(|definition| {
+                .invocation_references_observed(|definition| {
                     if observed {
                         work.flush()?;
                     } else {

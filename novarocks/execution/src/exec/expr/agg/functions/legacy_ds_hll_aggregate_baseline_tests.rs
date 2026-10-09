@@ -345,3 +345,7 @@ fn legacy_ds_hll_baseline_float_bits_are_not_ndv_canonicalization() {
         prehash_array_value(&values, 3, "raw").unwrap()
     );
 }
+
+#[cfg(test)]
+#[path = "ds_hll_local_phase_before_tests.rs"]
+mod ds_hll_local_phase_before_tests;

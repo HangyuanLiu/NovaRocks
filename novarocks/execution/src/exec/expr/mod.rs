@@ -1486,3 +1486,14 @@ mod sql_dependency_resolved_binding_source_tests;
 mod legacy_between_observed_baseline_tests;
 #[cfg(test)]
 mod between_actual_sql_compiler_tests;
+
+#[cfg(test)]
+mod legacy_integral_decimal128_baseline_tests;
+#[cfg(test)]
+mod integral_decimal128_actual_sql_tests;
+
+#[cfg(test)]
+mod percentile_hash_original_fold_tests;
+
+#[cfg(test)]
+mod between_actual_after_tests;

@@ -56,7 +56,10 @@ pub enum ControlShape {
     Disjunction,
     If,
     Coalesce,
-    /// Ordered source grammar frozen by the original emitted-call author.
+    /// Four ordered source occurrences and two intervening comparisons.
+    Between {
+        negated: bool,
+    },
     TemporalSource(crate::TemporalSourceShape),
     Case {
         simple: bool,
@@ -85,6 +88,10 @@ pub enum GuardKind {
     LambdaInvocation,
     /// The previous source phase completed successfully for this row.
     TemporalAfterSource {
+        ordinal: u32,
+    },
+    /// The preceding source (and completed bound comparison) succeeded.
+    BetweenAfterSource {
         ordinal: u32,
     },
     /// Whole current invocation predicate, never a per-row NULL branch.
@@ -652,6 +659,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::Conjunction | ControlShape::Disjunction => count > 0,
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
+        ControlShape::Between { .. } => count == 4,
         ControlShape::TemporalSource(shape) => count == shape.source_count(),
         ControlShape::HigherOrder { body_ordinal, .. } => (body_ordinal as usize) < count,
         ControlShape::Case {
@@ -685,6 +693,9 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
         },
         ControlShape::Coalesce => (ordinal > 0).then_some(GuardKind::CoalesceAfterNull {
             ordinal: ordinal as u32,
+        }),
+        ControlShape::Between { .. } => (ordinal > 0).then(|| GuardKind::BetweenAfterSource {
+            ordinal: (ordinal - 1) as u32,
         }),
         ControlShape::TemporalSource(source) => {
             if source == crate::TemporalSourceShape::SecondsCastOther && ordinal == 2 {
@@ -731,7 +742,8 @@ fn control_argument_demand(
         ControlShape::Eager
         | ControlShape::TypeOnly
         | ControlShape::Coalesce
-        | ControlShape::TemporalSource(_) => Value,
+        | ControlShape::TemporalSource(_)
+        | ControlShape::Between { .. } => Value,
         ControlShape::Conjunction | ControlShape::Disjunction => owner,
         ControlShape::LambdaBody => {
             if ordinal + 1 == count {

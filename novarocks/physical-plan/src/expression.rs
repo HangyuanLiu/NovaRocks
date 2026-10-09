@@ -430,6 +430,7 @@ impl ExprKind {
                 })?,
                 has_else: else_expr.is_some(),
             }),
+            ExprKind::Between { negated, .. } => Some(ControlShape::Between { negated: *negated }),
             ExprKind::Lambda { .. } => Some(ControlShape::LambdaBody),
             ExprKind::FunctionCall { .. } => None,
             ExprKind::Value(_)
@@ -441,11 +442,36 @@ impl ExprKind {
             | ExprKind::Cast { .. }
             | ExprKind::IsNull { .. }
             | ExprKind::InList { .. }
-            | ExprKind::Between { .. }
             | ExprKind::Like { .. }
             | ExprKind::IsTruthValue { .. }
             | ExprKind::WindowCall { .. } => Some(ControlShape::Eager),
         })
+    }
+
+    /// Original ordered evaluation occurrences. A definition edge is not a
+    /// memoized invocation: BETWEEN reads its operand in both comparisons.
+    pub fn invocation_references_observed<E>(
+        &self,
+        mut visit: impl FnMut(ExprId) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if let Self::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } = self
+        {
+            for role in novarocks_type_contract::NativeBetweenPlan::new(*negated).sources() {
+                visit(match role {
+                    novarocks_type_contract::BetweenSourceRole::Operand => *expr,
+                    novarocks_type_contract::BetweenSourceRole::Lower => *low,
+                    novarocks_type_contract::BetweenSourceRole::Upper => *high,
+                })?;
+            }
+            Ok(())
+        } else {
+            self.expression_references_observed(visit)
+        }
     }
 
     /// Actual primitive parameter consumers, independent of function-call

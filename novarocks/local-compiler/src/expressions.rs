@@ -408,6 +408,9 @@ fn lower_core(
                     right,
                     ..
                 } => [*left, *right].get(next).copied(),
+                ExprKind::Between {
+                    expr, low, high, ..
+                } => [*expr, *low, *high].get(next).copied(),
                 ExprKind::Case {
                     operand,
                     when_then,
@@ -727,6 +730,28 @@ fn lower_core(
                         left,
                         right,
                     )
+                }
+                ExprKind::Between {
+                    expr,
+                    low,
+                    high,
+                    negated,
+                } => {
+                    let operand = *ids.get(expr).ok_or(ExpressionLoweringError::Invalid(
+                        "BETWEEN operand was not lowered",
+                    ))?;
+                    let low = *ids.get(low).ok_or(ExpressionLoweringError::Invalid(
+                        "BETWEEN lower was not lowered",
+                    ))?;
+                    let high = *ids.get(high).ok_or(ExpressionLoweringError::Invalid(
+                        "BETWEEN upper was not lowered",
+                    ))?;
+                    StaticExprKind::PreparedBetween {
+                        plan: novarocks_type_contract::NativeBetweenPlan::new(*negated),
+                        operand,
+                        low,
+                        high,
+                    }
                 }
                 ExprKind::Case {
                     operand,
@@ -1218,6 +1243,74 @@ fn prepare_core(
                         ));
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (
+                    ExprKind::Between {
+                        expr,
+                        low,
+                        high,
+                        negated,
+                    },
+                    StaticExprKind::PreparedBetween {
+                        plan,
+                        operand,
+                        low: local_low,
+                        high: local_high,
+                    },
+                ) => {
+                    if plan.negated() != *negated
+                        || invocation.control != (ControlShape::Between { negated: *negated })
+                        || invocation.arguments.len() != 4
+                        || lowered.ids.get(expr) != Some(operand)
+                        || lowered.ids.get(low) != Some(local_low)
+                        || lowered.ids.get(high) != Some(local_high)
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "BETWEEN differs from its frozen source",
+                        ));
+                    }
+                    let definitions = package.fragment().expressions();
+                    let source_type = |id| {
+                        definitions
+                            .get(id)
+                            .map(|node| &node.ty)
+                            .ok_or(ExpressionLoweringError::Invalid("missing BETWEEN source"))
+                    };
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedNativeBetweenRecipe::try_new(
+                        *plan,
+                        source_type(*expr)?,
+                        source_type(*low)?,
+                        source_type(*high)?,
+                        &source.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                    let mut combined = recipe.own_effects(invocation.context);
+                    for (ordinal, role) in plan.sources().into_iter().enumerate() {
+                        let expected = match role {
+                            novarocks_type_contract::BetweenSourceRole::Operand => *expr,
+                            novarocks_type_contract::BetweenSourceRole::Lower => *low,
+                            novarocks_type_contract::BetweenSourceRole::Upper => *high,
+                        };
+                        let child_use = invocation.arguments[ordinal];
+                        if flow.uses()[&child_use].definition != expected {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "BETWEEN ordered source use differs",
+                            ));
+                        }
+                        combined = combined.join_control_argument(
+                            *effects
+                                .get(&child_use)
+                                .ok_or(ExpressionLoweringError::Invalid(
+                                    "BETWEEN child effects were not prepared",
+                                ))?,
+                            flow,
+                            ordinal,
+                        )?;
+                        work.step()?;
+                    }
+                    combined
                 }
                 (
                     ExprKind::Unary {
@@ -2031,6 +2124,7 @@ fn literal_argument(
                 },
                 StaticExprKind::PreparedNativeBitNot(_),
             ) => Ok(None),
+            (ExprKind::Between { .. }, StaticExprKind::PreparedBetween { .. }) => Ok(None),
             (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
             (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
             (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })

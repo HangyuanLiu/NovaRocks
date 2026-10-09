@@ -26,9 +26,7 @@ use arrow::{
 };
 use novarocks_connector_contract::*;
 use novarocks_functions::*;
-use novarocks_local_compiler::{
-    LocalCompileOptions, compile_fragment, validate_fragment_providers,
-};
+use novarocks_local_compiler::{LocalCompileOptions, compile_fragment, validate_fragment_providers};
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
     ProgramNodeKind, ProgramUseRef, StaticExprKind,
@@ -37,9 +35,7 @@ use novarocks_physical_plan::*;
 use novarocks_sql::compiler::{
     SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode, author_fragment_package_semantics,
 };
-use novarocks_type_contract::{
-    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
-};
+use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType};
 use std::{
     collections::BTreeMap,
     num::{NonZeroU64, NonZeroUsize},
@@ -151,6 +147,12 @@ fn providers() -> PureProviderProgramCatalog<ConnectorError> {
 fn frozen_reads(
     source: &SqlAuthoredPhysicalPlan,
 ) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
+    frozen_reads_with_residual_mode(source, false)
+}
+fn frozen_reads_with_residual_mode(
+    source: &SqlAuthoredPhysicalPlan,
+    admit_original_scan_residuals: bool,
+) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
     let mut reads = BTreeMap::new();
     for fragment in source.plan().fragments().values() {
         for node in fragment.nodes().values() {
@@ -163,7 +165,12 @@ fn frozen_reads(
                 derived_values,
             } = &node.kind
             {
-                assert!(residuals.is_empty() && derived_values.is_empty());
+                if !admit_original_scan_residuals {
+                    assert!(residuals.is_empty());
+                }
+                // Residual definitions remain in the original physical Scan.
+                // This fixture supplies no provider predicate guarantees.
+                assert!(derived_values.is_empty());
                 assert!(relation.predicate_guarantees().is_empty());
                 assert_eq!(
                     relation.provided_properties().distribution,
@@ -248,6 +255,19 @@ pub(super) fn programs_with_catalogue(
     source: &SqlAuthoredPhysicalPlan,
     functions: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
+    programs_with_original_frozen_reads(source, functions, false)
+}
+pub(super) fn programs_with_catalogue_and_original_scan_residuals(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
+    programs_with_original_frozen_reads(source, functions, true)
+}
+fn programs_with_original_frozen_reads(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+    admit_original_scan_residuals: bool,
+) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
     let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
     let uses = semantics
         .iter()
@@ -282,7 +302,11 @@ pub(super) fn programs_with_catalogue(
         .collect();
     let packages = extract_fragment_packages(
         source.plan(),
-        &frozen_reads(source),
+        &if admit_original_scan_residuals {
+            frozen_reads_with_residual_mode(source, true)
+        } else {
+            frozen_reads(source)
+        },
         &BTreeMap::new(),
         &uses,
         &calls,

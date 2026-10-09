@@ -1030,3 +1030,7 @@ mod failure_latch_tests {
 #[cfg(test)]
 #[path = "opaque_memory_host_tests.rs"]
 mod opaque_memory_host_tests;
+
+#[cfg(test)]
+#[path = "ds_hll_local_phase_factory_tests.rs"]
+mod ds_hll_local_phase_factory_tests;
