@@ -1419,3 +1419,6 @@ mod sql_dependency_artifact_storage_tests;
 
 #[cfg(test)]
 mod sql_dependency_type_host_abort_tests;
+
+#[cfg(test)]
+mod sql_dependency_binding_host_abort_tests;

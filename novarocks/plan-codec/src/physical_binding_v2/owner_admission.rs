@@ -19,6 +19,9 @@ use super::{BindingCodecError, BindingProjectionFacts, BindingProjectionLimits};
 use novarocks_type_contract::CompileControlError;
 use std::alloc::Layout;
 
+pub(crate) type HostAdmit<'a, H> = dyn FnMut(&BindingProjectionFacts) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>
+    + 'a;
+
 pub(crate) type Admit<'a> =
     dyn FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError> + 'a;
 
@@ -65,6 +68,20 @@ impl Policy {
         limits: BindingProjectionLimits,
         admit: &mut Admit<'_>,
     ) -> Result<(), BindingCodecError> {
+        self.gate_with_host(facts, limits, &mut |facts| {
+            admit(facts).map_err(
+                crate::host_projection_v2::AdmissionRefusal::<std::convert::Infallible>::Control,
+            )
+        })
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+    }
+
+    pub(crate) fn gate_with_host<H>(
+        self,
+        facts: &BindingProjectionFacts,
+        limits: BindingProjectionLimits,
+        admit: &mut HostAdmit<'_, H>,
+    ) -> Result<(), crate::host_projection_v2::ProjectionFailure<BindingCodecError, H>> {
         if !self.0 {
             return Ok(());
         }
@@ -86,7 +103,15 @@ impl Policy {
                 return Err(CompileControlError::ResourceExhausted.into());
             }
         }
-        admit(facts)?;
+        match admit(facts) {
+            Ok(()) => {}
+            Err(crate::host_projection_v2::AdmissionRefusal::Control(cause)) => {
+                return Err(cause.into());
+            }
+            Err(crate::host_projection_v2::AdmissionRefusal::Host(error)) => {
+                return Err(crate::host_projection_v2::ProjectionFailure::Host(error));
+            }
+        }
         Ok(())
     }
 }

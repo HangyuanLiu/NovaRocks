@@ -91,6 +91,22 @@ impl std::error::Error for BindingCodecError {
         }
     }
 }
+
+impl<H> From<CompileControlError>
+    for crate::host_projection_v2::ProjectionFailure<BindingCodecError, H>
+{
+    fn from(cause: CompileControlError) -> Self {
+        Self::Codec(cause.into())
+    }
+}
+impl<H> From<TypeCodecError>
+    for crate::host_projection_v2::ProjectionFailure<BindingCodecError, H>
+{
+    fn from(error: TypeCodecError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+
 pub(crate) struct VerifiedSignature {
     matches: bool,
     work: usize,
@@ -320,6 +336,38 @@ pub fn encode_function_bindings_in<'loan, 'source>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedFunctionBindings<'loan, 'source>, BindingCodecError> {
     let (definitions, facts) = encode::encode(
+        types,
+        inputs,
+        source_retained_bytes,
+        limits,
+        owner_admission::Policy(true),
+        admit,
+        work,
+    )?;
+    Ok(EncodedFunctionBindings {
+        definitions,
+        inputs,
+        types,
+        facts,
+    })
+}
+
+/// The original sender and exact source loans with a nominal host refusal.
+/// A refusal aborts this capture only; it is not a SQL Control classification.
+pub fn encode_function_bindings_with_host_in<'loan, 'source, H>(
+    types: &'loan EncodedTypeTable<'source>,
+    inputs: &'loan [FunctionBindingInput<'source>],
+    source_retained_bytes: usize,
+    limits: BindingProjectionLimits,
+    admit: &mut impl FnMut(
+        &BindingProjectionFacts,
+    ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    EncodedFunctionBindings<'loan, 'source>,
+    crate::host_projection_v2::ProjectionFailure<BindingCodecError, H>,
+> {
+    let (definitions, facts) = encode::encode_with_host(
         types,
         inputs,
         source_retained_bytes,

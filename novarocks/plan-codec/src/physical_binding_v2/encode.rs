@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::owner_admission::{Admit, Policy};
+use super::owner_admission::{Admit, HostAdmit, Policy};
+use crate::host_projection_v2::{AdmissionRefusal, ProjectionFailure};
+type HostError<H> = ProjectionFailure<BindingCodecError, H>;
 use super::*;
 use crate::borrowed_type_resources::verify_type_binding;
 use novarocks_type_contract::{
@@ -80,19 +82,19 @@ fn header_requests(
     }
     request::<wire::FunctionArgumentType>(arguments, facts, policy)
 }
-fn preflight(
+fn preflight<H>(
     types: &EncodedTypeTable<'_>,
     inputs: &[FunctionBindingInput<'_>],
     source: usize,
     limits: BindingProjectionLimits,
     policy: Policy,
-    admit: &mut Admit<'_>,
+    admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<BindingProjectionFacts, BindingCodecError> {
+) -> Result<BindingProjectionFacts, HostError<H>> {
     let add = |a, b| policy.add(a, b, "binding projection arithmetic overflow");
     let mul = |a, b| policy.mul(a, b, "binding projection arithmetic overflow");
     if !policy.0 && inputs.len() > limits.max_definitions {
-        return Err(invalid("binding definition count exceeds its envelope"));
+        return Err(invalid("binding definition count exceeds its envelope").into());
     }
     let mut facts = BindingProjectionFacts {
         definition_count: inputs.len(),
@@ -106,22 +108,22 @@ fn preflight(
         .map_err(|_| invalid("binding source layout is unrepresentable"))?
         .size();
     if !policy.0 && source < root_bytes {
-        return Err(invalid("binding source invoice omits original input roots"));
+        return Err(invalid("binding source invoice omits original input roots").into());
     }
     // Admit fixed header/tail work and the original definition walk before it
     // starts. Empty tables still perform bounded projection bookkeeping.
     let own_prefix = add(128, mul(inputs.len(), 12)?)?;
     if !policy.0 && own_prefix > limits.max_work {
-        return Err(invalid("binding work exceeds its envelope"));
+        return Err(invalid("binding work exceeds its envelope").into());
     }
     request::<wire::FunctionBindingDefinition>(inputs.len(), &mut facts, policy)?;
     let mut previous = None;
     let mut name_chunks = 0usize;
     if policy.0 {
         refresh(types, source, own_prefix, name_chunks, &mut facts, policy)?;
-        policy.gate(&facts, limits, admit)?;
+        policy.gate_with_host(&facts, limits, admit)?;
         if source < root_bytes {
-            return Err(invalid("binding source invoice omits original input roots"));
+            return Err(invalid("binding source invoice omits original input roots").into());
         }
     }
     for input in inputs {
@@ -137,20 +139,20 @@ fn preflight(
                 policy,
             )?;
             refresh(types, source, own_prefix, name_chunks, &mut facts, policy)?;
-            policy.gate(&facts, limits, admit)?;
+            policy.gate_with_host(&facts, limits, admit)?;
         }
         let ordered = previous.is_none_or(|id| id < input.id);
         previous = Some(input.id);
         work.step()?;
         if !ordered {
-            return Err(invalid("binding input IDs must be unique and ascending"));
+            return Err(invalid("binding input IDs must be unique and ascending").into());
         }
         if args.len() != input.arguments.len() {
-            return Err(invalid("binding argument ID shape differs from its source"));
+            return Err(invalid("binding argument ID shape differs from its source").into());
         }
         if matches!(input.source, BindingSource::Scalar(value) if value.kind == FunctionKind::Table)
         {
-            return Err(invalid("scalar binding source has table kind"));
+            return Err(invalid("scalar binding source has table kind").into());
         }
         let identity_bytes = add(function.len(), overload.len())?;
         // Reused source owners/ID slices can alias. Only actual root-slice
@@ -210,16 +212,18 @@ fn preflight(
                     request::<u32>(parameters.len(), &mut facts, policy)?;
                     add(parameters.len(), 1)?
                 }
-                _ => return Err(invalid("binding argument ID shape differs from its source")),
+                _ => {
+                    return Err(invalid("binding argument ID shape differs from its source").into());
+                }
             };
             facts.type_reference_count = add(facts.type_reference_count, references)?;
             if policy.0 {
                 refresh(types, source, own_prefix, name_chunks, &mut facts, policy)?;
-                policy.gate(&facts, limits, admit)?;
+                policy.gate_with_host(&facts, limits, admit)?;
             }
             work.step()?;
             if facts.type_reference_count > limits.max_type_references {
-                return Err(invalid("binding type references exceed their envelope"));
+                return Err(invalid("binding type references exceed their envelope").into());
             }
         }
         let results = match (input.source, input.result) {
@@ -235,42 +239,40 @@ fn preflight(
                 request::<u32>(ids.len(), &mut facts, policy)?;
                 ids.len()
             }
-            _ => return Err(invalid("binding result ID shape differs from its source")),
+            _ => return Err(invalid("binding result ID shape differs from its source").into()),
         };
         facts.type_reference_count = add(facts.type_reference_count, results)?;
         if policy.0 {
             refresh(types, source, own_prefix, name_chunks, &mut facts, policy)?;
-            policy.gate(&facts, limits, admit)?;
+            policy.gate_with_host(&facts, limits, admit)?;
         }
         work.step()?;
         // Root inputs, owned signature storage and typed ID slices are
         // distinct live storage. The u32 slices can alias one another, so
         // only their maximum known extent is added for this source.
         if source < add(add(root_bytes, known)?, add(ids_bytes, u32_ids_bytes)?)? {
-            return Err(invalid(
-                "binding source invoice omits original signature backing",
-            ));
+            return Err(invalid("binding source invoice omits original signature backing").into());
         }
     }
     if facts.type_reference_count > limits.max_type_references {
-        return Err(invalid("binding type references exceed their envelope"));
+        return Err(invalid("binding type references exceed their envelope").into());
     }
     if facts.request_bytes_upper_bound > limits.max_request_bytes
         || facts.allocation_requests_upper_bound > limits.max_allocation_requests
     {
-        return Err(invalid("binding output requests exceed their envelope"));
+        return Err(invalid("binding output requests exceed their envelope").into());
     }
     facts.coexisting_source_and_request_bytes_upper_bound =
         add(source, facts.request_bytes_upper_bound)?;
     if facts.coexisting_source_and_request_bytes_upper_bound
         > limits.max_coexisting_source_and_request_bytes
     {
-        return Err(invalid("binding coexistence exceeds its envelope"));
+        return Err(invalid("binding coexistence exceeds its envelope").into());
     }
     refresh(types, source, own_prefix, name_chunks, &mut facts, policy)?;
-    policy.gate(&facts, limits, admit)?;
+    policy.gate_with_host(&facts, limits, admit)?;
     if facts.cumulative_work_upper_bound > limits.max_work {
-        return Err(invalid("binding work exceeds its envelope"));
+        return Err(invalid("binding work exceeds its envelope").into());
     }
     Ok(facts)
 }
@@ -296,17 +298,17 @@ fn refresh(
         add(add(lookups, owned)?, add(copies, mul(name_chunks, 2)?)?)?;
     Ok(())
 }
-fn verify_id(
+fn verify_id<H>(
     types: &EncodedTypeTable<'_>,
     id: u32,
     expected: &FunctionValueType,
     envelope: (usize, BindingProjectionLimits, Policy),
     facts: &mut BindingProjectionFacts,
-    admit: &mut Admit<'_>,
+    admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), BindingCodecError> {
+) -> Result<(), HostError<H>> {
     let (source, limits, policy) = envelope;
-    policy.gate(facts, limits, admit)?;
+    policy.gate_with_host(facts, limits, admit)?;
     let actual = types
         .value_type_observed(id, work)?
         .ok_or_else(|| invalid("binding value type ID is absent"))?;
@@ -327,7 +329,7 @@ fn verify_id(
                     prefix.work_upper_bound(),
                     "binding projection arithmetic overflow",
                 )?;
-                policy.gate(facts, limits, admit)
+                policy.gate_with_host(facts, limits, admit)
             },
             work,
         )?
@@ -335,22 +337,20 @@ fn verify_id(
         verify_type_binding(expected, actual, source, remaining, work)?
     };
     facts.cumulative_work_upper_bound = add(base, verified.work_upper_bound())?;
-    policy.gate(facts, limits, admit)?;
+    policy.gate_with_host(facts, limits, admit)?;
     if !verified.matches() {
-        return Err(invalid(
-            "binding value type differs from its original source",
-        ));
+        return Err(invalid("binding value type differs from its original source").into());
     }
     Ok(())
 }
-fn validate(
+fn validate<H>(
     types: &EncodedTypeTable<'_>,
     inputs: &[FunctionBindingInput<'_>],
     envelope: (usize, BindingProjectionLimits, Policy),
     facts: &mut BindingProjectionFacts,
-    admit: &mut Admit<'_>,
+    admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), BindingCodecError> {
+) -> Result<(), HostError<H>> {
     for input in inputs {
         for (argument, ids) in arguments(input.source).iter().zip(input.arguments) {
             match (argument, ids) {
@@ -369,7 +369,9 @@ fn validate(
                     }
                     verify_id(types, *result, result_type, envelope, facts, admit, work)?;
                 }
-                _ => return Err(invalid("binding argument ID shape differs from its source")),
+                _ => {
+                    return Err(invalid("binding argument ID shape differs from its source").into());
+                }
             }
             work.step()?;
         }
@@ -382,7 +384,7 @@ fn validate(
                     verify_id(types, *id, value, envelope, facts, admit, work)?;
                 }
             }
-            _ => return Err(invalid("binding result ID shape differs from its source")),
+            _ => return Err(invalid("binding result ID shape differs from its source").into()),
         }
         work.step()?;
     }
@@ -420,6 +422,27 @@ pub(super) fn encode(
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Vec<wire::FunctionBindingDefinition>, BindingProjectionFacts), BindingCodecError> {
+    encode_with_host(
+        types,
+        inputs,
+        source,
+        limits,
+        policy,
+        &mut |facts| admit(facts).map_err(AdmissionRefusal::<std::convert::Infallible>::Control),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(super) fn encode_with_host<H>(
+    types: &EncodedTypeTable<'_>,
+    inputs: &[FunctionBindingInput<'_>],
+    source: usize,
+    limits: BindingProjectionLimits,
+    policy: Policy,
+    admit: &mut HostAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Vec<wire::FunctionBindingDefinition>, BindingProjectionFacts), HostError<H>> {
     let mut facts = preflight(types, inputs, source, limits, policy, admit, work)?;
     validate(
         types,
@@ -470,7 +493,9 @@ pub(super) fn encode(
                 FunctionKind::Scalar => wire::FunctionKind::Scalar,
                 FunctionKind::Aggregate => wire::FunctionKind::Aggregate,
                 FunctionKind::Window => wire::FunctionKind::Window,
-                FunctionKind::Table => return Err(invalid("scalar binding source has table kind")),
+                FunctionKind::Table => {
+                    return Err(invalid("scalar binding source has table kind").into());
+                }
             },
             BindingSource::Table(_) => wire::FunctionKind::Table,
         };
