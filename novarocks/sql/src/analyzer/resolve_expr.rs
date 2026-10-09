@@ -415,6 +415,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         unary.span,
                     ));
                 }
+                self.function_catalog
+                    .admit_native_bitnot_source_observed(&inner_typed.value_type, self.control)
+                    .map_err(|error| {
+                        AnalyzeError::function_binding(error).at_type_mismatch(unary.span)
+                    })?;
                 let value_type = inner_typed.value_type.clone();
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {

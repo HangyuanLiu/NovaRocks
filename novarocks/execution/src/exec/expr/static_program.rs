@@ -131,6 +131,11 @@ fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
                 "compiled native negate cannot enter the legacy expression bridge".to_string(),
             );
         }
+        Static::PreparedNativeBitNot(..) => {
+            return Err(
+                "compiled native BitwiseNot cannot enter the legacy expression bridge".to_string(),
+            );
+        }
         Static::PreparedArithmetic { .. } => {
             return Err(
                 "compiled arithmetic cannot enter the legacy expression bridge".to_string(),

@@ -833,6 +833,30 @@ pub(super) fn evaluate_tree<'a>(
                     work.flush()?;
                     OwnedValue::from_selected(output)
                 }
+                StaticExprKind::PreparedNativeBitNot(_) => {
+                    if frame.children.len() != 1 {
+                        return Err(invalid(
+                            "native BitwiseNot requires its exact ordered operand",
+                        ));
+                    }
+                    let child = frame
+                        .children
+                        .pop()
+                        .ok_or_else(|| internal("missing native BitwiseNot operand"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let recipe = program
+                        .native_bitnot_recipe(frame.occurrence)
+                        .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
+                    work.flush()?;
+                    let output = recipe.evaluate_selected(
+                        child.argument(),
+                        local_selection,
+                        work.control,
+                    )?;
+                    work.flush()?;
+                    OwnedValue::from_selected(output)
+                }
                 StaticExprKind::PreparedArithmetic { .. } => {
                     if frame.children.len() != 2 {
                         return Err(invalid("arithmetic requires its exact ordered operands"));

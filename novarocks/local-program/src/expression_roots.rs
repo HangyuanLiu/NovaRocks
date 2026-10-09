@@ -814,6 +814,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::CastTimeFromDatetime(..)
             | StaticExprKind::PreparedCast { .. }
             | StaticExprKind::PreparedNativeNegate(..)
+            | StaticExprKind::PreparedNativeBitNot(..)
             | StaticExprKind::PreparedArithmetic { .. }
             | StaticExprKind::Add(..)
             | StaticExprKind::Sub(..)
@@ -886,6 +887,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::CastTime(definition, _)
             | StaticExprKind::CastTimeFromDatetime(definition, _)
             | StaticExprKind::PreparedNativeNegate(definition)
+            | StaticExprKind::PreparedNativeBitNot(definition)
             | StaticExprKind::Not(definition)
             | StaticExprKind::IsNull(definition)
             | StaticExprKind::IsNotNull(definition)

@@ -1451,3 +1451,6 @@ mod filter_conjunction_frame_tests;
 
 #[cfg(test)]
 mod native_bitnot_intrinsic_baseline_tests;
+
+#[cfg(test)]
+mod native_bitnot_intrinsic_after_tests;

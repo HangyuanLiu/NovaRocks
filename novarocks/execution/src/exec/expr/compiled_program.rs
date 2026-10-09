@@ -269,6 +269,7 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::Case { .. }
                     | StaticExprKind::PreparedCast { .. }
                     | StaticExprKind::PreparedNativeNegate(_)
+                    | StaticExprKind::PreparedNativeBitNot(_)
                     | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::PreparedNullSafeComparison { .. }
                     | StaticExprKind::Eq(..)
@@ -291,6 +292,14 @@ impl CompiledExpressionInstance {
                                     .native_negate_recipe(occurrence)
                                     .ok_or_else(|| {
                                         invalid("missing mandatory native negate effect recipe")
+                                    })?
+                                    .own_effects(invocation.context)
+                            } else if matches!(node.kind(), StaticExprKind::PreparedNativeBitNot(_))
+                            {
+                                program
+                                    .native_bitnot_recipe(occurrence)
+                                    .ok_or_else(|| {
+                                        invalid("missing mandatory native BitwiseNot effect recipe")
                                     })?
                                     .own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
@@ -375,6 +384,10 @@ impl CompiledExpressionInstance {
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
                         && program.native_negate_recipe(occurrence).is_some() => {}
+                StaticExprKind::PreparedNativeBitNot(_)
+                    if invocation.control == ControlShape::Eager
+                        && invocation.arguments.len() == 1
+                        && program.native_bitnot_recipe(occurrence).is_some() => {}
                 StaticExprKind::PreparedArithmetic { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2

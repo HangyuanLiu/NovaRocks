@@ -384,7 +384,8 @@ fn lower_core(
                 ExprKind::Unary {
                     op:
                         novarocks_physical_plan::UnaryOperator::Not
-                        | novarocks_physical_plan::UnaryOperator::Minus,
+                        | novarocks_physical_plan::UnaryOperator::Minus
+                        | novarocks_physical_plan::UnaryOperator::BitwiseNot,
                     expr,
                 }
                 | ExprKind::IsNull { expr, .. }
@@ -513,6 +514,26 @@ fn lower_core(
                     )?;
                     work.flush()?;
                     StaticExprKind::PreparedNativeNegate(child)
+                }
+                ExprKind::Unary {
+                    op: novarocks_physical_plan::UnaryOperator::BitwiseNot,
+                    expr,
+                } => {
+                    let child = *ids.get(expr).ok_or(ExpressionLoweringError::Invalid(
+                        "native BitwiseNot operand was not lowered",
+                    ))?;
+                    let source_child =
+                        source.get(*expr).ok_or(ExpressionLoweringError::Invalid(
+                            "native BitwiseNot source operand is missing",
+                        ))?;
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeBitNotRecipe::try_new(
+                        &source_child.ty,
+                        &node.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                    StaticExprKind::PreparedNativeBitNot(child)
                 }
                 ExprKind::Unary {
                     op: novarocks_physical_plan::UnaryOperator::Not,
@@ -1228,6 +1249,42 @@ fn prepare_core(
                             *effects.get(&invocation.arguments[0]).ok_or(
                                 ExpressionLoweringError::Invalid(
                                     "native negate child effects were not prepared",
+                                ),
+                            )?,
+                            flow,
+                            0,
+                        )?
+                }
+                (
+                    ExprKind::Unary {
+                        op: novarocks_physical_plan::UnaryOperator::BitwiseNot,
+                        expr,
+                    },
+                    StaticExprKind::PreparedNativeBitNot(local_child),
+                ) => {
+                    if invocation.control != ControlShape::Eager
+                        || invocation.arguments.len() != 1
+                        || lowered.ids.get(expr) != Some(local_child)
+                        || flow.uses()[&invocation.arguments[0]].definition != *expr
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "native BitwiseNot differs from its actual ordered source",
+                        ));
+                    }
+                    let child = package.fragment().expressions().get(*expr).ok_or(
+                        ExpressionLoweringError::Invalid("missing native BitwiseNot source"),
+                    )?;
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedNativeBitNotRecipe::try_new(
+                        &child.ty, &source.ty, control,
+                    )?;
+                    work.flush()?;
+                    recipe
+                        .own_effects(invocation.context)
+                        .join_control_argument(
+                            *effects.get(&invocation.arguments[0]).ok_or(
+                                ExpressionLoweringError::Invalid(
+                                    "native BitwiseNot child effects were not prepared",
                                 ),
                             )?,
                             flow,
@@ -1966,6 +2023,13 @@ fn literal_argument(
                     ..
                 },
                 StaticExprKind::PreparedNativeNegate(_),
+            ) => Ok(None),
+            (
+                ExprKind::Unary {
+                    op: novarocks_physical_plan::UnaryOperator::BitwiseNot,
+                    ..
+                },
+                StaticExprKind::PreparedNativeBitNot(_),
             ) => Ok(None),
             (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
             (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),

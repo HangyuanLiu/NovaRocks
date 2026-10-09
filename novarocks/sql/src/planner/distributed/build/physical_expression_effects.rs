@@ -560,6 +560,18 @@ fn primitive_own_effects(
             recipe.own_effects(context)
         }
         ExprKind::Unary {
+            op: UnaryOperator::BitwiseNot,
+            expr,
+        } => {
+            let child = operand(*expr)?;
+            work.flush()?;
+            let recipe = novarocks_functions::PreparedNativeBitNotRecipe::try_new(
+                &child.ty, &source.ty, control,
+            )?;
+            work.flush()?;
+            recipe.own_effects(context)
+        }
+        ExprKind::Unary {
             op: UnaryOperator::Not,
             ..
         }

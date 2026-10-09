@@ -2672,3 +2672,6 @@ mod time_text_cast_tests;
 pub mod time_calendar_cast;
 
 pub mod field_shared;
+
+mod native_bitnot;
+pub use native_bitnot::*;
