@@ -359,7 +359,12 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
             DataType::Binary,
             DataType::Date64,
             DataType::Decimal128(10, 0),
-        ] {
+        ]
+        .into_iter()
+        // Float64 decimal profiles now have their complete positive matrix.
+        // Float32 decimal and the other unsupported pairs retain this boundary.
+        .filter(|target| source != DataType::Float64 || !matches!(target, DataType::Decimal128(..)))
+        {
             assert_eq!(
                 PreparedCastRecipe::try_new(
                     CastOperation::Carrier,

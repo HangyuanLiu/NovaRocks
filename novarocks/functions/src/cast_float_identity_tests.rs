@@ -356,7 +356,12 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
             DataType::Date64,
             DataType::Binary,
             DataType::Decimal128(10, 0),
-        ] {
+        ]
+        .into_iter()
+        // Float64 decimal profiles now have their complete positive matrix.
+        // Float32 decimal and the other unsupported pairs retain this boundary.
+        .filter(|target| source != DataType::Float64 || !matches!(target, DataType::Decimal128(..)))
+        {
             assert_eq!(
                 PreparedCastRecipe::try_new(
                     CastOperation::Carrier,
