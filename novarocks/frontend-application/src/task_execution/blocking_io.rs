@@ -169,8 +169,7 @@ struct JobOutcome<T> {
     value: Mutex<Option<Result<T, ConnectorBlockingIoError>>>,
     // Unclaimed outputs are destroyed before their original join pins.
     pins: Box<[ConnectorBlockingIoJoinPin]>,
-    failure: Arc<Mutex<Option<ConnectorBlockingIoError>>>,
-    failure_ready: Arc<tokio::sync::Notify>,
+    retirement: ConnectorBlockingIoSupervisor,
 }
 
 impl<T> Drop for JobOutcome<T> {
@@ -203,6 +202,7 @@ impl<T> Drop for JobOutcome<T> {
         if let Some(error) = failure {
             let rejected = {
                 let mut first = self
+                    .retirement
                     .failure
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
@@ -213,9 +213,13 @@ impl<T> Drop for JobOutcome<T> {
                     Some(error)
                 }
             };
-            // No arbitrary original payload is destroyed under the slot lock.
-            drop(rejected);
-            self.failure_ready.notify_one();
+            // Keep the first unclaimed failure. A later original payload is
+            // still provider code: retire it off the dropped waiter's thread
+            // with the same responsibility and observed original join pins.
+            if let Some(error) = rejected {
+                self.retirement.retire_original_failure(error);
+            }
+            self.retirement.failure_ready.notify_one();
         }
     }
 }
@@ -342,8 +346,7 @@ impl ConnectorBlockingIoSupervisor {
         let outcome = Arc::new(JobOutcome {
             value: Mutex::new(None),
             pins: pins.into_boxed_slice(),
-            failure: Arc::clone(&self.failure),
-            failure_ready: Arc::clone(&self.failure_ready),
+            retirement: self.clone(),
         });
         let published = Arc::clone(&outcome);
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -898,6 +901,78 @@ pub(crate) mod tests {
             0,
             "refused provider code ran"
         );
+    }
+
+    #[test]
+    fn a_rejected_secondary_failure_retires_outside_the_dropped_waiter() {
+        struct Payload {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            destroyed: Arc<AtomicBool>,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                self.destroyed.store(true, Ordering::Release);
+            }
+        }
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let first = supervisor.spawn_protected(|| panic!("first unclaimed failure"));
+        drop(first);
+        until(|| supervisor.failure.lock().unwrap().is_some());
+        let (control, root, window) =
+            admitted_class(novarocks_workload_control::ResultWindowClass::Local);
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let (started, entered) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let payload = Payload {
+            started,
+            release: held,
+            destroyed: Arc::clone(&destroyed),
+        };
+        let job = supervisor
+            .spawn_admitted(&root.owner.scope(), &window.retain_alias(), move || {
+                std::panic::panic_any(payload);
+            })
+            .unwrap();
+        // The original blocking call has really joined and its publisher no
+        // longer owns this outcome. Dropping the waiter now owns raw cleanup.
+        until(|| {
+            Arc::strong_count(&job.outcome) == 1 && job.outcome.value.lock().unwrap().is_some()
+        });
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        let (disarm, watch) = mpsc::channel();
+        let rescue = release.clone();
+        let watchdog = std::thread::spawn(move || {
+            if watch.recv_timeout(Duration::from_millis(500)).is_err() {
+                let _ = rescue.send(());
+            }
+        });
+        let began = Instant::now();
+        drop(job);
+        let elapsed = began.elapsed();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let retained = control.snapshot();
+        let _ = release.send(());
+        let _ = disarm.send(());
+        watchdog.join().unwrap();
+        until(|| control.snapshot().scopes.is_empty());
+        let first = supervisor.take_original_failure().unwrap();
+        assert!(supervisor.take_original_failure().is_none());
+        drop(first);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "secondary original failure blocked the dropped waiter: {elapsed:?}"
+        );
+        assert_eq!(retained.result_windows.held_positions, [0, 1, 0, 0]);
+        assert_eq!(retained.root_responsibilities, 1);
+        assert!(destroyed.load(Ordering::Acquire));
     }
 
     #[test]
