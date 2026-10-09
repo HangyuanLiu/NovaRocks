@@ -720,8 +720,26 @@ fn lower(
                         Distribution::Hash { .. } | Distribution::BucketShuffle { .. }
                     )
             });
+        // Repeat emits its frozen grouping sets on the exact input instances.
+        // Its property author may drop partition keys after nullifying them,
+        // but that does not create a new placement or ordering source.
+        let repeat_placed = matches!(node.kind, NodeKind::Repeat { .. })
+            && node.inputs.len() == 1
+            && physical.nodes().get(&node.inputs[0]).is_some_and(|input| {
+                input.output_properties.row_multiplicity
+                    == novarocks_physical_plan::RowMultiplicity::SingleCopy
+                    && (properties.get(&input.id).is_some_and(|p| p.2)
+                        || matches!(
+                            input.output_properties.distribution,
+                            Distribution::Singleton
+                                | Distribution::RoundRobin
+                                | Distribution::Hash { .. }
+                                | Distribution::BucketShuffle { .. }
+                        ))
+            });
         let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
             || projected_placement
+            || repeat_placed
             || partial_groups
             || union_placed
             || ((transparent || partial_rows)

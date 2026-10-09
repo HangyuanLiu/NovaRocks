@@ -1578,3 +1578,6 @@ mod float_arithmetic_statistics_actual_sql_tests;
 
 #[cfg(test)]
 mod float_arithmetic_conversion_author_tests;
+
+#[cfg(test)]
+mod grouping_sets_actual_sql_placement_tests;
