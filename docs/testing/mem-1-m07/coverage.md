@@ -283,3 +283,13 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 定向验证：producer17纯本地 PASS、observer13纯本地/synthetic loopback PASS、runner112 PASS/0FAIL/2ignored、fmt/diff-check PASS。收据 `p09-real-rest-cl-integration-focused-20261009.json`；仅测试接入，不是 bulk READY/native CL/跨provider/CM/CP验收。此前两项裁决、P00b/P09/P10未完成门仍OPEN；无push/PR/归档。
 
 - 执行前只读审查已修正验证层：native phase与resource convergence共用同一个固定1800s deadline，不在各phase重置；外部只读verification沿独立7200s producer时钟。SQL/observer/落盘错误分开保存，失败路径先kill/reap/join exactobserver再停止privatefixture，双cleanup失败聚合。修正后runner112 PASS/0FAIL/2ignored；真实执行仍未开始。
+
+
+### 2026-10-09 P09：真实 stock REST CL 原始大输入原生 PASS（memory owner follow-up OPEN）
+
+- clean `ce6b859efde841a32d964f50fb959e5ba669d11c`，实际 server `d37effa017f69979d189cbd3d33265a9647535685f56eeda744271d3ae0b5459` / runner `12fe4e3bb83ad4c7473391f2ff91a199a394a5371a63b06c79b0e4802a5336e9`，原生1FE+3BE；单场景 PASS/总409.495s（native context含外部后验核对155.886s），38个FE sampled phases全部PASS。没有结果后放宽输入、deadline、cap或重试。
+- 实际私有REST镜像DockerId与冻结BOM digest一致，既有fixture拥有全部5个标准Compose服务。preflight14次HTTP通过；bulk65700次真实HTTP/241.066324s，实际创建32namespace×512tables+512views后完整分页、独立GET32768份metadata，READY同次source/binding/freeze/ledger严格一致，不以producer计数代替验证。
+- catalog admission与独立cl_discovery各16384次实际metadataGET/129listing pages/16416names，sampled allocated peak82096240/82356008 B、after16400792/15963176 B。information_schema的1/8/16 clients分别65/520/1040实际listing pages、16416/131328/262656names，SQL每clientCOUNT16384且tablepage精确64×clients，actual HTTP listing concurrency peak1/8/8。每32namespace SHOW VIEWS精确512名字/2实际页；FORCE DROP精确1025实际HTTP200 mutations（512table+512view+namespace），此前各phase mutation0。
+- 独立 GET-only after-drop：实际31871 HTTP/38.237511s、mutation0，31namespace×512table+512view=31744存活对象metadata逐一与READY完全相等；namespace0按正常catalog namespace authority精确缺席，未猜对象404类型。`VERIFICATION_PASS`与独立native DROP测量合并证明该SQL效果，不单凭外部receipt声称native执行。
+- exact FE73291/BE73302,73303,73304/observer73290均已退出；observer lifetime failures0/active connections与requests0，exact private project容器与volume均消失。共享fixture未改。收据 `p09-real-rest-cl-native-v1-pass-20261009.json` 绑定全部源输入/实际镜像/进程身份/phase bytes/counters与140份raw hashes。
+- 需继续审查：information_schema16clients sampled allocated peak1737269616 B（约1.62GiB）、after22278448 B（约21MiB）；1/8clients peak134418784/894877760 B。初步源码证实该SQL走Client路径，COUNT规划前把表集合展开为VALUES AST；observer metadata_loads0，不将峰值归因Local96MiB或SDK permit。该观测没有新增字节PASS门；内存owner/bound审查仍OPEN。真实HMS/Paimon大CL、P00b/CM/CP/P10、两个既有语义裁决及M07整体仍OPEN；无push/PR/归档。
