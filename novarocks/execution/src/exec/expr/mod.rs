@@ -1442,3 +1442,6 @@ mod ndv_filter_actual_sql_source_tests;
 
 #[cfg(test)]
 mod cast_calendar_time_oracle_tests;
+
+#[cfg(test)]
+mod filter_conjunction_actual_sql_compiler_tests;

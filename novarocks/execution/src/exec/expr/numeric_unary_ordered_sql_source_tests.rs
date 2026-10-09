@@ -29,7 +29,7 @@ use novarocks_sql::compiler::SqlPhysicalEmissionMode;
 // implementation identity or state-format record. An uncovered definition is
 // absent from the seal as in the actual candidate; required source calls still
 // fail explicitly during the real LocalCompiler path.
-fn installed_builtin_owner_catalogue() -> novarocks_functions::PureEngineFunctionCatalog {
+pub(super) fn installed_builtin_owner_catalogue() -> novarocks_functions::PureEngineFunctionCatalog {
     use novarocks_functions::{EngineFunctionCatalogBuilder, InstalledPureKernel};
     let metadata = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
     let control = novarocks_sql::compiler::SqlCompileControl::unbounded();

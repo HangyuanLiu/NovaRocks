@@ -49,7 +49,7 @@ use novarocks_sql::compiler::{
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-fn ndv_sql_source(
+pub(super) fn ndv_sql_source(
     sql: &str,
     emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
