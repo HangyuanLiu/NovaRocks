@@ -530,3 +530,12 @@ Unix组件 **20 PASS / 0 FAIL / 0 ignored，0.99s**（原v1 16＋v2 4）；runne
 host unittest **27 PASS / 0 FAIL，0.197s**，保留全部参数组合与两项真实短Pythonchild capture/实际退出检查；不引入pytest依赖。反例覆盖final cleanup/fsync late失败、不刷新clock、迟到成功收据改FAILED/覆盖失败则撤销精确private artifact、原异常对象和次错。源码模板/合成metadata验证器并非Java/HMS执行，库不启动Nova/HMS/provider。
 
 本slice stockJVM/Native/Docker均0。可执行clean-source/base/bulk冻结、外部固定预算、真实stock准备成本、大只读CL native driver、8positions/SDK future实际退出/取消恢复、真实四role退出仍OPEN。ignored新freeze保持draft/null/false，不能执行；旧规模/caps和产品期限不放宽。HMS Nova写/FORCE正确性继续IRU-7用户excluded，stock外部create/drop属于fixture必要工作；REST/Hadoop/Paimon边界无改。收据 `docs/testing/mem-1-m07/evidence/p09-hms-readonly-cl-bulk-host-components-20261009.json`。无push/PR/归档。
+
+
+### P09 original FE marker / prelaunch clock / host role-exit component checkpoint (2026-10-09)
+
+原 FE fixture bind 后由 NativeTrust 投影有限 UUID marker；原 ManagedProcess 在 spawn 前持实际 File dev/ino，新 scanner 只读原 regular logfile 的有限快照（2MiB / 512B scratch / 384B line），拒绝 replacement/history/重复或不完整 marker，不以 Unix DTO/PID 回填 Native identity。host20s 在原 cluster launch 前只 capture 一次；显式 fixture 只准 FaultScenario 1FE+3BE，binary 解析和 invalid-topology 都保留失败并清理已有 owner。
+
+FE 成功门复查原 deadline 前后并要求实际 ExitSuccess，任何失败仍 stop 同 FE+原三 BE；固定七槽保留 actual error。startup marker IO 首因与 close secondary 保留；exact terminal/diagnostics 有限呈现，内部原 cause 不丢。定向 **harness9 PASS / runner49 PASS / FE marker2 PASS / adapter140 PASS / process-support56 PASS**；其中四个真实 host shell child 分别覆盖 exit0/exit1/expired-exited/expired-live，先原 owner stop 再 actualPID ESRCH。feature/default server check、fmt、diff check 通过。最初 testsupport 缺 imports 的编译 FAIL 保留后已修。
+
+收据：`docs/testing/mem-1-m07/evidence/p09-fe-marker-prelaunch-owner-components-20261009.json`。原 v1/v2 codec/input 与旧 native freeze 字节未改。四 host child不是 Native FE/BE；output join 跨原 deadline 仅源码 postcheck、未定向 faultinject；appendable log identity 不证明原地内容不可变或 rawstdout 独立来源；同步 launch/forcedcleanup 不声称物理20s上界。本轮 Native/Docker0；完整 actual token/Root 独立源、真实Unix互通、W2/精确cut/ACK/recovery/四role实际退出及最终同HEAD验收仍 OPEN。

@@ -63,6 +63,7 @@ pub struct MysqlWriteFixtureError {
     prescribed_eof: Option<crate::listener::MysqlFixtureProtocolFailure>,
     gate: Option<io::Error>,
     invalid_facts: bool,
+    startup_projection: bool,
     aborted_sessions: u64,
     counter_overflow: bool,
     first_gate_failure: Option<GateFailure>,
@@ -127,6 +128,11 @@ impl fmt::Display for MysqlWriteFixtureError {
 }
 impl std::error::Error for MysqlWriteFixtureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Startup projection is the initiating cause; close remains retained as
+        // secondary cleanup. Other original runtime cause ordering is unchanged.
+        if self.startup_projection {
+            return self.gate.as_ref().map(|error| error as _);
+        }
         if let Some(error) = &self.control {
             return Some(error);
         }
@@ -201,6 +207,15 @@ impl MysqlWriteFixture {
     pub fn fail_and_stop(&mut self) {
         self.control.fail(GateFailure::Transition);
         self.control.stop();
+    }
+    /// Retain actual startup marker IO and original control close sources in one startup verdict.
+    pub fn fail_startup_projection(&mut self, cause: io::Error) -> MysqlWriteFixtureError {
+        self.fail_and_stop();
+        let mut retained = self.close_control().err().unwrap_or_default();
+        retained.gate = Some(cause);
+        retained.invalid_facts = true;
+        retained.startup_projection = true;
+        retained
     }
     pub fn close_control(&mut self) -> Result<(), MysqlWriteFixtureError> {
         self.control
@@ -289,5 +304,55 @@ impl MysqlWriteFixture {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod startup_projection_tests {
+    use super::*;
+    use std::error::Error;
+    #[test]
+    fn startup_marker_cause_precedes_but_retains_original_close_failure() {
+        use crate::mysql_write_gate::unix_control::{ControlClass, ControlStage, PrefixSummary};
+        let error = MysqlWriteFixtureError {
+            startup_projection: true,
+            gate: Some(io::Error::from(io::ErrorKind::BrokenPipe)),
+            close: Some(ControlFailure {
+                class: ControlClass::Cleanup,
+                stage: ControlStage::Cleanup,
+                frame: PrefixSummary {
+                    declared_wire_bytes: None,
+                    observed_bytes: 0,
+                    sha256: [0; 32],
+                },
+                response: PrefixSummary {
+                    declared_wire_bytes: None,
+                    observed_bytes: 0,
+                    sha256: [0; 32],
+                },
+                io_cause: Some(io::Error::from(io::ErrorKind::PermissionDenied)),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            error
+                .close
+                .as_ref()
+                .unwrap()
+                .io_cause
+                .as_ref()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }

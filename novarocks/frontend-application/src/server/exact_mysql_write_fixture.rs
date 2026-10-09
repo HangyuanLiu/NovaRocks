@@ -49,9 +49,33 @@ pub(super) fn bind_from_environment(
             "exact MySQL fixture requires the original bound FE process identity",
         ));
     };
-    MysqlWriteFixture::bind(path, frontend, nonce, Instant::now() + CONTROL_DEADLINE)
-        .map(Some)
-        .map_err(FrontendApplicationError::server_fixture)
+    let mut fixture =
+        MysqlWriteFixture::bind(path, frontend, nonce, Instant::now() + CONTROL_DEADLINE)
+            .map_err(FrontendApplicationError::server_fixture)?;
+    if let Err(cause) = write_frontend_identity_marker(&mut std::io::stdout().lock(), frontend) {
+        return Err(FrontendApplicationError::server_fixture(
+            fixture.fail_startup_projection(cause),
+        ));
+    }
+    Ok(Some(fixture))
+}
+// Only this feature's successful original fixture bind emits this fixed projection.
+// No marker is emitted by the default server or feature builds with no explicit inputs.
+fn write_frontend_identity_marker(
+    output: &mut impl std::io::Write,
+    frontend: novarocks_types::FrontendProcessId,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut bytes = [0u8; 128];
+    let length = {
+        let mut target = std::io::Cursor::new(&mut bytes[..]);
+        writeln!(
+            target,
+            "NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE frontend_process_id={frontend}"
+        )?;
+        target.position() as usize
+    };
+    output.write_all(&bytes[..length])
 }
 fn decode_nonce(text: &str) -> Result<[u8; 16], &'static str> {
     let bytes = text.as_bytes();
@@ -282,5 +306,41 @@ mod tests {
             role.to_string()
                 .starts_with("Server: original role failure; cleanup failed:")
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_marker_tests {
+    #[test]
+    fn one_fixed_line_projects_only_supplied_actual_identity() {
+        let frontend = novarocks_types::FrontendProcessId::try_from_bytes([
+            1, 137, 15, 110, 122, 0, 113, 35, 129, 35, 69, 103, 137, 171, 205, 239,
+        ])
+        .unwrap();
+        let mut output = Vec::new();
+        super::write_frontend_identity_marker(&mut output, frontend).unwrap();
+        assert_eq!(output,b"NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n");
+    }
+}
+
+#[cfg(test)]
+mod identity_marker_io_tests {
+    #[test]
+    fn original_output_error_is_returned_without_text_reconstruction() {
+        struct Refusal;
+        impl std::io::Write for Refusal {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(32))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = super::write_frontend_identity_marker(
+            &mut Refusal,
+            novarocks_types::FrontendProcessId::new_v7(),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
     }
 }

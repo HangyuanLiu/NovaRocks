@@ -1,4 +1,7 @@
+#[path = "exact_mysql_fixture_clock.rs"]
+mod exact_mysql_fixture_clock;
 use anyhow::{Context, Result, bail};
+pub(crate) use exact_mysql_fixture_clock::ExactMysqlPrelaunchClock;
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessNativeFaultProxyConfig,
     CrossProcessRootReplyFaultConfig, CrossProcessServerHandle, LaunchProfile, NativeTrustFixture,
@@ -93,6 +96,7 @@ pub struct ScenarioContext {
     handle: CrossProcessServerHandle,
     scenario_root: PathBuf,
     deadline: Instant,
+    exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
     actions: Vec<String>,
     phase_observations: Vec<ScenarioPhaseObservation>,
     binary: PathBuf,
@@ -176,7 +180,7 @@ pub struct ScenarioPhaseObservation {
 }
 
 impl ScenarioContext {
-    pub fn new(
+    pub(crate) fn new(
         name: &'static str,
         handle: CrossProcessServerHandle,
         scenario_root: PathBuf,
@@ -189,12 +193,14 @@ impl ScenarioContext {
         launch_profile: LaunchProfile,
         uea1_workload_manifest: Option<PathBuf>,
         uea1_preparation_diagnostic_secret: Option<String>,
+        exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
     ) -> Self {
         Self {
             name,
             handle,
             scenario_root,
             deadline: Instant::now() + timeout,
+            exact_mysql_clock,
             actions: Vec::new(),
             phase_observations: Vec::new(),
             binary,
@@ -206,7 +212,7 @@ impl ScenarioContext {
             launch_profile,
             uea1_workload_manifest,
             uea1_preparation_diagnostic_secret,
-            started_at: SystemTime::now(),
+            started_at: exact_mysql_clock.map_or_else(SystemTime::now, |clock| clock.started_at()),
         }
     }
 
@@ -257,6 +263,28 @@ impl ScenarioContext {
         self.handle.mysql_user()
     }
 
+    /// The launch-time exact fixture clock, never the generic run-entry deadline.
+    pub(crate) fn exact_mysql_deadline(&self) -> Result<Instant> {
+        let clock = self
+            .exact_mysql_clock
+            .context("exact MySQL scene has no prelaunch clock")?;
+        clock.remaining("exact scene operation")?;
+        Ok(clock.deadline())
+    }
+    /// Caller first saves scene wire/control evidence; cleanup must still run on expiry.
+    pub(crate) fn shutdown_exact_mysql_fixture(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let clock = self
+                .exact_mysql_clock
+                .context("exact MySQL scene has no prelaunch clock")?;
+            self.handle.shutdown_exact_mysql_fixture(clock.deadline())
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("exact MySQL fixture requires Unix original role owners")
+        }
+    }
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -349,7 +377,13 @@ impl ScenarioContext {
     }
 
     pub fn diagnostics(&self) -> String {
-        self.handle.diagnostics()
+        if self.exact_mysql_clock.is_some() {
+            // Raw runtime diagnostics contain child tails outside the bounded
+            // failure-log redactor. Keep only a finite verdict in this artifact.
+            "exact MySQL fixture failed; original role cleanup remains required".to_string()
+        } else {
+            self.handle.diagnostics()
+        }
     }
 
     pub fn compatible_binary(&self) -> Result<PathBuf> {

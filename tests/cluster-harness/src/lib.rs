@@ -16,6 +16,10 @@
 // under the License.
 
 mod effective_launch_config;
+#[cfg(unix)]
+mod exact_mysql_fixture_exit;
+#[cfg(unix)]
+mod exact_mysql_fixture_identity;
 
 pub use effective_launch_config::EffectiveLaunchConfigEvidence;
 pub mod delayed_s3;
@@ -4089,6 +4093,77 @@ impl CrossProcessServerHandle {
         self.query_execution_resource_diagnostics_impl()
     }
 
+    /// Independent bounded projection from the original FE child log, not Unix control.
+    #[cfg(unix)]
+    pub fn original_exact_mysql_frontend_identity(
+        &self,
+        original_deadline: Instant,
+    ) -> Result<novarocks_types::FrontendProcessId> {
+        ensure!(
+            self.fe_log_history.is_empty(),
+            "exact MySQL observer refuses FE replacement history"
+        );
+        ensure!(
+            self.fe_process.is_running()? && self.fe_process.pid() == self.fe_launch_identity.pid,
+            "exact MySQL observer requires original live FE child"
+        );
+        let _ = process_resources::recheck_process_launch_identity(&self.fe_launch_identity)?;
+        let identity = self.fe_process.log_source().with_bounded_snapshot_reader(
+            exact_mysql_fixture_identity::SCAN_BYTES,
+            |reader, length| exact_mysql_fixture_identity::scan(reader, length, original_deadline),
+        )?;
+        let _ = process_resources::recheck_process_launch_identity(&self.fe_launch_identity)?;
+        Ok(identity)
+    }
+    /// Explicit fixture-only success gate, using the original four role owners.
+    /// A failed FE success gate never skips cleanup or becomes successful generic stop.
+    #[cfg(unix)]
+    pub fn shutdown_exact_mysql_fixture(&mut self, original_deadline: Instant) -> Result<()> {
+        let mut failures: [Option<anyhow::Error>; 7] = std::array::from_fn(|_| None);
+        if self.be_processes.len() != 3 {
+            failures[1] = Some(anyhow::anyhow!(
+                "exact MySQL role gate requires original 1FE+3BE"
+            ));
+            // Even an invalid topology must settle every original owner before
+            // the caller starts external-fixture teardown. It remains FAILED.
+            if let Err(error) = self.shutdown() {
+                failures[2] = Some(error);
+            }
+            return Err(ExactMysqlRoleShutdownError { failures }.into());
+        }
+        if let Err(error) = self.native_fault_proxies.stop_root_reply_actors() {
+            failures[0] = Some(error);
+        }
+        if let Err(error) = exact_mysql_fixture_exit::require_original_fe_success(
+            &mut self.fe_process,
+            original_deadline,
+        ) {
+            failures[1] = Some(error);
+        }
+        // Always settle this same FE, including failed/expired successful-exit wait.
+        if let Err(error) = self.fe_process.stop() {
+            failures[2] = Some(error);
+        }
+        for (index, process) in self.be_processes.iter_mut().enumerate() {
+            if let Err(error) = process.stop() {
+                failures[3 + index] = Some(error);
+            }
+        }
+        self.native_fault_proxies.stop();
+        if failures.iter().all(Option::is_none) && !self.retain_runtime_artifacts {
+            if let Err(error) = fs::remove_dir_all(&self.runtime_dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    failures[6] = Some(error.into());
+                }
+            }
+        }
+        self.native_trust_fixture.cleanup_sensitive_material();
+        if failures.iter().any(Option::is_some) {
+            Err(ExactMysqlRoleShutdownError { failures }.into())
+        } else {
+            Ok(())
+        }
+    }
     /// Stop this cluster explicitly. Retained artifacts remain available.
     pub fn shutdown(&mut self) -> Result<()> {
         let mut failures = Vec::new();
@@ -5247,6 +5322,10 @@ fn collect_failure_log_redactions(
 }
 
 fn sensitive_environment_name(name: &str) -> bool {
+    // The exact fixture nonce is private although its key has no generic secret keyword.
+    if name == "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX" {
+        return true;
+    }
     let name = name.to_ascii_uppercase();
     [
         "SECRET",
@@ -5652,6 +5731,43 @@ mod tests {
         let captured = sources.capture(128).expect("capture redacted log");
         assert_eq!(captured.logs[0].contents, "prefix <redacted> suffix");
         assert!(!captured.logs[0].contents.contains("raw-secret"));
+    }
+
+    #[test]
+    fn exact_mysql_nonce_is_redacted_before_failure_artifact_handoff() {
+        // Synthetic fixed canary only: never read the real private fixture environment.
+        const CANARY: &str = "0123456789abcdef0123456789abcdef";
+        let fe = BTreeMap::from([
+            (
+                "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX".into(),
+                CANARY.into(),
+            ),
+            ("VISIBLE_SETTING".into(), "visible".into()),
+        ]);
+        let redactions = collect_failure_log_redactions(&fe, &[]).unwrap();
+        assert_eq!(redactions.as_ref(), &[CANARY.to_string()]);
+        assert!(!sensitive_environment_name("UNRELATED_NONCE_HEX"));
+        let sources = ServerFailureLogSources {
+            backend_count: 3,
+            logs: vec![ServerFailureLogSource::inline(
+                "fe.log".into(),
+                format!("visible before={CANARY} after"),
+                256,
+                redactions,
+            )],
+        };
+        let captured = sources.capture(256).unwrap();
+        assert_eq!(captured.logs[0].contents, "visible before=<redacted> after");
+        let artifact = serde_json::json!({
+            "backend_count": captured.backend_count,
+            "logs": [{ "name": captured.logs[0].name,
+                "original_bytes": captured.logs[0].original_bytes,
+                "contents": captured.logs[0].contents }],
+        })
+        .to_string();
+        assert!(!artifact.contains(CANARY));
+        assert!(artifact.contains("<redacted>"));
+        assert!(artifact.contains("visible"));
     }
 
     #[test]
@@ -7927,5 +8043,39 @@ static_file_path = "catalogs.toml"
         };
 
         assert!(expired.convergence_failure(&baseline).is_none());
+    }
+}
+
+/// Owns the actual first and cleanup errors; Display never expands arbitrary source text.
+#[cfg(unix)]
+struct ExactMysqlRoleShutdownError {
+    failures: [Option<anyhow::Error>; 7],
+}
+#[cfg(unix)]
+impl std::fmt::Display for ExactMysqlRoleShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exact MySQL role cleanup failed at stages:")?;
+        for (index, source) in self.failures.iter().enumerate() {
+            if source.is_some() {
+                write!(f, " {index}")?;
+            }
+        }
+        Ok(())
+    }
+}
+#[cfg(unix)]
+impl std::fmt::Debug for ExactMysqlRoleShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+#[cfg(unix)]
+impl std::error::Error for ExactMysqlRoleShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failures
+            .iter()
+            .flatten()
+            .next()
+            .map(|error| error.as_ref())
     }
 }
