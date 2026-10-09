@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "purpose": "private-stock-hms-small-native-classification-only",
+  "review_status": "draft",
+  "frozen_before_execution": false,
+  "source_revision": "a431f630e34ad696468b7645aad31b73b6081280",
+  "source_tree_sha256": null,
+  "cargo_lock_sha256": null,
+  "runner_native_build_identity": null,
+  "runner_path": null,
+  "runner_bytes": null,
+  "runner_sha256": null,
+  "server_path": null,
+  "server_bytes": null,
+  "server_sha256": null,
+  "build_receipt_path": null,
+  "build_receipt_sha256": null,
+  "original_capability_execution_freeze_sha256": null,
+  "companion_helper_sha256": "eacec55b81db260fa21026ed548efd32d621f46d97eceeacab9adce38c52a880",
+  "bounds": {
+    "work_deadline_seconds": 1200,
+    "cleanup_deadline_seconds": 240,
+    "owner_command_seconds": 180,
+    "spark_stage_seconds": 240,
+    "inspection_seconds": 15,
+    "writer_exit_seconds": 45,
+    "max_output_bytes": 1048576,
+    "max_marker_bytes": 65536,
+    "max_namespaces": 128,
+    "max_metadata_bytes": 1048576,
+    "port_start": 28250,
+    "port_end": 28499,
+    "host_reap_seconds": 5,
+    "max_local_file_bytes": 1048576,
+    "jar_block_bytes": 65536,
+    "native_stage_seconds": 240,
+    "startup_timeout_seconds": 30,
+    "role_exit_reserve_seconds": 24,
+    "exact_role_count": 4,
+    "exact_backend_count": 3,
+    "assertion_budget_millis_max": 216000
+  },
+  "input": {
+    "namespace_prefix": "m07_cap_",
+    "catalog_name": "m07_hms_preflight",
+    "table_name": "cap_table",
+    "view_name": "cap_view",
+    "view_sql": "SELECT id FROM cap_table",
+    "view_dialect": "spark",
+    "table_format_version": 2,
+    "view_format_version": 1,
+    "view_version_id": 1,
+    "schema": {
+      "type": "struct",
+      "schema-id": 0,
+      "fields": [
+        {
+          "id": 1,
+          "name": "id",
+          "required": true,
+          "type": "long"
+        }
+      ]
+    },
+    "hms_failure_retries": 0,
+    "table_partition_spec": {
+      "spec-id": 0,
+      "fields": []
+    },
+    "table_spec_count": 1,
+    "oracle_list_all_tables": true,
+    "hms_connect_attempts": 1
+  }
+}

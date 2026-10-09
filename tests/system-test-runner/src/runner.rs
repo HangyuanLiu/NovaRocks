@@ -23,6 +23,19 @@ pub fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let config = RunnerConfig::from_cli(&cli)?;
+    if let Some(binding) = &cli.hms_classification_binding {
+        if config.cluster_size != 3
+            || config.launch_profile != novarocks_cluster_harness::LaunchProfile::FaultScenario
+        {
+            bail!("HMS classification preflight requires fault-scenario 1FE+3BE");
+        }
+        let scenario =
+            scenarios::hms_classification_preflight::HmsClassificationPreflight::from_binding(
+                binding,
+                &config.base_config_path,
+            )?;
+        return run_one(&scenario, &config);
+    }
     let selected = select(&scenarios, &cli.only)?;
     if selected.is_empty() {
         bail!("no system scenarios are registered");

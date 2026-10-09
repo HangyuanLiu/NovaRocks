@@ -6,6 +6,7 @@ mod connector;
 mod distributed_writer;
 mod exchange_normal_close;
 mod frontend_lifecycle;
+pub(crate) mod hms_classification_preflight;
 mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;

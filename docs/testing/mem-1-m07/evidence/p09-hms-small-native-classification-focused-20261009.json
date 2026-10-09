@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "a431f630e34ad696468b7645aad31b73b6081280",
+  "purpose": "Optional unchanged-input stock HMS small native correctness preflight implementation",
+  "checks": [
+    {
+      "suite": "Host ownership and complete-role-ledger checks",
+      "passed": 14,
+      "failed": 0,
+      "seconds": 0.026
+    },
+    {
+      "suite": "Runner exclusive CLI and exact source refusal focused checks after save-error preservation",
+      "passed": 2,
+      "failed": 0,
+      "seconds": 0.0
+    },
+    {
+      "suite": "Runner regression before final primary/secondary save-error preservation",
+      "passed": 127,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 6.14
+    }
+  ],
+  "boundaries": [
+    "New opt-in exclusive binding does not change default discovery",
+    "Original stock Java capability helper, four Scala programs, bounds and immutable freezes unchanged",
+    "Fresh Java oracle runs only after complete exact 4-role ledger and independent actual PID absence; abnormal/unknown outcome retains owned resources",
+    "Actual native source/binaries/build identity reviewed and frozen before growth; fixed 240 second native phase within original absolute work clock",
+    "Template is draft and refused; execution requires separately reviewed ignored freeze"
+  ],
+  "limitations": [
+    "No actual native stock HMS result yet",
+    "No mutation RPC observer: fresh Java equality proves final unchanged state only",
+    "Not original large CL, hard SDK internal bytes, performance or overall acceptance",
+    "No push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-host-tests-v1-20261009.log",
+      "bytes": 113,
+      "sha256": "5588b256ee4b948aa406c335ef3d6d9593702e739835e5d99e2b8255b3339813"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-runner-focused-v1-20261009.log",
+      "bytes": 5602,
+      "sha256": "79d1c21f94f4991f833864ac231e907215e3d665a5107d55d81b7987112cde9b"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-runner-regression-v1-20261009.log",
+      "bytes": 18442,
+      "sha256": "ac6516591b9526f14f4b66fac666e2fb52fff37d04ef640ce51eac272bb97e64"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-host-tests-v2-20261009.log",
+      "bytes": 113,
+      "sha256": "35183794784a293116669bf0e27fedb2cb6efff4c5a4ac0ad88b97a0e1136ef0"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-runner-focused-v2-20261009.log",
+      "bytes": 5253,
+      "sha256": "d8fd0d6f0447cf42590eceaa5e092342ed9c1c301d27d822010eb70acc8134a5"
+    }
+  ]
+}

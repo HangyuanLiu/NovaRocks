@@ -436,3 +436,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - GovernedProtocolOwner.statement_token仅借原live statement并取其既有token，StreamingStatementResult只delegate；已settled/taken返回None，无新mint/reconstruct/registration别名/registry或取消容量权。为后续exact caller绑定提供原身份，不能把sessionepoch猜作connectiongeneration。
 - 原streaming Closing alias真实fixture校验token跨取消cut不变、下一statement仍Busy、普通/Closing位置仍按实际alias退出；focused1PASS、query_control全部26PASS/0FAIL/0.02s。收据p09-protocol-owner-token-projection-20261009.json；feature IO/control/Native接线仍OPEN，无deadline/资格/失败语义改变。
+
+
+### 2026-10-09 P09：stock HMS小规模Native分类预检接入（真实运行待验）
+
+- 新opt-in exclusive CLI/scenario和原capability helper的独立companion；原helper/四Scala/input/bounds/旧freeze字节不变。仅完整exact4role身份+runner正常完整evidence+逐PID实际不存在才允许freshJava核对及原cleanup；timeout/partial/unknown退出保留Native/HMS/catalog/objectstore，不从host group退出推断角色退出。新freeze模板draft/null pins，拒绝直接运行。
+- host14PASS/0.026s，最终runner focused2PASS；runner回归127PASS/0FAIL/2ignored/6.14s在最终primary+save secondary错误合并前运行，最终合并后focused另通过。收据p09-hms-small-native-classification-focused-20261009.json绑定全部日志hash。正常代码0/1完整证据仍分别PASS/FAIL，不把成功cleanup改写实验失败。
+- 真实stock HMS/1FE+3BE即将独立cleanHEAD构建运行，尚无Native结论。freshJava finalunchanged不证明zero intermediate mutation RPC；该observer仍OPEN。原大CL、其余P09/P00b/P10/final及两人工语义门不变，无push/PR/归档。
