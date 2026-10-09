@@ -45,9 +45,13 @@ use crate::query_execution::split_assignment_round::{
     RoundSplitSourceRecipe, assignment_endpoints, assignment_targets, open_round_split_source,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::task_execution::blocking_io::{ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor};
+use crate::task_execution::blocking_io::{
+    ConnectorBlockingIoJob, ConnectorBlockingIoJoinPin, ConnectorBlockingIoResponsibility,
+    ConnectorBlockingIoSupervisor,
+};
 use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
+use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
@@ -154,6 +158,10 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
     fn next_source_recipe(
         &mut self,
     ) -> Result<Option<AttemptSourceRecipe<Self::Recipe>>, DistributedQueryError>;
+
+    fn source_join_pin(
+        recipe: &AttemptSourceRecipe<Self::Recipe>,
+    ) -> Option<ConnectorBlockingIoJoinPin>;
 
     fn open_source(
         recipe: AttemptSourceRecipe<Self::Recipe>,
@@ -262,7 +270,8 @@ async fn drive_attempt_initialization<S: SerialAttemptInitialization>(
                 "attempt initializer produced a source recipe for another execution",
             ));
         }
-        let job = supervisor.spawn_ordinary(move || S::open_source(recipe));
+        let pins = S::source_join_pin(&recipe).into_iter().collect();
+        let job = supervisor.spawn_pinned(pins, move || S::open_source(recipe));
         let opened = lifecycle.await_job(job).await??;
         if opened.identity != expected {
             return Err(failed(format!(
@@ -280,6 +289,8 @@ async fn drive_attempt_initialization<S: SerialAttemptInitialization>(
 }
 
 struct ProductionInitializationState {
+    work_scope: WorkScope,
+    result_window: ResultWindowAlias,
     execution_id: QueryExecutionId,
     artifacts: PreparedDistributedQuery,
     schedule: ValidatedFragmentSchedule,
@@ -296,6 +307,7 @@ struct ProductionInitializationState {
 }
 
 struct ProductionSourceRecipe {
+    responsibility: ConnectorBlockingIoResponsibility,
     source: RoundSplitSourceRecipe,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     connector_context: ConnectorRequestContext,
@@ -329,6 +341,11 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         Ok(Some(AttemptSourceRecipe {
             identity,
             recipe: ProductionSourceRecipe {
+                responsibility: ConnectorBlockingIoResponsibility::admit(
+                    &self.work_scope,
+                    &self.result_window,
+                )
+                .map_err(|error| failed(error.to_string()))?,
                 source,
                 session: self.session.clone(),
                 // Every source belongs to this same admitted attempt. Preserve
@@ -341,6 +358,12 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         }))
     }
 
+    fn source_join_pin(
+        recipe: &AttemptSourceRecipe<Self::Recipe>,
+    ) -> Option<ConnectorBlockingIoJoinPin> {
+        Some(recipe.recipe.responsibility.join_pin())
+    }
+
     fn open_source(
         recipe: AttemptSourceRecipe<Self::Recipe>,
     ) -> Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError> {
@@ -350,6 +373,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             &recipe.session,
             &recipe.connector_context,
             recipe.blocking_io,
+            recipe.responsibility,
         )
         .map_err(failed)?;
         Ok(OpenedAttemptSource {
@@ -423,6 +447,8 @@ impl AttemptInitializing {
     )]
     pub(crate) fn new(
         execution_id: QueryExecutionId,
+        work_scope: WorkScope,
+        result_window: ResultWindowAlias,
         artifacts: PreparedDistributedQuery,
         schedule: ValidatedFragmentSchedule,
         retry_policy: TaskUpdateRetryPolicy,
@@ -437,6 +463,8 @@ impl AttemptInitializing {
             AttemptInitializationLifecycle::new(connector_context.deadline(), cancellation);
         Self::from_lifecycle(
             execution_id,
+            work_scope,
+            result_window,
             artifacts,
             schedule,
             retry_policy,
@@ -455,6 +483,8 @@ impl AttemptInitializing {
     )]
     fn from_lifecycle(
         execution_id: QueryExecutionId,
+        work_scope: WorkScope,
+        result_window: ResultWindowAlias,
         artifacts: PreparedDistributedQuery,
         schedule: ValidatedFragmentSchedule,
         retry_policy: TaskUpdateRetryPolicy,
@@ -479,6 +509,8 @@ impl AttemptInitializing {
             runtime,
             lifecycle,
             state: ProductionInitializationState {
+                work_scope,
+                result_window,
                 execution_id,
                 artifacts,
                 schedule,
@@ -506,6 +538,8 @@ impl AttemptInitializing {
     )]
     pub(crate) fn new_governed(
         execution_id: QueryExecutionId,
+        work_scope: WorkScope,
+        result_window: ResultWindowAlias,
         artifacts: PreparedDistributedQuery,
         schedule: ValidatedFragmentSchedule,
         retry_policy: TaskUpdateRetryPolicy,
@@ -520,6 +554,8 @@ impl AttemptInitializing {
             AttemptInitializationLifecycle::governed(connector_context.deadline(), cancellation);
         Self::from_lifecycle(
             execution_id,
+            work_scope,
+            result_window,
             artifacts,
             schedule,
             retry_policy,
@@ -682,6 +718,12 @@ mod tests {
                 .take()
                 .expect("fixture recipe is consumed once");
             Ok(Some(AttemptSourceRecipe { identity, recipe }))
+        }
+
+        fn source_join_pin(
+            _: &AttemptSourceRecipe<Self::Recipe>,
+        ) -> Option<ConnectorBlockingIoJoinPin> {
+            None
         }
 
         fn open_source(

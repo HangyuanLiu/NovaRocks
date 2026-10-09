@@ -310,6 +310,7 @@ impl std::error::Error for FrontendApplicationError {
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 struct FrontendExecutionRuntimeOwner {
+    connector_blocking_io: ConnectorBlockingIoSupervisor,
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
     lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
@@ -337,7 +338,7 @@ struct FrontendExecutionRuntimeOwner {
 /// admit, complete, or release business work.
 struct FrontendWorkloadDeadlineSupervisor {
     stop: tokio::sync::watch::Sender<bool>,
-    worker: tokio::task::JoinHandle<()>,
+    worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FrontendWorkloadDeadlineSupervisor {
@@ -364,23 +365,35 @@ impl FrontendWorkloadDeadlineSupervisor {
                 }
             }
         });
-        Self { stop, worker }
+        Self {
+            stop,
+            worker: Some(worker),
+        }
     }
 
     async fn shutdown(&mut self) {
         self.stop.send_replace(true);
-        let _ = (&mut self.worker).await;
+        if let Some(worker) = self.worker.as_mut() {
+            let _ = worker.await;
+            // Keep the original handle on a cancelled await; consume it only
+            // after actual join, before a later Host owner can time out.
+            self.worker.take();
+        }
     }
 
     fn abort_for_process_exit(&self) {
         self.stop.send_replace(true);
-        self.worker.abort();
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
     }
 }
 
 impl Drop for FrontendWorkloadDeadlineSupervisor {
     fn drop(&mut self) {
-        self.worker.abort();
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
     }
 }
 
@@ -404,6 +417,7 @@ struct FrontendQueryRuntimeConfig {
 impl FrontendExecutionRuntimeOwner {
     fn try_new(
         runtime: Handle,
+        connector_blocking_io: ConnectorBlockingIoSupervisor,
         frontend_process_id: FrontendProcessId,
         supervisor_config: LogicalExecutionSupervisorConfig,
         workload_config: WorkloadConfig,
@@ -471,6 +485,7 @@ impl FrontendExecutionRuntimeOwner {
             workload.owner.deadline_expiry_handle(),
         );
         Ok(Self {
+            connector_blocking_io,
             supervisor,
             logical_execution_client,
             lifecycle_diagnostics,
@@ -591,6 +606,12 @@ impl FrontendExecutionRuntimeOwner {
 
     async fn shutdown_workload_until(&mut self, deadline: Instant) -> Result<(), String> {
         loop {
+            if let Some(error) = self.connector_blocking_io.take_original_failure() {
+                // Keep arbitrary provider payload destruction off the Host
+                // future and hold its original backing until actual join.
+                self.record_terminal_error(error.to_string());
+                self.connector_blocking_io.retire_original_failure(error);
+            }
             let revision = self
                 .workload
                 .as_ref()
@@ -642,11 +663,12 @@ impl FrontendExecutionRuntimeOwner {
                 .as_ref()
                 .expect("failed workload shutdown returns the exact owner")
                 .wait_progress(revision);
-            if tokio::time::timeout_at(deadline.into(), wait)
-                .await
-                .is_err()
-            {
-                return Err("frontend workload shutdown deadline exceeded before drain".to_string());
+            tokio::select! {
+                _ = wait => {},
+                _ = self.connector_blocking_io.wait_failure() => {},
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    return Err("frontend workload shutdown deadline exceeded before drain".to_string());
+                }
             }
         }
     }
@@ -1237,6 +1259,7 @@ impl FrontendApplicationHost {
         })?;
         let execution_runtime_owner = FrontendExecutionRuntimeOwner::try_new(
             query_runtime,
+            data_runtime.connector_blocking_io().clone(),
             frontend_process_id,
             execution.logical_execution_supervisor,
             execution.workload.clone(),
@@ -2040,6 +2063,7 @@ mod tests {
         TEST_STATE_STORE_PROVIDER_ID, input as test_state_store_input,
         registry as test_state_store_registry,
     };
+    use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
     use async_trait::async_trait;
     use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
     use novarocks_state_store_api::{
@@ -2066,9 +2090,27 @@ mod tests {
     struct FailingFactory;
 
     #[tokio::test]
+    async fn deadline_supervisor_keeps_an_observed_join_terminal_on_shutdown_retry() {
+        let workload =
+            novarocks_workload_control::WorkloadControl::try_new_counted(WorkloadConfig::default())
+                .unwrap();
+        let mut supervisor = super::FrontendWorkloadDeadlineSupervisor::start(
+            &tokio::runtime::Handle::current(),
+            workload.owner.deadline_expiry_handle(),
+        );
+        supervisor.shutdown().await;
+        // A later owner can exhaust the Host deadline after this original join
+        // has completed. Retrying teardown must not poll that handle again.
+        supervisor.shutdown().await;
+        workload.owner.close_admission();
+        assert!(workload.owner.shutdown().is_ok());
+    }
+
+    #[tokio::test]
     async fn execution_runtime_shutdown_deadline_retains_the_same_workload_owner_for_retry() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2112,6 +2154,7 @@ mod tests {
     async fn execution_runtime_supervises_admitted_statement_deadlines() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2165,6 +2208,7 @@ mod tests {
     async fn execution_runtime_shutdown_consumes_terminal_control_notifications() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2252,6 +2296,206 @@ mod tests {
         assert!(diagnostic.contains("Open (frontend-unit-test)"));
         assert!(diagnostic.contains("injected provider primary failure"));
         assert!(diagnostic.contains("injected provider cleanup failure"));
+    }
+
+    async fn blocking_test_host(name: &str) -> FrontendApplicationHost {
+        let registry = test_state_store_registry();
+        let backend = crate::topology::ClusterBackendOpenConfig::new(
+            novarocks_types::ClusterRole::Fe,
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            Duration::from_secs(1),
+            1,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            Some(test_state_store_input(name)),
+            &registry,
+            FrontendExecutionConfig::new_for_test(
+                NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                std::sync::Arc::new(
+                    novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap(),
+                ),
+            ),
+            backend,
+            Vec::new(),
+            tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
+        )
+        .await
+        .unwrap();
+        host.mark_ready()
+            .expect("original Host admission becomes ready");
+        host
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_drain_retains_the_same_admitted_connector_call_until_actual_join() {
+        use crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility;
+        let mut host = blocking_test_host("connector-held-host").await;
+        let (root, window) = host
+            .execution_runtime_owner
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .unwrap();
+        let pin = responsibility.join_pin();
+        let (release, held) = std::sync::mpsc::channel();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (returned, exited) = tokio::sync::oneshot::channel();
+        let job = host
+            .connector_blocking_io_supervisor()
+            .spawn_pinned(vec![pin], move || {
+                let _responsibility = responsibility;
+                let _ = started.send(());
+                held.recv().expect("release original Connector call");
+                let _ = returned.send(());
+            });
+        tokio::time::timeout(Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        drop(job);
+        let first = host
+            .shutdown_until(Instant::now() + Duration::from_millis(40))
+            .await;
+        let remained_held = exited.is_empty();
+        let retained = host.execution_runtime_owner.workload_observation.snapshot();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = host
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert!(first.is_err() && remained_held);
+        assert_eq!(retained.root_responsibilities, 1);
+        assert_eq!(retained.result_windows.held_positions, [0, 0, 1, 0]);
+        retry.expect("same Host drains after original join");
+        assert!(
+            host.execution_runtime_owner
+                .workload_observation
+                .snapshot()
+                .scopes
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_drain_consumes_an_unclaimed_original_panic_before_releasing_its_window() {
+        use crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility;
+        struct Payload {
+            destroyed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                let _ = self.started.take().unwrap().send(());
+                self.release
+                    .recv()
+                    .expect("release original panic payload destructor");
+                self.destroyed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let mut host = blocking_test_host("connector-panic-host").await;
+        let (root, window) = host
+            .execution_runtime_owner
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .unwrap();
+        let pin = responsibility.join_pin();
+        let destroyed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (payload_started, payload_entered) = tokio::sync::oneshot::channel();
+        let (release_payload, payload_held) = std::sync::mpsc::channel();
+        let payload = Payload {
+            destroyed: std::sync::Arc::clone(&destroyed),
+            started: Some(payload_started),
+            release: payload_held,
+        };
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let job = host
+            .connector_blocking_io_supervisor()
+            .spawn_pinned(vec![pin], move || {
+                let _responsibility = responsibility;
+                let _ = started.send(());
+                std::panic::panic_any(payload);
+            });
+        tokio::time::timeout(Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        drop(job);
+        // A real external releaser makes the former synchronous-Drop path a
+        // bounded failing test instead of leaving the original barrier held.
+        let (disarm_watchdog, watch) = std::sync::mpsc::channel();
+        let rescue = release_payload.clone();
+        let watchdog = std::thread::spawn(move || {
+            if watch.recv_timeout(Duration::from_millis(500)).is_err() {
+                let _ = rescue.send(());
+            }
+        });
+        let began = Instant::now();
+        let blocked = host
+            .shutdown_until(Instant::now() + Duration::from_millis(40))
+            .await;
+        let shutdown_elapsed = began.elapsed();
+        let payload_started_by_deadline = !payload_entered.is_empty();
+        let held = host.execution_runtime_owner.workload_observation.snapshot();
+        let _ = release_payload.send(());
+        let _ = disarm_watchdog.send(());
+        watchdog
+            .join()
+            .expect("original payload rescue thread actually joined");
+        tokio::time::timeout(Duration::from_secs(1), payload_entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let verdict = host
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        let after = host.execution_runtime_owner.workload_observation.snapshot();
+        let cleanup_complete = host.execution_runtime_owner.is_shutdown_complete();
+        host.shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("cleaned Host remains closed");
+        assert!(blocked.is_err() && payload_started_by_deadline);
+        assert!(
+            shutdown_elapsed < Duration::from_millis(500),
+            "Host deadline blocked on its original panic payload destructor: {shutdown_elapsed:?}"
+        );
+        assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
+        assert_eq!(held.root_responsibilities, 1);
+        assert!(
+            verdict
+                .expect_err("original unclaimed panic must be reported")
+                .to_string()
+                .contains("panicked")
+        );
+        assert!(destroyed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(after.result_windows.held_positions, [0; 4]);
+        assert!(after.scopes.is_empty() && cleanup_complete);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

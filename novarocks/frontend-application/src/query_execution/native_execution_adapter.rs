@@ -948,6 +948,7 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
         let factory = ProductionDormantAttemptFactory {
             projection: ProductionManifestAttemptProjection {
                 runtime: self.runtime.clone(),
+                work_scope: owner.scope(),
                 options,
                 aborts: Arc::clone(&aborts),
                 delivery,
@@ -977,6 +978,7 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
 
 #[derive(Clone)]
 struct ProductionManifestAttemptProjection {
+    work_scope: novarocks_workload_control::WorkScope,
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
     aborts: Arc<LogicalAbortRouter>,
@@ -1277,8 +1279,11 @@ impl ProductionManifestAttemptProjection {
         )
         .map_err(projection_message)?;
         let connector_context = credential_source.connector_request_context(connector_context);
+        let ProductionRootDelivery::Relayed { window, .. } = &self.delivery;
         let ready = AttemptInitializing::new_governed(
             execution,
+            self.work_scope.clone(),
+            window.clone(),
             prepared,
             schedule,
             self.runtime.task_update_retry_policy,

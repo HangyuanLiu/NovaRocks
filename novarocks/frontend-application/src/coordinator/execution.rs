@@ -680,8 +680,13 @@ impl FrontendDistributedQueryCoordinator {
         .map_err(failed)?;
         let connector_context =
             credential_lease_source.connector_request_context(connector_context);
+        let binding = parts.result_capacity.as_ref().ok_or_else(|| {
+            failed("attempt initialization requires its admitted result capacity")
+        })?;
         let initializing = AttemptInitializing::new(
             execution_id,
+            binding.scope().clone(),
+            binding.window_alias(),
             parts.artifacts,
             schedule,
             self.task_update_retry_policy,

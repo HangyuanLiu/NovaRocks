@@ -24,17 +24,38 @@
 //! second Connector permit, controls whether the call may be submitted.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use novarocks_workload_control::{
+    ResultWindowAlias, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,
+};
 
 use tokio::runtime::Handle;
 
 /// Why a submitted blocking call produced no Connector outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ConnectorBlockingIoError {
     detail: String,
+    original: Arc<OriginalFailure>,
 }
 
-impl ConnectorBlockingIoError {}
+struct OriginalFailure {
+    cause: OriginalFailureCause,
+    // The original panic payload is destroyed before its backing responsibility.
+    _backing: Box<[ConnectorBlockingIoBacking]>,
+}
+
+enum OriginalFailureCause {
+    WorkerJoin(tokio::task::JoinError),
+    OutcomeDrop(#[allow(dead_code)] Mutex<Box<dyn std::any::Any + Send>>),
+}
+
+impl fmt::Debug for OriginalFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OriginalConnectorBlockingFailure")
+    }
+}
 
 impl fmt::Display for ConnectorBlockingIoError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -42,17 +63,173 @@ impl fmt::Display for ConnectorBlockingIoError {
     }
 }
 
-impl std::error::Error for ConnectorBlockingIoError {}
+impl std::error::Error for ConnectorBlockingIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.original.cause {
+            OriginalFailureCause::WorkerJoin(error) => Some(error),
+            OriginalFailureCause::OutcomeDrop(_) => None,
+        }
+    }
+}
+
+/// One source/call responsibility, derived before dispatch from the original
+/// admitted scope. The existing scope-record bound limits these cells; this
+/// does not acquire a second business, execution or Connector permit.
+pub(crate) struct ConnectorBlockingIoResponsibility(Arc<ResponsibilityCell>);
+
+struct ResponsibilityCell {
+    owner: Option<WorkOwner>,
+    pending_joins: AtomicUsize,
+    _window: ResultWindowAlias,
+}
+
+impl Drop for ResponsibilityCell {
+    fn drop(&mut self) {
+        let owner = self
+            .owner
+            .take()
+            .expect("one Connector responsibility owner");
+        if *self.pending_joins.get_mut() == 0 {
+            // This private child owns no receiver or remote cancellation
+            // delivery. Its last backing alias and every original join have
+            // exited, so its own pending Cancel is now obsolete.
+            owner.complete_after_terminal_cancel_settled();
+        } else {
+            // A publisher aborted before awaiting its original blocking job
+            // has no exit proof. WorkOwner::drop records an orphan, keeping
+            // Host drain fail-closed instead of inventing a successful join.
+            drop(owner);
+        }
+    }
+}
+
+impl ConnectorBlockingIoResponsibility {
+    pub(crate) fn admit(scope: &WorkScope, window: &ResultWindowAlias) -> Result<Self, WorkError> {
+        if !window.is_for_scope(scope) {
+            return Err(WorkError::Conflict);
+        }
+        let owner = scope.child(WorkRequest::new(WorkClass::Query))?;
+        let delegated = match window.for_child(&owner.scope()) {
+            Ok(window) => window,
+            Err(error) => {
+                // No call, source or receiver was installed for this child.
+                owner.complete_after_terminal_cancel_settled();
+                return Err(error);
+            }
+        };
+        Ok(Self(Arc::new(ResponsibilityCell {
+            owner: Some(owner),
+            pending_joins: AtomicUsize::new(0),
+            _window: delegated,
+        })))
+    }
+
+    /// Fixed backing alias, retained after all other fields of an enclosing
+    /// source/result have been destroyed. It cannot authorize another job.
+    pub(crate) fn retain_backing(&self) -> ConnectorBlockingIoBacking {
+        ConnectorBlockingIoBacking(Arc::clone(&self.0))
+    }
+
+    pub(crate) fn join_pin(&self) -> ConnectorBlockingIoJoinPin {
+        ConnectorBlockingIoJoinPin::new(&self.0)
+    }
+}
+
+pub(crate) struct ConnectorBlockingIoBacking(#[allow(dead_code)] Arc<ResponsibilityCell>);
+
+/// Remains outside the panic-able synchronous closure. Only the actual await
+/// of that original JoinHandle may mark it joined, including a JoinError.
+pub(crate) struct ConnectorBlockingIoJoinPin {
+    cell: Arc<ResponsibilityCell>,
+    joined: AtomicBool,
+}
+
+impl ConnectorBlockingIoJoinPin {
+    fn new(cell: &Arc<ResponsibilityCell>) -> Self {
+        cell.pending_joins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .expect("finite original Connector joins cannot overflow");
+        Self {
+            cell: Arc::clone(cell),
+            joined: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Drop for ConnectorBlockingIoJoinPin {
+    fn drop(&mut self) {
+        if self.joined.load(Ordering::Acquire) {
+            let previous = self.cell.pending_joins.fetch_sub(1, Ordering::AcqRel);
+            assert!(previous != 0, "original Connector join pin underflow");
+        }
+    }
+}
+
+struct JobOutcome<T> {
+    value: Mutex<Option<Result<T, ConnectorBlockingIoError>>>,
+    // Unclaimed outputs are destroyed before their original join pins.
+    pins: Box<[ConnectorBlockingIoJoinPin]>,
+    failure: Arc<Mutex<Option<ConnectorBlockingIoError>>>,
+    failure_ready: Arc<tokio::sync::Notify>,
+}
+
+impl<T> Drop for JobOutcome<T> {
+    fn drop(&mut self) {
+        let outcome = self
+            .value
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let failure = match outcome {
+            Some(Err(error)) => Some(error),
+            Some(Ok(value)) => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
+                    .err()
+                    .map(|payload| ConnectorBlockingIoError {
+                        detail: "connector blocking-I/O unclaimed outcome panicked during cleanup"
+                            .to_owned(),
+                        original: Arc::new(OriginalFailure {
+                            cause: OriginalFailureCause::OutcomeDrop(Mutex::new(payload)),
+                            _backing: self
+                                .pins
+                                .iter()
+                                .map(|pin| ConnectorBlockingIoBacking(Arc::clone(&pin.cell)))
+                                .collect(),
+                        }),
+                    })
+            }
+            None => None,
+        };
+        if let Some(error) = failure {
+            let rejected = {
+                let mut first = self
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if first.is_none() {
+                    *first = Some(error);
+                    None
+                } else {
+                    Some(error)
+                }
+            };
+            // No arbitrary original payload is destroyed under the slot lock.
+            drop(rejected);
+            self.failure_ready.notify_one();
+        }
+    }
+}
 
 /// A submitted call whose result can be polled by an existing serial owner.
 pub(crate) struct ConnectorBlockingIoJob<T> {
-    outcome: Arc<Mutex<Option<Result<T, ConnectorBlockingIoError>>>>,
+    outcome: Arc<JobOutcome<T>>,
     ready: Arc<tokio::sync::Notify>,
 }
 
 impl<T> ConnectorBlockingIoJob<T> {
     pub(crate) fn try_take(&self) -> Option<Result<T, ConnectorBlockingIoError>> {
         self.outcome
+            .value
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
@@ -78,11 +255,17 @@ impl<T> ConnectorBlockingIoJob<T> {
 #[derive(Clone)]
 pub(crate) struct ConnectorBlockingIoSupervisor {
     runtime: Handle,
+    failure: Arc<Mutex<Option<ConnectorBlockingIoError>>>,
+    failure_ready: Arc<tokio::sync::Notify>,
 }
 
 impl ConnectorBlockingIoSupervisor {
     pub(crate) fn new(runtime: Handle) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            failure: Arc::new(Mutex::new(None)),
+            failure_ready: Arc::new(tokio::sync::Notify::new()),
+        }
     }
 
     /// The runtime this lane's work is admitted onto.
@@ -99,7 +282,7 @@ impl ConnectorBlockingIoSupervisor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.spawn(call)
+        self.spawn_pinned(Vec::new(), call)
     }
 
     /// Submit ordinary split-source work.
@@ -112,28 +295,53 @@ impl ConnectorBlockingIoSupervisor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.spawn(call)
+        self.spawn_pinned(Vec::new(), call)
     }
 
-    fn spawn<T, F>(&self, call: F) -> ConnectorBlockingIoJob<T>
+    pub(crate) fn spawn_pinned<T, F>(
+        &self,
+        pins: Vec<ConnectorBlockingIoJoinPin>,
+        call: F,
+    ) -> ConnectorBlockingIoJob<T>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
         let runtime = self.runtime.clone();
-        let outcome = Arc::new(Mutex::new(None));
+        let outcome = Arc::new(JobOutcome {
+            value: Mutex::new(None),
+            pins: pins.into_boxed_slice(),
+            failure: Arc::clone(&self.failure),
+            failure_ready: Arc::clone(&self.failure_ready),
+        });
         let published = Arc::clone(&outcome);
         let ready = Arc::new(tokio::sync::Notify::new());
         let publish_ready = Arc::clone(&ready);
         self.runtime.spawn(async move {
-            let completed =
-                runtime
-                    .spawn_blocking(call)
-                    .await
-                    .map_err(|error| ConnectorBlockingIoError {
-                        detail: format!("connector blocking-I/O worker failed: {error}"),
-                    });
-            *published.lock().unwrap_or_else(|error| error.into_inner()) = Some(completed);
+            let joined = runtime.spawn_blocking(call).await;
+            for pin in &published.pins {
+                pin.joined.store(true, Ordering::Release);
+            }
+            let completed = joined.map_err(|error| ConnectorBlockingIoError {
+                detail: if error.is_panic() {
+                    "connector blocking-I/O worker panicked"
+                } else {
+                    "connector blocking-I/O worker was cancelled"
+                }
+                .to_owned(),
+                original: Arc::new(OriginalFailure {
+                    cause: OriginalFailureCause::WorkerJoin(error),
+                    _backing: published
+                        .pins
+                        .iter()
+                        .map(|pin| ConnectorBlockingIoBacking(Arc::clone(&pin.cell)))
+                        .collect(),
+                }),
+            });
+            *published
+                .value
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(completed);
             // Each job has exactly one consuming waiter. A stored single
             // notification token also covers completion before `finish` registers, while
             // `notify_waiters` would lose that notification.
@@ -141,14 +349,91 @@ impl ConnectorBlockingIoSupervisor {
         });
         ConnectorBlockingIoJob { outcome, ready }
     }
+
+    /// Move the original unclaimed failure out of the fixed process slot.
+    /// Host teardown records its finite verdict, destroys the actual payload
+    /// and its backing aliases, and then drains the same workload authority.
+    pub(crate) fn take_original_failure(&self) -> Option<ConnectorBlockingIoError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
+    /// Payload destructors are provider code too. Retire the original failure
+    /// on the same protected blocking lane, preserving each original scope
+    /// through that destructor's actual JoinHandle without new admission.
+    pub(crate) fn retire_original_failure(&self, error: ConnectorBlockingIoError) {
+        let pins = error
+            .original
+            ._backing
+            .iter()
+            .map(|backing| ConnectorBlockingIoJoinPin::new(&backing.0))
+            .collect();
+        let _ = self.spawn_pinned(pins, move || drop(error));
+    }
+
+    pub(crate) async fn wait_failure(&self) {
+        loop {
+            let ready = self.failure_ready.notified();
+            if self
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+            {
+                return;
+            }
+            ready.await;
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    pub(crate) fn admitted() -> (
+        novarocks_workload_control::WorkloadControl,
+        novarocks_workload_control::RootWork,
+        novarocks_workload_control::ResultWindowGrant,
+    ) {
+        use novarocks_workload_control::{
+            ResultCapacityConfig, ResultWindowClass, WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .expect("workload")
+            .owner;
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .expect("capacity");
+        control.mark_ready().expect("ready");
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .expect("original admitted work");
+        (control, root, window)
+    }
+
+    pub(crate) fn until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "original owner did not converge");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub(crate) fn settle_control(control: &novarocks_workload_control::WorkloadControl) {
+        while let Some(permit) = control.next_control() {
+            permit.acknowledge();
+        }
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -168,6 +453,286 @@ mod tests {
             assert!(Instant::now() < deadline, "blocking-I/O job did not finish");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn original_work_and_window_survive_a_dropped_waiter_and_control_ack() {
+        use novarocks_workload_control::{CancellationReason, OwnerState};
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) = admitted();
+        let scope = root.owner.scope();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&scope, &window.retain_alias())
+                .expect("source responsibility");
+        let pin = responsibility.join_pin();
+        let (release, released) = mpsc::channel();
+        let (started, entered) = mpsc::channel();
+        let job = supervisor.spawn_pinned(vec![pin], move || {
+            let _responsibility = responsibility;
+            started.send(()).expect("start");
+            released.recv().expect("release original call");
+        });
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("entered");
+        root.owner.cancel(CancellationReason::Requested);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        drop(job);
+        settle_control(&control);
+        let held = control.snapshot();
+        release.send(()).expect("release");
+        until(|| {
+            settle_control(&control);
+            control.snapshot().scopes.is_empty()
+        });
+        assert_eq!(held.root_responsibilities, 1);
+        assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
+        assert!(
+            held.scopes
+                .iter()
+                .any(|child| child.parent == Some(scope.id()) && child.owner == OwnerState::Active)
+        );
+        assert!(supervisor.take_original_failure().is_none());
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn an_unclaimed_outcome_keeps_its_original_join_and_backing() {
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) = admitted();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .expect("responsibility");
+        let pin = responsibility.join_pin();
+        let job = supervisor.spawn_pinned(vec![pin], move || {
+            drop(responsibility);
+            7u8
+        });
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        until(|| job.outcome.value.lock().unwrap().is_some());
+        let held = control.snapshot();
+        drop(job);
+        until(|| control.snapshot().scopes.is_empty());
+        assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn a_retained_original_panic_payload_keeps_its_backing_until_last_alias() {
+        struct Payload(std::sync::Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) = admitted();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .expect("responsibility");
+        let pin = responsibility.join_pin();
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let payload = Payload(Arc::clone(&destroyed));
+        let job = supervisor.spawn_pinned(vec![pin], move || {
+            let _responsibility = responsibility;
+            std::panic::panic_any(payload);
+        });
+        until(|| job.outcome.value.lock().unwrap().is_some());
+        drop(job);
+        until(|| supervisor.failure.lock().unwrap().is_some());
+        let error = supervisor.take_original_failure().expect("original panic");
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        let held = control.snapshot();
+        let payload_held = !destroyed.load(Ordering::Acquire);
+        drop(supervisor);
+        let last_alias_held = !destroyed.load(Ordering::Acquire);
+        drop(error);
+        until(|| control.snapshot().scopes.is_empty());
+        assert!(payload_held && last_alias_held);
+        assert!(destroyed.load(Ordering::Acquire));
+        assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn runtime_drop_before_original_join_cannot_complete_work() {
+        use novarocks_workload_control::OwnerState;
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) = admitted();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .expect("responsibility");
+        let pin = responsibility.join_pin();
+        let (release, released) = mpsc::channel();
+        let (started, entered) = mpsc::channel();
+        let (exited, exit) = mpsc::channel();
+        let job = supervisor.spawn_pinned(vec![pin], move || {
+            let _responsibility = responsibility;
+            started.send(()).expect("start");
+            released.recv().expect("release call");
+            drop(_responsibility);
+            exited.send(()).expect("actual exit");
+        });
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("entered");
+        drop(job);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        runtime.shutdown_background();
+        let held = control.snapshot();
+        release.send(()).expect("release original call");
+        exit.recv_timeout(Duration::from_secs(2))
+            .expect("actual exit");
+        until(|| {
+            control
+                .snapshot()
+                .scopes
+                .iter()
+                .any(|scope| scope.owner == OwnerState::Orphaned)
+        });
+        assert_eq!(held.root_responsibilities, 1);
+        assert!(
+            !control
+                .snapshot()
+                .scopes
+                .iter()
+                .any(|scope| scope.parent.is_some() && scope.own_completed)
+        );
+        control.close_admission();
+        assert!(
+            control.shutdown().is_err(),
+            "unobserved join must fail closed"
+        );
+    }
+
+    #[test]
+    fn adopting_a_failure_does_not_hide_another_unclaimed_failure() {
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let claimed = supervisor.spawn_ordinary(|| panic!("claimed failure"));
+        until(|| claimed.outcome.value.lock().unwrap().is_some());
+        let unclaimed = supervisor.spawn_protected(|| panic!("unclaimed close failure"));
+        until(|| unclaimed.outcome.value.lock().unwrap().is_some());
+        drop(unclaimed);
+        until(|| supervisor.failure.lock().unwrap().is_some());
+        let claimed_error = wait(&claimed).expect_err("claimed verdict");
+        let orphan_error = supervisor
+            .take_original_failure()
+            .expect("unclaimed original verdict remains");
+        let distinct_originals = !Arc::ptr_eq(&claimed_error.original, &orphan_error.original);
+        drop(claimed);
+        drop(claimed_error);
+        drop(orphan_error);
+        assert!(distinct_originals);
+        assert!(supervisor.take_original_failure().is_none());
+    }
+
+    #[test]
+    fn unclaimed_outcome_drop_panic_keeps_the_actual_payload_and_window() {
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        struct Outcome {
+            _responsibility: ConnectorBlockingIoResponsibility,
+            destroyed: Arc<AtomicBool>,
+        }
+        impl Drop for Outcome {
+            fn drop(&mut self) {
+                std::panic::panic_any(Payload(Arc::clone(&self.destroyed)));
+            }
+        }
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) = admitted();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .unwrap();
+        let pin = responsibility.join_pin();
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let outcome = Outcome {
+            _responsibility: responsibility,
+            destroyed: Arc::clone(&destroyed),
+        };
+        let job = supervisor.spawn_pinned(vec![pin], move || outcome);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        drop(job);
+        until(|| supervisor.failure.lock().unwrap().is_some());
+        let held = control.snapshot();
+        let payload_held = !destroyed.load(Ordering::Acquire);
+        let original = supervisor.take_original_failure().unwrap();
+        let has_cleanup_verdict = original.to_string().contains("during cleanup");
+        drop(original);
+        until(|| control.snapshot().scopes.is_empty());
+        assert!(payload_held && has_cleanup_verdict);
+        assert!(destroyed.load(Ordering::Acquire));
+        assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn local_source_terminal_settles_its_own_cancel_without_host_shutdown() {
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) = admitted();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .unwrap();
+        let pin = responsibility.join_pin();
+        let (release, held) = mpsc::channel();
+        let (started, entered) = mpsc::channel();
+        let job = supervisor.spawn_pinned(vec![pin], move || {
+            let _responsibility = responsibility;
+            started.send(()).unwrap();
+            held.recv().unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
+        control.expire_deadlines();
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+        drop(window);
+        let retained = control.snapshot();
+        let joined = Arc::downgrade(&job.outcome);
+        drop(job);
+        release.send(()).unwrap();
+        until(|| {
+            joined.upgrade().is_none() && control.snapshot().result_windows.held_positions == [0; 4]
+        });
+        let actual_terminal = control.snapshot();
+        // Settle any remaining notifications before the assertions, so the
+        // former orphaned-notification path is an exited, reproducible FAIL.
+        settle_control(&control);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+        assert_eq!(retained.root_responsibilities, 1);
+        assert_eq!(retained.result_windows.held_positions, [0, 0, 1, 0]);
+        assert!(
+            actual_terminal.scopes.is_empty(),
+            "actual source join/backing exit left its local Cancel waiting for Host shutdown: {:?}",
+            actual_terminal.scopes
+        );
     }
 
     #[test]
@@ -225,6 +790,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         while job
             .outcome
+            .value
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .is_none()
