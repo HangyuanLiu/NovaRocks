@@ -673,20 +673,42 @@ impl PreparedAggregateKernel for PercentileKernel {
         })
     }
 }
+/// The original logical-channel predicate is shared by FE admission and preparation.
+pub(super) fn original_logical_profile(
+    logical_argument_count: usize,
+    channel_count: usize,
+    has_order_keys: bool,
+) -> bool {
+    !has_order_keys && logical_argument_count == 2 && logical_argument_count == channel_count
+}
+
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), KernelFailure> {
+    validate_selected_profile(
+        contract.call().selected(),
+        contract.intermediate_type(),
+        work,
+    )
+}
+
+/// Borrow the original full selected fields; no prepared object or value is read.
+pub(super) fn validate_selected_profile(
+    selected: &FunctionBindingSelection,
+    intermediate_type: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
     let [
         FunctionArgumentType::Value(value),
         FunctionArgumentType::Value(_rate),
-    ] = contract.call().selected().argument_types.as_ref()
+    ] = selected.argument_types.as_ref()
     else {
         return Err(invalid(
             "percentile requires the original two full value arguments",
         ));
     };
-    let FunctionResultType::Scalar(output) = &contract.call().selected().result_type else {
+    let FunctionResultType::Scalar(output) = &selected.result_type else {
         return Err(invalid("percentile requires its original scalar result"));
     };
     let mut expected = value.clone();
@@ -694,7 +716,7 @@ pub(super) fn validate_contract(
     if !expected
         .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
         || !FunctionValueType::new(DataType::Binary, true)
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
+            .exactly_equals_observed::<KernelFailure>(intermediate_type, || {
                 work.step().map_err(compile_failure)
             })?
     {

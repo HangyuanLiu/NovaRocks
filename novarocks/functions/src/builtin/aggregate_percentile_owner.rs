@@ -19,7 +19,9 @@
 //! DISTINCT and encoded-source aggregate OVER retain separate obligations.
 
 use super::{
-    aggregate_percentile::{PercentileKernel, validate_contract},
+    aggregate_percentile::{
+        PercentileKernel, original_logical_profile, validate_contract, validate_selected_profile,
+    },
     catalogue::BuiltinAggregateResolver,
 };
 use crate::kernel_control::{compile_failure, invalid};
@@ -197,6 +199,50 @@ impl PureFunctionMetadataOwner for PercentileOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_selected_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        self.declaration.effect_declaration(&selected.overload)?;
+        let result = (|| {
+            let original_channels = original_logical_profile(
+                logical_argument_count,
+                selected.argument_types.len(),
+                selected.argument_types.len() > logical_argument_count,
+            );
+            work.step()?;
+            if !original_channels {
+                return Err(FunctionBindingError::UnavailableImplementation(
+                    selected.overload.clone(),
+                ));
+            }
+            let state = selected.aggregate.as_ref().ok_or_else(|| {
+                FunctionBindingError::UnavailableImplementation(selected.overload.clone())
+            })?;
+            validate_selected_profile(selected, &state.intermediate_type, &mut work).map_err(
+                |cause| match cause {
+                    KernelFailure::Cancelled => FunctionBindingError::Control(
+                        novarocks_type_contract::CompileControlError::Cancelled,
+                    ),
+                    KernelFailure::DeadlineExceeded => FunctionBindingError::Control(
+                        novarocks_type_contract::CompileControlError::DeadlineExceeded,
+                    ),
+                    KernelFailure::ResourceExhausted => FunctionBindingError::Control(
+                        novarocks_type_contract::CompileControlError::ResourceExhausted,
+                    ),
+                    _ => FunctionBindingError::UnavailableImplementation(selected.overload.clone()),
+                },
+            )
+        })();
+        if matches!(&result, Err(FunctionBindingError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
 }
 impl FunctionEffectOwner for PercentileOwner {
     type Error = FunctionBindingError;
@@ -278,9 +324,11 @@ impl PureAggregateImplementation for PercentileOwner {
                     "exact percentile aggregate preparation differs from its exact checked call",
                 ));
             }
-            let supported = contract.order_keys().is_empty()
-                && input.request.logical_argument_count == 2
-                && input.request.logical_argument_count == input.request.arguments.len();
+            let supported = original_logical_profile(
+                input.request.logical_argument_count,
+                input.request.arguments.len(),
+                !contract.order_keys().is_empty(),
+            );
             work.step().map_err(compile_failure)?;
             if !supported {
                 return Err(invalid(

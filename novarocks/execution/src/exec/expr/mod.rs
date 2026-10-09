@@ -1601,3 +1601,9 @@ mod e08s1_late_original_source_tests;
 
 #[cfg(test)]
 mod e08s1_late_source_tests;
+
+#[cfg(test)]
+mod e08s1_percentile_original_static_tests;
+
+#[cfg(test)]
+mod e08s1_percentile_static_tests;
