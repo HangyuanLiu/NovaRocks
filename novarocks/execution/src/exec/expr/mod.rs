@@ -1409,3 +1409,5 @@ mod sql_published_source_observation_tests;
 
 #[cfg(test)]
 mod sql_dependency_context_tests;
+#[cfg(test)]
+mod sql_scalar_presence_original_tests;
