@@ -359,20 +359,37 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
         .next()
         .or_else(|| delivery.as_ref().and_then(RootSegmentDelivery::client_rows));
     let next_body = resident_bodies.next();
+    let closing_cursor = lease.receipt();
+    let buffered_row_bytes = lease.writer().buffered_row_bytes();
     let resident = resident_tail(
-        lease.receipt(),
-        lease.writer().buffered_row_bytes(),
+        closing_cursor,
+        buffered_row_bytes,
         current_body.as_ref(),
         next_body.as_ref(),
     );
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    if let Some(hook) = hook {
+        hook.record_original_freeze(
+            crate::mysql_write_gate::original_freeze::OriginalFreezeScalars::capture(
+                resident_window.is_some(),
+                &resident_items,
+                delivery.as_ref(),
+                closing_cursor,
+                buffered_row_bytes,
+                current_body.as_ref(),
+                next_body.as_ref(),
+                resident.as_deref(),
+            ),
+        );
+    }
     let backing_check = capacity.check_backing_total(CLOSING_OBJECT_BYTES);
     if backing_check.is_err() || resident.is_none() {
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         let prescribed_missing = backing_check.is_ok()
             && resident.is_none()
             && has_missing_resident_tail(
-                lease.receipt(),
-                lease.writer().buffered_row_bytes(),
+                closing_cursor,
+                buffered_row_bytes,
                 current_body.as_ref(),
                 next_body.as_ref(),
             );

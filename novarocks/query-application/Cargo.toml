@@ -9,6 +9,7 @@ workspace = true
 
 [features]
 test-support = []
+mem-1-m07-exact-mysql-write = []
 
 [dependencies]
 arrow.workspace = true

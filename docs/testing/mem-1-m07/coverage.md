@@ -506,3 +506,11 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 真实注册 TCP 握手 / 原 intermediary / socket EOF / watcher actual join / registry drain 的三项定向 PASS；缺尾使用一个真实V1 partial1MiB body，满池使用实际64个原V1 Closing grant，不改配置。feature adapter full **133 PASS / 0 FAIL / 0 ignored，2.56s**；后加 mint/geometry 两项 focused PASS；default和feature server编译PASS。初次missing import与test select返回值编译失败日志保留。
 
 严格边界：这未证明 native W2双item、原生fullpool/Root/wire/ACK/健康恢复/四role退出；同kind字符串/Control/第二EOF是ledger组件负例。非Capacity/backing拒绝与完整facade混合cause尚无独立用例。actual FE独立marker和prelaunch20s原clock仍待接线；generic stop不代表FE ownerfinish成功。收据 `docs/testing/mem-1-m07/evidence/p09-prescribed-relay-eof-components-20261009.json`；默认产品失败返回、cap、30s/5s/20s无变更，无push/PR/归档。
+
+### P09 original freeze scalar component checkpoint (2026-10-09)
+
+新 QA/API 只读 getter 仅由默认关闭的 exact-write feature 启用；从原 RetainedRootReply / ResidentRootSegment / fallback delivery 复制完整身份、原native/window序号、frontier、visible长度。原close唯一freeze之后使用同原receipt、buffered计数、既有body views和实际resident_tail选出的长度，同步写已有Hub的单固定槽。无第二freeze、body/reply/guard clone、新task、ACK或read能力。root改用既有Hub.checked维持deadline/firstcause和Stop/wake拒绝路径。
+
+原window模型 **1 PASS**：getter无Arc增持、两原slot序号和Root相同、实际最后owner Drop后capacity为0且标量仍可读。feature adapter full **134 PASS / 0 FAIL / 0 ignored，2.54s**；随后observer重复/错receipt/phase/已有失败 focused1 PASS。原registered intermediary focused3 PASS，并准确断言缺尾只有fallback1MiB、无resident window；pool拒绝在freeze之前，因此没有虚构的空W2观察。default和feature server编译PASS。
+
+Unix v1字节/16tests和旧freezes未变；wire-v2/newfreeze/strictdecoder仅新ignored草稿，尚未启用。真实native双item W2/fullpool/ACK/独立wire/健康恢复/FE成功退出和四role实际退出继续OPEN，visible长度不当完整allocation backing。收据 `docs/testing/mem-1-m07/evidence/p09-original-freeze-scalar-components-20261009.json`。默认产品close资格、cap与30s/5s/20s无改动，HMS按只读例外，无push/PR/归档。

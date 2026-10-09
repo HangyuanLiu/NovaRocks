@@ -308,6 +308,35 @@ async fn original_intermediary_eof(pool_refusal: bool) {
     assert_eq!(observation.snapshot().protocol_io_failures, 0);
     assert_eq!(observation.snapshot().prescribed_protocol_eofs, 1);
     assert_eq!(observation.watcher_snapshot().joined, 1);
+    let freeze = controller.snapshot().original_freeze;
+    if pool_refusal {
+        assert!(
+            freeze.is_none(),
+            "capacity refusal occurs before original freeze"
+        );
+    } else {
+        let freeze = freeze.expect("actual original close captured fallback scalars");
+        assert!(!freeze.had_resident_window);
+        assert!(freeze.slots.iter().all(Option::is_none));
+        assert!(matches!(
+            freeze.current_source,
+            crate::mysql_write_gate::original_freeze::CurrentBodySource::OriginalDeliveryFallback
+        ));
+        let data = freeze.fallback_delivery.unwrap();
+        assert_eq!(data.root_task.query_execution_id(), execution_id);
+        assert_eq!(data.native_sequence.get(), 1);
+        assert_eq!(data.body_bytes, 1048576);
+        assert_eq!(
+            freeze.framing,
+            controller.snapshot().gate.unwrap().cancel_receipt.unwrap()
+        );
+        assert!(!freeze.tail_complete);
+        assert_eq!(freeze.tail_parts, 0);
+        assert_eq!(freeze.tail_selected_bytes, 0);
+        assert_eq!(freeze.current.unwrap().before_remaining, 0);
+        assert!(freeze.current.unwrap().after_remaining > 0);
+        assert!(freeze.next.is_none());
+    }
     assert!(controller.snapshot().failure.is_none());
     assert!(controller.snapshot().original_writer_exited);
     // Keep the real error: a matching string/kind on another error never acquires provenance.

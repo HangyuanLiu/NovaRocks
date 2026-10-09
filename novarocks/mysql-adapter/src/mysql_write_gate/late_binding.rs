@@ -35,6 +35,8 @@ struct HubState {
     scope: Option<Arc<MysqlWriteTestScope>>,
     original_writer_exited: bool,
     final_gate: Option<MysqlWriteGateSnapshot>,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    original_freeze: Option<super::original_freeze::OriginalFreezeScalars>,
 }
 
 /// One listener-owned slot. Per-connection aliases never allocate another scope.
@@ -62,6 +64,8 @@ pub(crate) struct MysqlWriteHubSnapshot {
     pub failure: Option<GateFailure>,
     pub original_writer_exited: bool,
     pub gate: Option<MysqlWriteGateSnapshot>,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub original_freeze: Option<super::original_freeze::OriginalFreezeScalars>,
 }
 
 fn hub_fail(state: &mut HubState, reason: GateFailure) -> io::Error {
@@ -96,6 +100,8 @@ impl MysqlWriteGateHub {
                 scope: None,
                 original_writer_exited: false,
                 final_gate: None,
+                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                original_freeze: None,
             }),
         });
         Ok((Arc::clone(&hub), MysqlWriteGateController { hub }))
@@ -356,6 +362,8 @@ impl MysqlWriteGateHub {
                 .as_ref()
                 .map(|scope| scope.snapshot())
                 .or(state.final_gate),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            original_freeze: state.original_freeze,
         }
     }
 }
@@ -498,6 +506,38 @@ impl std::error::Error for PrescribedRelayEof {
 }
 
 impl MysqlWriteRelayHook {
+    /// Copy-only observation after the ONE production freeze and original tail selection.
+    /// checked keeps the established Hub -> Core order and Stop/wake on every refusal.
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn record_original_freeze(
+        &self,
+        observed: io::Result<super::original_freeze::OriginalFreezeScalars>,
+    ) {
+        let Ok(observed) = observed else {
+            self.hub.fail(GateFailure::Receipt);
+            return;
+        };
+        let _ = self.hub.checked(|state| {
+            let facts = self.scope.snapshot();
+            if state.original_freeze.is_some()
+                || !state
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| Arc::ptr_eq(scope, &self.scope))
+                || facts.statement != Some(self.statement)
+                || facts.phase != GatePhase::Resumed
+                || facts.failure.is_some()
+                || facts.cancel_receipt != Some(observed.framing)
+                || facts.accepted_prefix_bytes != facts.cut_bytes
+                || !facts.blocked_after_acceptance
+            {
+                return Err(hub_fail(state, GateFailure::Receipt));
+            }
+            state.original_freeze = Some(observed);
+            Ok(())
+        });
+    }
+
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     pub(crate) fn fail_fixture(&self, reason: GateFailure) {
         self.hub.fail(reason);
@@ -889,6 +929,90 @@ mod tests {
                 } else {
                     GateFailure::Receipt
                 })
+            );
+            drop(writer);
+            drop(hook);
+            controller.stop();
+            controller.finish_after_protocol_join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[tokio::test]
+    async fn original_freeze_observation_refuses_duplicate_wrong_receipt_phase_and_prior_failure() {
+        for case in 0..4 {
+            let connection = ClientConnectionToken::new(71, 19).unwrap();
+            let statement = StatementToken::new(SessionToken::new(71, 23), 30);
+            let (hub, mut controller) = MysqlWriteGateHub::new(
+                FrontendProcessId::new_v7(),
+                NONCE,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            controller
+                .arm(controller.snapshot().frontend, NONCE, 71, SQL, 2)
+                .unwrap();
+            let hook = hub
+                .bind_statement(connection, statement, SQL)
+                .unwrap()
+                .unwrap();
+            let original = InitiallyRawMysqlWriter::new(Vec::new(), connection, hub.clone());
+            let mut writer =
+                OwnedStreamingMysqlWriter::new(original, ProtocolLimits::default(), 1).unwrap();
+            writer.start_metadata(metadata().unwrap()).unwrap();
+            writer.finish_metadata().await.unwrap();
+            hook.begin_rows(writer.receipt()).unwrap();
+            writer.start_row(4).unwrap();
+            writer.push_slice(b"\x03abc").unwrap();
+            {
+                let flushing = writer.flush_pending();
+                tokio::pin!(flushing);
+                tokio::select! {
+                    result=&mut flushing => panic!("cut must block: {result:?}"),
+                    blocked=hook.scope.wait_blocked() => {blocked.unwrap();},
+                }
+            }
+            let mut receipt = writer.receipt();
+            if case != 0 {
+                hook.record_cancel_and_resume(receipt).unwrap();
+            }
+            let observed = super::super::original_freeze::OriginalFreezeScalars::capture(
+                false,
+                &[None, None],
+                None,
+                receipt,
+                0,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            if case == 1 {
+                receipt.rows_completed += 1;
+            }
+            if case == 2 {
+                hook.record_original_freeze(Ok(observed));
+                assert!(controller.snapshot().original_freeze.is_some());
+            }
+            if case == 3 {
+                hook.fail_fixture(GateFailure::Identity);
+            }
+            let mut supplied = observed;
+            supplied.framing = receipt;
+            hook.record_original_freeze(Ok(supplied));
+            assert_eq!(
+                controller.snapshot().failure,
+                Some(if case == 3 {
+                    GateFailure::Identity
+                } else {
+                    GateFailure::Receipt
+                })
+            );
+            assert_eq!(controller.snapshot().original_freeze.is_some(), case == 2);
+            assert_eq!(
+                hook.scope.snapshot().phase,
+                GatePhase::Stopped,
+                "refusal uses original Stop/wake path"
             );
             drop(writer);
             drop(hook);

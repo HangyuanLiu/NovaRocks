@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [features]
-mem-1-m07-exact-mysql-write = ["dep:sha2"]
+mem-1-m07-exact-mysql-write = ["dep:sha2", "novarocks-query-application/mem-1-m07-exact-mysql-write"]
 
 [dependencies]
 async-trait.workspace = true

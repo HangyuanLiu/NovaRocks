@@ -1589,3 +1589,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+#[path = "mysql_write_gate/original_freeze.rs"]
+pub(crate) mod original_freeze;
