@@ -3079,6 +3079,7 @@ pub fn contribute_builtin_functions(
                     | "ds_hll_count_distinct_union" => {
                         Some(super::aggregate_ds_hll_owner::effects())
                     }
+                    "map_agg" => Some(super::aggregate_map_owner::effects()),
                     "count" => Some(super::aggregate_count_owner::effects()),
                     "multi_distinct_count" => {
                         Some(super::aggregate_count_distinct_owner::effects())
@@ -3162,6 +3163,14 @@ pub fn contribute_builtin_functions(
             "percentile_approx" | "percentile_approx_weighted"
         ) {
             builder.register(super::aggregate_approx_percentile_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if declaration.name == "map_agg" {
+            builder.register(super::aggregate_map_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -5170,4 +5179,36 @@ pub(super) fn ds_hll_host_test_catalog() -> EngineFunctionCatalog {
             .unwrap();
     }
     builder.seal().unwrap()
+}
+
+// Test-only attachment to the original immutable binding and resolver authors.
+#[cfg(test)]
+pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
+    let native = build_builtin_engine_function_catalog().unwrap();
+    let original = native
+        .definition("map_agg", FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap();
+    let declaration = FunctionBindingDeclaration::try_new(
+        original.function_id().clone(),
+        original.kind(),
+        original.overloads().iter().cloned().map(|mut overload| {
+            overload.effects = Some(super::aggregate_map_owner::effects());
+            overload
+        }),
+    )
+    .unwrap();
+    let declaration_source = builtin_aggregate_declarations()
+        .into_iter()
+        .find(|declaration| declaration.name == "map_agg")
+        .unwrap();
+    let resolver = Arc::new(BuiltinAggregateResolver {
+        declaration: declaration_source,
+    });
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(super::aggregate_map_owner::definition("map_agg", declaration, resolver).unwrap())
+        .unwrap();
+    builder.seal_bound().unwrap()
 }

@@ -360,3 +360,67 @@ fn legacy_map_agg_baseline_lazy_full_diagnostic_uses_actual_carrier_debug() {
     drop(state);
     assert_eq!(tracker.current(), 0);
 }
+
+#[test]
+fn legacy_map_agg_baseline_raw_nominal_largeint_target_preserves_exact_bytes() {
+    let input_values = novarocks_types::largeint::array_from_i128(&[
+        Some(i128::MIN),
+        Some(i128::MAX),
+        Some(i128::MIN),
+        None,
+    ])
+    .unwrap();
+    let input = packed(input_values.clone(), input_values, None);
+    let field = |name: &str| {
+        novarocks_functions::FunctionValueType {
+            logical_type: novarocks_type_contract::ValueLogicalType::LargeInt,
+            ..novarocks_functions::FunctionValueType::new(DataType::FixedSizeBinary(16), true)
+        }
+        .try_to_field(name)
+        .unwrap()
+    };
+    let output = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(vec![field("key"), field("value")].into()),
+            false,
+        )),
+        false,
+    );
+    let s = spec(&input, output.clone());
+    let tracker = MemTracker::new_root("map-raw-nominal-original");
+    let mut state = MapAggState::new(tracker.clone());
+    update(&mut state, &s, &input).unwrap();
+    for partial in [false, true] {
+        let array = emit(&state, &s, partial).unwrap();
+        assert_eq!(array.data_type(), &output);
+        let map = array.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.value_length(0), 2);
+        for child in [map.keys(), map.values()] {
+            assert_eq!(
+                novarocks_types::largeint::value_at(
+                    child
+                        .as_any()
+                        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+                        .unwrap(),
+                    0
+                )
+                .unwrap(),
+                i128::MIN
+            );
+            assert_eq!(
+                novarocks_types::largeint::value_at(
+                    child
+                        .as_any()
+                        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+                        .unwrap(),
+                    1
+                )
+                .unwrap(),
+                i128::MAX
+            );
+        }
+    }
+    drop(state);
+    assert_eq!(tracker.current(), 0);
+}

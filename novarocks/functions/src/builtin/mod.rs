@@ -320,3 +320,8 @@ mod string_field_tests;
 
 mod hll_hash_owner;
 mod hll_hash_selected;
+
+pub mod aggregate_map_core;
+
+mod aggregate_map;
+mod aggregate_map_owner;

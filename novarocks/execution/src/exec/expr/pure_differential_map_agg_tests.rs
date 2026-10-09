@@ -59,7 +59,7 @@ fn pure_differential_map_agg_original_native_utf8_int32_first_wins_nulls() {
     );
 }
 #[test]
-fn pure_differential_map_agg_all_original_scalar_carriers_and_nominal_largeint() {
+fn pure_differential_map_agg_all_original_scalar_carriers_and_physical_fsb16() {
     let mut types = vec![
         DataType::Boolean,
         DataType::Int8,
@@ -116,7 +116,7 @@ fn pure_differential_map_agg_all_original_scalar_carriers_and_nominal_largeint()
                     .partitions(5, 104),
             );
         }
-        for logical_type in [ValueLogicalType::Physical, ValueLogicalType::LargeInt] {
+        for logical_type in [ValueLogicalType::Physical] {
             let ty = FunctionValueType {
                 logical_type,
                 ..FunctionValueType::new(DataType::FixedSizeBinary(16), nullable)
@@ -251,4 +251,44 @@ fn pure_differential_map_agg_original_pool_constants_and_sparse_phase_selection(
             .constant_rows(321)
             .partitions(7, 112),
     );
+}
+
+// Original registered v1 cannot re-derive top-level nominal input tags from
+// its DataType-only signature arguments. This is an admission witness, not
+// an aggregate value comparison or a pure-owner rejection claim.
+#[test]
+fn pure_differential_map_agg_nominal_largeint_preserves_original_binding_refusal() {
+    const ORIGINAL_REASON: &str = r##"bind aggregate `map_agg`: aggregate `map_agg` resolved signature drift: planned=ResolvedAggregateSignature { overload: AggregateOverloadIdentity("builtin.aggregate/map_agg/derived-v1"), argument_types: [FixedSizeBinary(16), FixedSizeBinary(16)], intermediate_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }]) }, false), output_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }]) }, false), state_format: AggregateStateFormatId("novarocks/map_agg/state-v1") }, local=ResolvedAggregateSignature { overload: AggregateOverloadIdentity("builtin.aggregate/map_agg/derived-v1"), argument_types: [FixedSizeBinary(16), FixedSizeBinary(16)], intermediate_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true }]) }, false), output_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true }]) }, false), state_format: AggregateStateFormatId("novarocks/map_agg/state-v1") }"##;
+    for nullable in [false, true] {
+        for values in [
+            novarocks_types::largeint::array_from_i128(&[
+                Some(i128::MIN),
+                Some(i128::MAX),
+                Some(0),
+                Some(-1),
+            ])
+            .unwrap(),
+            new_empty_array(&DataType::FixedSizeBinary(16)),
+            new_null_array(&DataType::FixedSizeBinary(16), 4),
+        ] {
+            if !nullable && values.null_count() != 0 {
+                continue;
+            }
+            let ty = FunctionValueType {
+                logical_type: ValueLogicalType::LargeInt,
+                ..FunctionValueType::new(DataType::FixedSizeBinary(16), nullable)
+            };
+            let spec = AggregateDiffSpec::new("map_agg")
+                .typed_column(ty.clone(), values.clone())
+                .typed_column(ty, values)
+                .partitions(5, 105);
+            match super::aggregate::run_aggregate_differential(&spec) {
+                Err(super::DifferentialFailure::LegacyUnavailable { name, reason }) => {
+                    assert_eq!(name, "map_agg");
+                    assert_eq!(reason, ORIGINAL_REASON);
+                }
+                other => panic!("original nominal binding route changed: {other:?}"),
+            }
+        }
+    }
 }
