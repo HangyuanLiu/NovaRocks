@@ -1,5 +1,0 @@
-{
-  "vendor/http-1.4.0/src/header/map.rs": "dad2ec60041155227c232257d8f92209e8835a472fac35fabe7344c5912137ed",
-  "vendor/http-1.4.0/src/header/mod.rs": "9dcce73691eb9a4930af953217161743dbe013d58cdd2aeeff7bed000add8af4",
-  "novarocks/native-adapter/tests/native_http_header_map_pool.rs": "85c278c603561cb06cfa7962aa7070258c9f688fb2c8bdd932a0cffe8f23ae77"
-}

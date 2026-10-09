@@ -1,6 +1,0 @@
-{
-  "vendor/tonic-0.12.3/src/codec/encode.rs": "d82c672688c016cbf9a7c3b59c1a47830859e61840dc5f22d8bb0a9679c00539",
-  "vendor/tonic-0.12.3/src/status.rs": "ccae2b492321430b56da2348c83244d4cc5b57529e83526188152414b54a93b2",
-  "vendor/tonic-0.12.3/src/status/field.rs": "ff5eeeb1615ef28890034defae0adcd4c130c1a15efc3bc44753d1b7bf550154",
-  "novarocks/native-adapter/tests/native_tonic_preallocated_trailers.rs": "16c3f58792008f23b94b45a85de84023c6dc6e57f775d2c553cfc62db914b34e"
-}

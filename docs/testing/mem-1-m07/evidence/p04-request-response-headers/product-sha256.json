@@ -1,9 +1,0 @@
-{
-  "novarocks/native-adapter/src/lib.rs": "5b57b65e02bbecdfc42c8ff6e96297abbfd981e68c92737214f8bfe16352f6bb",
-  "novarocks/native-adapter/src/native_ingress.rs": "3e0545ad70bcd9f4aaf9f07b044b15ba2de3b65ffb22733725af62f03bc04d2a",
-  "novarocks/native-adapter/src/native_server.rs": "93aa6550bd74a1360c4e7be479553804dd8f4e10ebeaf4ff21d49d9d1ce1a4de",
-  "novarocks/native-adapter/src/native_response.rs": "600b425df9aacfa9fc215547fd45eff36e41b54960784e99715a0bbb93cf3201",
-  "novarocks/native-adapter/tests/native_tonic_request_response_headers.rs": "078cfba4b710f7fedf9ce11657efd827ce414a6884aed9e2062a29fc88569274",
-  "novarocks/native-adapter/tests/native_ingress_response_headers.rs": "a70ec5ee927a41304c9b81ff9b6ad8d477566b796ada7676cf4125f633059a4d",
-  "vendor/tonic-0.12.3/src/server/grpc.rs": "a6b2e8a73ee49cd03f1c90df3d893be99d0ab0ad55096ff4b3c1681ad4013c00"
-}

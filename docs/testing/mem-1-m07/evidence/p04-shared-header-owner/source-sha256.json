@@ -1,9 +1,0 @@
-{
-  "Cargo.toml": "f7aaeb4a61c904b2bd4b3049e553348b73101068f7fb5cae9ed752969b8e58da",
-  "Cargo.lock": "c246f3eb194bde11e3e42869d1446a7c324a72fad421b8038f4a9bad952b3ffb",
-  "vendor/http-1.4.0/src/header/name.rs": "7ff5b63859bdf24481cd92c0c02f1778dfd4df81f45cc6680f85b59f7f6814b2",
-  "vendor/http-1.4.0/Cargo.toml": "74a5d378644f01aaf6fb7461af281d0196ded9b6425dc174e9ca870f688fc019",
-  "vendor/h2-0.4.12/src/hpack/header.rs": "28b0f727333ad6057ad36e89cf60624d10f3de446b9e2cec07736bc0f2a67f8e",
-  "vendor/h2-0.4.12/src/hpack/decoder.rs": "2aa0086331599988c32a94a1c0e8049a32f9fbc178486e41e074558a703d3970",
-  "novarocks/native-adapter/tests/native_http_header_owner.rs": "191bc02858f67387202f1529c2e774d153da31cf960696614fde63cdcaac1310"
-}

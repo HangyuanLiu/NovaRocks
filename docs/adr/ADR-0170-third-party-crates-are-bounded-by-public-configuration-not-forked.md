@@ -76,7 +76,7 @@ NovaRocks 的内存治理分两类对象，保证程度不同：
 
 仓库钉住的 pilota 0.11.10 `thrift/binary.rs::read_string` 先按线上长度 `vec![0; len]`；hive_metastore 0.2.0 的 GetAllTables 生成解码先按声明元素数 `Vec::with_capacity`。误配传输、错端口或流错位也可能触发大分配；该缺口按已接受设计交上游独立修复，M07 不扩大 vendor 范围。
 
-CL 记录条目、名字字节、页数、实际进程身份及调用期间 jemalloc 采样高水位，不进入 `E_FE_result` 结构上界证明。整个 information_schema SQL 还包含自有 AST/规划/wire 工作，lake discovery 还包含单表加载与 request metadata cache；这些整段高水位不能直接归因为 SDK 列表缓冲。HTTP fixture 的 handler 结束也不能代替 SDK future 或后台 job 的退出。受控协议检查不替代真实 REST/HMS/Paimon 跨 provider 验收，当前收据与未完成门见 `docs/testing/mem-1-m07/evidence/`。
+CL 记录条目、名字字节、页数、实际进程身份及调用期间 jemalloc 采样高水位，不进入 `E_FE_result` 结构上界证明。整个 information_schema SQL 还包含自有 AST/规划/wire 工作，lake discovery 还包含单表加载与 request metadata cache；这些整段高水位不能直接归因为 SDK 列表缓冲。HTTP fixture 的 handler 结束也不能代替 SDK future 或后台 job 的退出。受控协议检查不替代真实 REST/HMS/Paimon 跨 provider 验收；测试入口与产物保存边界见 [有界结果交付测试资产](../testing/mem-1-m07/README.md)。
 
 ## 接受的妥协（诚实记录）
 

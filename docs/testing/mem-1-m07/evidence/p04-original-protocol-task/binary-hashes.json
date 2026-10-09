@@ -1,6 +1,0 @@
-{
-  "target/debug/novarocks": "25d6dd0fd53ad69e64a6ce3a56265350d8219adbf6003d6165d25664a3deeea6",
-  "logs/mem-1-m07/p04-protocol-compat-binaries/novarocks-primary": "25d6dd0fd53ad69e64a6ce3a56265350d8219adbf6003d6165d25664a3deeea6",
-  "logs/mem-1-m07/p04-protocol-compat-binaries/novarocks-compatible": "34f6d705df7694de124894adc04eb9ec0868d9c7c895765857e61d3b07d6a8d9",
-  "logs/mem-1-m07/p04-protocol-compat-binaries/novarocks-other-island": "b22e3b474b01472ef32ee13af4ff66aeef1fb63fa22ebca6be46b7dca31e0693"
-}

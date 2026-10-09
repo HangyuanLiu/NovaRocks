@@ -1,196 +1,59 @@
-# MEM-1 M07 执行证据
+# 有界结果交付测试资产
 
-> 2026-10-09：用户已授权先发布实现 PR，再以第二个 PR 完成测试、修复与收尾。
-> 当前交付边界见 [分批交付记录](pr-delivery-split.md)。下文“无发布授权”均为当时的历史状态；
-> M07 整体验收仍进行中，历史收据不代替发布版本或最终同 SHA 的验证。
+本目录维护结果协议与外部列表测试使用的固定输入、独立预期和可运行工具。
+测试实现与场景入口见 [System Test Runner](../../../tests/system-test-runner/README.md)。
+第三方库边界见 [ADR-0170](../../adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)。
 
-> 原始日志及批量测试产物已于 2026-10-06 移至 Git 外的本地归档；保存边界、历史 SHA 映射与获取限制见 [证据保存说明](evidence/README.md)。历史文件路径仅作归档定位，不表示仓库内存在原始产物。
+## 固定输入
 
-本目录记录已批准的 spec / plan 第 5 版的本地实施与验收。P00/P01/P02/P03 本地检查点已保存，P04 正在执行；这里的目标参数或源码审查不代表产品已经实现或通过验收。
+- [profile-v1.json](profile-v1.json)：结果窗口、协议、领域与 SDK 列表参数的冻结值。
+  Server、SPI 与 Result Contract 的测试直接读取它；其中历史状态字段不能作为当前验收进度。
+  冻结时的说明路径仅作历史来源；当前工具与保存边界以本页为入口。
+- [inputs/](inputs/)：System Test Runner 使用的 wire、retention、RootResult 拒绝、ACK/replay、
+  Closing 和 REST 列表输入。保留被现行输入引用的旧版本，以便核对来源与准确 SHA；
+  旧版本的存在不表示继续运行其已被替代的场景。
+- [result_delivery_wire_oracle.py](oracles/result_delivery_wire_oracle.py)：
+  从固定字面量独立推导行字节、包数、列名和 MySQL 类型，不从引擎输出录制预期。
 
-## 第 7 版续接（2026-10-08）
+这些输入按原字节保留。修改 SQL、oracle、容量或期限时，应先核对场景合同，不能通过改预期掩盖失败。
 
-accepted spec与本次获批plan revision7在 `codex/mem-1-m07-v7-resume` 本地继续，代码从fork
-`c313bc1bb`（与用户给定`92fe1f718`同code tree）续接。P07 SET整窗/compiler实际退出已保存，
-FE Membership共享有限准入已补齐（[收据](evidence/p07-membership-ingress.md)）。P06s独立
-worktree检查点已集成（[收据](evidence/p06s-external-listing.md)）：D15 trusted endpoint例外、
-REST单页公开接口、generation8 gate/ctx期限、FS List16MiB非retry及维护streaming边界。
+## 本地工具
 
-P06s组件1492PASS/1既有ignored，Frontend错误传播3PASS，vendor lib58PASS；vendor
-all-targets clippy保留既有integration缺test-utils/async调用失败，未扩大SDK补丁掩盖。
-当前集成workspace、剩余P07生产用途/实际Local aliases/Internal执行owner、P08唯一切换、
-P00b测量、P09原生1FE+3BE/性能与P10仍OPEN。c_*仍null，旧FE/BE保护保留，无push/PR/归档。
-以下v5/v6记录按历史解释，不冒称当前完整验收。
+以下检查只复算目标算术或核对独立预期，不证明产品容量、物理释放或 Native 验收：
+工具需要 Python 3.10 或更新版本；本地验证使用 Python 3.11。
 
-## 第 6 版（2026-10-06）
+```bash
+python3 docs/testing/mem-1-m07/scripts/check_profile.py
+python3 docs/testing/mem-1-m07/scripts/transport_envelope.py
+python3 docs/testing/mem-1-m07/oracles/result_delivery_wire_oracle.py
+```
 
-spec 与 plan 已改为第 6 版并获批：计量边界改为 NovaRocks 自有对象；撤回十个第三方 vendor patch，Native 传输只用上游公开配置与库外准入（ADR-0170）。执行在同一分支继续，先合入 main（`f008e2682`），再剥离 v5 的传输计费。R1 已删除的模块：`native_transport_capacity`、`native_response`、`native_task_executor`、`native_channel_worker_capacity` 及专测补丁的集成测试；保留并迁移的 D12 行为：Data/Control 独立 listener 与拒绝不失败的 accept 循环、端点方法分类、按 peer process/endpoint/lane 的单飞有界 channel 缓存、调用方进程签名与连接封印。R2 待补：每 lane 的 FE 连接数与 stream 位置持有到 body 退出、DNS 在自有阻塞闭包中解析、FD 上限、lane 指标与 NIG-1 交接口径。下文第 5 版记录保留为历史。
+传输报告中的 `coefficients` 与 `total_bytes` 为 `null`，表示测量尚未冻结，不能按零计算。
+公开配置推导的结构项不能作为进程 RSS 或可部署容量承诺。
 
-2026-10-08 P00b 部分输出：[结构算术](transport-envelope-v1.md) / [JSON](transport-envelope-v1.json)
-按当前 R2 geometry 复算；profile 与 check_profile 不再使用 v5 每连接2MiB、Native3GiB/整体16GiB
-断言。这些旧数值归入 historical_v5_transport_targets，不能被当作当前容量 grant。
-R2 计数/公开退出接缝已有模块验证；系数、lane grid、repeatability、soak 与当前 main 旧路径基线
-尚未完成，结构算术不是测量通过。后续 P07/P08/P09/P10 仍在执行，未发布。
+真实 REST 列表场景直接调用下面两个工具；执行绑定、原始观测及输出均写入 Git 外：
 
-## 批准与基线
+- [prepare_real_rest_cl.py](scripts/prepare_real_rest_cl.py)：核对显式冻结绑定，准备、独立核验和清理私有数据。
+- [observe_real_rest_cl.py](scripts/observe_real_rest_cl.py)：按绑定启动透明观测器，保留实际请求与退出事实。
 
-- 2026-10-01 用户批准已落盘 plan 第 5 版，并授权 sub-agent。
-- 实施分支：`codex/mem-1-m07-be-encoded-results`。
-- 设计审查基线：`b1d13989c50231ee7a5031163255b2607c5176c0`。
-- 执行 / 旧版测量基线：`eb35251de575e071ad3657d0ce0fc1fc95d1a91a`，启动时工作树干净，已核实与 `origin/main` 一致。
-- 两基线之间的相关变化：M02a 已替换 memory core 并删除 memory-arrow；SQL / decimal / complex-type golden 有独立语义修复。M07 必须消费当前代码，不恢复旧 Charge / Reservation API，也不改写既有 golden 来掩盖结果差异。
-- 持久 goal 包含 P00–P10 的本地实现、1FE+3BE 功能与冻结性能门、最终同 SHA workspace / SQL / system 和交接。当前没有 push / PR 授权。
+工具的本地自检可以独立运行，不启动真实 REST/HMS fixture：
 
-## 证据状态
+```bash
+python3 docs/testing/mem-1-m07/scripts/prepare_real_rest_cl.py --self-test
+python3 docs/testing/mem-1-m07/scripts/observe_real_rest_cl.py --self-test
+```
 
-| 内容 | 状态 | 说明 |
-|---|---|---|
-| producer / transport / MySQL census | 已调查 | 三个只读 sub-agent 独立调查，已归入 coverage；准确产品接线仍待实现 |
-| profile / 完整 checked 包络 | 冻结目标 v1，算术 PASS | profile-v1.json / owner-envelopes-v1.md；actual allocation/holder 防护是后续实施与验收门，尚未产品实现 |
-| 旧版 release / dev-opt 构建 | PASS | 原始构建与 binary hash 见旧基线 index |
-| macOS 原生 1FE+3BE 旧路径 | 部分 PASS | 短查询/慢读/type smoke 和四个功能场景已留存；扩展 wire 测量准备中 |
-| Linux 正式测试 | 用户后续手动执行 | 用户明确取消本次 agent 的 Linux 测试要求；不阻塞本地实施，保留复现材料 |
-| 共享 REST / MinIO fixture | READY | `DOCKER_CONTEXT=desktop-linux` 的 BOM 离线校验/up 通过；原 OrbStack 空 daemon 判断已纠正，无需下载输入 |
-| P01 / P02 / P03 | 已完成对应切片 | 共享合同/纯 renderer/vendor framing 已留收据；完整产品切换仍待 P04–P08 |
-| P04 context-root core | 定向通过，P04 继续 | [原核心收据](evidence/p04-context-root/README.md)：301 Worker、54 Native host、3 Observable、28 Renderer；后续 Host producer 接管和 reader 收据列于下文，真实 fetch/lane 仍待接线 |
+模板必须绑定实际源码、脚本哈希和 fixture publication 后才能执行；未绑定模板不能当作 READY。
+真实 fixture 使用仓库版本化 runtime owner，端点从实际 publication 读取。
 
-## 验证口径
+## 验证与产物
 
-每份运行收据绑定完整 source SHA、binary hash、实际 role 配置语义、机器、三 BE 身份、fixture publication / 数据身份、负载与冻结门。原始错误、拒绝和超时保留，不只统计成功子集。功能用 dev-opt，正式性能旧版与候选使用同 toolchain release；macOS scratch 与 Linux 正式结果分别记录。
+生产验收使用原生 **1FE+3BE**。工具自检、组件测试和 all-in-one smoke 各自只有其实际覆盖范围。
+第一批实现与已有检查的范围见 [PR #1173](https://github.com/NovaRocks/NovaRocks/pull/1173)；
+完整 M07 验收仍待后续交付，包括真实压力与退出、完整启动与 drain 保护、传输系数、
+macOS 性能/内存测量和最终同 HEAD 全量验证。Linux 验收由用户手动执行。
 
-最终 CI 使用 `tools/ci/local-full-ci.sh --tier full --all-discovered --cluster-mode cross-process --cluster-size 3`。其默认 system discovery 是 `--list-default`；`--list` 用于定位显式性能 / 外部 fixture 场景。M07 的定向性能另按准确场景执行，不扩大默认功能 CI。
-
-执行期间保留旧 FE 保护与现有 BE retained 防护；只有 P08 的完整生产接线验证成立后删除 FE LRA。M03a/M03b 的真实 Query@BE 分配归属和自身上限、M04b 的 MEM-backed 窗口授权仍是后续独立交接。
-
-2026-10-01 Docker 入口纠正：本机默认 context 为 OrbStack（0 images），预备好的输入在 Docker Desktop。后续 fixture/SQL/system 命令显式设 `DOCKER_CONTEXT=desktop-linux`，不改变全局 Docker context。已核验锁定的 Spark/Paimon/REST/MinIO/mc 和派生镜像/BOM。先前对 OrbStack 执行 provision 的拉取超时保留为错误 daemon 的准备失败，不能归为当前 fixture 缺失。
-
-P00 本地收据：release旧server未改变；原始wire smoke 22/22成功，16/64/256各3轮共11088样本全部保留。16客户端528/528成功；64客户端1016/2112成功；256客户端2196/8448成功，其余服务端1105（尚未细分内部原因，不能断言全来自某一gate）。deterministic结果无重复不一致。旧REST混合场景（MV/ANALYZE/OPTIMIZE+foreground）通过；此smoke不当作正式吞吐/容量验收。测量器四个定向协议测试和格式检查通过。P00的Linux正式集中root、RTT/control、完整CPU/network对照收据按用户指示由用户后补；保留版本化门，不阻塞本次本地实施，不称已性能通过。
-
-P01环境复核：`--consumer iceberg-rest`再次通过；`--consumer all`发现已有`paimon-writer`派生镜像定义收据不匹配当前源码（prepared `320bd65a…`，current `23dc030b…`），不是镜像缺失。完整CI的Paimon输入尚未通过当前版本核验；独立准备/准确版本验证留在P09/P10入口，不能沿用REST通过冒称全BOM通过。
-
-Paimon定义差异已只读定位：prepared版本对应`3af07efbb`，当前变化来自已合入`375c9e0ea`的host env parser（unset/变量名/shlex quoting）；Dockerfile/versions/JAR lock/SQL/golden未变。全部5个canonical image、6个JAR已验证存在且hash正确，当前派生image仍带旧definition。完整CI无条件all verify+Paimon准备，故需在独立测试准备阶段用已验证本地输入真实重建并经owner发布，不能仅改BOM/label；现有provision无条件重新下载JAR，不直接使用其联网流程。当前REST运行实例固定image ID不受current alias重建影响。
-
-P04 context-root 核心收据已保存：新增 immutable 通道/物理 backing owner、context fence 接管与读取、正常 seal/abort/lease 收敛；allocation failure callback、schema spare 合并容量和默认并行 allocator probe 已修复且反例通过。Native host 仍为 root=None、V1 未 advertise；P04/P05–P10 继续。此前 Paimon definition 不匹配已在 P02 离线修正，当前 all-consumer 校验通过，详见 [fixture-ready](evidence/fixture-ready/README.md)。
-
-P04最后pull/Execution生命周期检查点：唯一事前input grant、original-carrier直移、built DOP绑定、explicit RootRegistration与actual-exit成功门已定向通过；[收据](evidence/p04-last-pull/README.md)。P04仍执行，原始Arrow/schema metadata实际backing证明与Native producer/fetch/lane产品接线继续。
-
-P04 metadata 来源已接真实 Native output / ChunkSchema / ExecPlan lowering / LocalProgram projection，且覆盖嵌套 carrier 派生和独立 work 上限；[定向收据](evidence/p04-source-origin/README.md)。完整 actual Arrow/Chunk backing proof 与 Native producer 仍继续，未宣称产品验收。
-
-P04来源接线进一步覆盖Native scan/Project和生产Project/hydration，包含重复occurrence/CSE/empty输出及known/unknown同结果反例；[收据](evidence/p04-scan-project-hydration/README.md)。完整Arrow/Chunk source proof、exchange与Native finite producer仍继续。
-
-[P04 input backing and process-pool reservation](evidence/p04-input-backing-pool/README.md)
-
-P04 有限 Native producer/session 与固定唤醒槽位已完成模块切片，184 项定向测试及 check/Clippy/fmt 通过；[收据](evidence/p04-native-producer/README.md)。实际 host、显式 domain/read ingress/lane/source 接线继续，V1 未 advertise；不称 C4/native/performance 验收完成。Docker Desktop all-consumer live 校验通过，无缺失镜像。
-
-P04 真实 Host 的 ClientRows/CountOnly 接管与 context 留存已保存本地行为切片，553 项相关测试及四包 all-target Clippy/fmt/diff 通过；[收据](evidence/p04-native-host/README.md)。包含准确取消原因 fan-out 竞态、多 DOP、准备回滚、连续 observer panic 的真实释放反例；InternalFacts/source/read ingress/Native lane 仍继续，P04 未完成、V1 未 advertise，无性能验收结论。完整 desktop-linux fixture 校验通过，当前无缺失镜像或 JAR。
-
-P04 seal/ACK 竞态端口已准确携带实际接受水位，codec 仅允许 closed marker 保留未生效 ACK；[收据](evidence/p04-seal-watermark/README.md)，Worker309/codec5/真实Host61共375定向通过。实际Native服务和传输copy生命周期继续，P04未完成。
-
-P04 StatisticsArtifactV1 独立流式 codec 已完成模块切片，main 通过真实 library consumer 的12项定向测试/目标Clippy/Native all-target check/fmt/diff；[收据](evidence/p04-statistics-codec/README.md)。STA1准确声明先验、逐turn工作及实际零分配已证明；Session/SQL/FE/源头32MiB增长防护仍继续，未开启该domain产品路径。
-
-P04 Native reader 的同一 admission ACK/完整发送 pregrant 与 strong-only owner 已保存模块切片，401 项相关测试和两包 all-target Clippy/fmt/diff 通过；[收据](evidence/p04-native-reader/README.md)。包括满池 ACK、真实 alias、回调 seal、task horizon 后 replay；真实 HTTP/H2 仍未接线，P04 继续、V1 未 advertise。统计源头的 Unpivot→Project→Root permit 缝隙已准确定位，见 [增长审计](statistics-source-growth-audit.md)。
-
-P04 Bytes wrapper 的真实 allocator exit 已接原 segment/offered/read owner，negative mutant、normal/两类 panic、Barrier alias 和 Miri 通过；[收据](evidence/p04-bytes-physical-exit/README.md)。vendor 全 suite 1,250、consumer 490 项及 workspace all-target check 通过；既有 Clippy/依赖解析失败保留。真实 Tonic/HTTP/H2 与 lane 接线仍继续，P04 未完成。
-
-P04 真实 Tonic unary 的 post-admission metadata/初始 buffer/concrete Body/last DATA alias 已完成模块切片，187项相关测试、Frameguard负向反例、目标all-target Clippy/fmt/diff通过；[收据](evidence/p04-native-unary/README.md)。未安装新FetchTaskResult签名，pre-decode lane/stream/headers/outerframework及H2独立副本仍待接线；P04继续、V1未advertise。
-
-P04 固定 H2 writer 与本地出站 frame cap 已完成可验证切片；[收据](evidence/p04-h2-fixed-writer/README.md)。68 项实际 H2/Hyper/Tonic 协议、Native574/Worker313共955非重复测试及独立物理分配/退出与Miri通过，五类负向验证真实失败并恢复。只闭合 writer Vec/Core 与相关转发；HeaderMap/HPACK/queue/framecopy/stream/task/socket/TLS和完整2MiB连接包络、Native安装继续，P04仍executing/V1未advertise。desktop-linux fixture完整BOM校验通过，无缺Docker image/JAR；Linux继续由用户手动测试。
-
-P04 本地出站HPACK表上限已完成切片；[收据](evidence/p04-h2-send-header-table/README.md)。fresh0在peer大设置下保留正确size-update/static/literal语义且Table两容器0分配，positive仅逻辑界、晚清零保留spare。75实际协议/Native574/Worker313共962非重复workspace tests、actualsource35/1ignored及7Miri通过；五类runtime负例实际失败/byteexact恢复。wholeheaderblock/HTTPmetadata与完整2MiBconnection/Native安装继续，P04executing/V1未advertise。
-
-线协议探针校验完整 ColumnDefinition41 结构，并比较执行前 v4 冻结的列名和 MySQL type。v3 的合法大行 root backing 拒绝已保留为 FAIL；历史行字节观察不证明列元数据正确。原生复跑须使用强化探针，全部输入与上限不变。
-
-`result-delivery/root-read-profile-kind-refusal` 使用真实认证 Native RootResult endpoint：结构合法的 foreign-process V1 请求必须进入准确身份拒绝；其余六个仅改变 profile/kind/sequence 的请求必须在结构 decode 被拒绝。此场景明确限定 authenticated plaintext/IP；每次请求有绝对 RPC probe deadline 与 4KiB gRPC 请求 frame 与累计响应 DATA 界（不作为 header/第三方分配界），不外推 DNS/TLS teardown 界，完成后用真正 Native SUM 查询验证精确行字节及公开 owner 收敛。冻结输入 `inputs/root-read-refusal-freeze-v1.json`；不证明 installed-root replay/ACK/生产退休/ClosingRow，也不证明非法响应拒绝。
-
-
-### 2026-10-09：P09 paused-client 取消场景，native 待执行
-
-- 首次 native 前冻结 `root-cancel-closing-freeze-v1.json`：原 S+8 单行暂停客户端读取，要求独立 Closing=1/Client=0、完整 row+ERR1317、同 socket 精确 SUM oracle 与实际 Native task 增长；原17×1MiB合法行冻结到W=2未完成producer，要求正 wire prefix/零完整行、物理EOF/reset、同 socket 后续零schema/packet/bytes且三BE task counter不增长。握手真实connection ID用于KILL，无猜测。
-- KILL start/return/resume时间保存；返回后复查原2s观察截止，Closing观察2s从KILL返回计算，不作为生产5s deadline的起点证明。失败仍恢复并join客户端保存wire；不证明具体framing cursor/partial-tail/full-pool/allocator exit。生产配置、容量和deadline未改。
-- runner all-target100 PASS/0 FAIL/2既有ignored，覆盖真实handshake身份拒绝与follow-up错误分类；最初缺少test import的E0425保留。C0 from_ref测试清理已纳入。两个主要语义裁决/P09其它门/P00b/P10/final仍OPEN；无push/PR/归档。
-
-取消探针收紧：runner101 PASS/0 FAIL/2 ignored。真实短header后EOF反例记录3 wire bytes但0 packets，后续拒绝必须wire_bytes=0；resume后timing写失败延后到join/save wire后传播。独立只读复核已修正两项具体证据漏洞。native仍待执行。
-
-
-### 2026-10-09：P09 paused-client 取消与留存复跑 native PASS
-
-- 干净 `43463c6f678341e979629cc51ca7387fd813aa1f`、实际同build identity，3个独立native1FE+3BE场景全部PASS，总7.575s；原root-retention场景复跑验证actor改动，无server配置/容量/deadline修改。12个精确FE/BE PID已退出。收据 `p09-row-cancel-native-pass-20261009.json` 保存准确binary/input hashes与原始观测。
-- resident S+8：连续两次W=2/producer guard exited/task退休/End未ACK；KILL仅0.789ms，101ms后观察Client=0/Closing=1；恢复得到完整1048580B行、5packets、独立digest/schema一致、ERR1317。同socket SUM精确5050/native task counter总增2。
-- missing-tail17MiB：W=2/payload2S/producer仍running/End未发布，KILL后收到655360B行前缀、零完整行并真实EOF；后续同socket查询zero wire/schema/row/packet、EOF且三BE task counter完全不变。KILL仅0.755ms。该行为不证明FE parser未收到命令，不外推具体framing cursor/partial-tail/fullpool/allocator最后退出。
-- 定向runner101 PASS/0 FAIL/2既有ignored；上一个产品切片C0为9695源码12280/0/7，当前test-only增量不冒充final同HEAD C0。ACK-only、small/large精确partial矩阵、满池、real CL、CM/CP/P00b/P10/final及两项待裁决语义继续OPEN，无push/PR/归档。
-
-
-### 2026-10-09：P09 installed-root ACK/replay 冻结，native 待执行
-
-- 新 `installed-root-protocol-freeze-v1.json` 依附准确原S+8 retention输入：解析三BE fresh TaskCreateApplied完整typed identities，仅允许同一execution、无重复、occupied BE最多8候选；零ACK路由必须定位恰一个真实installed root，其余仅exact UnknownRoot/status5/零DATA。不猜stage/task或假定单task，不加产品marker/registry。
-- ZeroAck场景两次ACK0/no-retirement后恢复正常wire独立oracle。FinalAck独立协议干扰场景真实fetch Data1(S)/Data2(8B+End3/rows1)、replay1摘要/元数据等价、实际End3后ACK3两次、Retired1，逐步fresh census要求context持有/producer exited、最后Data0/payload0/EndACK1；随后KILL/resume/save事实wire，不宣称正常结果或physical-last-alias。
-- Whole probe链5s，实际BE上游认证plaintext/IP；请求frame4KiB/累计响应DATA≤S+4096，逐块释放h2 flow-control。严格唯一application/grpc、有DATA成功仅final trailer0、重复status拒绝、单未压缩message，使用生产task-codec解码与实际proven watermark，不设无限上界。Busy/Preparing/其它状态直接FAIL不重试。失败仍resume/join/savewire。
-- runner all-target111 PASS/0 FAIL/2既有ignored；10个helper负例覆盖实际身份/候选与response结构。独立只读复核重算native prefix与Data1/Data2摘要，并修正content-type/status位置宽松点。生产配置/容量/deadline未改；P09其它门/两个裁决/P00b/P10/final仍OPEN，无push/PR/归档。
-
-P09 installed-root pre-native接入修正：此前request builder的wait=0违反生产RootResultRead正值契约，v1未执行native、原输入保留。v2明确冻结100ms request wait并附v1 SHA/correction；原S+8/全部操作/容量/5s链期限/20s actor不变，生产配置不变。新增实际冻结请求经过生产decode_read与zero拒绝反例，runner112 PASS/0 FAIL/2既有ignored。native待执行。
-
-
-### 2026-10-09：P09 native空拒绝响应缺口与修正
-
-- 首次clean63bb/v2 installed-root native失败（4.757s）：准确BE1/stage1/task1 typed零ACK定位成功，stage2/task2非root拒绝无法满足strict trailers-only；后者实为相同execution的第二个真实task，未猜root。失败仍resume/join，原1048580B row/独立schema/hash正常，4精确PID已退出；FinalAck场景未执行。收据 `p09-installed-root-native-fail-20261009.json`，不转换为PASS。
-- 根因是 `native_ingress.rs` 的OwnedResponseBody只poll_frame，未转发inner.is_end_stream/size_hint；内层Tonic空status response被默认false掩盖，Hyper产生empty EOS DATA，违反gRPC拒绝应在status HEADERS上结束的结构。真实Hyper+h2 duplex回归旧码0PASS/1FAIL，修正后Native lib720PASS/0FAIL；收据 `p09-empty-grpc-refusal-focused-20261009.json`。
-- 最小修法仅转发两个inner facts，ownership仍由实际Drop/last DATA alias退出，不主动释放permit、不改变status/容量/deadline/owner分类；strict probe保留。原生复跑待执行，跨共享Native响应包装器修正触发一次C0里程碑。两个待裁决语义与其它P09/P00b/P10/final仍OPEN，无push/PR/归档。
-
-
-### 2026-10-09：原精确取消十场景 Native PASS
-
-clean `1fb1319df` 的原 x S−1/S/S+1、wide q17 S+1缺尾、tiny1..6，十个独立1FE+3BE全部PASS。actual原runner十次wait0、schema5 passed/0fail与40原role PID ESRCH均通过；原输入/SQL/cut/caps/deadlines未改。见[十场景收据](evidence/p09-exact-native-ten-cases-1fb1319df-20261009.json)和coverage最新追加记录。原ef0350 S-boundary失败保留。该矩阵不是Closing64/lateACK/backing最后alias或M07整体完成；其余P08/P00b/P09/P10和两人工语义决定仍OPEN。HMS非只读正确性按用户IRU-7 excluded。
-
-### 2026-10-09：P08 准确 Root support 完整绑定回归 PASS
-
-原完整 manifest 绑定在 access/Connector/TaskCreate 前拒绝准确 root 的缺失 V1 support；其它支持 BE 不能代替 root，legacy 非 root candidate 不妨碍支持 root。真实 whole-plan/freeze/encoder/bind_facts 回归及 artifact 共32 PASS，attempt owner12 PASS，fmt/diff-check通过。见[组件收据](evidence/p08-selected-root-support-components-20261009.json)。该组件采用有限 private request/schedule 事实，真实 QA ticket/公开 bind/Native 缺能力拒绝仍 OPEN；前一十场景 Native 早于新 guard。其它完整 M07 门和用户语义决定保持 OPEN，无发布。
-
-### 2026-10-09：P09 同原 response 持有 actor 组件 PASS
-
-原protocol10项和新held-response11项共21 PASS；non-test runner check、fmt/diff-check PASS。原handle保留/actualjoin、取消cleanup重入sticky失败、过期/早退出/panic、实际BE端口绑定均有定向组件覆盖。见[收据](evidence/p09-held-response-actor-components-20261009.json)。host H2 queued owner不是BE alias，Native新scene/source/clock/freeze、真实正holder/seal/lateACK/recovery与四role退出仍OPEN；其它完整M07门不关闭。
-
-### 2026-10-09：P08 SDK 参数联合启动校验组件 PASS
-
-原config load/FE/BE composition检查实际owner冻结V1参数与checked算术，无新增配置旋钮或跨域预算公式。参数5/app_config65/composition8项PASS，Server非test lib+binarycheck、fmt/diff-checkPASS；见[收据](evidence/p08-sdk-listing-startup-components-20261009.json)。参数/JSON一致性不能代替SDK实际退出、List运行行为或Native/CM；完整进程包络、P00b、P08里程碑C0及其它M07门仍OPEN。
-
-
-### 2026-10-09：P06s HMS 原 SDK 对象观测组件 PASS
-
-原 catalog generation 的 ListingAdmission allocation 增 default-off 私有 observer；HMS Names/Tables/Views delegate 把原 client 返回的实际 SDK future inline 交给 helper，首次poll/Ready/实际对象析构与 wrapper退出、原permit归还、settled分列，不新增SDKclient/后台task/globalregistry。默认feature-off与原collector/Unsupported/stop/absolute deadline保持；原SDK业务结果不因诊断invalid被替换。IRU-7 Nova HMS非只读正确性继续excluded，共享路径只保证编译。
-
-初次feature测试编译成功，前三项PASS后，原8pending对象＋第9等待的测试实际stack overflow/SIGABRT，terminal101；原日志保留FAIL。State与Snapshot改为同1024条fixed heap slice、独立snapshot clone，idle reset fill原allocation；未缩cap/输入或增thread stack。补phaseMAX sticky invalid；实际generic SDK poll panic反例保留原Arc payload、原future destructor在permit仍持位时退出、permit8恢复、证据invalid与后继原业务OK。deadline组件先poll确定actual SDK Pending，再await同一次100ms absolute deadline，不改生产clock。
-
-actual admission13 PASS、内部3 PASS，feature catalog80 PASS/default catalog67 PASS，均0FAIL/0ignored/terminal0；前两filter包含在80中，不累加。feature非test connectorlib与默认Serverlib+binarycheck、fmt/diffcheckPASS。收据 `docs/testing/mem-1-m07/evidence/p06s-hms-sdk-object-observer-components-20261009.json` pin实际七source/lock、原draft/v1/v2独立review和初始失败/最终通过logs；dev unoptimized/jobs1/incremental0/threads1。旧draft/失败和review bytes不覆盖。
-
-这些是NO-I/O generic future/catalog组件，不是stock Java、真实Thrift或Native HMS退出证明。observer UUID只识别allocation，非原ConnectorControlBinding instance/epoch/FE/QueryExecutionId；每snapshot独立持1024heap records，真实导出owner必须限制并存份数和persist-before-idle-reset。实际FE/generation/request-stop关联、有界出口/phase精确调用预算、原32×512table＋512trueview/clients1,8,16 Native大CL/SDK8取消恢复/四role退出仍OPEN；SDK对象Drop不冒充RPC/连接/返回body最后alias。本slice Native/stock服务0；heldlateACK/fullClosing64/backing/P08/P00b/P09/P10/final及两人工语义门不闭合，无push/PR/归档。
-
-
-### 2026-10-09：P09 独立 FE 身份与启动前时钟接线组件 PASS
-
-前一 HMS observer 检查点为 `09cda0b5450c6339d1837520a3b2c03d5ec195f8`。新增 default-off `mem-1-m07-root-observation` 从原 NativeTrust 输出真实 Frontend UUID，原 FE managed durable log 保持 birth/file identity 前后核对；whole-source reserved-stem scanner 拒绝嵌入、重复、截断和超长候选，不借旧 exact marker。场景一次 absolute clock 在首个 role spawn 前消费，与 exact clock 互斥；原 exact Hub finish 和四 error 槽不改，neutral 用普通原 role shutdown。
-
-实际 marker IO 保原 io::Error，私有有限 Debug/Display wrapper 经 source formatter-panic canary 验证；实际 run_one 的 launch_config/clock 拒绝保原 primary＋teardown Arc 身份，teardown 一次。scanner6 PASS、新 runner 反例3 PASS、runner全组件279 PASS/0FAIL/2既有ignored、neutral marker2 PASS、双feature FE server24 PASS/0FAIL/0ignored；重叠计数不累加。non-test Server default/neutral/both 三配置与runner check、fmt/diff-check PASS。初次错误 --lib 调用在编译前拒绝和fmt单行换行失败均保留原日志。收据 `docs/testing/mem-1-m07/evidence/p09-neutral-fe-source-components-20261009.json` pin实际11 source、原exact/lock、草稿、v1/v2独立review与实际logs；dev unoptimized/jobs1/incremental0/threads1。
-
-本切片 Native/stock服务0，不把prelaunch拒绝当成功启动、source/marker组件当实际Native身份或20s物理syscall抢占。旧同步startup/source等待保持前后clock拒晚成功；中间Passed artifact须配原runner终态0与外部独立final verifier。实际build identity/clean source input admission、具体held-response scene/原handle全分支settle、同context正BE holder/seal后两次ACK-only consumed1 accepted0、释放后原MySQL恢复/四role退出仍OPEN。fullClosing64/完整backing-lastalias/P08/P00b/P09/P10/final同SHA及两个人工语义门不闭合；IRU-7 HMS非只读正确性excluded，caps/deadlines不改，无push/PR/归档。
-
-
-### 2026-10-09：P07 完整 backing 与一字节末 alias 组件 PASS
-
-前一 neutral FE/source/clock 检查点为 `5e2857ee8`。仅扩展原 Worker guarded_bytes 和 Native root_result_reader 两个 integration-test binary 的既有 allocator oracle；固定8条actual pointer/Layout/ordinal，按实际Bytes地址范围认领唯一live backing，System.dealloc实际返回后才记free，替换同size最后pointer误判。原生产owner、budget/credit callback、Bytes::from_owner、cap/deadline/default路径与依赖未改。
-
-Worker实际1MiB Vec可见4B、最后1B slice：非末alias退出后原credit仍Blocked；原guard直接观察同allocation post-dealloc，再由原credit字段退出；之后完整1MiB可重新Granted。Native实际unary短wire仍持完整SEGMENT encoder backing，所有非末clone/slice退出仍retain root与copy credit；最后DATAalias退出后actualfree/physical_idle/完整COPY回用。ACK捕获真实decoder/send两块envelope backing，按ordinal区分合法同址ABA；ACK已经retire Data，只验证原fixed metadata owner，不伪称process Data位置仍满。第9块actualallocation使oracle sticky invalid，全部drop也不得声称reclamation成功。
-
-actual Worker完整7 PASS、Native reader完整27 PASS，均0FAIL/0ignored/terminal0；包含五项新增和所有原probe，不用新测试替代旧回归。fmt/diffcheckPASS；收据 `docs/testing/mem-1-m07/evidence/p07-physical-backing-components-20261009.json` pin两actualsource、未改productionowner/lock、原finaldraft/pins和logs；dev unoptimized/jobs1/incremental0/threads1。component-only，无Native/stock服务。
-
-只证明选定same-thread System Layout/capacity与post-return实际free，非usable size/RSS/cache或全部allocator；native credit退出顺序仍同时依据未改GuardedOwner字段序，Bytes wrapper固定metadata例外保持ADR-0170。Closing old+new copy峰值/returnable失败回滚、fixed-core完整backing、其它domain/window/Arrow及跨线程最后alias、held-response Native/fullClosing64/P08/P00b/P09/P10/final同SHA仍OPEN。两个人工语义门与IRU-7 HMS非只读excluded不改，无push/PR/归档。
-
-
-### 2026-10-09：P09 held-response / late ACK 场景组件 PASS
-
-前一physical backing组件checkpoint为 `601a0ebf1`。接入新explicit factory与具体held-response-late-ACK场景，保原S+8 SQL、W2、原FE/source与一次prelaunch20s；discovery前仅一次protocol5s覆盖fullData1验证/heldreplay/KILL/两次typedACK/census及actualactor settle。取消前后同闭合context必须有正delivery/reservation/metadata/segment holder；seal后logicalData/payload0、End published1/ack0、两ACK consumed1 accepted0/AwaitTerminalControl。零census或releasedroot不代正holder。新CLI/admission尚未接，factory shape校验不冒充真实准入。
-
-原actor/runtime/MySQLjob/resume均在primary外，Result失败也先actualactor settle、resume并borrow actualawait同MySQLhandle，再关闭原TCP/收敛/保存有限receipt，保primary/cleanup原对象。ownedobserver只有完整<=4096 protocol41 ERR才暴露actualcode1317，还须完整S+4行/hash；同TCP5050健康核真实task增长。原probe handle在timeout外，abort→actualawait→take，原三slot primary/cleanup/late提取私有组合便于真实反例，不改settle资格。新增source检查actual原task ID、future析构、Elapsed/h2/IO object pointer与Arc identity/formatter canary；deadline后actualOk仍FAIL。locked h2可能stringify内部IO内因，本测试保实际返回h2对象，不伪称库内IO源不失。
-
-actual ownedTCP observer7 PASS（原5＋metadatapause timeout原jobjoin/fullS行ERR2）、scene pure7 PASS、probe6 PASS（原2＋extra4），完整runner里程碑299 PASS/0FAIL/2既有ignored/17.60s；各filter含在299，不累加。non-test runnercheck、fmt/diffcheckPASS；初次错误bin target在编译前拒绝、随后两KILL缺ServerHandle import的编译失败日志保留，补原traitimport后通过。收据 `docs/testing/mem-1-m07/evidence/p09-held-scene-components-20261009.json` pin实际七source、未改actor/exact/旧inputs/lock、原stable草稿/独立review/extra draft与实际logs。dev unoptimized/jobs1/incremental0/threads1；Native/stock服务0。
-
-尚须new immutableinput/exclusive selector、clean source/build/binary/neutralfeature/config准入、完整target contexts/descriptors/loganchors与closedACK事实保存、外部independent final verifier，以及实际1FE+3BE/四role ESRCH。loopback H2和纯predicate不证明认证BE alias，RST只方法调用，zero census不证明allocator最后alias；中间receipt状态须配实际runner wait0和最终clock/source核验。场景失败注入、fullClosing64/P06s大providerCL/P08/P00b/P09/P10/final同SHA及两个人工语义门均OPEN。IRU-7 HMS非只读excluded，cap/deadline/旧exactfinish gate不改，无push/PR/归档。
+运行日志、逐检查点收据、临时探针、一次性基线/预期生成器、执行绑定和测量输出统一放在
+忽略目录 `logs/mem-1-m07/`，不作为仓库长期测试资产维护。PR 正文记录精简的验证结论及其准确版本；
+需要共享原始产物时，使用独立 artifact 存储。历史日志的本地路径不能当作可下载证据，
+历史通过结果也不能代替当前源码的验收。

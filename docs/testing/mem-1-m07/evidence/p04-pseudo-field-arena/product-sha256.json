@@ -1,9 +1,0 @@
-{
-  "vendor/h2-0.4.12/src/hpack/header.rs": "28d3b965062bb707310cadb9eeeef92259b99551b5c20ba431cf08893b69382b",
-  "vendor/h2-0.4.12/src/server.rs": "587f67d98cd4294ca9c00df29ff7f3e1b51b0adad921ca990e047593e6efb48f",
-  "vendor/http-1.4.0/src/method.rs": "58f6de165c861ae52e467ec1259baa180aacbfc73b1cc8990dc26f0d7fa61645",
-  "vendor/http-1.4.0/src/uri/mod.rs": "02be3504c3be69b0c4f14ca9b123ef969cd5d08f1f38a64edef555ddd2357044",
-  "vendor/http-1.4.0/src/uri/scheme.rs": "b31a3bbb185c5b6e759d76550ace0d8645584ba8dafac5a0a54105f47f7dfae2",
-  "novarocks/native-adapter/tests/native_h2_pseudo_field_pool.rs": "322c0e70cf1e1bcb7f689c0f78b1bfd1b8a561eb7ff6713dac74c3d15e8d3afd",
-  "novarocks/native-adapter/tests/native_http_pseudo_field_owner.rs": "e96dbef122b1f57dbb9ff5da08b5a4caeabc3ad9639781cd29b499d7fa5dc73b"
-}

@@ -1,7 +1,0 @@
-{
-  "target/debug/novarocks": "bfdbee7c59b5fb27dc8b3d00c317bea02a33aadaa60312263f9efadfea832ed1",
-  "target/debug/novarocks-system-tests": "3b90db2058c2736f492651af9a6a11fe206bd5fb8c2983550c884d55e4db5bf9",
-  "logs/mem-1-m07/p04-driver-compat-binaries/novarocks-primary": "bfdbee7c59b5fb27dc8b3d00c317bea02a33aadaa60312263f9efadfea832ed1",
-  "logs/mem-1-m07/p04-driver-compat-binaries/novarocks-other-island": "4c30472fc2d05bc39f2cdace3367edb5595c68a96e1da35cd240e98d7f66ca75",
-  "logs/mem-1-m07/p04-driver-compat-binaries/novarocks-compatible": "99f14da86f5da658235ee3c69a1ca8c8cd4661c9209c6f232463f57580d6e1f8"
-}
