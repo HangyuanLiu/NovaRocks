@@ -1080,7 +1080,7 @@ impl ScalarCall<'_> {
                 return;
             }
         };
-        let legacy = self.evaluate_legacy(Some(&selected_rows));
+        let legacy = self.evaluate_legacy(rows);
         let mut found = Vec::new();
         let outcome = compare_selection(
             SelectionComparison {
@@ -1172,10 +1172,22 @@ impl ScalarCall<'_> {
             };
             let mut id = match argument {
                 DiffArgument::Column { value_type, values } => {
-                    let values = match &indices {
-                        Some(indices) => take(values.as_ref(), indices, None)
+                    let values = match (rows, &indices) {
+                        (None, _) => Arc::clone(values),
+                        (Some([]), _) => values.slice(0, 0),
+                        (Some(rows), _)
+                            if rows.iter().enumerate().all(|(ordinal, row)| {
+                                rows[0].checked_add(ordinal) == Some(*row)
+                            }) =>
+                        {
+                            // Keep the original carrier for a contiguous host chunk.
+                            // An unnecessary Arrow take can reject valid retained
+                            // dictionary backing before the legacy function runs.
+                            values.slice(rows[0], rows.len())
+                        }
+                        (_, Some(indices)) => take(values.as_ref(), indices, None)
                             .map_err(|error| format!("harness gather failed: {error}"))?,
-                        None => Arc::clone(values),
+                        (Some(_), None) => unreachable!("selection indices authored above"),
                     };
                     let slot = SlotId::new(index as u32 + 1);
                     fields.push(
@@ -1769,3 +1781,6 @@ mod array_difference_tests;
 
 #[path = "pure_differential/string_reverse_shared_tests.rs"]
 mod string_reverse_shared_tests;
+
+#[path = "pure_differential_map_entries_tests.rs"]
+mod map_entries_tests;

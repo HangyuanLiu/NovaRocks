@@ -1393,4 +1393,10 @@ mod numeric_unary_ordered_sql_source_tests;
 mod numeric_unary_typed_ordered_merge_tests;
 
 #[cfg(test)]
+mod legacy_map_entries_baseline_tests;
+
+#[cfg(test)]
 mod numeric_unary_narrow_state_source_tests;
+
+#[cfg(test)]
+mod map_entries_copy_edge_tests;

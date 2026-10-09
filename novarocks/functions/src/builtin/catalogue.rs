@@ -2735,6 +2735,7 @@ pub(super) fn dynamic_definition_parts(
             value: error.to_string().into(),
         })?;
     let pure_effects = match name {
+        "map_entries" => Some(super::map_entries_owner::effects()),
         name if super::array_difference_owner::operation(name).is_some() => {
             Some(super::array_difference_owner::effects())
         }
@@ -2793,6 +2794,7 @@ pub fn contribute_builtin_functions(
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {
+            "map_entries" => super::map_entries_owner::definition(name, declaration, resolver)?,
             name if super::array_difference_owner::operation(name).is_some() => {
                 super::array_difference_owner::definition(name, declaration, resolver)?
             }
