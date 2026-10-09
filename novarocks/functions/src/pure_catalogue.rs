@@ -157,6 +157,26 @@ impl PureOverloadDeclaration<'_> {
     pub const fn effects(&self) -> &FunctionEffectDeclaration {
         self.effects
     }
+    /// Borrow the exact installed metadata owner; no fresh resolution or
+    /// prepared instance is constructed at this static FE admission boundary.
+    pub fn admit_selected_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        if selected.overload != self.implementation().overload
+            || selected.argument_types.len() != logical_argument_count
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "pure profile admission differs from its exact selected overload".into(),
+            ));
+        }
+        self.attachment
+            .metadata_owner
+            .admit_selected_profile_observed(selected, logical_argument_count, control)
+    }
 }
 impl fmt::Debug for PureOverloadDeclaration<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -176,6 +196,19 @@ pub trait PureFunctionMetadataOwner:
 {
     fn binding_declaration(&self) -> &FunctionBindingDeclaration;
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration];
+
+    /// Candidate-only static profile admission from this same installed owner.
+    /// The default preserves the existing presence contract. It grants no
+    /// preparation, payload validation, environment fact or execution seal.
+    fn admit_selected_profile_observed(
+        &self,
+        _selected: &FunctionBindingSelection,
+        _logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        Ok(())
+    }
 }
 
 /// An independently assembled record of actually installed CPU/control
@@ -366,6 +399,7 @@ trait InstalledPureOwner: Send + Sync {
 pub(crate) struct PureFunctionAttachment {
     implementations: Arc<[PureImplementationDeclaration]>,
     owner: Arc<dyn InstalledPureOwner>,
+    metadata_owner: Arc<dyn PureFunctionMetadataOwner>,
 }
 impl fmt::Debug for PureFunctionAttachment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -903,6 +937,7 @@ fn attach_definition<O: PureFunctionMetadataOwner + 'static>(
     binding.pure = Some(PureFunctionAttachment {
         implementations,
         owner,
+        metadata_owner: registered.owner.clone(),
     });
     Ok(definition)
 }

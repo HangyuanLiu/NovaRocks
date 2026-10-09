@@ -111,6 +111,8 @@ mod collection_cardinality_owner;
 mod control_owner;
 pub mod crc32;
 mod crc32_owner;
+mod percentile_hash_owner;
+mod percentile_hash_selected;
 mod date;
 mod date_owner;
 mod dround;

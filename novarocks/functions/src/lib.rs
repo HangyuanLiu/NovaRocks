@@ -42,6 +42,7 @@ pub mod aggregate_scalar_fingerprint;
 mod aggregate_state_column;
 pub mod aggregate_types;
 pub mod approx_percentile_core;
+pub mod percentile_hash_core;
 pub mod approx_percentile_aggregate_core;
 mod arithmetic;
 mod binding;

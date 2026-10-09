@@ -23,6 +23,7 @@ use arrow_schema::DataType;
 pub enum PercentileInputDiagnostic<'a> {
     ExactUpdate,
     ExactMerge,
+    Hash,
     LegacyLabel(&'a str),
 }
 impl std::fmt::Display for PercentileInputDiagnostic<'_> {
@@ -30,6 +31,7 @@ impl std::fmt::Display for PercentileInputDiagnostic<'_> {
         f.write_str(match self {
             Self::ExactUpdate => "percentile_disc_cont_update",
             Self::ExactMerge => "percentile_disc_cont_merge",
+            Self::Hash => "percentile_hash",
             Self::LegacyLabel(label) => label,
         })
     }

@@ -2523,6 +2523,7 @@ pub(super) fn scalar_definition_parts(
                         ))
                     }
                     "crc32" => Some(super::crc32_owner::effects()),
+                    "percentile_hash" => Some(super::percentile_hash_owner::effects()),
                     name if super::string_measure_owner::operation(name).is_some() => {
                         Some(super::string_measure_owner::effects())
                     }
@@ -2867,6 +2868,7 @@ pub fn contribute_builtin_functions(
                 super::control_owner::definition(name, declaration, resolver)?
             }
             "crc32" => super::crc32_owner::definition(declaration, resolver)?,
+            "percentile_hash" => super::percentile_hash_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {
                 super::string_measure_owner::definition(name, declaration, resolver)?
             }

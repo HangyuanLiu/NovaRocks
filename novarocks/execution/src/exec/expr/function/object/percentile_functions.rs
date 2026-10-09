@@ -31,10 +31,7 @@ pub fn eval_percentile_hash(
     let input = arena.eval(args[0], chunk)?;
     let mut builder = BinaryBuilder::new();
     for row in 0..input.len() {
-        match numeric_value_at(&input, row, "percentile_hash")? {
-            Some(value) => builder.append_value(percentile::encode_single_value(value)),
-            None => builder.append_value(percentile::encode_empty_state()),
-        }
+        builder.append_value(novarocks_functions::percentile_hash_core::row(&input, row)?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }

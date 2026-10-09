@@ -1497,3 +1497,9 @@ mod percentile_hash_original_fold_tests;
 
 #[cfg(test)]
 mod between_actual_after_tests;
+
+#[cfg(test)]
+mod percentile_hash_native_n1_frame_tests;
+
+#[cfg(test)]
+mod percentile_hash_native_n1_availability_tests;

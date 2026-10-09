@@ -36,6 +36,8 @@ impl ScalarPresenceCatalog {
         function: &novarocks_functions::FunctionId,
         kind: FunctionKind,
         overload: &novarocks_functions::FunctionOverloadId,
+        selected: &novarocks_functions::FunctionBindingSelection,
+        logical_argument_count: usize,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         // Table/operator, window and aggregate lifecycle admission have separate authors.
@@ -46,7 +48,9 @@ impl ScalarPresenceCatalog {
             .original
             .pure_overload_declaration_observed(function, kind, overload, control)
         {
-            Ok(_loan) => Ok(()),
+            Ok(loan) => {
+                loan.admit_selected_profile_observed(selected, logical_argument_count, control)
+            }
             Err(FunctionSpecializationFailure::Control(cause)) => {
                 Err(FunctionBindingError::Control(cause))
             }
@@ -68,6 +72,8 @@ impl ScalarPresenceCatalog {
             &binding.function_id,
             binding.kind,
             &binding.selected.overload,
+            &binding.selected,
+            binding.logical_argument_count,
             control,
         )?;
         Ok(binding)
@@ -103,7 +109,14 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         let selected = self
             .original
             .select_exact_overload_observed(_function, _kind, _overload, _request, control)?;
-        self.admit_identity(_function, _kind, _overload, control)?;
+        self.admit_identity(
+            _function,
+            _kind,
+            _overload,
+            &selected,
+            _request.logical_argument_count,
+            control,
+        )?;
         Ok(selected)
     }
     fn pure_overload_declaration_observed<'a>(

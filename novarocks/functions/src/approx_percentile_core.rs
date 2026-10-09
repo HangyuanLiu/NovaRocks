@@ -789,10 +789,54 @@ pub fn encode_empty_state() -> Vec<u8> {
     encode_state(&PercentileState::default())
 }
 
+/// The original singleton calculation with an explicit allocation policy.
+/// The legacy adapter retains its original Global allocation/expect behavior.
+pub fn single_value_state_in<A: Allocator + Clone>(
+    value: f64,
+    allocator: A,
+) -> Result<PercentileState<A>, String> {
+    let mut state = PercentileState::new_in(DEFAULT_COMPRESSION_FACTOR, allocator);
+    add_value(&mut state, value)?;
+    Ok(state)
+}
 pub fn encode_single_value(value: f64) -> Vec<u8> {
-    let mut state = PercentileState::default();
-    add_value(&mut state, value).expect("single percentile value must fit bounded TDigest");
+    let state = single_value_state_in(value, Global)
+        .expect("single percentile value must fit bounded TDigest");
     encode_state(&state)
+}
+/// Original scalar hash codec footprint, before its std Vec allocations.
+/// Only the actual singleton producer may consume this receipt. The original
+/// serializer's four-byte capacity underestimate is intentionally unchanged.
+/// Rust 1.92 RawVec doubles the 52-byte digest backing when its final u32
+/// extends to 56 bytes. Account both old and replacement backing while resizing,
+/// plus the original outer 11-byte header + 56-byte digest backing.
+/// This is a host reservation for opaque logical allocations, not a physical
+/// allocator/RSS or formal MEM bound.
+pub fn scalar_hash_codec_extent<A: Allocator + Clone>(state: &PercentileState<A>) -> Option<usize> {
+    if state.quantiles.is_some() || state.compression != DEFAULT_COMPRESSION_FACTOR {
+        return None;
+    }
+    if state.digest.is_empty() {
+        return Some(HEADER_LEN);
+    }
+    if !state.digest.processed.is_empty()
+        || state.digest.unprocessed.len() != 1
+        || !state.digest.cumulative.is_empty()
+    {
+        return None;
+    }
+    let original_capacity = 4 * std::mem::size_of::<f32>()
+        + 2 * std::mem::size_of::<u64>()
+        + 3 * std::mem::size_of::<u32>()
+        + 2 * std::mem::size_of::<f32>();
+    let actual_length = 5 * std::mem::size_of::<f32>()
+        + 2 * std::mem::size_of::<u64>()
+        + 3 * std::mem::size_of::<u32>()
+        + 2 * std::mem::size_of::<f32>();
+    original_capacity
+        .checked_add(original_capacity.checked_mul(2)?.max(actual_length))?
+        .checked_add(HEADER_LEN)?
+        .checked_add(actual_length)
 }
 
 pub fn encode_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Vec<u8> {
