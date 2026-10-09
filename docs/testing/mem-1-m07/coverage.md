@@ -443,3 +443,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 新opt-in exclusive CLI/scenario和原capability helper的独立companion；原helper/四Scala/input/bounds/旧freeze字节不变。仅完整exact4role身份+runner正常完整evidence+逐PID实际不存在才允许freshJava核对及原cleanup；timeout/partial/unknown退出保留Native/HMS/catalog/objectstore，不从host group退出推断角色退出。新freeze模板draft/null pins，拒绝直接运行。
 - host14PASS/0.026s，最终runner focused2PASS；runner回归127PASS/0FAIL/2ignored/6.14s在最终primary+save secondary错误合并前运行，最终合并后focused另通过。收据p09-hms-small-native-classification-focused-20261009.json绑定全部日志hash。正常代码0/1完整证据仍分别PASS/FAIL，不把成功cleanup改写实验失败。
 - 真实stock HMS/1FE+3BE即将独立cleanHEAD构建运行，尚无Native结论。freshJava finalunchanged不证明zero intermediate mutation RPC；该observer仍OPEN。原大CL、其余P09/P00b/P10/final及两人工语义门不变，无push/PR/归档。
+
+
+### 2026-10-09 P09：HMS Native首轮失败保留与有限阶段诊断
+
+- clean450b4625真实1FE+3BE runner正常exit1，分类事实保存前断言失败；原stdout仅hash不能定位阶段，不能猜测原因/放宽oracle。四role PID及60host PID独立不存在，五stockJava create/oracle/afterNative-oracle/drop/restored均0/实际exit，freshJava核对未变，6实际containerID均消失，cleanup完整/无unknown retention。实验仍FAILED，收据p09-hms-small-native-v1-failed-20261009.json保留source/freeze/native/artifacts，不因cleanup正确改作PASS。
+- 新诊断仅保存有限local阶段、各成功阶段立即facts、SQL数值code+hash（不留provider message），connect错误也hash；原query/input/bounds/clock未变。payload-redaction反例+既有CLI/refusal共3PASS/0FAIL。收据p09-hms-small-native-phase-diagnostic-focused-20261009.json；下一cleanHEAD运行仅定位同原输入失败，不是busyretry。大CL/zero-mutation observer/其余门仍OPEN，无push/PR/归档。

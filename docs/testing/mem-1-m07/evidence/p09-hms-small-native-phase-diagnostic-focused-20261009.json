@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "450b4625bbf5db6d283e776c72ab13156c8ac84d",
+  "purpose": "Finite native assertion phase and redacted SQL diagnostic retention after actual failed native trial",
+  "checks": [
+    {
+      "passed": 3,
+      "failed": 0,
+      "seconds": 0.0,
+      "suite": "HMS exclusive CLI, exact refusal and numeric-code/payload-redaction negative checks"
+    }
+  ],
+  "boundaries": [
+    "No SQL/workload/caps/clock changed",
+    "Assertion receipt retains controlled phase and locally fixed/redacted failure text; SQL payload only hash and optional numeric server code",
+    "Successful prior phase facts saved immediately; primary plus save error still preserved"
+  ],
+  "limitations": [
+    "Native v1 FAILED retained; exact failing query still unknown before new diagnostic native run",
+    "No full native classification or overall acceptance",
+    "No push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-phase-diagnostic-focused-v1-20261009.log",
+      "bytes": 5485,
+      "sha256": "937de5d73a405427d9469a43177a0a214e8ede2ea64731570fffdd54d8e7fbd1"
+    }
+  ]
+}

@@ -88,8 +88,12 @@ fn sql_string(value: &str) -> String {
 
 fn safe_sql_error(error: &mysql::Error) -> anyhow::Error {
     // Only a digest is retained; unexpected provider payloads can contain secrets.
+    let code = match error {
+        mysql::Error::MySqlError(server) => Some(server.code),
+        _ => None,
+    };
     anyhow::anyhow!(
-        "HMS preflight SQL failed; error_sha256={}",
+        "HMS preflight SQL failed; server_code={code:?}; error_sha256={}",
         digest(error.to_string().as_bytes())
     )
 }
@@ -223,9 +227,17 @@ impl Scenario for HmsClassificationPreflight {
             .join("hms-classification-assertions.json");
         std::fs::write(&receipt, serde_json::to_vec_pretty(&facts)?)?;
         let assertions: Result<()> = (|| {
+            facts["phase"] = json!("connect");
             let timeout = self.remaining()?.min(Duration::from_secs(15));
             let mut client =
-                mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+                mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout).map_err(
+                    |error| {
+                        anyhow::anyhow!(
+                            "HMS preflight connection failed; error_sha256={}",
+                            digest(error.to_string().as_bytes())
+                        )
+                    },
+                )?;
             let catalog = &self.input.catalog_name;
             let namespace = &self.input.namespace;
             let sql = format!(
@@ -234,41 +246,52 @@ impl Scenario for HmsClassificationPreflight {
                 sql_string(&self.input.warehouse),
                 sql_string(&self.input.object_store_endpoint)
             );
+            facts["phase"] = json!("create-catalog");
             self.remaining()?;
             client
                 .query_drop(sql)
                 .map_err(|error| safe_sql_error(&error))?;
+            facts["phase"] = json!("use-namespace");
             self.remaining()?;
             client
                 .query_drop(format!("USE {catalog}.{namespace}"))
                 .map_err(|error| safe_sql_error(&error))?;
+            facts["phase"] = json!("show-tables");
             self.remaining()?;
             let names: Vec<String> = client
                 .query("SHOW TABLES")
                 .map_err(|error| safe_sql_error(&error))?;
+            facts["show_tables"] = json!(names);
             ensure!(
                 names == ["cap_table"],
                 "HMS table list included a view, omitted a table or duplicated a name"
             );
+            facts["phase"] = json!("information-schema");
             self.remaining()?;
             let rows: Vec<(String,String)> = client.query(format!(
                 "SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.tables WHERE TABLE_CATALOG={} AND TABLE_SCHEMA={} ORDER BY TABLE_NAME",
                 sql_string(catalog), sql_string(namespace))).map_err(|error| safe_sql_error(&error))?;
+            facts["information_schema"] = json!(rows);
             ensure!(
                 rows == [("cap_table".into(), "BASE TABLE".into())],
                 "HMS information_schema classification differs"
             );
-            facts["show_tables"] = json!(names);
-            facts["information_schema"] = json!(rows);
+            facts["phase"] = json!("show-views");
             self.remaining()?;
             facts["show_views"] = require_view_refusal(client.query_drop("SHOW VIEWS"))?;
+            facts["phase"] = json!("drop-database-force");
             self.remaining()?;
             facts["drop_database_force"] = require_view_refusal(
                 client.query_drop(format!("DROP DATABASE {catalog}.{namespace} FORCE")),
             )?;
             self.remaining()?;
+            facts["phase"] = json!("complete");
             Ok(())
         })();
+        if let Err(error) = &assertions {
+            // Every assertion error above is local fixed text or a redacted SQL/connection summary.
+            facts["failure_reason"] = json!(error.to_string());
+        }
         facts["assertions"] = json!(if assertions.is_ok() {
             "passed"
         } else {
@@ -304,6 +327,19 @@ mod refusal_tests {
             state: state.into(),
             message: message.into(),
         }))
+    }
+
+    #[test]
+    fn sql_failure_preserves_numeric_code_without_provider_payload() {
+        let error = mysql::Error::MySqlError(mysql::MySqlError {
+            code: 1054,
+            state: "HY000".into(),
+            message: "provider-secret-must-not-be-retained".into(),
+        });
+        let safe = safe_sql_error(&error).to_string();
+        assert!(safe.contains("server_code=Some(1054)"));
+        assert!(safe.contains("error_sha256="));
+        assert!(!safe.contains("provider-secret"));
     }
 
     #[test]
