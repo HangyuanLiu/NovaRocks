@@ -512,29 +512,55 @@ mod typed {
         process_id: BackendProcessId,
     ) -> Result<Option<QueryLifecycleFaultScope>, String> {
         let arm = arm_path(root, backend_index, kind);
-        let contents = match fs::read_to_string(&arm) {
-            Ok(value) => value,
+        // Consume eligibility before publishing: a BE may claim the trigger
+        // immediately, while another FE binder is still visiting this arm.
+        // A unique rename gives exactly one binder ownership of the token.
+        let claimed = arm.with_extension(format!(
+            "arm-claimed-{}-{}",
+            std::process::id(),
+            NEXT_CLAIM.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::rename(&arm, &claimed) {
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("read {}: {error}", arm.display())),
-        };
-        let fields = parse_fields(&contents)?;
-        let token = required_token(&fields)?;
-        let armed_backend_index = required_usize(&fields, "backend_index")?;
-        if armed_backend_index != backend_index {
-            return Err(format!(
-                "fault arm backend_index {armed_backend_index} does not match path backend {backend_index}"
-            ));
+            Err(error) => return Err(format!("claim {}: {error}", arm.display())),
         }
-        let scope = QueryLifecycleFaultScope {
-            token,
-            execution_id,
-            backend_index,
-            process_id,
-        };
-        let trigger = trigger_path(root, backend_index, kind);
-        publish_new(&trigger, serialize_scope(&scope).as_bytes())?;
-        fs::remove_file(&arm).map_err(|error| format!("consume {}: {error}", arm.display()))?;
-        Ok(Some(scope))
+        let result = (|| {
+            let contents = fs::read_to_string(&claimed)
+                .map_err(|error| format!("read {}: {error}", claimed.display()))?;
+            let fields = parse_fields(&contents)?;
+            let token = required_token(&fields)?;
+            let armed_backend_index = required_usize(&fields, "backend_index")?;
+            if armed_backend_index != backend_index {
+                return Err(format!(
+                    "fault arm backend_index {armed_backend_index} does not match path backend {backend_index}"
+                ));
+            }
+            let scope = QueryLifecycleFaultScope {
+                token,
+                execution_id,
+                backend_index,
+                process_id,
+            };
+            let trigger = trigger_path(root, backend_index, kind);
+            publish_new(&trigger, serialize_scope(&scope).as_bytes())?;
+            Ok(scope)
+        })();
+        match result {
+            Ok(scope) => {
+                fs::remove_file(&claimed)
+                    .map_err(|error| format!("consume {}: {error}", claimed.display()))?;
+                Ok(Some(scope))
+            }
+            Err(error) => {
+                // Restore a refused arm for diagnosis/retry without replacing
+                // a newer harness arm. If restoration fails, retain the claim
+                // and report its exact path instead of losing the token.
+                restore_claimed_file(&claimed, &arm)
+                    .map_err(|restore_error| format!("{error}; {restore_error}"))?;
+                Err(error)
+            }
+        }
     }
 
     /// Matches an armed fault without consuming it.
@@ -587,12 +613,7 @@ mod typed {
         {
             return Ok(None);
         }
-        match fs::remove_file(&trigger) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("consume {}: {error}", trigger.display())),
-        }
-        Ok(Some(scope))
+        claim_observed_scope(&trigger, scope)
     }
 
     /// Claims a runner fault by its authoritative process identity. The file
@@ -624,10 +645,8 @@ mod typed {
             if scope.execution_id != execution_id || scope.process_id != process_id {
                 continue;
             }
-            match fs::remove_file(&path) {
-                Ok(()) => return Ok(Some(scope)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("consume {}: {error}", path.display())),
+            if let Some(scope) = claim_observed_scope(&path, scope)? {
+                return Ok(Some(scope));
             }
         }
         Ok(None)
@@ -663,13 +682,66 @@ mod typed {
             if scope.execution_id != execution_id {
                 continue;
             }
-            match fs::remove_file(&path) {
-                Ok(()) => return Ok(Some(scope)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("consume {}: {error}", path.display())),
+            if let Some(scope) = claim_observed_scope(&path, scope)? {
+                return Ok(Some(scope));
             }
         }
         Ok(None)
+    }
+
+    /// Reading selects an eligible scope; renaming, rather than unlinking,
+    /// grants one claimant ownership. Revalidate after the rename so a trigger
+    /// replaced between selection and claim cannot perturb another attempt.
+    fn claim_observed_scope(
+        trigger: &Path,
+        observed: QueryLifecycleFaultScope,
+    ) -> Result<Option<QueryLifecycleFaultScope>, String> {
+        let claimed = trigger.with_extension(format!(
+            "trigger-claimed-{}-{}",
+            std::process::id(),
+            NEXT_CLAIM.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::rename(trigger, &claimed) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("claim {}: {error}", trigger.display())),
+        }
+        let result = (|| {
+            let contents = fs::read_to_string(&claimed)
+                .map_err(|error| format!("read {}: {error}", claimed.display()))?;
+            let scope = parse_scope(&contents)?;
+            if scope != observed {
+                return Err(format!(
+                    "fault scope changed while claiming {}",
+                    trigger.display()
+                ));
+            }
+            Ok(scope)
+        })();
+        match result {
+            Ok(scope) => {
+                fs::remove_file(&claimed)
+                    .map_err(|error| format!("consume {}: {error}", claimed.display()))?;
+                Ok(Some(scope))
+            }
+            Err(error) => {
+                restore_claimed_file(&claimed, trigger)
+                    .map_err(|restore_error| format!("{error}; {restore_error}"))?;
+                Err(error)
+            }
+        }
+    }
+
+    fn restore_claimed_file(claimed: &Path, original: &Path) -> Result<(), String> {
+        // A hard link never replaces a newer arm/trigger at the original path.
+        fs::hard_link(claimed, original).map_err(|error| {
+            format!(
+                "restore {}: {error}; retained claim {}",
+                original.display(),
+                claimed.display()
+            )
+        })?;
+        fs::remove_file(claimed).map_err(|error| format!("remove {}: {error}", claimed.display()))
     }
 
     pub fn observe_matching_fault(
@@ -693,6 +765,43 @@ mod typed {
             return Ok(None);
         }
         Ok(Some(scope))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn a_replaced_trigger_is_restored_instead_of_firing_on_the_old_attempt() {
+        let root = super::tests::unique_temp_root("replaced-trigger");
+        fs::create_dir_all(&root).unwrap();
+        let kind = QueryLifecycleFaultKind::ConnectorWriteAppendHold;
+        let process = BackendProcessId::new_v7();
+        let execution = QueryExecutionId::new(
+            novarocks_types::QueryId::new(7, 9),
+            AttemptId::new(1).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            arm_path(&root, 0, kind),
+            "token=original\nbackend_index=0\n",
+        )
+        .unwrap();
+        let observed = bind_armed_fault(&root, kind, execution, 0, process)
+            .unwrap()
+            .unwrap();
+        let replacement = QueryLifecycleFaultScope {
+            token: "replacement".to_string(),
+            execution_id: QueryExecutionId::new(execution.query_id(), AttemptId::new(2).unwrap())
+                .unwrap(),
+            ..observed.clone()
+        };
+        let trigger = trigger_path(&root, 0, kind);
+        fs::write(&trigger, serialize_scope(&replacement)).unwrap();
+        assert!(claim_observed_scope(&trigger, observed).is_err());
+        assert_eq!(
+            parse_scope(&fs::read_to_string(&trigger).unwrap()).unwrap(),
+            replacement
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn serialize_scope(scope: &QueryLifecycleFaultScope) -> String {
@@ -955,7 +1064,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
-    fn unique_temp_root(label: &str) -> PathBuf {
+    pub(super) fn unique_temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "novarocks-failpoint-{label}-{}-{}",
             std::process::id(),
@@ -998,6 +1107,85 @@ mod tests {
                 .is_some()
         );
         std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(feature = "typed")]
+    #[test]
+    fn concurrent_binders_cannot_republish_a_consumed_token() {
+        use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId};
+        use std::sync::{Arc, Barrier};
+
+        let root = unique_temp_root("concurrent-bind");
+        std::fs::create_dir_all(&root).unwrap();
+        let kind = QueryLifecycleFaultKind::ConnectorWriteAppendHold;
+        let process = BackendProcessId::new_v7();
+        for round in 0..32 {
+            let execution =
+                QueryExecutionId::new(QueryId::new(7, round), AttemptId::new(1).unwrap()).unwrap();
+            std::fs::write(arm_path(&root, 0, kind), "token=once\nbackend_index=0\n").unwrap();
+            let barrier = Arc::new(Barrier::new(12));
+            let outcomes = std::thread::scope(|threads| {
+                let workers = (0..12)
+                    .map(|_| {
+                        let root = &root;
+                        let barrier = Arc::clone(&barrier);
+                        threads.spawn(move || {
+                            barrier.wait();
+                            let bound =
+                                bind_armed_fault(root, kind, execution, 0, process).unwrap();
+                            // Consume promptly while other binders can still be in flight.
+                            let claimed =
+                                claim_matching_fault(root, kind, execution, 0, process).unwrap();
+                            (bound.is_some(), claimed.is_some())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(outcomes.iter().filter(|(bound, _)| *bound).count(), 1);
+            assert_eq!(outcomes.iter().filter(|(_, claimed)| *claimed).count(), 1);
+            assert!(!arm_path(&root, 0, kind).exists());
+            assert!(!trigger_path(&root, 0, kind).exists());
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "typed")]
+    #[test]
+    fn failed_binding_restores_the_arm_without_overwriting_a_trigger() {
+        use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId};
+
+        let root = unique_temp_root("refused-bind");
+        std::fs::create_dir_all(&root).unwrap();
+        let kind = QueryLifecycleFaultKind::ConnectorWriteAppendHold;
+        let execution =
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).unwrap()).unwrap();
+        let process = BackendProcessId::new_v7();
+        let arm = arm_path(&root, 0, kind);
+        let trigger = trigger_path(&root, 0, kind);
+        std::fs::write(&arm, "token=next\nbackend_index=0\n").unwrap();
+        std::fs::write(&trigger, "existing trigger").unwrap();
+        assert!(bind_armed_fault(&root, kind, execution, 0, process).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&trigger).unwrap(),
+            "existing trigger"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&arm).unwrap(),
+            "token=next\nbackend_index=0\n"
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_file(&trigger).unwrap();
+        let scope = bind_armed_fault(&root, kind, execution, 0, process)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.token, "next");
+        assert!(!arm.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(feature = "typed")]

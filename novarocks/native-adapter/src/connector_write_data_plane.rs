@@ -35,7 +35,7 @@ use novarocks_proto_models::connector_write as dto;
 use novarocks_spi::connector::ConnectorWriteFragmentWireEncoder;
 use novarocks_spi::connector::write_stack::{ConnectorCommitFragment, WriteTargetOrdinal};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-use novarocks_types::QueryExecutionId;
+use novarocks_types::{BackendProcessId, QueryExecutionId};
 use novarocks_worker::connector_write_runtime::{
     ConnectorWriteObservation, ConnectorWriteObservationPort, ConnectorWriterAbortOutcome,
     ConnectorWriterObservation,
@@ -50,8 +50,38 @@ const WRITE_EVENT_TARGET: &str = "novarocks::connector_write";
 /// This adapter turns those settled facts into role-local metrics and logs, and
 /// may consume the existing debug hold fault after an append is already live.
 /// It cannot open a writer or change its result.
-#[derive(Debug, Default)]
-pub struct NativeConnectorWriteObservationPort;
+#[derive(Debug)]
+pub struct NativeConnectorWriteObservationPort {
+    #[cfg(debug_assertions)]
+    process_id: BackendProcessId,
+}
+
+impl NativeConnectorWriteObservationPort {
+    pub fn new(process_id: BackendProcessId) -> Self {
+        #[cfg(not(debug_assertions))]
+        let _ = process_id;
+        Self {
+            #[cfg(debug_assertions)]
+            process_id,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn claim_append_hold(
+        &self,
+        root: &std::path::Path,
+        execution_id: QueryExecutionId,
+    ) -> Option<novarocks_failpoint::QueryLifecycleFaultScope> {
+        novarocks_failpoint::claim_matching_fault_for_process(
+            root,
+            novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
+            execution_id,
+            self.process_id,
+        )
+        .ok()
+        .flatten()
+    }
+}
 
 impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
     fn observe(&self, observation: ConnectorWriteObservation) {
@@ -168,10 +198,10 @@ impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
     fn hold_append(&self, writer: ConnectorWriterObservation) -> bool {
         #[cfg(debug_assertions)]
         {
-            let Some(token) = claim_write_fault(
-                writer.execution_id(),
-                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
-            ) else {
+            let Some(root) = novarocks_failpoint::configured_root() else {
+                return false;
+            };
+            let Some(scope) = self.claim_append_hold(&root, writer.execution_id()) else {
                 return false;
             };
             crate::backend_metrics::record_connector_write_debug_fault("append_hold");
@@ -183,7 +213,8 @@ impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
                 attempt_id = writer.execution_id().attempt_id().get(),
                 node_id = writer.node_id(),
                 write_target_ordinal = writer.target().get(),
-                token,
+                token = %scope.token,
+                backend_process_id = %self.process_id,
                 "holding a driver-local writer append until query cancellation"
             );
             true
@@ -492,6 +523,44 @@ mod tests {
     use prost::Message;
 
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn append_holds_belong_to_the_exact_admitted_backend_process_and_attempt() {
+        use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, bind_armed_fault};
+
+        let processes = std::array::from_fn::<_, 3, _>(|_| BackendProcessId::new_v7());
+        let execution =
+            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
+        let next_attempt =
+            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(2).unwrap()).unwrap();
+        let root = std::env::temp_dir().join(format!("novarocks-append-hold-{}", processes[0]));
+        std::fs::create_dir_all(&root).unwrap();
+        let kind = QueryLifecycleFaultKind::ConnectorWriteAppendHold;
+        for (index, process) in processes.into_iter().enumerate() {
+            std::fs::write(
+                arm_path(&root, index, kind),
+                format!("token=hold-{index}\nbackend_index={index}\n"),
+            )
+            .unwrap();
+            bind_armed_fault(&root, kind, execution, index, process)
+                .unwrap()
+                .unwrap();
+        }
+        let replaced = NativeConnectorWriteObservationPort::new(BackendProcessId::new_v7());
+        assert!(replaced.claim_append_hold(&root, execution).is_none());
+        // Visit the middle BE first: directory order must never select its peer's token.
+        for index in [1, 2, 0] {
+            let observer = NativeConnectorWriteObservationPort::new(processes[index]);
+            assert!(observer.claim_append_hold(&root, next_attempt).is_none());
+            let scope = observer.claim_append_hold(&root, execution).unwrap();
+            assert_eq!(scope.backend_index, index);
+            assert_eq!(scope.process_id, processes[index]);
+            assert_eq!(scope.token, format!("hold-{index}"));
+            assert!(observer.claim_append_hold(&root, execution).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn catalog_handle() -> novarocks_spi::connector::CatalogHandle {
         novarocks_spi::connector::CatalogHandle::new(
