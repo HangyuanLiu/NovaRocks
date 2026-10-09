@@ -795,7 +795,7 @@ fn try_fold_node(
     work.flush()?;
     let source = match &node {
         ScalarNode::FunctionCall { binding, .. } => {
-            crate::compiler::SqlFoldDependencySource::Function(binding.resolved())
+            crate::compiler::SqlFoldDependencySource::Function(binding)
         }
         ScalarNode::BinaryOp { .. } | ScalarNode::UnaryOp { .. } | ScalarNode::Cast { .. } => {
             crate::compiler::SqlFoldDependencySource::Intrinsic

@@ -19,14 +19,15 @@
 //! Observation owns no binding, provenance, constant backing, or capacity grant.
 
 use super::{FoldRequest, SqlConstantEvaluationError, SqlConstantEvaluator};
-use novarocks_functions::{ConstantValue, ResolvedFunctionBinding};
+use crate::binding::SqlFunctionBinding;
+use novarocks_functions::ConstantValue;
 use novarocks_type_contract::PureCompileControl;
 
 /// Positive source classification from the original optimizer node.
 /// Intrinsics have no function identity; absence is never interpreted as a name.
 #[derive(Clone, Copy, Debug)]
 pub enum SqlFoldDependencySource<'a> {
-    Function(&'a ResolvedFunctionBinding),
+    Function(&'a SqlFunctionBinding),
     Intrinsic,
 }
 

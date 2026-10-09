@@ -65,6 +65,9 @@ enum Outcome {
 #[derive(Debug)]
 struct Receipt {
     binding: Option<ResolvedFunctionBinding>,
+    source_result_constraint: Option<FunctionValueType>,
+    source_constraint_origin: Option<novarocks_sql::binding::SqlResultConstraintOrigin>,
+    source_decimal_policy: Option<novarocks_type_contract::DecimalOverflowPolicy>,
     request_result: FunctionValueType,
     request_kind: FoldNodeKind,
     arguments: Vec<FoldArg>,
@@ -152,6 +155,15 @@ impl SqlFoldDependencyObserver for Probe {
         if let Some(cause) = self.refuse_start {
             return Err(cause);
         }
+        let (source_result_constraint, source_constraint_origin, source_decimal_policy) =
+            match input.source {
+                SqlFoldDependencySource::Function(binding) => (
+                    binding.result_constraint().cloned(),
+                    Some(binding.result_constraint_origin().clone()),
+                    Some(binding.decimal_overflow_policy()),
+                ),
+                SqlFoldDependencySource::Intrinsic => (None, None, None),
+            };
         let binding = match input.source {
             SqlFoldDependencySource::Function(binding) => {
                 assert!(matches!(input.request.kind, FoldNodeKind::Function { .. }));
@@ -176,7 +188,7 @@ impl SqlFoldDependencyObserver for Probe {
                     );
                     assert_eq!(argument.value.value_type(), &argument.value_type);
                 }
-                Some(binding.clone())
+                Some(binding.resolved().clone())
             }
             SqlFoldDependencySource::Intrinsic => {
                 assert!(!matches!(input.request.kind, FoldNodeKind::Function { .. }));
@@ -190,6 +202,9 @@ impl SqlFoldDependencyObserver for Probe {
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         receipts.push(Receipt {
             binding,
+            source_result_constraint,
+            source_constraint_origin,
+            source_decimal_policy,
             request_result: input.request.result_type.clone(),
             request_kind: input.request.kind.clone(),
             arguments: input.request.args.clone(),
@@ -606,4 +621,40 @@ fn sql_fold_dependency_query_owned_receipts_are_isolated_and_released() {
 fn sql_fold_dependency_observer_absence_keeps_existing_calculator_path() {
     let source = compile("SELECT upper('plain')", &REAL, None).unwrap();
     assert_eq!(calls(&source), 0);
+}
+
+#[test]
+fn sql_fold_dependency_original_unconstrained_binding_is_not_selected_result_constraint() {
+    let observer = probe();
+    let source = compile(
+        "SELECT upper('unconstrained') AS folded",
+        &REAL,
+        Some(observer.clone()),
+    )
+    .unwrap();
+    assert_eq!(calls(&source), 0);
+    let receipts = observer.receipts.lock().unwrap();
+    let receipt = receipts
+        .iter()
+        .find(|receipt| receipt.binding.is_some())
+        .expect("actual original function fold must be observed");
+    let binding = receipt.binding.as_ref().unwrap();
+    assert_eq!(
+        binding.selected.result_type,
+        FunctionResultType::Scalar(receipt.request_result.clone())
+    );
+    assert!(receipt.source_result_constraint.is_none());
+    assert_eq!(
+        receipt.source_constraint_origin,
+        Some(novarocks_sql::binding::SqlResultConstraintOrigin::Unconstrained)
+    );
+    assert_eq!(
+        receipt.source_decimal_policy,
+        Some(
+            novarocks_sql::sql_mode::SqlSemanticSettings::default()
+                .sql_mode()
+                .decimal_overflow_policy()
+        )
+    );
+    assert!(matches!(receipt.outcome, Some(Outcome::Produced(_))));
 }

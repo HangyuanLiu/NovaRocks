@@ -81,7 +81,7 @@ impl GroupConcatSourceFacts {
 /// Positive evidence of the constructor that supplied an exact result target.
 /// It is not inferred from a function name, selected result or source absence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum SqlResultConstraintOrigin {
+pub enum SqlResultConstraintOrigin {
     Unconstrained,
     EmptyArrayLiteral,
     ValueDomainConversion {
@@ -196,11 +196,11 @@ impl SqlFunctionBinding {
         self.0.group_concat.as_ref()
     }
 
-    pub(crate) fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {
+    pub fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {
         self.0.result_constraint.as_ref()
     }
 
-    pub(crate) fn result_constraint_origin(&self) -> &SqlResultConstraintOrigin {
+    pub fn result_constraint_origin(&self) -> &SqlResultConstraintOrigin {
         &self.0.result_constraint_origin
     }
 
