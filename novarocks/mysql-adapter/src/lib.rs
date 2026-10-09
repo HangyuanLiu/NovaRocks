@@ -18,6 +18,8 @@
 //! MySQL protocol adaptation for Query Application contracts.
 
 mod authentication;
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+mod closing_pressure_gate;
 mod connection_registry;
 mod disconnect_watcher;
 mod error_mapping;

@@ -81,6 +81,8 @@ pub(crate) async fn write_streaming_query_result_with_more<'writer, W: AsyncWrit
         more_results,
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         None,
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        None,
     )
     .await
 }
@@ -91,7 +93,37 @@ pub(crate) async fn write_streaming_query_result_with_gate<W: AsyncWrite + Unpin
     results: QueryResultWriter<'_, W>,
     hook: Option<crate::mysql_write_gate::late_binding::MysqlWriteRelayHook>,
 ) -> io::Result<()> {
-    match write_streaming_query_result_kernel(result, results, false, hook).await? {
+    match write_streaming_query_result_kernel(
+        result,
+        results,
+        false,
+        hook,
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        None,
+    )
+    .await?
+    {
+        MysqlStatementWriteOutcome::Continue(results) => results.no_more_results().await,
+        MysqlStatementWriteOutcome::Terminated => Ok(()),
+    }
+}
+
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+pub(crate) async fn write_streaming_query_result_with_pressure<W: AsyncWrite + Unpin>(
+    result: StreamingStatementResult,
+    results: QueryResultWriter<'_, W>,
+    pressure_hook: Option<crate::closing_pressure_gate::relay::PressureRelayHook>,
+) -> io::Result<()> {
+    match write_streaming_query_result_kernel(
+        result,
+        results,
+        false,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        None,
+        pressure_hook,
+    )
+    .await?
+    {
         MysqlStatementWriteOutcome::Continue(results) => results.no_more_results().await,
         MysqlStatementWriteOutcome::Terminated => Ok(()),
     }
@@ -103,6 +135,9 @@ async fn write_streaming_query_result_kernel<'writer, W: AsyncWrite + Unpin>(
     more_results: bool,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")] hook: Option<
         crate::mysql_write_gate::late_binding::MysqlWriteRelayHook,
+    >,
+    #[cfg(feature = "mem-1-m07-closing-pressure")] pressure_hook: Option<
+        crate::closing_pressure_gate::relay::PressureRelayHook,
     >,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     let schema_delivery = match result.begin_schema() {
@@ -121,6 +156,8 @@ async fn write_streaming_query_result_kernel<'writer, W: AsyncWrite + Unpin>(
         more_results,
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         hook,
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        pressure_hook,
     )
     .await
 }

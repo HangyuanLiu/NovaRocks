@@ -56,6 +56,9 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
     #[cfg(feature = "mem-1-m07-exact-mysql-write")] hook: Option<
         crate::mysql_write_gate::late_binding::MysqlWriteRelayHook,
     >,
+    #[cfg(feature = "mem-1-m07-closing-pressure")] pressure_hook: Option<
+        crate::closing_pressure_gate::relay::PressureRelayHook,
+    >,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     let limits = results.protocol_limits();
     let profile = match schema.row_carrier() {
@@ -122,6 +125,8 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                     None,
                     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
                     hook.as_ref(),
+                    #[cfg(feature = "mem-1-m07-closing-pressure")]
+                    pressure_hook.as_ref(),
                 )
                 .await
             }
@@ -140,6 +145,15 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
             drop(lease);
             let _ = result.fail();
             return Err(error);
+        }
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    if let Some(pressure) = &pressure_hook {
+        if let Err(original) = pressure.begin_rows(lease.receipt()) {
+            schema.fail(invalid("pressure original Rows hook refused"));
+            drop(lease);
+            let _ = result.fail();
+            return Err(original);
         }
     }
     schema.complete();
@@ -167,6 +181,8 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                     resident_window,
                     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
                     hook.as_ref(),
+                    #[cfg(feature = "mem-1-m07-closing-pressure")]
+                    pressure_hook.as_ref(),
                 )
                 .await;
             }
@@ -204,6 +220,21 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                 if let Err(error) = written {
                     return match error {
                         WriteInterruption::Query(error) => {
+                            #[cfg(feature = "mem-1-m07-closing-pressure")]
+                            if let Some(pressure) = &pressure_hook {
+                                // Actual borrowed write_body future has dropped when select! returns.
+                                if error.kind() == QueryExecutionErrorKind::Cancelled
+                                    && matches!(cancellation.reason(), Some(novarocks_query_application::cancellation::QueryCancellationReason::ExplicitKill { .. })) {
+                                    if let Err(original) = pressure.record_cancel(lease.receipt()) {
+                                        delivery.fail(error);
+                                        drop(lease);
+                                        let _ = result.fail();
+                                        return Err(original);
+                                    }
+                                } else {
+                                    pressure.fail(crate::closing_pressure_gate::Failure::Transition);
+                                }
+                            }
                             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
                             if let Some(hook) = &hook {
                                 // select! has returned: its actual Data write future
@@ -229,6 +260,8 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                                 resident_window,
                                 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
                                 hook.as_ref(),
+                                #[cfg(feature = "mem-1-m07-closing-pressure")]
+                                pressure_hook.as_ref(),
                             )
                             .await
                         }
@@ -247,6 +280,16 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                 delivery.complete();
             }
             ResultDelivery::End(delivery) => {
+                #[cfg(feature = "mem-1-m07-closing-pressure")]
+                if let Some(pressure) = &pressure_hook {
+                    pressure.fail(crate::closing_pressure_gate::Failure::Transition);
+                    let original =
+                        invalid("pressure target ended without its original cancelled Rows cut");
+                    delivery.fail(original.clone());
+                    drop(lease);
+                    let _ = result.fail();
+                    return Err(io_error(original));
+                }
                 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
                 if let Some(hook) = &hook {
                     // The armed target must observe its exact interrupted Data
@@ -305,6 +348,9 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
     #[cfg(feature = "mem-1-m07-exact-mysql-write")] hook: Option<
         &crate::mysql_write_gate::late_binding::MysqlWriteRelayHook,
     >,
+    #[cfg(feature = "mem-1-m07-closing-pressure")] pressure_hook: Option<
+        &crate::closing_pressure_gate::relay::PressureRelayHook,
+    >,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     if matches!(result.cancellation().reason(),
         Some(novarocks_query_application::cancellation::QueryCancellationReason::ExplicitKillConnection { .. }
@@ -322,8 +368,25 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
     ) {
         Ok(capacity) => capacity,
         Err(admission) => {
-            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            ))]
             let receipt = lease.receipt();
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            let legacy_capacity_refused = matches!(
+                admission,
+                novarocks_workload_control::WorkError::Capacity(_)
+            );
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            let pressure_record = match pressure_hook {
+                // The original writer/receipt is still live. Record before its actual destructor.
+                Some(pressure) => Some(pressure.record_capacity_refusal(receipt, admission)),
+                None => {
+                    let _ = admission;
+                    None
+                }
+            };
             if let Some(delivery) = delivery {
                 delivery.fail(error.clone());
             }
@@ -331,10 +394,7 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
             let _ = result.client_disconnected();
             let original = io_error(error);
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-            let original = if matches!(
-                admission,
-                novarocks_workload_control::WorkError::Capacity(_)
-            ) {
+            let original = if legacy_capacity_refused {
                 match hook {
                     Some(hook) => hook.prescribed_eof(crate::mysql_write_gate::late_binding::PrescribedRelayEofKind::ClosingAdmissionCapacityRefused, receipt, original),
                     None => original,
@@ -342,7 +402,20 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
             } else {
                 original
             };
-            #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            let original = match pressure_record {
+                Some(Err(hook_source)) => {
+                    crate::closing_pressure_gate::relay::preserve_refusal_hook_failure(
+                        original,
+                        hook_source,
+                    )
+                }
+                _ => original,
+            };
+            #[cfg(not(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            )))]
             let _ = admission;
             return Err(original);
         }
@@ -466,7 +539,20 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
     }
     // No Native stream, ordinary grant or root payload is held by this wait.
     // Repeated KILL cannot restart the independent absolute closing deadline.
-    match tokio::time::timeout(CLOSING_DEADLINE, closing.writer_mut().finish()).await {
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    let finished = tokio::time::timeout(CLOSING_DEADLINE, async {
+        // Original Closing observation and physical Gate hold both run INSIDE this original 5s.
+        if let Some(pressure) = pressure_hook {
+            return pressure
+                .finish_original_closing(closing_cursor, &mut closing)
+                .await;
+        }
+        closing.writer_mut().finish().await
+    })
+    .await;
+    #[cfg(not(feature = "mem-1-m07-closing-pressure"))]
+    let finished = tokio::time::timeout(CLOSING_DEADLINE, closing.writer_mut().finish()).await;
+    match finished {
         Ok(Ok(writer)) => {
             let _ = closing.settle_after_writer_exit().await;
             writer.no_more_results().await?;
