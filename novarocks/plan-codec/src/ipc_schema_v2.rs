@@ -23,6 +23,8 @@
 //! allocation; auxiliary builder/sorting storage is structurally bounded, not
 //! a formal MEM grant or a total-heap/RSS model.
 
+use crate::host_projection_v2::ProjectionFailure;
+type HostError<H> = ProjectionFailure<TypeCodecError, H>;
 use crate::physical_type_v2::{TypeCodecError, validate_field, validate_type};
 use arrow::datatypes::{DataType, Field};
 use flatbuffers::FlatBufferBuilder;
@@ -51,10 +53,10 @@ pub struct IpcSchemaProjectionLimits {
 pub(crate) mod owner_admission;
 mod writer_resources;
 use owner_admission::{Admission, Policy};
-pub(crate) use owner_admission::{SchemaAdmit, SchemaWriterRequestFacts};
+pub(crate) use owner_admission::{HostSchemaAdmit, SchemaAdmit, SchemaWriterRequestFacts};
 pub(crate) use writer_resources::{
     preflight_schema_writer_resources, schema_writer_prefix_resources,
-    schema_writer_prefix_resources_in,
+    schema_writer_prefix_resources_in, schema_writer_prefix_resources_with_host_in,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -112,16 +114,16 @@ impl Counts {
         )?;
         Ok(())
     }
-    fn field(
+    fn field<H>(
         &mut self,
         field: &Field,
         limits: IpcSchemaProjectionLimits,
         admission: &mut Option<(
             writer_resources::SchemaWriterPrefixFacts,
-            &mut Admission<'_, '_>,
+            &mut Admission<'_, '_, H>,
         )>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), TypeCodecError> {
+    ) -> Result<(), HostError<H>> {
         let policy = Policy(admission.is_some());
         let checked_add = |a, b| policy.numeric(checked_add(a, b));
         if let Some((_, admission)) = admission.as_ref() {
@@ -212,13 +214,13 @@ impl Counts {
             union_id_requests: self.union_id_requests,
         })
     }
-    fn publish(
+    fn publish<H>(
         &self,
         admission: &mut Option<(
             writer_resources::SchemaWriterPrefixFacts,
-            &mut Admission<'_, '_>,
+            &mut Admission<'_, '_, H>,
         )>,
-    ) -> Result<(), TypeCodecError> {
+    ) -> Result<(), HostError<H>> {
         if let Some((prefix, admission)) = admission.as_mut() {
             let schema = admission.policy().numeric(self.schema())?;
             writer_resources::counts_prefix(schema, *prefix, admission)?;
@@ -258,6 +260,12 @@ fn control_cause(error: TypeCodecError) -> novarocks_type_contract::CompileContr
     match error {
         TypeCodecError::Control(cause) => cause,
         _ => novarocks_type_contract::CompileControlError::ResourceExhausted,
+    }
+}
+fn control_cause_host<H>(error: HostError<H>) -> HostError<H> {
+    match error {
+        ProjectionFailure::Codec(error) => control_cause(error).into(),
+        ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
     }
 }
 
@@ -334,18 +342,19 @@ fn preflight_source(
     limits: IpcSchemaProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Counts, TypeCodecError> {
-    preflight_source_core(field, limits, None, work)
+    preflight_source_core::<std::convert::Infallible>(field, limits, None, work)
+        .map_err(ProjectionFailure::without_host)
 }
 
-fn preflight_source_core(
+fn preflight_source_core<H>(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
     mut admission: Option<(
         writer_resources::SchemaWriterPrefixFacts,
-        &mut Admission<'_, '_>,
+        &mut Admission<'_, '_, H>,
     )>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Counts, TypeCodecError> {
+) -> Result<Counts, HostError<H>> {
     let policy = Policy(admission.is_some());
     validate_field(field, work)?;
     novarocks_type_contract::field_logical_type(field)?;
@@ -367,7 +376,7 @@ fn preflight_source_core(
                 .checked_mul(4)
                 .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
             facts.work_upper_bound = facts.work_upper_bound.max(scratch_work);
-            admission.update(facts).map_err(control_cause)
+            admission.update(facts).map_err(control_cause_host)
         };
         let mut capture = |visit: ValueTypeVisit<'_>| {
             if let ValueTypeVisit::Field(field) = visit {
@@ -394,9 +403,12 @@ fn preflight_source_core(
                     Policy(true).numeric(writer_resources::reader_facts(schema, *prefix))
                 })
                 .map_err(control_cause)?;
-            current.borrow_mut().update(facts).map_err(control_cause)
+            current
+                .borrow_mut()
+                .update(facts)
+                .map_err(control_cause_host)
         };
-        crate::physical_type_v2::validate_type_with_scratch_observed(
+        crate::physical_type_v2::validate_type_with_scratch_host_observed(
             field.data_type(),
             &mut scratch_gate,
             &mut capture,
@@ -407,33 +419,39 @@ fn preflight_source_core(
     }
     let mut counts = Counts::default();
     counts.field(field, limits, &mut admission, work)?;
-    validate_value_type_structure_observed(field.data_type(), |visit| {
-        if admission.is_none() {
-            work.step()?;
-        }
-        match visit {
-            ValueTypeVisit::TypeNode(ty) => {
-                counts.type_header(ty, limits, policy)?;
-                match ty {
-                    DataType::Dictionary(_, value)
-                        if matches!(value.as_ref(), DataType::Dictionary(_, _)) =>
-                    {
-                        return Err(TypeCodecError::InvalidShape(
-                            "direct nested dictionary has no inner IPC Field identity",
-                        ));
-                    }
-                    _ => {}
-                }
+    validate_value_type_structure_observed(
+        field.data_type(),
+        |visit| -> Result<(), HostError<H>> {
+            if admission.is_none() {
+                work.step()?;
             }
-            ValueTypeVisit::Field(field) => counts.field(field, limits, &mut admission, work)?,
-            ValueTypeVisit::ChildEdge(_) => {}
-        }
-        counts.publish(&mut admission)?;
-        if admission.is_some() {
-            work.step()?;
-        }
-        Ok(())
-    })?;
+            match visit {
+                ValueTypeVisit::TypeNode(ty) => {
+                    counts.type_header(ty, limits, policy)?;
+                    match ty {
+                        DataType::Dictionary(_, value)
+                            if matches!(value.as_ref(), DataType::Dictionary(_, _)) =>
+                        {
+                            return Err((TypeCodecError::InvalidShape(
+                                "direct nested dictionary has no inner IPC Field identity",
+                            ))
+                            .into());
+                        }
+                        _ => {}
+                    }
+                }
+                ValueTypeVisit::Field(field) => {
+                    counts.field(field, limits, &mut admission, work)?
+                }
+                ValueTypeVisit::ChildEdge(_) => {}
+            }
+            counts.publish(&mut admission)?;
+            if admission.is_some() {
+                work.step()?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(counts)
 }
 
@@ -442,18 +460,19 @@ pub(crate) fn preflight_writer(
     limits: IpcSchemaProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SchemaPreflight, TypeCodecError> {
-    preflight_writer_core(field, limits, None, work)
+    preflight_writer_core::<std::convert::Infallible>(field, limits, None, work)
+        .map_err(ProjectionFailure::without_host)
 }
 
-fn preflight_writer_core(
+fn preflight_writer_core<H>(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
     admission: Option<(
         writer_resources::SchemaWriterPrefixFacts,
-        &mut Admission<'_, '_>,
+        &mut Admission<'_, '_, H>,
     )>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<SchemaPreflight, TypeCodecError> {
+) -> Result<SchemaPreflight, HostError<H>> {
     let policy = Policy(admission.is_some());
     let counts = preflight_source_core(field, limits, admission, work)?;
     let schema = policy.numeric(counts.schema())?;
@@ -463,11 +482,12 @@ fn preflight_writer_core(
         "IPC schema FlatBuffer envelope exceeded",
     )?;
     if schema.backing >= (1usize << 31) {
-        return Err(if policy.0 {
+        return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
         } else {
             TypeCodecError::InvalidShape("IPC schema FlatBuffer envelope exceeded")
-        });
+        })
+        .into());
     }
     Ok(schema)
 }
@@ -481,22 +501,23 @@ pub fn encode_single_field_schema(
     control: &dyn PureCompileControl,
 ) -> Result<Vec<u8>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = encode_schema_core(field, limits, None, &mut work);
+    let result = encode_schema_core::<std::convert::Infallible>(field, limits, None, &mut work)
+        .map_err(ProjectionFailure::without_host);
     if matches!(&result, Err(TypeCodecError::Control(_))) {
         return result;
     }
     work.finish()?;
     result
 }
-fn encode_schema_core(
+fn encode_schema_core<H>(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
     mut admission: Option<(
         writer_resources::SchemaWriterPrefixFacts,
-        &mut Admission<'_, '_>,
+        &mut Admission<'_, '_, H>,
     )>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<u8>, TypeCodecError> {
+) -> Result<Vec<u8>, HostError<H>> {
     (|| {
         let facts = if let Some((prefix, admission)) = admission.as_mut() {
             preflight_writer_core(field, limits, Some((*prefix, &mut **admission)), work)?
@@ -547,9 +568,10 @@ fn encode_schema_core(
         // The proven primary backing cover must prevent builder growth. This
         // postcondition is a source-model witness, not allocation admission.
         if builder.mut_finished_buffer().0.len() > capacity {
-            return Err(TypeCodecError::InvalidShape(
+            return Err((TypeCodecError::InvalidShape(
                 "IPC schema exceeded its proven backing cover",
-            ));
+            ))
+            .into());
         }
         // These are source-derived bounds for this exact writer: every
         // emitted table is counted, and the backing cover also bounds the
@@ -606,6 +628,18 @@ impl PreparedSchemaWriter<'_> {
         admit: &mut SchemaAdmit<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Vec<u8>, TypeCodecError> {
+        self.emit_with_host_in(
+            &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
+            work,
+        )
+        .map_err(ProjectionFailure::without_host)
+    }
+
+    pub(crate) fn emit_with_host_in<H>(
+        &self,
+        admit: &mut HostSchemaAdmit<'_, H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<u8>, HostError<H>> {
         let mut admission = Admission {
             parent: Some(admit),
             source: self.source,
@@ -630,10 +664,29 @@ pub(crate) fn prepare_schema_writer_in<'field>(
     admit: &mut SchemaAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedSchemaWriter<'field>, TypeCodecError> {
-    let prefix = writer_resources::schema_writer_prefix_resources_in(
+    prepare_schema_writer_with_host_in(
+        field,
+        source,
+        limits,
+        max_work,
+        &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(crate) fn prepare_schema_writer_with_host_in<'field, H>(
+    field: &'field Field,
+    source: usize,
+    limits: IpcSchemaProjectionLimits,
+    max_work: usize,
+    admit: &mut HostSchemaAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedSchemaWriter<'field>, HostError<H>> {
+    let prefix = writer_resources::schema_writer_prefix_resources_with_host_in(
         field, source, limits, max_work, admit, work,
     )?;
-    prepare_schema_writer_with_prefix_in(field, source, limits, max_work, prefix, admit, work)
+    prepare_schema_writer_with_prefix_host_in(field, source, limits, max_work, prefix, admit, work)
 }
 
 pub(crate) fn prepare_schema_writer_with_prefix_in<'field>(
@@ -645,6 +698,27 @@ pub(crate) fn prepare_schema_writer_with_prefix_in<'field>(
     admit: &mut SchemaAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedSchemaWriter<'field>, TypeCodecError> {
+    prepare_schema_writer_with_prefix_host_in(
+        field,
+        source,
+        limits,
+        max_work,
+        prefix,
+        &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(crate) fn prepare_schema_writer_with_prefix_host_in<'field, H>(
+    field: &'field Field,
+    source: usize,
+    limits: IpcSchemaProjectionLimits,
+    max_work: usize,
+    prefix: writer_resources::SchemaWriterPrefixFacts,
+    admit: &mut HostSchemaAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedSchemaWriter<'field>, HostError<H>> {
     let mut admission = Admission {
         parent: Some(admit),
         source,
@@ -727,8 +801,11 @@ pub(crate) fn verify_single_field_schema_in(
     )?;
     source_floor(expected, source)?;
     let prefix = policy.numeric(writer_resources::prefix_initial(expected, source))?;
+    let mut parent = |facts: &SchemaWriterRequestFacts| {
+        admit(facts).map_err(HostError::<std::convert::Infallible>::from)
+    };
     let mut admission = Admission {
-        parent: Some(admit),
+        parent: Some(&mut parent),
         source,
         reader: true,
         max_work,
@@ -761,9 +838,11 @@ pub(crate) fn verify_single_field_schema_in(
         limits.max_field_occurrences,
         "IPC schema field envelope exceeded",
     )?;
-    writer_resources::counts_prefix(policy.numeric(initial.schema())?, prefix, &mut admission)?;
+    writer_resources::counts_prefix(policy.numeric(initial.schema())?, prefix, &mut admission)
+        .map_err(ProjectionFailure::without_host)?;
     (|| {
-        preflight_source_core(expected, limits, Some((prefix, &mut admission)), work)?;
+        preflight_source_core(expected, limits, Some((prefix, &mut admission)), work)
+            .map_err(ProjectionFailure::without_host)?;
         verify_message(metadata, expected, verifier, work)
     })()
 }

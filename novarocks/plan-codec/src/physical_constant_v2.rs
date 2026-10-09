@@ -22,7 +22,6 @@
 use crate::{
     ipc_flat_pool_v2::{
         FlatPoolWriteFacts, FlatPoolWriteLimits, PreparedFlatPoolWriter, prepare_flat_pool_write,
-        prepare_flat_pool_write_in,
     },
     ipc_flat_stream_v2::{
         FlatPoolResourceError, FlatReaderError, FlatReaderProjectionLimits,
@@ -30,7 +29,6 @@ use crate::{
     },
     ipc_recursive_pool_v2::{
         PreparedRecursivePoolWriter, RecursivePoolWriteLimits, prepare_recursive_pool_write,
-        prepare_recursive_pool_write_in,
     },
     ipc_recursive_stream_v2::{
         RecursiveReaderProjectionLimits, RecursiveStreamProjectionLimits,
@@ -288,7 +286,34 @@ pub fn encode_constant_record(
     .emit()
 }
 
-type WriterAdmit<'a> = dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError> + 'a;
+use crate::host_projection_v2::{AdmissionRefusal, ProjectionFailure};
+type HostError<H> = ProjectionFailure<PhysicalConstantCodecError, H>;
+type HostTypeError<H> = ProjectionFailure<TypeCodecError, H>;
+type HostWriterAdmit<'a, H> = dyn FnMut(&FlatPoolWriteFacts) -> Result<(), HostTypeError<H>> + 'a;
+fn writer_refusal<H>(error: AdmissionRefusal<H>) -> HostTypeError<H> {
+    match error {
+        AdmissionRefusal::Control(cause) => cause.into(),
+        AdmissionRefusal::Host(error) => ProjectionFailure::Host(error),
+    }
+}
+impl<H> From<CompileControlError> for HostError<H> {
+    fn from(cause: CompileControlError) -> Self {
+        Self::Codec(cause.into())
+    }
+}
+impl<H> From<TypeCodecError> for HostError<H> {
+    fn from(error: TypeCodecError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<HostTypeError<H>> for HostError<H> {
+    fn from(error: HostTypeError<H>) -> Self {
+        match error {
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+            ProjectionFailure::Host(error) => Self::Host(error),
+        }
+    }
+}
 
 enum PreparedWriter<'pool, 'control> {
     Flat(PreparedFlatPoolWriter<'pool, 'control>),
@@ -314,7 +339,9 @@ impl PreparedConstantRecordWrite<'_, '_> {
     }
     pub fn emit(self) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
-        let result = self.emit_core(None, &mut work);
+        let result = self
+            .emit_core::<std::convert::Infallible>(None, &mut work)
+            .map_err(ProjectionFailure::without_host);
         finish(work, result)
     }
     pub fn emit_in(
@@ -322,28 +349,48 @@ impl PreparedConstantRecordWrite<'_, '_> {
         admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
+        self.emit_with_host_in(
+            &mut |facts| {
+                admit(facts).map_err(AdmissionRefusal::<std::convert::Infallible>::Control)
+            },
+            work,
+        )
+        .map_err(ProjectionFailure::without_host)
+    }
+
+    pub fn emit_with_host_in<H>(
+        self,
+        admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), AdmissionRefusal<H>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<wire::IpcConstantPool, HostError<H>> {
         if !std::ptr::addr_eq(self.control, work.control()) {
             return Err(PhysicalConstantCodecError::InvalidShape(
                 "constant record caller work has a different original control",
-            ));
+            )
+            .into());
         }
-        admit(self.facts())?;
-        self.emit_core(Some(admit), work)
+        admit(self.facts()).map_err(writer_refusal)?;
+        self.emit_core(
+            Some(&mut |facts| admit(facts).map_err(writer_refusal)),
+            work,
+        )
     }
-    fn emit_core(
+    fn emit_core<H>(
         self,
-        mut admit: Option<&mut WriterAdmit<'_>>,
+        mut admit: Option<&mut HostWriterAdmit<'_, H>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
+    ) -> Result<wire::IpcConstantPool, HostError<H>> {
         (|| {
             work.flush()?;
             let arrow_ipc = match self.writer {
                 PreparedWriter::Flat(writer) => match &mut admit {
-                    Some(parent) => writer.emit_in(*parent, work)?,
+                    Some(parent) => writer.emit_with_host_in(*parent, work)?,
                     None => writer.emit(work.control())?,
                 },
                 PreparedWriter::Recursive(writer) => match &mut admit {
-                    Some(parent) => writer.emit_in(&mut |facts| parent(&facts.flat), work)?,
+                    Some(parent) => {
+                        writer.emit_with_host_in(&mut |facts| parent(&facts.flat), work)?
+                    }
                     None => writer.emit(work.control())?,
                 },
             };
@@ -371,7 +418,7 @@ pub fn prepare_constant_record_write<'pool, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = prepare_record_core(
+    let result = prepare_record_core::<std::convert::Infallible>(
         id,
         value_type_id,
         field_id,
@@ -381,7 +428,7 @@ pub fn prepare_constant_record_write<'pool, 'control>(
         None,
         &mut work,
     );
-    finish(work, result)
+    finish(work, result.map_err(ProjectionFailure::without_host))
 }
 
 pub fn prepare_constant_record_write_in<'pool, 'control>(
@@ -394,6 +441,29 @@ pub fn prepare_constant_record_write_in<'pool, 'control>(
     admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
+    prepare_constant_record_write_with_host_in(
+        id,
+        value_type_id,
+        field_id,
+        pool,
+        source_retained_bytes,
+        limits,
+        &mut |facts| admit(facts).map_err(AdmissionRefusal::<std::convert::Infallible>::Control),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub fn prepare_constant_record_write_with_host_in<'pool, 'control, H>(
+    id: ConstantPoolId,
+    value_type_id: u32,
+    field_id: u32,
+    pool: &'pool ConstantPool,
+    source_retained_bytes: usize,
+    limits: ConstantWriteProjectionLimits,
+    admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantRecordWrite<'pool, 'control>, HostError<H>> {
     prepare_record_core(
         id,
         value_type_id,
@@ -401,34 +471,36 @@ pub fn prepare_constant_record_write_in<'pool, 'control>(
         pool,
         source_retained_bytes,
         limits,
-        Some(admit),
+        Some(&mut |facts| admit(facts).map_err(writer_refusal)),
         work,
     )
 }
 
-fn prepare_record_core<'pool, 'control>(
+fn prepare_record_core<'pool, 'control, H>(
     id: ConstantPoolId,
     value_type_id: u32,
     field_id: u32,
     pool: &'pool ConstantPool,
     source_retained_bytes: usize,
     limits: ConstantWriteProjectionLimits,
-    mut admit: Option<&mut WriterAdmit<'_>>,
+    mut admit: Option<&mut HostWriterAdmit<'_, H>>,
     work: &mut CompileCheckpoints<'control>,
-) -> Result<PreparedConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
+) -> Result<PreparedConstantRecordWrite<'pool, 'control>, HostError<H>> {
     (|| {
         if admit.is_none() {
             work.flush()?;
         }
         let writer = if recursive(pool.field().data_type()) {
             PreparedWriter::Recursive(match &mut admit {
-                Some(parent) => prepare_recursive_pool_write_in(
-                    pool,
-                    source_retained_bytes,
-                    limits.recursive,
-                    &mut |facts| parent(&facts.flat),
-                    work,
-                )?,
+                Some(parent) => {
+                    crate::ipc_recursive_pool_v2::prepare_recursive_pool_write_with_host_in(
+                        pool,
+                        source_retained_bytes,
+                        limits.recursive,
+                        &mut |facts| parent(&facts.flat),
+                        work,
+                    )?
+                }
                 None => prepare_recursive_pool_write(
                     pool,
                     source_retained_bytes,
@@ -438,7 +510,7 @@ fn prepare_record_core<'pool, 'control>(
             })
         } else {
             PreparedWriter::Flat(match &mut admit {
-                Some(parent) => prepare_flat_pool_write_in(
+                Some(parent) => crate::ipc_flat_pool_v2::prepare_flat_pool_write_with_host_in(
                     pool,
                     source_retained_bytes,
                     limits.flat,

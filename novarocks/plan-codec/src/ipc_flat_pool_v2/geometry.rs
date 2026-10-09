@@ -96,7 +96,7 @@ pub(crate) fn inspect_span(
     max_body_bytes: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, TypeCodecError> {
-    inspect_span_core(
+    inspect_span_core::<std::convert::Infallible>(
         data,
         start,
         rows,
@@ -106,35 +106,39 @@ pub(crate) fn inspect_span(
         None,
         work,
     )
+    .map_err(ProjectionFailure::without_host)
 }
 
-type GeometryCapture<'callback> = dyn FnMut(&Geometry) -> Result<(), TypeCodecError> + 'callback;
+use crate::host_projection_v2::ProjectionFailure;
+type HostError<H> = ProjectionFailure<TypeCodecError, H>;
+type GeometryCapture<'callback, H> = dyn FnMut(&Geometry) -> Result<(), HostError<H>> + 'callback;
 
-pub(crate) fn inspect_span_core(
+pub(crate) fn inspect_span_core<H>(
     data: &ArrayData,
     start: usize,
     rows: usize,
     max_rows: usize,
     max_buffers: usize,
     max_body_bytes: usize,
-    mut capture: Option<&mut GeometryCapture<'_>>,
+    mut capture: Option<&mut GeometryCapture<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Geometry, TypeCodecError> {
+) -> Result<Geometry, HostError<H>> {
     let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     let aligned = |a| policy.numeric(aligned(a));
     let mul = |a, b| policy.numeric(mul(a, b));
     let bit_bytes = |a| policy.numeric(bit_bytes(a));
     if add(start, rows)? > data.len() {
-        return Err(invalid());
+        return Err((invalid()).into());
     }
     let offset = add(data.offset(), start)?;
     if rows > max_rows || i64::try_from(rows).is_err() {
-        return Err(if policy.0 {
+        return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
         } else {
             TypeCodecError::InvalidShape("flat pool writer row envelope exceeded")
-        });
+        })
+        .into());
     }
     let kind = layout(data.data_type())?;
     let variadic = if matches!(kind, Layout::Views) {
@@ -149,11 +153,12 @@ pub(crate) fn inspect_span_core(
         _ => 2,
     };
     if buffers > max_buffers || i64::try_from(variadic).is_err() {
-        return Err(if policy.0 {
+        return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
         } else {
             TypeCodecError::InvalidShape("flat pool writer buffer envelope exceeded")
-        });
+        })
+        .into());
     }
     if capture.is_none() {
         work.step()?;
@@ -173,15 +178,16 @@ pub(crate) fn inspect_span_core(
         capture(&result)?;
         work.step()?;
     }
-    let mut charge = |bytes: usize| -> Result<(), TypeCodecError> {
+    let mut charge = |bytes: usize| -> Result<(), HostError<H>> {
         result.body_bytes = add(result.body_bytes, aligned(bytes)?)?;
         result.payload_bytes = add(result.payload_bytes, bytes)?;
         if result.body_bytes > max_body_bytes || i64::try_from(result.body_bytes).is_err() {
-            return Err(if policy.0 {
+            return Err((if policy.0 {
                 novarocks_type_contract::CompileControlError::ResourceExhausted.into()
             } else {
                 TypeCodecError::InvalidShape("flat pool writer body envelope exceeded")
-            });
+            })
+            .into());
         }
         if let Some(capture) = capture.as_deref_mut() {
             capture(&result)?;
@@ -200,7 +206,7 @@ pub(crate) fn inspect_span_core(
             // range arithmetic so this projection never assumes a wrapping sum.
             let last = add(offset, rows)?;
             if bit_bytes(last)? > data.buffers()[0].len() {
-                return Err(invalid());
+                return Err((invalid()).into());
             }
             charge(bytes)?;
             result.values_bytes = bytes;
@@ -209,7 +215,7 @@ pub(crate) fn inspect_span_core(
             let start = mul(offset, width)?;
             let bytes = mul(rows, width)?;
             if add(start, bytes)? > data.buffers()[0].len() {
-                return Err(invalid());
+                return Err((invalid()).into());
             }
             charge(bytes)?;
             result.values_start = start;
@@ -228,7 +234,7 @@ pub(crate) fn inspect_span_core(
             };
             let bytes = end.checked_sub(base).ok_or_else(invalid)?;
             if end > data.buffers()[1].len() {
-                return Err(invalid());
+                return Err((invalid()).into());
             }
             charge(offset_bytes)?;
             charge(bytes)?;
@@ -240,7 +246,7 @@ pub(crate) fn inspect_span_core(
             let start = mul(offset, 16)?;
             let bytes = mul(rows, 16)?;
             if add(start, bytes)? > data.buffers()[0].len() {
-                return Err(invalid());
+                return Err((invalid()).into());
             }
             charge(bytes)?;
             for buffer in data.buffers().iter().skip(1) {
@@ -262,6 +268,25 @@ pub(crate) fn inspect_in(
     capture: &mut dyn FnMut(&Geometry) -> Result<(), TypeCodecError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, TypeCodecError> {
+    inspect_with_host_in(
+        pool,
+        max_rows,
+        max_buffers,
+        max_body_bytes,
+        &mut |geometry| capture(geometry).map_err(HostError::<std::convert::Infallible>::from),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(crate) fn inspect_with_host_in<H>(
+    pool: &ConstantPool,
+    max_rows: usize,
+    max_buffers: usize,
+    max_body_bytes: usize,
+    capture: &mut dyn FnMut(&Geometry) -> Result<(), HostError<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, HostError<H>> {
     inspect_span_core(
         pool.data(),
         0,

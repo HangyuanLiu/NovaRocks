@@ -88,23 +88,25 @@ fn profile(
     Ok(())
 }
 
-type NodeCapture<'node, 'callback> =
-    dyn FnMut(&Node<'node>, bool) -> Result<(), TypeCodecError> + 'callback;
-type GeometryCapture<'callback> = dyn FnMut(&Geometry) -> Result<(), TypeCodecError> + 'callback;
+use crate::host_projection_v2::ProjectionFailure;
+type HostError<H> = ProjectionFailure<TypeCodecError, H>;
+type NodeCapture<'node, 'callback, H> =
+    dyn FnMut(&Node<'node>, bool) -> Result<(), HostError<H>> + 'callback;
+type GeometryCapture<'callback, H> = dyn FnMut(&Geometry) -> Result<(), HostError<H>> + 'callback;
 
-pub(super) fn node_core<'a>(
+pub(super) fn node_core<'a, H>(
     span: Span<'a>,
     count_nulls: bool,
-    capture: &mut Option<&mut NodeCapture<'a, '_>>,
+    capture: &mut Option<&mut NodeCapture<'a, '_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Node<'a>, TypeCodecError> {
+) -> Result<Node<'a>, HostError<H>> {
     let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     let mul = |a, b| policy.numeric(mul(a, b));
     let aligned = |a| policy.numeric(aligned(a));
     let bit_bytes = |a| policy.numeric(bit_bytes(a));
     if add(span.start, span.len)? > span.data.len() || i64::try_from(span.len).is_err() {
-        return Err(invalid());
+        return Err((invalid()).into());
     }
     work.step()?;
     let null_count = if !count_nulls {
@@ -159,7 +161,7 @@ pub(super) fn node_core<'a>(
             let extent = end.checked_sub(base).ok_or_else(invalid)?;
             let child = span.data.child_data().first().ok_or_else(invalid)?;
             if end > child.len() {
-                return Err(invalid());
+                return Err((invalid()).into());
             }
             let validity = bit_bytes(span.len)?;
             let offsets = mul(add(span.len, 1)?, width)?;
@@ -245,20 +247,29 @@ pub(super) fn walk<'a>(
     work: &mut CompileCheckpoints<'_>,
     visit: &mut impl FnMut(&Node<'a>, &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError>,
 ) -> Result<(), TypeCodecError> {
-    walk_core(span, reverse, count_nulls, depth, &mut None, work, visit)
+    walk_core::<std::convert::Infallible>(
+        span,
+        reverse,
+        count_nulls,
+        depth,
+        &mut None,
+        work,
+        &mut |node, work| visit(node, work).map_err(HostError::<std::convert::Infallible>::from),
+    )
+    .map_err(ProjectionFailure::without_host)
 }
 
-pub(super) fn walk_core<'a>(
+pub(super) fn walk_core<'a, H>(
     span: Span<'a>,
     reverse: bool,
     count_nulls: bool,
     depth: usize,
-    capture: &mut Option<&mut NodeCapture<'a, '_>>,
+    capture: &mut Option<&mut NodeCapture<'a, '_, H>>,
     work: &mut CompileCheckpoints<'_>,
-    visit: &mut impl FnMut(&Node<'a>, &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError>,
-) -> Result<(), TypeCodecError> {
+    visit: &mut impl FnMut(&Node<'a>, &mut CompileCheckpoints<'_>) -> Result<(), HostError<H>>,
+) -> Result<(), HostError<H>> {
     if depth > MAX_VALUE_TYPE_DEPTH {
-        return Err(invalid());
+        return Err((invalid()).into());
     }
     let current = node_core(span, count_nulls, capture, work)?;
     let children = match span.data.data_type() {
@@ -267,7 +278,7 @@ pub(super) fn walk_core<'a>(
         _ => 0,
     };
     if children != span.data.child_data().len() {
-        return Err(invalid());
+        return Err((invalid()).into());
     }
     work.step()?;
     if reverse {
@@ -307,7 +318,8 @@ pub(super) fn inspect(
     limits: RecursivePoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, TypeCodecError> {
-    inspect_core(data, limits, None, work)
+    inspect_core::<std::convert::Infallible>(data, limits, None, work)
+        .map_err(ProjectionFailure::without_host)
 }
 
 pub(super) fn inspect_in(
@@ -316,23 +328,39 @@ pub(super) fn inspect_in(
     capture: &mut dyn FnMut(&Geometry) -> Result<(), TypeCodecError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, TypeCodecError> {
+    inspect_with_host_in(
+        data,
+        limits,
+        &mut |geometry| capture(geometry).map_err(HostError::<std::convert::Infallible>::from),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(super) fn inspect_with_host_in<H>(
+    data: &ArrayData,
+    limits: RecursivePoolWriteLimits,
+    capture: &mut dyn FnMut(&Geometry) -> Result<(), HostError<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, HostError<H>> {
     inspect_core(data, limits, Some(capture), work)
 }
 
-pub(super) fn inspect_core(
+pub(super) fn inspect_core<H>(
     data: &ArrayData,
     limits: RecursivePoolWriteLimits,
-    mut capture: Option<&mut GeometryCapture<'_>>,
+    mut capture: Option<&mut GeometryCapture<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Geometry, TypeCodecError> {
+) -> Result<Geometry, HostError<H>> {
     let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     if data.len() > limits.flat.max_rows {
-        return Err(if policy.0 {
+        return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
         } else {
             invalid()
-        });
+        })
+        .into());
     }
     work.step()?;
     profile(data.data_type(), 1, work)?;
@@ -345,7 +373,7 @@ pub(super) fn inspect_core(
     let mut summarize = |node: &Node<'_>,
                          complete: bool,
                          mut step: Option<&mut CompileCheckpoints<'_>>|
-     -> Result<(), TypeCodecError> {
+     -> Result<(), HostError<H>> {
         result = committed;
         result.nodes = add(result.nodes, 1)?;
         result.total_rows = add(result.total_rows, node.span.len)?;
@@ -368,11 +396,12 @@ pub(super) fn inspect_core(
             || u32::try_from(result.nodes).is_err()
             || u32::try_from(result.buffers).is_err()
         {
-            return Err(if policy.0 {
+            return Err((if policy.0 {
                 novarocks_type_contract::CompileControlError::ResourceExhausted.into()
             } else {
                 invalid()
-            });
+            })
+            .into());
         }
         if let Some(capture) = capture.as_deref_mut() {
             capture(&result)?;
@@ -400,7 +429,7 @@ pub(super) fn inspect_core(
             },
         )?;
     } else {
-        walk(
+        walk_core(
             Span {
                 data,
                 start: 0,
@@ -409,6 +438,7 @@ pub(super) fn inspect_core(
             false,
             false,
             1,
+            &mut None,
             work,
             &mut |node, work| summarize(node, true, Some(work)),
         )?;

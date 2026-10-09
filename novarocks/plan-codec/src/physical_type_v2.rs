@@ -945,6 +945,45 @@ pub(crate) fn validate_type_with_scratch_observed<'source>(
     capture: &mut impl FnMut(ValueTypeVisit<'source>) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
+    validate_type_with_scratch_host_observed(
+        ty,
+        &mut |layout| {
+            admit_scratch(layout).map_err(
+                crate::host_projection_v2::ProjectionFailure::<
+                    TypeCodecError,
+                    std::convert::Infallible,
+                >::from,
+            )
+        },
+        &mut |visit| {
+            capture(visit).map_err(
+                crate::host_projection_v2::ProjectionFailure::<
+                    TypeCodecError,
+                    std::convert::Infallible,
+                >::from,
+            )
+        },
+        work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+
+pub(crate) fn validate_type_with_scratch_host_observed<'source, H>(
+    ty: &'source DataType,
+    admit_scratch: &mut impl FnMut(
+        std::alloc::Layout,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
+    capture: &mut impl FnMut(
+        ValueTypeVisit<'source>,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
     let layout = std::alloc::Layout::new::<
         [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
     >();
@@ -955,7 +994,7 @@ pub(crate) fn validate_type_with_scratch_observed<'source>(
         &mut scratch,
         |visit| {
             capture(visit)?;
-            validate_type_visit(visit, work)
+            validate_type_visit(visit, work).map_err(Into::into)
         },
     )
 }

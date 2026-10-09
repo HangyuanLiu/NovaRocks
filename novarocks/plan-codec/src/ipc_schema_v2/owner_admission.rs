@@ -17,6 +17,8 @@
 
 //! Numerical policy for the original IPC writer resource authors.
 //! A snapshot replaces this child contribution; it is not a new wallet.
+use crate::host_projection_v2::ProjectionFailure;
+type HostError<H> = ProjectionFailure<crate::physical_type_v2::TypeCodecError, H>;
 use crate::physical_type_v2::TypeCodecError;
 use novarocks_type_contract::CompileControlError;
 
@@ -57,24 +59,27 @@ pub(crate) struct SchemaWriterRequestFacts {
 pub(crate) type SchemaAdmit<'a> =
     dyn FnMut(&SchemaWriterRequestFacts) -> Result<(), CompileControlError> + 'a;
 
-pub(super) struct Admission<'a, 'b> {
-    pub parent: Option<&'a mut SchemaAdmit<'b>>,
+pub(crate) type HostSchemaAdmit<'a, H> =
+    dyn FnMut(&SchemaWriterRequestFacts) -> Result<(), HostError<H>> + 'a;
+
+pub(super) struct Admission<'a, 'b, H> {
+    pub parent: Option<&'a mut HostSchemaAdmit<'b, H>>,
     pub source: usize,
     pub reader: bool,
     pub max_work: usize,
     pub facts: SchemaWriterRequestFacts,
 }
-impl Admission<'_, '_> {
+impl<H> Admission<'_, '_, H> {
     pub fn policy(&self) -> Policy {
         Policy(self.parent.is_some())
     }
-    pub fn update(&mut self, facts: SchemaWriterRequestFacts) -> Result<(), TypeCodecError> {
+    pub fn update(&mut self, facts: SchemaWriterRequestFacts) -> Result<(), HostError<H>> {
         self.facts.request_bytes = self.facts.request_bytes.max(facts.request_bytes);
         self.facts.request_count = self.facts.request_count.max(facts.request_count);
         self.facts.work_upper_bound = self.facts.work_upper_bound.max(facts.work_upper_bound);
         if let Some(parent) = self.parent.as_mut() {
             if self.facts.work_upper_bound > self.max_work {
-                return Err(CompileControlError::ResourceExhausted.into());
+                return Err(TypeCodecError::from(CompileControlError::ResourceExhausted).into());
             }
             parent(&self.facts)?;
         }

@@ -20,14 +20,16 @@ use super::{
     FlatPoolWriteFacts, FlatPoolWriteLimits,
     geometry::{Geometry, add, mul},
 };
+use crate::host_projection_v2::ProjectionFailure;
 use crate::{ipc_schema_v2::SchemaWriterRequestFacts, physical_type_v2::TypeCodecError};
 use novarocks_type_contract::CompileControlError;
-pub(crate) struct Admission<'a, 'b> {
-    pub parent: &'a mut (dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError> + 'b),
+type HostError<H> = ProjectionFailure<TypeCodecError, H>;
+pub(crate) struct Admission<'a, 'b, H> {
+    pub parent: &'a mut (dyn FnMut(&FlatPoolWriteFacts) -> Result<(), HostError<H>> + 'b),
     pub limits: FlatPoolWriteLimits,
     pub facts: FlatPoolWriteFacts,
 }
-impl Admission<'_, '_> {
+impl<H> Admission<'_, '_, H> {
     pub fn initial(
         source: usize,
         rows: usize,
@@ -56,7 +58,7 @@ impl Admission<'_, '_> {
             cumulative_library_work_upper_bound: work,
         })
     }
-    pub fn gate(&mut self) -> Result<(), CompileControlError> {
+    pub fn gate(&mut self) -> Result<(), HostError<H>> {
         let f = &self.facts;
         let l = &self.limits;
         if f.rows > l.max_rows
@@ -68,11 +70,11 @@ impl Admission<'_, '_> {
                 > l.max_coexisting_source_and_request_bytes
             || f.cumulative_library_work_upper_bound > l.max_cumulative_library_work
         {
-            return Err(CompileControlError::ResourceExhausted);
+            return Err((CompileControlError::ResourceExhausted).into());
         }
         (self.parent)(&self.facts)
     }
-    pub fn schema(&mut self, s: &SchemaWriterRequestFacts) -> Result<(), CompileControlError> {
+    pub fn schema(&mut self, s: &SchemaWriterRequestFacts) -> Result<(), HostError<H>> {
         self.facts.new_allocation_request_bytes_upper_bound = self
             .facts
             .new_allocation_request_bytes_upper_bound
@@ -92,7 +94,7 @@ impl Admission<'_, '_> {
         .map_err(|_| CompileControlError::ResourceExhausted)?;
         self.gate()
     }
-    pub fn geometry(&mut self, g: &Geometry) -> Result<(), TypeCodecError> {
+    pub fn geometry(&mut self, g: &Geometry) -> Result<(), HostError<H>> {
         self.facts.rows = g.rows;
         self.facts.buffer_descriptors = g.buffers;
         self.facts.variadic_buffers = g.variadic;
@@ -108,10 +110,7 @@ impl Admission<'_, '_> {
         self.gate()?;
         Ok(())
     }
-    pub fn complete(
-        &mut self,
-        f: FlatPoolWriteFacts,
-    ) -> Result<FlatPoolWriteFacts, CompileControlError> {
+    pub fn complete(&mut self, f: FlatPoolWriteFacts) -> Result<FlatPoolWriteFacts, HostError<H>> {
         let old = self.facts;
         self.facts = f;
         self.facts.new_allocation_request_bytes_upper_bound = f

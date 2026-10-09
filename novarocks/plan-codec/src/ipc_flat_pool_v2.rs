@@ -137,16 +137,17 @@ fn prepare<'pool>(
     limits: FlatPoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Prepared<'pool>, TypeCodecError> {
-    prepare_core(pool, source, limits, None, work)
+    prepare_core::<std::convert::Infallible>(pool, source, limits, None, work)
+        .map_err(ProjectionFailure::without_host)
 }
 
-fn prepare_core<'pool>(
+fn prepare_core<'pool, H>(
     pool: &'pool ConstantPool,
     source: usize,
     limits: FlatPoolWriteLimits,
-    mut admission: Option<&mut progress::Admission<'_, '_>>,
+    mut admission: Option<&mut progress::Admission<'_, '_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Prepared<'pool>, TypeCodecError> {
+) -> Result<Prepared<'pool>, HostError<H>> {
     let policy = ipc_schema_v2::owner_admission::Policy(admission.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     let cap = |a, b, c| policy.cap(a, b, c);
@@ -163,7 +164,7 @@ fn prepare_core<'pool>(
         && arrow::ARROW_VERSION == "58.2.0"
         && cfg!(target_endian = "little"))
     {
-        return Err(shape("flat pool writer source or endian model changed"));
+        return Err((shape("flat pool writer source or endian model changed")).into());
     }
     let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
         .map_err(|_| shape("flat pool source retention is not representable"))?;
@@ -174,7 +175,7 @@ fn prepare_core<'pool>(
     )?;
     work.step()?;
     let geometry = if let Some(admission) = admission.as_deref_mut() {
-        geometry::inspect_in(
+        geometry::inspect_with_host_in(
             pool,
             limits.max_rows,
             limits.max_buffer_descriptors,
@@ -192,7 +193,7 @@ fn prepare_core<'pool>(
         )?
     };
     if geometry.buffers > u32::MAX as usize {
-        return Err(shape("flat pool buffer vector is not representable"));
+        return Err((shape("flat pool buffer vector is not representable")).into());
     }
     cap(
         policy.numeric(source_work(source, pool.field().metadata().len()))?,
@@ -214,7 +215,7 @@ fn prepare_core<'pool>(
     )?;
     work.flush()?;
     let schema_token = if let Some(admission) = admission.as_deref_mut() {
-        Some(ipc_schema_v2::prepare_schema_writer_in(
+        Some(ipc_schema_v2::prepare_schema_writer_with_host_in(
             pool.field(),
             source,
             limits.schema,
@@ -317,8 +318,9 @@ fn prepare_core<'pool>(
 
 /// Sealed geometry/model preparation bound to the original checked pool.
 /// The preparation scratch and host authorization remain earlier obligations.
-type PoolAdmit<'callback> =
-    dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError> + 'callback;
+use crate::host_projection_v2::ProjectionFailure;
+type HostError<H> = ProjectionFailure<TypeCodecError, H>;
+type HostPoolAdmit<'a, H> = dyn FnMut(&FlatPoolWriteFacts) -> Result<(), HostError<H>> + 'a;
 
 pub(crate) struct PreparedFlatPoolWriter<'p, 'control> {
     pool: &'p ConstantPool,
@@ -335,11 +337,23 @@ impl PreparedFlatPoolWriter<'_, '_> {
         admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Vec<u8>, TypeCodecError> {
+        self.emit_with_host_in(
+            &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
+            work,
+        )
+        .map_err(ProjectionFailure::without_host)
+    }
+
+    pub(crate) fn emit_with_host_in<H>(
+        self,
+        admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), HostError<H>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<u8>, HostError<H>> {
         if !self
             .control
             .is_some_and(|control| std::ptr::addr_eq(control, work.control()))
         {
-            return Err(shape("flat pool writer belongs to another control"));
+            return Err((shape("flat pool writer belongs to another control")).into());
         }
         admit(&self.prepared.facts)?;
         emit_prepared_core(self.pool, self.prepared, self.limits, Some(admit), work)
@@ -392,7 +406,24 @@ pub(crate) fn prepare_flat_pool_write_in<'pool, 'control>(
     admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedFlatPoolWriter<'pool, 'control>, TypeCodecError> {
-    let facts = progress::Admission::initial(source, pool.data().len(), limits)?;
+    prepare_flat_pool_write_with_host_in(
+        pool,
+        source,
+        limits,
+        &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(crate) fn prepare_flat_pool_write_with_host_in<'pool, 'control, H>(
+    pool: &'pool ConstantPool,
+    source: usize,
+    limits: FlatPoolWriteLimits,
+    admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), HostError<H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedFlatPoolWriter<'pool, 'control>, HostError<H>> {
+    let facts = progress::Admission::<H>::initial(source, pool.data().len(), limits)?;
     let mut admission = progress::Admission {
         parent: admit,
         limits,
@@ -502,19 +533,20 @@ fn emit_prepared(
     limits: FlatPoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, TypeCodecError> {
-    emit_prepared_core(pool, prepared, limits, None, work)
+    emit_prepared_core::<std::convert::Infallible>(pool, prepared, limits, None, work)
+        .map_err(ProjectionFailure::without_host)
 }
 
-fn emit_prepared_core(
+fn emit_prepared_core<H>(
     pool: &ConstantPool,
     prepared: Prepared<'_>,
     limits: FlatPoolWriteLimits,
-    mut admit: Option<&mut PoolAdmit<'_>>,
+    mut admit: Option<&mut HostPoolAdmit<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<u8>, TypeCodecError> {
+) -> Result<Vec<u8>, HostError<H>> {
     work.flush()?;
     let schema = if let Some(schema) = &prepared.schema {
-        schema.emit_in(
+        schema.emit_with_host_in(
             &mut |_| {
                 if let Some(admit) = admit.as_deref_mut() {
                     admit(&prepared.facts)?;
@@ -540,9 +572,7 @@ fn emit_prepared_core(
     // Witness the complete primary backing, not just the finished message.
     let backing = builder.mut_finished_buffer().0.len();
     if backing != prepared.facts.batch_backing_bytes_upper_bound {
-        return Err(shape(
-            "flat pool batch builder grew beyond its admitted backing",
-        ));
+        return Err((shape("flat pool batch builder grew beyond its admitted backing")).into());
     }
     let mut output = reserve(prepared.facts.encoded_stream_bytes_upper_bound, work)?;
     frame(&mut output, &schema, work)?;
@@ -558,7 +588,7 @@ fn emit_prepared_core(
     )?;
     append(&mut output, &[255, 255, 255, 255, 0, 0, 0, 0], work)?;
     if output.len() > prepared.facts.encoded_stream_bytes_upper_bound {
-        return Err(shape("flat pool encoded result exceeds admitted capacity"));
+        return Err((shape("flat pool encoded result exceeds admitted capacity")).into());
     }
     Ok(output)
 }

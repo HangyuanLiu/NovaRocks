@@ -20,7 +20,9 @@
 //! coexistence limits before the full helper begins its two type walks.
 //! These numbers neither admit memory nor cover batch metadata/body/output.
 
-use super::owner_admission::{Admission, SchemaAdmit, SchemaWriterRequestFacts};
+use super::owner_admission::{Admission, HostSchemaAdmit, SchemaAdmit, SchemaWriterRequestFacts};
+use crate::host_projection_v2::ProjectionFailure;
+type HostError<H> = ProjectionFailure<TypeCodecError, H>;
 use super::{IpcSchemaProjectionLimits, SchemaPreflight, checked_add as add, checked_mul as mul};
 use crate::{
     ipc_flat_batch_v2,
@@ -217,7 +219,7 @@ pub(crate) fn schema_writer_prefix_resources(
     max_preflight_library_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
-    schema_writer_prefix_core(
+    schema_writer_prefix_core::<std::convert::Infallible>(
         field,
         source_retained_bytes,
         _limits,
@@ -225,16 +227,17 @@ pub(crate) fn schema_writer_prefix_resources(
         None,
         work,
     )
+    .map_err(ProjectionFailure::without_host)
 }
 
-fn schema_writer_prefix_core(
+fn schema_writer_prefix_core<H>(
     field: &Field,
     source_retained_bytes: usize,
     _limits: IpcSchemaProjectionLimits,
     max_preflight_library_work: usize,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    mut admission: Option<&mut Admission<'_, '_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
+) -> Result<SchemaWriterPrefixFacts, HostError<H>> {
     let result = (|| {
         let policy = super::owner_admission::Policy(admission.is_some());
         let add = |a, b| policy.numeric(add(a, b));
@@ -349,7 +352,7 @@ fn schema_writer_prefix_core(
                     ) {
                         work.flush()?;
                     }
-                    Ok::<_, TypeCodecError>(())
+                    Ok::<_, HostError<H>>(())
                 },
             )?;
             add(
@@ -367,7 +370,10 @@ fn schema_writer_prefix_core(
             is_flat,
         })
     })();
-    if matches!(&result, Err(TypeCodecError::Control(_))) {
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Codec(TypeCodecError::Control(_)) | ProjectionFailure::Host(_))
+    ) {
         return result;
     }
     work.flush()?;
@@ -545,11 +551,11 @@ pub(super) fn prefix_initial(
         is_flat,
     })
 }
-pub(super) fn counts_prefix(
+pub(super) fn counts_prefix<H>(
     schema: SchemaPreflight,
     prefix: SchemaWriterPrefixFacts,
-    admission: &mut Admission<'_, '_>,
-) -> Result<(), TypeCodecError> {
+    admission: &mut Admission<'_, '_, H>,
+) -> Result<(), HostError<H>> {
     if admission.reader {
         let facts = admission.policy().numeric(reader_facts(schema, prefix))?;
         return admission.update(facts);
@@ -604,6 +610,25 @@ pub(crate) fn schema_writer_prefix_resources_in(
     admit: &mut SchemaAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
+    schema_writer_prefix_resources_with_host_in(
+        field,
+        source,
+        limits,
+        max_work,
+        &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(crate) fn schema_writer_prefix_resources_with_host_in<H>(
+    field: &Field,
+    source: usize,
+    limits: IpcSchemaProjectionLimits,
+    max_work: usize,
+    admit: &mut HostSchemaAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaWriterPrefixFacts, HostError<H>> {
     let mut admission = Admission {
         parent: Some(admit),
         source,
@@ -613,14 +638,14 @@ pub(crate) fn schema_writer_prefix_resources_in(
     };
     schema_writer_prefix_core(field, source, limits, max_work, Some(&mut admission), work)
 }
-pub(super) fn preflight_schema_writer_resources_in(
+pub(super) fn preflight_schema_writer_resources_in<H>(
     field: &Field,
     source: usize,
     limits: IpcSchemaProjectionLimits,
     prefix: SchemaWriterPrefixFacts,
-    admission: &mut Admission<'_, '_>,
+    admission: &mut Admission<'_, '_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<SchemaWriterAllocationFacts, TypeCodecError> {
+) -> Result<SchemaWriterAllocationFacts, HostError<H>> {
     let schema =
         super::preflight_writer_core(field, limits, Some((prefix, &mut *admission)), work)?;
     let actual_flat = ipc_flat_batch_v2::layout(field.data_type()).is_ok();
@@ -631,9 +656,9 @@ pub(super) fn preflight_schema_writer_resources_in(
     work.step()?; // original flat classification
     work.step()?; // original source-prefix comparison
     if !same {
-        return Err(TypeCodecError::InvalidShape(
-            "schema writer prefix differs from source",
-        ));
+        return Err(
+            (TypeCodecError::InvalidShape("schema writer prefix differs from source")).into(),
+        );
     }
     let facts = admission
         .policy()
