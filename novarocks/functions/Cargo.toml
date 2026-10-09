@@ -28,6 +28,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+datasketches = { workspace = true, features = ["hll"] }
 openssl = "0.10"
 url.workspace = true
 arrow-arith = "58.2.0"

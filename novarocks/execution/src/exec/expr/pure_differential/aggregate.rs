@@ -51,7 +51,6 @@ use novarocks_functions::{
     FunctionResultType, KernelFailure, PreparedAggregateHandle, PreparedPureKernel,
     PureCallPreparation, PureKernelAbi, ResolvedAggregateSignature, ResolvedFunctionBinding,
     ScopedExpressionEffects, SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
-    UnaccountedAggregateStateAllocator,
 };
 use novarocks_type_contract::{
     CallProofScope, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
@@ -840,7 +839,9 @@ impl PureAggregate {
     ) -> Result<AggregateStateColumn, KernelFailure> {
         let mut column = AggregateStateColumn::try_new(
             handle.clone(),
-            Arc::new(UnaccountedAggregateStateAllocator),
+            crate::exec::operators::compiled_aggregate::differential_aggregate_state_allocator(
+                MemTracker::new_root("pure-differential-aggregate-state"),
+            ),
             NonZeroUsize::new(64).expect("nonzero block"),
         )?;
         for _ in 0..groups {

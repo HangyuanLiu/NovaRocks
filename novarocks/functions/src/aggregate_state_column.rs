@@ -34,6 +34,12 @@ use std::{alloc::Layout, fmt, mem::MaybeUninit, num::NonZeroUsize, ptr::NonNull,
 
 /// Host authority over aggregate state backing memory.
 pub trait AggregateStateAllocator: Send + Sync {
+    /// Optional authority for opaque library backing. Existing block-only
+    /// allocators retain their original behavior and do not fabricate a grant.
+    fn opaque_allocation_host(&self) -> Option<&dyn crate::opaque_memory::OpaqueAllocationHost> {
+        None
+    }
+
     /// One block of exactly `layout`, which has a nonzero size. The host
     /// accounts for it until it is released.
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure>;

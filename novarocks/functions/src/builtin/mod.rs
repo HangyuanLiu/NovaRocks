@@ -287,6 +287,12 @@ mod string_to_base64;
 mod string_to_base64_owner;
 pub mod to_base64_shared;
 
+pub mod aggregate_ds_hll_core;
+pub mod aggregate_ds_hll_failure;
+pub mod aggregate_ds_hll_state;
+mod aggregate_ds_hll_kernel;
+mod aggregate_ds_hll_owner;
+pub mod ds_hll_state_core;
 pub mod aes_primitive;
 pub mod aes_rows;
 pub mod bytes_output;

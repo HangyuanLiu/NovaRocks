@@ -4015,6 +4015,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
+ "datasketches",
  "hashbrown 0.14.5",
  "hex",
  "md-5 0.10.6",

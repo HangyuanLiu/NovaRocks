@@ -104,43 +104,82 @@ pub fn numeric_value_at(
     }
 }
 
+pub enum PercentilePayloadFailure<'a> {
+    Downcast(&'static str),
+    Unsupported(&'a DataType),
+}
+impl PercentilePayloadFailure<'_> {
+    pub fn message<'a>(
+        &'a self,
+        context: PercentileInputDiagnostic<'a>,
+    ) -> PercentilePayloadMessage<'a> {
+        PercentilePayloadMessage {
+            failure: self,
+            context,
+        }
+    }
+}
+pub struct PercentilePayloadMessage<'a> {
+    failure: &'a PercentilePayloadFailure<'a>,
+    context: PercentileInputDiagnostic<'a>,
+}
+impl std::fmt::Display for PercentilePayloadMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.failure {
+            PercentilePayloadFailure::Downcast(kind) => {
+                write!(f, "{}: failed to downcast {}", self.context, kind)
+            }
+            PercentilePayloadFailure::Unsupported(ty) => write!(
+                f,
+                "{}: unsupported percentile payload type {:?}",
+                self.context, ty
+            ),
+        }
+    }
+}
 pub fn payload_bytes_at<'a>(
     array: &'a ArrayRef,
     row: usize,
     context: PercentileInputDiagnostic<'_>,
 ) -> Result<Option<&'a [u8]>, String> {
+    payload_bytes_at_with_failure(array, row, &mut |failure| {
+        failure.message(context).to_string()
+    })
+}
+pub fn payload_bytes_at_with_failure<'a, E>(
+    array: &'a ArrayRef,
+    row: usize,
+    fail: &mut impl FnMut(PercentilePayloadFailure<'_>) -> E,
+) -> Result<Option<&'a [u8]>, E> {
     match array.data_type() {
         DataType::Binary => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast BinaryArray"))?;
+                .ok_or_else(|| fail(PercentilePayloadFailure::Downcast("BinaryArray")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row)))
         }
         DataType::Utf8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast StringArray"))?;
+                .ok_or_else(|| fail(PercentilePayloadFailure::Downcast("StringArray")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row).as_bytes()))
         }
         DataType::LargeBinary => {
             let arr = array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast LargeBinaryArray"))?;
+                .ok_or_else(|| fail(PercentilePayloadFailure::Downcast("LargeBinaryArray")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row)))
         }
         DataType::LargeUtf8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast LargeStringArray"))?;
+                .ok_or_else(|| fail(PercentilePayloadFailure::Downcast("LargeStringArray")))?;
             Ok((!arr.is_null(row)).then_some(arr.value(row).as_bytes()))
         }
-        other => Err(format!(
-            "{context}: unsupported percentile payload type {:?}",
-            other
-        )),
+        other => Err(fail(PercentilePayloadFailure::Unsupported(other))),
     }
 }

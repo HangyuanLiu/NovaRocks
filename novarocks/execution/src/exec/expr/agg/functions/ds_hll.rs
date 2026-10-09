@@ -16,22 +16,25 @@
 // under the License.
 use std::sync::Arc;
 
+use arrow::array::ArrayRef;
+#[cfg(test)]
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Builder, LargeStringArray, StringArray,
-    StructArray,
+    Array, BinaryArray, BinaryBuilder, Int64Builder, LargeStringArray, StringArray, StructArray,
 };
 use arrow::datatypes::DataType;
 
-use crate::exec::expr::function::object::percentile_functions::payload_bytes_at;
 use crate::exec::hll::{HllHandle, HllTargetType};
 use crate::exec::node::aggregate::AggFunction;
+#[cfg(test)]
 use crate::exec::sketch_hash::prehash_array_value;
 use crate::runtime::mem_tracker::MemTracker;
 
 use super::super::*;
 use super::AggregateFunction;
 
+#[cfg(test)]
 const DEFAULT_LOG_K: u8 = 17;
+#[cfg(test)]
 const DEFAULT_TARGET_TYPE: HllTargetType = HllTargetType::Hll6;
 
 pub(super) struct DsHllAgg;
@@ -55,76 +58,69 @@ impl DsHllState {
     fn ensure_handle(
         &mut self,
         log_k: u8,
-        target_type: HllTargetType,
+        target: HllTargetType,
     ) -> Result<&mut HllHandle, String> {
-        if self.handle.is_none() {
-            let preflight = HllHandle::new_allocation_preflight(log_k, target_type)?;
-            let mut reservation = self.retained_charge.reserve_operation(
-                preflight.bounds().operation_peak_bytes,
-                "reserve ds_hll handle creation",
-            )?;
-            let (handle, outcome) = HllHandle::new_under_reservation(&preflight, &reservation)?;
-            self.retained_charge.reconcile_under_reservation(
-                hll_heap_bytes(outcome.current_bytes),
-                &mut reservation,
-            )?;
-            self.handle = Some(handle);
-        }
-        Ok(self.handle.as_mut().expect("ds_hll handle initialized"))
+        novarocks_functions::builtin::aggregate_ds_hll_state::ensure_handle(
+            &mut self.handle,
+            &mut self.retained_charge,
+            log_k,
+            target,
+            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+        )
     }
-
     fn ensure_handle_from_payload(&mut self, payload: &[u8]) -> Result<&mut HllHandle, String> {
-        if self.handle.is_none() {
-            let preflight = HllHandle::from_payload_allocation_preflight(payload)?;
-            let mut reservation = self.retained_charge.reserve_operation(
-                preflight.bounds().operation_peak_bytes,
-                "reserve ds_hll payload initialization",
-            )?;
-            let (handle, outcome) =
-                HllHandle::from_payload_under_reservation(payload, &preflight, &reservation)?;
-            self.retained_charge.reconcile_under_reservation(
-                hll_heap_bytes(outcome.current_bytes),
-                &mut reservation,
-            )?;
-            self.handle = Some(handle);
-        }
-        Ok(self.handle.as_mut().expect("ds_hll handle initialized"))
+        novarocks_functions::builtin::aggregate_ds_hll_state::ensure_handle_from_payload(
+            &mut self.handle,
+            &mut self.retained_charge,
+            payload,
+            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+        )
     }
-
     fn update_hash(&mut self, hash: u64) -> Result<(), String> {
-        let handle = self
-            .handle
-            .as_mut()
-            .ok_or_else(|| "ds_hll handle is not initialized".to_string())?;
-        let preflight = handle.update_hash_allocation_preflight();
-        let mut reservation = self.retained_charge.reserve_operation(
-            preflight.bounds().additional_headroom_bytes(),
-            "reserve ds_hll update",
-        )?;
-        let outcome = handle.update_hash_under_reservation(hash, &preflight, &reservation)?;
-        self.retained_charge
-            .reconcile_under_reservation(hll_heap_bytes(outcome.current_bytes), &mut reservation)
+        novarocks_functions::builtin::aggregate_ds_hll_state::update_hash(
+            &mut self.handle,
+            &mut self.retained_charge,
+            hash,
+            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+        )
     }
-
     fn merge_payload(&mut self, payload: &[u8]) -> Result<(), String> {
-        if self.handle.is_none() {
-            self.ensure_handle_from_payload(payload)?;
-            return Ok(());
-        }
-        let handle = self.handle.as_mut().expect("ds_hll handle initialized");
-        let preflight = handle.merge_payload_allocation_preflight(payload)?;
-        let mut reservation = self.retained_charge.reserve_operation(
-            preflight.bounds().additional_headroom_bytes(),
-            "reserve ds_hll merge",
-        )?;
-        let outcome = handle.merge_payload_under_reservation(payload, &preflight, &reservation)?;
-        self.retained_charge
-            .reconcile_under_reservation(hll_heap_bytes(outcome.current_bytes), &mut reservation)
+        novarocks_functions::builtin::aggregate_ds_hll_state::merge_payload(
+            &mut self.handle,
+            &mut self.retained_charge,
+            payload,
+            &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+        )
     }
 }
-
-fn hll_heap_bytes(current_allocation_bytes: usize) -> usize {
-    current_allocation_bytes.saturating_sub(std::mem::size_of::<HllHandle>())
+impl
+    novarocks_functions::builtin::aggregate_ds_hll_state::DsHllRetainedPort<
+        novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+    > for AggregateRetainedCharge
+{
+    type Reservation = super::super::allocation::AggregateTransientReservation;
+    fn payload_error_headroom(
+        &self,
+        _: novarocks_functions::datasketches_hll::HllPayloadPreflight,
+    ) -> usize {
+        0
+    }
+    fn reserve(
+        &self,
+        bytes: usize,
+        operation: novarocks_functions::builtin::aggregate_ds_hll_state::DsHllRetainedOperation,
+        _: &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+    ) -> Result<Self::Reservation, String> {
+        self.reserve_operation(bytes, operation.label())
+    }
+    fn reconcile(
+        &mut self,
+        bytes: usize,
+        reservation: &mut Self::Reservation,
+        _: &mut novarocks_functions::builtin::aggregate_ds_hll_failure::LegacyDsHllFailure,
+    ) -> Result<(), String> {
+        self.reconcile_under_reservation(bytes, reservation)
+    }
 }
 
 unsafe fn get_state<'a>(ptr: *const u8) -> &'a DsHllState {
@@ -135,216 +131,50 @@ unsafe fn get_state_mut<'a>(ptr: *mut u8) -> &'a mut DsHllState {
     unsafe { &mut *(ptr as *mut DsHllState) }
 }
 
-fn parse_target_type(value: &str) -> HllTargetType {
-    match value.to_ascii_uppercase().as_str() {
-        "HLL_4" => HllTargetType::Hll4,
-        "HLL_8" => HllTargetType::Hll8,
-        _ => HllTargetType::Hll6,
+impl novarocks_functions::builtin::aggregate_ds_hll_core::DsHllStorage for DsHllState {
+    type Allocator = AggregateAllocator;
+    fn allocator(&self) -> AggregateAllocator {
+        self.allocator.clone()
+    }
+    fn handle(&self) -> Option<&HllHandle> {
+        self.handle.as_ref()
+    }
+    fn ensure_handle(&mut self, log_k: u8, target: HllTargetType) -> Result<(), String> {
+        DsHllState::ensure_handle(self, log_k, target).map(|_| ())
+    }
+    fn update_hash(&mut self, hash: u64) -> Result<(), String> {
+        DsHllState::update_hash(self, hash)
+    }
+    fn merge_payload(&mut self, payload: &[u8]) -> Result<(), String> {
+        DsHllState::merge_payload(self, payload)
     }
 }
-
-fn parse_log_k(array: &ArrayRef, row: usize, context: &str) -> Result<Option<u8>, String> {
-    match array.data_type() {
-        DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int8Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int8Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as u8))
-        }
-        DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int16Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int16Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as u8))
-        }
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int32Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as u8))
-        }
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as u8))
-        }
-        other => Err(format!(
-            "{context}: ds_hll log_k expects integer input, got {:?}",
-            other
-        )),
-    }
-}
-
-fn parse_target_type_array(
-    array: &ArrayRef,
-    row: usize,
-    context: &str,
-) -> Result<Option<HllTargetType>, String> {
-    match array.data_type() {
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast StringArray"))?;
-            Ok((!arr.is_null(row)).then_some(parse_target_type(arr.value(row))))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast LargeStringArray"))?;
-            Ok((!arr.is_null(row)).then_some(parse_target_type(arr.value(row))))
-        }
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast BinaryArray"))?;
-            Ok((!arr.is_null(row)).then_some(parse_target_type(
-                std::str::from_utf8(arr.value(row)).unwrap_or_default(),
-            )))
-        }
-        DataType::Null => Ok(None),
-        other => Err(format!(
-            "{context}: ds_hll target type expects string input, got {:?}",
-            other
-        )),
-    }
-}
-
-fn update_from_struct(
-    array: &StructArray,
+struct StateAccess<'a> {
     offset: usize,
-    state_ptrs: &[AggStatePtr],
-    context: &str,
-) -> Result<(), String> {
-    let fields = array.columns();
-    if fields.is_empty() {
-        return Err(format!("{context}: ds_hll input struct is empty"));
-    }
-    let values = fields[0].clone();
-
-    for (row, &base) in state_ptrs.iter().enumerate() {
-        let lg_k = if fields.len() >= 2 {
-            parse_log_k(&fields[1], row, context)?.unwrap_or(DEFAULT_LOG_K)
-        } else {
-            DEFAULT_LOG_K
-        };
-        let target_type = if fields.len() >= 3 {
-            parse_target_type_array(&fields[2], row, context)?.unwrap_or(DEFAULT_TARGET_TYPE)
-        } else {
-            DEFAULT_TARGET_TYPE
-        };
-        let Some(hash) = prehash_array_value(&values, row, context)? else {
-            continue;
-        };
-        let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { get_state_mut(ptr) };
-        state.ensure_handle(lg_k, target_type)?;
-        state.update_hash(hash)?;
-    }
-    Ok(())
+    pointers: &'a [AggStatePtr],
 }
-
-fn update_from_raw_array(
-    array: &ArrayRef,
-    offset: usize,
-    state_ptrs: &[AggStatePtr],
-    log_k: u8,
-    target_type: HllTargetType,
-    context: &str,
-) -> Result<(), String> {
-    for (row, &base) in state_ptrs.iter().enumerate() {
-        let Some(hash) = prehash_array_value(array, row, context)? else {
-            continue;
-        };
-        let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { get_state_mut(ptr) };
-        state.ensure_handle(log_k, target_type)?;
-        state.update_hash(hash)?;
+impl novarocks_functions::builtin::aggregate_ds_hll_core::DsHllStateAccess for StateAccess<'_> {
+    type State = DsHllState;
+    fn len(&self) -> usize {
+        self.pointers.len()
     }
-    Ok(())
-}
-
-fn merge_payload_array(
-    array: &ArrayRef,
-    offset: usize,
-    state_ptrs: &[AggStatePtr],
-    context: &str,
-) -> Result<(), String> {
-    for (row, &base) in state_ptrs.iter().enumerate() {
-        let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { get_state_mut(ptr) };
-        let Some(payload) = payload_bytes_for_merge(array, row, context, state.allocator.clone())?
-        else {
-            continue;
-        };
-        state.merge_payload(payload.as_ref())?;
-    }
-    Ok(())
-}
-
-enum MergePayload<'a> {
-    Borrowed(&'a [u8]),
-    Owned(AggregateVec<u8>),
-}
-
-impl AsRef<[u8]> for MergePayload<'_> {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(value) => value,
-            Self::Owned(value) => value.as_slice(),
-        }
+    fn with_state<T>(
+        &mut self,
+        ordinal: usize,
+        visit: impl FnOnce(&mut DsHllState) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let ptr = unsafe { (self.pointers[ordinal] as *mut u8).add(self.offset) };
+        visit(unsafe { get_state_mut(ptr) })
     }
 }
-
-fn payload_bytes_for_merge<'a>(
-    array: &'a ArrayRef,
-    row: usize,
-    context: &str,
-    allocator: AggregateAllocator,
-) -> Result<Option<MergePayload<'a>>, String> {
-    match array.data_type() {
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast StringArray"))?;
-            if arr.is_null(row) {
-                return Ok(None);
-            }
-            let value = arr.value(row);
-            let mut payload = AggregateVec::new_in(allocator.clone());
-            payload
-                .try_reserve_exact(value.len())
-                .map_err(|_| allocator.allocation_error("reserve ds_hll string payload"))?;
-            payload.extend(value.chars().map(|ch| ch as u8));
-            Ok(Some(MergePayload::Owned(payload)))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast LargeStringArray"))?;
-            if arr.is_null(row) {
-                return Ok(None);
-            }
-            let value = arr.value(row);
-            let mut payload = AggregateVec::new_in(allocator.clone());
-            payload
-                .try_reserve_exact(value.len())
-                .map_err(|_| allocator.allocation_error("reserve ds_hll string payload"))?;
-            payload.extend(value.chars().map(|ch| ch as u8));
-            Ok(Some(MergePayload::Owned(payload)))
-        }
-        _ => {
-            payload_bytes_at(array, row, context).map(|payload| payload.map(MergePayload::Borrowed))
-        }
+impl novarocks_functions::builtin::aggregate_ds_hll_core::DsHllStateReadAccess for StateAccess<'_> {
+    type State = DsHllState;
+    fn len(&self) -> usize {
+        self.pointers.len()
+    }
+    fn state(&self, ordinal: usize) -> &DsHllState {
+        let ptr = unsafe { (self.pointers[ordinal] as *const u8).add(self.offset) };
+        unsafe { get_state(ptr) }
     }
 }
 
@@ -468,24 +298,37 @@ impl AggregateFunction for DsHllAgg {
         let AggInputView::Any(array) = input else {
             return Err("ds_hll input type mismatch".to_string());
         };
-        if let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() {
-            return update_from_struct(struct_array, offset, state_ptrs, "ds_hll_count_distinct");
-        }
-        match &spec.kind {
-            AggKind::DsHllHash => update_from_raw_array(
-                array,
+        if novarocks_functions::builtin::aggregate_ds_hll_core::update_struct_if_present(
+            array,
+            &mut StateAccess {
                 offset,
-                state_ptrs,
-                DEFAULT_LOG_K,
-                DEFAULT_TARGET_TYPE,
-                "ds_hll_count_distinct",
-            ),
-            AggKind::DsHllMerge => merge_payload_array(array, offset, state_ptrs, "ds_hll_merge"),
-            AggKind::DsHllCount => {
-                merge_payload_array(array, offset, state_ptrs, "ds_hll_count_distinct")
-            }
-            other => Err(format!("unexpected ds_hll aggregate kind: {:?}", other)),
+                pointers: state_ptrs,
+            },
+        )?
+        .is_some()
+        {
+            return Ok(());
         }
+        let mode = match &spec.kind {
+            AggKind::DsHllHash => {
+                novarocks_functions::builtin::aggregate_ds_hll_core::DsHllUpdateMode::Hash
+            }
+            AggKind::DsHllMerge => {
+                novarocks_functions::builtin::aggregate_ds_hll_core::DsHllUpdateMode::Merge
+            }
+            AggKind::DsHllCount => {
+                novarocks_functions::builtin::aggregate_ds_hll_core::DsHllUpdateMode::Count
+            }
+            other => return Err(format!("unexpected ds_hll aggregate kind: {:?}", other)),
+        };
+        novarocks_functions::builtin::aggregate_ds_hll_core::update_nonstruct_batch(
+            mode,
+            array,
+            &mut StateAccess {
+                offset,
+                pointers: state_ptrs,
+            },
+        )
     }
 
     fn merge_batch(
@@ -498,7 +341,14 @@ impl AggregateFunction for DsHllAgg {
         let AggInputView::Any(array) = input else {
             return Err("ds_hll merge input type mismatch".to_string());
         };
-        merge_payload_array(array, offset, state_ptrs, "ds_hll_merge")
+        novarocks_functions::builtin::aggregate_ds_hll_core::merge_batch(
+            array,
+            &mut StateAccess {
+                offset,
+                pointers: state_ptrs,
+            },
+            "ds_hll_merge",
+        )
     }
 
     fn build_array(
@@ -514,43 +364,13 @@ impl AggregateFunction for DsHllAgg {
             &spec.output_type
         };
 
-        match output_type {
-            DataType::Binary => {
-                let mut builder = BinaryBuilder::new();
-                let empty_payload =
-                    HllHandle::new_unreserved(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()?;
-                for &base in group_states {
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_state(ptr) };
-                    let payload = state
-                        .handle
-                        .as_ref()
-                        .map(HllHandle::serialize)
-                        .transpose()?
-                        .unwrap_or_else(|| empty_payload.clone());
-                    builder.append_value(payload);
-                }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
-            }
-            DataType::Int64 => {
-                let mut builder = Int64Builder::new();
-                for &base in group_states {
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let value = unsafe { get_state(ptr) }
-                        .handle
-                        .as_ref()
-                        .map(HllHandle::estimate)
-                        .transpose()?
-                        .unwrap_or(0);
-                    builder.append_value(value);
-                }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
-            }
-            other => Err(format!(
-                "ds_hll output type must be Binary or Int64, got {:?}",
-                other
-            )),
-        }
+        novarocks_functions::builtin::aggregate_ds_hll_core::build_array(
+            output_type,
+            &StateAccess {
+                offset,
+                pointers: group_states,
+            },
+        )
     }
 }
 

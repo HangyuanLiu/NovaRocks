@@ -86,7 +86,33 @@ struct TrackedStateAllocator {
     tracker: Arc<MemTracker>,
 }
 
+impl novarocks_functions::opaque_memory::OpaqueAllocationHost for TrackedStateAllocator {
+    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let bytes = i64::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+        if self.tracker.consume_and_check_limit(bytes).is_err() {
+            self.tracker.release(bytes);
+            return Err(KernelFailure::ResourceExhausted);
+        }
+        Ok(())
+    }
+    fn release_opaque(&self, bytes: usize) {
+        if bytes != 0 {
+            // Successful reservation was represented exactly as i64.
+            self.tracker
+                .release(i64::try_from(bytes).expect("successful opaque reservation size"));
+        }
+    }
+}
 impl AggregateStateAllocator for TrackedStateAllocator {
+    fn opaque_allocation_host(
+        &self,
+    ) -> Option<&dyn novarocks_functions::opaque_memory::OpaqueAllocationHost> {
+        Some(self)
+    }
+
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
         if layout.size() == 0 {
             return Err(KernelFailure::Internal(KernelDiagnostic::new(
@@ -1083,3 +1109,7 @@ impl GroupedUnpivotSource for CompiledGroupedUnpivot {
         Arc::clone(&self.source_observable)
     }
 }
+
+#[cfg(test)]
+#[path = "opaque_memory_host_tests.rs"]
+mod opaque_memory_host_tests;

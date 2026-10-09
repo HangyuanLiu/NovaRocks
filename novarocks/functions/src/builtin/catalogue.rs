@@ -3061,6 +3061,12 @@ pub fn contribute_builtin_functions(
                         Some(super::aggregate_array_owner::effects())
                     }
                     "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
+                    "ds_hll_count_distinct"
+                    | "approx_count_distinct_hll_sketch"
+                    | "ds_hll_count_distinct_merge"
+                    | "ds_hll_count_distinct_union" => {
+                        Some(super::aggregate_ds_hll_owner::effects())
+                    }
                     "count" => Some(super::aggregate_count_owner::effects()),
                     "multi_distinct_count" => {
                         Some(super::aggregate_count_distinct_owner::effects())
@@ -3141,6 +3147,20 @@ pub fn contribute_builtin_functions(
             "percentile_cont" | "percentile_disc" | "percentile_disc_lc"
         ) {
             builder.register(super::aggregate_percentile_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if matches!(
+            declaration.name,
+            "ds_hll_count_distinct"
+                | "approx_count_distinct_hll_sketch"
+                | "ds_hll_count_distinct_merge"
+                | "ds_hll_count_distinct_union"
+        ) {
+            builder.register(super::aggregate_ds_hll_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -5051,6 +5071,47 @@ pub(super) fn ndv_invocation_data_test_catalog() -> EngineFunctionCatalog {
             .register(
                 super::aggregate_hll_owner::definition(declaration.name, binding, resolver)
                     .unwrap(),
+            )
+            .unwrap();
+    }
+    builder.seal().unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn ds_hll_host_test_catalog() -> EngineFunctionCatalog {
+    let original = build_builtin_engine_function_catalog().unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    for declaration in builtin_aggregate_declarations().into_iter().filter(|item| {
+        matches!(
+            item.name,
+            "ds_hll_count_distinct"
+                | "approx_count_distinct_hll_sketch"
+                | "ds_hll_count_distinct_merge"
+                | "ds_hll_count_distinct_union"
+        )
+    }) {
+        let raw = original
+            .definition(declaration.name, FunctionKind::Aggregate)
+            .unwrap()
+            .binding_declaration()
+            .unwrap();
+        let binding = FunctionBindingDeclaration::try_new(
+            raw.function_id().clone(),
+            raw.kind(),
+            raw.overloads().iter().cloned().map(|mut overload| {
+                overload.effects = Some(super::aggregate_ds_hll_owner::effects());
+                overload
+            }),
+        )
+        .unwrap();
+        builder
+            .register(
+                super::aggregate_ds_hll_owner::definition(
+                    declaration.name,
+                    binding,
+                    Arc::new(BuiltinAggregateResolver { declaration }),
+                )
+                .unwrap(),
             )
             .unwrap();
     }
