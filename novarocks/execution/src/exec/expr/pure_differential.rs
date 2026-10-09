@@ -1788,3 +1788,7 @@ mod map_entries_tests;
 #[cfg(test)]
 #[path = "pure_differential_ndv_hll_tests.rs"]
 mod ndv_hll_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_exact_percentile_tests.rs"]
+mod exact_percentile_tests;

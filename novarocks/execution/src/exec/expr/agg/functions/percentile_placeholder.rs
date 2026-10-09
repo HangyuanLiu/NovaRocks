@@ -742,3 +742,7 @@ mod retained_bytes_tests {
         assert_eq!(state.rate, Some(0.5));
     }
 }
+
+#[cfg(test)]
+#[path = "percentile_original_baseline_tests.rs"]
+mod percentile_original_baseline_tests;
