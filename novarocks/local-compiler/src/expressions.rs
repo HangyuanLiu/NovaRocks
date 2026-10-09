@@ -411,6 +411,13 @@ fn lower_core(
                 ExprKind::Between {
                     expr, low, high, ..
                 } => [*expr, *low, *high].get(next).copied(),
+                ExprKind::InList { expr, list, .. } => {
+                    if next == 0 {
+                        Some(*expr)
+                    } else {
+                        list.get(next - 1).copied()
+                    }
+                }
                 ExprKind::Case {
                     operand,
                     when_then,
@@ -730,6 +737,27 @@ fn lower_core(
                         left,
                         right,
                     )
+                }
+                ExprKind::InList {
+                    expr,
+                    list,
+                    negated,
+                } => {
+                    let child = *ids.get(expr).ok_or(ExpressionLoweringError::Invalid(
+                        "IN source was not lowered",
+                    ))?;
+                    let mut values = Vec::with_capacity(list.len());
+                    for id in list {
+                        values.push(*ids.get(id).ok_or(ExpressionLoweringError::Invalid(
+                            "IN candidate was not lowered",
+                        ))?);
+                        work.step()?;
+                    }
+                    StaticExprKind::PreparedInList {
+                        child,
+                        values,
+                        is_not_in: *negated,
+                    }
                 }
                 ExprKind::Between {
                     expr,
@@ -1243,6 +1271,80 @@ fn prepare_core(
                         ));
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (
+                    ExprKind::InList {
+                        expr,
+                        list,
+                        negated,
+                    },
+                    StaticExprKind::PreparedInList {
+                        child,
+                        values,
+                        is_not_in,
+                    },
+                ) => {
+                    if *is_not_in != *negated
+                        || invocation.control != (ControlShape::Membership { negated: *negated })
+                        || invocation.arguments.len() != list.len() + 1
+                        || lowered.ids.get(expr) != Some(child)
+                        || list.len() != values.len()
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "IN differs from its original ordered source",
+                        ));
+                    }
+                    let definitions = package.fragment().expressions();
+                    let source_type = |id| {
+                        definitions
+                            .get(id)
+                            .map(|n| &n.ty)
+                            .ok_or(ExpressionLoweringError::Invalid("missing IN source"))
+                    };
+                    let mut candidates = Vec::with_capacity(list.len());
+                    for (ordinal, id) in std::iter::once(expr).chain(list.iter()).enumerate() {
+                        let local = lowered.ids.get(id).ok_or(ExpressionLoweringError::Invalid(
+                            "missing lowered IN source",
+                        ))?;
+                        if flow.uses()[&invocation.arguments[ordinal]].definition != *id {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "IN source occurrence differs",
+                            ));
+                        }
+                        if ordinal > 0 {
+                            if values[ordinal - 1] != *local {
+                                return Err(ExpressionLoweringError::Invalid(
+                                    "IN candidate definition differs",
+                                ));
+                            }
+                            candidates.push(source_type(*id)?);
+                        }
+                        work.step()?;
+                    }
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedNativeInListRecipe::try_new(
+                        *negated,
+                        source_type(*expr)?,
+                        &candidates,
+                        &source.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                    let mut combined = recipe.own_effects(invocation.context);
+                    for (ordinal, use_id) in invocation.arguments.iter().enumerate() {
+                        let child = *effects.get(use_id).ok_or(
+                            ExpressionLoweringError::Invalid("missing IN candidate effects"),
+                        )?;
+                        combined = combined
+                            .join_control_argument(child, flow, ordinal)
+                            .map_err(|_| {
+                                ExpressionLoweringError::Invalid(
+                                    "IN candidate effects differ from ordered domain",
+                                )
+                            })?;
+                        work.step()?;
+                    }
+                    combined
                 }
                 (
                     ExprKind::Between {
@@ -2125,6 +2227,7 @@ fn literal_argument(
                 StaticExprKind::PreparedNativeBitNot(_),
             ) => Ok(None),
             (ExprKind::Between { .. }, StaticExprKind::PreparedBetween { .. }) => Ok(None),
+            (ExprKind::InList { .. }, StaticExprKind::PreparedInList { .. }) => Ok(None),
             (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
             (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
             (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })

@@ -287,6 +287,7 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::PreparedNativeNegate(_)
                     | StaticExprKind::PreparedNativeBitNot(_)
                     | StaticExprKind::PreparedBetween { .. }
+                    | StaticExprKind::PreparedInList { .. }
                     | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::PreparedNullSafeComparison { .. }
                     | StaticExprKind::Eq(..)
@@ -318,6 +319,11 @@ impl CompiledExpressionInstance {
                                     .ok_or_else(|| {
                                         invalid("missing mandatory native BitwiseNot effect recipe")
                                     })?
+                                    .own_effects(invocation.context)
+                            } else if matches!(node.kind(), StaticExprKind::PreparedInList { .. }) {
+                                program
+                                    .native_inlist_recipe(occurrence)
+                                    .ok_or_else(|| invalid("missing mandatory IN effect recipe"))?
                                     .own_effects(invocation.context)
                             } else if let StaticExprKind::PreparedBetween { plan, .. } = node.kind()
                             {
@@ -433,6 +439,14 @@ impl CompiledExpressionInstance {
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
                         && program.native_bitnot_recipe(occurrence).is_some() => {}
+                StaticExprKind::PreparedInList {
+                    values, is_not_in, ..
+                } if invocation.control
+                    == (ControlShape::Membership {
+                        negated: *is_not_in,
+                    })
+                    && invocation.arguments.len() == values.len() + 1
+                    && program.native_inlist_recipe(occurrence).is_some() => {}
                 StaticExprKind::PreparedBetween { plan, .. }
                     if invocation.control
                         == (ControlShape::Between {

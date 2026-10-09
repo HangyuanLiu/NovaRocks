@@ -41,64 +41,20 @@ pub fn eval_in(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let array = arena.eval(child, chunk)?;
-    let len = array.len();
     let lhs_is_literal_like = !expr_contains_slot(arena, child);
     let single_candidate = values.len() == 1;
-
-    if len == 0 {
-        return Ok(Arc::new(BooleanArray::from(Vec::<bool>::new())));
+    let mut state = novarocks_functions::native_inlist::InRows::legacy(&array);
+    if state.is_empty() {
+        return Ok(Arc::new(state.finish_legacy(&array, is_not_in)));
     }
-
-    let mut has_null = vec![false; len];
-    let mut matched = vec![false; len];
-
     for value_id in values {
         let candidate = arena.eval(*value_id, chunk)?;
-        if candidate.len() != 1 && candidate.len() != len {
-            return Err(format!(
-                "IN predicate value length mismatch: input has {}, value has {}",
-                len,
-                candidate.len()
-            ));
-        }
-        for (row, has_null_row) in has_null.iter_mut().enumerate() {
-            if candidate.is_null(row_index(row, candidate.len())) {
-                *has_null_row = true;
-            }
-        }
-        let eq_array =
+        state.candidate_nulls_legacy(&candidate)?;
+        let equalities =
             eq_with_candidate(&array, &candidate, lhs_is_literal_like, single_candidate)?;
-        for (row, matched_row) in matched.iter_mut().enumerate() {
-            if eq_array.is_null(row) {
-                has_null[row] = true;
-            } else if eq_array.value(row) {
-                *matched_row = true;
-            }
-        }
+        state.equalities_legacy(&equalities);
     }
-
-    // SQL three-valued logic for IN/NOT IN:
-    // 1) lhs NULL => NULL
-    // 2) any match => TRUE for IN / FALSE for NOT IN
-    // 3) no match and list contains NULL => NULL
-    // 4) otherwise => FALSE for IN / TRUE for NOT IN
-    let mut builder = BooleanBuilder::with_capacity(len);
-    for (row, matched_row) in matched.iter().enumerate() {
-        if array.is_null(row) || matches!(array.data_type(), DataType::Null) {
-            builder.append_null();
-            continue;
-        }
-        if *matched_row {
-            builder.append_value(!is_not_in);
-            continue;
-        }
-        if has_null[row] {
-            builder.append_null();
-            continue;
-        }
-        builder.append_value(is_not_in);
-    }
-    Ok(Arc::new(builder.finish()))
+    Ok(Arc::new(state.finish_legacy(&array, is_not_in)))
 }
 
 fn row_index(row: usize, len: usize) -> usize {
@@ -157,64 +113,6 @@ fn eq_dictionary_input_with_candidate(
     .map_err(|e| e.to_string())
 }
 
-fn is_signed_integer_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}
-
-fn signed_integer_value(array: &ArrayRef, row: usize) -> Result<i64, String> {
-    match array.data_type() {
-        DataType::Int8 => Ok(array
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int8Array".to_string())?
-            .value(row) as i64),
-        DataType::Int16 => Ok(array
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int16Array".to_string())?
-            .value(row) as i64),
-        DataType::Int32 => Ok(array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int32Array".to_string())?
-            .value(row) as i64),
-        DataType::Int64 => Ok(array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| "failed to downcast signed IN value to Int64Array".to_string())?
-            .value(row)),
-        other => Err(format!("unsupported signed IN value type: {other:?}")),
-    }
-}
-
-fn eq_signed_integer_input_with_candidate(
-    array: &ArrayRef,
-    candidate: &ArrayRef,
-) -> Result<Option<BooleanArray>, String> {
-    if !is_signed_integer_type(array.data_type())
-        || !is_signed_integer_type(candidate.data_type())
-        || (candidate.len() != 1 && candidate.len() != array.len())
-    {
-        return Ok(None);
-    }
-
-    let mut builder = BooleanBuilder::with_capacity(array.len());
-    for row in 0..array.len() {
-        let candidate_row = row_index(row, candidate.len());
-        if array.is_null(row) || candidate.is_null(candidate_row) {
-            builder.append_null();
-            continue;
-        }
-        builder.append_value(
-            signed_integer_value(array, row)? == signed_integer_value(candidate, candidate_row)?,
-        );
-    }
-    Ok(Some(builder.finish()))
-}
-
 #[expect(
     clippy::if_same_then_else,
     reason = "Nested NULL semantics keep explicit branches for SQL three-valued logic."
@@ -263,6 +161,11 @@ fn eq_with_candidate(
         }
         return Ok(builder.finish());
     }
+    if let Some(result) =
+        novarocks_functions::native_inlist::signed_equality_legacy(array, candidate)?
+    {
+        return Ok(result);
+    }
     if candidate.len() == array.len()
         && array.data_type() == candidate.data_type()
         && !matches!(
@@ -280,9 +183,6 @@ fn eq_with_candidate(
             &candidate.as_ref() as &dyn arrow::array::Datum,
         )
         .map_err(|e| e.to_string());
-    }
-    if let Some(result) = eq_signed_integer_input_with_candidate(array, candidate)? {
-        return Ok(result);
     }
     if matches!(array.data_type(), DataType::Utf8)
         && is_numeric_json_candidate(candidate.data_type())

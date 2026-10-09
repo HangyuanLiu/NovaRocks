@@ -600,3 +600,81 @@ pub(crate) fn compile_native_bitnot(
     work.finish()?;
     result
 }
+
+pub(crate) fn compile_native_inlist(
+    checked: &ProgramLexicalBindings,
+    control: &dyn PureCompileControl,
+) -> Result<
+    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNativeInListRecipe>,
+    ProgramPrimitiveError,
+> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let typed = checked.channels().expressions();
+        let snapshot = typed.resolved_calls().snapshot();
+        let mut recipes = BTreeMap::new();
+        for (&arena, flow) in snapshot.flows() {
+            let definitions = &snapshot.roots().arenas()[&arena];
+            let types = &typed.types()[&arena];
+            let value = |id: crate::ProgramExprId| match types.get(id.index()) {
+                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                _ => Err(ProgramPrimitiveError::Invalid(
+                    "IN requires complete value types",
+                )),
+            };
+            for (&use_id, invocation) in flow.uses() {
+                work.step()?;
+                let kind = definitions
+                    .node(invocation.definition)
+                    .ok_or(ProgramPrimitiveError::Invalid("missing IN definition"))?
+                    .kind();
+                let StaticExprKind::PreparedInList {
+                    child,
+                    values,
+                    is_not_in,
+                } = kind
+                else {
+                    continue;
+                };
+                if invocation.control
+                    != (ControlShape::Membership {
+                        negated: *is_not_in,
+                    })
+                    || invocation.arguments.len() != values.len() + 1
+                {
+                    return Err(ProgramPrimitiveError::Invalid(
+                        "IN differs from its ordered occurrence",
+                    ));
+                }
+                let mut candidates = Vec::with_capacity(values.len());
+                for (ordinal, expected) in std::iter::once(child).chain(values.iter()).enumerate() {
+                    if flow.uses()[&invocation.arguments[ordinal]].definition != *expected {
+                        return Err(ProgramPrimitiveError::Invalid(
+                            "IN source occurrence differs",
+                        ));
+                    }
+                    if ordinal > 0 {
+                        candidates.push(value(*expected)?);
+                    }
+                    work.step()?;
+                }
+                work.flush()?;
+                let recipe = novarocks_functions::PreparedNativeInListRecipe::try_new(
+                    *is_not_in,
+                    value(*child)?,
+                    &candidates,
+                    value(invocation.definition)?,
+                    control,
+                )?;
+                recipes.insert(ProgramUseRef { arena, use_id }, recipe);
+                work.step()?;
+            }
+        }
+        Ok(recipes)
+    })();
+    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}

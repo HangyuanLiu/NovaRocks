@@ -431,6 +431,9 @@ impl ExprKind {
                 has_else: else_expr.is_some(),
             }),
             ExprKind::Between { negated, .. } => Some(ControlShape::Between { negated: *negated }),
+            ExprKind::InList { negated, .. } => {
+                Some(ControlShape::Membership { negated: *negated })
+            }
             ExprKind::Lambda { .. } => Some(ControlShape::LambdaBody),
             ExprKind::FunctionCall { .. } => None,
             ExprKind::Value(_)
@@ -441,7 +444,6 @@ impl ExprKind {
             | ExprKind::Binary { .. }
             | ExprKind::Cast { .. }
             | ExprKind::IsNull { .. }
-            | ExprKind::InList { .. }
             | ExprKind::Like { .. }
             | ExprKind::IsTruthValue { .. }
             | ExprKind::WindowCall { .. } => Some(ControlShape::Eager),

@@ -185,6 +185,37 @@ impl ProgramTypedExpressions {
                             }
                             work.step()?;
                         }
+                        if let StaticExprKind::PreparedInList {
+                            child,
+                            values,
+                            is_not_in,
+                        } = definition.kind()
+                        {
+                            let source = |id: ProgramExprId| match entries.get(id.index()) {
+                                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                                _ => Err(ProgramExpressionTypeError::WrongKind),
+                            };
+                            let mut candidates = Vec::with_capacity(values.len());
+                            for id in values {
+                                candidates.push(source(*id)?);
+                                work.step()?;
+                            }
+                            work.flush()?;
+                            novarocks_functions::PreparedNativeInListRecipe::try_new(
+                                *is_not_in,
+                                source(*child)?,
+                                &candidates,
+                                value,
+                                work.control(),
+                            )
+                            .map_err(|error| {
+                                match error.control_error() {
+                                    Some(cause) => ProgramExpressionTypeError::Control(cause),
+                                    None => ProgramExpressionTypeError::TypeMismatch,
+                                }
+                            })?;
+                            work.step()?;
+                        }
                         if let StaticExprKind::PreparedBetween {
                             plan,
                             operand,

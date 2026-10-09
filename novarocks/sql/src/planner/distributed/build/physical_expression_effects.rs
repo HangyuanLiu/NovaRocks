@@ -547,6 +547,28 @@ fn primitive_own_effects(
             )?;
             ScopedExpressionEffects::pure_value(context)
         }
+        ExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            work.flush()?;
+            let mut candidates = Vec::with_capacity(list.len());
+            for id in list {
+                candidates.push(&operand(*id)?.ty);
+                work.step()?;
+            }
+            work.flush()?;
+            let recipe = novarocks_functions::PreparedNativeInListRecipe::try_new(
+                *negated,
+                &operand(*expr)?.ty,
+                &candidates,
+                &source.ty,
+                control,
+            )?;
+            work.flush()?;
+            recipe.own_effects(context)
+        }
         ExprKind::Between {
             expr,
             low,

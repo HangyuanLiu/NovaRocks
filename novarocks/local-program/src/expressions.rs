@@ -210,6 +210,13 @@ pub enum StaticExprKind {
     Not(ProgramExprId),
     IsNull(ProgramExprId),
     IsNotNull(ProgramExprId),
+    /// Checked ordered native IN with a mandatory per-use recipe. The legacy
+    /// In tag below cannot authorize a compiled invocation.
+    PreparedInList {
+        child: ProgramExprId,
+        values: Vec<ProgramExprId>,
+        is_not_in: bool,
+    },
     In {
         child: ProgramExprId,
         values: Vec<ProgramExprId>,
@@ -357,7 +364,7 @@ impl StaticExprKind {
                 visit(*low)?;
                 visit(*high)?;
             }
-            Self::In { child, values, .. } => {
+            Self::In { child, values, .. } | Self::PreparedInList { child, values, .. } => {
                 visit(*child)?;
                 for id in values {
                     visit(*id)?;

@@ -140,7 +140,8 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
         ControlShape::Case { .. }
         | ControlShape::HigherOrder { .. }
         | ControlShape::TemporalSource(_)
-        | ControlShape::Between { .. } => None,
+        | ControlShape::Between { .. }
+        | ControlShape::Membership { .. } => None,
     };
     let kind = match (simple, shape) {
         (Some(simple), _) => Kind::Simple(simple as i32),
@@ -167,6 +168,7 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
             body_demand: encode_demand(body_demand),
         }),
         (None, ControlShape::Between { negated }) => Kind::BetweenNegated(negated),
+        (None, ControlShape::Membership { negated }) => Kind::MembershipNegated(negated),
         (None, ControlShape::TemporalSource(shape)) => {
             Kind::TemporalSource(encode_temporal_shape(shape))
         }
@@ -194,6 +196,7 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
             )),
         },
         Kind::BetweenNegated(negated) => Ok(ControlShape::Between { negated: *negated }),
+        Kind::MembershipNegated(negated) => Ok(ControlShape::Membership { negated: *negated }),
         Kind::TemporalSource(value) => {
             decode_temporal_shape(*value).map(ControlShape::TemporalSource)
         }
@@ -219,6 +222,7 @@ fn encode_guard(guard: DomainGuard) -> wire::DomainGuard {
         GuardKind::CaseWhen { arm } => Kind::CaseWhenArm(arm),
         GuardKind::CaseThen { arm } => Kind::CaseThenArm(arm),
         GuardKind::BetweenAfterSource { ordinal } => Kind::BetweenAfterSourceOrdinal(ordinal),
+        GuardKind::MembershipAfterSource { ordinal } => Kind::MembershipAfterSourceOrdinal(ordinal),
         GuardKind::TemporalAfterSource { ordinal } => Kind::TemporalAfterSourceOrdinal(ordinal),
         GuardKind::TemporalInvocationNull => {
             Kind::Simple(wire::SimpleGuard::TemporalInvocationNull as i32)
@@ -256,6 +260,9 @@ fn decode_guard(guard: &wire::DomainGuard) -> Result<DomainGuard, ControlCodecEr
         Kind::CaseThenArm(arm) => GuardKind::CaseThen { arm: *arm },
         Kind::BetweenAfterSourceOrdinal(ordinal) => {
             GuardKind::BetweenAfterSource { ordinal: *ordinal }
+        }
+        Kind::MembershipAfterSourceOrdinal(ordinal) => {
+            GuardKind::MembershipAfterSource { ordinal: *ordinal }
         }
         Kind::TemporalAfterSourceOrdinal(ordinal) => {
             GuardKind::TemporalAfterSource { ordinal: *ordinal }

@@ -60,6 +60,11 @@ pub enum ControlShape {
     Between {
         negated: bool,
     },
+    /// One source followed by ordered candidate comparisons. Matching never
+    /// suppresses a later candidate; an empty invocation skips candidates.
+    Membership {
+        negated: bool,
+    },
     TemporalSource(crate::TemporalSourceShape),
     Case {
         simple: bool,
@@ -92,6 +97,10 @@ pub enum GuardKind {
     },
     /// The preceding source (and completed bound comparison) succeeded.
     BetweenAfterSource {
+        ordinal: u32,
+    },
+    /// Source/comparison completed and current invocation is nonempty.
+    MembershipAfterSource {
         ordinal: u32,
     },
     /// Whole current invocation predicate, never a per-row NULL branch.
@@ -660,6 +669,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
         ControlShape::Between { .. } => count == 4,
+        ControlShape::Membership { .. } => count > 0,
         ControlShape::TemporalSource(shape) => count == shape.source_count(),
         ControlShape::HigherOrder { body_ordinal, .. } => (body_ordinal as usize) < count,
         ControlShape::Case {
@@ -697,6 +707,11 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
         ControlShape::Between { .. } => (ordinal > 0).then(|| GuardKind::BetweenAfterSource {
             ordinal: (ordinal - 1) as u32,
         }),
+        ControlShape::Membership { .. } => {
+            (ordinal > 0).then(|| GuardKind::MembershipAfterSource {
+                ordinal: (ordinal - 1) as u32,
+            })
+        }
         ControlShape::TemporalSource(source) => {
             if source == crate::TemporalSourceShape::SecondsCastOther && ordinal == 2 {
                 Some(GuardKind::TemporalInvocationNull)
@@ -743,7 +758,8 @@ fn control_argument_demand(
         | ControlShape::TypeOnly
         | ControlShape::Coalesce
         | ControlShape::TemporalSource(_)
-        | ControlShape::Between { .. } => Value,
+        | ControlShape::Between { .. }
+        | ControlShape::Membership { .. } => Value,
         ControlShape::Conjunction | ControlShape::Disjunction => owner,
         ControlShape::LambdaBody => {
             if ordinal + 1 == count {

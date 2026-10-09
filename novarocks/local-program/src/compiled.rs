@@ -100,6 +100,7 @@ pub struct LocalProgram {
     aggregates: BTreeMap<ProgramNodeId, CompiledAggregate>,
     native_negate: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNativeNegateRecipe>,
     native_bitnot: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNativeBitNotRecipe>,
+    native_inlist: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNativeInListRecipe>,
     arithmetic: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
     casts: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
     comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
@@ -256,6 +257,7 @@ impl LocalProgram {
         validate_exchange_inputs(graph, &exchange_inputs, control)?;
         validate_scan_inputs(graph, &scan_inputs, control)?;
         validate_aggregates(graph, &aggregates, control)?;
+        let native_inlist = crate::primitives::compile_native_inlist(&checked, control)?;
         let native_negate = crate::primitives::compile_native_negate(&checked, control)?;
         let native_bitnot = crate::primitives::compile_native_bitnot(&checked, control)?;
         let arithmetic = crate::primitives::compile_arithmetic(&checked, control)?;
@@ -274,6 +276,7 @@ impl LocalProgram {
             aggregates,
             comparisons,
             null_safe_comparisons,
+            native_inlist,
             native_negate,
             native_bitnot,
             arithmetic,
@@ -320,6 +323,12 @@ impl LocalProgram {
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedNullSafeComparisonRecipe> {
         self.null_safe_comparisons.get(&site)
+    }
+    pub fn native_inlist_recipe(
+        &self,
+        site: crate::ProgramUseRef,
+    ) -> Option<&novarocks_functions::PreparedNativeInListRecipe> {
+        self.native_inlist.get(&site)
     }
     pub fn native_negate_recipe(
         &self,

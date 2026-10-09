@@ -2697,3 +2697,6 @@ pub use native_between::*;
 
 /// Original signed integral Decimal128 conversion and policy projection.
 pub mod integral_decimal128;
+
+pub mod native_inlist;
+pub use native_inlist::PreparedNativeInListRecipe;

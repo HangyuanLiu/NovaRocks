@@ -1517,3 +1517,9 @@ mod legacy_bitmap_to_string_original_tests;
 
 #[cfg(test)]
 mod bitmap_to_string_actual_sql_source_tests;
+
+#[cfg(test)]
+mod inlist_signed_actual_after_tests;
+
+#[cfg(test)]
+mod scan_ordered_required_actual_tests;

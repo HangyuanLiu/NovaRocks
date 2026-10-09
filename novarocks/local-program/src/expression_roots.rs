@@ -785,6 +785,9 @@ fn validate_intrinsic_correspondence(
             StaticExprKind::FunctionCall { .. } | StaticExprKind::BoundCall { .. } => continue,
             StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. } => ControlShape::Conjunction,
             StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. } => ControlShape::Disjunction,
+            StaticExprKind::PreparedInList { is_not_in, .. } => ControlShape::Membership {
+                negated: *is_not_in,
+            },
             StaticExprKind::PreparedBetween { plan, .. } => ControlShape::Between {
                 negated: plan.negated(),
             },
@@ -931,6 +934,11 @@ fn validate_intrinsic_correspondence(
                 }
             }
             StaticExprKind::In {
+                child: definition,
+                values,
+                ..
+            }
+            | StaticExprKind::PreparedInList {
                 child: definition,
                 values,
                 ..
