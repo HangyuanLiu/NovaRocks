@@ -446,7 +446,8 @@ fallback 模糊 owner 和故障语义。
 - ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active；其中 schema 版本、history 保留与 commit-resolution 三项承诺已由 ADR-0143 替换，产品裁决仍有效）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active）
 - ADR-0142 — NovaRocks 自有 packages 为何共享一个 Cargo workspace、resolver 与 lock authority（active）
-- ADR-0150 — 概率结构为何精确锁定 registry DataSketches 正式版、并以版本无关的升级门管辖后续变化（active）
+- ADR-0150 — 概率结构为何精确锁定 registry DataSketches 正式版、并以版本无关的升级门管辖后续变化（active；守卫的版本/checksum 字面值规则由 ADR-0168 替换，格式所有权与五道升级门仍有效）
+- ADR-0168 — CI 依赖守卫为何从 Cargo 权威派生版本与 checksum、同时保护来源身份和封闭依赖面（active；部分替代 ADR-0150）
 
 #### 历史
 
