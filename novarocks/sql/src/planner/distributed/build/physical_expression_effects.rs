@@ -547,6 +547,22 @@ fn primitive_own_effects(
             )?;
             ScopedExpressionEffects::pure_value(context)
         }
+        ExprKind::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            work.flush()?;
+            let recipe = novarocks_functions::PreparedNativeLikeRecipe::try_new(
+                *negated,
+                &operand(*expr)?.ty,
+                &operand(*pattern)?.ty,
+                &source.ty,
+                control,
+            )?;
+            work.flush()?;
+            recipe.own_effects(context)
+        }
         ExprKind::InList {
             expr,
             list,

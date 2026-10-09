@@ -408,6 +408,7 @@ fn lower_core(
                     right,
                     ..
                 } => [*left, *right].get(next).copied(),
+                ExprKind::Like { expr, pattern, .. } => [*expr, *pattern].get(next).copied(),
                 ExprKind::Between {
                     expr, low, high, ..
                 } => [*expr, *low, *high].get(next).copied(),
@@ -737,6 +738,23 @@ fn lower_core(
                         left,
                         right,
                     )
+                }
+                ExprKind::Like {
+                    expr,
+                    pattern,
+                    negated,
+                } => {
+                    let text = *ids.get(expr).ok_or(ExpressionLoweringError::Invalid(
+                        "LIKE source was not lowered",
+                    ))?;
+                    let pattern = *ids.get(pattern).ok_or(ExpressionLoweringError::Invalid(
+                        "LIKE pattern was not lowered",
+                    ))?;
+                    StaticExprKind::PreparedLike {
+                        text,
+                        pattern,
+                        negated: *negated,
+                    }
                 }
                 ExprKind::InList {
                     expr,
@@ -1271,6 +1289,62 @@ fn prepare_core(
                         ));
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (
+                    ExprKind::Like {
+                        expr,
+                        pattern,
+                        negated,
+                    },
+                    StaticExprKind::PreparedLike {
+                        text,
+                        pattern: local_pattern,
+                        negated: local_negated,
+                    },
+                ) => {
+                    if negated != local_negated
+                        || invocation.control != ControlShape::Eager
+                        || invocation.arguments.len() != 2
+                        || lowered.ids.get(expr) != Some(text)
+                        || lowered.ids.get(pattern) != Some(local_pattern)
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "LIKE differs from original Eager2 source",
+                        ));
+                    }
+                    let definitions = package.fragment().expressions();
+                    let ty = |id| {
+                        definitions.get(id).map(|node| &node.ty).ok_or(
+                            ExpressionLoweringError::Invalid("missing original LIKE source"),
+                        )
+                    };
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedNativeLikeRecipe::try_new(
+                        *negated,
+                        ty(*expr)?,
+                        ty(*pattern)?,
+                        &source.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                    let mut combined = recipe.own_effects(invocation.context);
+                    for (ordinal, definition) in [expr, pattern].into_iter().enumerate() {
+                        let child = invocation.arguments[ordinal];
+                        if flow.uses()[&child].definition != *definition {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "LIKE source use differs",
+                            ));
+                        }
+                        combined = combined.join_control_argument(
+                            *effects.get(&child).ok_or(ExpressionLoweringError::Invalid(
+                                "LIKE child effects were not prepared",
+                            ))?,
+                            flow,
+                            ordinal,
+                        )?;
+                        work.step()?;
+                    }
+                    combined
                 }
                 (
                     ExprKind::InList {
@@ -2228,6 +2302,7 @@ fn literal_argument(
             ) => Ok(None),
             (ExprKind::Between { .. }, StaticExprKind::PreparedBetween { .. }) => Ok(None),
             (ExprKind::InList { .. }, StaticExprKind::PreparedInList { .. }) => Ok(None),
+            (ExprKind::Like { .. }, StaticExprKind::PreparedLike { .. }) => Ok(None),
             (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
             (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
             (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })

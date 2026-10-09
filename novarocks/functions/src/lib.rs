@@ -2702,3 +2702,6 @@ pub mod native_inlist;
 pub use native_inlist::PreparedNativeInListRecipe;
 
 pub mod hll_hash_core;
+
+pub mod native_like;
+pub use native_like::PreparedNativeLikeRecipe;

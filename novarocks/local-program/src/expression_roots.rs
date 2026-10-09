@@ -831,6 +831,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::PreparedCast { .. }
             | StaticExprKind::PreparedNativeNegate(..)
             | StaticExprKind::PreparedNativeBitNot(..)
+            | StaticExprKind::PreparedLike { .. }
             | StaticExprKind::PreparedArithmetic { .. }
             | StaticExprKind::Add(..)
             | StaticExprKind::Sub(..)
@@ -908,7 +909,12 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::IsNull(definition)
             | StaticExprKind::IsNotNull(definition)
             | StaticExprKind::Clone(definition) => child(*definition)?,
-            StaticExprKind::PreparedArithmetic {
+            StaticExprKind::PreparedLike {
+                text: a,
+                pattern: b,
+                ..
+            }
+            | StaticExprKind::PreparedArithmetic {
                 left: a, right: b, ..
             }
             | StaticExprKind::Add(a, b, _)

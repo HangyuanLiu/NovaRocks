@@ -1033,6 +1033,40 @@ pub(super) fn evaluate_tree<'a>(
                             .ok_or_else(|| invalid("slot source ordinal is absent"))?,
                     ))
                 }
+                StaticExprKind::PreparedLike { negated, .. } => {
+                    if frame.children.len() != 2 {
+                        return Err(invalid("LIKE requires its original ordered operands"));
+                    }
+                    let mut children = std::mem::take(&mut frame.children).into_iter();
+                    let text = children
+                        .next()
+                        .ok_or_else(|| internal("missing original LIKE source"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let pattern = children
+                        .next()
+                        .ok_or_else(|| internal("missing original LIKE pattern"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let recipe = program
+                        .native_like_recipe(frame.occurrence)
+                        .ok_or_else(|| invalid("missing exact LIKE recipe"))?;
+                    if recipe.negated() != *negated {
+                        return Err(invalid(
+                            "LIKE negative expansion differs from original source",
+                        ));
+                    }
+                    work.flush()?;
+                    let output = recipe.evaluate_selected(
+                        text.argument(),
+                        pattern.argument(),
+                        local_selection,
+                        invocation.context.demand == EvaluationDemand::TruthOnly,
+                        work.control,
+                    )?;
+                    work.flush()?;
+                    OwnedValue::from_selected(output)
+                }
                 StaticExprKind::PreparedInList { is_not_in, .. } => {
                     let recipe = program
                         .native_inlist_recipe(frame.occurrence)

@@ -287,6 +287,7 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::PreparedNativeNegate(_)
                     | StaticExprKind::PreparedNativeBitNot(_)
                     | StaticExprKind::PreparedBetween { .. }
+                    | StaticExprKind::PreparedLike { .. }
                     | StaticExprKind::PreparedInList { .. }
                     | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::PreparedNullSafeComparison { .. }
@@ -319,6 +320,11 @@ impl CompiledExpressionInstance {
                                     .ok_or_else(|| {
                                         invalid("missing mandatory native BitwiseNot effect recipe")
                                     })?
+                                    .own_effects(invocation.context)
+                            } else if matches!(node.kind(), StaticExprKind::PreparedLike { .. }) {
+                                program
+                                    .native_like_recipe(occurrence)
+                                    .ok_or_else(|| invalid("missing mandatory LIKE effect recipe"))?
                                     .own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedInList { .. }) {
                                 program
@@ -447,6 +453,10 @@ impl CompiledExpressionInstance {
                     })
                     && invocation.arguments.len() == values.len() + 1
                     && program.native_inlist_recipe(occurrence).is_some() => {}
+                StaticExprKind::PreparedLike { .. }
+                    if invocation.control == ControlShape::Eager
+                        && invocation.arguments.len() == 2
+                        && program.native_like_recipe(occurrence).is_some() => {}
                 StaticExprKind::PreparedBetween { plan, .. }
                     if invocation.control
                         == (ControlShape::Between {

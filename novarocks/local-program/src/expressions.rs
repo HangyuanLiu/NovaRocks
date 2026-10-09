@@ -200,6 +200,12 @@ pub enum StaticExprKind {
     NaryOr {
         args: Vec<ProgramExprId>,
     },
+    /// One checked original Eager2 LIKE source; negative expansion is explicit.
+    PreparedLike {
+        text: ProgramExprId,
+        pattern: ProgramExprId,
+        negated: bool,
+    },
     /// Three checked definitions, four distinct ordered invocation edges.
     PreparedBetween {
         plan: novarocks_type_contract::NativeBetweenPlan,
@@ -336,7 +342,12 @@ impl StaticExprKind {
             | Self::IsNull(child)
             | Self::IsNotNull(child)
             | Self::Clone(child) => visit(*child)?,
-            Self::PreparedArithmetic {
+            Self::PreparedLike {
+                text: a,
+                pattern: b,
+                ..
+            }
+            | Self::PreparedArithmetic {
                 left: a, right: b, ..
             }
             | Self::PreparedNullSafeComparison { left: a, right: b }

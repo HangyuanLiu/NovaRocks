@@ -136,6 +136,9 @@ fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
                 "compiled native BitwiseNot cannot enter the legacy expression bridge".to_string(),
             );
         }
+        Static::PreparedLike { .. } => {
+            return Err("compiled LIKE cannot enter the legacy expression bridge".to_string());
+        }
         Static::PreparedInList { .. } => {
             return Err("compiled IN cannot enter the legacy expression bridge".to_string());
         }

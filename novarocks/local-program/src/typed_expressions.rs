@@ -185,6 +185,32 @@ impl ProgramTypedExpressions {
                             }
                             work.step()?;
                         }
+                        if let StaticExprKind::PreparedLike {
+                            text,
+                            pattern,
+                            negated,
+                        } = definition.kind()
+                        {
+                            let source = |id: ProgramExprId| match entries.get(id.index()) {
+                                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                                _ => Err(ProgramExpressionTypeError::WrongKind),
+                            };
+                            work.flush()?;
+                            novarocks_functions::PreparedNativeLikeRecipe::try_new(
+                                *negated,
+                                source(*text)?,
+                                source(*pattern)?,
+                                value,
+                                work.control(),
+                            )
+                            .map_err(|error| {
+                                match error.control_error() {
+                                    Some(cause) => ProgramExpressionTypeError::Control(cause),
+                                    None => ProgramExpressionTypeError::TypeMismatch,
+                                }
+                            })?;
+                            work.step()?;
+                        }
                         if let StaticExprKind::PreparedInList {
                             child,
                             values,

@@ -678,3 +678,72 @@ pub(crate) fn compile_native_inlist(
     work.finish()?;
     result
 }
+
+pub(crate) fn compile_native_like(
+    checked: &ProgramLexicalBindings,
+    control: &dyn PureCompileControl,
+) -> Result<
+    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNativeLikeRecipe>,
+    ProgramPrimitiveError,
+> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let typed = checked.channels().expressions();
+        let snapshot = typed.resolved_calls().snapshot();
+        let mut recipes = BTreeMap::new();
+        for (&arena, flow) in snapshot.flows() {
+            let definitions = &snapshot.roots().arenas()[&arena];
+            let types = &typed.types()[&arena];
+            let value = |id: crate::ProgramExprId| match types.get(id.index()) {
+                Some(FunctionArgumentType::Value(v)) => Ok(v),
+                _ => Err(ProgramPrimitiveError::Invalid(
+                    "LIKE requires complete value types",
+                )),
+            };
+            for (&use_id, invocation) in flow.uses() {
+                work.step()?;
+                let kind = definitions
+                    .node(invocation.definition)
+                    .ok_or(ProgramPrimitiveError::Invalid("missing LIKE definition"))?
+                    .kind();
+                let StaticExprKind::PreparedLike {
+                    text,
+                    pattern,
+                    negated,
+                } = kind
+                else {
+                    continue;
+                };
+                if invocation.control != ControlShape::Eager || invocation.arguments.len() != 2 {
+                    return Err(ProgramPrimitiveError::Invalid(
+                        "LIKE differs from original Eager2",
+                    ));
+                }
+                for (ordinal, id) in [text, pattern].into_iter().enumerate() {
+                    if flow.uses()[&invocation.arguments[ordinal]].definition != *id {
+                        return Err(ProgramPrimitiveError::Invalid(
+                            "LIKE original ordered use differs",
+                        ));
+                    }
+                    work.step()?;
+                }
+                work.flush()?;
+                let recipe = novarocks_functions::PreparedNativeLikeRecipe::try_new(
+                    *negated,
+                    value(*text)?,
+                    value(*pattern)?,
+                    value(invocation.definition)?,
+                    control,
+                )?;
+                recipes.insert(ProgramUseRef { arena, use_id }, recipe);
+                work.step()?;
+            }
+        }
+        Ok(recipes)
+    })();
+    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}

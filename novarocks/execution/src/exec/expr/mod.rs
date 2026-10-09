@@ -1540,3 +1540,6 @@ mod like_required_actual_sql_tests;
 #[cfg(test)]
 #[path = "map_agg_actual_sql_source_tests.rs"]
 mod map_agg_actual_sql_source_tests;
+
+#[cfg(test)]
+mod like_shared_actual_after_tests;
