@@ -1393,6 +1393,9 @@ mod legacy_append_trailing_shared_baseline_tests;
 mod append_trailing_actual_sql_source_tests;
 
 #[cfg(test)]
+mod append_trailing_actual_compiled_source_tests;
+
+#[cfg(test)]
 mod numeric_unary_ordered_sql_source_tests;
 
 #[cfg(test)]

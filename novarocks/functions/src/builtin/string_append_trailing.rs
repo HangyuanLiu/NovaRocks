@@ -60,7 +60,7 @@ fn row_plan<'a>(
     ordinal: usize,
     batch_row: usize,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<(&'a str, Option<u8>)>, KernelFailure> {
+) -> Result<Option<crate::append_trailing_core::RowPlan<'a>>, KernelFailure> {
     let mut rows = [0usize; 2];
     let mut is_null = false;
     for (index, argument) in arguments.iter().enumerate() {
@@ -89,17 +89,39 @@ fn row_plan<'a>(
     if is_null {
         return Ok(None);
     }
-    let suffix = arrays[1].value(rows[1]);
-    let valid_suffix = suffix.len() == 1;
-    work.step()?;
-    if !valid_suffix {
-        return Ok(None);
+    crate::append_trailing_core::plan_observed(
+        arrays[1].value(rows[1]),
+        || arrays[0].value(rows[0]),
+        || work.step(),
+    )
+}
+
+// This port changes only output representation. The original renderer owns
+// keep/append decisions and source/suffix ordering. The wrapper has already
+// checked and reserved the complete compact extent before constructing it.
+struct CompactWriter<'work, 'control> {
+    bytes: &'work mut Vec<u8>,
+    work: &'work mut EvaluationCheckpoints<'control>,
+}
+impl crate::append_trailing_core::OutputWriter for CompactWriter<'_, '_> {
+    type Output = ();
+    type Error = KernelFailure;
+    fn unchanged(mut self, text: &str) -> Result<(), KernelFailure> {
+        self.push_str(text)
     }
-    let text = arrays[0].value(rows[0]);
-    let byte = suffix.as_bytes()[0];
-    let append = !text.is_empty() && text.as_bytes().last() != Some(&byte);
-    work.step()?;
-    Ok(Some((text, append.then_some(byte))))
+    fn begin_append(self, _capacity: usize) -> Result<Self, KernelFailure> {
+        Ok(self)
+    }
+    fn push_str(&mut self, text: &str) -> Result<(), KernelFailure> {
+        for byte in text.bytes() {
+            self.bytes.push(byte);
+            self.work.step()?;
+        }
+        Ok(())
+    }
+    fn finish(self) -> Result<(), KernelFailure> {
+        Ok(())
+    }
 }
 
 pub(super) fn evaluate_string_append_trailing<'a>(
@@ -153,12 +175,10 @@ pub(super) fn evaluate_string_append_trailing<'a>(
         output_capacity(selection.len(), 0)?;
         let mut total_bytes = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            if let Some((text, append)) =
-                row_plan(arrays, arguments, types, ordinal, batch_row, &mut work)?
-            {
+            if let Some(plan) = row_plan(arrays, arguments, types, ordinal, batch_row, &mut work)? {
                 total_bytes = total_bytes
-                    .checked_add(text.len())
-                    .and_then(|n| n.checked_add(usize::from(append.is_some())))
+                    .checked_add(plan.text_len())
+                    .and_then(|n| n.checked_add(usize::from(plan.appends_suffix())))
                     .ok_or(KernelFailure::ResourceExhausted)?;
             }
             work.step()?;
@@ -185,24 +205,23 @@ pub(super) fn evaluate_string_append_trailing<'a>(
                     validity.append(false);
                     has_null = true;
                 }
-                Some((text, append)) => {
-                    let row_bytes = text
-                        .len()
-                        .checked_add(usize::from(append.is_some()))
+                Some(plan) => {
+                    let row_bytes = plan
+                        .text_len()
+                        .checked_add(usize::from(plan.appends_suffix()))
                         .ok_or(KernelFailure::ResourceExhausted)?;
                     if row_bytes > total_bytes - bytes.len() {
                         return Err(internal(
                             "append_trailing exceeded its measured output extent",
                         ));
                     }
-                    for byte in text.bytes() {
-                        bytes.push(byte);
-                        work.step()?;
-                    }
-                    if let Some(byte) = append {
-                        bytes.push(byte);
-                        work.step()?;
-                    }
+                    crate::append_trailing_core::render_with(
+                        plan,
+                        CompactWriter {
+                            bytes: &mut bytes,
+                            work: &mut work,
+                        },
+                    )?;
                     validity.append(true);
                 }
             }
