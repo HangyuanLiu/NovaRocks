@@ -1128,3 +1128,6 @@ mod decimal_float_profile_tests;
 
 #[path = "cast_decimal_float32_tests.rs"]
 mod decimal_float32_profile_tests;
+
+#[path = "cast_text_time_tests.rs"]
+mod cast_text_time_tests;

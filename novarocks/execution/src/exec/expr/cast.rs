@@ -627,36 +627,11 @@ fn has_decimal_to_decimal_overflow(source: &ArrayRef, casted: &ArrayRef) -> bool
 }
 
 fn parse_time_string_to_seconds(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw.contains('+') || raw.starts_with('-') {
-        return None;
-    }
-    let mut parts = raw.split(':');
-    let hour = parts.next()?.trim().parse::<i64>().ok()?;
-    let minute = parts.next()?.trim().parse::<i64>().ok()?;
-    let second = parts.next()?.trim().parse::<i64>().ok()?;
-    if parts.next().is_some()
-        || hour < 0
-        || minute < 0
-        || second < 0
-        || minute >= 60
-        || second >= 60
-    {
-        return None;
-    }
-    hour.checked_mul(3600)?
-        .checked_add(minute.checked_mul(60)?)?
-        .checked_add(second)
+    novarocks_functions::time_text_cast::parse_time_string_to_seconds(raw)
 }
 
 fn parse_datetime_string_to_seconds(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let dt = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok()?;
-    let t = dt.time();
-    Some((t.hour() as i64) * 3600 + (t.minute() as i64) * 60 + t.second() as i64)
+    novarocks_functions::time_text_cast::parse_datetime_string_to_seconds(raw)
 }
 
 fn parse_string_to_naive_datetime(raw: &str) -> Option<NaiveDateTime> {
@@ -775,11 +750,7 @@ fn seconds_from_timestamp(unit: &TimeUnit, value: i64) -> Option<i64> {
 }
 
 fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> Result<ArrayRef, String> {
-    let micros: Vec<Option<i64>> = seconds
-        .into_iter()
-        .map(|v| v.and_then(|s| s.checked_mul(1_000_000)))
-        .collect();
-    Ok(Arc::new(Time64MicrosecondArray::from(micros)) as ArrayRef)
+    novarocks_functions::time_text_cast::seconds_to_time64_micro_array(seconds)
 }
 
 fn parse_varchar_to_boolean_starrocks(value: &str) -> Option<bool> {
@@ -3297,27 +3268,23 @@ fn eval_time_internal(
         });
     }
 
+    if matches!(
+        child_array.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        let mode = if source_is_datetime {
+            novarocks_functions::time_text_cast::TimeTextParseMode::Datetime
+        } else {
+            novarocks_functions::time_text_cast::TimeTextParseMode::Duration
+        };
+        return novarocks_functions::time_text_cast::evaluate_arrays(
+            &child_array,
+            &target_type,
+            mode,
+        );
+    }
     let mut seconds = Vec::with_capacity(child_array.len());
     match child_array.data_type() {
-        DataType::Utf8 => {
-            let arr = child_array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    seconds.push(None);
-                } else {
-                    let raw = arr.value(i);
-                    let parsed = if source_is_datetime {
-                        parse_datetime_string_to_seconds(raw)
-                    } else {
-                        parse_time_string_to_seconds(raw)
-                    };
-                    seconds.push(parsed);
-                }
-            }
-        }
         DataType::Boolean => {
             let arr = child_array
                 .as_any()

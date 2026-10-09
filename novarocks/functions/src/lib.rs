@@ -2664,3 +2664,7 @@ pub mod binary_text;
 mod native_negate_original_decimal_carrier_baseline_tests;
 
 pub mod decimal_float_cast;
+
+pub mod time_text_cast;
+#[cfg(test)]
+mod time_text_cast_tests;

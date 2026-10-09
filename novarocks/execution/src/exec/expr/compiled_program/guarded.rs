@@ -1382,6 +1382,7 @@ fn evaluate_cast<'a>(
         Date32(Vec<Option<i32>>),
         I64(Vec<Option<i64>>),
         Timestamp(Vec<Option<i64>>),
+        TimeMicroseconds(Vec<Option<i64>>),
         U8(Vec<Option<u8>>),
         U16(Vec<Option<u16>>),
         U32(Vec<Option<u32>>),
@@ -1398,6 +1399,9 @@ fn evaluate_cast<'a>(
         DataType::Date32 => Output::Date32(Vec::new()),
         DataType::Int64 => Output::I64(Vec::new()),
         DataType::Timestamp(_, None) => Output::Timestamp(Vec::new()),
+        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
+            Output::TimeMicroseconds(Vec::new())
+        }
         DataType::UInt8 => Output::U8(Vec::new()),
         DataType::UInt16 => Output::U16(Vec::new()),
         DataType::UInt32 => Output::U32(Vec::new()),
@@ -1415,6 +1419,7 @@ fn evaluate_cast<'a>(
         Output::Date32(v) => v.try_reserve_exact(selection.len()),
         Output::I64(v) => v.try_reserve_exact(selection.len()),
         Output::Timestamp(v) => v.try_reserve_exact(selection.len()),
+        Output::TimeMicroseconds(v) => v.try_reserve_exact(selection.len()),
         Output::U8(v) => v.try_reserve_exact(selection.len()),
         Output::U16(v) => v.try_reserve_exact(selection.len()),
         Output::U32(v) => v.try_reserve_exact(selection.len()),
@@ -1473,6 +1478,7 @@ fn evaluate_cast<'a>(
                 })?))
             }
             (Output::I64(v), R::Signed(n)) => v.push(Some(n)),
+            (Output::TimeMicroseconds(v), R::Signed(n)) => v.push(Some(n)),
             (Output::Date32(v), R::Signed(n)) => {
                 v.push(Some(i32::try_from(n).map_err(|_| {
                     internal("cast returned an out-of-range Date32")
@@ -1504,6 +1510,7 @@ fn evaluate_cast<'a>(
             (Output::Date32(v), R::Null) => v.push(None),
             (Output::I64(v), R::Null) => v.push(None),
             (Output::Timestamp(v), R::Null) => v.push(None),
+            (Output::TimeMicroseconds(v), R::Null) => v.push(None),
             (Output::U8(v), R::Null) => v.push(None),
             (Output::U16(v), R::Null) => v.push(None),
             (Output::U32(v), R::Null) => v.push(None),
@@ -1528,6 +1535,7 @@ fn evaluate_cast<'a>(
         Output::I32(v) => Arc::new(Int32Array::from(v)),
         Output::Date32(v) => Arc::new(arrow::array::Date32Array::from(v)),
         Output::I64(v) => Arc::new(Int64Array::from(v)),
+        Output::TimeMicroseconds(v) => Arc::new(arrow::array::Time64MicrosecondArray::from(v)),
         Output::Timestamp(v) => match ty {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None) => {
                 Arc::new(arrow::array::TimestampSecondArray::from(v))
