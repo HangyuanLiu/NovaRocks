@@ -735,20 +735,6 @@ fn parse_time_float_to_seconds(value: f64) -> Option<i64> {
     parse_time_integer_to_seconds(value.trunc() as i64)
 }
 
-fn seconds_from_timestamp(unit: &TimeUnit, value: i64) -> Option<i64> {
-    let micros = match unit {
-        TimeUnit::Second => value.checked_mul(1_000_000)?,
-        TimeUnit::Millisecond => value.checked_mul(1_000)?,
-        TimeUnit::Microsecond => value,
-        TimeUnit::Nanosecond => value / 1_000,
-    };
-    let seconds = micros.div_euclid(1_000_000);
-    let sub_micros = micros.rem_euclid(1_000_000) as u32;
-    let dt = DateTime::from_timestamp(seconds, sub_micros * 1000)?;
-    let t = dt.naive_utc().time();
-    Some((t.hour() as i64) * 3600 + (t.minute() as i64) * 60 + t.second() as i64)
-}
-
 fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> Result<ArrayRef, String> {
     novarocks_functions::time_text_cast::seconds_to_time64_micro_array(seconds)
 }
@@ -3283,6 +3269,15 @@ fn eval_time_internal(
             mode,
         );
     }
+    if matches!(
+        child_array.data_type(),
+        DataType::Date32 | DataType::Timestamp(_, _)
+    ) {
+        return novarocks_functions::time_calendar_cast::evaluate_arrays(
+            &child_array,
+            &target_type,
+        );
+    }
     let mut seconds = Vec::with_capacity(child_array.len());
     match child_array.data_type() {
         DataType::Boolean => {
@@ -3398,73 +3393,6 @@ fn eval_time_internal(
                 seconds.push(parse_time_integer_to_seconds(value as i64));
             }
         }
-        DataType::Date32 => {
-            let arr = child_array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    seconds.push(None);
-                } else {
-                    seconds.push(Some(0));
-                }
-            }
-        }
-        DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampSecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-            TimeUnit::Millisecond => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampMillisecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-            TimeUnit::Microsecond => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-            TimeUnit::Nanosecond => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-        },
         _ => {
             let casted = cast(child_array.as_ref(), &target_type).map_err(|e| {
                 format!(

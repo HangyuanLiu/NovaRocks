@@ -2668,3 +2668,5 @@ pub mod decimal_float_cast;
 pub mod time_text_cast;
 #[cfg(test)]
 mod time_text_cast_tests;
+
+pub mod time_calendar_cast;

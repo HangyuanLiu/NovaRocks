@@ -166,6 +166,11 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
     {
         return true;
     }
+    if target == &DataType::Time64(TimeUnit::Microsecond)
+        && crate::time_calendar_cast::can_produce_null(source)
+    {
+        return true;
+    }
     if target == &DataType::Float32
         && matches!(source, DataType::Decimal128(_, scale) if *scale < 0)
     {
@@ -326,6 +331,7 @@ impl DecimalTextSource {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    TimeCalendar,
     TimeText {
         mode: crate::time_text_cast::TimeTextParseMode,
     },
@@ -417,6 +423,28 @@ impl PreparedCastRecipe {
             let physical = source.logical_type == ValueLogicalType::Physical
                 && result.logical_type == ValueLogicalType::Physical;
             work.step()?;
+            if physical
+                && matches!(
+                    source.data_type,
+                    DataType::Date32 | DataType::Timestamp(_, _)
+                )
+                && result.data_type == DataType::Time64(TimeUnit::Microsecond)
+            {
+                if (source.nullable
+                    || crate::time_calendar_cast::can_produce_null(&source.data_type))
+                    && !result.nullable
+                {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::TimeCalendar,
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
             if physical
                 && matches!(
                     source.data_type,
@@ -733,7 +761,8 @@ impl PreparedCastRecipe {
             }
             CastBody::FloatDate { .. } => true,
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
-            CastBody::TimeText { .. }
+            CastBody::TimeCalendar
+            | CastBody::TimeText { .. }
             | CastBody::BinaryText
             | CastBody::LargeIntText
             | CastBody::Identity
@@ -771,6 +800,71 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if self.body == CastBody::TimeCalendar {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| match self.source.data_type {
+                        DataType::Date32 => array.as_any().is::<Date32Array>(),
+                        DataType::Timestamp(TimeUnit::Second, _) => {
+                            array.as_any().is::<TimestampSecondArray>()
+                        }
+                        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                            array.as_any().is::<TimestampMillisecondArray>()
+                        }
+                        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                            array.as_any().is::<TimestampMicrosecondArray>()
+                        }
+                        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                            array.as_any().is::<TimestampNanosecondArray>()
+                        }
+                        _ => false,
+                    },
+                )?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid(
+                            "non-null calendar TIME argument contains a selected NULL",
+                        ))
+                    };
+                }
+                work.flush()?;
+                let selected = argument.array().slice(row, 1);
+                work.flush()?;
+                let mut observe = |event| match event {
+                    crate::time_text_cast::TimeTextObservation::Step => work.step(),
+                    crate::time_text_cast::TimeTextObservation::OpaqueBoundary => work.flush(),
+                };
+                let output = crate::time_calendar_cast::evaluate_arrays_observed(
+                    &selected,
+                    &self.result.data_type,
+                    Some(&mut observe),
+                )?;
+                let output = match output {
+                    Ok(output) => output,
+                    Err(message) => {
+                        return Ok(CastRowResult::RowError(RowDataError::new(
+                            ordinal, &message,
+                        )));
+                    }
+                };
+                work.flush()?;
+                let output = output
+                    .as_any()
+                    .downcast_ref::<arrow_array::Time64MicrosecondArray>()
+                    .ok_or_else(|| {
+                        internal("calendar TIME core returned a different frozen carrier")
+                    })?;
+                return Ok(if output.is_null(0) {
+                    CastRowResult::Null
+                } else {
+                    CastRowResult::Signed(output.value(0))
+                });
+            }
             if let CastBody::TimeText { mode } = self.body {
                 let row = self.checked_row_with_shape(
                     argument,

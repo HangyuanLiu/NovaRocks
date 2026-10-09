@@ -135,3 +135,6 @@ fn text_time_actual_compiler_all_seven_runtime_causes_stop_and_latch_without_rep
         }
     }
 }
+
+#[path = "cast_calendar_time_tests.rs"]
+mod calendar_time_tests;
