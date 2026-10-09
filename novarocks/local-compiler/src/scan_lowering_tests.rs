@@ -1230,16 +1230,25 @@ fn union_all_of_two_runtime_split_scans_inherits_their_placement() {
 }
 
 #[test]
+fn primitive_exact_provider_guarantee_preserves_its_validated_recipe() {
+    let program = compile(Spec {
+        guarantee: Guarantee::Exact,
+        ..Spec::slice()
+    })
+    .unwrap();
+    let ProgramNodeKind::Scan {
+        source, residuals, ..
+    } = program.graph().nodes()[0].kind()
+    else {
+        panic!("Scan");
+    };
+    assert!(source.compiled().is_some());
+    assert_eq!(residuals.len(), 1);
+    assert_eq!(program.scan_inputs().len(), 1);
+}
+
+#[test]
 fn unsupported_scan_shapes_are_refused_explicitly() {
-    // A provider row guarantee is not trusted until the guarantee-only proof
-    // ruling, even when the residual still rechecks it.
-    refused(
-        Spec {
-            guarantee: Guarantee::Exact,
-            ..Spec::slice()
-        },
-        "exact provider predicate guarantee",
-    );
     refused(
         Spec {
             metadata: true,

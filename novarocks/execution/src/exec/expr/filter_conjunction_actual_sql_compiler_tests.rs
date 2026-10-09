@@ -133,7 +133,12 @@ fn frozen_reads(
             } = &node.kind
             {
                 assert!(residuals.is_empty() && derived_values.is_empty());
-                assert!(relation.predicate_guarantees().is_empty());
+                // The source fixture's provider negotiates exact predicate
+                // coverage. Package extraction preserves those physical facts;
+                // this identity compile port does not execute provider rows.
+                assert!(relation.predicate_guarantees().iter().all(|guarantee|
+                    guarantee.kind == PredicateGuaranteeKind::Exact
+                ));
                 assert_eq!(relation.schema().len(), provider_outputs.len());
                 let read = relation.read();
                 let mut assignments = Vec::new();

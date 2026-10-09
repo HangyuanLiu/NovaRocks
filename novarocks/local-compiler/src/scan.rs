@@ -42,10 +42,11 @@ pub(crate) struct LoweredScan {
 
 /// The admitted scan shape: a source-tree leaf over one runtime-split table
 /// read whose output is exactly its provider outputs in order, with its original
-/// ordered residuals and only pruning-only guarantees that the residuals evaluate.
+/// ordered residuals and guarantees admitted by the checked package. Exact
+/// guarantees remain in the provider recipe; pruning-only guarantees retain
+/// their local residual. The sole FragmentPackage guarantee proof gate rejects
+/// function calls without their guarantee's own proof before this compiler.
 /// Every other shape is refused here, before channels or expressions exist.
-/// An `Exact` guarantee stays refused until the guarantee-only proof ruling;
-/// its responsibility transfer is not inferred.
 pub(crate) fn admit_scan(
     node: &PhysicalNode,
     recipe: Option<&ConnectorReadProgramRecipe>,
@@ -84,9 +85,10 @@ pub(crate) fn admit_scan(
         let evaluated = residuals.contains(&guarantee.predicate);
         work.step()?;
         match guarantee.kind {
-            PredicateGuaranteeKind::Exact => {
-                return Err(unsupported("exact provider predicate guarantee"));
-            }
+            // The checked package owns the guarantee proof and the validated
+            // provider recipe owns its row filtering. Do not invent a local
+            // expression use or repeat the provider's exact predicate here.
+            PredicateGuaranteeKind::Exact => {}
             // The checked package already binds a pruning-only predicate to a
             // residual; this compiler never evaluates a guarantee on its own.
             PredicateGuaranteeKind::PruningOnly if !evaluated => {
