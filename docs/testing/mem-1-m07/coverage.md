@@ -402,3 +402,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - backend_readiness只创建即drop channel、不发RPC，锁定h2不保证drop前GOAWAY flush。test-only分类仅把exact1 GOAWAY改为0或1（若有则仍NO_ERROR/last0/debug0），完整legalcontrol/noapplication、零accepted/unresolvedRPC、原children全join/无cleanupfailure、stickycapture/lifecycle、同锁结算/每BE≤3/fourthfail等全部不变。control-only不认证peer或独立证明readiness意图，不对目标/未知RPC/IO其他kind/protocol/partial/timeout放宽。真实typed脚本79B everycut与所有fence反例通过。
 - 新第四独立freeze场景仅保留真实69B合法row后append01000000（73B/hash112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7），要求完整整段拒绝而不先publish合法前缀；原identity/profile/kind/seq/watermark/optionalEnd及原三freeze字节不变。真实OwnedBuffer共存计费、lastalias退出、cursor拒绝及独立End/hash oracle验证通过。
 - 最终actor21PASS/0.03s、harness161/0/3ignored/2.43s、runner125/0/2ignored/6.38s（suffix初步20actor/10oracle亦PASS）；收据p09-root-reply-no-goaway-suffix-focused-20261009.json。下一cleanHEAD同binary v7运行原3+新suffix4场景；无native完整矩阵/M07终验或push/PR/归档结论。
+
+
+### 2026-10-09 P09：真实FE四项非法RootReply原生PASS
+
+- clean81f8cc970d44a62818805dfa130bbe6ac5b5ea9c，同HEAD dev binary+runner构建62s；actual native 1FE+3BE v7四项PASS/13.062s：profile2、kindfalse、准确4Bprefix-only、完整合法69Brow后追加4Bprefix-only（73B）。原三immutable freeze hashes未变，第四dff0d953f21c13d7d990d532ee0017c711d3a61c6d93edd62b25c0f5368ce19c；每场实际独立fullFE/BE/TaskRoot marker与single target一致，实际malformed reply emitted1/claimed1，完整metadata后准确1105/HY000/seq4及各自原因，0row/0payload/positiveACK0。suffix证明真实FE先整段校验，合法前缀未提前publish。
+- 每项拒绝后与native healthy SUM=5050后均两次3BE×14项Root census全零；健康5packets/1row/hash准确。aftershutdown全部actor原handles实际join/listeners3、positions/credit0、failures/overflow空；每项独立status订阅remoteCANCEL记账2，不当目标ACK或掩盖failure。4FE+12BE共16个精确PID独立核对不存在。收据p09-native-root-reply-native-v7-pass-20261009.json绑定clean源码、binary/source identity、raw hashes、实际语义/过程与所有PID。v1–v6失败/部分成功保留。
+- 仅此四场景contract refusal矩阵闭合；不存在独立RootReply domain codec-version字段，不虚构mutation。exact partial poll_write、完整client/compute/closing/short并发、全部CL/Paimon/HMS、transport系数/P00b、人工两语义门、P10与最终同HEAD C0/C10等仍OPEN；无push/PR/归档。
