@@ -1238,6 +1238,7 @@ async fn supervise_rows(
 
         match pump_result {
             Ok(super::LogicalConclusion::Succeeded) => {
+                session.retire_preparation();
                 return converge_rows_attempts(
                     attempt.active.as_mut(),
                     attempt.schedule.contexts(),
@@ -1252,6 +1253,7 @@ async fn supervise_rows(
                 .await;
             }
             Ok(conclusion) => {
+                session.retire_preparation();
                 let convergence = converge_rows_attempts(
                     attempt.active.as_mut(),
                     attempt.schedule.contexts(),
@@ -1273,6 +1275,7 @@ async fn supervise_rows(
                 );
             }
             Err(ResultPumpFailure::Concluded(failure)) => {
+                session.retire_preparation();
                 let convergence = converge_rows_attempts(
                     attempt.active.as_mut(),
                     attempt.schedule.contexts(),
@@ -1295,6 +1298,7 @@ async fn supervise_rows(
                 };
             }
             Err(ResultPumpFailure::ActorOutcomeUnknown(failure)) => {
+                session.retire_preparation();
                 let convergence = converge_rows_attempts(
                     attempt.active.as_mut(),
                     attempt.schedule.contexts(),
@@ -1327,6 +1331,7 @@ async fn supervise_rows(
                     ),
                 });
                 if recovery != RecoveryDecision::BeginReplacement {
+                    session.retire_preparation();
                     let actor_result = decision
                         .fail_logical(actor)
                         .await
@@ -1350,6 +1355,7 @@ async fn supervise_rows(
                 let replacement = match next_attempt(attempt.schedule.execution()) {
                     Ok(replacement) => replacement,
                     Err(error) => {
+                        session.retire_preparation();
                         let actor_result = decision
                             .fail_logical(actor)
                             .await
@@ -1391,6 +1397,7 @@ async fn supervise_rows(
                 let (replacement_schedule, mut dormant) = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => {
+                        session.retire_preparation();
                         let actor_result = decision
                             .fail_logical(actor)
                             .await
@@ -1420,6 +1427,7 @@ async fn supervise_rows(
                 {
                     Ok((qualification, _)) => qualification,
                     Err(error) => {
+                        session.retire_preparation();
                         converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
                         let replacement_convergence = record_active_convergence(
                             registry,
@@ -1464,6 +1472,7 @@ async fn supervise_rows(
                 {
                     Ok(instantiation) => instantiation,
                     Err(error) => {
+                        session.retire_preparation();
                         converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
                         let replacement_convergence = record_active_convergence(
                             registry,
@@ -1489,6 +1498,7 @@ async fn supervise_rows(
                 {
                     Ok(admissions) => admissions,
                     Err(error) => {
+                        session.retire_preparation();
                         converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
                         let replacement_convergence = record_active_convergence(
                             registry,
@@ -1518,6 +1528,7 @@ async fn supervise_rows(
                 let activated = match activated {
                     Ok(Ok(activated)) => activated,
                     Ok(Err(failure)) => {
+                        session.retire_preparation();
                         let error = failure.into_failure().error().clone();
                         let actor_result = actor
                             .initialization_failed(instantiation)
@@ -1543,6 +1554,7 @@ async fn supervise_rows(
                         );
                     }
                     Err(()) => {
+                        session.retire_preparation();
                         let error = native_future_panicked(
                             "Native replacement attempt activation panicked",
                         );
@@ -1573,6 +1585,7 @@ async fn supervise_rows(
                 drop(dormant);
                 let (active, rows_runtime) = activated.into_parts();
                 let Some(rows_runtime) = rows_runtime else {
+                    session.retire_preparation();
                     let error = QueryExecutionError::new(
                         QueryExecutionErrorKind::InvalidRequest,
                         "Native replacement omitted its root result runtime",
@@ -1613,6 +1626,7 @@ async fn supervise_rows(
                 let running = match actor.activate(instantiation.ready()).await {
                     Ok(running) => running,
                     Err(error) => {
+                        session.retire_preparation();
                         let mut active = active;
                         let convergence = converge_active(
                             active.as_mut(),
@@ -2901,6 +2915,403 @@ mod tests {
                 NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
             })
         }
+    }
+
+    #[derive(Default)]
+    struct PreparationExitSignals {
+        factory_exited: AtomicBool,
+        convergence_entered: AtomicBool,
+        convergence_completed: AtomicBool,
+        reply_captured: AtomicBool,
+        release_convergence: tokio::sync::Notify,
+        trigger_failure: tokio::sync::Notify,
+        reply: std::sync::Mutex<Option<crate::api::RetainedRootReply>>,
+        transport: std::sync::Mutex<Option<novarocks_workload_control::ResultWindowAlias>>,
+    }
+    impl fmt::Debug for PreparationExitSignals {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("PreparationExitSignals")
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreparationExitState {
+        window: Option<TestWindow>,
+        signals: Arc<PreparationExitSignals>,
+    }
+    impl Drop for PreparationExitState {
+        fn drop(&mut self) {
+            // Witness actual state/window destruction, not just wrapper destruction.
+            drop(self.window.take());
+            self.signals.factory_exited.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreparationExitPort {
+        state: Arc<PreparationExitState>,
+        backend: BackendProcessId,
+    }
+    impl TestRowsPreparationPort for PreparationExitPort {
+        fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+            Arc::get_mut(&mut self.state)
+                .expect("window admission precedes the first preparation future")
+                .window = Some(TestWindow(window));
+        }
+    }
+    impl NativeAttemptPreparationPort for PreparationExitPort {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            // Match the production Arc-owned preparation state: the future can also
+            // retain the factory, independently of LogicalNativeSession.attempts.
+            let state = Arc::clone(&self.state);
+            let backend = self.backend;
+            Box::pin(async move {
+                let dormant = PreparationExitDormant {
+                    inner: RowsDormantOwner {
+                        relay_window: state.window.as_ref().expect("admitted window").clone(),
+                        backend,
+                        converged: Arc::new(AtomicBool::new(false)),
+                    },
+                    signals: Arc::clone(&state.signals),
+                };
+                let scheduling = no_scan_scheduling(&request);
+                let prepared = request.bind(scheduling, dormant).map_err(Into::into);
+                drop(state);
+                prepared
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreparationExitDormant {
+        inner: RowsDormantOwner,
+        signals: Arc<PreparationExitSignals>,
+    }
+    impl DormantNativeAttemptOwner for PreparationExitDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            self.inner.eligible_backends()
+        }
+        fn activate<'a>(
+            &'a mut self,
+            schedule: &'a AttemptSchedule,
+            admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            let signals = Arc::clone(&self.signals);
+            let activation = self.inner.activate(schedule, admissions, cancellation);
+            Box::pin(async move {
+                let activated = activation.await?;
+                let (inner, runtime) = activated.into_parts();
+                let mut runtime = runtime.expect("original Rows fixture carries its runtime");
+                runtime.binding.port = Arc::new(PreparationExitReadPort {
+                    signals: Arc::clone(&signals),
+                });
+                Ok(ActivatedNativeAttempt::relayed_rows(
+                    PreparationExitActive { inner, signals },
+                    runtime.binding,
+                    runtime.statuses,
+                ))
+            })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            self.inner.converge(cancellation)
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreparationExitActive {
+        inner: Box<dyn ActiveNativeAttemptOwner>,
+        signals: Arc<PreparationExitSignals>,
+    }
+    impl ActiveNativeAttemptOwner for PreparationExitActive {
+        fn run<'a>(
+            &'a mut self,
+            drive: &'a NativeAttemptDrive,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            let signals = Arc::clone(&self.signals);
+            let run = self.inner.run(drive, cancellation);
+            Box::pin(async move {
+                tokio::select! {
+                    terminal = run => terminal,
+                    _ = signals.trigger_failure.notified() => {
+                        NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
+                            AttemptFailureClass::ExecutionFailure,
+                            QueryExecutionError::new(
+                                QueryExecutionErrorKind::Failed,
+                                "held-convergence fixture execution failure",
+                            ),
+                        ))
+                    }
+                }
+            })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            let signals = Arc::clone(&self.signals);
+            Box::pin(async move {
+                signals.convergence_entered.store(true, Ordering::SeqCst);
+                signals.release_convergence.notified().await;
+                let result = self.inner.converge(cancellation).await;
+                signals.convergence_completed.store(true, Ordering::SeqCst);
+                result
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreparationExitReadPort {
+        signals: Arc<PreparationExitSignals>,
+    }
+    impl crate::api::BoundedRootReadPort for PreparationExitReadPort {
+        fn read(
+            &self,
+            request: novarocks_execution_contract::root_result::RootResultRead,
+            guard: novarocks_workload_control::ResultWindowAlias,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::api::RetainedRootReply,
+                            super::super::RootResultFetchFailure,
+                        >,
+                    > + Send,
+            >,
+        > {
+            let signals = Arc::clone(&self.signals);
+            Box::pin(async move {
+                use novarocks_execution_contract::root_result::{
+                    RootReadOutcome, RootResultData, RootResultReply,
+                };
+                // This reply is deliberately held by an independent decode owner.
+                // It is never delivered as a synthetic valid MySQL row or ACKed.
+                let reply = RootResultReply {
+                    root_task: request.root_task(),
+                    profile: request.profile(),
+                    kind: request.kind(),
+                    accepted_consumed: request.consumed(),
+                    outcome: RootReadOutcome::Data(
+                        RootResultData::try_new(
+                            request.kind(),
+                            std::num::NonZeroU64::MIN,
+                            bytes::Bytes::from_static(b"\x00"),
+                            None,
+                        )
+                        .expect("one nonempty byte is a bounded root data body"),
+                    ),
+                };
+                let retained = crate::api::RetainedRootReply::try_new(reply, guard, 64 * 1024)
+                    .map_err(|error| {
+                        super::super::RootResultFetchFailure::new(
+                            AttemptFailureClass::ContractViolation,
+                            work_error(error),
+                        )
+                    })?;
+                let transport = retained.retain_physical_guard();
+                *signals.transport.lock().expect("fixture transport lock") = Some(transport);
+                *signals.reply.lock().expect("fixture reply lock") = Some(retained);
+                signals.reply_captured.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            })
+        }
+        fn seal(
+            &self,
+            _: novarocks_execution_contract::root_lifetime::RootReadSealed,
+        ) -> Result<(), QueryExecutionError> {
+            Ok(())
+        }
+    }
+
+    async fn wait_preparation_exit_fact(flag: &AtomicBool) -> Result<(), &'static str> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "fixture fact was not observed within its bound")
+    }
+
+    #[derive(Debug)]
+    struct PreparationExitFacts {
+        factory_exited: bool,
+        convergence_still_held: bool,
+        held_with_reply_and_transport: usize,
+        held_after_reply_exit: usize,
+        held_after_last_transport_exit: usize,
+    }
+
+    async fn terminal_preparation_exit_fixture(fail: bool) {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let signals = Arc::new(PreparationExitSignals::default());
+        let attempts = PreparationExitPort {
+            state: Arc::new(PreparationExitState {
+                window: None,
+                signals: Arc::clone(&signals),
+            }),
+            backend: BackendProcessId::new_v7(),
+        };
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x74),
+            FrontendProcessId::new_v7(),
+            supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
+        );
+        let request = rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts);
+        let capacity = scope
+            .result_capacity()
+            .expect("original scope result capacity");
+        let original_client_positions = capacity.snapshot().held_positions[0];
+        // Capture every negative observation without asserting while the actual
+        // convergence owner is blocked. The outer cleanup always releases it.
+        let observations: Result<PreparationExitFacts, &'static str> = async {
+            let mut handle =
+                tokio::time::timeout(Duration::from_secs(1), client.start(request, root.owner))
+                    .await
+                    .map_err(|_| "Rows handle handoff timed out")?
+                    .map_err(|_| "Rows handle handoff failed")?;
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                return Err("original request did not hand off Rows");
+            };
+            wait_preparation_exit_fact(&signals.reply_captured).await?;
+            if fail {
+                signals.trigger_failure.notify_one();
+            } else {
+                handle
+                    .request_cancel()
+                    .map_err(|_| "original cancel request failed")?;
+            }
+            let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .map_err(|_| "Rows terminal result timed out")?;
+            if terminal.is_ok() {
+                return Err("terminal Rows result did not preserve a typed error");
+            }
+            drop(stream);
+            drop(handle);
+            wait_preparation_exit_fact(&signals.convergence_entered).await?;
+            let factory_exited = signals.factory_exited.load(Ordering::SeqCst);
+            let held_with_reply_and_transport = capacity.snapshot().held_positions[0];
+            let reply = signals
+                .reply
+                .lock()
+                .map_err(|_| "fixture reply lock poisoned")?
+                .take();
+            drop(reply);
+            let held_after_reply_exit = capacity.snapshot().held_positions[0];
+            let transport = signals
+                .transport
+                .lock()
+                .map_err(|_| "fixture transport lock poisoned")?
+                .take();
+            drop(transport);
+            let held_after_last_transport_exit = capacity.snapshot().held_positions[0];
+            let convergence_still_held = !signals.convergence_completed.load(Ordering::SeqCst);
+            Ok(PreparationExitFacts {
+                factory_exited,
+                convergence_still_held,
+                held_with_reply_and_transport,
+                held_after_reply_exit,
+                held_after_last_transport_exit,
+            })
+        }
+        .await;
+
+        // Preserve cleanup even when an observation failed. Poisoned fixture locks
+        // retain their actual slots until explicitly taken; do not abandon owners.
+        drop(
+            signals
+                .reply
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take(),
+        );
+        drop(
+            signals
+                .transport
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take(),
+        );
+        signals.release_convergence.notify_one();
+        // Process shutdown may legitimately end optional remote tracking.
+        // Observe this original fixture's convergence before requesting it.
+        let convergence_exit = wait_preparation_exit_fact(&signals.convergence_completed).await;
+        root.business.release();
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        // A timed-out handoff may have continued in the original supervisor.
+        // Once shutdown joins it, drain slots again before checking scope release.
+        drop(
+            signals
+                .reply
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take(),
+        );
+        drop(
+            signals
+                .transport
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take(),
+        );
+        acknowledge_all_control(&control);
+        let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
+
+        // All assertions happen after the original owner has been released/joined.
+        assert!(
+            shutdown.is_ok(),
+            "original supervisor did not shut down: {shutdown:?}"
+        );
+        assert!(settled.is_ok(), "original scope did not settle");
+        assert!(
+            convergence_exit.is_ok(),
+            "original convergence did not exit"
+        );
+        let facts = observations.expect("all bounded lifetime observations must complete");
+        assert_eq!(original_client_positions, 1);
+        assert!(
+            facts.factory_exited,
+            "terminal supervisor retained its preparation factory: {facts:?}"
+        );
+        assert!(
+            facts.convergence_still_held,
+            "fixture released remote convergence too early"
+        );
+        assert_eq!(facts.held_with_reply_and_transport, 1);
+        assert_eq!(
+            facts.held_after_reply_exit, 1,
+            "actual transport alias must keep the window"
+        );
+        assert_eq!(
+            facts.held_after_last_transport_exit, 0,
+            "last actual alias must return capacity before remote convergence"
+        );
+        assert!(signals.convergence_completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_cancel_retires_preparation_before_held_convergence_but_preserves_reply_aliases()
+     {
+        terminal_preparation_exit_fixture(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_failure_retires_preparation_before_held_convergence_but_preserves_reply_aliases()
+     {
+        terminal_preparation_exit_fixture(true).await;
     }
 
     #[tokio::test]

@@ -549,6 +549,7 @@ pub enum NativeExecutionContractError {
     ForeignScanWorkFact,
     MissingReplacementPort,
     UnexpectedReplacementPort,
+    AttemptPreparationRetired,
 }
 
 impl fmt::Display for NativeExecutionContractError {
@@ -565,6 +566,9 @@ impl fmt::Display for NativeExecutionContractError {
             }
             Self::DifferentLogicalQuery => {
                 "Native attempt does not belong to the opened logical query"
+            }
+            Self::AttemptPreparationRetired => {
+                "Native attempt preparation has retired for this logical execution"
             }
             Self::EmptyEligibleBackends => "Native attempt has no eligible backend process",
             Self::DuplicateEligibleBackend => {
@@ -673,7 +677,7 @@ impl LogicalNativeOpenRequest {
             ticket: self.ticket,
             aborts: self.seed.aborts,
             replacements: self.seed.replacements,
-            attempts: self.seed.attempts,
+            attempts: Some(self.seed.attempts),
         })
     }
 
@@ -705,7 +709,7 @@ pub struct LogicalNativeSession {
     ticket: Arc<LogicalNativeTicket>,
     aborts: Arc<dyn AbortQueryContextEffectPort>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
-    attempts: Box<dyn NativeAttemptPreparationPort>,
+    attempts: Option<Box<dyn NativeAttemptPreparationPort>>,
 }
 
 #[derive(Debug)]
@@ -736,6 +740,9 @@ impl LogicalNativeSession {
         ),
         NativeExecutionContractError,
     > {
+        if self.attempts.is_none() {
+            return Err(NativeExecutionContractError::AttemptPreparationRetired);
+        }
         if execution.query_id() != self.ticket.initial_execution.query_id() {
             return Err(NativeExecutionContractError::DifferentLogicalQuery);
         }
@@ -755,7 +762,20 @@ impl LogicalNativeSession {
         &mut self,
         request: NativeAttemptPreparationRequest,
     ) -> NativeAttemptPreparationFuture {
-        self.attempts.prepare(request)
+        match self.attempts.as_mut() {
+            Some(attempts) => attempts.prepare(request),
+            None => Box::pin(async {
+                Err(NativeExecutionContractError::AttemptPreparationRetired.into())
+            }),
+        }
+    }
+
+    /// Stop creating attempts once the supervisor has chosen a terminal path.
+    /// Drop the preparation owner before remote convergence: its unused window
+    /// alias is not a fetch/transport tail. Already-created futures, replies and
+    /// active attempts keep their own owners through their actual exit.
+    pub(crate) fn retire_preparation(&mut self) {
+        self.attempts.take();
     }
 
     pub(crate) fn abort_effect_port(&self) -> Arc<dyn AbortQueryContextEffectPort> {
@@ -1569,6 +1589,62 @@ mod tests {
 
     #[derive(Debug)]
     struct NoopPreparationPort;
+
+    #[tokio::test]
+    async fn retired_preparation_refuses_new_and_previously_issued_tickets() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        #[derive(Debug)]
+        struct ObservedPreparationPort {
+            calls: Arc<AtomicU64>,
+            exits: Arc<AtomicU64>,
+        }
+        impl NativeAttemptPreparationPort for ObservedPreparationPort {
+            fn prepare(
+                &mut self,
+                _request: NativeAttemptPreparationRequest,
+            ) -> NativeAttemptPreparationFuture {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(NativeExecutionContractError::ForeignAttemptTicket.into()) })
+            }
+        }
+        impl Drop for ObservedPreparationPort {
+            fn drop(&mut self) {
+                self.exits.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let exits = Arc::new(AtomicU64::new(0));
+        let description = description(RecoveryMode::NoRecovery);
+        let seed = seed_for_description(
+            &description,
+            PermanentlyBackpressuredAbortEffectPort::shared(),
+            None,
+            ObservedPreparationPort {
+                calls: Arc::clone(&calls),
+                exits: Arc::clone(&exits),
+            },
+        );
+        let (_governance, open, acceptance) = issue_with_seed(execution(1, 1), description, seed);
+        let mut session = acceptance.accept(open.bind().unwrap()).unwrap();
+        let (old_request, _) = session.issue_attempt(execution(1, 1)).unwrap();
+
+        session.retire_preparation();
+        session.retire_preparation();
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            session.issue_attempt(execution(1, 2)),
+            Err(NativeExecutionContractError::AttemptPreparationRetired)
+        ));
+        assert!(matches!(
+            session.prepare(old_request).await,
+            Err(NativeAttemptPreparationError::Contract(
+                NativeExecutionContractError::AttemptPreparationRetired
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     impl NativeAttemptPreparationPort for NoopPreparationPort {
         fn prepare(
