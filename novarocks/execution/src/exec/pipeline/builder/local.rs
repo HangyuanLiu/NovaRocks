@@ -36,9 +36,7 @@ use crate::exec::node::analytic::{
     WindowType as RuntimeWindowType,
 };
 use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
-use crate::exec::node::change_event_expand::{
-    ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
-};
+use crate::exec::node::change_event_expand::{ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::join::{
     JoinDistributionMode as RuntimeJoinDistributionMode, JoinRuntimeFilterProducerBinding,
@@ -833,10 +831,19 @@ fn build_pipeline_for_program_node(
         }
         lp::ProgramNodeKind::Scan {
             runtime_filters,
-            conjunct_predicate,
+            residuals,
             limit,
             ..
         } => {
+            let predicate =
+                match residuals.as_slice() {
+                    [] => None,
+                    [predicate] => Some(*predicate),
+                    _ => return Err(
+                        "legacy scan construction cannot consume multiple compiled residual roots"
+                            .into(),
+                    ),
+                };
             let consumers = runtime_filter_consumers(runtime_filters)?;
             validate_native_consumer_specs(&consumers, ctx)?;
             let source = bindings
@@ -851,7 +858,7 @@ fn build_pipeline_for_program_node(
                 .with_node_id(node_id)
                 .with_runtime_filter_consumers(consumers)
                 .with_output_chunk_schema(ChunkSchema::from_static_layout(node.output_layout())?)
-                .with_conjunct_predicate(conjunct_predicate.map(expr))
+                .with_conjunct_predicate(predicate.map(expr))
                 .with_limit(*limit);
             // One driver owns the scan stream; the shared handoff restores the
             // downstream DOP without duplicating the Task's reader capability.
@@ -2360,7 +2367,7 @@ mod tests {
                 lp::ProgramNodeKind::Scan {
                     source: recipe.into(),
                     runtime_filters: vec![],
-                    conjunct_predicate: None,
+                    residuals: Vec::new(),
                     limit: None,
                 },
                 layout.clone(),

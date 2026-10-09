@@ -264,7 +264,7 @@ fn checked_scans(
             ProgramNodeKind::Scan {
                 source,
                 runtime_filters: vec![],
-                conjunct_predicate: None,
+                residuals: Vec::new(),
                 limit: None,
             },
             layout.clone(),

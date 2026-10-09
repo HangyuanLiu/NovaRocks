@@ -382,7 +382,7 @@ mod tests {
                 lp::ProgramNodeKind::Scan {
                     source: recipe.into(),
                     runtime_filters: vec![],
-                    conjunct_predicate: None,
+                    residuals: Vec::new(),
                     limit: None,
                 },
                 layout.clone(),

@@ -534,7 +534,7 @@ impl Lowering<'_> {
                     P::Scan {
                         source: source.into(),
                         runtime_filters,
-                        conjunct_predicate: conjunct_predicate.map(expr),
+                        residuals: conjunct_predicate.map(expr).into_iter().collect(),
                         limit,
                     },
                 )

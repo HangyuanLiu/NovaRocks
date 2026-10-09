@@ -457,7 +457,7 @@ fn build_node(
         ProgramNodeKind::Scan {
             source,
             runtime_filters,
-            conjunct_predicate,
+            residuals,
             limit,
         } => {
             if source.compiled().is_none() {
@@ -481,13 +481,13 @@ fn build_node(
             })?;
             // The residual is the scan's own TruthOnly root over its output;
             // it is built first so a refused root binds no driver.
-            let residual = conjunct_predicate
-                .map(|_| {
+            let residual = (!residuals.is_empty())
+                .then(|| {
                     CompiledFilterProcessorFactory::try_new(
                         Arc::clone(program),
                         ProgramExpressionRootSite::Node {
                             node: id,
-                            role: ProgramNodeExpressionRole::ScanResidual,
+                            role: ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
                         },
                         Arc::clone(error),
                     )

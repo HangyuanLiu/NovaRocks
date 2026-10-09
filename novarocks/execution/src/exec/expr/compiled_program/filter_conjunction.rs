@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! One ordered Filter conjunct consumer over the actual original root sites.
+//! One ordered Filter/Scan conjunct consumer over the actual original root sites.
 //! The expression evaluator and BooleanRows remain their sole existing authors.
 use super::boolean_region::BooleanRows;
 use super::*;
@@ -56,11 +56,16 @@ impl CompiledFilterConjunctionInstance {
                 .nodes()
                 .get(node.index())
                 .ok_or_else(|| invalid("Filter conjunction node is absent"))?;
-            let ProgramNodeKind::Filter { predicates, .. } = graph_node.kind() else {
-                return Err(invalid(
-                    "Filter conjunction requires its actual Filter node",
-                ));
-            };
+            let (predicates, scan): (&[novarocks_local_program::ProgramExprId], bool) =
+                match graph_node.kind() {
+                    ProgramNodeKind::Filter { predicates, .. } => (predicates.as_ref(), false),
+                    ProgramNodeKind::Scan { residuals, .. } => (residuals.as_slice(), true),
+                    _ => {
+                        return Err(invalid(
+                            "Filter conjunction requires its actual Filter or Scan node",
+                        ));
+                    }
+                };
             if predicates.is_empty() {
                 return Err(invalid("Filter conjunction has no original predicate"));
             }
@@ -71,7 +76,11 @@ impl CompiledFilterConjunctionInstance {
                     u32::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?;
                 let site = ProgramExpressionRootSite::Node {
                     node,
-                    role: ProgramNodeExpressionRole::FilterPredicate { predicate: ordinal },
+                    role: if scan {
+                        ProgramNodeExpressionRole::ScanResidual { predicate: ordinal }
+                    } else {
+                        ProgramNodeExpressionRole::FilterPredicate { predicate: ordinal }
+                    },
                 };
                 let snapshot = program
                     .checked()

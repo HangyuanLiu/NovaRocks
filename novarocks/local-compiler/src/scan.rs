@@ -41,8 +41,8 @@ pub(crate) struct LoweredScan {
 }
 
 /// The admitted scan shape: a source-tree leaf over one runtime-split table
-/// read whose output is exactly its provider outputs in order, with at most
-/// one residual and only pruning-only guarantees that the residual evaluates.
+/// read whose output is exactly its provider outputs in order, with its original
+/// ordered residuals and only pruning-only guarantees that the residuals evaluate.
 /// Every other shape is refused here, before channels or expressions exist.
 /// An `Exact` guarantee stays refused until the guarantee-only proof ruling;
 /// its responsibility transfer is not inferred.
@@ -79,9 +79,6 @@ pub(crate) fn admit_scan(
     }
     if !derived_values.is_empty() {
         return Err(unsupported("derived or VARIANT scan value"));
-    }
-    if residuals.len() > 1 {
-        return Err(unsupported("multiple scan residuals"));
     }
     for guarantee in data.predicate_guarantees.iter() {
         let evaluated = residuals.contains(&guarantee.predicate);
@@ -189,23 +186,18 @@ fn lower_core(
             "Scan input, public schema, channel or output width differs",
         ));
     }
-    // The single residual is the scan's own TruthOnly root over its output.
-    let conjunct_predicate = match residuals.as_ref() {
-        [] => None,
-        [residual] => Some(
+    // Every original residual keeps its own ordered TruthOnly root.
+    let mut lowered_residuals = Vec::with_capacity(residuals.len());
+    for residual in residuals.iter() {
+        lowered_residuals.push(
             *expressions
                 .get(residual)
                 .ok_or(FragmentCompileError::Invalid(
                     "missing scan residual definition",
                 ))?,
-        ),
-        _ => {
-            return Err(FragmentCompileError::Unsupported {
-                node: Some(node.id),
-                feature: "multiple scan residuals",
-            });
-        }
-    };
+        );
+        work.step()?;
+    }
     // The provider authored these fields; the layout keeps names, field and
     // schema metadata exactly. The schema copy is opaque and only observed.
     work.flush()?;
@@ -220,7 +212,7 @@ fn lower_core(
         kind: ProgramNodeKind::Scan {
             source,
             runtime_filters,
-            conjunct_predicate,
+            residuals: lowered_residuals,
             limit: None,
         },
         requirement: BindingRequirement::Scan {

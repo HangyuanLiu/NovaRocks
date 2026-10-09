@@ -149,13 +149,12 @@ fn evaluate(
                     node: node.local_id().unwrap(),
                     role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
                 },
-                ProgramNodeKind::Scan {
-                    conjunct_predicate: Some(_),
-                    ..
-                } if truth => ProgramExpressionRootSite::Node {
-                    node: node.local_id().unwrap(),
-                    role: ProgramNodeExpressionRole::ScanResidual,
-                },
+                ProgramNodeKind::Scan { residuals, .. } if truth && residuals.len() == 1 => {
+                    ProgramExpressionRootSite::Node {
+                        node: node.local_id().unwrap(),
+                        role: ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
+                    }
+                }
                 _ => continue,
             };
             let snapshot = program

@@ -434,7 +434,7 @@ pub enum ProgramNodeKind {
     Scan {
         source: ProgramScanSource,
         runtime_filters: Vec<FilterConsumerAtExpr>,
-        conjunct_predicate: Option<ProgramExprId>,
+        residuals: Vec<ProgramExprId>,
         limit: Option<usize>,
     },
     ExchangeSource {
@@ -604,10 +604,10 @@ impl ProgramNodeKind {
             }
             Self::Scan {
                 runtime_filters,
-                conjunct_predicate,
+                residuals,
                 ..
             } => {
-                if let Some(id) = conjunct_predicate {
+                for id in residuals {
                     visit(Some(*id))?;
                 }
                 for binding in runtime_filters {

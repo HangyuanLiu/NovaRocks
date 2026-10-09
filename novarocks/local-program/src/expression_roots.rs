@@ -53,7 +53,9 @@ pub enum ProgramNodeExpressionRole {
     FilterPredicate {
         predicate: u32,
     },
-    ScanResidual,
+    ScanResidual {
+        predicate: u32,
+    },
     RuntimeFilter {
         binding: u32,
     },
@@ -364,12 +366,20 @@ impl RootCollector<'_> {
                 }
             }
             ProgramNodeKind::Scan {
-                conjunct_predicate,
+                residuals,
                 runtime_filters,
                 ..
             } => {
-                if let Some(definition) = conjunct_predicate {
-                    self.node_root(node, Role::ScanResidual, *definition, TruthOnly)?;
+                for (predicate, definition) in residuals.iter().enumerate() {
+                    self.step()?;
+                    self.node_root(
+                        node,
+                        Role::ScanResidual {
+                            predicate: ordinal(predicate)?,
+                        },
+                        *definition,
+                        TruthOnly,
+                    )?;
                 }
                 for (binding, value) in runtime_filters.iter().enumerate() {
                     self.node_root(

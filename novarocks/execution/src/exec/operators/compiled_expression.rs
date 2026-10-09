@@ -328,8 +328,8 @@ impl ProcessorOperator for CompiledProjectProcessor {
     }
 }
 
-/// Filter by the original ordered TruthOnly predicate roots. The single
-/// Scan residual retains its original consumer. Both preserve the exact
+/// Filter by the original ordered Filter or Scan TruthOnly predicate roots.
+/// Both preserve the exact
 /// input port and keep only rows whose complete predicate is TRUE.
 pub struct CompiledFilterProcessorFactory {
     name: String,
@@ -339,7 +339,7 @@ pub struct CompiledFilterProcessorFactory {
 }
 impl CompiledFilterProcessorFactory {
     /// `site` identifies the Filter owner through original predicate zero,
-    /// or the single original ScanResidual. All Filter roots share its
+    /// or original ScanResidual zero. All roots share the same
     /// checked NodeOutput input port, which is also the filtered output.
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
@@ -361,9 +361,10 @@ impl CompiledFilterProcessorFactory {
                 ProgramNodeKind::Filter { .. },
                 ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
             ) => "COMPILED_FILTER",
-            (ProgramNodeKind::Scan { .. }, ProgramNodeExpressionRole::ScanResidual) => {
-                "COMPILED_SCAN_RESIDUAL"
-            }
+            (
+                ProgramNodeKind::Scan { .. },
+                ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
+            ) => "COMPILED_SCAN_RESIDUAL",
             _ => {
                 return Err(format!(
                     "compiled filter root {role:?} at local node {} is neither a Filter predicate nor a Scan residual",
@@ -413,14 +414,10 @@ struct CompiledFilterProcessor {
     program: Arc<LocalProgram>,
     site: ProgramExpressionRootSite,
     control: RuntimeKernelControl,
-    instance: Option<CompiledFilterEvaluation>,
+    instance: Option<crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance>,
     pending: Option<Chunk>,
     finishing: bool,
     finished: bool,
-}
-enum CompiledFilterEvaluation {
-    Filter(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance),
-    Scan(Vec<CompiledExpressionInstance>),
 }
 impl Operator for CompiledFilterProcessor {
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
@@ -451,27 +448,25 @@ impl ProcessorOperator for CompiledFilterProcessor {
             return Err("compiled Filter received input while output is pending".into());
         }
         if self.instance.is_none() {
-            let created = match self.site {
-                ProgramExpressionRootSite::Node { node, role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 } } =>
-                    CompiledFilterEvaluation::Filter(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new_with_allocator(Arc::clone(&self.program), node, &self.control, self.control.allocator())?),
-                _ => {
-                    let mut instances_slot = None;
-                    instances(&mut instances_slot, &self.program, std::slice::from_ref(&self.site), &self.control)?;
-                    CompiledFilterEvaluation::Scan(instances_slot.expect("scan instance was created"))
-                }
+            let ProgramExpressionRootSite::Node { node, .. } = self.site else {
+                return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                    "compiled Filter root is not a node",
+                ))
+                .into());
             };
-            self.instance = Some(created);
+            self.instance = Some(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new_with_allocator(
+                Arc::clone(&self.program), node, &self.control, self.control.allocator(),
+            )?);
         }
-        let truth = match self.instance.as_mut().expect("instance was created") {
-            CompiledFilterEvaluation::Filter(instance) => instance.evaluate_required(
+        let truth = self
+            .instance
+            .as_mut()
+            .expect("instance was created")
+            .evaluate_required(
                 &chunk.batch,
                 Selection::all(chunk.batch.num_rows()),
                 &self.control,
-            )?,
-            CompiledFilterEvaluation::Scan(instances) => {
-                evaluate_all(&mut instances[0], self.site, &chunk.batch, &self.control)?
-            }
-        };
+            )?;
         let truth = truth
             .as_any()
             .downcast_ref::<BooleanArray>()

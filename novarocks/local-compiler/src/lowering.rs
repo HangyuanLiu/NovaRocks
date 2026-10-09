@@ -1706,8 +1706,8 @@ fn lower(
             ExpressionRootRole::FilterPredicate { predicate } => {
                 ProgramNodeExpressionRole::FilterPredicate { predicate }
             }
-            ExpressionRootRole::ScanResidual { predicate: 0 } => {
-                ProgramNodeExpressionRole::ScanResidual
+            ExpressionRootRole::ScanResidual { predicate } => {
+                ProgramNodeExpressionRole::ScanResidual { predicate }
             }
             ExpressionRootRole::SortOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
             ExpressionRootRole::SortPartition { key } => {

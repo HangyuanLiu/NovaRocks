@@ -421,7 +421,7 @@ fn scan_with_consumers(
         .snapshot();
     let ProgramNodeKind::Scan {
         source,
-        conjunct_predicate,
+        residuals,
         limit,
         ..
     } = base.graph().nodes()[scan.index()].kind()
@@ -457,7 +457,7 @@ fn scan_with_consumers(
     let kind = ProgramNodeKind::Scan {
         source: source.clone(),
         runtime_filters,
-        conjunct_predicate: *conjunct_predicate,
+        residuals: residuals.clone(),
         limit: *limit,
     };
     rebuild(
@@ -1257,7 +1257,7 @@ fn compiled_runtime_filter_bindings_must_match_the_requirements_and_a_session() 
                     expr_id: definition,
                     consumer: blocking_consumer(7),
                 }],
-                conjunct_predicate: None,
+                residuals: Vec::new(),
                 limit: None,
             },
         ),

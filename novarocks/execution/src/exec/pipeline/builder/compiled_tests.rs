@@ -129,7 +129,10 @@ fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
             project,
             ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
         ),
-        site(filter, ProgramNodeExpressionRole::ScanResidual),
+        site(
+            filter,
+            ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
+        ),
         site(
             filter,
             ProgramNodeExpressionRole::ProjectOutput { expression: 0 },

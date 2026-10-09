@@ -1011,7 +1011,7 @@ fn residual_scan_compiles_to_the_provider_layout_seal_address_and_residual_root(
     let ProgramNodeKind::Scan {
         source,
         runtime_filters,
-        conjunct_predicate,
+        residuals,
         limit,
     } = node.kind()
     else {
@@ -1068,12 +1068,13 @@ fn residual_scan_compiles_to_the_provider_layout_seal_address_and_residual_root(
         Some(StaticSinkProgram::DataStream { .. })
     ));
     // The one residual is the scan's own TruthOnly root over its output.
-    let predicate = conjunct_predicate.expect("residual conjunct");
+    assert_eq!(residuals.len(), 1);
+    let predicate = residuals[0];
     let checked = program.checked();
     let snapshot = checked.channels().expressions().resolved_calls().snapshot();
     let site = ProgramExpressionRootSite::Node {
         node: ProgramNodeId::new(0),
-        role: ProgramNodeExpressionRole::ScanResidual,
+        role: ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
     };
     let use_id = snapshot.bindings()[&site];
     let root = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[&use_id];
@@ -1116,13 +1117,10 @@ fn plain_scan_has_no_conjunct_and_no_root() {
         ..Spec::slice()
     })
     .unwrap();
-    let ProgramNodeKind::Scan {
-        conjunct_predicate, ..
-    } = program.graph().nodes()[0].kind()
-    else {
+    let ProgramNodeKind::Scan { residuals, .. } = program.graph().nodes()[0].kind() else {
         panic!("Scan");
     };
-    assert!(conjunct_predicate.is_none());
+    assert!(residuals.is_empty());
     let snapshot = program
         .checked()
         .channels()
@@ -1233,13 +1231,6 @@ fn union_all_of_two_runtime_split_scans_inherits_their_placement() {
 
 #[test]
 fn unsupported_scan_shapes_are_refused_explicitly() {
-    refused(
-        Spec {
-            residuals: 2,
-            ..Spec::slice()
-        },
-        "multiple scan residuals",
-    );
     // A provider row guarantee is not trusted until the guarantee-only proof
     // ruling, even when the residual still rechecks it.
     refused(
