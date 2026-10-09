@@ -1784,3 +1784,7 @@ mod string_reverse_shared_tests;
 
 #[path = "pure_differential_map_entries_tests.rs"]
 mod map_entries_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_ndv_hll_tests.rs"]
+mod ndv_hll_tests;

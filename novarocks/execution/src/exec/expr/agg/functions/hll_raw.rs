@@ -1154,3 +1154,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_ndv_hll_baseline_tests.rs"]
+mod legacy_ndv_hll_baseline_tests;
