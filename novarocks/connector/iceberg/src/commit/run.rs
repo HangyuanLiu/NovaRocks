@@ -764,6 +764,9 @@ mod application_document_publication_trace_tests {
                 concrete,
                 catalog.clone(),
             );
+        // These tests exercise publication protocol outcomes under an explicit
+        // admitted owner, independent of Hadoop's product document policy.
+        let owner = crate::catalog::admission_test_support::all_admitted(owner);
         let runtime = Arc::new(
             crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
                 crate::catalog_control::IcebergCatalogControlState::new(configuration),

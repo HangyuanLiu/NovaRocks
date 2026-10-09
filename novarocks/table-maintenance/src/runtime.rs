@@ -385,6 +385,20 @@ where
             notified.await;
         }
     }
+    pub async fn request_cancel(&self, job_id: i64) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        if !state.active.contains_key(&job_id) {
+            if state.terminal.iter().any(|job| job.job_id == job_id) {
+                return Ok(());
+            }
+            return Err(Self::not_found(job_id));
+        }
+        state.cancellation_requested.insert(job_id);
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
     pub async fn cancellation_requested(&self, job_id: i64) -> Result<bool, RuntimeError> {
         Ok(self.lock()?.cancellation_requested.contains(&job_id))
     }
@@ -587,5 +601,43 @@ mod tests {
                 .await
                 .expect("cancellation state")
         );
+    }
+    #[tokio::test]
+    async fn per_job_cancel_retains_pending_and_running_work_until_actual_finish() {
+        for dispatch in [false, true] {
+            let runtime: ProcessRuntime<String, (), ()> = ProcessRuntime::new();
+            let job = runtime.submit(create("orders", 1), ()).await.unwrap();
+            if dispatch {
+                runtime.claim_next(2).await.unwrap().unwrap();
+            }
+            runtime.request_cancel(job.job_id).await.unwrap();
+            assert!(runtime.cancellation_requested(job.job_id).await.unwrap());
+            let wait = runtime.wait_for_completion(job.job_id);
+            tokio::pin!(wait);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    wait.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            let terminal = if dispatch {
+                Ok(())
+            } else {
+                runtime.claim_next(2).await.unwrap().unwrap();
+                Err(TerminalError::cancelled_before_dispatch("cancelled"))
+            };
+            runtime.finish(job.job_id, terminal, 3).await.unwrap();
+            let actual = wait.await.unwrap();
+            assert_eq!(
+                actual.state,
+                if dispatch {
+                    MaintenanceJobState::Finished
+                } else {
+                    MaintenanceJobState::CancelledBeforeDispatch
+                }
+            );
+            runtime.request_cancel(job.job_id).await.unwrap();
+            assert!(!runtime.cancellation_requested(job.job_id).await.unwrap());
+        }
     }
 }

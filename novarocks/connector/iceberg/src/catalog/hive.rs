@@ -36,14 +36,9 @@ use super::{
 
 /// A Hive Metastore Iceberg catalog.
 ///
-/// HMS is a permanently read-only compatibility entry. It has no staged-create protocol, so CTAS and create-or-replace
-/// are refused here — before a source runs, a writer dispatches, or a staging
-/// object exists. There is no visible-empty-table fallback: creating the target
-/// first and filling it afterwards would make a half-built table readable,
-/// which is the failure mode the staged protocol exists to prevent.
-///
-/// Views are not special-cased. The vendored HMS client does not implement the
-/// view methods, so delegation already yields a typed `Unsupported`.
+/// HMS is a permanently read-only compatibility entry. Every mutation and
+/// transaction constructor uses the same local refusal rule before catalog or
+/// filesystem effects. Read operations retain the vendored HMS compatibility.
 #[derive(Debug)]
 pub(super) struct NovaRocksHiveCatalog {
     delegate: CatalogDelegate,
@@ -229,9 +224,11 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         &self,
         _evidence: ConditionalCreateEvidence,
     ) -> Result<ConditionalCreateVerdict, ConnectorError> {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-            "Hive Metastore Iceberg catalog publishes a create through the metastore, not through a conditional metadata write",
+        Err(crate::catalog::admission::connector_unsupported(
+            self.refuse_operation(
+                CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+                CatalogTableName::new(_evidence.namespace, _evidence.table),
+            ),
         ))
     }
 

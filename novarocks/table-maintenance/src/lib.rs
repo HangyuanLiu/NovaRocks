@@ -223,8 +223,18 @@ pub enum MaintenanceTargetRebind {
 
 /// Named current-process submission for one exact OPTIMIZE job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptimizeCompletionMode {
+    Detached,
+    AwaitTerminal,
+}
+
+/// Submission retains the completion rule captured with the exact target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptimizeSubmission {
-    Submitted { job_id: i64 },
+    Submitted {
+        job_id: i64,
+        completion: OptimizeCompletionMode,
+    },
     AlreadyActive,
 }
 
@@ -246,7 +256,7 @@ impl OptimizeSubmission {
     /// silently transfer its business responsibility and conflict gate.
     pub const fn handle(self) -> Option<runtime::JobHandle> {
         match self {
-            Self::Submitted { job_id } => Some(runtime::JobHandle::new(job_id)),
+            Self::Submitted { job_id, .. } => Some(runtime::JobHandle::new(job_id)),
             Self::AlreadyActive => None,
         }
     }
@@ -263,10 +273,13 @@ mod tests {
     #[test]
     fn submitted_handle_names_only_its_exact_job() {
         assert_eq!(
-            OptimizeSubmission::Submitted { job_id: 41 }
-                .handle()
-                .expect("submitted job has a handle")
-                .job_id(),
+            OptimizeSubmission::Submitted {
+                job_id: 41,
+                completion: super::OptimizeCompletionMode::Detached
+            }
+            .handle()
+            .expect("submitted job has a handle")
+            .job_id(),
             41
         );
         assert_eq!(OptimizeSubmission::AlreadyActive.handle(), None);

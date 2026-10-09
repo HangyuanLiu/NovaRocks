@@ -200,12 +200,23 @@ async fn run_worker(
         };
         let Some(execution) = execution.acquire() else {
             drop(scope);
+            finish(
+                jobs.as_ref(),
+                job.job_id,
+                Err(TerminalError::pre_dispatch_failed(
+                    "optimize execution owner disappeared before provider dispatch",
+                )),
+            )
+            .await?;
             cancel_for_shutdown(jobs.as_ref()).await?;
             return Ok(());
         };
-        let result = execute_claimed_job(jobs.as_ref(), execution, scope.as_ref(), job).await;
+        let job_id = job.job_id;
+        let terminal = execute_claimed_job(jobs.as_ref(), execution, scope.as_ref(), job).await;
+        // Design: ADR-0169 (docs/adr/ADR-0169-read-only-hms-and-single-writer-admission.md)
+        // A terminal observer must also observe release of the governed root.
         drop(scope);
-        result?;
+        finish(jobs.as_ref(), job_id, terminal).await?;
     }
 }
 
@@ -220,23 +231,20 @@ async fn execute_claimed_job(
     execution: Box<dyn OptimizeJobExecution>,
     scope: &dyn OptimizeJobScope,
     job: OptimizeJob,
-) -> Result<(), String> {
+) -> Result<crate::OptimizeJobOutcome, TerminalError> {
     let job_id = job.job_id;
     let initially_cancelled = match scope.is_cancelled() {
         Ok(cancelled) => cancelled,
         Err(error) => {
-            return finish(
-                jobs,
-                job_id,
-                Err(TerminalError::pre_dispatch_failed(format!(
-                    "read optimize cancellation before target rebind failed: {error}"
-                ))),
-            )
-            .await;
+            return Err(TerminalError::pre_dispatch_failed(format!(
+                "read optimize cancellation before target rebind failed: {error}"
+            )));
         }
     };
     if initially_cancelled {
-        return finish_cancelled(jobs, job_id, "optimize job cancelled before target rebind").await;
+        return Err(TerminalError::cancelled_before_dispatch(
+            "optimize job cancelled before target rebind",
+        ));
     }
     let terminal = match execution.rebind_target(&job) {
         Ok(MaintenanceTargetRebind::Bound) => None,
@@ -251,41 +259,28 @@ async fn execute_claimed_job(
         )))),
     };
     if let Some(terminal) = terminal {
-        return finish(jobs, job_id, terminal).await;
+        return terminal;
     }
     let scope_cancelled = match scope.is_cancelled() {
         Ok(cancelled) => cancelled,
         Err(error) => {
-            return finish(
-                jobs,
-                job_id,
-                Err(TerminalError::pre_dispatch_failed(format!(
-                    "read optimize cancellation before provider dispatch failed: {error}"
-                ))),
-            )
-            .await;
+            return Err(TerminalError::pre_dispatch_failed(format!(
+                "read optimize cancellation before provider dispatch failed: {error}"
+            )));
         }
     };
     let job_cancelled = match jobs.cancellation_requested(job_id).await {
         Ok(cancelled) => cancelled,
         Err(error) => {
-            return finish(
-                jobs,
-                job_id,
-                Err(TerminalError::pre_dispatch_failed(format!(
-                    "read optimize job cancellation before provider dispatch failed: {error}"
-                ))),
-            )
-            .await;
+            return Err(TerminalError::pre_dispatch_failed(format!(
+                "read optimize job cancellation before provider dispatch failed: {error}"
+            )));
         }
     };
     if scope_cancelled || job_cancelled {
-        return finish_cancelled(
-            jobs,
-            job_id,
+        return Err(TerminalError::cancelled_before_dispatch(
             "optimize job cancelled before provider dispatch",
-        )
-        .await;
+        ));
     }
     let automatic = job.effect_id.is_some();
     let execution = tokio::task::spawn_blocking(move || match job.effect_id {
@@ -299,7 +294,7 @@ async fn execute_claimed_job(
         None => execution.execute(&job).map(|action| (action, None)),
     })
     .await;
-    let terminal = match execution {
+    match execution {
         Ok(Ok((outcome, committed))) => optimize_job_outcome_from_action(outcome)
             .map(|mut outcome| {
                 outcome.commit_occurred = committed;
@@ -321,21 +316,7 @@ async fn execute_claimed_job(
                 TerminalError::failed(message)
             })
         }
-    };
-    finish(jobs, job_id, terminal).await
-}
-
-async fn finish_cancelled(
-    jobs: &OptimizeProcessRuntime,
-    job_id: i64,
-    message: &'static str,
-) -> Result<(), String> {
-    finish(
-        jobs,
-        job_id,
-        Err(TerminalError::cancelled_before_dispatch(message)),
-    )
-    .await
+    }
 }
 
 async fn finish(
@@ -563,5 +544,98 @@ mod tests {
             .await
             .expect("the retained optimize join remains retryable");
         assert!(!worker.has_join_owner());
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_follows_actual_scope_release_on_all_execution_paths() {
+        struct ReleaseScope {
+            jobs: Arc<OptimizeProcessRuntime>,
+            job_id: i64,
+            released: Arc<AtomicBool>,
+            cancelled: bool,
+        }
+        impl OptimizeJobScope for ReleaseScope {
+            fn is_cancelled(&self) -> Result<bool, String> {
+                Ok(self.cancelled)
+            }
+        }
+        impl Drop for ReleaseScope {
+            fn drop(&mut self) {
+                // The repository lookup is synchronous under its mutex. Check
+                // the ordering inside release, not after a scheduling delay.
+                let lookup = self.jobs.get(self.job_id);
+                tokio::pin!(lookup);
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                let std::task::Poll::Ready(Ok(Some(job))) = lookup.as_mut().poll(&mut cx) else {
+                    panic!("job lookup must be immediate");
+                };
+                assert_eq!(
+                    job.state,
+                    crate::runtime::MaintenanceJobState::Running,
+                    "terminal was published while scope resources were still live"
+                );
+                self.released.store(true, Ordering::Release);
+            }
+        }
+        struct ReleaseAdmission {
+            scope: Mutex<Option<ReleaseScope>>,
+        }
+        #[async_trait::async_trait]
+        impl OptimizeJobAdmissionPort for ReleaseAdmission {
+            async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
+                Ok(match self.scope.lock().unwrap().take() {
+                    Some(scope) => OptimizeJobAdmission::Acquired(Box::new(scope)),
+                    None => OptimizeJobAdmission::Closed,
+                })
+            }
+        }
+        for (rebind, cancelled, expected) in [
+            (
+                MaintenanceTargetRebind::Bound,
+                false,
+                crate::runtime::MaintenanceJobState::Finished,
+            ),
+            (
+                MaintenanceTargetRebind::Replaced,
+                false,
+                crate::runtime::MaintenanceJobState::TargetReplaced,
+            ),
+            (
+                MaintenanceTargetRebind::Bound,
+                true,
+                crate::runtime::MaintenanceJobState::CancelledBeforeDispatch,
+            ),
+        ] {
+            let jobs = Arc::new(OptimizeProcessRuntime::new());
+            let job_id = submit_job(&jobs).await;
+            let released = Arc::new(AtomicBool::new(false));
+            let mut worker = OptimizeWorker::start(
+                &Handle::current(),
+                Arc::clone(&jobs),
+                Arc::new(ReleaseAdmission {
+                    scope: Mutex::new(Some(ReleaseScope {
+                        jobs: Arc::clone(&jobs),
+                        job_id,
+                        released: Arc::clone(&released),
+                        cancelled,
+                    })),
+                }),
+                Arc::new(RecordingExecution {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    rebind,
+                }),
+            );
+            let terminal =
+                tokio::time::timeout(Duration::from_secs(1), jobs.wait_for_completion(job_id))
+                    .await
+                    .expect("terminal release barrier must complete")
+                    .unwrap();
+            assert_eq!(terminal.state, expected);
+            assert!(released.load(Ordering::Acquire));
+            worker
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+        }
     }
 }

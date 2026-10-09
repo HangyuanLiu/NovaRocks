@@ -378,6 +378,22 @@ impl StatisticsJobRepository {
             }))
     }
 
+    pub async fn wait_for_conclusion(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let job = self.get(id).await?.ok_or_else(|| Self::not_found(id))?;
+            if job.state.is_terminal() && job.convergence.is_complete() {
+                return Ok(job);
+            }
+            notified.await;
+        }
+    }
+
     pub async fn list(&self) -> Result<Vec<StatisticsJob>, StatisticsRepositoryError> {
         let state = self.lock()?;
         let mut jobs = state
@@ -429,10 +445,27 @@ impl StatisticsJobRepository {
         self.request_cancel_now(id, at_ms)
     }
 
+    /// Deliver cancellation even if no fresh wall-clock observation is available.
+    /// Existing observation timestamps are retained; no time is invented.
+    pub async fn request_cancel_without_time(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.request_cancel_with_time(id, None)
+    }
+
     pub(crate) fn request_cancel_now(
         &self,
         id: StatisticsJobId,
         at_ms: i64,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.request_cancel_with_time(id, Some(at_ms))
+    }
+
+    fn request_cancel_with_time(
+        &self,
+        id: StatisticsJobId,
+        at_ms: Option<i64>,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         let mut state = self.lock()?;
         let mut entry = state
@@ -440,13 +473,15 @@ impl StatisticsJobRepository {
             .remove(&id)
             .ok_or_else(|| Self::not_found(id))?;
         entry.job.cancel_requested = true;
-        entry.job.updated_at_ms = at_ms;
+        if let Some(at_ms) = at_ms {
+            entry.job.updated_at_ms = at_ms;
+        }
         if entry.job.state == StatisticsJobState::Active(StatisticsJobPhase::Submitted) {
             entry.job.state = StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled);
             entry.job.failure = Some(StatisticsFailure {
                 message: Arc::from("statistics job cancelled before collection"),
             });
-            entry.job.completed_at_ms = Some(at_ms);
+            entry.job.completed_at_ms = at_ms;
             entry.job.convergence = StatisticsConvergence {
                 collection_stopped: true,
                 execution_resources_released: true,
@@ -1564,5 +1599,103 @@ mod tests {
             .await
             .expect("actual convergence");
         assert!(converged.convergence.is_complete());
+    }
+    #[tokio::test]
+    async fn conclusion_wait_requires_all_actual_convergence_facts() {
+        let repository = StatisticsJobRepository::new();
+        let job = repository.create(create(1), root()).await.unwrap();
+        repository.claim_next(2).await.unwrap().unwrap();
+        let wait = repository.wait_for_conclusion(job.id);
+        tokio::pin!(wait);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        repository
+            .conclude(
+                job.id,
+                StatisticsJobPhase::Preparing,
+                StatisticsJobConclusion::Failed,
+                StatisticsPublicationFact::NotStarted,
+                Some(StatisticsFailure {
+                    message: Arc::from("failed"),
+                }),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        repository
+            .record_convergence(
+                job.id,
+                StatisticsConvergence {
+                    collection_stopped: true,
+                    execution_resources_released: true,
+                    provider_session_closed: false,
+                },
+                4,
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        repository
+            .record_convergence(
+                job.id,
+                StatisticsConvergence {
+                    collection_stopped: false,
+                    execution_resources_released: false,
+                    provider_session_closed: true,
+                },
+                5,
+            )
+            .await
+            .unwrap();
+        let terminal = wait.await.unwrap();
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
+        );
+        assert!(terminal.convergence.is_complete());
+        assert_eq!(
+            repository.wait_for_conclusion(job.id).await.unwrap(),
+            terminal
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_wait_returns_only_the_complete_terminal_record() {
+        let service = StatisticsJobService::new();
+        let job = service.submit(create(1), root()).await.unwrap();
+        service.request_cancel(job.id, 2).await.unwrap();
+        let terminal = service.wait_for_conclusion(job.id).await.unwrap();
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
+        assert!(terminal.convergence.is_complete());
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_clock_preserves_observation_time_and_converges() {
+        let service = StatisticsJobService::new();
+        let job = service.submit(create(17), root()).await.unwrap();
+        service.request_cancel_without_time(job.id).await.unwrap();
+        let terminal = service.wait_for_conclusion(job.id).await.unwrap();
+        assert_eq!(terminal.updated_at_ms, 17);
+        assert_eq!(
+            terminal.completed_at_ms, None,
+            "no completion time is fabricated"
+        );
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
+        assert!(terminal.convergence.is_complete());
     }
 }

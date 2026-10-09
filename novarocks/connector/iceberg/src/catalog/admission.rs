@@ -16,6 +16,8 @@
 // under the License.
 
 //! Operation-shaped, side-effect-free catalog admission.
+//!
+//! Design: ADR-0169 (docs/adr/ADR-0169-read-only-hms-and-single-writer-admission.md)
 
 use super::error::CatalogUnsupported;
 use super::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};

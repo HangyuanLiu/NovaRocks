@@ -2000,14 +2000,9 @@ impl<'a> AnalyzerContext<'a> {
                 // would leave a partitioned table's `partition` unresolvable on
                 // this path only.
                 let qualifier = rel.alias.as_deref().unwrap_or(&rel.table.name);
-                for col in &rel.table.columns {
-                    scope.add_column(
-                        Some(qualifier),
-                        &col.name,
-                        col.data_type.clone(),
-                        col.nullable,
-                    );
-                }
+                // ORDER BY-only columns must reference the original scan
+                // bindings, just as ordinary Scan columns do above.
+                scope.add_table_with_ids(Some(qualifier), &rel.table.columns, &rel.column_ids);
                 Ok(())
             }
             Relation::IcebergDeltaScan(rel) => {
@@ -6155,6 +6150,71 @@ mod tests {
         assert_eq!(col.name, "snapshot_id");
         assert_eq!(col.data_type, arrow::datatypes::DataType::Int64);
         assert!(!col.nullable);
+    }
+
+    #[test]
+    fn metadata_order_by_hidden_column_reuses_scan_column_id() {
+        for sql in [
+            "SELECT snapshot_id FROM orders$snapshots ORDER BY committed_at LIMIT 1",
+            "SELECT snapshot_id FROM orders$snapshots AS s ORDER BY s.committed_at LIMIT 1",
+        ] {
+            let resolved = parse_raw_and_analyze(sql).expect("analyze metadata ORDER BY");
+            let QueryBody::Select(select) = &resolved.body else {
+                panic!("expected Select body");
+            };
+            let Some(Relation::IcebergMetadataScan(scan)) = &select.from else {
+                panic!("expected metadata scan");
+            };
+            let index = scan
+                .table
+                .columns
+                .iter()
+                .position(|column| column.name == "committed_at")
+                .expect("committed_at metadata column");
+            let ExprKind::ColumnRef { column_id, .. } = &resolved.order_by[0].expr.kind else {
+                panic!("expected ORDER BY column reference");
+            };
+            assert_eq!(
+                *column_id, scan.column_ids[index],
+                "ORDER BY must retain the original scan ColumnId: {sql}"
+            );
+            assert_eq!(resolved.output_columns.len(), 1);
+            assert_eq!(resolved.output_columns[0].name, "snapshot_id");
+        }
+    }
+
+    #[test]
+    fn metadata_order_by_hidden_column_survives_optimizer_id_binding() {
+        for sql in [
+            "SELECT snapshot_id FROM orders$snapshots ORDER BY committed_at LIMIT 1",
+            "SELECT snapshot_id FROM orders$snapshots AS s ORDER BY s.committed_at LIMIT 1",
+        ] {
+            let query = parse_native_query(sql).expect("parse metadata ORDER BY");
+            let (resolved, registry, mut factory) =
+                analyze(&query, &TestCatalog, "default").expect("analyze metadata ORDER BY");
+            let logical_plan =
+                crate::planner::logical::build::plan_query(resolved, registry, &mut factory)
+                    .expect("plan metadata ORDER BY");
+            let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
+            let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+                &logical_plan,
+                &mut scalar_arena,
+            )
+            .expect("logical to optimizer expression");
+            let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
+                optimizer_expr,
+                scalar_arena,
+                &std::collections::HashMap::new(),
+                factory,
+                Vec::new(),
+                &crate::optimizer::options::SessionOptimizerSettings::default(),
+            )
+            .expect("optimize metadata ORDER BY");
+            crate::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+                &optimized_tree,
+            )
+            .unwrap_or_else(|error| panic!("metadata ORDER BY binding failed for {sql}: {error}"));
+        }
     }
 
     #[test]

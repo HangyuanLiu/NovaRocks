@@ -601,6 +601,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         Ok(admission::CatalogAdmission::Admitted)
     }
 
+    // Design: ADR-0169 (docs/adr/ADR-0169-read-only-hms-and-single-writer-admission.md)
     fn admit(
         &self,
         request: &admission::CatalogAdmissionRequest,
