@@ -243,3 +243,7 @@ fn parse_constant_field_name<P: ProjectionPort>(
     port.after_operation()?;
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "array_projection_operation_before_tests.rs"]
+mod array_projection_operation_before_tests;
