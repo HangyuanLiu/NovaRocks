@@ -1607,3 +1607,9 @@ mod e08s1_percentile_original_static_tests;
 
 #[cfg(test)]
 mod e08s1_percentile_static_tests;
+
+#[cfg(test)]
+mod e08s1_mv_original_catalogue_tests;
+
+#[cfg(test)]
+mod e08s1_mv_catalogue_retention_tests;

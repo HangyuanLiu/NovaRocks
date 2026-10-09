@@ -437,6 +437,19 @@ pub fn analyze_join_first_refresh_connector_write(
     let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
         .map_err(crate::compiler::SqlCompileError::from)?;
     let decimal_overflow_policy = sql_semantics.sql_mode().decimal_overflow_policy();
+    // Generated bindings and logical reentry retain the same request scope.
+    // Original mode borrows the original catalogue without added admission.
+    let scoped_functions = match context.emission_mode {
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1 => None,
+        crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
+            context.control.check()?;
+            Some(context.functions.snapshot_for_scalar_presence())
+        }
+    };
+    let functions: &dyn crate::compiler::SqlFunctionCatalog = match &scoped_functions {
+        Some(scoped) => scoped.as_ref(),
+        None => context.functions,
+    };
     let request = plain_join_first_refresh_logical_request(
         query,
         context.current_catalog.clone(),
@@ -444,7 +457,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.optimizer_settings.clone(),
         context.environment,
         context.catalog,
-        context.functions,
+        functions,
         context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
@@ -463,7 +476,7 @@ pub fn analyze_join_first_refresh_connector_write(
         ),
         logical_output.factory,
         snapshot,
-        context.functions,
+        functions,
         decimal_overflow_policy,
         context.constant_policy,
         &context.control,
@@ -488,7 +501,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.emission_mode,
         context.control,
     )
-    .with_function_catalog(context.functions.snapshot());
+    .with_function_catalog(functions.snapshot());
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)?.into_pending()?;
     Ok(SqlMvJoinFirstRefreshAnalyzed {
         emission_mode: context.emission_mode,
@@ -615,6 +628,19 @@ pub fn analyze_join_incremental_refresh_change_stream(
     let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
         .map_err(crate::compiler::SqlCompileError::from)?;
     let decimal_overflow_policy = sql_semantics.sql_mode().decimal_overflow_policy();
+    // Generated bindings and logical reentry retain the same request scope.
+    // Original mode borrows the original catalogue without added admission.
+    let scoped_functions = match context.emission_mode {
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1 => None,
+        crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
+            context.control.check()?;
+            Some(context.functions.snapshot_for_scalar_presence())
+        }
+    };
+    let functions: &dyn crate::compiler::SqlFunctionCatalog = match &scoped_functions {
+        Some(scoped) => scoped.as_ref(),
+        None => context.functions,
+    };
     let request = plain_join_first_refresh_logical_request(
         query,
         context.current_catalog,
@@ -622,7 +648,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.optimizer_settings,
         context.environment,
         context.catalog,
-        context.functions,
+        functions,
         context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
@@ -643,7 +669,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.join_mode,
         logical,
         logical_output.factory,
-        context.functions,
+        functions,
         decimal_overflow_policy,
         context.constant_policy,
         &context.control,
@@ -664,7 +690,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.emission_mode,
         context.control,
     )
-    .with_function_catalog(context.functions.snapshot());
+    .with_function_catalog(functions.snapshot());
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)?.into_pending()?;
     Ok(SqlMvJoinIncrementalRefreshAnalyzed {
         emission_mode: context.emission_mode,
