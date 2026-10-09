@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "dce3577b1",
+  "purpose": "Test-only late binding to original MySQL socket with statement successor and sticky cause guards",
+  "checks": [
+    {
+      "suite": "Initial v2 draft child plus existing gate",
+      "passed": 27,
+      "failed": 0,
+      "seconds": 1.34
+    },
+    {
+      "suite": "Extra guard/IO tests after fixture corrections",
+      "passed": 33,
+      "failed": 0,
+      "seconds": 1.33
+    },
+    {
+      "suite": "Final full MySQL adapter with older/zero epoch and non-adjacent healthy successor",
+      "passed": 102,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 1.51
+    }
+  ],
+  "failure_history": [
+    "Intermediate extra-test run27PASS/6FAIL: healthy/failure expected-wire branches mistakenly transposed; corrected fixture oracle",
+    "NO-I/O bad-inner vectored test was still Armed passthrough; corrected setup to real framer metadata receipt then Rows before injecting invariant violation, without changing passthrough contract"
+  ],
+  "boundaries": [
+    "Still cfg(test) only; default listener and product paths untouched",
+    "One Hub/scope, move-only controller, original IO and full original connection/statement identities; initially raw greeting, metadata attaches on original poll",
+    "Actual TCP target cut/drop framer flush future/record exact receipt/local once resume and same original IO healthy follow-up",
+    "Scope fixed first cause projected Hub->Core before later Hub failure; no unknown original IO error fabricated as gate cause",
+    "Follow-up session exactly original, generation strictly newer; actual component healthy skips a generation without requiring +1",
+    "New child16 tests:13 actual TCP functions,3 NO-I/O functions (including scalar/vector scripted failure cases)",
+    "Original parent JoinSet stop/abort/await retains actual panic JoinError; drop/lastalias facts supplement actual joins"
+  ],
+  "limitations": [
+    "Tokens and greeting are component fixtures; no actual FE authentication/KILL QUERY or Native caller proof",
+    "No feature/Unix/composition integration yet",
+    "Original listener JoinErrors are log-only; feature integration must preserve original JoinSet failures, not infer from Ok/census",
+    "No byte/owner/performance or overall M07 acceptance; no push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-late-binding-focused-v1-20261009.log",
+      "bytes": 56429,
+      "sha256": "93f6304465d9221464c92a3f418f78800e8c770590c816e4b33946ff15a5f18f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-late-binding-focused-v2-20261009.log",
+      "bytes": 67002,
+      "sha256": "873df51d71933a010fe912dfe6f2c403f6d2f9df845b05fc5e415e4566567bc5"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-late-binding-focused-v3-20261009.log",
+      "bytes": 56942,
+      "sha256": "94092ca5dd4291a12e31f431ad882e9784f6e26a849385c6b27423079bb5a61c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-late-binding-adapter-regression-v1-20261009.log",
+      "bytes": 63805,
+      "sha256": "0a0a563341a6ac85ddd9446e9c743ed235d0f25ecd74f68507d801f347847837"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-late-binding-adapter-regression-v2-20261009.log",
+      "bytes": 63996,
+      "sha256": "38604ea8cbff1bf2f0c50859527c5b68f7a23090e7a4973ee3cd37003c9d2995"
+    },
+    {
+      "path": "logs/mem-1-m07/mysql_write_gate.late_binding.v2.independent-retention-audit.md",
+      "bytes": 8929,
+      "sha256": "8d0165851f45db3c87a0a78b6356149ab11b39e8395e8f9502140f24affd6a36"
+    },
+    {
+      "path": "logs/mem-1-m07/mysql_write_gate.late_binding.v2.draft.rs",
+      "bytes": 42058,
+      "sha256": "b96f4f11982fbcb00cca04de3f02e4e53e499f69d8f27316b0a6021de3106a4e"
+    }
+  ]
+}
