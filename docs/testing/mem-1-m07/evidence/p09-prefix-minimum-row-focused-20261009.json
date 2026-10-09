@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "plan_task": "P09 exact prefix-only refusal and minimum5B new-row positive",
+  "source_parent": "20f8dd86764c3bd7d75221423ad8fc6a4e3b245b",
+  "outcome": "focused PASS; native minimum-row matrix pending",
+  "checks": {
+    "p09-prefix-only-component-focused-20261009.log": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "p09-prefix-only-adjacent-focused-20261009.log": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    "p09-minimum-new-row-runner-focused-v3-20261009.log": {
+      "passed": 113,
+      "failed": 0,
+      "ignored": 2
+    }
+  },
+  "raw_files": [
+    {
+      "path": "logs/mem-1-m07/p09-prefix-only-component-focused-20261009.log",
+      "sha256": "74950df1bcf1360290c51f7df9ad7158840aa0373cd8a660a69ffa2248cb74e7"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-prefix-only-adjacent-focused-20261009.log",
+      "sha256": "7ef57d5434fc8f2b97544d965ccf975b2ff4343f5d8a950e3be678c307860dea"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-runner-focused-v3-20261009.log",
+      "sha256": "58e37fcb558f2a0df716aadf89d289f96a3bbf877a582143339f2c071ed6049b"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-runner-focused-20261009.log",
+      "sha256": "207b9f7b95e864e7990aff7e7d79d0c0e71e110c67895e99ff8f1ec426c50101"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-runner-focused-v2-20261009.log",
+      "sha256": "dc0d3a26633221538f23d0553ba49ac5fdb462912379c2b247a84b502cae7e71"
+    }
+  ],
+  "source_files": [
+    {
+      "path": "novarocks/query-application/src/coordination/result_pump.rs",
+      "sha256": "c24fbaf10634863b289c781e561755f302c39a0cb1580fb117c8facbf58502a8"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenarios/result_delivery.rs",
+      "sha256": "c52294317bf2b5705e3a16098bb94c5cf7e0f60dba2954d55b56b8a038a5bc80"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/minimum-new-row-retention-freeze-v1.json",
+      "sha256": "3ff9ec431822edad6c4ae134b8ad454c1863f7249e6975644fffaaf90532f927"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/minimum-new-row-protocol-freeze-v1.json",
+      "sha256": "711638b29244f75066f3422d1df4027a48855d1189f516f3bfeaf5e1654084db"
+    }
+  ],
+  "corrections": [
+    "Initial runner --lib command refused because the package has only a bin target; preserved log p09-minimum-new-row-runner-focused-20261009.log.",
+    "First correct target compilation rejected a test predicate comparing &Bytes to an array (E0277); v3 uses borrowed byte slices. No production semantics or frozen inputs changed."
+  ],
+  "scope": "New exact4B body and valid-row-plus4B suffix are rejected before delivery/ACK with ContractViolation and test window alias exit. New ordered S+5 two-row scene freezes Data2 exactly0100000000 and a complete independent MySQL literal oracle. Components do not prove real FE malformed native reply or physical last alias. Native5B positive remains pending."
+}

@@ -309,3 +309,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 随后同clean HEAD单独dev build（71s）并真实REST原始32×512 tables+512 views、clients1/8/16、全部38phase原生1FE+3BE PASS，总413.335s；65700实际外部准备HTTP/231.436537s后独立核对32768对象。独立after-drop31871 GET/39.541424s，mutation0，31744存活对象完全相等、目标namespace按正常catalog authority缺席。没有放宽cap/deadline/输入或自动重试。
 - 5个精确进程41942/41945/41946/41947/observer41941均消失，observer lifetime failures0/全部active0，实际private project `nr-isolated-rest-40658-1791512946839762000-1` 全部container/volume消失，owner manifest已由owner退出删除；实际image/live binding与140份raw hashes保存于 `p09-real-rest-cl-native-v2-pass-20261009.json`。共享fixture未改。
 - information_schema1/8/16 clients allocated peak134267200/911366120/1748091776 B，after17090024/21048080/22824576 B；16clients仍约1.63GiB。此dev同profile复跑只证明功能/provider观测与source-copy切片兼容，不证明因果峰值下降、AST/planner包络、physical last alias或正式release CL/CM/CP。P00b、真实HMS/Paimon大CL、两个待裁决语义问题、P10及M07最终同HEAD门仍OPEN；无push/PR/归档。
+
+
+### 2026-10-09 P09：4B prefix-only 组件与5B最小新行接入（定向PASS）
+
+- result_pump 新准确4B body及完整合法row后4B suffix均在完整body校验时以ContractViolation拒绝；consumer首个观察为failure，实际scripted port仅wanted1/consumed0，无Segment/ACK-only/positive ACK；drop测试held grant后window positions归零。新测试1PASS，相关relay_refuses三测试PASS；不称实际native FE reply或physical backing退出。
+- 新ordered两行 S+5 scene：首row占满S、第二empty String新row准确Native `[1,0,0,0,0]`，cursor starts_row=1、remaining0→0、rows1→2，实际End3/rows2；独立MySQL两row1048573B/6packets/sequence1..6/hash冻结。保留旧zeroACK/finalACK/1B continuation、W2/caps/deadlines。runner113PASS/0FAIL/2既有ignored，收据 `p09-prefix-minimum-row-focused-20261009.json`，原生四scene矩阵待执行。
+- 初始误选--lib与随后test-only &Bytes比较E0277均保留日志，已改正确bin target与借用slice比较；无生产行为或输入修改。前一生产source C0/真实REST已在cleanefb完成，本增量仅测试，最终同HEAD门仍OPEN。无push/PR/归档。

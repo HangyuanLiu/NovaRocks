@@ -62,6 +62,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(ContextRootRetention(RootProtocolMode::ZeroAck)),
         Box::new(ContextRootRetention(RootProtocolMode::FinalAck)),
         Box::new(ContextRootRetention(RootProtocolMode::OneByte)),
+        Box::new(ContextRootRetention(RootProtocolMode::MinimumNewRow)),
     ]
 }
 
@@ -395,6 +396,8 @@ struct RetentionManifest {
     expected_packets: u64,
     expected_schema: Vec<TextColumnObservation>,
     expected_row_sha256: String,
+    #[serde(default)]
+    expected_packet_sequences: Option<Vec<u8>>,
 }
 
 const ROOT_RESOURCES: [&str; 14] = [
@@ -453,6 +456,7 @@ enum RootProtocolMode {
     ZeroAck,
     FinalAck,
     OneByte,
+    MinimumNewRow,
 }
 struct ContextRootRetention(RootProtocolMode);
 
@@ -461,6 +465,7 @@ impl Scenario for ContextRootRetention {
         match self.0 {
             RootProtocolMode::None => "result-delivery/producer-exit-context-retention",
             RootProtocolMode::OneByte => "result-delivery/one-byte-continuation-normal-wire",
+            RootProtocolMode::MinimumNewRow => "result-delivery/minimum-new-row-normal-wire",
             RootProtocolMode::ZeroAck => "result-delivery/installed-root-zero-ack-normal-wire",
             RootProtocolMode::FinalAck => {
                 "result-delivery/installed-root-replay-final-ack-interference"
@@ -474,7 +479,11 @@ impl Scenario for ContextRootRetention {
             "root retention requires native 1FE+3BE"
         );
         let manifest: RetentionManifest = serde_json::from_str(
-            if self.0 == RootProtocolMode::OneByte {
+            if self.0 == RootProtocolMode::MinimumNewRow {
+                include_str!(
+                    "../../../../docs/testing/mem-1-m07/inputs/minimum-new-row-retention-freeze-v1.json"
+                )
+            } else if self.0 == RootProtocolMode::OneByte {
                 include_str!(
                     "../../../../docs/testing/mem-1-m07/inputs/one-byte-continuation-retention-freeze-v1.json"
                 )
@@ -489,7 +498,14 @@ impl Scenario for ContextRootRetention {
                 && manifest.topology == "1FE+3BE"
                 && !manifest.scope.is_empty()
                 && manifest.segment_bytes == 1048576
-                && manifest.native_row_bytes == manifest.expected_row_payload_bytes + 4
+                && manifest.expected_rows
+                    == if self.0 == RootProtocolMode::MinimumNewRow {
+                        2
+                    } else {
+                        1
+                    }
+                && manifest.native_row_bytes
+                    == manifest.expected_row_payload_bytes + 4 * manifest.expected_rows
                 && manifest.native_row_bytes > manifest.segment_bytes
                 && manifest.native_row_bytes <= 2 * manifest.segment_bytes
                 && manifest.query_observation_ms == 20000
@@ -499,6 +515,20 @@ impl Scenario for ContextRootRetention {
                 && manifest.phase_max_samples == 51,
             "unsupported root retention freeze"
         );
+        if self.0 == RootProtocolMode::MinimumNewRow {
+            ensure!(
+                manifest.expected_columns == 1
+                    && manifest.expected_packets == 6
+                    && manifest.expected_packet_sequences.as_deref()
+                        == Some(&[1, 2, 3, 4, 5, 6][..])
+                    && manifest.expected_schema
+                        == vec![TextColumnObservation {
+                            name: "payload".into(),
+                            mysql_type: 253
+                        }],
+                "unsupported minimum-new-row wire oracle"
+            );
+        }
         let epoch = Instant::now();
         await_idle(context, "root-retention", "before", epoch)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -744,7 +774,16 @@ fn installed_root_protocol(
     use novarocks_execution_contract::root_result::RootReadOutcome;
     use sha2::{Digest, Sha256};
     let one_byte = mode == RootProtocolMode::OneByte;
-    let (protocol_json, retention_bytes, parent_path, parent_bytes) = if one_byte {
+    let minimum_new_row = mode == RootProtocolMode::MinimumNewRow;
+    let typed_rows = one_byte || minimum_new_row;
+    let (protocol_json, retention_bytes, parent_path, parent_bytes) = if minimum_new_row {
+        (
+            include_str!("../../../../docs/testing/mem-1-m07/inputs/minimum-new-row-protocol-freeze-v1.json"),
+            include_bytes!("../../../../docs/testing/mem-1-m07/inputs/minimum-new-row-retention-freeze-v1.json").as_slice(),
+            "docs/testing/mem-1-m07/inputs/one-byte-continuation-protocol-freeze-v1.json",
+            include_bytes!("../../../../docs/testing/mem-1-m07/inputs/one-byte-continuation-protocol-freeze-v1.json").as_slice(),
+        )
+    } else if one_byte {
         (
             include_str!("../../../../docs/testing/mem-1-m07/inputs/one-byte-continuation-protocol-freeze-v1.json"),
             include_bytes!("../../../../docs/testing/mem-1-m07/inputs/one-byte-continuation-retention-freeze-v1.json").as_slice(),
@@ -768,7 +807,9 @@ fn installed_root_protocol(
         )
     };
     let freeze: InstalledProtocolManifest = serde_json::from_str(protocol_json)?;
-    let expected_cases: &[&str] = if one_byte {
+    let expected_cases: &[&str] = if minimum_new_row {
+        &["result-delivery/minimum-new-row-normal-wire"]
+    } else if one_byte {
         &["result-delivery/one-byte-continuation-normal-wire"]
     } else {
         &[
@@ -776,7 +817,7 @@ fn installed_root_protocol(
             "result-delivery/installed-root-replay-final-ack-interference",
         ]
     };
-    let expected_operations: &[&str] = if one_byte {
+    let expected_operations: &[&str] = if typed_rows {
         &["ack0", "ack0", "fetch1", "fetch2", "fetch-end3"]
     } else {
         &[
@@ -792,7 +833,7 @@ fn installed_root_protocol(
         ]
     };
     ensure!(
-        freeze.schema_version == if one_byte { 1 } else { 3 }
+        freeze.schema_version == if typed_rows { 1 } else { 3 }
             && freeze.topology == "1FE+3BE"
             && !freeze.scope.is_empty()
             && freeze.retention_input_sha256 == format!("{:x}", Sha256::digest(retention_bytes))
@@ -806,9 +847,16 @@ fn installed_root_protocol(
             && freeze.request_frame_bytes == 4096
             && freeze.response_data_bytes == 1048576 + 4096
             && freeze.data1_bytes == 1048576
-            && freeze.data2_bytes == if one_byte { 1 } else { 8 }
+            && freeze.data2_bytes
+                == if minimum_new_row {
+                    5
+                } else if one_byte {
+                    1
+                } else {
+                    8
+                }
             && freeze.end_sequence == 3
-            && freeze.output_rows == 1
+            && freeze.output_rows == if minimum_new_row { 2 } else { 1 }
             && freeze.cases == expected_cases
             && freeze.operations == expected_operations,
         "unsupported installed-root protocol freeze"
@@ -904,7 +952,7 @@ fn installed_root_protocol(
                     && match data.end_after_data() {
                         None => true,
                         Some(end) => {
-                            one_byte
+                            typed_rows
                                 && end.sequence.get() == freeze.end_sequence
                                 && end.output_rows == freeze.output_rows
                         }
@@ -957,8 +1005,51 @@ fn installed_root_protocol(
                 }
             }
         }
-        if one_byte && operation == "fetch-end3" {
-            matches &= cursor.validate_end().is_ok() && cursor.completed_rows() == 1;
+        if minimum_new_row && matches && matches!(operation.as_str(), "fetch1" | "fetch2") {
+            if let RootReadOutcome::Data(data) = &reply.outcome {
+                match cursor.validate_body(row_profile, data.body()) {
+                    Ok(validated) => {
+                        let after = validated.after();
+                        let second_row = operation == "fetch2";
+                        let spans = validated.payload_spans().collect::<Vec<_>>();
+                        let expected_payload = if second_row {
+                            1
+                        } else {
+                            freeze.data1_bytes - 4
+                        };
+                        let exact_span = spans.len() == 1
+                            && spans[0].starts_row.map(|length| length.get() as usize)
+                                == Some(expected_payload)
+                            && spans[0].bytes.len() == expected_payload
+                            && spans[0].completes_row
+                            && (!second_row || spans[0].bytes == [0]);
+                        matches = cursor.remaining() == 0
+                            && cursor.completed_rows() == u64::from(second_row)
+                            && after.remaining() == 0
+                            && after.completed_rows() == 1 + u64::from(second_row)
+                            && exact_span
+                            && (!second_row || data.body().as_ref() == &[1, 0, 0, 0, 0][..]);
+                        observation["client_row_cursor"] = serde_json::json!({
+                            "before_remaining": cursor.remaining(), "after_remaining": after.remaining(),
+                            "before_completed_rows": cursor.completed_rows(), "completed_rows": after.completed_rows(),
+                            "spans": spans.len(), "starts_row_payload_bytes": spans.first().and_then(|span| span.starts_row).map(|length| length.get()),
+                            "minimum_new_row": second_row && exact_span,
+                        });
+                        if matches {
+                            cursor = after;
+                        }
+                    }
+                    Err(error) => {
+                        observation["client_row_cursor_error"] =
+                            serde_json::json!(error.to_string());
+                        matches = false;
+                    }
+                }
+            }
+        }
+        if typed_rows && operation == "fetch-end3" {
+            matches &=
+                cursor.validate_end().is_ok() && cursor.completed_rows() == freeze.output_rows;
         }
         if matches && operation == "fetch1" {
             delivered_data |= 1;
@@ -1030,6 +1121,104 @@ fn installed_root_protocol(
 
 #[cfg(test)]
 mod census_tests {
+    #[test]
+    fn minimum_new_row_frozen_literal_oracles_and_requests_are_exact() {
+        use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor, RootProfileV1};
+        use sha2::{Digest, Sha256};
+        let retention_bytes = include_bytes!(
+            "../../../../docs/testing/mem-1-m07/inputs/minimum-new-row-retention-freeze-v1.json"
+        );
+        let retention: super::RetentionManifest = serde_json::from_slice(retention_bytes).unwrap();
+        let freeze: super::InstalledProtocolManifest = serde_json::from_str(include_str!(
+            "../../../../docs/testing/mem-1-m07/inputs/minimum-new-row-protocol-freeze-v1.json"
+        ))
+        .unwrap();
+        let value_bytes = 1048568usize;
+        let mut first_row = vec![0xfd, 0xf8, 0xff, 0x0f];
+        first_row.extend(std::iter::repeat_n(b'x', value_bytes));
+        let second_row = [0u8];
+        let mut wire_hash = Sha256::new();
+        wire_hash.update(&first_row);
+        wire_hash.update((first_row.len() as u64).to_le_bytes());
+        wire_hash.update(second_row);
+        wire_hash.update(1u64.to_le_bytes());
+        assert_eq!(
+            format!("{:x}", wire_hash.finalize()),
+            retention.expected_row_sha256
+        );
+        assert_eq!(retention.expected_rows, 2);
+        assert_eq!(retention.expected_columns, 1);
+        assert_eq!(
+            retention.expected_row_payload_bytes,
+            (first_row.len() + 1) as u64
+        );
+        assert_eq!(retention.expected_packets, 6);
+        assert_eq!(
+            retention.expected_packet_sequences.as_deref(),
+            Some(&[1, 2, 3, 4, 5, 6][..])
+        );
+        assert_eq!(
+            retention.expected_schema,
+            vec![super::TextColumnObservation {
+                name: "payload".into(),
+                mysql_type: 253
+            }]
+        );
+        assert_eq!(
+            retention.sql,
+            "SELECT payload FROM (SELECT 0 AS ordinal, REPEAT('x', 1048568) AS payload UNION ALL SELECT 1 AS ordinal, '' AS payload) ordered_rows ORDER BY ordinal ASC"
+        );
+        let mut data1 = (first_row.len() as u32).to_le_bytes().to_vec();
+        data1.extend_from_slice(&first_row);
+        let data2 = [1u8, 0, 0, 0, 0];
+        assert_eq!(data1.len(), RootProfileV1::SEGMENT_BYTES);
+        assert_eq!(freeze.data1_bytes, data1.len());
+        assert_eq!(freeze.data2_bytes, data2.len());
+        assert_eq!(freeze.end_sequence, 3);
+        assert_eq!(freeze.output_rows, 2);
+        assert_eq!(format!("{:x}", Sha256::digest(&data1)), freeze.data1_sha256);
+        assert_eq!(format!("{:x}", Sha256::digest(data2)), freeze.data2_sha256);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(retention_bytes)),
+            freeze.retention_input_sha256
+        );
+        let profile = ClientRowProfile::try_new(
+            RootProfileV1::SEGMENT_BYTES,
+            RootProfileV1::ROW_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let first = ClientRowStreamCursor::new()
+            .validate_body(profile, &data1)
+            .unwrap();
+        assert_eq!(first.after().remaining(), 0);
+        assert_eq!(first.after().completed_rows(), 1);
+        let second = first.after().validate_body(profile, &data2).unwrap();
+        let spans = second.payload_spans().collect::<Vec<_>>();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].starts_row.unwrap().get(), 1);
+        assert_eq!(spans[0].bytes, [0]);
+        assert!(spans[0].completes_row);
+        assert_eq!(second.after().remaining(), 0);
+        assert_eq!(second.after().completed_rows(), 2);
+        second.after().validate_end().unwrap();
+        let task = super::foreign_root_task();
+        for operation in &freeze.operations {
+            let wanted = match operation.as_str() {
+                "ack0" => None,
+                "fetch1" => Some(1),
+                "fetch2" => Some(2),
+                "fetch-end3" => Some(3),
+                other => panic!("unexpected frozen operation {other}"),
+            };
+            let request = super::installed_root_request(&task, wanted, 0, freeze.max_wait_millis);
+            novarocks_task_codec::root_result::decode_read(
+                &request,
+                novarocks_proto_codec::FieldPath::root("minimum_new_row"),
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn frozen_installed_root_requests_pass_the_production_decoder() {
         let freeze: super::InstalledProtocolManifest = serde_json::from_str(include_str!(

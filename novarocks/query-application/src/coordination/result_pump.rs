@@ -2657,6 +2657,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_refuses_exact_prefix_only_and_complete_row_prefix_suffix_without_ack() {
+        for (body, label) in [
+            (&[1, 0, 0, 0][..], "exact four-byte prefix-only body"),
+            (
+                &[1, 0, 0, 0, b'a', 1, 0, 0, 0][..],
+                "complete valid row followed by a four-byte prefix-only suffix",
+            ),
+        ] {
+            let (
+                Harness {
+                    control: _control,
+                    scope,
+                    actor,
+                    owner,
+                    permit,
+                    mut stream,
+                    root,
+                },
+                window,
+            ) = relay_harness(75).await;
+            let capacity = scope.result_capacity().unwrap();
+            assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+            let (status_sender, statuses) = accepted_root_status_projection(root);
+            status_sender.publish(running(root)).unwrap();
+            let port = ScriptedRootPort::new(vec![rows_data(1, body, None)]);
+            let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_root_relay(
+                    permit,
+                    root,
+                    scope,
+                    relay_binding(root, port.clone(), &window),
+                    statuses,
+                    terminal_source,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let ResultPumpFailure::DecisionPending(decision) = error else {
+                panic!("{label} must retain its failure decision");
+            };
+            assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), decision.fail_logical(&actor))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                LogicalConclusion::Failed
+            );
+            // Whole-body validation must reject the valid row too; the first
+            // consumer observation is the failure, never a Segment delivery.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), stream.next())
+                    .await
+                    .unwrap()
+                    .is_err(),
+                "{label} must not deliver any segment"
+            );
+            let requests = port.requests();
+            assert_eq!(requests, vec![(Some(1), 0)], "{label}");
+            assert!(
+                requests
+                    .iter()
+                    .all(|(wanted, consumed)| wanted.is_some() && *consumed == 0),
+                "{label} must neither ACK-only nor acknowledge consumption"
+            );
+            // The test's original grant still holds its one position. After
+            // dropping it, the existing capacity oracle detects leaked relay
+            // window aliases; this is not a physical-allocation exit oracle.
+            assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+            drop((stream, actor, owner, window, status_sender));
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        }
+    }
+
+    #[tokio::test]
     async fn relay_refuses_malformed_rows_and_end_mismatch_before_delivery() {
         for (outcomes, label) in [
             (
