@@ -83,6 +83,7 @@ pub(crate) struct RewriteContext<'a> {
     /// `None` means the compile path has no execution capability attached, and
     /// constant folding degrades to a no-op.
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+    fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
     function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
 }
 
@@ -107,6 +108,7 @@ impl<'a> RewriteContext<'a> {
             column_ref_factory: None,
             scalar_arena: None,
             constant_evaluator: None,
+            fold_dependency_observer: None,
             function_catalog: None,
         }
     }
@@ -246,6 +248,17 @@ impl<'a> RewriteContext<'a> {
         self.constant_evaluator
     }
 
+    pub(crate) fn set_fold_dependency_observer(
+        &mut self,
+        observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
+    ) {
+        self.fold_dependency_observer = observer;
+    }
+    pub(crate) fn fold_dependency_observer(
+        &self,
+    ) -> Option<&dyn crate::compiler::SqlFoldDependencyObserver> {
+        self.fold_dependency_observer.as_deref()
+    }
     pub(crate) fn set_function_catalog(
         &mut self,
         catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,

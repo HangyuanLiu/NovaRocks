@@ -1400,3 +1400,6 @@ mod numeric_unary_narrow_state_source_tests;
 
 #[cfg(test)]
 mod map_entries_copy_edge_tests;
+
+#[cfg(test)]
+mod sql_fold_dependency_observation_tests;

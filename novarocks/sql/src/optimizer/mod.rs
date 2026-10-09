@@ -95,6 +95,7 @@ pub(crate) struct OptimizerEnvironment<'a> {
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
     function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
 }
 
 impl<'a> OptimizerEnvironment<'a> {
@@ -111,7 +112,15 @@ impl<'a> OptimizerEnvironment<'a> {
             function_catalog,
             decimal_overflow_policy,
             control,
+            fold_dependency_observer: None,
         }
+    }
+    pub(crate) fn with_fold_dependency_observer(
+        mut self,
+        observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
+    ) -> Self {
+        self.fold_dependency_observer = observer;
+        self
     }
 }
 
@@ -250,6 +259,7 @@ fn optimize_with_root_property(
         function_catalog,
         decimal_overflow_policy,
         control,
+        fold_dependency_observer,
     } = environment;
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
     let bounded_control = OptimizerControl {
@@ -281,6 +291,7 @@ fn optimize_with_root_property(
     if let Some(evaluator) = constant_evaluator {
         rewrite_ctx.set_constant_evaluator(evaluator);
     }
+    rewrite_ctx.set_fold_dependency_observer(fold_dependency_observer);
     rewrite_ctx.set_function_catalog(Arc::clone(&function_catalog));
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));

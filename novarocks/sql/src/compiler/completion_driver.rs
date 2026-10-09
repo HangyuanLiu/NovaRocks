@@ -796,7 +796,8 @@ fn optimize_to_physical(
         Arc::clone(&function_catalog),
         decimal_overflow_policy,
         control,
-    );
+    )
+    .with_fold_dependency_observer(control.fold_dependency_observer().cloned());
     let optimized = match root_distribution {
         Some(distribution) => crate::optimizer::optimize_with_root_distribution(
             optimizer_expr,

@@ -202,9 +202,11 @@ impl LogicalRewriteRule for FoldConstant {
         } = expr;
 
         let arena = ctx.scalar_arena();
+        let evaluator =
+            crate::compiler::SqlFoldEvaluatorLoan::new(evaluator, ctx.fold_dependency_observer());
         let changed = {
             let mut arena = arena.borrow_mut();
-            let mut folder = ConstantFolder::new(&mut arena, evaluator, work);
+            let mut folder = ConstantFolder::new(&mut arena, &evaluator, work);
             let changed = folder.fold_operator(&mut op)?;
             folder.work.finish()?;
             changed
@@ -235,7 +237,7 @@ impl LogicalRewriteRule for FoldConstant {
 /// the arena, memo values or rewritten output.
 struct ConstantFolder<'a, 'control> {
     arena: &'a mut ScalarArena,
-    evaluator: &'static dyn SqlConstantEvaluator,
+    evaluator: &'control dyn SqlConstantEvaluator,
     memo: HashMap<ScalarId, ScalarId>,
     work: CompileCheckpoints<'control>,
 }
@@ -243,7 +245,7 @@ struct ConstantFolder<'a, 'control> {
 impl<'a, 'control> ConstantFolder<'a, 'control> {
     fn new(
         arena: &'a mut ScalarArena,
-        evaluator: &'static dyn SqlConstantEvaluator,
+        evaluator: &'control dyn SqlConstantEvaluator,
         work: CompileCheckpoints<'control>,
     ) -> Self {
         Self {
@@ -505,7 +507,7 @@ fn operator_has_scalars(op: &Operator) -> bool {
 fn fold_scalar(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &'static dyn SqlConstantEvaluator,
+    evaluator: &dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<ScalarId>, SqlCompileError> {
@@ -516,7 +518,7 @@ fn fold_scalar(
 fn fold_scalar_id(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &'static dyn SqlConstantEvaluator,
+    evaluator: &dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScalarId, SqlCompileError> {
@@ -532,7 +534,7 @@ fn fold_scalar_id(
 fn fold_scalar_uncached(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &'static dyn SqlConstantEvaluator,
+    evaluator: &dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScalarId, SqlCompileError> {
@@ -662,7 +664,7 @@ fn has_sec_to_time_source(
 fn fold_sec_to_time_source(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &'static dyn SqlConstantEvaluator,
+    evaluator: &dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScalarId, SqlCompileError> {
@@ -689,7 +691,7 @@ fn fold_sec_to_time_source(
 fn try_fold_node(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &'static dyn SqlConstantEvaluator,
+    evaluator: &dyn SqlConstantEvaluator,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<ScalarId>, SqlCompileError> {
     work.step()?;
@@ -791,7 +793,24 @@ fn try_fold_node(
 
     work.step()?;
     work.flush()?;
-    let evaluated = match evaluator.eval_scalar(&request, work.control()) {
+    let source = match &node {
+        ScalarNode::FunctionCall { binding, .. } => {
+            crate::compiler::SqlFoldDependencySource::Function(binding.resolved())
+        }
+        ScalarNode::BinaryOp { .. } | ScalarNode::UnaryOp { .. } | ScalarNode::Cast { .. } => {
+            crate::compiler::SqlFoldDependencySource::Intrinsic
+        }
+        _ => unreachable!("original foldability gate checked the node shape"),
+    };
+    let input = crate::compiler::SqlFoldDependencyInput {
+        source,
+        request: &request,
+    };
+    let evaluated = match crate::compiler::evaluate_fold_dependency_observed(
+        evaluator,
+        input,
+        work.control(),
+    ) {
         Ok(value) => Ok(value),
         Err(SqlConstantEvaluationError::Evaluation(error)) => Err(error),
         Err(SqlConstantEvaluationError::Control(error)) => return Err(error.into()),

@@ -460,6 +460,12 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
 }
 
 pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
+mod fold_observation;
+pub use fold_observation::{
+    SqlFoldDependencyInput, SqlFoldDependencyObserver, SqlFoldDependencySource,
+    SqlFoldEvaluationOutcome,
+};
+pub(crate) use fold_observation::{SqlFoldEvaluatorLoan, evaluate_fold_dependency_observed};
 
 /// One scalar node shape the optimizer may ask a constant evaluator to fold.
 ///
@@ -523,6 +529,28 @@ pub trait SqlConstantEvaluator: Send + Sync {
         request: &FoldRequest,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>;
+
+    /// Optional observation before the original evaluator performs any work.
+    /// An observer must admit and reserve its complete receipt storage here.
+    /// A refusal aborts compilation with this exact control cause, without eval.
+    /// Existing evaluators observe nothing and introduce no extra checkpoints.
+    fn before_fold_dependency_observed(
+        &self,
+        _input: SqlFoldDependencyInput<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
+
+    /// Complete only the receipt admitted by the corresponding start callback.
+    /// No allocation/admission, failure, binding, evaluation, or retry is allowed.
+    /// Borrowed error text is complete; this hook cannot replace the primary cause.
+    fn after_fold_dependency_observed(
+        &self,
+        _input: SqlFoldDependencyInput<'_>,
+        _outcome: SqlFoldEvaluationOutcome<'_>,
+    ) {
+    }
 }
 
 /// Request failures stay distinct from a failed optional legacy evaluation.
@@ -720,6 +748,7 @@ pub enum SqlPlanningEnvironment {
 pub struct SqlCompileControl {
     deadline: Option<Instant>,
     cancellation: Arc<dyn SqlCancellationObservation>,
+    fold_dependency_observer: Option<Arc<dyn SqlFoldDependencyObserver>>,
 }
 
 struct SqlNeverCancelled;
@@ -738,6 +767,7 @@ impl SqlCompileControl {
         Self {
             deadline,
             cancellation,
+            fold_dependency_observer: None,
         }
     }
 
@@ -748,9 +778,22 @@ impl SqlCompileControl {
         Self {
             deadline: None,
             cancellation: Arc::new(SqlNeverCancelled),
+            fold_dependency_observer: None,
         }
     }
 
+    /// Attach this request's observer; preserve its original control sources.
+    /// The host owns admission. This attachment grants no capacity.
+    pub fn with_fold_dependency_observer(
+        mut self,
+        observer: Arc<dyn SqlFoldDependencyObserver>,
+    ) -> Self {
+        self.fold_dependency_observer = Some(observer);
+        self
+    }
+    pub(crate) fn fold_dependency_observer(&self) -> Option<&Arc<dyn SqlFoldDependencyObserver>> {
+        self.fold_dependency_observer.as_ref()
+    }
     pub(crate) fn check(&self) -> Result<(), SqlCompileError> {
         novarocks_type_contract::PureCompileControl::checkpoint(
             self,
@@ -1672,7 +1715,8 @@ impl SqlCompiler {
                     Arc::clone(&function_catalog),
                     decimal_overflow_policy,
                     &control,
-                ),
+                )
+                .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
             ),
             None => crate::optimizer::optimize(
                 optimizer_expr,
@@ -1686,7 +1730,8 @@ impl SqlCompiler {
                     Arc::clone(&function_catalog),
                     decimal_overflow_policy,
                     &control,
-                ),
+                )
+                .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
             ),
         }?;
         control.check()?;
