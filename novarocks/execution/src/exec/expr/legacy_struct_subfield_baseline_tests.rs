@@ -421,3 +421,6 @@ fn original_subfield_array_arena_arity_validation_precedes_all_children() {
 
 #[path = "legacy_array_struct_subfield_demand_tests.rs"]
 mod array_demand_before;
+
+#[path = "original_scalar_invocation_activation_baseline_tests.rs"]
+mod scalar_invocation_activation_baseline;
