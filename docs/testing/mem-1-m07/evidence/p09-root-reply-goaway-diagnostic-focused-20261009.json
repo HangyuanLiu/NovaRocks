@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "purpose": "Validated control-frame and independent RPC failure diagnostics; no close exemptions",
+  "source_base_revision": "d19ccfed6b7751f5ebe28d5aad415e6b7b49d8e8",
+  "checks": [
+    {
+      "suite": "Actor RPC diagnostic",
+      "passed": 10,
+      "failed": 0
+    },
+    {
+      "suite": "Actor final framing validation",
+      "passed": 13,
+      "failed": 0
+    },
+    {
+      "suite": "Full harness",
+      "passed": 153,
+      "failed": 0,
+      "ignored": 3,
+      "seconds": 2.38
+    }
+  ],
+  "changes": [
+    "Fixed public framing parser validates settings/window/ping/GOAWAY using eight-byte scratch and sticky invalid flag; no header block or payload retained",
+    "Actual GOAWAY last-stream and error-code facts retained, debug data discarded",
+    "Bounded RPC path and stream ID/authentication class error contexts",
+    "Capacity None records exactly one nonblocking poll_reset observation; does not synthesize a typed reset or allow it"
+  ],
+  "limitations": [
+    "No new close/error exemption is connected",
+    "Real native v3 remains failed before capture",
+    "poll_reset Reason alone does not equal h2 typed reset and is never exempted",
+    "Fixed parser is harness metadata under existing connection cap; not product physical transport envelope"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-rpc-diagnostic-focused-20261009.log",
+      "bytes": 1433,
+      "sha256": "58c25cd753ca6e8f03692357157ae48fae8ec01e02612b1ea7700ad3a4137bdb"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-goaway-diagnostic-focused-20261009.log",
+      "bytes": 1832,
+      "sha256": "25855fa3c46c8d24631db150fe972a520312e997f86a6caa32c6188cc3ceae08"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-goaway-diagnostic-harness-regression-20261009.log",
+      "bytes": 14804,
+      "sha256": "f49bd7147ad47ebe84bd39ed70954d6b8529604d4e9731a8d36f21bc96e49cee"
+    }
+  ]
+}

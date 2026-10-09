@@ -1,0 +1,1199 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "purpose": "Frame-instrumented actual FE malformed RootReply run failed before injection",
+  "source_revision": "d19ccfed6b7751f5ebe28d5aad415e6b7b49d8e8",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "server_sha256": "2e61fdd3238f75deab1e3c0f9ccc98b0cc5b70f887f632bda4fb892d2a1584bb",
+  "runner_sha256": "2ceea4bb39d3607f446cf7752bd53134201da2589ff3fc40e0d06abd42ffd842",
+  "freeze_inputs": [
+    {
+      "path": "docs/testing/mem-1-m07/inputs/native-root-reply-kind-freeze-v1.json",
+      "sha256": "e63a1f13f0056253ef453692efd6c38067a912dc79a2e512e19b6f65a17873f3"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/native-root-reply-prefix-only-freeze-v1.json",
+      "sha256": "70df917b110e051ce747f1bf1c1f2a1703bf17ceb68579323a2577a73166c86b"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/native-root-reply-profile-freeze-v1.json",
+      "sha256": "08c272a3818e4e32ecd4b3aeabdf149d681f7b631a33898abfefc8d33de5a074"
+    }
+  ],
+  "exit_code": 1,
+  "duration_seconds": 5.478,
+  "scenario": "result-delivery/native-root-reply-profile-refusal",
+  "native_observations": {
+    "actor_after_shutdown": {
+      "active_connections": 0,
+      "active_listeners": 0,
+      "active_streams": 0,
+      "claimed": 0,
+      "connection_positions": 0,
+      "emitted_messages": 0,
+      "failure_overflow": false,
+      "failures": [
+        "root connection: root downstream H2 accept (accepted_rpcs=0, children=1, frames=IngressFrames { read_bytes: 87, preface_bytes: 24, preface_valid: true, header: [0, 0, 0, 0, 0, 0, 0, 0, 0], header_bytes: 0, payload_remaining: 0, frames: 3, settings: 1, window_updates: 1, pings: 0, goaways: 1, application_or_unknown_frame: false }, io=true, io_kind=Some(ConnectionReset), raw_os_error=None, reset=false, remote=false, reason=None): connection reset",
+        "root connection: root downstream H2 accept (accepted_rpcs=0, children=1, frames=IngressFrames { read_bytes: 96, preface_bytes: 24, preface_valid: true, header: [0, 0, 0, 0, 0, 0, 0, 0, 0], header_bytes: 0, payload_remaining: 0, frames: 4, settings: 2, window_updates: 1, pings: 0, goaways: 1, application_or_unknown_frame: false }, io=true, io_kind=Some(ConnectionReset), raw_os_error=None, reset=false, remote=false, reason=None): connection reset",
+        "root connection: root downstream H2 accept (accepted_rpcs=0, children=1, frames=IngressFrames { read_bytes: 96, preface_bytes: 24, preface_valid: true, header: [0, 0, 0, 0, 0, 0, 0, 0, 0], header_bytes: 0, payload_remaining: 0, frames: 4, settings: 2, window_updates: 1, pings: 0, goaways: 1, application_or_unknown_frame: false }, io=true, io_kind=Some(ConnectionReset), raw_os_error=None, reset=false, remote=false, reason=None): connection reset",
+        "root connection: root downstream response copy: root output capacity closed"
+      ],
+      "first_failure": {
+        "bytes": 448,
+        "class": "connection-or-stream",
+        "sha256": "e51fa94f972cbe610cd32423c7b3adae6286cd238381ec680dd3a89d8e47a762"
+      },
+      "first_overflow": null,
+      "frozen_request": null,
+      "frozen_root_task": null,
+      "joined_children": 20,
+      "joined_connections": 10,
+      "joined_listeners": 3,
+      "last_overflow": null,
+      "mutated": null,
+      "non_target_peer_cancels": 0,
+      "not_ready_forwarded": 0,
+      "not_ready_observed": 0,
+      "not_ready_replies": [],
+      "original": null,
+      "overflow_failures": 0,
+      "owned_buffer_bytes": 0,
+      "peak_owned_buffer_bytes": 32768,
+      "shutdown_joined": true,
+      "stream_positions": 0,
+      "target_attempt_requests": [],
+      "target_attempts": 0,
+      "target_consumed_positive_requests": 0,
+      "target_requests": 0,
+      "target_slots": 0
+    },
+    "actor_before_shutdown": {
+      "active_connections": 6,
+      "active_listeners": 3,
+      "active_streams": 0,
+      "claimed": 0,
+      "connection_positions": 6,
+      "emitted_messages": 0,
+      "failure_overflow": false,
+      "failures": [
+        "root connection: root downstream H2 accept (accepted_rpcs=0, children=1, frames=IngressFrames { read_bytes: 87, preface_bytes: 24, preface_valid: true, header: [0, 0, 0, 0, 0, 0, 0, 0, 0], header_bytes: 0, payload_remaining: 0, frames: 3, settings: 1, window_updates: 1, pings: 0, goaways: 1, application_or_unknown_frame: false }, io=true, io_kind=Some(ConnectionReset), raw_os_error=None, reset=false, remote=false, reason=None): connection reset",
+        "root connection: root downstream H2 accept (accepted_rpcs=0, children=1, frames=IngressFrames { read_bytes: 96, preface_bytes: 24, preface_valid: true, header: [0, 0, 0, 0, 0, 0, 0, 0, 0], header_bytes: 0, payload_remaining: 0, frames: 4, settings: 2, window_updates: 1, pings: 0, goaways: 1, application_or_unknown_frame: false }, io=true, io_kind=Some(ConnectionReset), raw_os_error=None, reset=false, remote=false, reason=None): connection reset",
+        "root connection: root downstream H2 accept (accepted_rpcs=0, children=1, frames=IngressFrames { read_bytes: 96, preface_bytes: 24, preface_valid: true, header: [0, 0, 0, 0, 0, 0, 0, 0, 0], header_bytes: 0, payload_remaining: 0, frames: 4, settings: 2, window_updates: 1, pings: 0, goaways: 1, application_or_unknown_frame: false }, io=true, io_kind=Some(ConnectionReset), raw_os_error=None, reset=false, remote=false, reason=None): connection reset",
+        "root connection: root downstream response copy: root output capacity closed"
+      ],
+      "first_failure": {
+        "bytes": 448,
+        "class": "connection-or-stream",
+        "sha256": "e51fa94f972cbe610cd32423c7b3adae6286cd238381ec680dd3a89d8e47a762"
+      },
+      "first_overflow": null,
+      "frozen_request": null,
+      "frozen_root_task": null,
+      "joined_children": 14,
+      "joined_connections": 4,
+      "joined_listeners": 0,
+      "last_overflow": null,
+      "mutated": null,
+      "non_target_peer_cancels": 0,
+      "not_ready_forwarded": 0,
+      "not_ready_observed": 0,
+      "not_ready_replies": [],
+      "original": null,
+      "overflow_failures": 0,
+      "owned_buffer_bytes": 0,
+      "peak_owned_buffer_bytes": 32768,
+      "shutdown_joined": false,
+      "stream_positions": 0,
+      "target_attempt_requests": [],
+      "target_attempts": 0,
+      "target_consumed_positive_requests": 0,
+      "target_requests": 0,
+      "target_slots": 0
+    },
+    "effective_capture_grace": {
+      "capture_millis": 5000,
+      "queue_residence_millis": 15000,
+      "source": "server-serde-default"
+    },
+    "effective_launch": {
+      "schema_version": 1,
+      "semantics": {
+        "child_environment": {
+          "backends": [
+            [
+              {
+                "classification": "non-formal-unsealed",
+                "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                "present": true
+              }
+            ],
+            [
+              {
+                "classification": "non-formal-unsealed",
+                "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                "present": true
+              }
+            ],
+            [
+              {
+                "classification": "non-formal-unsealed",
+                "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                "present": true
+              }
+            ]
+          ],
+          "frontend": [
+            {
+              "classification": "non-formal-unsealed",
+              "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+              "present": true
+            }
+          ]
+        },
+        "cluster_size": 3,
+        "expected_eligible_backend_count": 3,
+        "fixed_environment": {
+          "NO_PROXY": "127.0.0.1,localhost"
+        },
+        "launch_profile": "fault-scenario",
+        "native_proxy": {
+          "backends": [
+            {
+              "backend_index": 0,
+              "retained_byte_limit": 1048576
+            },
+            {
+              "backend_index": 1,
+              "retained_byte_limit": 1048576
+            },
+            {
+              "backend_index": 2,
+              "retained_byte_limit": 1048576
+            }
+          ],
+          "root_reply_message_fault": {
+            "actor": {
+              "accounting": "actor-owned-Vec-capacity-only-not-production-physical-envelope",
+              "bounds": {
+                "forward_timeout_millis": 20000,
+                "handshake_timeout_millis": 2000,
+                "maximum_active_streams": 256,
+                "maximum_capture_millis": 5000,
+                "maximum_connections": 32,
+                "maximum_owned_buffer_bytes": 16777216
+              },
+              "capture_deadline": "single-absolute-never-reset",
+              "client_hpack_table_bytes": 4096,
+              "failure_bytes": 4096,
+              "failure_digest_positions": 3,
+              "failure_digest_sha256_bytes": 64,
+              "failures": 32,
+              "h2_connection_window_bytes": 1048576,
+              "h2_frame_bytes": 16384,
+              "h2_header_bytes": 16384,
+              "h2_reset_positions": 32,
+              "h2_send_buffer_bytes": 65536,
+              "h2_stream_window_bytes": 262144,
+              "h2_streams_per_connection": 128,
+              "maximum_data_listeners": 3,
+              "maximum_target_attempts": 32,
+              "mode": "authenticated-plaintext-root-reply-message-v1",
+              "not_ready_transparency": true,
+              "one_shot_per_actor_group": true,
+              "overflow_policy": "fixed-first-cause-first-overflow-last-overflow-wholefailure",
+              "request_bytes": 4096,
+              "response_bytes": 1052672,
+              "server_hpack": "locked-h2-public-default",
+              "target_attempt_evidence_positions": 32,
+              "target_slots": 1
+            },
+            "backend_indices": [
+              0,
+              1,
+              2
+            ],
+            "control_tcp_budget": "original_backend_retained_byte_limit_separate_from_actor",
+            "controller": "shared-one-target-slot-global-connection-stream-owned-buffer-bounds"
+          }
+        },
+        "roles": [
+          {
+            "attachments": [],
+            "backend_index": null,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "catalog_source": {
+                  "type": "table",
+                  "value": {
+                    "mode": {
+                      "type": "string",
+                      "value": "dynamic-state-store"
+                    }
+                  }
+                },
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "heartbeat_interval_ms": {
+                      "type": "integer",
+                      "value": 500
+                    },
+                    "heartbeat_timeout_retries": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "fe"
+                    }
+                  }
+                },
+                "debug": {
+                  "type": "table",
+                  "value": {
+                    "cleanup_fault_dir": {
+                      "type": "string",
+                      "value": "$RUNTIME/connector-cleanup-faults"
+                    }
+                  }
+                },
+                "mv_management": {
+                  "type": "table",
+                  "value": {
+                    "audit_log": {
+                      "type": "string",
+                      "value": "mv-management-audit.log"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "mysql_port": {
+                      "type": "string",
+                      "value": "$FE_MYSQL"
+                    },
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                },
+                "state_store": {
+                  "type": "table",
+                  "value": {
+                    "cluster_id": {
+                      "type": "string",
+                      "value": "novarocks-system-scenarios"
+                    },
+                    "path": {
+                      "type": "string",
+                      "value": "$RUNTIME/frontend-state.sqlite"
+                    },
+                    "provider": {
+                      "type": "string",
+                      "value": "sqlite"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "fe"
+          },
+          {
+            "attachments": [],
+            "backend_index": 0,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_control_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_CONTROL_GRPC"
+                    },
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "advertise_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_GRPC"
+                    },
+                    "frontend_endpoint": {
+                      "type": "string",
+                      "value": "$FE_GRPC_ENDPOINT"
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "be"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "control_grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_CONTROL_GRPC"
+                    },
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "be"
+          },
+          {
+            "attachments": [],
+            "backend_index": 1,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_control_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_CONTROL_GRPC"
+                    },
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "advertise_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_GRPC"
+                    },
+                    "frontend_endpoint": {
+                      "type": "string",
+                      "value": "$FE_GRPC_ENDPOINT"
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "be"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "control_grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_CONTROL_GRPC"
+                    },
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "be"
+          },
+          {
+            "attachments": [],
+            "backend_index": 2,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_control_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_CONTROL_GRPC"
+                    },
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "advertise_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_GRPC"
+                    },
+                    "frontend_endpoint": {
+                      "type": "string",
+                      "value": "$FE_GRPC_ENDPOINT"
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "be"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "control_grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_CONTROL_GRPC"
+                    },
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "be"
+          }
+        ]
+      }
+    },
+    "failure_summaries": {
+      "client_join": null,
+      "owner_cleanup": null,
+      "primary": {
+        "bytes": 54,
+        "class": "scene-contract",
+        "format_failed": false,
+        "length_overflow": false,
+        "sha256": "a6b155906cc82de648ebf59e8c1411afa94840af348fe1499e9dd86ff15fde93"
+      }
+    },
+    "freeze": {
+      "capture_millis": 5000,
+      "contract_reason": "unsupported root-result profile",
+      "expected_native_body_sha256": "3796c6fb19ce8ad0d4c3ad37cef1abf50dfdecd525aa796acfa1a2ca8bda6164",
+      "expected_row_sha256": "21a177fd757b7adf5f9c208c4a449ae1d498f365e6aeb5d51a46f1a26474dacd",
+      "forward_millis": 20000,
+      "health_row_sha256": "6dab454b19ecc06d337eb421a7ecc69aaa272a74fdf3a6bf7b81900ca94758b1",
+      "maximum_target_attempts": 32,
+      "metadata_oracle": "complete-same-SQL-successful-native-baseline-plus-fixed-encoder-fields",
+      "mutation": "ProfileTwo",
+      "mysql_error_code": 1105,
+      "mysql_packet_cap": 4096,
+      "mysql_sqlstate": "HY000",
+      "root_meta_proof": "known-semantic-profile-purpose-schema-not-exact-protobuf-bytes",
+      "scenario": "result-delivery/native-root-reply-profile-refusal",
+      "schema_version": 1,
+      "sql": "SELECT REPEAT('x',64) AS payload",
+      "status": "draft-unexecuted",
+      "topology": "1FE+3BE"
+    },
+    "metadata_baseline": {
+      "columns": 1,
+      "elapsed_micros": 36749,
+      "error": null,
+      "first_payload_chunk_micros": 34460,
+      "first_row_micros": 34463,
+      "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+      "packets": 5,
+      "row_payload_bytes": 65,
+      "row_sha256": "21a177fd757b7adf5f9c208c4a449ae1d498f365e6aeb5d51a46f1a26474dacd",
+      "rows": 1,
+      "schema": [
+        {
+          "mysql_type": 253,
+          "name": "payload"
+        }
+      ],
+      "wire_bytes": 125,
+      "wire_prefix_sha256": "4f5a4c65b22b57079a59bb1c392ac50ce2d2efa854ba02eea92cf450a76ccf1a"
+    },
+    "outcome": {
+      "actor_join_ok": false,
+      "client_join_ok": true,
+      "cluster_shutdown_ok": false,
+      "contract_and_recovery_ok": false,
+      "failure_owner_cleanup_ok": true
+    },
+    "root_zero_before-baseline": [
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ],
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    ],
+    "root_zero_before-capture": [
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ],
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    ],
+    "root_zero_failure-cleanup": [
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ],
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    ],
+    "scenario": "result-delivery/native-root-reply-profile-refusal",
+    "schema_version": 1
+  },
+  "process_exit": [
+    {
+      "role": "fe",
+      "pid": 68007,
+      "process_start_token": "macos:1791517234:473597",
+      "pid_absent": true
+    },
+    {
+      "role": "be-0",
+      "pid": 68044,
+      "process_start_token": "macos:1791517237:237334",
+      "pid_absent": true
+    },
+    {
+      "role": "be-1",
+      "pid": 68045,
+      "process_start_token": "macos:1791517237:291382",
+      "pid_absent": true
+    },
+    {
+      "role": "be-2",
+      "pid": 68046,
+      "process_start_token": "macos:1791517237:351476",
+      "pid_absent": true
+    }
+  ],
+  "limitations": [
+    "No malformed reply was captured or emitted; no actual FE refusal claim",
+    "Normal baseline succeeded but connection reset/broken pipe blocked begin_capture",
+    "Actor owners actually joined and exact four role PIDs are absent; whole actor join verdict remains failed",
+    "Failed runtime role logs were retained before explicit shutdown; read-byte and H2 accept evidence alone does not prove no RPC framing"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/driver-status.json",
+      "sha256": "1ac67355f458a0022a00c8d058ad870804d4b967a033eefaf187ba905dc35336",
+      "bytes": 917
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/driver.log",
+      "sha256": "2f228ea5f710d246b4abe4f1848ef882713a5ce173d4125cf3116739df7aac60",
+      "bytes": 6131
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/native-root-reply-observations.json",
+      "sha256": "9bd33e8d3084a95eb7d7b30de5688bd47032d1fdc65d92ce3d1bd531450418ad",
+      "bytes": 33918
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/owner-barrier-root-reply-before-baseline.json",
+      "sha256": "891c8adeb0549546eecbc2dbad8cd9608547872af73e66e2817c2ccbbf0a3aa0",
+      "bytes": 7396
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/owner-barrier-root-reply-before-capture.json",
+      "sha256": "c6fc699094dd68f0a77c61839eabbfb9f86b5382e366c2698b386f4db520cad4",
+      "bytes": 11036
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/owner-barrier-root-reply-failure-cleanup.json",
+      "sha256": "6022c1332455a3685bf90dc77c6c305e1e9a966a7dc6aa46acbc00738b035585",
+      "bytes": 7397
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/be_0.log",
+      "sha256": "1fa1881a7bf36eade32e20cdc448f82788d44b68c371619e990bb81e6015722a",
+      "bytes": 99
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/be_0.toml",
+      "sha256": "ca9696d3dc4c2e75484d91858e84509076aa7c7db266c5047c538358d8000006",
+      "bytes": 613
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/be_1.log",
+      "sha256": "05fb60558b930cb0dbc8698b0d2cb536362dce1e2af9276a8fb6f8b2491a779e",
+      "bytes": 1363
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/be_1.toml",
+      "sha256": "9edda2f4d66ad09d739d06fce283e66ebf6b42636b19a344339163a482c46935",
+      "bytes": 613
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/be_2.log",
+      "sha256": "892fa2e0867056a8b00dd0b3627dd5d2ef33016ef8b8276ad2d213a617ed3af3",
+      "bytes": 99
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/be_2.toml",
+      "sha256": "cc0e0e6ba7eec86aaad00cb92981c20b8da4e5de207c2b95fe15d929f112407c",
+      "bytes": 613
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/fe.log",
+      "sha256": "6db5e9ae4fade30a1e2a15b8ced4b703b3a3ba6d919972c3c4576256d73d12ef",
+      "bytes": 120
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/fe.toml",
+      "sha256": "6318a0db4f0e70a123f73a2ab1bc33313ce5bb086b46f354069ac241fea7d4ba",
+      "bytes": 1210
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/frontend-state.sqlite",
+      "sha256": "140dbf6fccd770c082db889e5909e23cdabeb0fe07e41ba2dfe271312e847aa3",
+      "bytes": 32768
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/runtime/68006_1791517234459251000/frontend-state.sqlite.owner.lock",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v3-20261009/result-delivery-native-root-reply-profile-refusal/scenario-evidence.json",
+      "sha256": "b6193446355283a13c9277e5b8b8dca35e3f0ad0fdca8ed098590d756d5dab19",
+      "bytes": 23470
+    }
+  ]
+}

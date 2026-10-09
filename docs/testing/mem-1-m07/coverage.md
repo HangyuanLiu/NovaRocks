@@ -372,3 +372,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - clean dae0a3e74原生v2仍FAILED/5.335s，claimed/emitted/attempts0；三条downstream H2 accept分别read87/96/96B、children1 reset，另有独立root output capacity closed。四个精确PID已确认不存在，所有actor positions/credit0且实际join，但whole failure保留。失败runtime日志这次实际保留，收据p09-native-root-reply-native-v2-failed-20261009.json包含raw hashes。
 - actual BE启动确有Data readiness connect_with_connector后drop channel、无application RPC的源码；仅byte数/children1不足以将这些错误认定正常。本增量增加固定public preface/header/parser，记录帧类别/完整边界/ever application frame、connection-local accepted RPC与typedIO kind，request/response copy分阶段；不保存AUTH/headerblock/body，不放宽reset、timeout、未知stream或独立capacity错误。
 - 新逐cut/parser反例及相关actor10PASS/0.01s，harness150/0/3ignored/2.42s（最后context-only补充另做focused10PASS）。E0425初始counter误放listener scope已在运行前修正并保留失败日志。收据p09-root-reply-frame-diagnostic-focused-20261009.json；用下一cleanHEAD v3进一步测量，尚无negative/native PASS或新关闭豁免。
+
+
+### 2026-10-09 P09：第三次公开帧诊断与GOAWAY/RPC精确事实
+
+- clean d19ccfed6原生v3 FAILED/5.478s，仍claimed/emitted0。三个accept reset均正确完整preface、acceptedRPC0、完整87/96/96B边界，实际settings1/2/2、connection window1、GOAWAY1，noapplicationframe；typed IO ConnectionReset/resetfalse。GOAWAY payload此前尚unknown，不能称正常close。独立第四条是downstream response copy capacity closed，仍wholefailure。四PID独立不存在/所有actorowners实际退出，收据p09-native-root-reply-native-v3-failed-20261009.json。
+- 本增量完整control parser仅一个8B scratch、标量frameheaders，校验known settings/WU/PING/GOAWAY公开值，保留GOAWAY laststream/error/debug长度而不留debug/Auth/HPACK/body；固定计数overflow sticky失去候选资格。加入RPC有限path/stream/authclass、capacityNone单次nonblocking poll_reset观察，不等待/不合成typedreset/不豁免。原caps/clock/三输入不变。
+- 13actor/153harness PASS，既有ignored3；wholecontrol frames逐cut/bytewise、partial/badpreface/应用帧/unknownsetting/value/错误GOAWAY等反例通过。draft初始debug字面长度14纠正15在apply前完成，无执行失败。收据p09-root-reply-goaway-diagnostic-focused-20261009.json；下一cleanHEAD v4只进一步诊断，尚无native负例PASS或新close分类。

@@ -724,22 +724,71 @@ async fn capture_expiry(core: Arc<Core>) {
     }
 }
 
-// Only public connection framing is observed. No header block, JWT or body
-// payload is retained. The fixed parser stays under its connection position.
-#[derive(Debug, Default)]
+// Observe only public control framing. Header fields are accumulated as
+// scalars; one fixed 8-byte unit validates settings/window/GOAWAY payloads.
+// Never retain application, HPACK, authorization, PING or GOAWAY debug bytes.
+#[derive(Default)]
 struct IngressFrames {
     read_bytes: u64,
     preface_bytes: usize,
     preface_valid: bool,
-    header: [u8; 9],
     header_bytes: usize,
+    header_length: usize,
+    header_kind: u8,
+    header_flags: u8,
+    header_stream: u32,
     payload_remaining: usize,
+    payload_unit_target: usize,
+    unit: [u8; 8],
+    unit_bytes: usize,
     frames: u64,
+    completed_frames: u64,
+    first_frame_non_ack_settings: bool,
     settings: u64,
+    setting_entries: u64,
     window_updates: u64,
     pings: u64,
     goaways: u64,
+    goaway_payloads_validated: u64,
+    goaway_no_error_last_stream_zero: u64,
+    last_goaway_stream_id: Option<u32>,
+    last_goaway_error_code: Option<u32>,
+    goaway_debug_bytes: u64,
     application_or_unknown_frame: bool,
+}
+impl std::fmt::Debug for IngressFrames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngressFrames")
+            .field("read_bytes", &self.read_bytes)
+            .field("preface_bytes", &self.preface_bytes)
+            .field("preface_valid", &self.preface_valid)
+            .field("header_bytes", &self.header_bytes)
+            .field("payload_remaining", &self.payload_remaining)
+            .field("frames", &self.frames)
+            .field("completed_frames", &self.completed_frames)
+            .field(
+                "first_frame_non_ack_settings",
+                &self.first_frame_non_ack_settings,
+            )
+            .field("settings", &self.settings)
+            .field("setting_entries", &self.setting_entries)
+            .field("window_updates", &self.window_updates)
+            .field("pings", &self.pings)
+            .field("goaways", &self.goaways)
+            .field("goaway_payloads_validated", &self.goaway_payloads_validated)
+            .field(
+                "goaway_no_error_last_stream_zero",
+                &self.goaway_no_error_last_stream_zero,
+            )
+            .field("last_goaway_stream_id", &self.last_goaway_stream_id)
+            .field("last_goaway_error_code", &self.last_goaway_error_code)
+            .field("goaway_debug_bytes", &self.goaway_debug_bytes)
+            .field(
+                "application_or_unknown_frame",
+                &self.application_or_unknown_frame,
+            )
+            .finish()
+    }
 }
 impl IngressFrames {
     fn new() -> Self {
@@ -748,51 +797,364 @@ impl IngressFrames {
             ..Self::default()
         }
     }
+    fn count(counter: &mut u64) -> bool {
+        if let Some(next) = counter.checked_add(1) {
+            *counter = next;
+            true
+        } else {
+            false
+        }
+    }
+    fn complete_control_sequence(&self) -> bool {
+        self.preface_valid
+            && self.preface_bytes == 24
+            && self.header_bytes == 0
+            && self.payload_remaining == 0
+            && self.unit_bytes == 0
+            && self.frames > 0
+            && self.completed_frames == self.frames
+            && self.first_frame_non_ack_settings
+            && !self.application_or_unknown_frame
+            && self.goaway_payloads_validated == self.goaways
+            && self.goaway_no_error_last_stream_zero == self.goaways
+    }
     fn observe(&mut self, mut bytes: &[u8]) {
         const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-        self.read_bytes = self.read_bytes.saturating_add(bytes.len() as u64);
+        match self.read_bytes.checked_add(bytes.len() as u64) {
+            Some(total) => self.read_bytes = total,
+            None => self.application_or_unknown_frame = true,
+        }
         if self.preface_bytes < PREFACE.len() {
             let take = bytes.len().min(PREFACE.len() - self.preface_bytes);
             self.preface_valid &=
                 bytes[..take] == PREFACE[self.preface_bytes..self.preface_bytes + take];
             self.preface_bytes += take;
             bytes = &bytes[take..];
+            if !self.preface_valid {
+                self.application_or_unknown_frame = true;
+            }
         }
         while !bytes.is_empty() {
             if self.payload_remaining != 0 {
-                let take = bytes.len().min(self.payload_remaining);
+                let take = if self.payload_unit_target != 0 {
+                    bytes
+                        .len()
+                        .min(self.payload_remaining)
+                        .min(self.payload_unit_target - self.unit_bytes)
+                } else {
+                    bytes.len().min(self.payload_remaining)
+                };
+                if self.payload_unit_target != 0 {
+                    self.unit[self.unit_bytes..self.unit_bytes + take]
+                        .copy_from_slice(&bytes[..take]);
+                    self.unit_bytes += take;
+                }
                 self.payload_remaining -= take;
                 bytes = &bytes[take..];
+                if self.payload_unit_target != 0 && self.unit_bytes == self.payload_unit_target {
+                    self.validate_unit();
+                    self.unit.fill(0);
+                    self.unit_bytes = 0;
+                }
+                if self.payload_remaining == 0 {
+                    self.finish_frame();
+                }
                 continue;
             }
-            let take = bytes.len().min(9 - self.header_bytes);
-            self.header[self.header_bytes..self.header_bytes + take]
-                .copy_from_slice(&bytes[..take]);
-            self.header_bytes += take;
-            bytes = &bytes[take..];
-            if self.header_bytes != 9 {
-                continue;
+            let byte = bytes[0];
+            bytes = &bytes[1..];
+            match self.header_bytes {
+                0 => self.header_length = (byte as usize) << 16,
+                1 => self.header_length |= (byte as usize) << 8,
+                2 => self.header_length |= byte as usize,
+                3 => self.header_kind = byte,
+                4 => self.header_flags = byte,
+                5 => self.header_stream = byte as u32,
+                _ => self.header_stream = (self.header_stream << 8) | byte as u32,
             }
-            let length = ((self.header[0] as usize) << 16)
-                | ((self.header[1] as usize) << 8)
-                | self.header[2] as usize;
-            let stream =
-                u32::from_be_bytes(self.header[5..9].try_into().expect("fixed frame header"))
-                    & 0x7fff_ffff;
-            self.frames = self.frames.saturating_add(1);
-            if stream != 0 || length > FRAME_BYTES {
-                self.application_or_unknown_frame = true;
+            self.header_bytes += 1;
+            if self.header_bytes == 9 {
+                self.start_frame();
             }
-            match self.header[3] {
-                4 => self.settings = self.settings.saturating_add(1),
-                8 => self.window_updates = self.window_updates.saturating_add(1),
-                6 => self.pings = self.pings.saturating_add(1),
-                7 => self.goaways = self.goaways.saturating_add(1),
-                _ => self.application_or_unknown_frame = true,
+        }
+    }
+    fn start_frame(&mut self) {
+        let first = self.frames == 0;
+        self.application_or_unknown_frame |= !Self::count(&mut self.frames);
+        let stream = self.header_stream & 0x7fff_ffff;
+        let length = self.header_length;
+        let flags = self.header_flags;
+        let legal_shape = stream == 0
+            && length <= FRAME_BYTES
+            && match self.header_kind {
+                4 => (flags == 0 && length.is_multiple_of(6)) || (flags == 1 && length == 0),
+                8 => flags == 0 && length == 4,
+                6 => (flags == 0 || flags == 1) && length == 8,
+                7 => flags == 0 && length >= 8,
+                _ => false,
+            };
+        if first {
+            self.first_frame_non_ack_settings = self.header_kind == 4 && flags == 0 && legal_shape;
+        }
+        self.application_or_unknown_frame |=
+            !legal_shape || (first && !self.first_frame_non_ack_settings);
+        self.payload_unit_target = 0;
+        match self.header_kind {
+            4 => {
+                self.application_or_unknown_frame |= !Self::count(&mut self.settings);
             }
-            self.payload_remaining = length;
-            self.header_bytes = 0;
-            self.header = [0; 9];
+            8 => {
+                self.application_or_unknown_frame |= !Self::count(&mut self.window_updates);
+            }
+            6 => {
+                self.application_or_unknown_frame |= !Self::count(&mut self.pings);
+            }
+            7 => {
+                self.application_or_unknown_frame |= !Self::count(&mut self.goaways);
+            }
+            _ => {}
+        }
+        // An ineligible frame cannot copy arbitrary bytes into control scratch.
+        if legal_shape && self.preface_valid && !self.application_or_unknown_frame {
+            self.payload_unit_target = match self.header_kind {
+                4 if flags == 0 => 6,
+                8 => 4,
+                7 => 8,
+                _ => 0,
+            };
+        }
+        self.payload_remaining = length;
+        if length == 0 {
+            self.finish_frame();
+        }
+    }
+    fn validate_unit(&mut self) {
+        match self.header_kind {
+            4 => {
+                let id = u16::from_be_bytes([self.unit[0], self.unit[1]]);
+                let value =
+                    u32::from_be_bytes(self.unit[2..6].try_into().expect("six-byte setting unit"));
+                // Matches the known setting domains in locked h2 0.4.12.
+                // Unknown IDs may be legal HTTP/2 extensions, but are outside
+                // this narrow candidate; do not pretend to validate them.
+                let valid = match id {
+                    1 | 3 | 6 => true,
+                    2 | 8 => value <= 1,
+                    4 => value <= 0x7fff_ffff,
+                    5 => (16_384..=16_777_215).contains(&value),
+                    _ => false,
+                };
+                self.application_or_unknown_frame |=
+                    !valid || !Self::count(&mut self.setting_entries);
+            }
+            8 => {
+                let increment =
+                    u32::from_be_bytes(self.unit[..4].try_into().expect("four-byte window unit"))
+                        & 0x7fff_ffff;
+                self.application_or_unknown_frame |= increment == 0;
+                self.payload_unit_target = 0;
+            }
+            7 => {
+                let last =
+                    u32::from_be_bytes(self.unit[..4].try_into().expect("GOAWAY last stream"))
+                        & 0x7fff_ffff;
+                let error =
+                    u32::from_be_bytes(self.unit[4..8].try_into().expect("GOAWAY error code"));
+                self.last_goaway_stream_id = Some(last);
+                self.last_goaway_error_code = Some(error);
+                self.application_or_unknown_frame |=
+                    !Self::count(&mut self.goaway_payloads_validated);
+                if last == 0 && error == 0 {
+                    self.application_or_unknown_frame |=
+                        !Self::count(&mut self.goaway_no_error_last_stream_zero);
+                } else {
+                    self.application_or_unknown_frame = true;
+                }
+                match self
+                    .goaway_debug_bytes
+                    .checked_add((self.header_length - 8) as u64)
+                {
+                    Some(total) => self.goaway_debug_bytes = total,
+                    None => self.application_or_unknown_frame = true,
+                }
+                self.payload_unit_target = 0; // Discard all remaining debug data.
+            }
+            _ => self.application_or_unknown_frame = true,
+        }
+        if self.application_or_unknown_frame {
+            self.payload_unit_target = 0;
+        }
+    }
+    fn finish_frame(&mut self) {
+        self.application_or_unknown_frame |= !Self::count(&mut self.completed_frames);
+        self.header_bytes = 0;
+        self.header_length = 0;
+        self.header_kind = 0;
+        self.header_flags = 0;
+        self.header_stream = 0;
+        self.payload_unit_target = 0;
+        self.unit.fill(0);
+        self.unit_bytes = 0;
+    }
+}
+
+#[cfg(test)]
+mod preapplication_framing_tests {
+    use super::*;
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let length = payload.len();
+        let mut wire = vec![
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+            kind,
+            flags,
+        ];
+        wire.extend_from_slice(&stream.to_be_bytes());
+        wire.extend_from_slice(payload);
+        wire
+    }
+    fn wire(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        for frame in frames {
+            wire.extend_from_slice(frame);
+        }
+        wire
+    }
+    fn facts(bytes: &[u8]) -> IngressFrames {
+        let mut facts = IngressFrames::new();
+        facts.observe(bytes);
+        facts
+    }
+    #[test]
+    fn full_controls_and_goaway_facts_are_valid_across_every_byte_split() {
+        let mut settings = Vec::new();
+        for (id, value) in [
+            (1u16, 4096u32),
+            (2, 0),
+            (3, 128),
+            (4, 256 * 1024),
+            (5, 16384),
+            (6, 16384),
+            (8, 0),
+        ] {
+            settings.extend_from_slice(&id.to_be_bytes());
+            settings.extend_from_slice(&value.to_be_bytes());
+        }
+        let mut goaway = vec![0; 8];
+        goaway.extend_from_slice(b"discarded-debug");
+        let input = wire(&[
+            frame(4, 0, 0, &settings),
+            frame(4, 1, 0, &[]),
+            frame(8, 0, 0, &1u32.to_be_bytes()),
+            frame(6, 0, 0, b"12345678"),
+            frame(6, 1, 0, b"87654321"),
+            frame(7, 0, 0, &goaway),
+        ]);
+        for split in 0..=input.len() {
+            let mut facts = IngressFrames::new();
+            facts.observe(&input[..split]);
+            facts.observe(&input[split..]);
+            assert!(
+                facts.complete_control_sequence(),
+                "split {split}: {facts:?}"
+            );
+            assert_eq!(
+                (
+                    facts.frames,
+                    facts.completed_frames,
+                    facts.settings,
+                    facts.setting_entries
+                ),
+                (6, 6, 2, 7)
+            );
+            assert_eq!(
+                (
+                    facts.goaways,
+                    facts.goaway_payloads_validated,
+                    facts.goaway_no_error_last_stream_zero
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                (facts.last_goaway_stream_id, facts.last_goaway_error_code),
+                (Some(0), Some(0))
+            );
+            assert_eq!(facts.goaway_debug_bytes, 15);
+            assert_eq!(facts.unit, [0; 8]);
+            assert!(!format!("{facts:?}").contains("discarded-debug"));
+        }
+        let mut bytewise = IngressFrames::new();
+        for byte in &input {
+            bytewise.observe(&[*byte]);
+        }
+        assert!(bytewise.complete_control_sequence());
+    }
+    #[test]
+    fn no_partial_preface_header_or_payload_can_be_a_candidate() {
+        let input = wire(&[
+            frame(4, 0, 0, &[0, 3, 0, 0, 0, 128]),
+            frame(7, 0, 0, &[0; 8]),
+        ]);
+        for end in 0..=input.len() {
+            let facts = facts(&input[..end]);
+            // Only the completed SETTINGS boundary and full final GOAWAY are legal.
+            let boundary = end == 24 + 9 + 6 || end == input.len();
+            assert_eq!(
+                facts.complete_control_sequence(),
+                boundary,
+                "prefix {end}: {facts:?}"
+            );
+        }
+        let mut bad = input.clone();
+        bad[0] = b'x';
+        assert!(!facts(&bad).complete_control_sequence());
+        assert!(!facts(&wire(&[])).complete_control_sequence());
+        assert!(!facts(&wire(&[frame(4, 1, 0, &[])])).complete_control_sequence());
+        assert!(!facts(&wire(&[frame(8, 0, 0, &1u32.to_be_bytes())])).complete_control_sequence());
+    }
+    #[test]
+    fn malformed_shapes_known_setting_values_unknown_apps_and_goaway_are_ineligible() {
+        let mut cases = vec![
+            frame(4, 2, 0, &[]),
+            frame(4, 1, 0, &[0; 6]),
+            frame(4, 0, 0, &[0; 5]),
+            frame(8, 0, 0, &[0; 4]),
+            frame(8, 1, 0, &[0, 0, 0, 1]),
+            frame(8, 0, 0, &[0; 3]),
+            frame(6, 2, 0, &[0; 8]),
+            frame(6, 0, 0, &[0; 7]),
+            frame(7, 1, 0, &[0; 8]),
+            frame(7, 0, 0, &[0; 7]),
+            frame(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]),
+            frame(7, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 1]),
+            frame(1, 4, 1, b"not-retained-authorization"),
+            frame(0, 0, 0, b"not-retained-body"),
+            frame(99, 0, 0, &[]),
+            frame(4, 0, 1, &[]),
+            frame(6, 0, 1, &[0; 8]),
+            frame(4, 0, 0, &vec![0; 16_386]),
+        ];
+        for (id, value) in [
+            (2u16, 2u32),
+            (8, 2),
+            (4, 0x8000_0000),
+            (5, 16_383),
+            (5, 16_777_216),
+            (999, 0),
+        ] {
+            let mut entry = id.to_be_bytes().to_vec();
+            entry.extend_from_slice(&value.to_be_bytes());
+            cases.push(frame(4, 0, 0, &entry));
+        }
+        for (ordinal, bad) in cases.into_iter().enumerate() {
+            let facts = facts(&wire(&[frame(4, 0, 0, &[]), bad]));
+            assert!(
+                !facts.complete_control_sequence(),
+                "case {ordinal}: {facts:?}"
+            );
+            assert_eq!(facts.unit, [0; 8]);
+            assert!(!format!("{facts:?}").contains("not-retained"));
         }
     }
 }
@@ -1013,6 +1375,13 @@ async fn forward_stream(
     backend_index: usize,
     core: Arc<Core>,
 ) -> Result<()> {
+    let rpc_path = request.uri().path();
+    let rpc_label = if rpc_path.len() <= 128 {
+        rpc_path.to_owned()
+    } else {
+        format!("oversize-path-sha256={}", hash(rpc_path.as_bytes()))
+    };
+    let downstream_stream = response.stream_id().as_u32();
     let mut stream_class = StreamClass::Unknown;
     let normal = if request.method() == http::Method::POST && request.uri().path() == ROOT_PATH {
         core.verifier
@@ -1223,7 +1592,7 @@ async fn forward_stream(
             state.non_target_peer_cancels = state.non_target_peer_cancels.saturating_add(1);
             Ok(())
         }
-        outcome => outcome,
+        outcome => outcome.with_context(|| format!("root RPC (path={rpc_label}, downstream_stream={downstream_stream}, authenticated_root={}, class={stream_class:?})", normal.is_some())),
     }
 }
 
@@ -1291,9 +1660,18 @@ async fn send_bytes(output: &mut SendStream<Bytes>, mut bytes: Bytes) -> Result<
         let available = if output.capacity() > 0 {
             output.capacity()
         } else {
-            poll_fn(|cx| output.poll_capacity(cx))
-                .await
-                .context("root output capacity closed")??
+            match poll_fn(|cx| output.poll_capacity(cx)).await {
+                Some(capacity) => capacity?,
+                None => {
+                    // A single poll preserves the actual reset observation;
+                    // it does not wait, synthesize a typed reset, or exempt it.
+                    let reset = poll_fn(|cx| std::task::Poll::Ready(output.poll_reset(cx))).await;
+                    bail!(
+                        "root output capacity closed (stream={}, reset_observation={reset:?})",
+                        output.stream_id().as_u32()
+                    );
+                }
+            }
         };
         ensure!(available > 0, "root output returned zero capacity");
         let take = bytes.len().min(available).min(FRAME_BYTES);
