@@ -241,6 +241,13 @@ fn frozen_reads(
 pub(super) fn programs(
     source: &SqlAuthoredPhysicalPlan,
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
+    let functions = catalogue();
+    programs_with_catalogue(source, &functions)
+}
+pub(super) fn programs_with_catalogue(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
     let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
     let uses = semantics
         .iter()
@@ -285,13 +292,12 @@ pub(super) fn programs(
     )
     .unwrap();
     let providers = providers();
-    let functions = catalogue();
     packages
         .into_iter()
         .map(|(id, package)| {
             let compiled = compile_fragment(
                 validate_fragment_providers(Arc::new(package), &providers, &Control).unwrap(),
-                &functions,
+                functions,
                 LocalCompileOptions {
                     pipeline_dop: NonZeroUsize::new(1).unwrap(),
                     root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
@@ -550,6 +556,7 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
         "SELECT SUM(-k) AS observed FROM fixture",
         "SELECT x FROM fixture, UNNEST([-k]) AS u(x)",
     ] {
+        eprintln!("actual canonical state SQL: {sql}");
         let source = sql_source(
             sql,
             DataType::Int8,

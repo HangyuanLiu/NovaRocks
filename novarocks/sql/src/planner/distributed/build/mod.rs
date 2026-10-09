@@ -54,3 +54,11 @@ pub(crate) use contract_lowering::{
 
 #[cfg(test)]
 mod physical_temporal_journal_tests;
+
+#[cfg(feature = "test-support")]
+pub mod state_source_fixture;
+
+#[cfg(feature = "test-support")]
+pub mod state_author_fixture;
+#[cfg(feature = "test-support")]
+pub mod writer_state_fixture;

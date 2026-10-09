@@ -442,13 +442,24 @@ fn checked_captured_requests_observed(
     producer: &CheckedWriterAggregateLogicalSourceEntry<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), PhysicalWriterRequestError> {
-    let left = consumer.captured().request();
-    let right = producer.captured().request();
+    checked_captured_writer_sources_observed(consumer.captured(), producer.captured(), work)
+}
+
+/// The ONE original full captured Writer pair-compatibility author. Construction
+/// and publication borrow each contributor's own source; shared lineage is not
+/// part of this original Writer policy.
+pub(in crate::planner::distributed::build) fn checked_captured_writer_sources_observed(
+    consumer: &crate::binding::CapturedAggregateLogicalRequest,
+    producer: &crate::binding::CapturedAggregateLogicalRequest,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PhysicalWriterRequestError> {
+    let left = consumer.request();
+    let right = producer.request();
     let same = left.logical_argument_count == right.logical_argument_count
         && left.arguments.len() == right.arguments.len()
-        && consumer.captured().constant_policy() == producer.captured().constant_policy()
-        && consumer.captured().binding().decimal_overflow_policy()
-            == producer.captured().binding().decimal_overflow_policy();
+        && consumer.constant_policy() == producer.constant_policy()
+        && consumer.binding().decimal_overflow_policy()
+            == producer.binding().decimal_overflow_policy();
     work.step()?;
     if !same {
         return Err(PhysicalWriterRequestError::InvalidSource(

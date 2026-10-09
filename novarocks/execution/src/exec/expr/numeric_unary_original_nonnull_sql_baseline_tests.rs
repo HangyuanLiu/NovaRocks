@@ -57,13 +57,26 @@ pub(super) fn sql_source(
     dtype: DataType,
     emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_semantics(
+        sql,
+        dtype,
+        emission_mode,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+}
+pub(super) fn sql_source_with_semantics(
+    sql: &str,
+    dtype: DataType,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
         SqlStatementInput::sql(sql),
         SqlCompileIntent::Query,
         SqlSessionContext {
-            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            sql_semantics,
             current_catalog: None,
             current_database: "fixture".into(),
             optimizer_settings: SessionOptimizerSettings {

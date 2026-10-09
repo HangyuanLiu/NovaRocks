@@ -1356,14 +1356,41 @@ mod numeric_unary_owned_transaction_tests;
 mod numeric_unary_public_transport_tests;
 
 #[cfg(test)]
-mod numeric_unary_writer_dml_source_tests;
-
-#[cfg(test)]
 mod cast_decimal_float32_oracle_tests;
 #[cfg(test)]
 mod legacy_decimal_float32_cast_baseline_tests;
+
+#[cfg(test)]
+mod numeric_unary_writer_dml_source_tests;
+
 #[cfg(test)]
 mod decimal_float32_sql_own_null_tests;
 
 #[cfg(test)]
+mod numeric_unary_original_state_union_baseline_tests;
+
+#[cfg(test)]
+mod numeric_unary_exact_state_union_baseline_tests;
+
+#[cfg(test)]
+mod numeric_unary_state_author_tests;
+#[cfg(test)]
+mod numeric_unary_writer_source_author_tests;
+
+#[cfg(test)]
+mod numeric_unary_own_constant_state_tests;
+
+#[cfg(test)]
+mod numeric_unary_state_compile_control_tests;
+
+#[cfg(test)]
 mod legacy_reverse_shared_baseline_tests;
+
+#[cfg(test)]
+mod numeric_unary_ordered_sql_source_tests;
+
+#[cfg(test)]
+mod numeric_unary_typed_ordered_merge_tests;
+
+#[cfg(test)]
+mod numeric_unary_narrow_state_source_tests;

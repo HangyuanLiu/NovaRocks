@@ -650,8 +650,110 @@ impl ContractLoweringVisitor<'_> {
                 },
             )?;
         }
+        // Dependency identity comes only from the ONE checked original state
+        // visitor. Fragment IDs and missing canonical records are not ordering.
+        let mut by_site = BTreeMap::new();
+        let mut dependencies = Vec::new();
+        self.work.flush()?;
+        dependencies
+            .try_reserve_exact(calls.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for (index, (fragment, _, site, _)) in calls.iter().enumerate() {
+            self.work.flush()?;
+            if by_site.insert((*fragment, *site), index).is_some() {
+                return Err(invalid("actual aggregate dependency site is duplicated"));
+            }
+            dependencies.push(BTreeSet::new());
+            self.work.step()?;
+        }
+        for (index, (fragment, _, site, call)) in calls.iter().enumerate() {
+            let binding = match call {
+                Call::Ordinary(c) => &c.binding,
+                Call::Writer(c) => &c.binding,
+            };
+            self.work.step()?;
+            if binding.phase.consumes_logical_arguments() {
+                continue;
+            }
+            let graph = super::super::lowered_draft::state_sources::ConstructionStateGraph::borrow(
+                &self.call_sources,
+                &self.fragments,
+                &self.completions,
+                &self.edges,
+            );
+            graph
+                .visit_merge_observed(
+                    *fragment,
+                    *site,
+                    &mut self.work,
+                    |producer, endpoint, work| {
+                        let producer_index =
+                            by_site.get(&(endpoint.fragment, producer.site)).copied();
+                        work.step()?;
+                        let producer_index = producer_index.ok_or(
+                            super::super::lowered_draft::SqlSourceJournalError::InvalidSource(
+                                "actual state producer has no relational construction call",
+                            ),
+                        )?;
+                        if producer_index == index {
+                            return Err(
+                                super::super::lowered_draft::SqlSourceJournalError::InvalidSource(
+                                    "actual aggregate dependency refers to its own consumer",
+                                ),
+                            );
+                        }
+                        work.flush()?;
+                        dependencies[index].insert(producer_index);
+                        work.step()?;
+                        Ok(())
+                    },
+                )
+                .map_err(Self::state_source_error)?;
+        }
+        let mut completed = BTreeSet::new();
+        let mut pending = Vec::new();
+        let mut ordered = Vec::new();
+        self.work.flush()?;
+        pending
+            .try_reserve_exact(calls.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        ordered
+            .try_reserve_exact(calls.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for call in calls {
+            pending.push(Some(call));
+            self.work.step()?;
+        }
+        while ordered.len() < pending.len() {
+            let mut ready = None;
+            for (index, call) in pending.iter().enumerate() {
+                self.work.step()?;
+                if call.is_none() {
+                    continue;
+                }
+                let mut available = true;
+                for producer in &dependencies[index] {
+                    self.work.step()?;
+                    available &= completed.contains(producer);
+                }
+                if available {
+                    ready = Some(index);
+                    break;
+                }
+            }
+            let index =
+                ready.ok_or_else(|| invalid("actual aggregate state dependencies are cyclic"))?;
+            ordered.push(
+                pending[index]
+                    .take()
+                    .expect("ready construction call checked above"),
+            );
+            self.work.flush()?;
+            completed.insert(index);
+            self.work.step()?;
+        }
         let mut changed = false;
-        for (fragment, node, site, call) in calls {
+        for (fragment, node, site, call) in ordered {
             let old_binding = match &call {
                 Call::Ordinary(c) => &c.binding,
                 Call::Writer(c) => &c.binding,
@@ -681,6 +783,7 @@ impl ContractLoweringVisitor<'_> {
             // A merge borrows every exact contributor from the ONE original
             // state traversal, retaining repeated links and no-contribution
             // terminals. It never scans for a same-signature aggregate.
+            let mut no_contribution_count = 0usize;
             let contributors = if update {
                 Vec::new()
             } else {
@@ -692,7 +795,14 @@ impl ContractLoweringVisitor<'_> {
                         &self.edges,
                     );
                 let mut contributors = Vec::new();
-                graph.visit_merge_observed(fragment, site, &mut self.work, |producer, _, work| {
+                let consumer = self
+                    .call_sources
+                    .entries
+                    .get(&(fragment, site))
+                    .and_then(|entry| entry.logical.captured())
+                    .ok_or_else(|| invalid("merge lacks its actual captured logical source"))?;
+                let mut writer_callback_failure = None;
+                let traversal = graph.visit_merge_sources_observed(fragment, site, &mut self.work, |producer, _, work| {
                     if producer.writer != matches!(&call, Call::Writer(_)) {
                         return Err(super::super::lowered_draft::SqlSourceJournalError::InvalidSource(
                             "merge route changes ordinary/Writer source lifecycle",
@@ -709,13 +819,41 @@ impl ContractLoweringVisitor<'_> {
                             "state contributor canonical request belongs to a foreign source",
                         ));
                     }
+                    if !producer.writer {
+                        super::super::physical_aggregate_requests::checked_aggregate_state_semantics_observed(
+                            consumer, old_binding, captured, producer.binding, work)?;
+                    }
+                    if producer.writer {
+                        if let Err(error) = super::super::physical_writer_requests::checked_captured_writer_sources_observed(consumer, captured, work) {
+                            let exit = match &error {
+                                super::super::physical_writer_requests::PhysicalWriterRequestError::Control(cause) => super::super::lowered_draft::SqlSourceJournalError::Control(*cause),
+                                super::super::physical_writer_requests::PhysicalWriterRequestError::InvalidSource(detail) => super::super::lowered_draft::SqlSourceJournalError::InvalidSource(detail),
+                                _ => super::super::lowered_draft::SqlSourceJournalError::InvalidSource("construction Writer captured compatibility rejected"),
+                            };
+                            writer_callback_failure = Some(error);
+                            return Err(exit);
+                        }
+                    }
                     work.flush()?;
                     contributors.try_reserve(1).map_err(|_| CompileControlError::ResourceExhausted)?;
                     contributors.push((Arc::clone(canonical), producer.binding.clone()));
                     work.step()?;
                     work.flush()?;
                     Ok(())
-                }).map_err(Self::state_source_error)?;
+                }, |_, work| {
+                    no_contribution_count = no_contribution_count.checked_add(1)
+                        .ok_or(CompileControlError::ResourceExhausted)?;
+                    work.step()?;
+                    Ok(())
+                });
+                if let Some(error) = writer_callback_failure {
+                    return Err(match error {
+                        super::super::physical_writer_requests::PhysicalWriterRequestError::Control(cause) => ContractLoweringError::Control(cause),
+                        super::super::physical_writer_requests::PhysicalWriterRequestError::InvalidSource(detail) => invalid(detail),
+                        error => ContractLoweringError::InvalidFunctionBinding { detail: format!("construction Writer captured compatibility: {error:?}") },
+                    });
+                }
+                traversal.map_err(Self::state_source_error)?;
                 contributors
             };
             let mut entry = self
@@ -769,75 +907,73 @@ impl ContractLoweringVisitor<'_> {
                     Arc::clone(&canonical.selected),
                 )
             } else {
-                let Some((first, _)) = contributors.first() else {
-                    return Err(invalid("merge has no actual state contribution"));
-                };
-                let mut arguments = first.arguments.clone();
-                let logical_count = captured.request().logical_argument_count;
-                if first.logical_count != logical_count
-                    || arguments.len() != captured.request().arguments.len()
+                if contributors.is_empty()
+                    && (!matches!(&call, Call::Writer(_)) || no_contribution_count == 0)
                 {
                     return Err(invalid(
-                        "merge contributor changes original ordered channel count",
+                        "merge has no actual state contribution or Writer terminal",
                     ));
+                }
+                // The consumer retains its OWN original logical/control/ORDER
+                // channels and constants. Producers never elect these values.
+                let request = captured.request();
+                let logical_count = request.logical_argument_count;
+                self.work.flush()?;
+                let mut arguments = Vec::new();
+                arguments
+                    .try_reserve_exact(request.arguments.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                for argument in request.arguments {
+                    self.work.flush()?;
+                    arguments.push(argument.clone());
+                    self.work.step()?;
                 }
                 for (producer, binding) in &contributors {
                     self.work.step()?;
-                    if !producer.identity.same_revision(captured.logical_identity())
-                        || producer.logical_count != logical_count
-                        || producer.arguments.len() != arguments.len()
+                    // The original semantic/state author already checked this
+                    // independently captured source. Only the declared state
+                    // law can transfer root nullability into matching logical
+                    // Value domains. A constant retains its OWN complete FVT and
+                    // checked backing; no constant or control value is replaced.
+                    // Exact state signatures may read the current root fact
+                    // of their OWN logical source revision. Independent sources
+                    // retain their own request and original compatibility law.
+                    let own_source = producer.identity.same_revision(captured.logical_identity());
+                    self.work.step()?;
+                    if binding.state_argument_contract != novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent
+                        && !own_source
                     {
-                        return Err(invalid(
-                            "merge contributor has a foreign original logical source",
-                        ));
+                        continue;
                     }
                     for (ordinal, (left, right)) in arguments
                         .iter_mut()
                         .zip(producer.arguments.iter())
                         .enumerate()
                     {
-                        self.work.flush()?;
-                        match (left, right) {
-                            (novarocks_functions::FunctionArgument::Value { value_type: a, constant: ac },
-                             novarocks_functions::FunctionArgument::Value { value_type: b, constant: bc })
-                                if ordinal < logical_count && binding.state_argument_contract ==
-                                    novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent => {
-                                self.work.flush()?;
-                                let mut root = b.clone();
-                                root.nullable = a.nullable;
-                                if !a.exactly_equals_observed::<ContractLoweringError>(&root, || {
+                        self.work.step()?;
+                        // Only the positive SAME revision receipt can update
+                        // its OWN ORDER metadata. Independent states never elect
+                        // a consumer's ORDER value, constant or type.
+                        if ordinal >= logical_count && !own_source {
+                            continue;
+                        }
+                        if let (
+                            novarocks_functions::FunctionArgument::Value {
+                                value_type: a,
+                                constant: None,
+                            },
+                            novarocks_functions::FunctionArgument::Value { value_type: b, .. },
+                        ) = (left, right)
+                        {
+                            self.work.flush()?;
+                            let mut root = b.clone();
+                            root.nullable = a.nullable;
+                            let same_domain = a
+                                .exactly_equals_observed::<ContractLoweringError>(&root, || {
                                     self.work.step().map_err(ContractLoweringError::from)
-                                })? {
-                                    return Err(invalid("state contributor changes nominal/nested channel identity"));
-                                }
-                                let constants_equal = match (ac.as_ref(), bc.as_ref()) {
-                                    (None, None) => true,
-                                    (Some(a), Some(b)) => {
-                                        self.work.flush()?;
-                                        let same = a.equals_observed(b, CompilePhase::FunctionSpecialization, self.control)?;
-                                        self.work.flush()?;
-                                        same
-                                    }
-                                    _ => false,
-                                };
-                                if !constants_equal {
-                                    return Err(invalid("state contributor changes nominal/nested/constant channel identity"));
-                                }
+                                })?;
+                            if same_domain {
                                 a.nullable |= b.nullable;
-                                self.work.step()?;
-                            }
-                            (a, b) => {
-                                self.work.flush()?;
-                                let same = a.equals_observed(b, CompilePhase::FunctionSpecialization, self.control)
-                                    .map_err(|error| match error {
-                                        novarocks_functions::FunctionBindingError::Control(cause) => ContractLoweringError::Control(cause),
-                                        error => ContractLoweringError::InvalidFunctionBinding { detail: format!("state contributor comparison: {error}") },
-                                    })?;
-                                self.work.step()?;
-                                self.work.flush()?;
-                                if !same {
-                                    return Err(invalid("state contributor changes an exact logical or ORDER BY channel"));
-                                }
                             }
                         }
                     }
@@ -849,6 +985,9 @@ impl ContractLoweringVisitor<'_> {
                     &arguments,
                     constraint.as_ref(),
                 )?;
+                self.work.flush()?;
+                let arguments = arguments.into_boxed_slice();
+                self.work.step()?;
                 (arguments, constraint, selected)
             };
             let logical_count = captured.request().logical_argument_count;
@@ -864,11 +1003,16 @@ impl ContractLoweringVisitor<'_> {
                 &mut self.work,
             )?;
             for (_, producer) in &contributors {
-                if !novarocks_physical_plan::aggregate_bindings_match_observed(
-                    &revised,
-                    producer,
-                    &mut self.work,
-                )? {
+                // Writer has the original complete binding compatibility law.
+                // Ordinary pair semantics are authored by its ONE original
+                // state owner above, not by a Writer rule or source equality.
+                if matches!(&call, Call::Writer(_))
+                    && !novarocks_physical_plan::aggregate_bindings_match_observed(
+                        &revised,
+                        producer,
+                        &mut self.work,
+                    )?
+                {
                     return Err(invalid(
                         "aggregate state contributor differs from current consumer contract",
                     ));

@@ -855,6 +855,7 @@ pub(in crate::planner::distributed::build) struct ConstructionStateGraph<'a> {
     edges: &'a BTreeMap<novarocks_physical_plan::EdgeId, novarocks_physical_plan::Edge>,
 }
 pub(in crate::planner::distributed::build) struct ConstructionStateEmission<'a> {
+    pub(in crate::planner::distributed::build) site: PhysicalCallSite,
     pub(in crate::planner::distributed::build) entry: &'a super::LoweredAggregateSourceEntry,
     pub(in crate::planner::distributed::build) binding:
         &'a novarocks_physical_plan::AggregateBinding,
@@ -881,6 +882,23 @@ impl<'a> ConstructionStateGraph<'a> {
         work: &mut CompileCheckpoints<'_>,
         emission: impl FnMut(
             ConstructionStateEmission<'a>,
+            AggregateStateEndpoint,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+    ) -> Result<(), SqlSourceJournalError> {
+        self.visit_merge_sources_observed(fragment, site, work, emission, |_, _| Ok(()))
+    }
+    pub(in crate::planner::distributed::build) fn visit_merge_sources_observed(
+        &self,
+        fragment: FragmentId,
+        site: PhysicalCallSite,
+        work: &mut CompileCheckpoints<'_>,
+        emission: impl FnMut(
+            ConstructionStateEmission<'a>,
+            AggregateStateEndpoint,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+        no_contribution: impl FnMut(
             AggregateStateEndpoint,
             &mut CompileCheckpoints<'_>,
         ) -> Result<(), SqlSourceJournalError>,
@@ -912,7 +930,7 @@ impl<'a> ConstructionStateGraph<'a> {
             work,
             emission,
             |_, _, _, _| Ok(()),
-            |_, _| Ok(()),
+            no_contribution,
         )
     }
 }
@@ -1037,6 +1055,7 @@ impl<'a> StateGraph<'a> for ConstructionStateGraph<'a> {
         };
         Ok((
             ConstructionStateEmission {
+                site,
                 entry,
                 binding,
                 writer,
