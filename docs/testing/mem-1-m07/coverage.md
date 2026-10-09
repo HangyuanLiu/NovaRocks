@@ -514,3 +514,11 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 原window模型 **1 PASS**：getter无Arc增持、两原slot序号和Root相同、实际最后owner Drop后capacity为0且标量仍可读。feature adapter full **134 PASS / 0 FAIL / 0 ignored，2.54s**；随后observer重复/错receipt/phase/已有失败 focused1 PASS。原registered intermediary focused3 PASS，并准确断言缺尾只有fallback1MiB、无resident window；pool拒绝在freeze之前，因此没有虚构的空W2观察。default和feature server编译PASS。
 
 Unix v1字节/16tests和旧freezes未变；wire-v2/newfreeze/strictdecoder仅新ignored草稿，尚未启用。真实native双item W2/fullpool/ACK/独立wire/健康恢复/FE成功退出和四role实际退出继续OPEN，visible长度不当完整allocation backing。收据 `docs/testing/mem-1-m07/evidence/p09-original-freeze-scalar-components-20261009.json`。默认产品close资格、cap与30s/5s/20s无改动，HMS按只读例外，无push/PR/归档。
+
+### P09 private Unix wire-v2 component checkpoint (2026-10-09)
+
+同原Unix control owner显式保留V1/V2选择；原bind/v1布局/16组件与runner v1 source/tests原字节保留，opt-in facade仅明确bind_v2。v2追加同原freeze已保存的fixed scalars，最大whole reply744B；4096 envelope、16commands、一个peer、原absolute20s及默认产品路径/caps均不改。独立runner DTO/codec不依赖adapter/control/root owner，新输入另冻结为 `inputs/private-unix-frame-v2-freeze-v1.json`，无版本fallback。修复原freeze新文件截断ASF头；encoder入口可见性、module path与test private imports由定向编译验证。
+
+Unix组件 **20 PASS / 0 FAIL / 0 ignored，0.99s**（原v1 16＋v2 4）；runner组件 **43 PASS / 0 FAIL / 0 ignored，0.61s**（v1 17＋v2 26）；feature adapter milestone **139 PASS / 0 FAIL / 0 ignored，2.58s**；feature/default server check PASS，13.04s/9.73s。首次误用dev-opt造成无关profile重编译，root停止task-owned进程，原中断log保留；随后module path/import编译FAIL日志保留，修正后PASS。新Unix测试固定49B读缓冲、同原3s绝对clock，先originalowner close/exactinode清理再断言；Drop只作物理兜底，不作cleanup收据。
+
+744B独立literal只是最大option布局模型，不当实际W2历史。实际v2 Unix Stop/version拒绝和runner pair-stream证明组件协议，不证明实际FE身份、prelaunch时钟、Root/backing/ACK或four-role exit。真实1FE+3BE exact矩阵仍OPEN，本slice Native/Docker为0；formalrelease性能排除fixture feature。收据 `docs/testing/mem-1-m07/evidence/p09-private-unix-frame-v2-components-20261009.json`。HMS仍按IRU-7用户只读范围，其余人工语义门不改，无push/PR/归档。

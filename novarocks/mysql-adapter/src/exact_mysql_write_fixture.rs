@@ -158,12 +158,16 @@ impl MysqlWriteFixture {
         nonce: [u8; 16],
         original_absolute_deadline: Instant,
     ) -> Result<Self, MysqlWriteFixtureError> {
-        let (control, hub) =
-            UnixMysqlWriteControl::bind(path, actual_frontend, nonce, original_absolute_deadline)
-                .map_err(|control| MysqlWriteFixtureError {
-                control: Some(control),
-                ..Default::default()
-            })?;
+        let (control, hub) = UnixMysqlWriteControl::bind_v2(
+            path,
+            actual_frontend,
+            nonce,
+            original_absolute_deadline,
+        )
+        .map_err(|control| MysqlWriteFixtureError {
+            control: Some(control),
+            ..Default::default()
+        })?;
         let joins = Arc::new(MysqlFixtureSessionJoins::default());
         Ok(Self {
             control,

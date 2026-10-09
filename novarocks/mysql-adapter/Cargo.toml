@@ -26,6 +26,7 @@ tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-execution-contract.workspace = true
 sha2.workspace = true
 novarocks-parser.workspace = true
 novarocks-query-application = { workspace = true, features = ["test-support"] }

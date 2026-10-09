@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "478850f98eca02e8bd012f2da16f806c9478415e",
+  "status": "PRIVATE_WIRE_V2_COMPONENT_PASS_NATIVE_MATRIX_OPEN",
+  "source_files": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 190792,
+      "sha256": "097368767526cd68f71aa839adf96f8a3c70b5d3dec892a9f1ecde65eaa2cfd9"
+    },
+    {
+      "path": "novarocks/mysql-adapter/Cargo.toml",
+      "bytes": 1128,
+      "sha256": "2f7fb2032eb7371335590253e3882c36d18864ec190034aa0dfcca68be77ef34"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/exact_mysql_write_fixture.rs",
+      "bytes": 10914,
+      "sha256": "694b89988bf3fe10054dd20c5b9ef7bebca48f4e9fcfe4554fe5d45c9464e0ee"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/mysql_write_gate/original_freeze.rs",
+      "bytes": 5683,
+      "sha256": "b9662a151281a3105b424df1f9a22b923d0f38d4b6ce60bc6f63c1357244b363"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/mysql_write_gate/unix_control.rs",
+      "bytes": 36232,
+      "sha256": "1ca40b9ea537c396de8599c87883c740e47f918160bee4e32e3f7dd7fd90daa4"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/mysql_write_gate/original_freeze_encoder.rs",
+      "bytes": 4682,
+      "sha256": "dad7d21fe1e56fc59825252ae1cd2432488d6bd5dce2035f28fca336f410adfd"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/mysql_write_gate/unix_control_v2_tests.rs",
+      "bytes": 15588,
+      "sha256": "51be0cecb5439af395effb6b45b9f3602066829dc18836f275bb1154b9a4baf2"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/mod.rs",
+      "bytes": 173,
+      "sha256": "6db440fced5104e4c9480d76ae2d360bf976e262947cdd301985d450f8bd9901"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/exact_mysql_control_v2.rs",
+      "bytes": 34571,
+      "sha256": "b5610f90b03e211c5a93f434f90ef06e5591728ea2fa321d14d965bd68929de6"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/exact_mysql_control_v2.tests.rs",
+      "bytes": 35333,
+      "sha256": "6f6abee8ed9a2658b16161bedce1d464ca7840e0d54dd6cb6f001ea406842fae"
+    }
+  ],
+  "new_frozen_input": {
+    "path": "docs/testing/mem-1-m07/inputs/private-unix-frame-v2-freeze-v1.json",
+    "bytes": 8401,
+    "sha256": "0b283a85e151ec2bd2d33129d93a650dc5ca4cf00f5114fda0cc246e98d97fc0"
+  },
+  "preserved_v1_sources": [
+    {
+      "path": "tests/system-test-runner/src/actors/exact_mysql_control.rs",
+      "bytes": 27220,
+      "sha256": "51db838271890dc55160dae073b9abade118aa911859d87e617b792a0e278a23",
+      "unchanged_from": "478850f98eca02e8bd012f2da16f806c9478415e"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/exact_mysql_control.tests.rs",
+      "bytes": 25189,
+      "sha256": "0c89dd75885d610ed5af7c7ac9a97a33256aa256fa75f3afe72066a2ee1d1000",
+      "unchanged_from": "478850f98eca02e8bd012f2da16f806c9478415e"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/mysql_write_gate/unix_control_tests.rs",
+      "bytes": 45463,
+      "sha256": "cc46dade270e3697c4c432a7daa98f181df1fed8057980a13a84f1a658b63805",
+      "unchanged_from": "478850f98eca02e8bd012f2da16f806c9478415e"
+    }
+  ],
+  "checks": [
+    {
+      "path": "logs/mem-1-m07/p09-wire-v2-adapter-components-v1-20261009.log",
+      "bytes": 662,
+      "sha256": "8d86ca6e3c6a659b67dd31e5ddc1195f91c26c9e1d231d50deaab00c8706234e",
+      "status": "INTERRUPTED_BY_ROOT_REDUNDANT_PROFILE_COMPILATION",
+      "passed": null,
+      "execution_seconds": null
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-v2-adapter-components-v2-20261009.log",
+      "bytes": 55621,
+      "sha256": "92ef5c9faba2d7991649dea74b7a2268fde9de49c5e75add8935b7defee01e99",
+      "status": "COMPILE_FAIL_MODULE_PATH_AND_PRIVATE_IMPORTS",
+      "passed": null,
+      "execution_seconds": null
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-v2-adapter-components-v3-20261009.log",
+      "bytes": 55844,
+      "sha256": "94b5ac398ef1d47ad300d8b15c7fa1869167aba553bf0f5854f87349632031ff",
+      "status": "PASS",
+      "passed": 20,
+      "execution_seconds": 0.99
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-v2-runner-components-v1-20261009.log",
+      "bytes": 11068,
+      "sha256": "be3f50e820f32941300c66cb24eb5a77023f7adc2bd2c5b60ddf9fc2206a8a6a",
+      "status": "PASS",
+      "passed": 43,
+      "execution_seconds": 0.61
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-v2-adapter-milestone-v1-20261009.log",
+      "bytes": 70849,
+      "sha256": "cf059935ca6c2fd7dbf60f3b7bba607a8eaf8973913e5bf89524e757e27dff8b",
+      "status": "PASS",
+      "passed": 139,
+      "execution_seconds": 2.58
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-v2-feature-server-v1-20261009.log",
+      "bytes": 186947,
+      "sha256": "340904b3b30f41a246bddb43af8e21d8d7990473a738021f030a0ca47afc1875",
+      "status": "PASS",
+      "passed": null,
+      "execution_seconds": null
+    },
+    {
+      "path": "logs/mem-1-m07/p09-wire-v2-default-server-v1-20261009.log",
+      "bytes": 184099,
+      "sha256": "6623284ed8c0ed07bec8a0ad9cae264f31e5eecff97a48a54d4903c8137adb39",
+      "status": "PASS",
+      "passed": null,
+      "execution_seconds": null
+    }
+  ],
+  "readonly_reviews": [
+    {
+      "path": "logs/mem-1-m07/p09-original-freeze-observer-integrated-review-v1.md",
+      "bytes": 8347,
+      "sha256": "e8b1499e493a00e1544ec7c99649f9fa93861372a93ff51a8f865bb7e37dedcb"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-unix-wire-v2-integrated-review-v1.md",
+      "bytes": 8905,
+      "sha256": "7e462ba02e846e117b90a01cdf2f0bb360156e6a1f53d91ecbe0c36880fa2381"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-unix-wire-v2-test-cleanup-review-v2.md",
+      "bytes": 4287,
+      "sha256": "76ceb1cd89bbeedcf4338c24ddf732b1a679ff3cceecb97f3215c938c96b4fee"
+    }
+  ],
+  "changes": [
+    "Explicit retained private V1/V2 selection in same original Unix control owner; original bind and v1 encoder shape preserved; opt-in facade binds v2, no auto-detection or fallback.",
+    "V2 suffix copies the already-recorded one original freeze scalars, max whole reply744; requests/transport buffers/16-command bound and original deadline unchanged.",
+    "Independent runner DTO codec/client has no adapter/control/root owner dependencies, rejects noncanonical options/enums/bounds, preserves actual prefix hashes and original absolute clock.",
+    "Root restored complete ASF license header in original_freeze.rs and encoder child; added dev-only execution-contract dependency for independent literal tests."
+  ],
+  "evidence_limits": [
+    "20 adapter Unix components include unchanged16 v1 and four new v2; actual Unix test proves one owner Stop and version rejection, no MySQL/native owner or Root W2.",
+    "43 runner components comprise unchanged17 v1 and26 v2; pair streams and literal projection do not prove actual FE/client integration.",
+    "Max744 fixture intentionally tests all optional layout fields; it is not a physically reachable resident history or body/backing/last-owner proof.",
+    "Cleanup guard has exact inode fallback and explicit normal cleanup; no new panic/replacement fault was executed by the v2 test. Existing v1 fault tests remain separate.",
+    "Registered intermediary, actualNative 1FE+3BE exact cuts/dual-itemW2/fullpool/ACK/healthy recovery/actual role exits are not newly exercised.",
+    "FE independent bounded marker/prelaunch clock/owner-finish success gate remain open; Stop success only finishes Unix protocol.",
+    "Formal release performance excludes opt-in fixture feature; no performance/RSS/CMCP claim."
+  ],
+  "native_runs_this_slice": 0,
+  "docker_runs_this_slice": 0,
+  "hms_scope": "User-authorized IRU-7 read-only retirement excludes NovaRocks HMS write/FORCE correctness, not read classification or real large readonly CL.",
+  "publication": "Local checkpoint only; no push, PR or archive."
+}

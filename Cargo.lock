@@ -4062,6 +4062,7 @@ dependencies = [
  "async-trait",
  "libc",
  "mysql_common 0.32.4",
+ "novarocks-execution-contract",
  "novarocks-parser",
  "novarocks-query-application",
  "novarocks-result-contract",

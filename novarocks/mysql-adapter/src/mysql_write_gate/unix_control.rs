@@ -41,7 +41,12 @@ const BODY_CAP: usize = FRAME_WIRE_CAP - HEADER_BYTES;
 const COMMAND_CAP: u8 = 16;
 // A conservative, explicitly frozen test bound; not a production path setting.
 const SOCKET_PATH_CAP: usize = 90;
-const VERSION: u8 = 1;
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum WireVersion {
+    V1 = 1,
+    V2 = 2,
+}
 const ARM: u8 = 1;
 const SNAPSHOT: u8 = 2;
 const STOP: u8 = 3;
@@ -245,6 +250,7 @@ impl OwnedSocketPath {
 /// Dropping its run future does not lose the peer/listener or the cleanup locator.
 pub(crate) struct UnixMysqlWriteControl {
     controller: MysqlWriteGateController,
+    wire_version: WireVersion,
     listener: Option<UnixListener>,
     peer: Option<UnixStream>,
     path: OwnedSocketPath,
@@ -269,6 +275,36 @@ impl UnixMysqlWriteControl {
         actual_frontend: FrontendProcessId,
         nonce: [u8; 16],
         original_absolute_deadline: Instant,
+    ) -> Result<(Self, Arc<MysqlWriteGateHub>), ControlExitError> {
+        Self::bind_version(
+            path,
+            actual_frontend,
+            nonce,
+            original_absolute_deadline,
+            WireVersion::V1,
+        )
+    }
+    /// Explicit private native fixture revision; never inferred from incoming frames.
+    pub(crate) fn bind_v2(
+        path: PathBuf,
+        actual_frontend: FrontendProcessId,
+        nonce: [u8; 16],
+        original_absolute_deadline: Instant,
+    ) -> Result<(Self, Arc<MysqlWriteGateHub>), ControlExitError> {
+        Self::bind_version(
+            path,
+            actual_frontend,
+            nonce,
+            original_absolute_deadline,
+            WireVersion::V2,
+        )
+    }
+    fn bind_version(
+        path: PathBuf,
+        actual_frontend: FrontendProcessId,
+        nonce: [u8; 16],
+        original_absolute_deadline: Instant,
+        wire_version: WireVersion,
     ) -> Result<(Self, Arc<MysqlWriteGateHub>), ControlExitError> {
         let empty = PrefixSummary::empty();
         let startup = |class, cause| ControlExitError {
@@ -380,6 +416,7 @@ impl UnixMysqlWriteControl {
         Ok((
             Self {
                 controller,
+                wire_version,
                 listener: Some(listener),
                 peer: None,
                 path: owned,
@@ -510,7 +547,7 @@ impl UnixMysqlWriteControl {
             let length = self.read_frame().await?;
             self.facts.commands += 1;
             self.stage = ControlStage::Decode;
-            let decoded = decode(&self.request[..length]);
+            let decoded = decode(&self.request[..length], self.wire_version);
             self.request.fill(0);
             let command = decoded.map_err(|class| self.failure(class, None))?;
             if command.frontend != self.frontend || command.nonce != self.nonce {
@@ -547,8 +584,9 @@ impl UnixMysqlWriteControl {
                 return Err(self.failure(ControlClass::Hub, None));
             }
             self.stage = ControlStage::WriteReply;
-            let reply_length = encode_reply(&mut self.reply, opcode, self.facts, hub)
-                .map_err(|class| self.failure(class, None))?;
+            let reply_length =
+                encode_reply(&mut self.reply, opcode, self.facts, hub, self.wire_version)
+                    .map_err(|class| self.failure(class, None))?;
             self.facts.last_response = PrefixSummary {
                 declared_wire_bytes: Some(reply_length as u64),
                 ..PrefixSummary::empty()
@@ -737,8 +775,8 @@ enum Operation {
     Snapshot,
     Stop,
 }
-fn decode(body: &[u8]) -> Result<Command, ControlClass> {
-    if body.len() < 2 || body[0] != VERSION {
+fn decode(body: &[u8], wire_version: WireVersion) -> Result<Command, ControlClass> {
+    if body.len() < 2 || body[0] != wire_version as u8 {
         return Err(ControlClass::Fields);
     }
     let opcode = body[1];
@@ -928,12 +966,13 @@ fn encode_reply(
     opcode: u8,
     facts: ControlFacts,
     hub: MysqlWriteHubSnapshot,
+    wire_version: WireVersion,
 ) -> Result<usize, ControlClass> {
     let mut writer = ReplyWriter {
         bytes,
         length: HEADER_BYTES,
     };
-    writer.put(&[VERSION, opcode, 0])?;
+    writer.put(&[wire_version as u8, opcode, 0])?;
     writer.put(&hub.frontend.to_bytes())?;
     writer.put(&[facts.accepted_peers, facts.commands])?;
     writer.u64(facts.request_wire_bytes)?;
@@ -945,6 +984,12 @@ fn encode_reply(
     writer.failure(hub.failure)?;
     writer.flag(hub.original_writer_exited)?;
     writer.gate(hub.gate)?;
+    if matches!(wire_version, WireVersion::V2) {
+        writer.original_freeze_scalars(hub.original_freeze)?;
+        if writer.length > 744 {
+            return Err(ControlClass::Length);
+        }
+    }
     let length = writer.length;
     writer.bytes[..HEADER_BYTES].copy_from_slice(&((length - HEADER_BYTES) as u32).to_le_bytes());
     Ok(length)
@@ -953,3 +998,10 @@ fn encode_reply(
 #[cfg(test)]
 #[path = "unix_control_tests.rs"]
 mod tests;
+
+#[path = "original_freeze_encoder.rs"]
+mod original_freeze_encoder;
+
+#[cfg(test)]
+#[path = "unix_control_v2_tests.rs"]
+mod v2_tests;
