@@ -581,7 +581,7 @@ fn freeze_branch_source(
     let source = ConnectorTableHandle::try_new(freeze.catalog.clone(), Bytes::from(encoded))?;
     let (scan_bindings, match_tokens, written_version_token) =
         branch_scan_bindings(freeze.input, scan_schema.as_ref())?;
-    Ok(ConnectorWriteRewriteSource::new(
+    let signed_source = ConnectorWriteRewriteSource::new(
         source,
         pinned_source,
         freeze.base_version_digest,
@@ -589,7 +589,33 @@ fn freeze_branch_source(
         scan_bindings,
         match_tokens,
         written_version_token,
-    ))
+    );
+    // Diagnostic-only observation of the ONE original signed source. Paths,
+    // payloads, storage properties and field metadata are never printed.
+    if tracing::enabled!(tracing::Level::INFO) {
+        use sha2::Digest;
+        let source_digest = sha2::Sha256::digest(signed_source.source().payload());
+        for path in signed_source.pinned_source().files() {
+            tracing::info!(
+                target: "novarocks::cow_source_receipt_probe",
+                snapshot_id = signed_source.pinned_source().version_ordinal(),
+                path_digest = format_args!("{:x}", sha2::Sha256::digest(path.as_bytes())),
+                source_digest = format_args!("{:x}", source_digest),
+                "Original COW signed source pin"
+            );
+        }
+        for (ordinal, field) in signed_source.scan_schema().fields().iter().enumerate() {
+            tracing::info!(
+                target: "novarocks::cow_source_receipt_probe",
+                snapshot_id = signed_source.pinned_source().version_ordinal(),
+                source_digest = format_args!("{:x}", source_digest),
+                ordinal, field_name = %field.name(), nullable = field.is_nullable(),
+                carrier = %field.data_type(),
+                "Original COW signed source field"
+            );
+        }
+    }
+    Ok(signed_source)
 }
 
 /// Bind every signed writer field to the column of the frozen source that
