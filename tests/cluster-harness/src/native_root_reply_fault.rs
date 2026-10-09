@@ -143,6 +143,7 @@ pub enum RootReplyMutation {
     ProfileTwo,
     ClientRowsFalse,
     FourBytePrefixOnly,
+    ValidRowPrefixOnlySuffix,
 }
 
 /// No mutation is authorized by a candidate. The runner must independently
@@ -1290,7 +1291,10 @@ fn preapplication_close_candidate(
         && facts.all_children_joined
         && !facts.cleanup_failed
         && frames.complete_control_sequence()
-        && frames.goaways == 1
+        // An inert readiness channel can disappear before GOAWAY is flushed.
+        // If present, exactly one GOAWAY must retain the existing NO_ERROR /
+        // last_stream_zero / complete-boundary validation and zero debug bytes.
+        && frames.goaways <= 1
         && frames.goaway_debug_bytes == 0
         && ledger
             .slot(backend_index)
@@ -1394,6 +1398,9 @@ mod preapplication_close_candidate_tests {
     async fn typed_accept_error(kind: ErrorKind) -> anyhow::Error {
         let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         bytes.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        typed_accept_error_with_wire(kind, bytes).await
+    }
+    async fn typed_accept_error_with_wire(kind: ErrorKind, bytes: Vec<u8>) -> anyhow::Error {
         let io = FailingRead {
             bytes: std::io::Cursor::new(bytes),
             kind,
@@ -1412,6 +1419,150 @@ mod preapplication_close_candidate_tests {
         assert!(error.is_io());
         assert_eq!(error.get_io().map(std::io::Error::kind), Some(kind));
         anyhow::Error::new(error).context("actual downstream accept stage")
+    }
+    // This is a legal 79-byte control-only shape matching the observed frame
+    // counts. Values are valid fixture settings, not recovered peer settings.
+    fn readiness_wire_without_goaway() -> Vec<u8> {
+        let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        bytes.extend_from_slice(&[0, 0, 24, 4, 0, 0, 0, 0, 0]);
+        for (id, value) in [(1u16, 4096u32), (2, 0), (4, 65535), (6, 16384)] {
+            bytes.extend_from_slice(&id.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0, 0, 4, 1, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        bytes
+    }
+    #[tokio::test]
+    async fn no_goaway_readiness_keeps_all_pre_capture_and_actual_exit_fences() {
+        let bytes = readiness_wire_without_goaway();
+        assert_eq!(bytes.len(), 79);
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+            let error = typed_accept_error_with_wire(kind, bytes.clone()).await;
+            for cut in 0..=bytes.len() {
+                let mut frames = IngressFrames::new();
+                frames.observe(&bytes[..cut]);
+                frames.observe(&bytes[cut..]);
+                assert!(frames.complete_control_sequence());
+                assert_eq!(
+                    (
+                        frames.frames,
+                        frames.settings,
+                        frames.setting_entries,
+                        frames.window_updates,
+                        frames.goaways
+                    ),
+                    (3, 2, 4, 1, 0)
+                );
+                let mut state = State::default();
+                let mut ledger = PreapplicationCloseLedger::new(&[2, 7, 11]).unwrap();
+                assert!(preapplication_close_candidate(
+                    &state,
+                    &ledger,
+                    7,
+                    exit(),
+                    &frames,
+                    &error
+                ));
+                state.used_capture = true;
+                assert!(!preapplication_close_candidate(
+                    &state,
+                    &ledger,
+                    7,
+                    exit(),
+                    &frames,
+                    &error
+                ));
+                state.used_capture = false;
+                state.lifecycle_closed = true;
+                assert!(!preapplication_close_candidate(
+                    &state,
+                    &ledger,
+                    7,
+                    exit(),
+                    &frames,
+                    &error
+                ));
+                state.lifecycle_closed = false;
+                for facts in [
+                    PreapplicationExitFacts {
+                        accepted_rpcs: 1,
+                        ..exit()
+                    },
+                    PreapplicationExitFacts {
+                        unresolved_rpcs: 1,
+                        ..exit()
+                    },
+                    PreapplicationExitFacts {
+                        never_provisional_target: false,
+                        ..exit()
+                    },
+                    PreapplicationExitFacts {
+                        all_children_joined: false,
+                        ..exit()
+                    },
+                    PreapplicationExitFacts {
+                        cleanup_failed: true,
+                        ..exit()
+                    },
+                    PreapplicationExitFacts {
+                        stage: ConnectionFailureStage::ResponseCopy,
+                        ..exit()
+                    },
+                    PreapplicationExitFacts {
+                        stage: ConnectionFailureStage::Timeout,
+                        ..exit()
+                    },
+                ] {
+                    assert!(!preapplication_close_candidate(
+                        &state, &ledger, 7, facts, &frames, &error
+                    ));
+                }
+                for _ in 0..3 {
+                    assert!(settle_preapplication_close_locked(
+                        &state,
+                        &mut ledger,
+                        7,
+                        exit(),
+                        &frames,
+                        &error
+                    ));
+                }
+                assert!(!settle_preapplication_close_locked(
+                    &state,
+                    &mut ledger,
+                    7,
+                    exit(),
+                    &frames,
+                    &error
+                ));
+                assert_eq!(ledger.closes, [0, 3, 0]);
+            }
+        }
+        let error = typed_accept_error_with_wire(ErrorKind::ConnectionAborted, bytes.clone()).await;
+        let mut frames = IngressFrames::new();
+        frames.observe(&bytes);
+        let ledger = PreapplicationCloseLedger::new(&[7]).unwrap();
+        assert!(!preapplication_close_candidate(
+            &State::default(),
+            &ledger,
+            7,
+            exit(),
+            &frames,
+            &error
+        ));
+        for tail in [
+            vec![0, 0],
+            vec![0, 0, 0, 1, 4, 0, 0, 0, 1],
+            vec![0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0],
+            vec![0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+            vec![0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        ] {
+            let mut rejected = IngressFrames::new();
+            rejected.observe(&bytes);
+            rejected.observe(&tail);
+            assert!(!rejected.complete_control_sequence());
+        }
     }
     #[tokio::test]
     async fn only_two_typed_accept_io_kinds_can_settle_three_closes_per_actual_backend() {
@@ -1566,7 +1717,7 @@ mod preapplication_close_candidate_tests {
             &error
         ));
         state.failure_overflow = false;
-        for (goaways, debug_bytes) in [(0, 0), (2, 0), (1, 1)] {
+        for (goaways, debug_bytes) in [(2, 0), (1, 1)] {
             let mut changed = controls();
             changed.goaways = goaways;
             changed.goaway_payloads_validated = goaways;
@@ -2420,6 +2571,27 @@ fn require_canonical_reply(
     Ok(())
 }
 
+// Preserve the exact real scalar row; only append the closed malformed suffix.
+// The new body backing is charged alongside the original until its last alias exits.
+fn append_prefix_only_suffix(core: Arc<Core>, original: &Bytes) -> Result<Bytes> {
+    ensure!(
+        original.len() == 69,
+        "suffix fixture requires the real 69-byte scalar body"
+    );
+    let length = original
+        .len()
+        .checked_add(4)
+        .context("suffix body length overflow")?;
+    ensure!(
+        length <= RootProfileV1::SEGMENT_BYTES,
+        "suffix body exceeds frozen segment"
+    );
+    let mut body = OwnedBuffer::new(core, length)?;
+    body.append(original)?;
+    body.append(&[1, 0, 0, 0])?;
+    Ok(body.into_bytes())
+}
+
 async fn inject_reply(
     upstream: Response<RecvStream>,
     mut downstream: server::SendResponse<Bytes>,
@@ -2556,6 +2728,13 @@ async fn inject_reply(
                 wire.outcome.as_mut()
             {
                 data.body = Bytes::from_static(&[1, 0, 0, 0]);
+            }
+        }
+        RootReplyMutation::ValidRowPrefixOnlySuffix => {
+            if let Some(wire::fetch_root_result_response::Outcome::Data(data)) =
+                wire.outcome.as_mut()
+            {
+                data.body = append_prefix_only_suffix(core.clone(), &data.body)?;
             }
         }
     }
@@ -2704,6 +2883,47 @@ mod tests {
             joined_connections: AtomicU64::new(0),
             joined_children: AtomicU64::new(0),
         })
+    }
+
+    #[test]
+    fn valid_real_row_plus_prefix_suffix_preserves_bytes_and_last_body_alias() {
+        let core = core();
+        let mut original = vec![65, 0, 0, 0, 64];
+        original.extend_from_slice(&[b'x'; 64]);
+        let original = Bytes::from(original);
+        let profile = ClientRowProfile::try_new(
+            RootProfileV1::SEGMENT_BYTES,
+            RootProfileV1::ROW_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let valid = ClientRowStreamCursor::new()
+            .validate_body(profile, &original)
+            .unwrap();
+        assert_eq!(valid.after().completed_rows(), 1);
+        valid.after().validate_end().unwrap();
+        let body = append_prefix_only_suffix(core.clone(), &original).unwrap();
+        assert_eq!(&body[..69], original.as_ref());
+        assert_eq!(&body[69..], &[1, 0, 0, 0]);
+        assert_eq!(
+            hash(&body),
+            "112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7"
+        );
+        assert!(
+            ClientRowStreamCursor::new()
+                .validate_body(profile, &body)
+                .is_err()
+        );
+        let alias = body.clone();
+        let charged = core.bytes.load(Ordering::Acquire);
+        assert!(charged >= 73);
+        drop(body);
+        assert_eq!(core.bytes.load(Ordering::Acquire), charged);
+        drop(alias);
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        assert!(
+            append_prefix_only_suffix(core.clone(), &Bytes::from_static(&[1, 0, 0, 0])).is_err()
+        );
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]

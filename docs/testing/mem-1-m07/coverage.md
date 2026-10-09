@@ -394,3 +394,11 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 新debug-gated prepared ClientRoot marker只在实际成功prepare、真实profileV1 ClientRows root channel出现；不是Installed事实。oracle保持原SQL，核对全3BE真实UUID、exact2 task、唯一显式Root与实际occupied BE、每个参与BE的exact context/FE/execution，不能借candidate或maxstage推测Root。原2MiB日志/384B单行上限不变，observer固定8槽/BE。
 - status仅exact authenticated normalFE RPC与原4096B请求production covered decode/签名FE一致/完整EOF后保留原RecvStream。只有response copy实际private CapacityClosed且同stream，单次nonblocking原inbound取得typed remote CANCEL才独立记账；Reason/GOAWAY/IO/Target/Provisional/未知身份及原failures都不能因此消失。额外固定一个digest槽，产品caps/clocks未改。
 - 初始E0308修正helper Bytes签名；首跑18PASS/1FAIL为fixture提前drop上游导致driver broken pipe，修正为实际统一abort/join前保留owner。最终actor19PASS/0.02s、harness159/0/3ignored/2.45s、runner124/0/2ignored/6.14s；native task protocol43PASS、独立Root oracle9PASS。收据p09-root-reply-root-oracle-covered-status-focused-20261009.json保留全部失败/成功日志hash，duplex只是组件证据，下一cleanHEAD v6须实际三负例/native验证。无push/PR/归档，其余门仍OPEN。
+
+
+### 2026-10-09 P09：v6真实profile拒绝PASS；无GOAWAY启动变体及合法行后缀负例接入
+
+- cleanad553271f原生v6整体FAILED/7.829s：profile完整PASS（actualRoot是stage1，独立marker而非maxstage推测），实际profile2回复一次，完整metadata后1105/HY000/unsupported root-result profile，0row/0payload/0positiveACK；owner两次归零、健康native5050及actualjoin通过。kind尚未capture，bootstrap完整79B/SETTINGS2+WU1/noGOAWAY/acceptedRPC0 typedBrokenPipe仍按旧strict判据失败；prefix未执行。全部8精确role PID独立不存在。收据p09-native-root-reply-native-v6-partial-20261009.json完整保留部分成功与原failure，不能称三场景通过。
+- backend_readiness只创建即drop channel、不发RPC，锁定h2不保证drop前GOAWAY flush。test-only分类仅把exact1 GOAWAY改为0或1（若有则仍NO_ERROR/last0/debug0），完整legalcontrol/noapplication、零accepted/unresolvedRPC、原children全join/无cleanupfailure、stickycapture/lifecycle、同锁结算/每BE≤3/fourthfail等全部不变。control-only不认证peer或独立证明readiness意图，不对目标/未知RPC/IO其他kind/protocol/partial/timeout放宽。真实typed脚本79B everycut与所有fence反例通过。
+- 新第四独立freeze场景仅保留真实69B合法row后append01000000（73B/hash112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7），要求完整整段拒绝而不先publish合法前缀；原identity/profile/kind/seq/watermark/optionalEnd及原三freeze字节不变。真实OwnedBuffer共存计费、lastalias退出、cursor拒绝及独立End/hash oracle验证通过。
+- 最终actor21PASS/0.03s、harness161/0/3ignored/2.43s、runner125/0/2ignored/6.38s（suffix初步20actor/10oracle亦PASS）；收据p09-root-reply-no-goaway-suffix-focused-20261009.json。下一cleanHEAD同binary v7运行原3+新suffix4场景；无native完整矩阵/M07终验或push/PR/归档结论。

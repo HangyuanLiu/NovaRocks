@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "draft-unexecuted",
+  "scenario": "result-delivery/native-root-reply-valid-row-prefix-suffix-refusal",
+  "topology": "1FE+3BE",
+  "sql": "SELECT REPEAT('x',64) AS payload",
+  "mutation": "ValidRowPrefixOnlySuffix",
+  "contract_reason": "malformed root client rows: client-row prefix has no payload in the same body",
+  "capture_millis": 5000,
+  "maximum_target_attempts": 32,
+  "forward_millis": 20000,
+  "mysql_packet_cap": 4096,
+  "mysql_error_code": 1105,
+  "mysql_sqlstate": "HY000",
+  "metadata_oracle": "complete-same-SQL-successful-native-baseline-plus-fixed-encoder-fields",
+  "root_meta_proof": "known-semantic-profile-purpose-schema-not-exact-protobuf-bytes",
+  "expected_native_body_sha256": "3796c6fb19ce8ad0d4c3ad37cef1abf50dfdecd525aa796acfa1a2ca8bda6164",
+  "expected_row_sha256": "21a177fd757b7adf5f9c208c4a449ae1d498f365e6aeb5d51a46f1a26474dacd",
+  "health_row_sha256": "6dab454b19ecc06d337eb421a7ecc69aaa272a74fdf3a6bf7b81900ca94758b1",
+  "expected_mutated_body_bytes": 73,
+  "expected_mutated_body_sha256": "112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7"
+}

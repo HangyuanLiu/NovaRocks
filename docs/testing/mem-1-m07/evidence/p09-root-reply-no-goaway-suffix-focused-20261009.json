@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "ad553271fddd798632909de5a0652fcbc3bdae86",
+  "purpose": "Legal no-GOAWAY pre-application close variant and valid-row malformed-suffix native fixture",
+  "checks": [
+    {
+      "suite": "Suffix actor",
+      "passed": 20,
+      "failed": 0,
+      "seconds": 0.02
+    },
+    {
+      "suite": "Suffix runner oracle",
+      "passed": 10,
+      "failed": 0,
+      "seconds": 0.02
+    },
+    {
+      "suite": "Final actor",
+      "passed": 21,
+      "failed": 0,
+      "seconds": 0.03
+    },
+    {
+      "suite": "Full harness",
+      "passed": 161,
+      "failed": 0,
+      "ignored": 3,
+      "seconds": 2.43
+    },
+    {
+      "suite": "Full runner",
+      "passed": 125,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 6.38
+    }
+  ],
+  "boundaries": [
+    "Only change to bootstrap eligibility is GOAWAY count zero or one; complete legal controls and all existing pre-capture, exact registered listener, child join, no-RPC and limited ledger fences remain",
+    "This cannot authenticate peer or prove readiness intent; captures no pre-capture application success and makes no RPC success claim",
+    "New closed mutation retains the independently validated actual 69-byte row and appends exactly 01000000; total73B and independent fixed hash",
+    "Original target identity/profile/kind/sequence/watermark/optional End preserved, same credited body-owner backing and alias exit",
+    "Original three freeze input bytes unchanged; fourth independent input adds body oracle without altering workload/caps/deadlines"
+  ],
+  "limitations": [
+    "Actual v6 only profile PASS; kind failed before injection and prefix was unrun",
+    "Scripted h2 typed errors and duplex fixtures are component proof; v7 must execute all four real FE/BE scenarios",
+    "No final M07 acceptance or publish authorization"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-valid-row-prefix-suffix-focused-20261009.log",
+      "bytes": 2713,
+      "sha256": "1a7cc71be1c6afa5a152521e685ace30dea0a2ccd5f07db28ad195624b2e4edf"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-valid-row-prefix-suffix-runner-focused-20261009.log",
+      "bytes": 6659,
+      "sha256": "24282d2c949694a0efd3f69129f6b5032e37ec4ca1c4d2abffed1b8eae3c4641"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-no-goaway-suffix-focused-20261009.log",
+      "bytes": 2852,
+      "sha256": "fd95784b4e2cb716540cff621599fb9f57b8fff9136abb3c706856dbf3a5313b"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-no-goaway-suffix-harness-regression-20261009.log",
+      "bytes": 15824,
+      "sha256": "600ded65f71ecc95bf99113ea8f1cbe7fa4bee9a2e48144618b36b7653bc92e0"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-no-goaway-suffix-runner-regression-20261009.log",
+      "bytes": 18348,
+      "sha256": "a7bb60820ecda1c870e16a03b6f2f2ba3833f065a563fbb107089b5607980a87"
+    }
+  ]
+}

@@ -60,6 +60,7 @@ enum Case {
     Profile,
     Kind,
     Prefix,
+    PrefixSuffix,
 }
 impl Case {
     fn mutation(self) -> RootReplyMutation {
@@ -67,6 +68,7 @@ impl Case {
             Self::Profile => RootReplyMutation::ProfileTwo,
             Self::Kind => RootReplyMutation::ClientRowsFalse,
             Self::Prefix => RootReplyMutation::FourBytePrefixOnly,
+            Self::PrefixSuffix => RootReplyMutation::ValidRowPrefixOnlySuffix,
         }
     }
     fn freeze(self) -> &'static str {
@@ -79,6 +81,9 @@ impl Case {
             ),
             Self::Prefix => include_str!(
                 "../../../../docs/testing/mem-1-m07/inputs/native-root-reply-prefix-only-freeze-v1.json"
+            ),
+            Self::PrefixSuffix => include_str!(
+                "../../../../docs/testing/mem-1-m07/inputs/native-root-reply-valid-row-prefix-suffix-freeze-v1.json"
             ),
         }
     }
@@ -103,11 +108,15 @@ struct Freeze {
     metadata_oracle: String,
     root_meta_proof: String,
     expected_native_body_sha256: String,
+    #[serde(default)]
+    expected_mutated_body_bytes: Option<usize>,
+    #[serde(default)]
+    expected_mutated_body_sha256: Option<String>,
     expected_row_sha256: String,
     health_row_sha256: String,
 }
 pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
-    [Case::Profile, Case::Kind, Case::Prefix]
+    [Case::Profile, Case::Kind, Case::Prefix, Case::PrefixSuffix]
         .into_iter()
         .map(|case| Box::new(NativeRootReplyRefusal(case)) as Box<dyn Scenario>)
         .collect()
@@ -175,6 +184,9 @@ impl Scenario for NativeRootReplyRefusal {
             Case::Profile => "result-delivery/native-root-reply-profile-refusal",
             Case::Kind => "result-delivery/native-root-reply-kind-refusal",
             Case::Prefix => "result-delivery/native-root-reply-prefix-only-refusal",
+            Case::PrefixSuffix => {
+                "result-delivery/native-root-reply-valid-row-prefix-suffix-refusal"
+            }
         }
     }
     fn is_explicit_stage(&self) -> bool {
@@ -225,6 +237,7 @@ impl Scenario for NativeRootReplyRefusal {
                     == "known-semantic-profile-purpose-schema-not-exact-protobuf-bytes",
             "unsupported frozen negative contract"
         );
+        validate_suffix_freeze(&freeze, self.0)?;
         let control = context.handle().native_root_reply_fault(0)?;
         let epoch = Instant::now();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -455,6 +468,27 @@ impl Scenario for NativeRootReplyRefusal {
     }
 }
 
+// Only the new closed fixture carries a mutation-body oracle; older inputs stay exact.
+fn validate_suffix_freeze(freeze: &Freeze, case: Case) -> Result<()> {
+    if matches!(case, Case::PrefixSuffix) {
+        ensure!(
+            freeze.expected_mutated_body_bytes == Some(73)
+                && freeze.expected_mutated_body_sha256.as_deref()
+                    == Some("112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7")
+                && freeze.contract_reason
+                    == "malformed root client rows: client-row prefix has no payload in the same body",
+            "unsupported frozen valid-row prefix-only suffix"
+        );
+    } else {
+        ensure!(
+            freeze.expected_mutated_body_bytes.is_none()
+                && freeze.expected_mutated_body_sha256.is_none(),
+            "existing refusal fixture cannot acquire a suffix-body oracle"
+        );
+    }
+    Ok(())
+}
+
 fn positive_query(
     context: &mut ScenarioContext,
     runtime: &tokio::runtime::Runtime,
@@ -584,6 +618,19 @@ fn check_fault(obs: &RootReplyFaultObservation, freeze: &Freeze, case: Case) -> 
                 && new["body_hex"] == "01000000",
             "prefix-only mutation differs"
         ),
+        Case::PrefixSuffix => {
+            validate_suffix_freeze(freeze, case)?;
+            ensure!(
+                new["profile"] == 1
+                    && new["output_kind"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("ClientRows(true)"))
+                    && new["body_bytes"] == 73
+                    && new["body_sha256"].as_str()
+                        == freeze.expected_mutated_body_sha256.as_deref(),
+                "valid-row prefix-only suffix mutation differs"
+            );
+        }
     }
     Ok(())
 }
@@ -1274,6 +1321,45 @@ mod root_reply_predicate_tests {
             mutated: Some(mutated),
         }
     }
+    #[test]
+    fn frozen_suffix_literal_and_optional_end_are_exact() {
+        let freeze: Freeze = serde_json::from_str(Case::PrefixSuffix.freeze()).expect("freeze");
+        validate_suffix_freeze(&freeze, Case::PrefixSuffix).unwrap();
+        let mut literal = vec![65, 0, 0, 0, 64];
+        literal.extend_from_slice(&[b'x'; 64]);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&literal)),
+            freeze.expected_native_body_sha256
+        );
+        literal.extend_from_slice(&[1, 0, 0, 0]);
+        let digest = format!("{:x}", Sha256::digest(&literal));
+        assert_eq!(literal.len(), freeze.expected_mutated_body_bytes.unwrap());
+        assert_eq!(
+            Some(digest.as_str()),
+            freeze.expected_mutated_body_sha256.as_deref()
+        );
+        for end in [Value::Null, json!({"sequence":2,"output_rows":1})] {
+            let mut observed = data_fixture(end, &freeze);
+            let mutated = observed.mutated.as_mut().unwrap();
+            mutated["mutation"] = json!("ValidRowPrefixOnlySuffix");
+            mutated["profile"] = json!(1);
+            mutated["output_kind"] = json!("ClientRows(true)");
+            mutated["body_bytes"] = json!(73);
+            mutated["body_sha256"] = json!(digest);
+            check_fault(&observed, &freeze, Case::PrefixSuffix).unwrap();
+            observed.mutated.as_mut().unwrap()["body_sha256"] =
+                json!(freeze.expected_native_body_sha256);
+            assert!(check_fault(&observed, &freeze, Case::PrefixSuffix).is_err());
+        }
+        let mut changed: Freeze = serde_json::from_str(Case::PrefixSuffix.freeze()).unwrap();
+        changed.expected_mutated_body_bytes = Some(72);
+        assert!(validate_suffix_freeze(&changed, Case::PrefixSuffix).is_err());
+        for case in [Case::Profile, Case::Kind, Case::Prefix] {
+            let old: Freeze = serde_json::from_str(case.freeze()).unwrap();
+            validate_suffix_freeze(&old, case).unwrap();
+        }
+    }
+
     #[test]
     fn data_without_piggyback_end_is_legal_but_some_end_is_exact_and_immutable() {
         let freeze: Freeze = serde_json::from_str(Case::Profile.freeze()).expect("freeze");
