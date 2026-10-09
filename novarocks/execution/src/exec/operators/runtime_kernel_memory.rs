@@ -76,6 +76,43 @@ pub(in crate::exec::operators) fn request(
     }
 }
 
+/// Compose the strict complete-operation policy from the SAME bound authority.
+/// The caller supplies a proven full coexistence peak; observation does not
+/// consume ScopeLease stock and cannot provide intermediate threshold safety.
+/// Its entire admitted workset is available before the body, and its actual
+/// next-step receipt is checked only after that bounded synchronous body.
+/// Registry lengths bound one sweep, not concurrent busy/stale qualification:
+/// the original Pending and SharedShortage outcomes remain nominal.
+pub(in crate::exec::operators) fn request_complete_operation(
+    binding: Option<&QueryMemoryBinding>,
+    actual_peak: usize,
+) -> KernelMemoryAdmission {
+    let Some(binding) = binding else {
+        return KernelMemoryAdmission::MissingQueryMemory;
+    };
+    let workset_bytes = match u64::try_from(actual_peak) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return KernelMemoryAdmission::Refused(CapacityError::Invalid {
+                detail: "complete kernel operation workset exceeds funding width",
+            });
+        }
+    };
+    let maintenance_budget = match binding.authority().maintenance_scan_bound() {
+        Ok(budget) => budget,
+        Err(cause) => return KernelMemoryAdmission::Refused(cause),
+    };
+    request(
+        Some(binding),
+        KernelMemoryRequest {
+            workset_bytes,
+            stock_bytes: workset_bytes,
+            threshold_bytes: 0,
+            maintenance_budget,
+        },
+    )
+}
+
 /// Caller-owned fixed storage; no allocation, string formatting or fallible
 /// callback is needed after a body error. The primary result stays with its
 /// original owner; these secondary observations never replace that result.

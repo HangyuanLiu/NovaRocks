@@ -290,3 +290,6 @@ fn by_runtime_memory_ready_debt_and_policy_refusal_remain_secondary_to_original_
     unsafe { allocator.dealloc(block.as_ptr(), actual) };
     assert_eq!(ready.domain().snapshot().live, 0);
 }
+
+#[path = "runtime_kernel_memory_policy_tests.rs"]
+mod policy_tests;
