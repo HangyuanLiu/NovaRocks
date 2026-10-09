@@ -1020,9 +1020,14 @@ fn qualifies_root(input: RowInput, root: &BTreeMap<String, u64>) -> Result<bool>
     }
     let native_bytes = input.payload_bytes()? + 4;
     // Original tiny row is exactly 8 native bytes, so a synthetic second Data is forbidden.
-    let data = if native_bytes <= S { 1 } else { 2 };
+    // Native and MySQL row prefixes both occupy four bytes for these original
+    // one-column inputs. At S the first Data has been consumed and retired;
+    // W=2 remains the capacity, not a requirement to retain that consumed item.
+    let retired = u64::from(native_bytes > S && input.cut >= S);
+    let data = if native_bytes <= S { 1 } else { 2 - retired };
+    let retained_bytes = native_bytes - retired * S;
     Ok(root["data_positions"] == data
-        && root["payload_bytes"] == native_bytes
+        && root["payload_bytes"] == retained_bytes
         && root["segments"] == data
         && root["producers_running"] == 0
         && root["producers_exited"] == 1

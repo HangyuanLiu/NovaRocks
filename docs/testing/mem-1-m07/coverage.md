@@ -570,3 +570,12 @@ Root observer沿原三BE日志 baseline prefix hash与原四launch实例，严�
 完整runner组件里程碑262 PASS/0 FAIL/2既有ignored/15.52s；后补dispatch唯一选择/canary与pre-spawn clock后定向141 PASS/0 FAIL/9.58s。prelaunch harness真实host反例1 PASS/0.02s，确认callback拒绝在任何role spawn之前；Python最终verifier17纯mock PASS/0.010s。version10组件及feature/default server check PASS。迭代dev/test unoptimized、jobs1/incremental0/threads1；先前wide测试producer缺lenenc/socketlocator过长/tempfile缺依赖失败原日志保留，修正后通过。收据 `docs/testing/mem-1-m07/evidence/p09-exact-native-reader-driver-admission-components-20261009.json`。
 
 本slice Native/Docker0。final verifier组件不是实际运行验收：必须外部独立冻结原launch PID/birth tokens与pre-role artifact，原runner实际wait0、schema5与operation/raw/source/build一致后四PID实际ESRCH；external orchestration与原生十场景仍OPEN。fullClosing64/latealias/ACK/backing/其余压力、provider大CL、P00b/CM/CP/Linux/P10/final及两人工语义裁决不闭合。HMS非只读按IRU-7用户scope excluded；无push/PR/归档。
+
+
+### P09 exact Native first run and segment-boundary census correction (2026-10-09)
+
+clean `ef0350bc061ffa64222191b9f7e1b425128acaae` actual server+runner同HEAD feature build PASS74s；实际server fullcommit诊断exit0/stderr0，binary分别435081352B/121842488B，另新execution binding frozen/runnable true，原两ignored不可执行输入不改。external orchestration12纯mock PASS/0.024s；实际首次x S−1原1FE+3BE PASS，same originalhandshake/cut/Root/freeze、完整row+ERR1317/70100与sameTCP nativehealth符合独立hash，原runner actualwait0与四原launch PID/birth的ESRCH通过。outer49.682s含prep/hash，绝不当原scene20s耗时。原生收据 `evidence/p09-exact-native-resident-cut-1048575-ef0350bc0-20261009.json`。
+
+接着原x S case FAILED beforeKILL：原cut1048576已让首S-byte native Data消费/退休，actual BE census只保留第二Data8B/segment1、producerExited1/terminal1/End1；driver误要求原整行2Data/S+8。失败operation/runner1与四原roleESRCH原样保留，收据 `evidence/p09-exact-native-resident-cut-1048576-ef0350bc0-20261009.json`，余case未启动，不把清理成功当case PASS。原one-row oracle早已覆盖S/S+1的seq2/currentbody8/Some(empty)；原immutable JSON未要求已消费Data永恒驻留。
+
+仅修正测试driver观察：原complete x cut<S严格2Data/S+8，cut>=S严格1Data/8；tiny仍1Data8，wide仍2Data/2S/running/noEnd。反例拒绝错误whole-row/one-S/producer状态；driver定向19 PASS/0FAIL/0.31s。生产窗口W2、SQL/cut/bytes/hash/30s/5s/20s/commands不改。下一cleanHEAD实际重跑完整十场景，当前原十case整体仍OPEN；剩余P09/P00b/P10/final及两个重大语义决定不闭合，HMS非只读继续IRU-7 excluded，无push/PR/归档。

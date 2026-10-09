@@ -115,6 +115,16 @@ fn large_resident_and_missing_tail_require_distinct_original_census() {
     assert!(!qualifies_root(CASES[3].input, &root(2, 2 * S, 0, 1, 1)).unwrap());
 }
 #[test]
+fn original_boundary_cuts_require_exact_remaining_data_after_first_segment_retirement() {
+    for case in &CASES[1..3] {
+        assert!(qualifies_root(case.input, &root(1, 8, 0, 1, 1)).unwrap());
+        assert!(!qualifies_root(case.input, &root(2, S + 8, 0, 1, 1)).unwrap());
+        assert!(!qualifies_root(case.input, &root(1, S, 0, 1, 1)).unwrap());
+        assert!(!qualifies_root(case.input, &root(1, 8, 1, 0, 0)).unwrap());
+    }
+    assert!(!qualifies_root(CASES[0].input, &root(1, 8, 0, 1, 1)).unwrap());
+}
+#[test]
 fn same_socket_health_schema_structure_and_more_results_are_checked() {
     let mut payload = Vec::new();
     for value in [b"def".as_slice(), b"", b"", b"", b"total", b"total"] {
