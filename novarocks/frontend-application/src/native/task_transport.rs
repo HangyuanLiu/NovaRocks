@@ -2010,6 +2010,12 @@ async fn observe_context_convergence(
         match intake.publish(context, receipt) {
             Ok(admission) => {
                 assert!(admission.authorizes_cursor_advance());
+                tracing::debug!(
+                    %context,
+                    version = %receipt.version(),
+                    state = ?receipt.state(),
+                    "frontend retained worker stop and context fence"
+                );
                 *current = current.advanced_to(receipt.version());
                 return Ok(StreamObservation::Delivered);
             }
