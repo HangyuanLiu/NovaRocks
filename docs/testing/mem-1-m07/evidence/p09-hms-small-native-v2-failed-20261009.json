@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_revision": "d1c2e7ca1f9e93097877ce9c4c8ef558651b3074",
+  "source_dirty": false,
+  "status": "FAILED",
+  "scope": "small stock HMS native classification preflight",
+  "native": {
+    "classification_passed": false,
+    "launch_identities": [
+      {
+        "pid": 6817,
+        "process_start_token": "macos:1791525057:190757",
+        "role": "fe"
+      },
+      {
+        "pid": 6821,
+        "process_start_token": "macos:1791525060:124601",
+        "role": "be-0"
+      },
+      {
+        "pid": 6827,
+        "process_start_token": "macos:1791525060:192452",
+        "role": "be-1"
+      },
+      {
+        "pid": 6828,
+        "process_start_token": "macos:1791525060:264546",
+        "role": "be-2"
+      }
+    ],
+    "mutation_rpc_count": "OPEN; source/component pre-first-mutation guarantee is separate",
+    "normal_runner_return": 1,
+    "role_settlement": "four exact PIDs independently absent",
+    "scenario_evidence_sha256": "72a027b0edb0f623a69e43b51e8e98c707a84e96f0973f364bccfcd544173b24"
+  },
+  "failure_facts": {
+    "assertions": "failed",
+    "failure_reason": "HMS preflight SQL failed; server_code=Some(1064); error_sha256=259cf683498953580adea6bc7a4d176e8acaec1f2c258d90f4e8cbe94fb33e1d",
+    "launch_identities": [
+      {
+        "pid": 6817,
+        "process_start_token": "macos:1791525057:190757",
+        "role": "fe"
+      },
+      {
+        "pid": 6821,
+        "process_start_token": "macos:1791525060:124601",
+        "role": "be-0"
+      },
+      {
+        "pid": 6827,
+        "process_start_token": "macos:1791525060:192452",
+        "role": "be-1"
+      },
+      {
+        "pid": 6828,
+        "process_start_token": "macos:1791525060:264546",
+        "role": "be-2"
+      }
+    ],
+    "mutation_rpc_count": "unobserved; source/component pre-mutation guarantee only",
+    "parent_freeze_sha256": "219c966c117643614f659a45d64a6788fb260a3c124907da62aec8432ca83ae9",
+    "phase": "show-tables",
+    "pre_native_oracle_sha256": "ee06a0dc2877eb877a01c9c3296819d4765a51f9f88dab780d6eb15fa5c2e7f0",
+    "schema_version": 1,
+    "scope": "small-hms-classification-only"
+  },
+  "source_diagnosis": "SHOW TABLES is not an admitted current parser shape; use existing catalog-qualified information_schema.tables for names and type assertions",
+  "cleanup": {
+    "complete": true,
+    "four_role_pids_independently_absent": true,
+    "host_pids_independently_absent": true,
+    "six_actual_container_ids_absent": [
+      "34bca8a6ab04c7c4caf5fab6a752c1be2ae0eab2953280303a71852931321408",
+      "7464ba9a021612ae2ccd454706c80329524b870fd8cc69febc7522d848c2cb5f",
+      "e57578a5c34fab47044664f243ec508ceb8c5096fb08de917b6db2431e1a8df1",
+      "ada5d73b7e0ca12010c3bd184c24e50462dbb10247db47810db83b50ba87bdfd",
+      "428408fca113ad17d7a8779d5ce8ef123db62a435cfca6d3993d3352c9efcddd",
+      "5aed5dbb380b905d035d4b43c2873a413efcaae52009f02c4aa5e2667bfed56a"
+    ],
+    "errors": []
+  },
+  "limitations": [
+    "No native classification PASS; unsupported probe shape failed before provider classification",
+    "Fresh Java oracle after native remained identical; intermediate mutation count unobserved",
+    "No large CL or overall acceptance",
+    "No push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v2-20261009/status.json",
+      "bytes": 54389,
+      "sha256": "a39f2f8f5294ead38ba451f6a47a8affc8fc270c4db23e258b00d56f705193de"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v2-20261009/small-native-receipt.json",
+      "bytes": 615,
+      "sha256": "391c4d2ab811773a69015573a8998f067a2c92cabc3f9387c0195e44b6b4ee1f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v2-20261009/oracle-receipt.json",
+      "bytes": 2868,
+      "sha256": "ee06a0dc2877eb877a01c9c3296819d4765a51f9f88dab780d6eb15fa5c2e7f0"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v2-20261009/after-native/oracle-receipt.json",
+      "bytes": 2868,
+      "sha256": "be8a06872ba1470be2598b25b9038ba0925a2359f0e60f3b7c716043113e731f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v2-20261009/native-artifacts/catalog-mem-1-m07-hms-classification-preflight/scenario-evidence.json",
+      "bytes": 30282,
+      "sha256": "72a027b0edb0f623a69e43b51e8e98c707a84e96f0973f364bccfcd544173b24"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-classification-v2-20261009/native-artifacts/catalog-mem-1-m07-hms-classification-preflight/hms-classification-assertions.json",
+      "bytes": 1011,
+      "sha256": "83d8e08f5192986131849a8b8596d5375bd68754406fcee0160692a4642a5d4b"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-execution-freeze-v2-20261009.json",
+      "bytes": 2817,
+      "sha256": "71529b9c77b2bf6ab1ec9820c728b32b4be2376c7c3845a816e39df4b4421288"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-build-v2-20261009.log",
+      "bytes": 184444,
+      "sha256": "219984eaf7670036fad38f6405cbb2e8290527f4af7b17560513013296f110a9"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "d1c2e7ca1f9e93097877ce9c4c8ef558651b3074",
+  "purpose": "Correct small HMS preflight to use existing admitted catalog-qualified table enumeration",
+  "checks": [
+    {
+      "suite": "HMS CLI/refusal/redaction focused regression",
+      "passed": 3,
+      "failed": 0,
+      "seconds": 0.0
+    }
+  ],
+  "source_evidence": [
+    "Parser catalog.rs admits SHOW CREATE TABLE, not SHOW TABLES; unmatched SHOW is claimed by show_backends/mod.rs",
+    "Existing SQL runner session.rs table discovery uses catalog-qualified information_schema.tables"
+  ],
+  "boundaries": [
+    "One genuine table plus one genuine view input unchanged",
+    "Names and type queries explicitly select the same original external catalog",
+    "No product parser/API semantics, caps, clocks or frozen workload change"
+  ],
+  "limitations": [
+    "Native v2 FAILED (SHOW TABLES1064) preserved; corrected native trial still pending",
+    "No large CL/zero mutation observer/overall acceptance",
+    "No push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-hms-small-native-catalog-query-focused-v1-20261009.log",
+      "bytes": 5485,
+      "sha256": "5bf387217b5ebe6fc308a4a598bd49e85986f1cd3913ac0ff5d4c013de86aca5"
+    }
+  ]
+}

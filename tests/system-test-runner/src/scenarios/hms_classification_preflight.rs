@@ -256,12 +256,15 @@ impl Scenario for HmsClassificationPreflight {
             client
                 .query_drop(format!("USE {catalog}.{namespace}"))
                 .map_err(|error| safe_sql_error(&error))?;
-            facts["phase"] = json!("show-tables");
+            facts["phase"] = json!("table-names");
             self.remaining()?;
             let names: Vec<String> = client
-                .query("SHOW TABLES")
+                .query(format!(
+                    "SELECT table_name FROM {catalog}.information_schema.tables WHERE table_schema={} ORDER BY table_name",
+                    sql_string(namespace)
+                ))
                 .map_err(|error| safe_sql_error(&error))?;
-            facts["show_tables"] = json!(names);
+            facts["table_names"] = json!(names);
             ensure!(
                 names == ["cap_table"],
                 "HMS table list included a view, omitted a table or duplicated a name"
@@ -269,7 +272,7 @@ impl Scenario for HmsClassificationPreflight {
             facts["phase"] = json!("information-schema");
             self.remaining()?;
             let rows: Vec<(String,String)> = client.query(format!(
-                "SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.tables WHERE TABLE_CATALOG={} AND TABLE_SCHEMA={} ORDER BY TABLE_NAME",
+                "SELECT table_name,table_type FROM {catalog}.information_schema.tables WHERE table_catalog={} AND table_schema={} ORDER BY table_name",
                 sql_string(catalog), sql_string(namespace))).map_err(|error| safe_sql_error(&error))?;
             facts["information_schema"] = json!(rows);
             ensure!(

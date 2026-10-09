@@ -449,3 +449,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - clean450b4625真实1FE+3BE runner正常exit1，分类事实保存前断言失败；原stdout仅hash不能定位阶段，不能猜测原因/放宽oracle。四role PID及60host PID独立不存在，五stockJava create/oracle/afterNative-oracle/drop/restored均0/实际exit，freshJava核对未变，6实际containerID均消失，cleanup完整/无unknown retention。实验仍FAILED，收据p09-hms-small-native-v1-failed-20261009.json保留source/freeze/native/artifacts，不因cleanup正确改作PASS。
 - 新诊断仅保存有限local阶段、各成功阶段立即facts、SQL数值code+hash（不留provider message），connect错误也hash；原query/input/bounds/clock未变。payload-redaction反例+既有CLI/refusal共3PASS/0FAIL。收据p09-hms-small-native-phase-diagnostic-focused-20261009.json；下一cleanHEAD运行仅定位同原输入失败，不是busyretry。大CL/zero-mutation observer/其余门仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09 P09：HMS v2定位unsupported SHOW TABLES，修正预检调用面
+
+- cleand1c2e7ca1原生v2 FAILED，finite receipt准确phase=show-tables/server1064；current parser没有SHOW TABLES（catalog只SHOW CREATE TABLE，未知SHOW被show_backends接收），这是新预检调用面错误，不能归因provider分类。四role/host PID与6实际containerID确认消失，freshJava未变/cleanup完整，收据p09-hms-small-native-v2-failed-20261009.json保留前轮失败。
+- 仅names查询改为既有 `{catalog}.information_schema.tables` 单列，type查询也准确同catalog qualified；原1table+1view、排序/准确集合/类型/refusal/input/caps/clock不变，不增加产品SHOW语义或缩小负载。focused3PASS/0FAIL，收据p09-hms-small-native-catalog-query-focused-20261009.json；下一cleanHEAD真实Native验证仍待验。其余门OPEN，无push/PR/归档。
