@@ -2535,6 +2535,7 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_find_in_set_owner::operation(name).is_some() => {
                         Some(super::string_find_in_set_owner::effects())
                     }
+                    "field" => Some(super::string_field_owner::effects()),
                     name if super::string_trim_owner::operation(name).is_some() => {
                         Some(super::string_trim_owner::effects())
                     }
@@ -2875,6 +2876,7 @@ pub fn contribute_builtin_functions(
             name if super::string_find_in_set_owner::operation(name).is_some() => {
                 super::string_find_in_set_owner::definition(name, declaration, resolver)?
             }
+            "field" => super::string_field_owner::definition(&name, declaration, resolver)?,
             name if super::string_trim_owner::operation(name).is_some() => {
                 super::string_trim_owner::definition(name, declaration, resolver)?
             }

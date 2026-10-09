@@ -31,6 +31,7 @@ doctest = false
 openssl = "0.10"
 url.workspace = true
 arrow-arith = "58.2.0"
+arrow-ord = "58.2.0"
 regex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -57,6 +58,3 @@ sha2.workspace = true
 sm3 = "0.4"
 
 twox-hash = "2.1"
-
-[dev-dependencies]
-arrow-ord = "58.2.0"

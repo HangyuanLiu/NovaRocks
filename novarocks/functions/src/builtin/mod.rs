@@ -298,3 +298,8 @@ mod array_match_selected;
 pub mod array_difference_core;
 mod array_difference_owner;
 mod array_difference_selected;
+
+mod string_field;
+mod string_field_owner;
+#[cfg(test)]
+mod string_field_tests;
