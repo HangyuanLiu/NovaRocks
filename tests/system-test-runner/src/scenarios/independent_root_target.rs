@@ -24,10 +24,11 @@ use novarocks_cluster_harness::process_resources::ProcessLaunchIdentity;
 use novarocks_execution_contract::identity::{QueryContextRef, TaskIdentity};
 use novarocks_proto_codec::FieldPath;
 use novarocks_task_codec::identity::decode_task_identity;
+use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
 use novarocks_types::{BackendProcessId, FrontendProcessId};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const BACKENDS: usize = 3;
 const LOG_BYTES: u64 = 2 * 1024 * 1024;
@@ -36,6 +37,41 @@ const LINE_BYTES: usize = 384;
 const CREATE: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
 const CONTEXT: &str = "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED";
 const ROOT: &str = "NOVAROCKS_TASK_PREPARED_CLIENT_ROOT";
+
+#[derive(Debug)]
+enum IncompleteRootObservation {
+    NoCreatedTask,
+    NoPreparedRoot,
+    ContextTaskPublication,
+}
+impl std::fmt::Display for IncompleteRootObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("original root markers are not completely published")
+    }
+}
+impl std::error::Error for IncompleteRootObservation {}
+
+fn wait_for_complete_target(
+    deadline: Instant,
+    mut observe: impl FnMut() -> Result<IndependentRootTarget>,
+) -> Result<IndependentRootTarget> {
+    for _ in 0..51 {
+        before_deadline(deadline)?;
+        match observe() {
+            Ok(target) => {
+                before_deadline(deadline)?;
+                return Ok(target);
+            }
+            Err(error) if error.downcast_ref::<IncompleteRootObservation>().is_some() => {}
+            Err(error) => return Err(error),
+        }
+        before_deadline(deadline)?;
+        std::thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    anyhow::bail!("original root observation exhausted its fixed sample positions")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LogAnchor {
@@ -183,6 +219,15 @@ impl IndependentRootObserver {
     /// This emits no SQL target, Root RPC, proxy, registry entry, ACK or authority.
     pub(crate) fn observe(&self, context: &mut ScenarioContext) -> Result<IndependentRootTarget> {
         self.observe_until(context, self.original_deadline)
+    }
+    /// Metadata can precede BE preparation. Wait only for typed incomplete
+    /// publication, retaining the original phase deadline and all fatal errors.
+    pub(crate) fn observe_ready_until(
+        &self,
+        context: &mut ScenarioContext,
+        step_deadline: Instant,
+    ) -> Result<IndependentRootTarget> {
+        wait_for_complete_target(step_deadline, || self.observe_until(context, step_deadline))
     }
     pub(crate) fn observe_until(
         &self,
@@ -394,6 +439,50 @@ fn decode_task_marker(line: &str, prefix: &str) -> Result<TaskIdentity> {
         FieldPath::root("independent_original_root_task"),
     )?)
 }
+fn decode_context_marker(
+    line: &str,
+    expected_frontend: FrontendProcessId,
+    expected_backend: BackendProcessId,
+) -> Result<QueryContextRef> {
+    let fields: Vec<_> = line.split(' ').collect();
+    ensure!(
+        fields.len() == 4 && fields[0] == CONTEXT,
+        "fresh context has unknown fields"
+    );
+    let bits: Vec<_> = fields[1]
+        .strip_prefix("execution_id=")
+        .context("missing context execution")?
+        .split(':')
+        .collect();
+    ensure!(
+        bits.len() == 3,
+        "fresh context execution has unknown fields"
+    );
+    let hi = bits[0].parse::<i64>()?;
+    let lo = bits[1].parse::<i64>()?;
+    let attempt = bits[2].parse::<u64>()?;
+    ensure!(
+        fields[1] == format!("execution_id={hi}:{lo}:{attempt}"),
+        "noncanonical context execution"
+    );
+    let execution = QueryExecutionId::new(QueryId::new(hi, lo), AttemptId::new(attempt)?)?;
+    let frontend_text = fields[2]
+        .strip_prefix("frontend=")
+        .context("missing context frontend")?;
+    let frontend: FrontendProcessId = frontend_text.parse()?;
+    let backend_text = fields[3]
+        .strip_prefix("backend=")
+        .context("missing context backend")?;
+    let backend: BackendProcessId = backend_text.parse()?;
+    ensure!(
+        frontend.to_string() == frontend_text
+            && frontend == expected_frontend
+            && backend.to_string() == backend_text
+            && backend == expected_backend,
+        "context differs from independently actual original FE/BE processes"
+    );
+    Ok(QueryContextRef::new(execution, frontend, backend))
+}
 fn resolve(
     snapshots: &[LogDelta; BACKENDS],
     expected_frontend: FrontendProcessId,
@@ -409,6 +498,7 @@ fn resolve(
     // The total bound derives only from original 3BE x 8 marker positions.
     let mut tasks = Vec::with_capacity(BACKENDS * MARKERS);
     let mut root = None;
+    let mut contexts = [None; BACKENDS];
     for (backend, snapshot) in snapshots.iter().enumerate() {
         ensure!(
             snapshot.markers.len() <= MARKERS,
@@ -433,71 +523,62 @@ fn resolve(
             } else if line.contains(ROOT) {
                 let task = decode_task_marker(line, ROOT)?;
                 ensure!(
+                    task.backend_process_id() == processes[backend],
+                    "prepared root differs from its actual original backend UUID"
+                );
+                ensure!(
                     root.replace((backend, task)).is_none(),
                     "multiple prepared ClientRows roots"
                 );
             } else {
                 ensure!(line.contains(CONTEXT), "unknown bounded marker kind");
+                let context = decode_context_marker(line, expected_frontend, processes[backend])?;
+                ensure!(
+                    contexts[backend].replace(context).is_none(),
+                    "duplicate fresh context on one backend"
+                );
             }
         }
     }
-    ensure!(!tasks.is_empty(), "no fresh target SQL task creation");
-    let execution = tasks[0].1.query_execution_id();
-    ensure!(
-        tasks
-            .iter()
-            .all(|(_, task)| task.query_execution_id() == execution),
-        "fresh SQL task set spans multiple executions"
-    );
-    let (root_backend_index, root) = root.context("missing fresh prepared ClientRows root")?;
+    // Validate every published identity even while other markers are absent.
+    // Incomplete publication never waives a known malformed or conflicting fact.
+    if let Some(execution) = tasks
+        .first()
+        .map(|(_, task)| task.query_execution_id())
+        .or_else(|| root.map(|(_, task)| task.query_execution_id()))
+        .or_else(|| {
+            contexts
+                .iter()
+                .flatten()
+                .next()
+                .map(|c| c.query_execution_id())
+        })
+    {
+        ensure!(
+            tasks
+                .iter()
+                .all(|(_, task)| task.query_execution_id() == execution)
+                && root.is_none_or(|(_, task)| task.query_execution_id() == execution)
+                && contexts
+                    .iter()
+                    .flatten()
+                    .all(|c| c.query_execution_id() == execution),
+            "fresh SQL marker set spans multiple executions"
+        );
+    }
+    if tasks.is_empty() {
+        return Err(IncompleteRootObservation::NoCreatedTask.into());
+    }
+    let (root_backend_index, root) = root.ok_or(IncompleteRootObservation::NoPreparedRoot)?;
     ensure!(
         root.backend_process_id() == processes[root_backend_index]
             && tasks.contains(&(root_backend_index, root)),
         "prepared root is not an exact fresh created task on its actual original backend"
     );
-    let mut contexts = [None; BACKENDS];
-    let execution_text = format!(
-        "execution_id={}:{}:{}",
-        execution.query_id().high(),
-        execution.query_id().low(),
-        execution.attempt_id().get()
-    );
-    for (backend, snapshot) in snapshots.iter().enumerate() {
-        for line in snapshot
-            .markers
-            .iter()
-            .filter(|line| line.contains(CONTEXT))
-        {
-            let fields: Vec<_> = line.split(' ').collect();
-            ensure!(
-                fields.len() == 4 && fields[0] == CONTEXT && fields[1] == execution_text,
-                "fresh context has unknown fields or different execution"
-            );
-            let frontend_text = fields[2]
-                .strip_prefix("frontend=")
-                .context("missing context frontend")?;
-            let frontend: FrontendProcessId = frontend_text.parse()?;
-            let backend_text = fields[3]
-                .strip_prefix("backend=")
-                .context("missing context backend")?;
-            let observed_backend: BackendProcessId = backend_text.parse()?;
-            ensure!(
-                frontend.to_string() == frontend_text
-                    && frontend == expected_frontend
-                    && observed_backend.to_string() == backend_text
-                    && observed_backend == processes[backend],
-                "context differs from independently actual original FE/BE processes"
-            );
-            ensure!(
-                contexts[backend].is_none(),
-                "duplicate fresh context on one backend"
-            );
-            contexts[backend] = Some(QueryContextRef::new(execution, frontend, observed_backend));
+    for (backend, context) in contexts.iter().enumerate() {
+        if context.is_some() != tasks.iter().any(|(slot, _)| *slot == backend) {
+            return Err(IncompleteRootObservation::ContextTaskPublication.into());
         }
-        ensure!(
-            contexts[backend].is_some() == tasks.iter().any(|(slot, _)| *slot == backend),
-            "fresh context membership differs from actual task placement"
-        );
     }
     Ok(IndependentRootTarget {
         root,
@@ -518,6 +599,84 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::time::Duration;
+    #[test]
+    fn metadata_before_task_publication_waits_for_complete_original_markers() {
+        let (logs, ids) = fixtures(&[1, 2]);
+        let empty = std::array::from_fn(|_| {
+            decode_log(
+                b"",
+                Some(LogAnchor {
+                    bytes: 0,
+                    sha256: empty_sha(),
+                }),
+            )
+            .unwrap()
+        });
+        let mut reads = 0;
+        let target = wait_for_complete_target(Instant::now() + Duration::from_secs(1), || {
+            reads += 1;
+            resolve(
+                if reads == 1 { &empty } else { &logs },
+                frontend(),
+                &ids,
+                [empty_sha(); BACKENDS],
+            )
+        })
+        .unwrap();
+        assert_eq!(reads, 2);
+        assert_eq!(target.root_backend_index, 1);
+    }
+
+    #[test]
+    fn unknown_source_error_is_never_retried_as_incomplete_publication() {
+        let original = std::sync::Arc::new(std::io::Error::other(
+            "original root markers are not completely published",
+        ));
+        let mut reads = 0;
+        let error = wait_for_complete_target(Instant::now() + Duration::from_secs(1), || {
+            reads += 1;
+            Err(anyhow::Error::new(original.clone()))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(reads, 1);
+        assert!(std::sync::Arc::ptr_eq(
+            error
+                .downcast_ref::<std::sync::Arc<std::io::Error>>()
+                .unwrap(),
+            &original,
+        ));
+    }
+
+    #[test]
+    fn incomplete_publication_cannot_renew_the_original_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let mut reads = 0;
+        let result = wait_for_complete_target(deadline, || {
+            reads += 1;
+            Err(IncompleteRootObservation::NoPreparedRoot.into())
+        });
+        assert!(result.is_err());
+        assert!(reads <= 1);
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn invalid_context_without_task_or_root_is_fatal_before_waiting() {
+        let (mut logs, ids) = fixtures(&[1, 2]);
+        for log in &mut logs {
+            log.markers.retain(|line| line.starts_with(CONTEXT));
+        }
+        logs[2].markers[0] =
+            logs[2].markers[0].replace("execution_id=0:-7:2", "execution_id=00:-7:2");
+        let mut reads = 0;
+        let result = wait_for_complete_target(Instant::now() + Duration::from_secs(1), || {
+            reads += 1;
+            resolve(&logs, frontend(), &ids, [empty_sha(); BACKENDS])
+        });
+        assert!(result.is_err());
+        assert_eq!(reads, 1);
+    }
     #[test]
     fn source_evidence_retains_all_descriptors_contexts_and_original_log_anchors() {
         let (logs, ids) = fixtures(&[1, 2]);

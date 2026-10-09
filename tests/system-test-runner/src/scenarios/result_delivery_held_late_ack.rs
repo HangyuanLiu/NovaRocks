@@ -532,7 +532,7 @@ fn run_owned(
                 .saturating_duration_since(deadline - WHOLE)
                 .as_micros(),
         );
-        let target = observer.observe_until(context, phase)?;
+        let target = observer.observe_ready_until(context, phase)?;
         {
             let mut fences = source_fences
                 .lock()
