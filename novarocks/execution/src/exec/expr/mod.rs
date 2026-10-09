@@ -1387,6 +1387,12 @@ mod numeric_unary_state_compile_control_tests;
 mod legacy_reverse_shared_baseline_tests;
 
 #[cfg(test)]
+mod legacy_append_trailing_shared_baseline_tests;
+
+#[cfg(test)]
+mod append_trailing_actual_sql_source_tests;
+
+#[cfg(test)]
 mod numeric_unary_ordered_sql_source_tests;
 
 #[cfg(test)]
@@ -1460,3 +1466,6 @@ mod legacy_decimal128_rescale_baseline_tests;
 
 #[cfg(test)]
 mod approx_percentile_actual_sql_source_tests;
+
+#[cfg(test)]
+mod legacy_observed_list_cast_baseline_tests;

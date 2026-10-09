@@ -1782,6 +1782,9 @@ mod array_difference_tests;
 #[path = "pure_differential/string_reverse_shared_tests.rs"]
 mod string_reverse_shared_tests;
 
+#[path = "pure_differential/append_trailing_shared_tests.rs"]
+mod append_trailing_shared_tests;
+
 #[path = "pure_differential_map_entries_tests.rs"]
 mod map_entries_tests;
 

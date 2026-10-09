@@ -168,3 +168,7 @@ fn legacy_ds_hll_baseline_scalar_child_evaluation_precedes_row_hash_and_tuning()
 #[cfg(test)]
 #[path = "original_ds_scalar_domain_probes.rs"]
 mod original_ds_scalar_domain_probes;
+
+#[cfg(test)]
+#[path = "legacy_ds_scalar_reader_baseline_tests.rs"]
+mod legacy_ds_scalar_reader_baseline_tests;

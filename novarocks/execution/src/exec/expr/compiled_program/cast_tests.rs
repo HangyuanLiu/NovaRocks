@@ -1134,3 +1134,6 @@ mod cast_text_time_tests;
 
 #[path = "cast_decimal128_rescale_tests.rs"]
 mod decimal128_rescale_profile_tests;
+
+#[path = "cast_observed_list_tests.rs"]
+mod observed_list_cast_profile_tests;
