@@ -59,6 +59,7 @@ pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
+pub mod exact_percentile_core;
 #[cfg(test)]
 mod exact_installed_owner_selection_tests;
 #[cfg(test)]
@@ -74,6 +75,7 @@ pub mod largeint;
 pub mod largeint_text;
 pub mod math_numeric;
 pub mod pattern_memo;
+pub mod percentile_input;
 mod pure_catalogue;
 mod scalar_kernel;
 pub mod selected_copy;

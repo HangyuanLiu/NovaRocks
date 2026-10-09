@@ -48,6 +48,20 @@ impl novarocks_functions::aggregate_scalar::ScalarStateAllocator for AggregateAl
     }
 }
 
+impl novarocks_functions::exact_percentile_core::ExactPercentileAllocator for AggregateAllocator {
+    type ParserReservation = AggregateTransientReservation;
+    fn reserve_percentile_transient(
+        &self,
+        bytes: usize,
+        operation: &str,
+    ) -> Result<Self::ParserReservation, String> {
+        self.reserve_transient(bytes, operation)
+    }
+    fn percentile_allocation_error(&self, operation: &str) -> String {
+        self.allocation_error(operation)
+    }
+}
+
 impl AggregateAllocator {
     pub(crate) fn new(tracker: Arc<MemTracker>) -> Self {
         Self { tracker }

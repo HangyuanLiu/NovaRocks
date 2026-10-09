@@ -32,6 +32,7 @@ openssl = "0.10"
 url.workspace = true
 arrow-arith = "58.2.0"
 regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 allocator-api2 = "0.2"
 hashbrown = { version = "0.14.5", features = ["raw", "allocator-api2"] }

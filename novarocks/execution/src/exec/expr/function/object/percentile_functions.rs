@@ -16,17 +16,11 @@
 // under the License.
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeBinaryArray, LargeStringArray, StringArray,
-};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, BinaryBuilder, Float64Builder};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::percentile;
-use novarocks_types::largeint;
 
 pub fn eval_percentile_hash(
     arena: &ExprArena,
@@ -92,108 +86,20 @@ pub fn numeric_value_at(
     row: usize,
     context: &str,
 ) -> Result<Option<f64>, String> {
-    match array.data_type() {
-        DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int8Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
-        }
-        DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int16Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
-        }
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int32Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
-        }
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
-        }
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Float32Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as f64))
-        }
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Float64Array"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row)))
-        }
-        DataType::Decimal128(_, scale) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Decimal128Array"))?;
-            let divisor = 10_f64.powi(*scale as i32);
-            Ok((!arr.is_null(row)).then_some(arr.value(row) as f64 / divisor))
-        }
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast FixedSizeBinaryArray"))?;
-            Ok((!arr.is_null(row)).then_some(largeint::value_at(arr, row)? as f64))
-        }
-        other => Err(format!(
-            "{context}: unsupported numeric input type {:?}",
-            other
-        )),
-    }
+    novarocks_functions::percentile_input::numeric_value_at(
+        array,
+        row,
+        novarocks_functions::percentile_input::PercentileInputDiagnostic::LegacyLabel(context),
+    )
 }
-
 pub fn payload_bytes_at<'a>(
     array: &'a ArrayRef,
     row: usize,
     context: &str,
 ) -> Result<Option<&'a [u8]>, String> {
-    match array.data_type() {
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast BinaryArray"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row)))
-        }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast StringArray"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row).as_bytes()))
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast LargeBinaryArray"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row)))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| format!("{context}: failed to downcast LargeStringArray"))?;
-            Ok((!arr.is_null(row)).then_some(arr.value(row).as_bytes()))
-        }
-        other => Err(format!(
-            "{context}: unsupported percentile payload type {:?}",
-            other
-        )),
-    }
+    novarocks_functions::percentile_input::payload_bytes_at(
+        array,
+        row,
+        novarocks_functions::percentile_input::PercentileInputDiagnostic::LegacyLabel(context),
+    )
 }
