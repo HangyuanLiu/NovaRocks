@@ -366,7 +366,8 @@ pub(crate) struct RetainedCopiedArrowResult {
 /// admitted peak. Source identities are not bytes, grants, or value decoders.
 /// The actual HostVec owns each Layout; no observation replaces admission.
 pub(crate) trait CopyInputBacking {
-    fn source_array(&self) -> &dyn Array;
+    fn source_count(&self) -> usize;
+    fn source_array_at(&self, ordinal: usize) -> Option<&dyn Array>;
     fn index_array(&self) -> Option<&dyn Array>;
 }
 struct CopyInputPacket<C> {
@@ -455,8 +456,24 @@ pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + '
     work.flush()?;
     // Source/index loans are created inside the SAME earlier metadata/peak
     // reservation. Their identities classify aliases, never infer a grant.
-    let source_data = packet.source.source_array().to_data();
-    work.flush()?;
+    let mut source_data = allocator_api2::vec::Vec::<ArrayData, _>::new_in(allocator.clone());
+    if source_data
+        .try_reserve_exact(packet.source.source_count())
+        .is_err()
+    {
+        return Err(allocator.recorded_failure().unwrap_or_else(|| {
+            invalid("copy source metadata table exceeds its representable Layout")
+        }));
+    }
+    for ordinal in 0..packet.source.source_count() {
+        work.step()?;
+        let source = packet
+            .source
+            .source_array_at(ordinal)
+            .ok_or_else(|| invalid("copied backing owner has no exact source ordinal"))?;
+        source_data.push(source.to_data());
+        work.flush()?;
+    }
     let index_data = match packet.source.index_array() {
         Some(indices) => {
             let data = indices.to_data();
@@ -466,7 +483,9 @@ pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + '
         None => None,
     };
     let mut settlement = CopyBackingSettlement::new(allocator.clone());
-    custody_metadata_with_backing(&source_data, work, Some(&mut settlement))?;
+    for source in source_data.iter() {
+        custody_metadata_with_backing(source, work, Some(&mut settlement))?;
+    }
     if let Some(index_data) = &index_data {
         custody_metadata_with_backing(index_data, work, Some(&mut settlement))?;
     }

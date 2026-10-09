@@ -30,8 +30,11 @@ struct SliceSource<C> {
     original_owner: C,
 }
 impl<C> crate::arrow_result_custody::CopyInputBacking for SliceSource<C> {
-    fn source_array(&self) -> &dyn Array {
-        self.source.as_ref()
+    fn source_count(&self) -> usize {
+        1
+    }
+    fn source_array_at(&self, ordinal: usize) -> Option<&dyn Array> {
+        (ordinal == 0).then_some(self.source.as_ref())
     }
     fn index_array(&self) -> Option<&dyn Array> {
         // This exact original operation has no index carrier. This is a

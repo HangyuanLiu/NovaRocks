@@ -69,6 +69,12 @@ pub(super) struct OriginalTakeDiagnosticFacts {
     peak: usize,
 }
 impl OriginalTakeDiagnosticFacts {
+    pub(super) fn from_original_geometry(display_upper: usize, peak: usize) -> Self {
+        Self {
+            display_upper,
+            peak,
+        }
+    }
     pub(super) fn try_new() -> Result<Self, CopyError> {
         let mut maximum = usize::MAX;
         let mut digits = 1;

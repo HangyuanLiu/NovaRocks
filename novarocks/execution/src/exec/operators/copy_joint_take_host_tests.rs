@@ -595,3 +595,6 @@ mod original_fixed_list_index_tests;
 
 #[path = "copy_original_slice_host_tests.rs"]
 mod original_slice_host_tests;
+
+#[path = "copy_original_concat_host_tests.rs"]
+mod original_concat_host_tests;

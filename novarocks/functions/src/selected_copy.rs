@@ -31,6 +31,9 @@ mod copy_buffer_peak;
 #[path = "selected_copy/slice_host.rs"]
 mod slice_host;
 pub use slice_host::{RetainedSliceResult, slice_copy_in};
+#[path = "selected_copy/concat_host.rs"]
+mod concat_host;
+pub use concat_host::{RetainedConcatResult, concat_copy_in};
 pub use zip::preflight_zip;
 
 #[path = "selected_copy/root_scratch_host.rs"]
@@ -45,6 +48,8 @@ use child_scratch::ChildScratchVec;
 
 #[path = "selected_copy/copy_diagnostic.rs"]
 mod copy_diagnostic;
+#[path = "selected_copy/concat_diagnostic.rs"]
+mod concat_diagnostic;
 pub use copy_diagnostic::OriginalCopyData;
 
 use crate::KernelFailure;
@@ -243,9 +248,13 @@ impl Selection {
 enum CopyMode {
     Take { index_maximum: usize, raw: bool },
     Extend,
+    OriginalConcat,
 }
 
 impl CopyMode {
+    fn is_original_operation(self) -> bool {
+        self.is_raw_take() || self == Self::OriginalConcat
+    }
     fn is_take(self) -> bool {
         matches!(self, Self::Take { .. })
     }
@@ -320,6 +329,14 @@ fn mutable_capacity_many(
     capacity: usize,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
+    mutable_constructor_geometry(sources, capacity, CopyMode::Extend, work)
+}
+fn mutable_constructor_geometry(
+    sources: &[&ArrayData],
+    capacity: usize,
+    mode: CopyMode,
+    work: &mut CopyObservation<'_>,
+) -> Result<(), CopyError> {
     work.step()?;
     // This models actual constructor children even when no source row will be
     // extended. Dictionary constructors validate the whole retained dictionary
@@ -340,12 +357,13 @@ fn mutable_capacity_many(
             capacity,
             usize::try_from(*width).map_err(|_| CopyError::Extent)?,
         ),
-        DataType::FixedSizeList(_, width) => mutable_capacity_many(
+        DataType::FixedSizeList(_, width) => mutable_constructor_geometry(
             &data_children(sources, 0, work)?,
             mul(
                 capacity,
                 usize::try_from(*width).map_err(|_| CopyError::Extent)?,
             )?,
+            mode,
             work,
         ),
         DataType::List(_)
@@ -353,11 +371,16 @@ fn mutable_capacity_many(
         | DataType::ListView(_)
         | DataType::LargeListView(_)
         | DataType::Map(_, _) => {
-            mutable_capacity_many(&data_children(sources, 0, work)?, capacity, work)
+            mutable_constructor_geometry(&data_children(sources, 0, work)?, capacity, mode, work)
         }
         DataType::Struct(_) | DataType::Union(_, _) | DataType::RunEndEncoded(_, _) => {
             for index in 0..data.child_data().len() {
-                mutable_capacity_many(&data_children(sources, index, work)?, capacity, work)?;
+                mutable_constructor_geometry(
+                    &data_children(sources, index, work)?,
+                    capacity,
+                    mode,
+                    work,
+                )?;
             }
             Ok(())
         }
@@ -391,13 +414,15 @@ fn mutable_capacity_many(
                 work.step()?;
                 let end = add(if concat { cumulative } else { 0 }, dictionary.len())?;
                 // Arrow validates offset + len, including an unused dictionary.
-                limit(end, maximum)?;
+                if mode != CopyMode::OriginalConcat {
+                    limit(end, maximum)?;
+                }
                 if concat {
                     cumulative = end;
                 }
             }
             if concat {
-                mutable_capacity_many(&dictionaries, cumulative, work)?;
+                mutable_constructor_geometry(&dictionaries, cumulative, mode, work)?;
                 // The constructor copies complete domains before any selected extend.
                 // Use the same visitor, not a dictionary value decoder.
                 let mut arrays = Vec::new();
@@ -427,7 +452,7 @@ fn mutable_capacity_many(
                         nulls: 0,
                         null_ops: 0,
                     },
-                    CopyMode::Extend,
+                    mode,
                     work,
                 )?;
             }
@@ -448,7 +473,9 @@ fn mutable_capacity_many(
                         .checked_sub(1)
                         .ok_or(CopyError::Invalid("view source has no view record buffer"))?,
                 )?;
-                limit(buffers, u32::MAX as usize)?;
+                if mode != CopyMode::OriginalConcat {
+                    limit(buffers, u32::MAX as usize)?;
+                }
             }
             mutable_buffer_extent(buffers, std::mem::size_of::<arrow_buffer::Buffer>())?;
             mutable_buffer_extent(capacity, 16)
@@ -507,6 +534,32 @@ fn child_sources<'a>(
     }
     Ok(children)
 }
+fn full_child_selection(
+    sources: &[&dyn Array],
+    work: &mut CopyObservation<'_>,
+) -> Result<Selection, CopyError> {
+    let mut blocks = ChildScratchVec::try_with_capacity(sources.len(), work.1)?;
+    for (source, array) in sources.iter().enumerate() {
+        work.step()?;
+        let mut ranges = ChildScratchVec::new(work.1);
+        if !array.is_empty() {
+            ranges.try_push(0..array.len())?;
+        }
+        blocks.try_push(Block {
+            source,
+            ranges,
+            repeats: 1,
+            raw_null: false,
+            raw_outside: 0,
+        })?;
+    }
+    Ok(Selection {
+        blocks,
+        nulls: 0,
+        null_ops: 0,
+    })
+}
+
 fn visit(
     sources: &[&dyn Array],
     selection: &Selection,
@@ -537,7 +590,11 @@ fn visit(
             "Arrow union take requires non-null indices",
         ));
     }
-    if let Some(invoice) = work.3.as_deref_mut() {
+    if mode == CopyMode::OriginalConcat {
+        if let Some(invoice) = work.3.as_deref_mut() {
+            invoice.original_concat_node(array, sources.len(), rows)?;
+        }
+    } else if let Some(invoice) = work.3.as_deref_mut() {
         invoice.selected_node(array, rows, mode)?;
     }
     if rows == 0 && work.3.is_none() {
@@ -546,10 +603,48 @@ fn visit(
     // Original take(empty) invokes new_empty_array at the root, including all
     // nested offset constructors. Only the optional operation invoice must
     // visit those children; legacy preflight keeps its original early return.
+    if mode == CopyMode::OriginalConcat && matches!(array.data_type(), DataType::Null) {
+        return Ok(());
+    }
+    if mode == CopyMode::OriginalConcat
+        && matches!(
+            array.data_type(),
+            DataType::FixedSizeBinary(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Map(_, _)
+                | DataType::Union(_, _)
+        )
+    {
+        // The exact original fallback recursively constructs Mutable children
+        // BEFORE extending selected rows. Reuse the ONE constructor geometry
+        // with all actual sources, without imposing its old semantic key gate
+        // on specialized concat. Original fallback errors/panics still occur
+        // at the ONE Arrow call, not in this resource projection.
+        let mut data = ChildScratchVec::try_with_capacity(sources.len(), work.1)?;
+        for source in sources {
+            work.step()?;
+            work.boundary()?;
+            data.try_push(source.to_data())?;
+            work.boundary()?;
+        }
+        let mut refs = ChildScratchVec::try_with_capacity(data.len(), work.1)?;
+        for source in data.iter() {
+            work.step()?;
+            refs.try_push(source)?;
+        }
+        mutable_constructor_geometry(&refs, rows, mode, work)?;
+    }
+    let buffer_rows = if mode == CopyMode::OriginalConcat
+        && matches!(array.data_type(), DataType::RunEndEncoded(..))
+    {
+        0
+    } else {
+        rows
+    };
     // The outer take has UInt32 or UInt64 indices; recursive kernels may use other
     // widths, so eight bytes conservatively bounds their index buffers.
-    buffer_extent(rows, 8)?;
-    buffer_extent(add(rows, 1)?, 8)?;
+    buffer_extent(buffer_rows, 8)?;
+    buffer_extent(add(buffer_rows, 1)?, 8)?;
     if mode == CopyMode::Extend {
         interleave_bitmap_extent(rows)?;
     }
@@ -583,7 +678,24 @@ fn visit(
         // values unchanged; only keys expand, never its encoded value domain.
         DataType::Dictionary(key, _) => {
             mutable_buffer_extent(rows, key.primitive_width().ok_or(CopyError::Extent)?)?;
-            if rows == 0 && mode.is_take() && work.3.is_some() {
+            if mode == CopyMode::OriginalConcat {
+                let children = child_sources(sources, work, |source| {
+                    source
+                        .as_any_dictionary_opt()
+                        .map(|a| a.values().as_ref())
+                        .ok_or(CopyError::Invalid(
+                            "original concat requires its exact dictionary carrier",
+                        ))
+                })?;
+                let selection = full_child_selection(&children, work)?;
+                if let Some(invoice) = work.3.as_deref_mut() {
+                    invoice.original_dictionary_merge_scratch(&children, key, sources.len())?;
+                }
+                // Original merge/interleave produces at most the full values
+                // domain; original fallback concatenates that domain. No key or
+                // equality decoder and no Mutable dictionary cardinality gate.
+                visit(&children, &selection, mode, work)?;
+            } else if rows == 0 && mode.is_take() && work.3.is_some() {
                 // ArrayData::new_empty creates an empty values child, instead
                 // of retaining the source dictionary domain as nonempty take.
                 let children = child_sources(sources, work, |source| {
@@ -711,7 +823,16 @@ fn visit(
                 let source: &MapArray = downcast(source)?;
                 Ok(source.entries() as &dyn Array)
             })?;
-            visit(&children, &child, CopyMode::Extend, work)
+            visit(
+                &children,
+                &child,
+                if mode == CopyMode::OriginalConcat {
+                    mode
+                } else {
+                    CopyMode::Extend
+                },
+                work,
+            )
         }
         DataType::ListView(_) => list_view::<i32>(sources, selection, mode, false, work),
         DataType::LargeListView(_) => list_view::<i64>(sources, selection, mode, true, work),
@@ -767,7 +888,7 @@ fn visit(
                         child.null_ops = selection.null_ops;
                     }
                     // Both take and MutableArrayData write signed i32 offsets.
-                    if !mode.is_raw_take() {
+                    if !mode.is_original_operation() {
                         limit(child.len(work)?, i32::MAX as usize)?;
                     }
                     let child_mode = if mode.is_take() {
@@ -818,7 +939,10 @@ fn bytes<T: ByteArrayType>(
             work.step()?;
             for row in range.clone() {
                 work.step()?;
-                if mode == CopyMode::Extend || array.is_valid(row) {
+                if mode == CopyMode::Extend
+                    || mode == CopyMode::OriginalConcat
+                    || array.is_valid(row)
+                {
                     let start = offset_value(array.value_offsets()[row])?;
                     let end = offset_value(array.value_offsets()[row + 1])?;
                     one = add(one, end.checked_sub(start).ok_or(CopyError::Extent)?)?;
@@ -827,7 +951,7 @@ fn bytes<T: ByteArrayType>(
         }
         total = add(total, mul(one, block.repeats)?)?;
     }
-    if !mode.is_raw_take() {
+    if !mode.is_original_operation() {
         limit(total, offset_max(large))?;
     }
     if let Some(invoice) = work.3.as_deref_mut() {
@@ -857,7 +981,7 @@ fn offset_selection<O: OffsetSizeTrait>(
         }
         let array = sources[source];
         let offsets = offsets(array)?;
-        if mode == CopyMode::Extend {
+        if mode == CopyMode::Extend || mode == CopyMode::OriginalConcat {
             output
                 .try_push(offset_value(offsets[range.start])?..offset_value(offsets[range.end])?)?;
         } else {
@@ -879,7 +1003,7 @@ fn offset_selection<O: OffsetSizeTrait>(
             block.raw_outside = 0;
         }
     }
-    if !mode.is_raw_take() {
+    if !mode.is_original_operation() {
         limit(child.len(work)?, offset_max(large))?;
     }
     Ok(child)
@@ -910,7 +1034,16 @@ fn list<O: OffsetSizeTrait>(
         let source: &GenericListArray<O> = downcast(source)?;
         Ok(source.values().as_ref())
     })?;
-    visit(&children, &child, CopyMode::Extend, work)
+    visit(
+        &children,
+        &child,
+        if mode == CopyMode::OriginalConcat {
+            mode
+        } else {
+            CopyMode::Extend
+        },
+        work,
+    )
 }
 fn list_view<O: OffsetSizeTrait>(
     sources: &[&dyn Array],
@@ -920,6 +1053,14 @@ fn list_view<O: OffsetSizeTrait>(
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
     let _array: &GenericListViewArray<O> = downcast(sources[0])?;
+    if mode == CopyMode::OriginalConcat {
+        let children = child_sources(sources, work, |source| {
+            let source: &GenericListViewArray<O> = downcast(source)?;
+            Ok(source.values().as_ref())
+        })?;
+        let selection = full_child_selection(&children, work)?;
+        return visit(&children, &selection, mode, work);
+    }
     if mode.is_take() {
         // Nonempty take_list_view retains its original child. Empty take uses
         // new_empty_array and recursively creates empty child offset buffers.
@@ -944,7 +1085,7 @@ fn list_view<O: OffsetSizeTrait>(
         }
         Ok(())
     })?;
-    if !mode.is_raw_take() {
+    if !mode.is_original_operation() {
         limit(child.len(work)?, offset_max(large))?;
     }
     let children = child_sources(sources, work, |source| {
@@ -969,7 +1110,7 @@ fn run<R: RunEndIndexType>(
     maximum: usize,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
-    if !mode.is_raw_take() {
+    if !mode.is_original_operation() {
         limit(selection.len(work)?, maximum)?;
     }
     let mut output = ChildScratchVec::new(work.selection_allocator());
@@ -1013,7 +1154,7 @@ fn run<R: RunEndIndexType>(
         if ranges.is_empty() {
             continue;
         }
-        if mode == CopyMode::Extend {
+        if mode == CopyMode::Extend || mode == CopyMode::OriginalConcat {
             output.try_push(Block {
                 source: block.source,
                 ranges,
@@ -1059,29 +1200,60 @@ fn run<R: RunEndIndexType>(
         let source: &RunArray<R> = downcast(source)?;
         Ok(source.values().as_ref())
     })?;
-    visit(
-        &children,
-        &Selection {
-            blocks: output,
-            nulls: if mode == CopyMode::Extend {
-                selection.null_ops
-            } else {
-                0
-            },
-            null_ops: if mode == CopyMode::Extend {
-                selection.null_ops
-            } else {
-                0
-            },
+    let selected = Selection {
+        blocks: output,
+        nulls: if mode == CopyMode::Extend {
+            selection.null_ops
+        } else {
+            0
         },
-        mode,
-        work,
-    )
+        null_ops: if mode == CopyMode::Extend {
+            selection.null_ops
+        } else {
+            0
+        },
+    };
+    if mode == CopyMode::OriginalConcat {
+        let physical_rows = selected.len(work)?;
+        if let Some(invoice) = work.3.as_deref_mut() {
+            invoice.original_run_concat_scratch(
+                physical_rows,
+                sources.len(),
+                size_of::<R::Native>(),
+            )?;
+        }
+    }
+    visit(&children, &selected, mode, work)
 }
 
 // Raw numeric carrier source for the standalone original Arrow operation.
 // The same child/extent visitor receives ordered NULL and outside occurrences;
 // old Option-based entry points retain their exact original shape and gates.
+// Resource-only projection of the original concat input occurrences. Every
+// child extent is visited by the SAME selected-copy author; no value/key
+// comparison, serializer, or replacement concat executes here.
+fn preflight_original_concat_with_invoice(
+    sources: &[&dyn Array],
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+    allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
+    invoice: &mut take_host::CopyInvoiceTotals,
+) -> Result<(), CopyError> {
+    if sources.len() <= 1 {
+        // Original concat(empty) errors; concat(one) slices its exact source.
+        // Neither route constructs a new payload. The caller admits their
+        // original diagnostic or borrowed-slice metadata separately.
+        return Ok(());
+    }
+    let mut work = CopyObservation(
+        &mut observe,
+        Some(allocator),
+        ScratchCoverage::RecursiveSelections,
+        Some(invoice),
+    );
+    let selection = full_child_selection(sources, &mut work)?;
+    visit(sources, &selection, CopyMode::OriginalConcat, &mut work)
+}
+
 fn preflight_original_take_with_invoice(
     array: &dyn Array,
     indices: &take_host::CopyIndices,

@@ -110,6 +110,13 @@ impl CopyOperationFacts {
             copied_root: None,
         })
     }
+    pub(super) fn admit_original_concat_diagnostic(
+        &mut self,
+        diagnostic: &super::concat_diagnostic::OriginalConcatDiagnosticFacts,
+    ) -> Result<(), CopyError> {
+        self.operation_peak = add(self.operation_peak, diagnostic.operation_peak_bytes())?;
+        Ok(())
+    }
     pub(super) fn bind_original_copy(&mut self, original: &ArrayRef) {
         assert!(self.copied_root.is_none(), "copy facts bound only once");
         self.copied_root = Some(Arc::as_ptr(original) as *const () as usize);
@@ -253,6 +260,102 @@ impl CopyInvoiceTotals {
             other => Err(CopyError::Unsupported(other.clone())),
         }
     }
+    pub(super) fn original_concat_node(
+        &mut self,
+        array: &dyn Array,
+        source_count: usize,
+        rows: usize,
+    ) -> Result<(), CopyError> {
+        // Each specialized original concat owns a per-source reference table.
+        // List/Struct/Run paths additionally own Arc slice and output tables.
+        let borrowed = mul(source_count, size_of::<&dyn Array>())?;
+        let slices = mul(source_count, size_of::<ArrayRef>())?;
+        self.metadata = add(self.metadata, add(borrowed, slices)?)?;
+        let fields = match array.data_type() {
+            DataType::Struct(fields) => fields.len(),
+            DataType::Union(fields, _) => fields.len(),
+            _ => 0,
+        };
+        self.metadata = add(self.metadata, mul(fields, size_of::<ArrayRef>())?)?;
+        if matches!(
+            array.data_type(),
+            DataType::Null | DataType::RunEndEncoded(..)
+        ) {
+            // Null concat creates no row-sized payload. Run is invoiced by the
+            // SAME run child-range author using actual physical ends below.
+            return Ok(());
+        }
+        self.selected_node(array, rows, CopyMode::Extend)
+    }
+
+    pub(super) fn original_run_concat_scratch(
+        &mut self,
+        physical_rows: usize,
+        source_count: usize,
+        end_width: usize,
+    ) -> Result<(), CopyError> {
+        // Pinned concat_run_arrays stores a borrowed Run vector, an adjustment
+        // vector (N+1), values_slice Arc vector and borrowed child-concat vector.
+        self.metadata = add(self.metadata, mul(source_count, size_of::<&dyn Array>())?)?;
+        self.exact(mul(add(source_count, 1)?, end_width)?)?;
+        // A recursively reached run child of original Mutable fallback can
+        // retain its growing extension Vec beside the destination end buffer.
+        self.required(mul(physical_rows, end_width)?)?;
+        self.required(mul(physical_rows, end_width)?)
+    }
+
+    pub(super) fn original_dictionary_merge_scratch(
+        &mut self,
+        values: &[&dyn Array],
+        key: &DataType,
+        source_count: usize,
+    ) -> Result<(), CopyError> {
+        let value_type = values
+            .first()
+            .ok_or(CopyError::Invalid(
+                "original dictionary concat has no value source",
+            ))?
+            .data_type();
+        if !value_type.is_primitive()
+            && !matches!(
+                value_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+            )
+        {
+            return Ok(());
+        }
+        let mut domain = 0;
+        for array in values {
+            domain = add(domain, array.len())?;
+            self.required(add(
+                array.len() / 8,
+                usize::from(!array.len().is_multiple_of(8)),
+            )?)?;
+        }
+        let key_width = key.primitive_width().ok_or(CopyError::Extent)?;
+        // Actual masked-values Vec tuples (index, optional borrowed bytes),
+        // one native mapping per domain element and interleave source choices.
+        self.exact(mul(domain, size_of::<(usize, Option<&[u8]>)>())?)?;
+        self.exact(mul(domain, key_width)?)?;
+        self.exact(mul(domain, size_of::<(usize, usize)>())?)?;
+        self.metadata = add(
+            self.metadata,
+            mul(source_count, size_of::<Vec<(usize, Option<&[u8]>)>>())?,
+        )?;
+        self.metadata = add(self.metadata, mul(source_count, size_of::<Vec<u64>>())?)?;
+        // ONE original fixed interner formula, with capacity bounded by the
+        // actual full domain; no hash/equality computation or key-limit gate.
+        // u64 has the largest installed dictionary native key width/alignment.
+        let capacity = u64::try_from(domain).map_err(|_| CopyError::Extent)?;
+        let shift = capacity
+            .checked_add(128)
+            .ok_or(CopyError::Extent)?
+            .leading_zeros();
+        let buckets = (u64::MAX >> shift).saturating_add(1);
+        let buckets = usize::try_from(buckets).map_err(|_| CopyError::Extent)?;
+        self.exact(mul(buckets, size_of::<Option<(Option<&[u8]>, u64)>>())?)
+    }
+
     pub(super) fn constructor(
         &mut self,
         data: &ArrayData,
@@ -323,7 +426,7 @@ impl CopyInvoiceTotals {
             other => Err(CopyError::Unsupported(other.clone())),
         }
     }
-    fn finish(self, source_metadata: usize) -> Result<CopyOperationFacts, CopyError> {
+    pub(super) fn finish(self, source_metadata: usize) -> Result<CopyOperationFacts, CopyError> {
         // Summing constructor and selected envelopes avoids pairing distinct
         // nodes by guessed identity. Each actual buffer's initial/required is
         // <= their sum. Pinned reserve max(round64(required),2*previous) gives
@@ -352,8 +455,11 @@ struct CopySources<C> {
     original_owner: C,
 }
 impl<C> crate::arrow_result_custody::CopyInputBacking for CopySources<C> {
-    fn source_array(&self) -> &dyn Array {
-        self.source.as_ref()
+    fn source_count(&self) -> usize {
+        1
+    }
+    fn source_array_at(&self, ordinal: usize) -> Option<&dyn Array> {
+        (ordinal == 0).then_some(self.source.as_ref())
     }
     fn index_array(&self) -> Option<&dyn Array> {
         Some(self.indices.as_array())
