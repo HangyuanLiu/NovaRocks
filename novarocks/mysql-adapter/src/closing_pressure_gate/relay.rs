@@ -291,13 +291,34 @@ impl Drop for ClosingPollGuard {
         }
     }
 }
+/// Cancelling the borrowed original finish invalidates its held witness before
+/// the outer ClosingDelivery can drop its grant. W destruction can occur later.
+struct ClosingFutureGuard {
+    core: Arc<Core>,
+    completed: bool,
+}
+impl Drop for ClosingFutureGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.core.fail(if std::thread::panicking() {
+                Failure::Panic
+            } else {
+                Failure::Transition
+            });
+        }
+    }
+}
 /// Production calls this only with the one original ClosingResponseLease::finish future.
 /// No spawn/owned handle/clock is created. Cancel drops a borrowed future, not the outer ClosingDelivery.
 async fn paired_finish<F, T>(scope: &PressureScope, mut original: Pin<&mut F>) -> io::Result<T>
 where
     F: Future<Output = io::Result<T>>,
 {
-    poll_fn(|cx| {
+    let mut lifetime = ClosingFutureGuard {
+        core: Arc::clone(&scope.core),
+        completed: false,
+    };
+    let result = poll_fn(|cx| {
         let guard = match ClosingPollGuard::enter(scope) {
             Ok(guard) => guard,
             Err(error) => return Poll::Ready(Err(error)),
@@ -319,7 +340,9 @@ where
             }
         }
     })
-    .await
+    .await;
+    lifetime.completed = result.is_ok();
+    result
 }
 
 /// Construct at the original listener-owned W and exact original connection token.

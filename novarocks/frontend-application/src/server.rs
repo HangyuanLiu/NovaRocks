@@ -24,6 +24,8 @@ use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
 use tracing::info;
 
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+mod closing_pressure_fixture;
 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
 mod exact_mysql_write_fixture;
 #[cfg(feature = "mem-1-m07-root-observation")]
@@ -926,7 +928,8 @@ where
     let server_result = run_mysql_with_listener_supervision(
         #[cfg(any(
             feature = "mem-1-m07-exact-mysql-write",
-            feature = "mem-1-m07-root-observation"
+            feature = "mem-1-m07-root-observation",
+            feature = "mem-1-m07-closing-pressure"
         ))]
         Arc::clone(&config.native_trust),
         config.mysql_listener,
@@ -957,7 +960,8 @@ where
 async fn run_mysql_with_listener_supervision<F>(
     #[cfg(any(
         feature = "mem-1-m07-exact-mysql-write",
-        feature = "mem-1-m07-root-observation"
+        feature = "mem-1-m07-root-observation",
+        feature = "mem-1-m07-closing-pressure"
     ))]
     native_trust: Arc<NativeTrust>,
     mysql_listener: ResolvedMysqlListenerSettings,
@@ -975,6 +979,27 @@ where
 {
     #[cfg(feature = "mem-1-m07-root-observation")]
     root_observation_identity::emit(&native_trust)?;
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    let pressure = closing_pressure_fixture::bind_from_environment(
+        &native_trust,
+        host.workload_observation(),
+    )?;
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    if let Some(fixture) = pressure {
+        return closing_pressure_fixture::serve(
+            fixture,
+            mysql_listener,
+            session_factory,
+            client_connections,
+            shutdown,
+            report_server,
+            management_server,
+            host,
+            drain_timeout,
+            cleanup_timeout,
+        )
+        .await;
+    }
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     if let Some(fixture) = exact_mysql_write_fixture::bind_from_environment(&native_trust)? {
         return exact_mysql_write_fixture::serve(
@@ -1193,12 +1218,14 @@ fn combine_server_and_shutdown(
         (Err(server_error), Err(shutdown_error)) => {
             #[cfg(any(
                 feature = "mem-1-m07-exact-mysql-write",
-                feature = "mem-1-m07-root-observation"
+                feature = "mem-1-m07-root-observation",
+                feature = "mem-1-m07-closing-pressure"
             ))]
             return Err(server_error.with_role_cleanup(shutdown_error));
             #[cfg(not(any(
                 feature = "mem-1-m07-exact-mysql-write",
-                feature = "mem-1-m07-root-observation"
+                feature = "mem-1-m07-root-observation",
+                feature = "mem-1-m07-closing-pressure"
             )))]
             Err(server_error.with_cleanup_context(shutdown_error))
         }

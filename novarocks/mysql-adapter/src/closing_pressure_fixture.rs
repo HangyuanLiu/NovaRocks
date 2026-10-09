@@ -51,6 +51,7 @@ pub struct ClosingPressureFixture {
     controller: PressureController,
     joins: Arc<MysqlFixtureSessionJoins>,
     binding: Option<ClosingPressureListenerBinding>,
+    control: Option<crate::closing_pressure_control::UnixPressureControl>,
 }
 
 /// Read-only observation of the original session, watcher, protocol and listener failures.
@@ -66,6 +67,8 @@ impl ClosingPressureFailureObservation {
 #[derive(Default)]
 pub struct ClosingPressureFixtureError {
     gate: Option<io::Error>,
+    control: Option<crate::closing_pressure_control::ControlError>,
+    control_cleanup: Option<crate::closing_pressure_control::ControlError>,
     listener: Option<io::Error>,
     session_join: Option<JoinError>,
     watcher_join: Option<JoinError>,
@@ -85,7 +88,9 @@ impl fmt::Display for ClosingPressureFixtureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Closing pressure fixture failed; gate={} listener={} session_join={} watcher_join={} protocol={} original_capacity_eof={} invalid_facts={} aborted_sessions={} counter_overflow={} watchers={:?}",
+            "Closing pressure fixture failed; control={} control_cleanup={} gate={} listener={} session_join={} watcher_join={} protocol={} original_capacity_eof={} invalid_facts={} aborted_sessions={} counter_overflow={} watchers={:?}",
+            self.control.is_some(),
+            self.control_cleanup.is_some(),
             self.gate.is_some(),
             self.listener.is_some(),
             self.session_join.is_some(),
@@ -101,6 +106,9 @@ impl fmt::Display for ClosingPressureFixtureError {
 }
 impl std::error::Error for ClosingPressureFixtureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let Some(source) = &self.control {
+            return Some(source);
+        }
         if let Some(source) = &self.listener {
             return Some(source);
         }
@@ -114,6 +122,9 @@ impl std::error::Error for ClosingPressureFixtureError {
             return Some(source);
         }
         if let Some(source) = &self.gate {
+            return Some(source);
+        }
+        if let Some(source) = &self.control_cleanup {
             return Some(source);
         }
         self.capacity_eof.as_ref().map(|source| source as _)
@@ -142,7 +153,89 @@ impl ClosingPressureFixture {
                 joins: Arc::clone(&joins),
             }),
             joins,
+            control: None,
         })
+    }
+    /// Explicit startup inputs, original FE identity and original workload authority.
+    /// This owns the Unix IO; the polled run future only borrows it.
+    pub fn bind(
+        path: std::path::PathBuf,
+        actual_frontend: FrontendProcessId,
+        nonce: [u8; 16],
+        original_absolute_deadline: Instant,
+        original_workload: WorkloadObservationHandle,
+    ) -> Result<Self, ClosingPressureFixtureError> {
+        let mut fixture = Self::new(
+            actual_frontend,
+            original_absolute_deadline,
+            original_workload,
+        )
+        .map_err(|gate| ClosingPressureFixtureError {
+            gate: Some(gate),
+            ..Default::default()
+        })?;
+        match crate::closing_pressure_control::UnixPressureControl::bind(
+            path,
+            actual_frontend,
+            nonce,
+            original_absolute_deadline,
+        ) {
+            Ok(control) => {
+                fixture.control = Some(control);
+                Ok(fixture)
+            }
+            Err((control, control_cleanup)) => {
+                fixture.fail_and_stop();
+                Err(ClosingPressureFixtureError {
+                    control: Some(control),
+                    control_cleanup,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+    pub async fn run_control(&mut self) -> Result<(), ClosingPressureFixtureError> {
+        let Some(control) = &mut self.control else {
+            self.fail_and_stop();
+            return Err(ClosingPressureFixtureError {
+                gate: Some(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pressure control was not bound",
+                )),
+                ..Default::default()
+            });
+        };
+        control
+            .run(&mut self.controller)
+            .await
+            .map_err(|control| ClosingPressureFixtureError {
+                control: Some(control),
+                ..Default::default()
+            })
+    }
+    pub fn close_control(&mut self) -> Result<(), ClosingPressureFixtureError> {
+        match &mut self.control {
+            Some(control) => control
+                .close(&mut self.controller)
+                .map_err(|control_cleanup| ClosingPressureFixtureError {
+                    control_cleanup: Some(control_cleanup),
+                    ..Default::default()
+                }),
+            None => Ok(()),
+        }
+    }
+    pub fn fail_and_stop(&mut self) {
+        self.controller.fail(ClosingPressureFailure::Transition);
+        self.controller.stop();
+    }
+    pub fn fail_startup_projection(
+        &mut self,
+        original_cause: io::Error,
+    ) -> ClosingPressureFixtureError {
+        self.fail_and_stop();
+        let mut failure = self.close_control().err().unwrap_or_default();
+        failure.gate = Some(original_cause);
+        failure
     }
     pub fn listener_binding(&mut self) -> io::Result<ClosingPressureListenerBinding> {
         self.binding.take().ok_or_else(|| {
@@ -211,7 +304,11 @@ impl ClosingPressureFixture {
         let gate = self.controller.inspect_after_original_join().err();
         let session_join = self.joins.take_failure_after_join();
         let watcher_join = self.joins.take_watcher_failure_after_join();
-        let invalid_facts = self.binding.is_some()
+        let invalid_facts = self
+            .control
+            .as_ref()
+            .is_some_and(|control| !control.completed_and_closed())
+            || self.binding.is_some()
             || !self.joins.watchers_empty()
             || watchers.reserved != 0
             || watchers.failed()
@@ -238,8 +335,71 @@ impl ClosingPressureFixture {
                 aborted_sessions: facts.aborted,
                 counter_overflow: facts.counter_overflow,
                 watchers: Some(watchers),
+                ..Default::default()
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod startup_source_tests {
+    use super::*;
+    use std::{error::Error, os::unix::fs::PermissionsExt, time::Duration};
+    #[derive(Debug)]
+    struct OriginalOutput(Arc<()>);
+    impl fmt::Display for OriginalOutput {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("original startup source must not be formatted");
+        }
+    }
+    impl Error for OriginalOutput {}
+    #[tokio::test]
+    async fn startup_primary_survives_actual_replaced_socket_cleanup_error() {
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/nr-cp-src-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pressure.sock");
+        let workload = novarocks_workload_control::WorkloadControl::try_new_counted(
+            novarocks_workload_control::WorkloadConfig::default(),
+        )
+        .unwrap()
+        .owner;
+        let mut fixture = ClosingPressureFixture::bind(
+            path.clone(),
+            FrontendProcessId::new_v7(),
+            [1; 16],
+            Instant::now() + Duration::from_secs(3),
+            workload.observation(),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement must remain").unwrap();
+        let identity = Arc::new(());
+        let failure =
+            fixture.fail_startup_projection(io::Error::other(OriginalOutput(identity.clone())));
+        assert!(failure.control_cleanup.is_some());
+        let original = failure
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap()
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<OriginalOutput>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&original.0, &identity));
+        let _finite = format!("{failure:?} {failure}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement must remain");
+        drop(fixture);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }

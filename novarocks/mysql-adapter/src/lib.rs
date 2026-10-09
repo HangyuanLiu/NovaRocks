@@ -19,6 +19,8 @@
 
 mod authentication;
 #[cfg(feature = "mem-1-m07-closing-pressure")]
+mod closing_pressure_control;
+#[cfg(feature = "mem-1-m07-closing-pressure")]
 pub mod closing_pressure_fixture;
 #[cfg(feature = "mem-1-m07-closing-pressure")]
 mod closing_pressure_gate;

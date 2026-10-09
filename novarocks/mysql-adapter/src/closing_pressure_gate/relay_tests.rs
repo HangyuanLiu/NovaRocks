@@ -567,3 +567,57 @@ fn refusal_primary_and_secondary_original_sources_survive_finite_presentation() 
     ));
     assert!(!format!("{combined:?} {combined}").contains("secret source canary"));
 }
+
+#[tokio::test]
+async fn cancelled_borrowed_same_carrier_invalidates_hold_before_writer_and_grant_exit() {
+    let mut fixture = Fixture::new().await;
+    let mut writer = fixture.framer();
+    let actual = fixture.real_rows_cut(&mut writer).await.unwrap();
+    let mut closing = fixture.closing(writer);
+    fixture
+        .hook
+        .scope
+        .observe_installed_closing(fixture.hook.statement, actual, &closing)
+        .unwrap();
+    // A component moves the same original W out of its consuming component writer
+    // so a borrowed IO future can be cancelled while W remains physically alive.
+    // This does not instantiate the production ClosingResponseLease or a Native query.
+    let mut original_w = closing.writer_mut().writer.take().unwrap().into_inner();
+    {
+        let original = original_w.write_all(b"same original carrier");
+        tokio::pin!(original);
+        let finish = paired_finish(&fixture.hook.scope, original);
+        tokio::pin!(finish);
+        assert!(first_poll(finish.as_mut()).await.is_pending());
+        let facts = fixture.controller.snapshot(0).unwrap();
+        assert_eq!(facts.phase, Phase::ClosingHeld);
+        assert!(facts.paired_closing_polls > 0 && !facts.writer_destructor_returned);
+        assert!(facts.failure.is_none());
+    } // Actual borrowed future storage exits; W and the real grant remain outside it.
+    let facts = fixture.controller.snapshot(0).unwrap();
+    assert_eq!(facts.failure, Some(Failure::Transition));
+    assert!(!facts.writer_destructor_returned);
+    assert_eq!(fixture.capacity.snapshot().held_positions, [0, 0, 0, 1]);
+    assert!(fixture.controller.release(0).is_err());
+    drop(closing);
+    assert_eq!(fixture.capacity.snapshot().held_positions, [0; 4]);
+    assert!(
+        !fixture
+            .controller
+            .snapshot(0)
+            .unwrap()
+            .writer_destructor_returned
+    );
+    drop(original_w);
+    assert!(
+        fixture
+            .controller
+            .snapshot(0)
+            .unwrap()
+            .writer_destructor_returned
+    );
+    assert_eq!(
+        fixture.controller.snapshot(0).unwrap().failure,
+        Some(Failure::Transition)
+    );
+}

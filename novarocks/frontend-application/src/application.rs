@@ -141,10 +141,33 @@ impl fmt::Debug for RootObservationIoSource {
     }
 }
 
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+enum ClosingPressureRoleSource {
+    Fixture(novarocks_mysql_adapter::closing_pressure_fixture::ClosingPressureFixtureError),
+    OriginalIo(std::io::Error),
+}
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+impl fmt::Debug for ClosingPressureRoleSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OriginalClosingPressureSource { source_retained: true }")
+    }
+}
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+impl ClosingPressureRoleSource {
+    fn original(&self) -> &(dyn std::error::Error + 'static) {
+        match self {
+            Self::Fixture(source) => source,
+            Self::OriginalIo(source) => source,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FrontendApplicationError {
     kind: FrontendApplicationErrorKind,
     message: String,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pressure_failures: [Option<Box<ClosingPressureRoleSource>>; 4],
     #[cfg(feature = "mem-1-m07-root-observation")]
     root_observation_io: Option<Box<RootObservationIoSource>>,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -158,6 +181,8 @@ impl FrontendApplicationError {
         Self {
             kind,
             message: error.to_string(),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            pressure_failures: std::array::from_fn(|_| None),
             #[cfg(feature = "mem-1-m07-root-observation")]
             root_observation_io: None,
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -177,6 +202,26 @@ impl FrontendApplicationError {
         result.fixture_failures[0] = Some(Box::new(error));
         result
     }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn server_pressure(
+        error: novarocks_mysql_adapter::closing_pressure_fixture::ClosingPressureFixtureError,
+    ) -> Self {
+        let mut result = Self::server("original Closing pressure fixture failed");
+        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::Fixture(error)));
+        result
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn server_pressure_registry(error: std::io::Error) -> Self {
+        let mut result = Self::server("original Closing pressure connection drain failed");
+        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::OriginalIo(error)));
+        result
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn server_pressure_binding(error: std::io::Error) -> Self {
+        let mut result = Self::server("original Closing pressure listener binding failed");
+        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::OriginalIo(error)));
+        result
+    }
     #[cfg(feature = "mem-1-m07-root-observation")]
     pub(crate) fn server_root_observation(error: std::io::Error) -> Self {
         let mut result = Self::server("root observation stdout IO failed");
@@ -185,9 +230,10 @@ impl FrontendApplicationError {
     }
     #[cfg(any(
         feature = "mem-1-m07-exact-mysql-write",
-        feature = "mem-1-m07-root-observation"
+        feature = "mem-1-m07-root-observation",
+        feature = "mem-1-m07-closing-pressure"
     ))]
-    pub(crate) fn with_role_cleanup(mut self, cleanup: Self) -> Self {
+    pub fn with_role_cleanup(mut self, cleanup: Self) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup}"));
         #[cfg(feature = "mem-1-m07-root-observation")]
@@ -195,6 +241,17 @@ impl FrontendApplicationError {
             // Only the one startup emission can supply this original IO source.
             assert!(self.root_observation_io.is_none());
             self.root_observation_io = Some(source);
+        }
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        for source in cleanup.pressure_failures.into_iter().flatten() {
+            // Startup is mutually exclusive with the four serving verdict stages:
+            // control, socket close, registry verification and original-owner finish.
+            let slot = self
+                .pressure_failures
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .expect("fixed Closing pressure verdict stages");
+            *slot = Some(source);
         }
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         for source in cleanup.fixture_failures.into_iter().flatten() {
@@ -233,6 +290,10 @@ impl std::error::Error for FrontendApplicationError {
         #[cfg(feature = "mem-1-m07-root-observation")]
         if let Some(error) = &self.root_observation_io {
             return Some(&error.0);
+        }
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if let Some(error) = self.pressure_failures.iter().flatten().next() {
+            return Some(error.original());
         }
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         if let Some(error) = self.fixture_failures.iter().flatten().next() {
@@ -2234,5 +2295,44 @@ mod tests {
             novarocks_catalog_application::CatalogAdmission::Absent
         ));
         host.shutdown().await.expect("host shutdown");
+    }
+}
+
+#[cfg(all(test, feature = "mem-1-m07-closing-pressure"))]
+mod closing_pressure_role_error_tests {
+    use super::*;
+
+    #[test]
+    fn four_original_verdict_boxes_preserve_primary_and_each_cleanup_source() {
+        let sources: [std::sync::Arc<()>; 4] = std::array::from_fn(|_| std::sync::Arc::new(()));
+        #[derive(Debug)]
+        struct Actual(std::sync::Arc<()>);
+        impl fmt::Display for Actual {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("unknown original source cannot be formatted");
+            }
+        }
+        impl std::error::Error for Actual {}
+        let mut primary = FrontendApplicationError::server("original primary");
+        for source in &sources {
+            primary =
+                primary.with_role_cleanup(FrontendApplicationError::server_pressure_registry(
+                    std::io::Error::other(Actual(source.clone())),
+                ));
+        }
+        assert!(primary.message.starts_with("original primary"));
+        assert_eq!(primary.pressure_failures.iter().flatten().count(), 4);
+        for (slot, expected) in primary.pressure_failures.iter().flatten().zip(&sources) {
+            let actual = slot
+                .original()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<Actual>()
+                .unwrap();
+            assert!(std::sync::Arc::ptr_eq(&actual.0, expected));
+        }
+        let _finite = format!("{primary:?} {primary}");
     }
 }

@@ -527,6 +527,117 @@ impl PressureController {
         self.core.wake_all();
         self.core.check()
     }
+    pub(crate) fn fail(&self, reason: Failure) {
+        let _ = self.core.fail(reason);
+    }
+    pub(crate) async fn wait_rows(&self, first: usize, count: usize) -> io::Result<()> {
+        if count == 0 || first.checked_add(count).is_none_or(|end| end > TARGETS) {
+            return Err(self.core.fail(Failure::Length));
+        }
+        self.wait_until(|| {
+            let mut ready = true;
+            for slot in first..first + count {
+                let facts = self.core.snapshot(slot)?;
+                if matches!(
+                    facts.phase,
+                    Phase::Unarmed | Phase::Released | Phase::CapacityRefused
+                ) || facts.writer_destructor_returned
+                {
+                    return Err(self.core.fail(Failure::Transition));
+                }
+                ready &= facts.phase == Phase::Rows && facts.rows_blocked;
+            }
+            Ok(ready)
+        })
+        .await
+    }
+    pub(crate) async fn wait_joint_closing(
+        &self,
+        require_refusal: bool,
+    ) -> io::Result<crate::closing_pressure_fixture::ClosingPressureJointSnapshot> {
+        self.wait_until(|| {
+            let mut ready = true;
+            for slot in 0..CLOSING_TARGETS {
+                let facts = self.core.snapshot(slot)?;
+                if matches!(
+                    facts.phase,
+                    Phase::Unarmed | Phase::Released | Phase::CapacityRefused
+                ) || facts.writer_destructor_returned
+                {
+                    return Err(self.core.fail(Failure::Transition));
+                }
+                ready &= facts.phase == Phase::ClosingHeld
+                    && facts.real_closing_observed
+                    && facts.writer_attached
+                    && facts.cancel_receipt.is_some()
+                    && facts.paired_closing_polls > 0
+                    && (facts.closing_write_blocked || facts.closing_flush_blocked);
+            }
+            if require_refusal {
+                let state = self.core.state(CLOSING_TARGETS)?;
+                if state.facts.phase == Phase::Unarmed || state.facts.phase == Phase::Released {
+                    return Err(self.core.fail(Failure::Transition));
+                }
+                ready &= state.facts.phase == Phase::CapacityRefused
+                    && state.facts.cancel_receipt.is_some()
+                    && state.capacity_eof_minted
+                    && matches!(state.refusal, Some(WorkError::Capacity(_)));
+            }
+            Ok(ready)
+        })
+        .await?;
+        self.joint_closing_snapshot(require_refusal)
+    }
+    fn original_writers_exited(&self) -> io::Result<bool> {
+        self.core.check()?;
+        if !self.core.arm_consumed.load(Ordering::Acquire) {
+            return Err(self.core.fail(Failure::Transition));
+        }
+        let mut ready = true;
+        for slot in 0..TARGETS {
+            let state = self.core.state(slot)?;
+            ready &= state.facts.writer_attached
+                && state.facts.writer_destructor_returned
+                && state.facts.cancel_receipt.is_some()
+                && if slot < CLOSING_TARGETS {
+                    state.facts.phase == Phase::Released
+                } else {
+                    state.facts.phase == Phase::CapacityRefused
+                        && state.capacity_eof_minted
+                        && matches!(state.refusal, Some(WorkError::Capacity(_)))
+                };
+        }
+        self.core.check()?;
+        Ok(ready)
+    }
+    pub(crate) async fn wait_original_writers_exited(&self) -> io::Result<()> {
+        self.wait_until(|| self.original_writers_exited()).await
+    }
+    pub(crate) fn stop_after_original_writers_exited(&mut self) -> io::Result<()> {
+        if !self.original_writers_exited()? {
+            return Err(self.core.fail(Failure::Transition));
+        }
+        self.core.stop();
+        Ok(())
+    }
+    async fn wait_until(&self, mut ready: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
+        let wait = async {
+            loop {
+                let changed = self.core.changed.notified();
+                tokio::pin!(changed);
+                // Register before reading the original facts: no lost writer wakeup.
+                changed.as_mut().enable();
+                self.core.check()?;
+                if ready()? {
+                    return self.core.check();
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout_at(tokio::time::Instant::from_std(self.core.deadline), wait)
+            .await
+            .map_err(|_| self.core.fail(Failure::Deadline))?
+    }
     pub(crate) fn stop(&mut self) {
         self.core.stop();
     }

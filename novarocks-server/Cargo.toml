@@ -64,6 +64,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
 
 [features]
+mem-1-m07-closing-pressure = ["novarocks-frontend-application/mem-1-m07-closing-pressure"]
 mem-1-m07-root-observation = ["novarocks-frontend-application/mem-1-m07-root-observation"]
 mem-1-m07-exact-mysql-write = ["novarocks-frontend-application/mem-1-m07-exact-mysql-write"]
 default = ["jemalloc"]
