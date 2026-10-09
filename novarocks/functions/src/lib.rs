@@ -2710,3 +2710,5 @@ pub use native_like::PreparedNativeLikeRecipe;
 pub mod bitmap_aggregate_core;
 
 mod bitmap_decode_resources;
+
+pub mod percentile_approx_raw_core;

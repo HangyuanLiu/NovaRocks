@@ -24,6 +24,7 @@ pub enum PercentileInputDiagnostic<'a> {
     ExactUpdate,
     ExactMerge,
     Hash,
+    ApproxRaw,
     LegacyLabel(&'a str),
 }
 impl std::fmt::Display for PercentileInputDiagnostic<'_> {
@@ -32,6 +33,7 @@ impl std::fmt::Display for PercentileInputDiagnostic<'_> {
             Self::ExactUpdate => "percentile_disc_cont_update",
             Self::ExactMerge => "percentile_disc_cont_merge",
             Self::Hash => "percentile_hash",
+            Self::ApproxRaw => "percentile_approx_raw",
             Self::LegacyLabel(label) => label,
         })
     }

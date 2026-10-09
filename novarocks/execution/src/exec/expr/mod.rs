@@ -1557,3 +1557,8 @@ mod hll_payload_aggregate_actual_sql_source_tests;
 
 #[cfg(test)]
 mod hll_insert_literal_original_tests;
+
+#[cfg(test)]
+mod legacy_percentile_approx_raw_original_tests;
+#[cfg(test)]
+mod percentile_approx_raw_actual_sql_source_tests;

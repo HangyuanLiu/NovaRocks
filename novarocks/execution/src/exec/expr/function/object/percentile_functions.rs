@@ -16,7 +16,7 @@
 // under the License.
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BinaryBuilder, Float64Builder};
+use arrow::array::{Array, ArrayRef, BinaryBuilder};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -57,25 +57,7 @@ pub fn eval_percentile_approx_raw(
 ) -> Result<ArrayRef, String> {
     let payloads = arena.eval(args[0], chunk)?;
     let quantiles = arena.eval(args[1], chunk)?;
-    let mut builder = Float64Builder::with_capacity(payloads.len());
-
-    for row in 0..payloads.len() {
-        let payload = payload_bytes_at(&payloads, row, "percentile_approx_raw")?;
-        let quantile = numeric_value_at(&quantiles, row, "percentile_approx_raw")?;
-        match (payload, quantile) {
-            (Some(payload), Some(quantile)) => {
-                let state = percentile::decode_state(payload)?;
-                if let Some(value) = percentile::quantile_from_state(&state, Some(quantile))? {
-                    builder.append_value(value);
-                } else {
-                    builder.append_null();
-                }
-            }
-            _ => builder.append_null(),
-        }
-    }
-
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    novarocks_functions::percentile_approx_raw_core::evaluate_legacy(&payloads, &quantiles)
 }
 
 pub fn numeric_value_at(

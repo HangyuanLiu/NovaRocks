@@ -1846,3 +1846,6 @@ mod bitmap_agg_tests;
 
 #[path = "pure_differential_hll_payload_aggregate_tests.rs"]
 mod hll_payload_aggregate_tests;
+
+#[path = "pure_differential_percentile_approx_raw_tests.rs"]
+mod pure_differential_percentile_approx_raw_tests;
