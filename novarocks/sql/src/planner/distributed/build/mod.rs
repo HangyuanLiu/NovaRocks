@@ -24,8 +24,12 @@ pub use lowered_draft::{
     SqlCallDependencySite, SqlCanonicalDependencyLoan, SqlExpressionCallKind,
     SqlSourceJournalError,
 };
-pub(crate) use lowered_draft::{CheckedAggregateLogicalSourceEntry, LoweredSqlPhysicalDraft};
+pub(crate) use lowered_draft::{
+    CheckedAggregateLogicalSourceEntry, LoweredSqlPhysicalDraft, SqlPublicationError,
+};
 mod expression_occurrences;
+mod source_support;
+pub use source_support::check_pure_call_definitions_observed;
 mod package_semantics;
 mod physical_aggregate_occurrences;
 mod physical_aggregate_requests;

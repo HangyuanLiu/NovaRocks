@@ -44,6 +44,7 @@ pub use crate::planner::distributed::build::{
 };
 pub use crate::planner::distributed::build::{
     FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
+    check_pure_call_definitions_observed,
 };
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;

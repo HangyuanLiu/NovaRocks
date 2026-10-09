@@ -2347,13 +2347,26 @@ fn complete(
 ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
     let source = draft
         .finish_with_dependency_observer_observed(control)
-        .map_err(completion_plan_construction_error)?;
+        .map_err(completion_plan_publication_error)?;
     complete_source(
         version,
         CompletedPlanSource::Authored(source),
         display_intent,
         display_annotations,
     )
+}
+
+fn completion_plan_publication_error(
+    error: crate::planner::distributed::build::SqlPublicationError,
+) -> SqlCompileProgressError {
+    match error {
+        crate::planner::distributed::build::SqlPublicationError::Construction(error) => {
+            completion_plan_construction_error(error)
+        }
+        crate::planner::distributed::build::SqlPublicationError::Support(error) => {
+            SqlCompileProgressError::Compile(error.into_compile_error())
+        }
+    }
 }
 
 fn completion_plan_construction_error(

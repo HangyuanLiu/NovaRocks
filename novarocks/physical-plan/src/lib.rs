@@ -24,6 +24,7 @@
 mod builder;
 mod call_requests;
 mod constants;
+mod definition_sources;
 mod expression;
 mod expression_site;
 mod frozen_calls;
@@ -43,6 +44,7 @@ mod validation;
 pub use builder::*;
 pub use call_requests::*;
 pub use constants::*;
+pub use definition_sources::{FragmentDefinitionSource, visit_fragment_definitions_observed};
 pub use expression::*;
 pub use expression_site::*;
 pub use frozen_calls::*;

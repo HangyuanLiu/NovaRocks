@@ -589,6 +589,19 @@ fn final_lowering_error(
     }
 }
 
+fn final_plan_publication_error(
+    error: crate::planner::distributed::build::SqlPublicationError,
+) -> crate::compiler::SqlCompileError {
+    match error {
+        crate::planner::distributed::build::SqlPublicationError::Construction(error) => {
+            final_plan_construction_error(error)
+        }
+        crate::planner::distributed::build::SqlPublicationError::Support(error) => {
+            error.into_compile_error()
+        }
+    }
+}
+
 fn final_plan_construction_error(
     error: novarocks_physical_plan::PlanConstructionError,
 ) -> crate::compiler::SqlCompileError {
@@ -775,7 +788,7 @@ impl DmlWriteCompletion {
         self.query_statistics.annotate_final_plan(&mut draft);
         draft
             .finish_with_dependency_observer_observed(control)
-            .map_err(final_plan_construction_error)
+            .map_err(final_plan_publication_error)
     }
 }
 
@@ -866,7 +879,7 @@ fn complete_connector_write_plan(
     query_statistics.annotate_final_plan(&mut draft);
     draft
         .finish_with_dependency_observer_observed(control)
-        .map_err(final_plan_construction_error)
+        .map_err(final_plan_publication_error)
 }
 
 /// One internal DML read, optimized and waiting for its provider facts.
@@ -954,7 +967,7 @@ impl DmlReadCompletion {
         self.query_statistics.annotate_final_plan(&mut draft);
         draft
             .finish_with_dependency_observer_observed(control)
-            .map_err(final_plan_construction_error)
+            .map_err(final_plan_publication_error)
     }
 }
 
@@ -1262,7 +1275,7 @@ impl DmlChangeStreamCompletion {
         self.query_statistics.annotate_final_plan(&mut draft);
         let physical_plan = draft
             .finish_with_dependency_observer_observed(control)
-            .map_err(final_plan_construction_error)?;
+            .map_err(final_plan_publication_error)?;
         let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
         Ok(DmlFinalChangeStreamPlan {
             physical_plan,
@@ -1632,7 +1645,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     query_statistics.annotate_final_plan(&mut draft);
     let physical_plan = draft
         .finish_with_dependency_observer_observed(control)
-        .map_err(final_plan_construction_error)?;
+        .map_err(final_plan_publication_error)?;
     let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
     Ok(DmlFinalChangeStreamPlan {
         physical_plan,
@@ -2413,7 +2426,7 @@ pub fn build_final_statistics_connector_plan(
     .map_err(final_lowering_error)?;
     draft
         .finish_with_dependency_observer_observed(control)
-        .map_err(final_plan_construction_error)
+        .map_err(final_plan_publication_error)
 }
 
 fn build_statistics_connector_physical(

@@ -988,6 +988,13 @@ pub(super) struct SqlLogicalSourceJournal {
     pub(super) entries: BTreeMap<(FragmentId, PhysicalCallSite), LoweredAggregateSourceEntry>,
 }
 
+/// Exact support refusal remains distinct from original plan construction.
+#[derive(Debug)]
+pub(crate) enum SqlPublicationError {
+    Construction(PlanConstructionError),
+    Support(super::source_support::SqlSourceSupportError),
+}
+
 /// Sole actual lowering result. Only the original visitor constructs this;
 /// there is no raw-builder conversion or consuming builder accessor.
 pub(crate) struct LoweredSqlPhysicalDraft {
@@ -1021,15 +1028,19 @@ impl LoweredSqlPhysicalDraft {
     pub(crate) fn finish_with_dependency_observer_observed(
         self,
         control: &crate::compiler::SqlCompileControl,
-    ) -> Result<SqlAuthoredPhysicalPlan, PlanConstructionError> {
-        let source = self.finish_observed(control)?;
+    ) -> Result<SqlAuthoredPhysicalPlan, SqlPublicationError> {
+        let source = self
+            .finish_observed(control)
+            .map_err(SqlPublicationError::Construction)?;
+        super::source_support::admit_all_call_definitions_observed(&source, control)
+            .map_err(SqlPublicationError::Support)?;
         if let Some(observer) = control.fold_dependency_observer() {
             observer
                 .observe_published_source_observed(&source, control)
                 .map_err(|cause| {
-                    PlanConstructionError::Constants(
+                    SqlPublicationError::Construction(PlanConstructionError::Constants(
                         novarocks_physical_plan::ConstantReferenceError::Control(cause),
-                    )
+                    ))
                 })?;
         }
         Ok(source)
