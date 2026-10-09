@@ -56,7 +56,7 @@ fn raw<T>(
 pub fn retag_legacy(array: &Decimal128Array, precision: u8, scale: i8) -> Result<ArrayRef, String> {
     raw(|observe| retag_observed(array, precision, scale, observe))
 }
-fn retag_observed<E>(
+pub(crate) fn retag_observed<E>(
     array: &Decimal128Array,
     precision: u8,
     scale: i8,
@@ -159,7 +159,7 @@ fn relaxed_observed<E>(
 pub fn enforce_precision_legacy(array: ArrayRef) -> Result<ArrayRef, String> {
     raw(|observe| enforce_precision_observed(array, observe))
 }
-fn enforce_precision_observed<E>(
+pub(crate) fn enforce_precision_observed<E>(
     array: ArrayRef,
     observer: &mut dyn FnMut(DecimalRescaleObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, DecimalRescaleError<E>> {
@@ -215,7 +215,7 @@ pub fn checked_numeric_cast_has_overflow_legacy(
 ) -> Result<bool, String> {
     raw(|observe| checked_numeric_cast_has_overflow_observed(source, casted, observe))
 }
-fn checked_numeric_cast_has_overflow_observed<E>(
+pub(crate) fn checked_numeric_cast_has_overflow_observed<E>(
     source: &ArrayRef,
     casted: &ArrayRef,
     observer: &mut dyn FnMut(DecimalRescaleObservation) -> Result<(), E>,

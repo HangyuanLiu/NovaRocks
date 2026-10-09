@@ -2691,3 +2691,6 @@ mod list_cast_selected;
 
 mod native_between;
 pub use native_between::*;
+
+/// Original signed integral Decimal128 conversion and policy projection.
+pub mod integral_decimal128;

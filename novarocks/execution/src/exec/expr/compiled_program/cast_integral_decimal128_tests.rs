@@ -94,3 +94,6 @@ fn integral_decimal128_actual_compiler_i32_to_4_0_policy_selection_and_carrier()
 fn integral_decimal128_actual_compiler_i64_to_4_0_policy_selection_and_carrier() {
     compare_integral(DataType::Int64);
 }
+
+#[path = "cast_integral_decimal128_after_tests.rs"]
+mod after;

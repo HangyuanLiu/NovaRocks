@@ -186,11 +186,7 @@ fn pow10_i256(exp: usize) -> Result<i256, String> {
 }
 
 fn pow10_i128(scale: u32) -> Option<i128> {
-    let mut out: i128 = 1;
-    for _ in 0..scale {
-        out = out.checked_mul(10)?;
-    }
-    Some(out)
+    novarocks_functions::legacy_decimal::checked_pow10_i128(scale as usize)
 }
 
 fn decimal128_to_i64_literal(value: i128, scale: i8) -> Option<i64> {
@@ -1271,92 +1267,11 @@ fn cast_integral_to_decimal128_relaxed(
     target_precision: u8,
     target_scale: i8,
 ) -> Result<ArrayRef, String> {
-    let upscale = if target_scale > 0 {
-        Some(
-            pow10_i128(target_scale as u32)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
-        )
-    } else {
-        None
-    };
-    let downscale = if target_scale < 0 {
-        Some(
-            pow10_i128((-target_scale) as u32)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
-        )
-    } else {
-        None
-    };
-
-    let mut values = Vec::with_capacity(child_array.len());
-    for row in 0..child_array.len() {
-        if child_array.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        let mut value = match child_array.data_type() {
-            DataType::Int8 => child_array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?
-                .value(row) as i128,
-            DataType::Int16 => child_array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?
-                .value(row) as i128,
-            DataType::Int32 => child_array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?
-                .value(row) as i128,
-            DataType::Int64 => child_array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?
-                .value(row) as i128,
-            other => {
-                return Err(format!(
-                    "integral to DECIMAL cast unsupported source type: {:?}",
-                    other
-                ));
-            }
-        };
-
-        if let Some(factor) = upscale {
-            let Some(scaled) = value.checked_mul(factor) else {
-                values.push(None);
-                continue;
-            };
-            value = scaled;
-        } else if let Some(factor) = downscale {
-            value /= factor;
-        }
-
-        // For narrow targets (precision ≤ 18), StarRocks uses a BIGINT-compatible overflow
-        // window: any value that exceeds a 19-digit range is returned as NULL.  This matches
-        // the observed StarRocks behaviour for SELECT casts such as
-        //   cast(c_bigint as DECIMAL(9,1))  -- i64::MAX * 10 (20 digits) → NULL.
-        //
-        // For wider targets (precision > 18), the pipeline CAST does NOT enforce precision.
-        // Overflow values that fit in i128 pass through as non-null, and the write-path filter
-        // (filter_decimal_cast_overflow_rows) is responsible for detecting and dropping rows
-        // whose unscaled value exceeds the declared precision.  Values that truly overflow i128
-        // during upscaling are already NULL from the checked_mul guard above.
-        if target_precision <= 18 {
-            // BIGINT-window: reject values that exceed a 19-digit (i64) range.
-            if value.unsigned_abs().to_string().len() > 19 {
-                values.push(None);
-                continue;
-            }
-        }
-        values.push(Some(value));
-    }
-
-    let wide = Decimal128Array::from(values)
-        .with_precision_and_scale(38, target_scale)
-        .map_err(|e| e.to_string())?;
-    retag_decimal_array(&wide, target_precision, target_scale)
+    novarocks_functions::integral_decimal128::relaxed_legacy(
+        child_array,
+        target_precision,
+        target_scale,
+    )
 }
 
 fn cast_decimal_to_decimal_relaxed(

@@ -235,6 +235,13 @@ pub fn carrier_cast_can_produce_null_with_policy(
     policy: DecimalOverflowPolicy,
     allow: bool,
 ) -> bool {
+    if matches!(
+        source,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    ) && matches!(target, DataType::Decimal128(..))
+    {
+        return crate::integral_decimal128::can_produce_null(source, target, policy);
+    }
     if matches!(source, DataType::Decimal128(..)) && matches!(target, DataType::Decimal128(..)) {
         return crate::decimal128_rescale::can_produce_null(policy, allow);
     }
@@ -348,6 +355,10 @@ impl DecimalTextSource {
 enum CastBody {
     /// Original List retag/null-child computation on an exact selected domain.
     Collection,
+    IntegralDecimal {
+        precision: u8,
+        scale: i8,
+    },
     DecimalRescale {
         precision: u8,
         scale: i8,
@@ -416,6 +427,41 @@ impl PreparedCastRecipe {
         let outcome = (|| {
             for ty in [source, result] {
                 validate_type_observed(ty, &mut work).map_err(CastPrepareError::Kernel)?;
+            }
+            if operation == CastOperation::Carrier
+                && source.logical_type == ValueLogicalType::Physical
+                && result.logical_type == ValueLogicalType::Physical
+                && matches!(
+                    source.data_type,
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                )
+                && let DataType::Decimal128(precision, scale) = result.data_type
+            {
+                if !crate::integral_decimal128::selected_shape_supported(
+                    &source.data_type,
+                    &result.data_type,
+                ) {
+                    return Err(CastPrepareError::Unsupported);
+                }
+                if (source.nullable
+                    || crate::integral_decimal128::can_produce_null(
+                        &source.data_type,
+                        &result.data_type,
+                        policy,
+                    ))
+                    && !result.nullable
+                {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                work.step()?;
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::IntegralDecimal { precision, scale },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
             }
             // Decimal128's original same-metadata path enforces actual precision.
             // It is not an identity, even when only nullability differs.
@@ -823,6 +869,11 @@ impl PreparedCastRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
+            CastBody::IntegralDecimal { .. } => crate::integral_decimal128::may_raise(
+                &self.source.data_type,
+                &self.result.data_type,
+                self.decimal_overflow_policy,
+            ),
             CastBody::DecimalRescale { scale, .. } => {
                 let DataType::Decimal128(_, source_scale) = self.source.data_type else {
                     unreachable!("prepared exact Decimal128 source")
@@ -899,6 +950,61 @@ impl PreparedCastRecipe {
         let outcome = (|| {
             if self.is_collection() {
                 return Err(invalid("List CAST requires its actual selected invocation"));
+            }
+            if let CastBody::IntegralDecimal { precision, scale } = self.body {
+                let source_kind = Source::from_type(&self.source.data_type).ok_or_else(|| {
+                    internal("integral Decimal source lost its exact signed carrier")
+                })?;
+                let row =
+                    self.checked_row(source_kind, argument, ordinal, logical_row, &mut work)?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid(
+                            "non-null integral Decimal cast argument contains a selected NULL",
+                        ))
+                    };
+                }
+                work.flush()?;
+                let selected = argument.array().slice(row, 1);
+                work.flush()?;
+                let mut observe = |event| match event {
+                    crate::decimal128_rescale::DecimalRescaleObservation::Step => work.step(),
+                    crate::decimal128_rescale::DecimalRescaleObservation::OpaqueBoundary => {
+                        work.flush()
+                    }
+                };
+                let output = match crate::integral_decimal128::evaluate_observed(
+                    &selected,
+                    precision,
+                    scale,
+                    self.decimal_overflow_policy,
+                    self.allow_throw_exception,
+                    &mut observe,
+                ) {
+                    Ok(output) => output,
+                    Err(crate::decimal128_rescale::DecimalRescaleError::Host(cause)) => {
+                        return Err(cause);
+                    }
+                    Err(crate::decimal128_rescale::DecimalRescaleError::Data(message)) => {
+                        return Ok(CastRowResult::RowError(RowDataError::new(
+                            ordinal, &message,
+                        )));
+                    }
+                };
+                work.flush()?;
+                let output = output
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        internal("integral Decimal core returned a foreign frozen carrier")
+                    })?;
+                return Ok(if output.is_null(0) {
+                    CastRowResult::Null
+                } else {
+                    CastRowResult::Decimal128(output.value(0))
+                });
             }
             if let CastBody::DecimalRescale { precision, scale } = self.body {
                 let row = self.checked_row_with_shape(

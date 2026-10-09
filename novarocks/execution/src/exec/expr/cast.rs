@@ -1645,10 +1645,6 @@ fn cast_with_special_rules_with_field_schema(
                 .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
             Ok(cast_float32_to_utf8_array(arr))
         }
-        (
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
-            DataType::Decimal128(target_precision, target_scale),
-        ) => cast_integral_to_decimal128_relaxed(array, *target_precision, *target_scale),
         (DataType::FixedSizeBinary(width), DataType::Decimal128(precision, scale))
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
         {
@@ -2061,90 +2057,6 @@ fn retag_decimal256_array(
         .build()
         .map_err(|e| e.to_string())?;
     Ok(make_array(data))
-}
-
-fn cast_integral_to_decimal128_relaxed(
-    child_array: &ArrayRef,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let upscale = if target_scale > 0 {
-        Some(
-            pow10_i128(target_scale as u32)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
-        )
-    } else {
-        None
-    };
-    let downscale = if target_scale < 0 {
-        Some(
-            pow10_i128((-target_scale) as u32)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
-        )
-    } else {
-        None
-    };
-
-    let precision_limit = 10_u128
-        .checked_pow(u32::from(target_precision))
-        .filter(|_| (1..=38).contains(&target_precision))
-        .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
-    let mut values = Vec::with_capacity(child_array.len());
-    for row in 0..child_array.len() {
-        if child_array.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        let mut value = match child_array.data_type() {
-            DataType::Int8 => child_array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?
-                .value(row) as i128,
-            DataType::Int16 => child_array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?
-                .value(row) as i128,
-            DataType::Int32 => child_array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?
-                .value(row) as i128,
-            DataType::Int64 => child_array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?
-                .value(row) as i128,
-            other => {
-                return Err(format!(
-                    "integral to DECIMAL cast unsupported source type: {:?}",
-                    other
-                ));
-            }
-        };
-
-        if let Some(factor) = upscale {
-            let Some(scaled) = value.checked_mul(factor) else {
-                values.push(None);
-                continue;
-            };
-            value = scaled;
-        } else if let Some(factor) = downscale {
-            value /= factor;
-        }
-
-        if value.unsigned_abs() >= precision_limit {
-            values.push(None);
-            continue;
-        }
-        values.push(Some(value));
-    }
-
-    let wide = Decimal128Array::from(values)
-        .with_precision_and_scale(38, target_scale)
-        .map_err(|e| e.to_string())?;
-    retag_decimal_array(&wide, target_precision, target_scale)
 }
 
 fn cast_decimal_to_decimal_relaxed(
@@ -2768,6 +2680,19 @@ pub fn eval(
             &child_array,
             *precision,
             *scale,
+            decimal_overflow_policy,
+            arena.allow_throw_exception(),
+        );
+    }
+    if matches!(
+        child_array.data_type(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    ) && let DataType::Decimal128(precision, scale) = target_type
+    {
+        return novarocks_functions::integral_decimal128::evaluate_legacy(
+            &child_array,
+            precision,
+            scale,
             decimal_overflow_policy,
             arena.allow_throw_exception(),
         );
@@ -4060,9 +3985,7 @@ mod tests {
 
     #[test]
     fn list_json_metadata_cast_preserves_sliced_values_offsets_and_validity_buffers() {
-        use novarocks_types::logical::{
-            LogicalType, field_with_logical_type, logical_type_of_field,
-        };
+        use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
         for values in [
             Arc::new(StringArray::from(vec![
                 Some("{\"a\":1}"),
