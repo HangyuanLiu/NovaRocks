@@ -448,3 +448,6 @@ fn analytic_input_stage_original_empty_gather_panic_remains() {
             .is_empty()
     );
 }
+
+#[path = "analytic_copy_operation_port_tests.rs"]
+mod copy_operation_ports;

@@ -17,10 +17,12 @@
 //! ONE original analytic gathering, regrouping and output splitting.
 //! Scope ownership is supplied by the caller. Observing a source or a Layout
 //! grants no capacity; the legacy adapter supplies only its original lifetime.
-use super::{
-    ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, concat_batches, take,
-};
+use super::{ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, take};
 use std::{collections::VecDeque, convert::Infallible, sync::Arc};
+use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
+use arrow::compute::concat;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnalyticInputStage {
@@ -53,6 +55,14 @@ impl AnalyticInputSource<'_> {
     }
 }
 
+/// Preserve the original ArrowError until its original stage formatter. The
+/// tracked adapter supplies already-owned original text under its scope grant.
+pub(crate) enum AnalyticCopyFailure<E> {
+    OriginalArrow(ArrowError),
+    OriginalText(String),
+    Control(E),
+}
+
 /// Admission precedes the original stage's allocation. A tracked adapter must
 /// return its real host lease, not an observation token. Success and original
 /// whole-stage Data retain the scope until their owned payload is dropped.
@@ -63,6 +73,47 @@ pub(crate) trait AnalyticInputWork {
     fn admit(&mut self, source: AnalyticInputSource<'_>) -> Result<Self::Scope, Self::Failure>;
     fn step(&mut self) -> Result<(), Self::Failure>;
     fn boundary(&mut self) -> Result<(), Self::Failure>;
+
+    /// ONE original column-copy occurrence. The tracked adapter may replace
+    /// admission/custody, never the concat value operation or batch iteration.
+    fn concat_column(
+        &mut self,
+        _scope: &mut Self::Scope,
+        batches: &[&RecordBatch],
+        _sources: &[Chunk],
+        ordinal: usize,
+    ) -> Result<ArrayRef, AnalyticCopyFailure<Self::Failure>> {
+        concat(
+            &batches
+                .iter()
+                .map(|batch| batch.column(ordinal).as_ref())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(AnalyticCopyFailure::OriginalArrow)
+    }
+    fn take_column(
+        &mut self,
+        _scope: &mut Self::Scope,
+        source: &Chunk,
+        ordinal: usize,
+        indices: &Arc<UInt32Array>,
+    ) -> Result<ArrayRef, AnalyticCopyFailure<Self::Failure>> {
+        take(
+            source.batch.column(ordinal).as_ref(),
+            indices.as_ref(),
+            None,
+        )
+        .map_err(AnalyticCopyFailure::OriginalArrow)
+    }
+    fn slice_column(
+        &mut self,
+        _scope: &mut Self::Scope,
+        source: &ArrayRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<ArrayRef, Self::Failure> {
+        Ok(source.slice(offset, len))
+    }
 }
 #[derive(Debug)]
 pub(crate) struct AnalyticStageResult<T, S> {
@@ -111,12 +162,42 @@ pub(crate) fn legacy<T>(
     }
 }
 
+/// The original pinned Arrow 58.2 concat_batches body, parameterized only at
+/// its original per-column concat occurrence. Empty-schema row-count, source
+/// schema disregard, column order and final RecordBatch validator are unchanged.
+fn original_concat_batches<W: AnalyticInputWork>(
+    schema: &SchemaRef,
+    input_batches: &[RecordBatch],
+    sources: &[Chunk],
+    scope: &mut W::Scope,
+    work: &mut W,
+) -> Result<RecordBatch, AnalyticCopyFailure<W::Failure>> {
+    if schema.fields().is_empty() {
+        let num_rows: usize = input_batches.iter().map(RecordBatch::num_rows).sum();
+        let mut options = RecordBatchOptions::default();
+        options.row_count = Some(num_rows);
+        return RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
+            .map_err(AnalyticCopyFailure::OriginalArrow);
+    }
+    let batches: Vec<&RecordBatch> = input_batches.iter().collect();
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+    let field_num = schema.fields().len();
+    let mut arrays = Vec::with_capacity(field_num);
+    for i in 0..field_num {
+        let array = work.concat_column(scope, &batches, sources, i)?;
+        arrays.push(array);
+    }
+    RecordBatch::try_new(schema.clone(), arrays).map_err(AnalyticCopyFailure::OriginalArrow)
+}
+
 pub(crate) fn gather<W: AnalyticInputWork>(
     input: &[Chunk],
     work: &mut W,
 ) -> Result<AnalyticStageResult<Chunk, W::Scope>, AnalyticStageFailure<W::Scope, W::Failure>> {
     let stage = AnalyticInputStage::Gather;
-    let scope = work
+    let mut scope = work
         .admit(AnalyticInputSource::Gather { chunks: input })
         .map_err(|e| controlled(stage, e))?;
     let result = if input.len() == 1 {
@@ -131,15 +212,19 @@ pub(crate) fn gather<W: AnalyticInputWork>(
             batches.push(chunk.batch.clone());
         }
         work.boundary().map_err(|e| controlled(stage, e))?;
-        match concat_batches(&input_schema, &batches)
-            .map_err(|error| format!("concat_batches: {}", error))
-        {
+        match original_concat_batches(&input_schema, &batches, input, &mut scope, work) {
+            Err(AnalyticCopyFailure::Control(cause)) => return Err(controlled(stage, cause)),
+            Err(AnalyticCopyFailure::OriginalArrow(error)) => {
+                Err(format!("concat_batches: {}", error))
+            }
+            Err(AnalyticCopyFailure::OriginalText(error)) => {
+                Err(format!("concat_batches: {}", error))
+            }
             Ok(batch) => {
                 work.boundary().map_err(|e| controlled(stage, e))?;
                 Chunk::try_new_with_chunk_schema(batch, input[0].chunk_schema_ref())
                     .map_err(|error| format!("build analytic concat chunk: {error}"))
             }
-            Err(error) => Err(error),
         }
     };
     match result {
@@ -203,7 +288,7 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
     work: &mut W,
 ) -> Result<AnalyticStageResult<Chunk, W::Scope>, AnalyticStageFailure<W::Scope, W::Failure>> {
     let stage = AnalyticInputStage::Regroup;
-    let scope = work
+    let mut scope = work
         .admit(AnalyticInputSource::Regroup { chunk, keys })
         .map_err(|e| controlled(stage, e))?;
     let rows = chunk.len();
@@ -276,14 +361,22 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
         indices.append_value(row as u32);
     }
     work.boundary().map_err(|e| controlled(stage, e))?;
-    let indices = Arc::new(indices.finish()) as ArrayRef;
+    let indices = Arc::new(indices.finish());
     work.boundary().map_err(|e| controlled(stage, e))?;
     let mut columns = Vec::with_capacity(chunk.batch.num_columns());
-    for column in chunk.batch.columns() {
+    for ordinal in 0..chunk.batch.num_columns() {
         work.boundary().map_err(|e| controlled(stage, e))?;
-        let value = match take(column.as_ref(), indices.as_ref(), None).map_err(|e| e.to_string()) {
+        let value = match work.take_column(&mut scope, chunk, ordinal, &indices) {
             Ok(value) => value,
-            Err(message) => {
+            Err(AnalyticCopyFailure::Control(cause)) => return Err(controlled(stage, cause)),
+            Err(AnalyticCopyFailure::OriginalArrow(error)) => {
+                return Err(AnalyticStageFailure::OriginalData {
+                    stage,
+                    message: error.to_string(),
+                    scope,
+                });
+            }
+            Err(AnalyticCopyFailure::OriginalText(message)) => {
                 return Err(AnalyticStageFailure::OriginalData {
                     stage,
                     message,
@@ -324,7 +417,7 @@ pub(crate) fn split<W: AnalyticInputWork>(
     AnalyticStageFailure<W::Scope, W::Failure>,
 > {
     let stage = AnalyticInputStage::OutputSplit;
-    let scope = work
+    let mut scope = work
         .admit(AnalyticInputSource::OutputSplit {
             output: &output,
             columns,
@@ -343,7 +436,10 @@ pub(crate) fn split<W: AnalyticInputWork>(
         let mut slices = Vec::with_capacity(columns.len());
         for column in columns {
             work.boundary().map_err(|e| controlled(stage, e))?;
-            slices.push(column.slice(offset, len));
+            slices.push(
+                work.slice_column(&mut scope, column, offset, len)
+                    .map_err(|cause| controlled(stage, cause))?,
+            );
             work.step().map_err(|e| controlled(stage, e))?;
         }
         work.boundary().map_err(|e| controlled(stage, e))?;
