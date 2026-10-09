@@ -3714,3 +3714,7 @@ mod original_count_window_diff_tests;
 #[cfg(test)]
 #[path = "analytic_count_generic_diff_tests.rs"]
 mod original_count_generic_window_diff_tests;
+
+#[cfg(test)]
+#[path = "analytic_by_window_required_baseline_tests.rs"]
+mod by_window_required_original_tests;

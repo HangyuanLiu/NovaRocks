@@ -114,6 +114,36 @@ fn sql_source_with_explicit_single_field(
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_explicit_fields(
+        sql,
+        &[field],
+        emission_mode,
+        sql_semantics,
+        static_predicate_offer,
+    )
+}
+/// Explicit original relation declarations for multi-column SQL fixtures.
+/// This shares the one original fact/resume/provider author, never a second plan.
+pub(super) fn sql_source_with_declared_fields(
+    sql: &str,
+    fields: &[Field],
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_explicit_fields(
+        sql,
+        fields,
+        emission_mode,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        None,
+    )
+}
+fn sql_source_with_explicit_fields(
+    sql: &str,
+    fields: &[Field],
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+    static_predicate_offer: Option<bool>,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
@@ -173,18 +203,21 @@ fn sql_source_with_explicit_single_field(
                     .iter()
                     .map(|need| {
                         let relation = need.relation();
-                        let schema = Arc::new(Schema::new(vec![field.clone()]));
+                        let schema = Arc::new(Schema::new(fields.to_vec()));
                         let resolved = materialize_connector_read_table(ConnectorReadTableFacts {
                             catalog: relation.catalog.clone(),
                             namespace: relation.namespace.clone(),
                             table: relation.table.clone(),
-                            columns: vec![ColumnDef {
-                                name: field.name().clone(),
-                                data_type: field.data_type().clone(),
-                                nullable: field.is_nullable(),
-                                write_default: None,
-                                logical_type: None,
-                            }],
+                            columns: fields
+                                .iter()
+                                .map(|field| ColumnDef {
+                                    name: field.name().clone(),
+                                    data_type: field.data_type().clone(),
+                                    nullable: field.is_nullable(),
+                                    write_default: None,
+                                    logical_type: None,
+                                })
+                                .collect(),
                             iceberg_row_lineage_metadata_columns: Vec::new(),
                             schema,
                             binding: bindings.allocate().unwrap(),
@@ -193,10 +226,11 @@ fn sql_source_with_explicit_single_field(
                         })
                         .unwrap()
                         .into_resolved_table();
-                        if field.is_nullable() {
-                            assert!(catalog_table(&resolved).columns[0].nullable);
-                        } else {
-                            assert!(!catalog_table(&resolved).columns[0].nullable);
+                        for (ordinal, field) in fields.iter().enumerate() {
+                            assert_eq!(
+                                catalog_table(&resolved).columns[ordinal].nullable,
+                                field.is_nullable()
+                            );
                         }
                         CatalogRelationFact::resolved(need, resolved).unwrap()
                     })

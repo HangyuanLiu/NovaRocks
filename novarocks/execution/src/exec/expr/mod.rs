@@ -1545,15 +1545,10 @@ mod map_agg_actual_sql_source_tests;
 mod like_shared_actual_after_tests;
 
 #[cfg(test)]
-mod legacy_float64_decimal128_baseline_tests;
-#[cfg(test)]
-mod cast_float64_decimal128_oracle_tests;
-
-#[cfg(test)]
-mod bitmap_agg_actual_sql_source_tests;
-
-#[cfg(test)]
 mod hll_payload_aggregate_actual_sql_source_tests;
+
+#[cfg(test)]
+mod by_window_required_actual_sql_tests;
 
 #[cfg(test)]
 mod hll_insert_literal_original_tests;
@@ -1562,3 +1557,14 @@ mod hll_insert_literal_original_tests;
 mod legacy_percentile_approx_raw_original_tests;
 #[cfg(test)]
 mod percentile_approx_raw_actual_sql_source_tests;
+
+#[cfg(test)]
+mod legacy_float64_decimal128_baseline_tests;
+#[cfg(test)]
+mod cast_float64_decimal128_oracle_tests;
+
+#[cfg(test)]
+mod join_probe_filter_actual_sql_tests;
+
+#[cfg(test)]
+mod bitmap_agg_actual_sql_source_tests;

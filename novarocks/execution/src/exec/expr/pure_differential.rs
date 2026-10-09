@@ -1840,12 +1840,12 @@ mod bitmap_union_int_tests;
 #[path = "pure_differential_map_agg_tests.rs"]
 mod pure_differential_map_agg_tests;
 
-#[cfg(test)]
-#[path = "pure_differential_bitmap_agg_tests.rs"]
-mod bitmap_agg_tests;
-
 #[path = "pure_differential_hll_payload_aggregate_tests.rs"]
 mod hll_payload_aggregate_tests;
 
 #[path = "pure_differential_percentile_approx_raw_tests.rs"]
 mod pure_differential_percentile_approx_raw_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_bitmap_agg_tests.rs"]
+mod bitmap_agg_tests;

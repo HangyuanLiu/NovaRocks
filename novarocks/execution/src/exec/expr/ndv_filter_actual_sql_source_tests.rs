@@ -64,6 +64,33 @@ fn ndv_sql_source_with_semantics(
     emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_columns_and_semantics(
+        sql,
+        emission_mode,
+        sql_semantics,
+        &[("k", DataType::Int32), ("v", DataType::Int32), ("s", DataType::Utf8)],
+    )
+}
+
+pub(super) fn sql_source_with_columns(
+    sql: &str,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    columns: &[(&str, DataType)],
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_columns_and_semantics(
+        sql,
+        emission_mode,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        columns,
+    )
+}
+
+fn sql_source_with_columns_and_semantics(
+    sql: &str,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+    columns: &[(&str, DataType)],
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
@@ -124,11 +151,6 @@ fn ndv_sql_source_with_semantics(
                         let relation = need.relation();
                         // These are the original CREATE TABLE facts, not inferred
                         // from the query projection or manufactured physical nodes.
-                        let columns = [
-                            ("k", DataType::Int32),
-                            ("v", DataType::Int32),
-                            ("s", DataType::Utf8),
-                        ];
                         let schema = Arc::new(Schema::new(
                             columns
                                 .iter()
@@ -157,9 +179,9 @@ fn ndv_sql_source_with_semantics(
                         })
                         .unwrap()
                         .into_resolved_table();
-                        assert_eq!(catalog_table(&resolved).columns.len(), 3);
+                        assert_eq!(catalog_table(&resolved).columns.len(), columns.len());
                         for (actual, (name, ty)) in
-                            catalog_table(&resolved).columns.iter().zip(&columns)
+                            catalog_table(&resolved).columns.iter().zip(columns)
                         {
                             assert_eq!(actual.name, *name);
                             assert_eq!(&actual.data_type, ty);
