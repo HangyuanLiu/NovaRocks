@@ -219,6 +219,58 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_outgoing_io_holds_state_store_until_original_public_exit() {
+    use novarocks_native_adapter::native_lane::frontend_lane_connector;
+    use novarocks_native_trust::NativeEndpointConnector;
+    use novarocks_proto_codec::native_rpc::FrontendNativeLane;
+    use tower::ServiceExt;
+
+    let mut host = open_host(Some(state_store_input())).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint =
+        novarocks_types::NativeEndpoint::from_socket_addr(listener.local_addr().unwrap());
+    let connector = frontend_lane_connector(
+        NativeEndpointConnector::plaintext(endpoint),
+        host.data_runtime.transport_admission().clone(),
+        FrontendNativeLane::ResultData,
+    );
+    let io = tokio::time::timeout(
+        Duration::from_secs(2),
+        connector.oneshot(
+            "http://original-host-exit.test"
+                .parse::<axum::http::Uri>()
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (peer, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let original_deadline = std::time::Instant::now() + Duration::from_millis(200);
+    let failure = host.release_resources_until(original_deadline).await.err();
+    let retained_store = host.state_store().is_some();
+    let held = host
+        .data_runtime
+        .transport_admission()
+        .frontend_outgoing_snapshot()
+        .unwrap();
+    // Release the actual public IO. No counter mutation or synthetic ACK.
+    drop(io);
+    drop(peer);
+    drop(listener);
+    let retry = host
+        .release_resources_until(std::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let store_closed = host.state_store().is_none();
+    assert!(failure.is_some_and(|error| error.contains("outgoing public exits")));
+    assert!(retained_store && held.closed && held.data_connections == 1);
+    assert!(retry.is_ok() && store_closed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_host_opens_store_with_single_fe_view() {
     let mut host = open_host(Some(state_store_input()))
         .await

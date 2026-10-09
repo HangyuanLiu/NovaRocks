@@ -2052,6 +2052,21 @@ impl FrontendApplicationHost {
                 primary_error = Some(error);
             }
         }
+        // Role-owned callers have reached the Native tail. Close future calls,
+        // retire cache aliases and wait for the original public IO/body exits
+        // before StateStore, using the same absolute Host deadline.
+        // This observation does not replace original caller task/F joins or
+        // prove every escaped clone's undispatched stream reservation exited.
+        if let Err(error) = self
+            .data_runtime
+            .drain_native_outgoing_until(deadline)
+            .await
+        {
+            return Err(match primary_error {
+                Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                None => error,
+            });
+        }
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {
                 Ok(()) => {
