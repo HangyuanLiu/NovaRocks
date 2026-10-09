@@ -1000,6 +1000,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let token = statement.token();
         let native_alias = statement.result_window_alias().unwrap();
         let owner = statement.take_execution_owner().unwrap();
         let (_transport, _receipt, _failure, stream) = QueryResultStream::try_channel(
@@ -1030,8 +1031,14 @@ mod tests {
         );
         let mut result =
             StreamingStatementResult::try_from_execution(execution, statement).unwrap();
+        assert_eq!(result.statement_token(), Some(token));
+        assert!(matches!(
+            service.begin_statement(session),
+            Err(QueryControlError::StatementBusy)
+        ));
         control.kill_query(session, 7);
         let grant = result.try_closing_capacity(true).unwrap();
+        assert_eq!(result.statement_token(), Some(token));
         assert_eq!(workload.snapshot().admitted_queries, 0);
         let closing = result
             .into_closing_delivery((), grant, 1024)

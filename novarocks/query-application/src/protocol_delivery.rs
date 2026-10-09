@@ -25,7 +25,7 @@ use crate::api::{
 use crate::cancellation::QueryCancellationView;
 use crate::session_control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
-    GovernedStatementVisibilitySealOutcome,
+    GovernedStatementVisibilitySealOutcome, StatementToken,
 };
 use crate::session_error::QueryServiceError;
 use novarocks_workload_control::{ResultWindowClass, ResultWindowGrant, WorkError};
@@ -43,6 +43,13 @@ impl GovernedProtocolOwner {
             statement: Some(statement),
             settled: false,
         }
+    }
+
+    /// Project the original live statement identity without retaining its owner.
+    pub fn statement_token(&self) -> Option<StatementToken> {
+        self.statement
+            .as_ref()
+            .map(GovernedQueryStatementOwner::token)
     }
 
     pub fn cancellation(&self) -> QueryCancellationView {
@@ -445,6 +452,11 @@ impl StreamingStatementResult {
             protocol: GovernedProtocolOwner::new(statement),
             settled: false,
         })
+    }
+
+    /// Project the protocol owner's exact identity; observation grants no control.
+    pub fn statement_token(&self) -> Option<StatementToken> {
+        self.protocol.statement_token()
     }
 
     pub fn begin_schema(&mut self) -> Option<SchemaDelivery> {

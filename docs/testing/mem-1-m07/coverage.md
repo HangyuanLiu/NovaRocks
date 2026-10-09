@@ -430,3 +430,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - 六项固定脚本NO-I/O反例覆盖scalar/writev原Pending/waker、Ok0/原rawOSerror、framer原WriteZero、n>offered首错、多个Ready累积准确hash、zero-budget empty slices不假造blocked；与真实TCP/Native证据分列。第七项真实TCP使用实际stale baseline receipt使Receipt失败，resume拒绝、explicitStop唤醒、exact2B+EOF与原JoinSet实际全join。没有新增首错即时wakeup或泛化panic-prone inner合同。
 - 初次E0061/E0308因Pin receiver的方法名write解析到AsyncWriteExt；仅fixture改名scripted_poll并get_mut明确dispatch。完整19组件PASS/0FAIL/0ignored/1.25s，原错误日志及ignoreddraft保留；收据p09-exact-fe-poll-write-component-additional-20261009.json。gate实现/产品路径/caps/clock未变，Native接线及其余门仍OPEN。
+
+
+### 2026-10-09 P09：真实protocol owner身份只读投影
+
+- GovernedProtocolOwner.statement_token仅借原live statement并取其既有token，StreamingStatementResult只delegate；已settled/taken返回None，无新mint/reconstruct/registration别名/registry或取消容量权。为后续exact caller绑定提供原身份，不能把sessionepoch猜作connectiongeneration。
+- 原streaming Closing alias真实fixture校验token跨取消cut不变、下一statement仍Busy、普通/Closing位置仍按实际alias退出；focused1PASS、query_control全部26PASS/0FAIL/0.02s。收据p09-protocol-owner-token-projection-20261009.json；feature IO/control/Native接线仍OPEN，无deadline/资格/失败语义改变。
