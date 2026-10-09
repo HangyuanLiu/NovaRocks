@@ -1174,16 +1174,83 @@ fn runtime_filter_shapes_outside_m1_are_refused_by_name() {
             feature,
         );
     }
-    // A consumer of the join's own probe key is a RuntimeFilterConsumer
-    // node, which this milestone does not author.
-    refused(
+    // A checked blocking probe-key endpoint stays on its actual Join owner.
+    // It reuses the key definition but has an independent invocation source.
+    let program = compile(
         &broadcast(Rf {
             consumer: Consumer::ProbeKey,
             ..Rf::blocking()
         }),
         None,
-        JOIN,
-        "join probe-key runtime-filter consumer",
+    )
+    .expect("the exact membership probe-key contract is executable");
+    let join = node_of(&program, |kind| {
+        matches!(kind, ProgramNodeKind::Join { .. })
+    });
+    let ProgramNodeKind::Join {
+        probe_keys,
+        runtime_filter_consumers,
+        ..
+    } = program.graph().nodes()[join.index()].kind()
+    else {
+        unreachable!()
+    };
+    let [consumer] = runtime_filter_consumers.as_slice() else {
+        panic!("one join-owned consumer: {runtime_filter_consumers:?}");
+    };
+    assert_eq!(consumer.expr_id, probe_keys[0]);
+    assert_eq!(consumer.key_ordinal, 0);
+    assert_eq!(consumer.consumer.binding_id(), 2);
+    assert_eq!(consumer.consumer.channel_id(), FILTER.get());
+    assert_eq!(
+        consumer.consumer.activation(),
+        FilterConsumerActivation::BlockingSnapshot
+    );
+    assert_eq!(consumer.consumer.reduction(), FilterReduction::SetUnion);
+    assert_eq!(
+        consumer.consumer.contract(),
+        &membership(FilterNullSemantics::NeverMatches)
+    );
+    let mut required = filter_requirements(&program);
+    required.sort_unstable();
+    assert_eq!(required, vec![1, 2]);
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    let consumer_site = ProgramExpressionRootSite::Node {
+        node: join,
+        role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
+    };
+    let probe_site = ProgramExpressionRootSite::Node {
+        node: join,
+        role: ProgramNodeExpressionRole::JoinProbeKey { key: 0 },
+    };
+    let use_id = snapshot.bindings()[&consumer_site];
+    assert_ne!(use_id, snapshot.bindings()[&probe_site]);
+    let invocation = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[&use_id];
+    assert_eq!(invocation.definition, consumer.expr_id);
+    assert_eq!(invocation.context.demand, EvaluationDemand::Value);
+    assert!(invocation.arguments.is_empty());
+    assert_eq!(
+        program.checked().slots()[&ProgramUseRef {
+            arena: ProgramExpressionArena::Main,
+            use_id,
+        }],
+        ProgramLexicalSource::Input(ProgramChannelSite::Layout {
+            node: join,
+            role: ProgramChannelLayoutRole::JoinLeft,
+            ordinal: 0,
+        })
+    );
+    assert!(
+        !program
+            .graph()
+            .nodes()
+            .iter()
+            .any(|node| matches!(node.kind(), ProgramNodeKind::RuntimeFilterConsumer { .. }))
     );
     // An ordered hull over the build key is refused at its producer, which
     // the numbering lists first.

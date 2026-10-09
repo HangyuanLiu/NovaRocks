@@ -1189,9 +1189,57 @@ fn validate_ordered_live_plan_specs(
     Ok(())
 }
 
+enum RuntimeFilterProcessorPlan {
+    Arena(RuntimeFilterConsumerSet),
+    Compiled(Arc<CompiledRuntimeFilterConsumers>),
+}
+
+#[cfg(test)]
+impl RuntimeFilterProcessorPlan {
+    fn gate_observable(&self) -> Arc<Observable> {
+        match self {
+            Self::Arena(consumers) => consumers.gate_observable(),
+            Self::Compiled(consumers) => consumers.state().gate_observable(),
+        }
+    }
+}
+
+enum RuntimeFilterProcessorConsumers {
+    Arena(RuntimeFilterConsumerSet),
+    Compiled {
+        state: RuntimeFilterConsumerState,
+        keys: CompiledRuntimeFilterKeys,
+    },
+}
+impl RuntimeFilterProcessorConsumers {
+    fn state(&self) -> &RuntimeFilterConsumerState {
+        match self {
+            Self::Arena(value) => value.state(),
+            Self::Compiled { state, .. } => state,
+        }
+    }
+    fn apply_chunk_observed(
+        &mut self,
+        chunk: Chunk,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
+    ) -> ExecutionResult<Option<Chunk>> {
+        match self {
+            Self::Arena(value) => value
+                .apply_chunk_observed(chunk, event_sink)
+                .map_err(Into::into),
+            Self::Compiled { state, keys } => state.apply_chunk_observed(chunk, keys, event_sink),
+        }
+    }
+    fn bind_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        if let Self::Compiled { keys, .. } = self {
+            keys.bind_mem_tracker(tracker);
+        }
+    }
+}
+
 pub(crate) struct NativeRuntimeFilterProcessorFactory {
     name: String,
-    consumers: RuntimeFilterConsumerSet,
+    consumers: RuntimeFilterProcessorPlan,
 }
 
 impl NativeRuntimeFilterProcessorFactory {
@@ -1202,8 +1250,22 @@ impl NativeRuntimeFilterProcessorFactory {
     ) -> Result<Self, String> {
         Ok(Self {
             name: format!("NativeRuntimeFilter (id={owner_node_id})"),
-            consumers: RuntimeFilterConsumerSet::from_plan("Join", specs, arena)?,
+            consumers: RuntimeFilterProcessorPlan::Arena(RuntimeFilterConsumerSet::from_plan(
+                "Join", specs, arena,
+            )?),
         })
+    }
+}
+
+impl NativeRuntimeFilterProcessorFactory {
+    pub(crate) fn new_compiled(
+        owner_node_id: i32,
+        consumers: Arc<CompiledRuntimeFilterConsumers>,
+    ) -> Self {
+        Self {
+            name: format!("CompiledRuntimeFilter (id={owner_node_id})"),
+            consumers: RuntimeFilterProcessorPlan::Compiled(consumers),
+        }
     }
 }
 
@@ -1215,7 +1277,17 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
         Box::new(NativeRuntimeFilterProcessor {
             name: self.name.clone(),
-            consumers: self.consumers.clone(),
+            consumers: match &self.consumers {
+                RuntimeFilterProcessorPlan::Arena(value) => {
+                    RuntimeFilterProcessorConsumers::Arena(value.clone())
+                }
+                RuntimeFilterProcessorPlan::Compiled(value) => {
+                    RuntimeFilterProcessorConsumers::Compiled {
+                        state: value.state().clone(),
+                        keys: value.driver_keys(),
+                    }
+                }
+            },
             output: None,
             finishing: false,
             event_sink: Arc::new(NoopFragmentEventSink),
@@ -1225,13 +1297,16 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
 
 struct NativeRuntimeFilterProcessor {
     name: String,
-    consumers: RuntimeFilterConsumerSet,
+    consumers: RuntimeFilterProcessorConsumers,
     output: Option<Chunk>,
     finishing: bool,
     event_sink: Arc<dyn FragmentEventSink>,
 }
 
 impl Operator for NativeRuntimeFilterProcessor {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.consumers.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -1246,7 +1321,7 @@ impl Operator for NativeRuntimeFilterProcessor {
     }
 
     fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(self.consumers.bind(state)?)
+        Ok(self.consumers.state().bind(state)?)
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -1272,13 +1347,16 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
     /// Held back only once a chunk reached a pending gate: until then the
     /// gate's wait has not started and must not hold the pipeline.
     fn need_input(&self) -> bool {
-        self.has_room() && !self.consumers.gate_holds_input()
+        self.has_room() && !self.consumers.state().gate_holds_input()
     }
 
     /// The gate's wait starts here, with a chunk actually on the edge. While
     /// the gate is pending the chunk stays on the edge.
     fn can_accept_input(&self, _chunk: &Chunk) -> ExecutionResult<bool> {
-        Ok(self.has_room() && matches!(self.consumers.poll_gate(), RuntimeFilterGate::Open))
+        Ok(
+            self.has_room()
+                && matches!(self.consumers.state().poll_gate(), RuntimeFilterGate::Open),
+        )
     }
 
     fn has_output(&self) -> bool {
@@ -1289,7 +1367,7 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
         if !self.has_room() {
             return Err("native runtime-filter processor cannot accept input".into());
         }
-        if !matches!(self.consumers.poll_gate(), RuntimeFilterGate::Open) {
+        if !matches!(self.consumers.state().poll_gate(), RuntimeFilterGate::Open) {
             return Err(
                 "native runtime-filter processor received input before its gate opened".into(),
             );
@@ -1310,11 +1388,11 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
     }
 
     fn sink_observable(&self) -> Option<Arc<Observable>> {
-        Some(self.consumers.gate_observable())
+        Some(self.consumers.state().gate_observable())
     }
 
     fn sink_block_deadline(&self) -> Option<DriverBlockDeadline> {
-        self.consumers.gate_deadline()
+        self.consumers.state().gate_deadline()
     }
 }
 

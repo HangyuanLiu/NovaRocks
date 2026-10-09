@@ -1085,27 +1085,35 @@ fn build_pipeline_for_program_node(
             eq_null_safe,
             residual_predicate,
             runtime_filters,
-        } => build_join_pipeline(
-            program,
-            bindings,
-            *left,
-            *right,
-            node_id,
-            runtime_join_type(*join_type),
-            match distribution_mode {
-                lp::JoinDistributionMode::Broadcast => RuntimeJoinDistributionMode::Broadcast,
-                lp::JoinDistributionMode::Partitioned => RuntimeJoinDistributionMode::Partitioned,
-            },
-            left_layout,
-            right_layout,
-            join_scope_layout,
-            probe_keys,
-            build_keys,
-            eq_null_safe,
-            *residual_predicate,
-            runtime_filters,
-            ctx,
-        ),
+            runtime_filter_consumers,
+        } => {
+            if !runtime_filter_consumers.is_empty() {
+                return Err("compiled join probe consumers require the compiled pipeline".into());
+            }
+            build_join_pipeline(
+                program,
+                bindings,
+                *left,
+                *right,
+                node_id,
+                runtime_join_type(*join_type),
+                match distribution_mode {
+                    lp::JoinDistributionMode::Broadcast => RuntimeJoinDistributionMode::Broadcast,
+                    lp::JoinDistributionMode::Partitioned => {
+                        RuntimeJoinDistributionMode::Partitioned
+                    }
+                },
+                left_layout,
+                right_layout,
+                join_scope_layout,
+                probe_keys,
+                build_keys,
+                eq_null_safe,
+                *residual_predicate,
+                runtime_filters,
+                ctx,
+            )
+        }
         lp::ProgramNodeKind::Filter { input, predicates } => {
             let [predicate] = predicates.as_ref() else {
                 return Err("legacy Filter adapter requires its one original predicate".into());

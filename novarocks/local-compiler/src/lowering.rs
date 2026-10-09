@@ -415,11 +415,14 @@ fn lower(
     derived_definitions = derived_definitions
         .checked_add(runtime_filters.consumer_count()?)
         .ok_or(CompileControlError::ResourceExhausted)?;
+    let derived_roots = derived_definitions
+        .checked_add(runtime_filters.join_consumer_count()?)
+        .ok_or(CompileControlError::ResourceExhausted)?;
     let original_flow = package.expression_uses().flow();
     let mut references = original_flow
         .uses()
         .len()
-        .checked_add(derived_definitions)
+        .checked_add(derived_roots)
         .ok_or(CompileControlError::ResourceExhausted)?;
     for invocation in original_flow.uses().values() {
         references = references
@@ -441,12 +444,12 @@ fn lower(
         || original_flow
             .domains()
             .len()
-            .checked_add(derived_definitions)
+            .checked_add(derived_roots)
             .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
         || original_flow
             .uses()
             .len()
-            .checked_add(derived_definitions)
+            .checked_add(derived_roots)
             .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
         || references > novarocks_type_contract::MAX_CONTROL_USE_REFERENCES
     {
@@ -852,7 +855,9 @@ fn lower(
                 .get(&source)
                 .and_then(|rows| rows.first())
                 .map(Vec::as_slice);
-            let filters = runtime_filters.take_join(source, work)?;
+            let filters =
+                runtime_filters.take_join(source, package, join, &expressions.ids, work)?;
+            filter_roots.extend(filters.roots);
             source_requirements.extend(filters.requirements);
             work.flush()?;
             let lowered = crate::join::lower_join(
@@ -871,6 +876,7 @@ fn lower(
                 &expressions.ids,
                 selection,
                 filters.producers,
+                filters.consumers,
                 work.control(),
             )?;
             for emitted in lowered.nodes {

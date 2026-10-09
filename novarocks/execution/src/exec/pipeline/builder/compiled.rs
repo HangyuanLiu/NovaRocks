@@ -211,10 +211,17 @@ fn node_runtime_filter_bindings(kind: &ProgramNodeKind) -> Vec<u32> {
             .map(|filter| filter.producer.binding_id())
             .collect(),
         ProgramNodeKind::Join {
-            runtime_filters, ..
+            runtime_filters,
+            runtime_filter_consumers,
+            ..
         } => runtime_filters
             .iter()
             .map(|filter| filter.producer.binding_id())
+            .chain(
+                runtime_filter_consumers
+                    .iter()
+                    .map(|filter| filter.consumer.binding_id()),
+            )
             .collect(),
         _ => Vec::new(),
     }
@@ -278,7 +285,9 @@ fn validate_compiled_runtime_filter_bindings(
 /// scan's `RuntimeFilter { binding }` roots over its own output. This
 /// milestone executes BlockingSnapshot membership (SetUnion) consumers
 /// only; an ordered-domain or NonBlockingLive consumer is refused by name.
-fn compiled_scan_runtime_filters(
+fn compiled_runtime_filter_consumers(
+    owner: &'static str,
+    display_owner: &'static str,
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     bindings: &[FilterConsumerAtExpr],
@@ -293,14 +302,14 @@ fn compiled_scan_runtime_filters(
         let consumer = &binding.consumer;
         if matches!(consumer.contract(), StaticFilterContract::Ordered { .. }) {
             return Err(format!(
-                "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                "compiled {display_owner} at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
                 id.index(),
                 consumer.binding_id()
             ));
         }
         if let FilterConsumerActivation::NonBlockingLive { late_apply } = consumer.activation() {
             return Err(format!(
-                "compiled scan at local node {} runtime-filter binding_id={} with NonBlockingLive {late_apply:?} activation is not executable yet",
+                "compiled {display_owner} at local node {} runtime-filter binding_id={} with NonBlockingLive {late_apply:?} activation is not executable yet",
                 id.index(),
                 consumer.binding_id()
             ));
@@ -309,7 +318,7 @@ fn compiled_scan_runtime_filters(
         contracts.push(runtime_filter_consumer_contract(consumer)?);
     }
     CompiledRuntimeFilterConsumers::try_new(
-        "Scan",
+        owner,
         Arc::clone(program),
         id,
         contracts,
@@ -467,8 +476,15 @@ fn build_node(
                 ));
             }
             // Consumers are built first, so a refused binding builds no driver.
-            let runtime_filters =
-                compiled_scan_runtime_filters(program, id, runtime_filters, ctx, error)?;
+            let runtime_filters = compiled_runtime_filter_consumers(
+                "Scan",
+                "scan",
+                program,
+                id,
+                runtime_filters,
+                ctx,
+                error,
+            )?;
             if limit.is_some() {
                 return Err(format!(
                     "compiled scan at local node {} with a scan limit is not executable yet",

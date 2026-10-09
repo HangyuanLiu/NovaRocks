@@ -157,6 +157,36 @@ fn frozen_reads(
                     ));
                     logical_types.push(field.ty.logical_type);
                 }
+                // Preserve the exact same-source ScanSource endpoint, rather than
+                // inventing consumers from query text or Join probe endpoints.
+                let mut dynamic_filters_by_id: BTreeMap<u32, Arc<str>> = BTreeMap::new();
+                for filter in source.plan().runtime_filters().values() {
+                    for consumer in &filter.consumers {
+                        if consumer.endpoint.fragment != fragment.id()
+                            || consumer.endpoint.node != node.id
+                            || consumer.apply_point != RuntimeFilterApplyPoint::ScanSource
+                        {
+                            continue;
+                        }
+                        let [value] = consumer.endpoint.values.as_ref() else {
+                            panic!("original ScanSource endpoint must name exactly one value");
+                        };
+                        let ordinal = provider_outputs
+                            .iter()
+                            .position(|(_, output)| output == value)
+                            .expect("original ScanSource endpoint belongs to provider output");
+                        let variable: Arc<str> = Arc::from(assignments[ordinal].variable());
+                        if let Some(previous) =
+                            dynamic_filters_by_id.insert(filter.id.get(), Arc::clone(&variable))
+                        {
+                            assert_eq!(previous, variable, "one filter has one scan variable");
+                        }
+                    }
+                }
+                let dynamic_filters = dynamic_filters_by_id
+                    .into_iter()
+                    .map(|(filter_id, variable)| StaticScanDynamicFilter::new(filter_id, variable))
+                    .collect();
                 let recipe = ConnectorReadRelationRecipeDraft::try_new(
                     read.binding.clone(),
                     read.relation.clone(),
@@ -173,7 +203,7 @@ fn frozen_reads(
                     TupleDomain::all(),
                     TupleDomain::all(),
                     None,
-                    Vec::new(),
+                    dynamic_filters,
                     NonZeroU64::new(read_budget.max_batch_rows).unwrap(),
                     NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
                     relation.work_source(),

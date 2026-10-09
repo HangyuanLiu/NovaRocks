@@ -54,11 +54,11 @@ use crate::{
 };
 use arrow_schema::{FieldRef, Schema};
 use novarocks_local_program::{
-    DiagnosticSourceNodeId, FilterProducerAtExpr, JoinDistributionMode, JoinType, LocalOperatorId,
-    LocalOperatorOrigin, LocalOperatorProvenance, MetricAggregation, NestedLoopJoinType,
-    OperatorMetricAggregation, ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId,
-    ProgramNode, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, StaticFilterProducer,
-    StaticLayout,
+    DiagnosticSourceNodeId, FilterConsumerAtJoinKey, FilterProducerAtExpr, JoinDistributionMode,
+    JoinType, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance, MetricAggregation,
+    NestedLoopJoinType, OperatorMetricAggregation, ProgramChannelLayoutRole, ProgramChannelSite,
+    ProgramExprId, ProgramNode, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
+    StaticFilterProducer, StaticLayout,
 };
 use novarocks_physical_plan::{
     Distribution, ExprId, ExpressionRootRole, Fragment, FragmentPackage, JoinDistribution,
@@ -817,6 +817,11 @@ pub(crate) fn lower_join(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     selection_definitions: Option<&[ProgramExprId]>,
     runtime_filters: Vec<(usize, StaticFilterProducer)>,
+    runtime_filter_consumers: Vec<(
+        usize,
+        ProgramExprId,
+        novarocks_local_program::StaticFilterConsumer,
+    )>,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredJoin, FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
@@ -830,6 +835,7 @@ pub(crate) fn lower_join(
         expressions,
         selection_definitions,
         runtime_filters,
+        runtime_filter_consumers,
         &mut work,
     );
     if matches!(&result, Err(FragmentCompileError::Control(_))) {
@@ -959,6 +965,11 @@ fn lower_core(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     selection_definitions: Option<&[ProgramExprId]>,
     runtime_filters: Vec<(usize, StaticFilterProducer)>,
+    runtime_filter_consumers: Vec<(
+        usize,
+        ProgramExprId,
+        novarocks_local_program::StaticFilterConsumer,
+    )>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<LoweredJoin, FragmentCompileError> {
     let fragment = package.fragment();
@@ -1069,6 +1080,21 @@ fn lower_core(
                 });
                 work.step()?;
             }
+            let mut consumers = Vec::new();
+            reserve_vec(&mut consumers, runtime_filter_consumers.len(), work)?;
+            for (key_ordinal, expr_id, consumer) in runtime_filter_consumers {
+                if probe_keys.get(key_ordinal) != Some(&expr_id) {
+                    return Err(FragmentCompileError::Invalid(
+                        "probe consumer differs from its exact key ordinal",
+                    ));
+                }
+                consumers.push(FilterConsumerAtJoinKey {
+                    key_ordinal,
+                    expr_id,
+                    consumer,
+                });
+                work.step()?;
+            }
             ProgramNodeKind::Join {
                 left: probe.node,
                 right: build.node,
@@ -1082,10 +1108,11 @@ fn lower_core(
                 eq_null_safe,
                 residual_predicate: residual.map(|id| lowered(expressions, id)).transpose()?,
                 runtime_filters: producers,
+                runtime_filter_consumers: consumers,
             }
         }
         (NodeKind::NestLoopJoin { .. }, LocalJoinKind::NestLoop(_))
-            if !runtime_filters.is_empty() =>
+            if !runtime_filters.is_empty() || !runtime_filter_consumers.is_empty() =>
         {
             return Err(FragmentCompileError::Invalid(
                 "nested-loop join has runtime-filter producers",

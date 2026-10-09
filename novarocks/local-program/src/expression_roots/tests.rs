@@ -154,6 +154,7 @@ fn metadata_source_program(
                 build_keys: vec![ProgramExprId::new(0)],
                 eq_null_safe: vec![false],
                 residual_predicate: None,
+                runtime_filter_consumers: vec![],
                 runtime_filters: vec![FilterProducerAtExpr {
                     expr_id: source_definition,
                     key_ordinal: 0,

@@ -76,11 +76,20 @@ struct PlannedConsumer {
     consumer: StaticFilterConsumer,
 }
 
+struct PlannedJoinConsumer {
+    requirement: i32,
+    key_ordinal: usize,
+    key: novarocks_physical_plan::ExprId,
+    value: novarocks_physical_plan::ValueId,
+    consumer: StaticFilterConsumer,
+}
+
 /// Every local runtime-filter endpoint of one fragment, admitted and keyed by
 /// its physical node, each node's sites in binding-table order. Lowering takes
 /// each node's sites exactly once.
 pub(crate) struct PlannedRuntimeFilters {
     producers: BTreeMap<NodeId, Vec<PlannedProducer>>,
+    join_consumers: BTreeMap<NodeId, Vec<PlannedJoinConsumer>>,
     consumers: BTreeMap<NodeId, Vec<PlannedConsumer>>,
 }
 
@@ -95,6 +104,8 @@ pub(crate) struct ScanFilterSites {
 /// static producer, and their requirements.
 pub(crate) struct JoinFilterSites {
     pub producers: Vec<(usize, StaticFilterProducer)>,
+    pub consumers: Vec<(usize, ProgramExprId, StaticFilterConsumer)>,
+    pub roots: Vec<RuntimeFilterKeyRoot>,
     pub requirements: Vec<BindingRequirement>,
 }
 
@@ -178,6 +189,7 @@ pub(crate) fn plan_runtime_filters(
     }
     let mut planned = PlannedRuntimeFilters {
         producers: BTreeMap::new(),
+        join_consumers: BTreeMap::new(),
         consumers: BTreeMap::new(),
     };
     let mut bound = BTreeSet::new();
@@ -450,7 +462,7 @@ fn plan_consumer(
     match consumer.target {
         RuntimeFilterConsumerTarget::ScanField { .. } => {}
         RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {
-            return Err(unsupported(node, "join probe-key runtime-filter consumer"));
+            return plan_join_consumer(package, filter, binding, index, planned, work);
         }
         RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
             return Err(unsupported(node, "Aggregate TopN runtime-filter consumer"));
@@ -553,11 +565,164 @@ fn plan_consumer(
     Ok(())
 }
 
+fn plan_join_consumer(
+    package: &FragmentPackage,
+    filter: &RuntimeFilter,
+    binding: &RuntimeFilterBindingCut,
+    index: usize,
+    planned: &mut PlannedRuntimeFilters,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FragmentCompileError> {
+    let fragment = package.fragment();
+    let consumer = &filter.consumers[index];
+    let node = consumer.endpoint.node;
+    let RuntimeFilterConsumerTarget::JoinProbeKey { equality } = consumer.target else {
+        return Err(FragmentCompileError::Invalid(
+            "expected join probe-key target",
+        ));
+    };
+    let witness = filter
+        .equality_witnesses
+        .iter()
+        .find(|w| w.id == equality)
+        .ok_or(FragmentCompileError::Invalid(
+            "join probe consumer has no equality witness",
+        ))?;
+    let join = fragment
+        .nodes()
+        .get(&node)
+        .ok_or(FragmentCompileError::Invalid(
+            "join probe consumer has no join",
+        ))?;
+    let NodeKind::HashJoin {
+        keys, build_side, ..
+    } = &join.kind
+    else {
+        return Err(unsupported(
+            node,
+            "runtime-filter probe consumer outside a hash join",
+        ));
+    };
+    if witness.fragment != fragment.id()
+        || witness.join != node
+        || witness.domain_side != *build_side
+    {
+        return Err(FragmentCompileError::Invalid(
+            "join probe consumer equality witness differs from its join",
+        ));
+    }
+    if consumer.apply_point
+        != (RuntimeFilterApplyPoint::NodeInput {
+            input_ordinal: build_side.opposite().input_ordinal(),
+        })
+    {
+        return Err(unsupported(
+            node,
+            "runtime-filter probe consumer apply point differs from its probe input",
+        ));
+    }
+    if consumer.activation != RuntimeFilterConsumerActivation::BlockingSnapshot {
+        return Err(unsupported(
+            node,
+            "non-blocking join probe-key runtime-filter consumer activation",
+        ));
+    }
+    if consumer.capabilities.as_ref()
+        != [
+            RuntimeFilterArtifactCapability::Membership,
+            RuntimeFilterArtifactCapability::EmptyDomain,
+        ]
+    {
+        return Err(unsupported(
+            node,
+            "runtime-filter probe consumer capabilities other than membership and empty domain",
+        ));
+    }
+    let (contract, null_semantics) = membership_contract(filter, node)?;
+    let key_ordinal =
+        usize::try_from(witness.key_ordinal).map_err(|_| CompileControlError::ResourceExhausted)?;
+    let pair = keys.get(key_ordinal).ok_or(FragmentCompileError::Invalid(
+        "join probe consumer names an absent key",
+    ))?;
+    let key = match build_side {
+        novarocks_physical_plan::JoinSide::Left => pair.right,
+        novarocks_physical_plan::JoinSide::Right => pair.left,
+    };
+    let definition = fragment
+        .expressions()
+        .get(key)
+        .ok_or(FragmentCompileError::Invalid(
+            "missing join probe key definition",
+        ))?;
+    // The checked Physical endpoint author requires this exact direct Value.
+    // No expression is inferred from a matching datatype or from SQL text.
+    let novarocks_physical_plan::ExprKind::Value(value) = &definition.kind else {
+        return Err(FragmentCompileError::Invalid(
+            "join probe endpoint is not its checked direct value key",
+        ));
+    };
+    if consumer.endpoint.values.as_ref() != [*value] {
+        return Err(FragmentCompileError::Invalid(
+            "join probe endpoint differs from its equality key",
+        ));
+    }
+    if &definition.ty.data_type != contract_type(&contract)? {
+        return Err(unsupported(
+            node,
+            "runtime-filter probe key type differs from its membership type",
+        ));
+    }
+    if null_semantics
+        != if pair.null_safe {
+            FilterNullSemantics::NullSafeEqual
+        } else {
+            FilterNullSemantics::NeverMatches
+        }
+    {
+        return Err(unsupported(
+            node,
+            "runtime-filter NULL semantics differ from the join probe equality",
+        ));
+    }
+    let requirement = requirement_id(binding, node)?;
+    let consumer = StaticFilterConsumer::try_new(
+        binding.binding_id,
+        filter.id.get(),
+        FilterConsumerActivation::BlockingSnapshot,
+        contract,
+        FilterReduction::SetUnion,
+    )
+    .map_err(static_filter)?;
+    planned
+        .join_consumers
+        .entry(node)
+        .or_default()
+        .push(PlannedJoinConsumer {
+            requirement,
+            key_ordinal,
+            key,
+            value: *value,
+            consumer,
+        });
+    work.step()?;
+    Ok(())
+}
+
 impl PlannedRuntimeFilters {
     /// The number of compiler-authored consumer key definitions and roots.
     pub(crate) fn consumer_count(&self) -> Result<usize, FragmentCompileError> {
         let mut count = 0usize;
         for consumers in self.consumers.values() {
+            count = count
+                .checked_add(consumers.len())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn join_consumer_count(&self) -> Result<usize, FragmentCompileError> {
+        let mut count = 0usize;
+        for consumers in self.join_consumers.values() {
             count = count
                 .checked_add(consumers.len())
                 .ok_or(CompileControlError::ResourceExhausted)?;
@@ -660,11 +825,16 @@ impl PlannedRuntimeFilters {
     pub(crate) fn take_join(
         &mut self,
         join: NodeId,
+        package: &FragmentPackage,
+        planned_join: &crate::join::PlannedJoin,
+        definitions: &BTreeMap<novarocks_physical_plan::ExprId, ProgramExprId>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<JoinFilterSites, FragmentCompileError> {
         let planned = self.producers.remove(&join).unwrap_or_default();
         let mut sites = JoinFilterSites {
             producers: Vec::new(),
+            consumers: Vec::new(),
+            roots: Vec::new(),
             requirements: Vec::new(),
         };
         crate::assert_rows::reserve_vec(&mut sites.producers, planned.len(), work)?;
@@ -678,12 +848,55 @@ impl PlannedRuntimeFilters {
                 .push((producer.key_ordinal, producer.producer));
             work.step()?;
         }
+        let consumers = self.join_consumers.remove(&join).unwrap_or_default();
+        crate::assert_rows::reserve_vec(&mut sites.consumers, consumers.len(), work)?;
+        crate::assert_rows::reserve_vec(&mut sites.roots, consumers.len(), work)?;
+        crate::assert_rows::reserve_vec(&mut sites.requirements, consumers.len(), work)?;
+        let probe = &package.fragment().nodes()[&planned_join.probe];
+        for (binding, consumer) in consumers.into_iter().enumerate() {
+            let definition =
+                *definitions
+                    .get(&consumer.key)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing lowered probe consumer key",
+                    ))?;
+            let ordinal = probe
+                .output
+                .columns
+                .iter()
+                .position(|v| *v == consumer.value)
+                .ok_or(FragmentCompileError::Invalid(
+                    "probe consumer value is absent from its probe input",
+                ))?;
+            sites.roots.push(RuntimeFilterKeyRoot {
+                node: planned_join.join,
+                binding: u32::try_from(binding)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                definition,
+                source: ProgramChannelSite::Layout {
+                    node: planned_join.join,
+                    role: ProgramChannelLayoutRole::JoinLeft,
+                    ordinal: u32::try_from(ordinal)
+                        .map_err(|_| CompileControlError::ResourceExhausted)?,
+                },
+            });
+            sites.requirements.push(BindingRequirement::RuntimeFilter {
+                binding_id: consumer.requirement,
+            });
+            sites
+                .consumers
+                .push((consumer.key_ordinal, definition, consumer.consumer));
+            work.step()?;
+        }
         Ok(sites)
     }
 
     /// Every admitted endpoint was taken by exactly its lowered owner.
     pub(crate) fn finish(&self) -> Result<(), FragmentCompileError> {
-        if !self.producers.is_empty() || !self.consumers.is_empty() {
+        if !self.producers.is_empty()
+            || !self.consumers.is_empty()
+            || !self.join_consumers.is_empty()
+        {
             return Err(FragmentCompileError::Invalid(
                 "runtime-filter endpoint has no lowered site",
             ));

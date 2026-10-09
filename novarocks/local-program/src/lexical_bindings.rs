@@ -791,9 +791,10 @@ pub fn root_input_layout(
                 (ProgramNodeKind::Values { .. }, Role::ValuesCell { .. }) => {
                     return Ok(ProgramRootInput::Empty);
                 }
-                (ProgramNodeKind::Join { .. }, Role::JoinProbeKey { .. }) => {
-                    (owner, Layout::JoinLeft)
-                }
+                (
+                    ProgramNodeKind::Join { .. },
+                    Role::JoinProbeKey { .. } | Role::RuntimeFilter { .. },
+                ) => (owner, Layout::JoinLeft),
                 (ProgramNodeKind::Join { .. }, Role::JoinBuildKey { .. }) => {
                     (owner, Layout::JoinRight)
                 }

@@ -70,16 +70,16 @@ pub use novarocks_execution_contract::DataStreamPartitionType;
 pub use primitives::{ProgramComparisonSite, ProgramPrimitiveError};
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
-    ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,
-    LocalProgramError, LocalProgramGraph, MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH,
-    MAX_PROGRAM_NODES, NestedLoopJoinType, ProgramCompileError, ProgramNode, ProgramNodeKind,
-    ProgramScanSource, ProjectExpressionSlot, RowAssertion, SetOpKind, SortExpression,
-    SortTopNType, StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature,
-    StaticWindowFunction, StaticWriterProjection, StreamingPreaggregationMode,
-    TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping, UnpivotPassthrough, WindowBoundary,
-    WindowFrame, WindowFunctionKind, WindowType, WriterFinalAggregateCall,
-    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
-    WriterPartialAggregateCall,
+    ChangeEventSpec, FilterConsumerAtExpr, FilterConsumerAtJoinKey, FilterProducerAtExpr,
+    JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph,
+    MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
+    NestedLoopJoinType, ProgramCompileError, ProgramNode, ProgramNodeKind, ProgramScanSource,
+    ProjectExpressionSlot, RowAssertion, SetOpKind, SortExpression, SortTopNType,
+    StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
+    StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
+    UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
+    WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
+    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
 };
 pub use provenance::*;
 pub use provider_links::ProviderLinkError;

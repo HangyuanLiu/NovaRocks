@@ -112,6 +112,23 @@ pub(super) fn build_hash_join(
     // A refused node, or a refused runtime-filter producer, builds no driver.
     let plan = Arc::new(CompiledHashJoinPlan::try_new(program, id)?);
     let producers = compiled_join_producers(program, id, &plan, ctx)?;
+    let ProgramNodeKind::Join {
+        runtime_filter_consumers,
+        ..
+    } = program.graph().nodes()[id.index()].kind()
+    else {
+        unreachable!()
+    };
+    let bindings = runtime_filter_consumers
+        .iter()
+        .map(|filter| novarocks_local_program::FilterConsumerAtExpr {
+            expr_id: filter.expr_id,
+            consumer: filter.consumer.clone(),
+        })
+        .collect::<Vec<_>>();
+    let consumers = super::compiled_runtime_filter_consumers(
+        "Join", "join", program, id, &bindings, ctx, error,
+    )?;
     let probe_build = build_node(program, probe, ctx, error)?;
     let build_build = build_node(program, build, ctx, error)?;
     let mut build_build = gather_to_one(build_build, ctx, node_id);
@@ -129,6 +146,11 @@ pub(super) fn build_hash_join(
         probe_dop,
     ));
     let mut probe_build = probe_build;
+    if let Some(consumers) = consumers {
+        probe_build.pipeline.factories.push(Box::new(
+            crate::exec::operators::runtime_filter::NativeRuntimeFilterProcessorFactory::new_compiled(node_id, consumers)
+        ));
+    }
     probe_build
         .pipeline
         .factories

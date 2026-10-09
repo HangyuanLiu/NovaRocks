@@ -1770,3 +1770,412 @@ fn a_compiled_join_probe_key_consumer_node_is_refused_by_name() {
     assert!(session.subscribed.lock().unwrap().is_empty());
     assert!(subscription.records().is_empty());
 }
+
+// A join-owned consumer retains its key definition but receives one fresh
+// actual use and an exact JoinLeft lexical source, independent of probe uses.
+fn join_with_probe_consumers(
+    program: &LocalProgram,
+    consumers: Vec<StaticFilterConsumer>,
+) -> Result<Arc<LocalProgram>, String> {
+    let join = join_node(program);
+    let mut kind = program.graph().nodes()[join.index()].kind().clone();
+    let ProgramNodeKind::Join {
+        probe_keys,
+        runtime_filter_consumers,
+        ..
+    } = &mut kind
+    else {
+        unreachable!()
+    };
+    let definition = probe_keys[0];
+    let like = site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 });
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    let like_use = snapshot.bindings()[&like];
+    let source = program.checked().slots()[&ProgramUseRef {
+        arena: ProgramExpressionArena::Main,
+        use_id: like_use,
+    }];
+    let mut additions = Additions::default();
+    for (binding, consumer) in consumers.into_iter().enumerate() {
+        additions
+            .requirements
+            .push(requirement(consumer.binding_id()));
+        runtime_filter_consumers.push(novarocks_local_program::FilterConsumerAtJoinKey {
+            expr_id: definition,
+            key_ordinal: 0,
+            consumer,
+        });
+        additions.roots.push(AddedRoot {
+            site: site(
+                join,
+                ProgramNodeExpressionRole::RuntimeFilter {
+                    binding: binding.try_into().unwrap(),
+                },
+            ),
+            like,
+            definition: Some(definition),
+            source: Some(source),
+        });
+    }
+    rebuild(program, with_kind(program, join, kind), additions)
+}
+
+#[test]
+fn join_probe_owned_consumer_actual_root_and_runtime_membership_empty_unavailable() {
+    let base = single_join(false);
+    let program = join_with_probe_consumers(&base, vec![blocking_consumer(7)]).unwrap();
+    let join = join_node(&program);
+    let rf = site(
+        join,
+        ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
+    );
+    let probe = site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 });
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    assert_eq!(
+        snapshot.roots().sites()[&rf].definition,
+        snapshot.roots().sites()[&probe].definition
+    );
+    assert_ne!(snapshot.bindings()[&rf], snapshot.bindings()[&probe]);
+    let use_id = snapshot.bindings()[&rf];
+    assert!(
+        matches!(program.checked().slots()[&ProgramUseRef { arena: ProgramExpressionArena::Main, use_id }],
+        ProgramLexicalSource::Input(ProgramChannelSite::Layout { node, role: ProgramChannelLayoutRole::JoinLeft, .. }) if node == join)
+    );
+    for values in [vec![1, 2, 3, 4, 6], vec![1], vec![]] {
+        let subscription = ControlledSubscription::new();
+        subscription.publish(accepting(7, &values));
+        let filtered = LEFT_ROWS
+            .iter()
+            .copied()
+            .filter(|row| row.0.is_some_and(|v| values.contains(&v)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run_join(&program, FakeSession::consumers(&[(7, &subscription)])).unwrap(),
+            sorted(oracle(hash_spec(false), &filtered, &RIGHT_ROWS))
+        );
+        assert_eq!(subscription.records(), vec!["published"]);
+    }
+    let subscription = ControlledSubscription::new();
+    subscription.publish(execution::SnapshotAcquireOutcome::Cancelled);
+    assert_eq!(
+        run_join(&program, FakeSession::consumers(&[(7, &subscription)])).unwrap(),
+        sorted(oracle(hash_spec(false), &LEFT_ROWS, &RIGHT_ROWS))
+    );
+    assert_eq!(subscription.records(), vec!["cancelled"]);
+}
+
+#[test]
+fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observable() {
+    use crate::exec::operators::runtime_filter::{
+        CompiledRuntimeFilterConsumers, NativeRuntimeFilterProcessorFactory,
+    };
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    let base = single_join(false);
+    let program = join_with_probe_consumers(&base, vec![blocking_consumer(7)]).unwrap();
+    let join = join_node(&program);
+    let contract =
+        super::super::local::runtime_filter_consumer_contract(&blocking_consumer(7)).unwrap();
+    let consumers = Arc::new(
+        CompiledRuntimeFilterConsumers::try_new(
+            "Join",
+            program.clone(),
+            join,
+            vec![contract],
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap(),
+    );
+    let subscription = ControlledSubscription::new();
+    let runtime = state(
+        Some(FakeSession::consumers(&[(7, &subscription)])),
+        Duration::from_secs(60),
+        None,
+    );
+    let factory = NativeRuntimeFilterProcessorFactory::new_compiled(7, consumers.clone());
+    let mut operator = factory.create(1, 0);
+    operator.activate(&runtime).unwrap();
+    let ProgramNodeKind::Join { left_layout, .. } = program.graph().nodes()[join.index()].kind()
+    else {
+        unreachable!()
+    };
+    let arrays = vec![
+        Arc::new(arrow::array::Int64Array::from(vec![Some(1), None, Some(2)]))
+            as arrow::array::ArrayRef,
+        Arc::new(arrow::array::Int64Array::from(vec![
+            Some(10),
+            Some(40),
+            Some(20),
+        ])) as arrow::array::ArrayRef,
+    ];
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(left_layout.schema().clone(), arrays).unwrap();
+    let chunk = Chunk::try_new_with_chunk_schema(
+        batch,
+        crate::exec::chunk::ChunkSchema::from_compiled_layout(left_layout).unwrap(),
+    )
+    .unwrap();
+    assert!(operator.as_processor_ref().unwrap().need_input());
+    assert!(
+        operator
+            .as_processor_ref()
+            .unwrap()
+            .sink_block_deadline()
+            .is_none()
+    );
+    assert!(
+        !operator
+            .as_processor_ref()
+            .unwrap()
+            .can_accept_input(&chunk)
+            .unwrap()
+    );
+    assert!(!operator.as_processor_ref().unwrap().need_input());
+    assert!(
+        operator
+            .as_processor_ref()
+            .unwrap()
+            .sink_block_deadline()
+            .is_some()
+    );
+    assert!(Arc::ptr_eq(
+        &operator
+            .as_processor_ref()
+            .unwrap()
+            .sink_observable()
+            .unwrap(),
+        &consumers.state().gate_observable()
+    ));
+    subscription.publish(accepting(7, &[2]));
+    assert!(
+        operator
+            .as_processor_ref()
+            .unwrap()
+            .can_accept_input(&chunk)
+            .unwrap()
+    );
+    operator
+        .as_processor_mut()
+        .unwrap()
+        .push_chunk(&runtime, chunk)
+        .unwrap();
+    let output = operator
+        .as_processor_mut()
+        .unwrap()
+        .pull_chunk(&runtime)
+        .unwrap()
+        .unwrap();
+    assert_eq!(int64_rows(&[output]), vec![vec![Some(2), Some(20)]]);
+    operator
+        .as_processor_mut()
+        .unwrap()
+        .set_finishing(&runtime)
+        .unwrap();
+    assert!(operator.is_finished());
+    assert_eq!(subscription.records(), vec!["published"]);
+}
+
+#[test]
+fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latch() {
+    use novarocks_functions::{KernelEvaluationControl, KernelFailure, KernelDiagnostic, Selection};
+    use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+    struct Control {
+        calls: Mutex<Vec<u32>>,
+        refusal: Option<(usize, KernelFailure)>,
+    }
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            let mut calls = self.calls.lock().unwrap();
+            let at = calls.len();
+            calls.push(units);
+            if let Some((stop, cause)) = &self.refusal {
+                if at == *stop {
+                    return Err(cause.clone());
+                }
+            }
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("a key root never waits")
+        }
+    }
+    let program =
+        join_with_probe_consumers(&single_join(false), vec![blocking_consumer(7)]).unwrap();
+    let join = join_node(&program);
+    let root = site(
+        join,
+        ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
+    );
+    let ProgramNodeKind::Join { left_layout, .. } = program.graph().nodes()[join.index()].kind()
+    else {
+        unreachable!()
+    };
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        left_layout.schema().clone(),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(vec![Some(1), None, Some(2)]))
+                as arrow::array::ArrayRef,
+            Arc::new(arrow::array::Int64Array::from(vec![
+                Some(10),
+                Some(40),
+                Some(20),
+            ])) as arrow::array::ArrayRef,
+        ],
+    )
+    .unwrap();
+    let make = || {
+        let construction = Control {
+            calls: Mutex::new(vec![]),
+            refusal: None,
+        };
+        CompiledExpressionInstance::try_new(program.clone(), root, &construction).unwrap()
+    };
+    let baseline = Control {
+        calls: Mutex::new(vec![]),
+        refusal: None,
+    };
+    let mut instance = make();
+    instance
+        .evaluate(&batch, Selection::all(3), &baseline)
+        .unwrap();
+    let trace = baseline.calls.lock().unwrap().clone();
+    assert!(!trace.is_empty());
+    for at in 0..trace.len() {
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("original")),
+            KernelFailure::Internal(KernelDiagnostic::new("original")),
+            KernelFailure::Operational(KernelDiagnostic::new("original")),
+            KernelFailure::InstanceFailed,
+        ] {
+            let control = Control {
+                calls: Mutex::new(vec![]),
+                refusal: Some((at, cause.clone())),
+            };
+            let mut instance = make();
+            assert_eq!(
+                instance
+                    .evaluate(&batch, Selection::all(3), &control)
+                    .unwrap_err(),
+                cause
+            );
+            assert_eq!(*control.calls.lock().unwrap(), trace[..=at]);
+            let before = control.calls.lock().unwrap().clone();
+            assert_eq!(
+                instance
+                    .evaluate(&batch, Selection::all(3), &control)
+                    .unwrap_err(),
+                KernelFailure::InstanceFailed
+            );
+            assert_eq!(*control.calls.lock().unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn join_probe_owned_null_safe_key_retains_null_matches_with_original_evaluator() {
+    struct NullMembership(Int64Membership);
+    impl execution::RuntimeFilterArtifactQuery for NullMembership {
+        fn data_type(&self) -> &DataType {
+            self.0.data_type()
+        }
+        fn matches_null(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+        fn has_non_null_matches(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            self.0.has_non_null_matches()
+        }
+        fn non_null_value_may_match(
+            &self,
+            value: execution::RuntimeFilterScalarRef<'_>,
+        ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            self.0.non_null_value_may_match(value)
+        }
+        fn non_null_range_may_match(
+            &self,
+            lo: &ConnectorScalarValue,
+            hi: &ConnectorScalarValue,
+        ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            self.0.non_null_range_may_match(lo, hi)
+        }
+    }
+    let consumer = StaticFilterConsumer::try_new(
+        7,
+        7,
+        FilterConsumerActivation::BlockingSnapshot,
+        membership(&DataType::Int64, FilterNullSemantics::NullSafeEqual),
+        FilterReduction::SetUnion,
+    )
+    .unwrap();
+    let program = join_with_probe_consumers(&single_join(true), vec![consumer]).unwrap();
+    let subscription = ControlledSubscription::new();
+    subscription.publish(execution::SnapshotAcquireOutcome::Published(Arc::new(
+        execution::RuntimeFilterSnapshot::new(
+            execution::RuntimeFilterBindingId::new(7),
+            execution::LogicalVersion::FIRST,
+            [0; 32],
+            Arc::new(NullMembership(Int64Membership {
+                accepted: BTreeSet::from([1, 2, 3, 4, 6]),
+            })),
+        ),
+    )));
+    assert_eq!(
+        run_join(&program, FakeSession::consumers(&[(7, &subscription)])).unwrap(),
+        sorted(oracle(hash_spec(true), &LEFT_ROWS, &RIGHT_ROWS))
+    );
+    assert_eq!(subscription.records(), vec!["published"]);
+}
+
+#[test]
+fn join_probe_owned_contract_rejects_bad_ordinal_and_unsafe_local_join_direction() {
+    let base = single_join(false);
+    let program = join_with_probe_consumers(&base, vec![blocking_consumer(7)]).unwrap();
+    let join = join_node(&program);
+    for unsafe_kind in [
+        novarocks_local_program::JoinType::LeftOuter,
+        novarocks_local_program::JoinType::LeftAnti,
+        novarocks_local_program::JoinType::NullAwareLeftAnti,
+    ] {
+        let mut kind = program.graph().nodes()[join.index()].kind().clone();
+        let ProgramNodeKind::Join { join_type, .. } = &mut kind else {
+            unreachable!()
+        };
+        *join_type = unsafe_kind;
+        assert!(
+            rebuild(
+                &program,
+                with_kind(&program, join, kind),
+                Additions::default()
+            )
+            .is_err()
+        );
+    }
+    let mut kind = program.graph().nodes()[join.index()].kind().clone();
+    let ProgramNodeKind::Join {
+        runtime_filter_consumers,
+        ..
+    } = &mut kind
+    else {
+        unreachable!()
+    };
+    runtime_filter_consumers[0].key_ordinal = usize::MAX;
+    assert!(
+        rebuild(
+            &program,
+            with_kind(&program, join, kind),
+            Additions::default()
+        )
+        .is_err()
+    );
+}

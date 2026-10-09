@@ -662,6 +662,7 @@ impl Lowering<'_> {
                         eq_null_safe: n.eq_null_safe,
                         residual_predicate: n.residual_predicate.map(expr),
                         runtime_filters,
+                        runtime_filter_consumers: vec![],
                     },
                 )
             }

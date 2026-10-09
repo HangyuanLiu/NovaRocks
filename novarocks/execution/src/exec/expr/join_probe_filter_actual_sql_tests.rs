@@ -65,3 +65,74 @@ fn join_probe_filter_actual_original_sql_complete_compilation() {
         }
     }
 }
+
+#[test]
+fn join_probe_owned_actual_sql_compiler_every_callback_preserves_three_causes() {
+    use super::filter_conjunction_actual_sql_compiler_tests::{
+        source_packages, validate_package, compile_options,
+    };
+    use novarocks_type_contract::{PureCompileControl, CompilePhase, CompileControlError};
+    use std::sync::Mutex;
+    struct Trace {
+        events: Mutex<Vec<(CompilePhase, u32)>>,
+        refusal: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Trace {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut events = self.events.lock().unwrap();
+            let at = events.len();
+            events.push((phase, units));
+            if let Some((stop, cause)) = self.refusal {
+                if at == stop {
+                    return Err(cause);
+                }
+            }
+            Ok(())
+        }
+    }
+    let functions = installed_builtin_owner_catalogue();
+    let source = sources().remove(0);
+    let package = source_packages(&source)
+        .into_iter()
+        .find(|(_, package)| {
+            package.cuts().runtime_filters.iter().any(|filter| {
+                filter
+                    .consumers
+                    .iter()
+                    .any(|c| matches!(c.target, RuntimeFilterConsumerTarget::JoinProbeKey { .. }))
+            })
+        })
+        .expect("the original SQL authors a local join probe consumer")
+        .1;
+    let run = |control: &Trace| {
+        novarocks_local_compiler::compile_fragment(
+            validate_package(package.clone()),
+            &functions,
+            compile_options(),
+            control,
+        )
+    };
+    let baseline = Trace {
+        events: Mutex::new(vec![]),
+        refusal: None,
+    };
+    run(&baseline).unwrap();
+    let events = baseline.events.lock().unwrap().clone();
+    assert!(!events.is_empty());
+    for at in 0..events.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Trace {
+                events: Mutex::new(vec![]),
+                refusal: Some((at, cause)),
+            };
+            assert!(
+                matches!(run(&control),Err(novarocks_local_compiler::FragmentCompileError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.events.lock().unwrap(), events[..=at]);
+        }
+    }
+}

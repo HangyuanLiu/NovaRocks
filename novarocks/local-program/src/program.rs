@@ -123,6 +123,14 @@ pub struct FilterConsumerAtExpr {
     pub consumer: StaticFilterConsumer,
 }
 
+/// An admitted consumer of exactly one key of its owning hash join.
+#[derive(Clone, Debug)]
+pub struct FilterConsumerAtJoinKey {
+    pub expr_id: ProgramExprId,
+    pub key_ordinal: usize,
+    pub consumer: StaticFilterConsumer,
+}
+
 #[derive(Clone, Debug)]
 pub struct FilterProducerAtExpr {
     pub expr_id: ProgramExprId,
@@ -464,6 +472,7 @@ pub enum ProgramNodeKind {
         eq_null_safe: Vec<bool>,
         residual_predicate: Option<ProgramExprId>,
         runtime_filters: Vec<FilterProducerAtExpr>,
+        runtime_filter_consumers: Vec<FilterConsumerAtJoinKey>,
     },
     NestedLoopJoin {
         left: ProgramNodeId,
@@ -650,6 +659,7 @@ impl ProgramNodeKind {
                 build_keys,
                 residual_predicate,
                 runtime_filters,
+                runtime_filter_consumers,
                 ..
             } => {
                 for id in probe_keys
@@ -658,6 +668,9 @@ impl ProgramNodeKind {
                     .chain(residual_predicate)
                 {
                     visit(Some(*id))?;
+                }
+                for filter in runtime_filter_consumers {
+                    visit(Some(filter.expr_id))?;
                 }
                 for filter in runtime_filters {
                     visit(Some(filter.expr_id))?;
@@ -1430,8 +1443,13 @@ fn node_filter_ids(
             }
         }
         ProgramNodeKind::Join {
-            runtime_filters, ..
+            runtime_filters,
+            runtime_filter_consumers,
+            ..
         } => {
+            for filter in runtime_filter_consumers {
+                add(filter.consumer.binding_id())?;
+            }
             for filter in runtime_filters {
                 add(filter.producer.binding_id())?;
             }
@@ -1658,17 +1676,28 @@ fn validate_shape(
             }
         }
         ProgramNodeKind::Join {
+            join_type,
             probe_keys,
             build_keys,
             eq_null_safe,
             runtime_filters,
+            runtime_filter_consumers,
             ..
         } => {
-            let bad =
-                probe_keys.len() != build_keys.len() || probe_keys.len() != eq_null_safe.len();
+            let bad = (!runtime_filter_consumers.is_empty()
+                && !matches!(join_type, JoinType::Inner | JoinType::LeftSemi))
+                || probe_keys.len() != build_keys.len()
+                || probe_keys.len() != eq_null_safe.len();
             work.step()?;
             if bad {
                 return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for filter in runtime_filter_consumers {
+                let bad = probe_keys.get(filter.key_ordinal) != Some(&filter.expr_id);
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
             }
             for filter in runtime_filters {
                 let bad = build_keys.get(filter.key_ordinal) != Some(&filter.expr_id);

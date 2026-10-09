@@ -453,6 +453,7 @@ impl RootCollector<'_> {
                 build_keys,
                 residual_predicate,
                 join_type,
+                runtime_filter_consumers,
                 ..
             } => {
                 for (key, definition) in probe_keys.iter().enumerate() {
@@ -481,6 +482,16 @@ impl RootCollector<'_> {
                         } else {
                             TruthOnly
                         },
+                    )?;
+                }
+                for (binding, consumer) in runtime_filter_consumers.iter().enumerate() {
+                    self.node_root(
+                        node,
+                        Role::RuntimeFilter {
+                            binding: ordinal(binding)?,
+                        },
+                        consumer.expr_id,
+                        Value,
                     )?;
                 }
                 // Build-side RF producers observe the evaluated key arrays.
