@@ -492,3 +492,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 默认关闭的 exact-write fixture 把原 registered intermediary 的实际 IO 原因、完整 connection token 和原 Ordinary/Control 类别移交同一个 session ledger；摘要只含有限数字，第一实际 source 保留，counter overflow 和 supervisor wake 均可失败。owner finish 在原第四阶段纳入该原因，不增加第五个 cleanup stage。真实注册 TCP 握手 / ungoverned-result 拒绝测试观察原 socket EOF、watcher actual join、registry drain 后仍能取出原因。feature adapter **130 PASS / 0 FAIL / 0 ignored，2.46s**；default server check PASS。初次测试插入位置错误导致编译失败的原日志保留，修正后通过。
 
 这只闭合原 IO cause 丢失缺口；missing-tail / Closing pool refusal 的 prescribed EOF 仍需结构化分类，当前没有按 ErrorKind/string 放行。native exact cut、W2 原 freeze、真实 KILL、恢复和四个 role 实际退出仍 OPEN。证据：`docs/testing/mem-1-m07/evidence/p09-original-protocol-io-source-components-20261009.json`，source base `5ee78468f52f05e3847e97ac20ea0ce41d36e68a`。
+
+### P09 independent runner frame-v1 component checkpoint (2026-10-09)
+
+独立 Unix frame-v1 codec/client 已接入 system runner actors（而非草稿 SQL runner 路径），无 adapter/gate/private token 依赖；原 source/tests 字节不变，manifest/lock 未改。严格 4096 全 wire、完整 FE UUID、canonical TLVs/bool/options/enums/尾随拒绝、真实 partial EOF/长度/hash、单原 UnixStream owner、取消借用后禁止复用及跨命令原 absolute deadline 定向 **17 PASS / 0 FAIL / 0 ignored，0.22s**。
+
+这仍是 component evidence：原 scene 20s / FE child fixture locator、actual FE 独立来源、真实服务端三指令互通、精确 native cut/W2/Closing/ACK/恢复/四 role 退出保持 OPEN。实际 server 16 指令包括 Stop，第16次非Stop失败；client pair-stream cap测试不能当 server 健康证明。收据 `docs/testing/mem-1-m07/evidence/p09-runner-unix-frame-v1-components-20261009.json`。HMS继续按已记录只读scope；其它容量、期限、待裁决语义无改动。

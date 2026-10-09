@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "a8193f763dca129da4755eefa0e0fd73ddb62e20",
+  "status": "RUNNER_CODEC_COMPONENT_PASS_NATIVE_OPEN",
+  "source_files": [
+    {
+      "path": "tests/system-test-runner/src/actors/mod.rs",
+      "bytes": 120,
+      "sha256": "649144c2809f23291282d01e35e33e7b08134329a6740cb6dd0947ffc7b4ce68"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/exact_mysql_control.rs",
+      "bytes": 27220,
+      "sha256": "51db838271890dc55160dae073b9abade118aa911859d87e617b792a0e278a23"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/exact_mysql_control.tests.rs",
+      "bytes": 25189,
+      "sha256": "0c89dd75885d610ed5af7c7ac9a97a33256aa256fa75f3afe72066a2ee1d1000"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-runner-unix-frame-v1-components-v1-20261009.log",
+      "bytes": 7664,
+      "sha256": "9db2403792ff4faa09bd6a6c7759b80147a6a67f95dbb86da1138d9789e0220d"
+    },
+    {
+      "path": "logs/mem-1-m07/runner-unix-frame-v1-draft/runner-frame-v1.new-files.draft.patch",
+      "bytes": 54315,
+      "sha256": "eacb45b39e33ab065282463e830d9f385ef7b32ca8052367523464bbd79b07ce"
+    },
+    {
+      "path": "logs/mem-1-m07/runner-unix-frame-v1-draft/README.audit.md",
+      "bytes": 9750,
+      "sha256": "49b9a3a3904a8d97878062ad02cab642ce197408c0a3fc0d71b50651856f8cff"
+    },
+    {
+      "path": "logs/mem-1-m07/runner-unix-frame-v1-draft/receipt.json",
+      "bytes": 3309,
+      "sha256": "abd680db2002558ecdf48a9bc1eaa21904a17f706ac41a1b480788c69b44d56b"
+    }
+  ],
+  "verification": {
+    "command": "CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p novarocks-system-test-runner exact_mysql_control -- --test-threads=1",
+    "passed": 17,
+    "failed": 0,
+    "ignored": 0,
+    "seconds": 0.22
+  },
+  "integration": "Root placed independent unchanged source/tests under system runner actors instead of draft SQL runner path because P09 native scenarios are system-runner-owned. No manifest/lock change.",
+  "open": [
+    "Original scene absolute20s/startup binding and full actual FE independent source remain OPEN.",
+    "Real server Arm/Snapshot/Stop interoperability, exact native cut/window/Closing/ACK/healthy and actual role exits remain OPEN.",
+    "Actual server permits at most16 commands including Stop;16 nonStop causes failure. Pair-stream client-cap test does not prove server health."
+  ],
+  "scope": "Strict4096 fullwire frame-v1, fixed DTOs, no adapter/gate/private token authority, sole UnixStream owner, no tasks/reconnect/SQL copy/deadline refresh/default feature changes"
+}
