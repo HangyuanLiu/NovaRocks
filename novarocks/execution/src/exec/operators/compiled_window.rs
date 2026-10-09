@@ -54,7 +54,9 @@ use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
 use novarocks_functions::{
     EvaluatedArgument, FullPartitionWindowInput, PreparedWindowKernel, Selection,
-    WindowEvaluationPartition, WindowPartitionInput, WindowRowRange,
+    WindowEvaluationPartition, WindowInvocationContext, WindowPartitionInput, WindowRowRange,
+    WindowResultCarrier, WindowInvocationScratch, AggregateStateAllocator, KernelEvaluationControl,
+    KernelFailure,
 };
 use novarocks_local_program::{
     AnalyticOutputColumn, LocalProgram, ProgramCallSite, ProgramExpressionRootSite,
@@ -62,8 +64,13 @@ use novarocks_local_program::{
     WindowFunctionKind,
 };
 
+#[path = "compiled_window_invocation_input.rs"]
+mod invocation_input;
+use invocation_input::InvocationInputBuffer;
+
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
-use super::compiled_window_geometry::{admit_frame, frame_table, peer_groups};
+use super::analytic_shared::{AnalyticOutputValidationFailure, validate_analytic_output_columns_typed};
+use super::compiled_window_geometry::{admit_frame, frame_table, frame_table_tracked, peer_groups};
 use super::sort::normalize_sort_key_array;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
@@ -103,6 +110,7 @@ pub struct CompiledWindowProcessorFactory {
     columns: Vec<OutputSource>,
     output: ChunkSchemaRef,
     error: Arc<RuntimeErrorState>,
+    original_function_major: bool,
 }
 
 impl CompiledWindowProcessorFactory {
@@ -235,6 +243,11 @@ impl CompiledWindowProcessorFactory {
             ));
         }
         let (partition_keys, order_keys) = (partition_exprs.len(), order_by_exprs.len());
+        // Positive immutable owner capability, never a function-name decision.
+        let original_function_major = calls
+            .iter()
+            .any(|call| call.kernel.has_original_invocation_handoff());
+
         Ok(Self {
             name: format!("COMPILED_ANALYTIC (node={at})"),
             program,
@@ -245,6 +258,7 @@ impl CompiledWindowProcessorFactory {
             columns,
             output,
             error,
+            original_function_major,
         })
     }
 }
@@ -273,6 +287,10 @@ impl OperatorFactory for CompiledWindowProcessorFactory {
             pending: VecDeque::new(),
             finishing: false,
             finished: false,
+            failed: None,
+            original_function_major: self.original_function_major,
+            invocation_input: None,
+            partition_ordinal: 0,
         })
     }
 }
@@ -305,6 +323,10 @@ struct CompiledWindowProcessor {
     pending: VecDeque<Chunk>,
     finishing: bool,
     finished: bool,
+    failed: Option<ExecutionFailure>,
+    original_function_major: bool,
+    invocation_input: Option<InvocationInputBuffer>,
+    partition_ordinal: usize,
 }
 
 /// Row-encode normalized keys with the processor's one encoder for them.
@@ -326,7 +348,395 @@ fn encode(converter: &mut Option<RowConverter>, keys: &[ArrayRef]) -> ExecutionR
         .map_err(|error| failure("compiled window key row encoding", error))
 }
 
+/// Maximal adjacent groups using the ONE original semantic equality author.
+/// Every demanded key occurrence observes its real control; no decoded value,
+/// guessed dictionary expansion, or second comparison algorithm is introduced.
+fn original_peer_groups(
+    keys: &[ArrayRef],
+    start: usize,
+    end: usize,
+    host: Arc<dyn AggregateStateAllocator>,
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<WindowInvocationScratch<WindowRowRange>> {
+    let mut groups = WindowInvocationScratch::try_with_capacity(
+        if keys.is_empty() {
+            usize::from(start != end)
+        } else {
+            end - start
+        },
+        host,
+        control,
+    )?;
+    if start == end {
+        return Ok(groups);
+    }
+    let mut first = start;
+    for row in start + 1..end {
+        let mut equal = true;
+        for key in keys {
+            control.checkpoint(1)?;
+            if !super::analytic_shared::row_equal_on_keys(std::slice::from_ref(key), row - 1, row)
+                .map_err(ExecutionFailure::from)?
+            {
+                equal = false;
+                break;
+            }
+        }
+        if !equal {
+            groups.try_push(
+                WindowRowRange {
+                    start: first,
+                    end: row,
+                },
+                control,
+            )?;
+            first = row;
+        }
+    }
+    groups.try_push(WindowRowRange { start: first, end }, control)?;
+    Ok(groups)
+}
+
 impl CompiledWindowProcessor {
+    fn failure_result<T>(&mut self, result: ExecutionResult<T>) -> ExecutionResult<T> {
+        if let Some(cause) = &self.failed {
+            return Err(cause.clone());
+        }
+        match result {
+            Ok(value) => Ok(value),
+            Err(cause) => {
+                self.failed = Some(cause);
+                self.finishing = true;
+                self.finished = true;
+                self.instances = None;
+                self.invocation_input = None;
+                self.partition_rows = None;
+                self.order_rows = None;
+                self.last_partition = None;
+                drop(std::mem::take(&mut self.open));
+                drop(std::mem::take(&mut self.pending));
+                Err(self
+                    .failed
+                    .as_ref()
+                    .expect("first window failure retained")
+                    .clone())
+            }
+        }
+    }
+
+    fn consume_invocation(&mut self, chunk: Chunk) -> ExecutionResult<()> {
+        if self.invocation_input.is_none() {
+            let host = self.control.allocator().ok_or_else(|| {
+                KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+                    "tracked window invocation requires its actual allocator",
+                ))
+            })?;
+            self.invocation_input = Some(InvocationInputBuffer::try_new(host, &self.control)?);
+        }
+        self.invocation_input
+            .as_mut()
+            .expect("input owner installed")
+            .push(chunk, &self.control)?;
+        Ok(())
+    }
+    fn finish_invocation(&mut self) -> ExecutionResult<()> {
+        use novarocks_functions::{
+            FullWindowInvocationInput, WindowInvocationInput, WindowEvaluationInvocation,
+        };
+        // Check the real capability even for an empty source. No default host.
+        let host = self.control.allocator().ok_or_else(|| {
+            KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+                "tracked window invocation requires its actual allocator",
+            ))
+        })?;
+        if host.opaque_allocation_host().is_none() {
+            return Err(
+                KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+                    "tracked window invocation requires its actual opaque host",
+                ))
+                .into(),
+            );
+        }
+        let Some(input_owner) = self.invocation_input.take() else {
+            return Ok(());
+        };
+        let input = input_owner.chunks();
+        if input.is_empty() {
+            return Ok(());
+        }
+        // This is the ONE original input-gather author; source backing and its
+        // existing Chunk accounting lease survive through final splitting.
+        let mut ordered = super::analytic_shared::concat_original_analytic_input(input)?;
+        let rows = ordered.len();
+        if rows == 0 {
+            return Ok(());
+        }
+        instances(
+            &mut self.instances,
+            &self.program,
+            &self.sites,
+            &self.control,
+        )?;
+        let instances = self.instances.as_mut().expect("instances created");
+        let mut keys = WindowInvocationScratch::try_with_capacity(
+            self.partition_keys + self.order_keys,
+            host.clone(),
+            &self.control,
+        )?;
+        for root in 0..self.partition_keys + self.order_keys {
+            keys.try_push(
+                evaluate_all(
+                    &mut instances[root],
+                    self.sites[root],
+                    &ordered.batch,
+                    &self.control,
+                )?,
+                &self.control,
+            )?;
+        }
+        let regroup = novarocks_functions::window_input_order::should_regroup_partition_only(
+            self.order_keys != 0,
+            self.calls
+                .iter()
+                .any(|call| call.kernel.contract().options().frame().is_some()),
+            self.calls
+                .iter()
+                .map(|call| call.kernel.original_partition_regroup_eligible()),
+        );
+        if rows > 1 && self.partition_keys != 0 && regroup {
+            ordered = super::analytic_shared::reorder_chunk_by_partition_keys(
+                &ordered,
+                &keys[..self.partition_keys],
+            )?;
+            // Original source really re-invokes these roots even when the
+            // permutation happened to be identity. No source CSE is invented.
+            for root in 0..self.partition_keys + self.order_keys {
+                keys.as_mut_slice()[root] = evaluate_all(
+                    &mut instances[root],
+                    self.sites[root],
+                    &ordered.batch,
+                    &self.control,
+                )?;
+            }
+        }
+        let batch = &ordered.batch;
+        // The original adjacency author compares the actual keys directly.
+        // It preserves signed zero / NaN bit identity and original supported
+        // key errors, without a new normalized-key or RowConverter allocation.
+        let partitions = original_peer_groups(
+            &keys[..self.partition_keys],
+            0,
+            rows,
+            host.clone(),
+            &self.control,
+        )?;
+        let order = &keys[self.partition_keys..];
+        let mut peers =
+            WindowInvocationScratch::try_with_capacity(rows, host.clone(), &self.control)?;
+        for part in &partitions {
+            for peer in
+                original_peer_groups(order, part.start, part.end, host.clone(), &self.control)?
+                    .iter()
+            {
+                peers.try_push(*peer, &self.control)?;
+            }
+        }
+        let mut results = WindowInvocationScratch::try_with_capacity(
+            self.calls.len(),
+            host.clone(),
+            &self.control,
+        )?;
+        for (call_ordinal, call) in self.calls.iter().enumerate() {
+            // Original function-major order: this call's full-input argument
+            // uses precede THIS call's all-partition work, not later call roots.
+            let mut arguments = WindowInvocationScratch::try_with_capacity(
+                call.roots,
+                host.clone(),
+                &self.control,
+            )?;
+            for root in call.first_root..call.first_root + call.roots {
+                arguments.try_push(
+                    evaluate_all(
+                        &mut instances[root],
+                        self.sites[root],
+                        &ordered.batch,
+                        &self.control,
+                    )?,
+                    &self.control,
+                )?;
+            }
+            if call.kernel.has_original_invocation_handoff() {
+                let mut frames =
+                    WindowInvocationScratch::try_with_capacity(rows, host.clone(), &self.control)?;
+                for part in &partitions {
+                    let mut local_peers = WindowInvocationScratch::try_with_capacity(
+                        part.end - part.start,
+                        host.clone(),
+                        &self.control,
+                    )?;
+                    for peer in peers
+                        .iter()
+                        .filter(|peer| peer.start >= part.start && peer.end <= part.end)
+                    {
+                        local_peers.try_push(
+                            WindowRowRange {
+                                start: peer.start - part.start,
+                                end: peer.end - part.start,
+                            },
+                            &self.control,
+                        )?;
+                    }
+                    let local_frames = frame_table_tracked(
+                        &call.frame,
+                        &local_peers,
+                        host.clone(),
+                        &self.control,
+                    )?;
+                    for frame in local_frames.iter() {
+                        frames.try_push(
+                            WindowRowRange {
+                                start: part.start + frame.start,
+                                end: part.start + frame.end,
+                            },
+                            &self.control,
+                        )?;
+                    }
+                }
+                let mut logical = WindowInvocationScratch::try_with_capacity(
+                    arguments.len(),
+                    host.clone(),
+                    &self.control,
+                )?;
+                for argument in arguments.iter() {
+                    logical.try_push(EvaluatedArgument::Column(argument), &self.control)?;
+                }
+                let full = FullWindowInvocationInput::try_new(
+                    call.kernel.contract().as_ref(),
+                    rows,
+                    &logical,
+                    &[],
+                    &self.control,
+                )?;
+                let source = WindowInvocationInput::try_new(
+                    full,
+                    &partitions,
+                    &peers,
+                    &frames,
+                    &self.control,
+                )?;
+                let mut invocation = WindowEvaluationInvocation::begin(
+                    Arc::clone(&call.kernel),
+                    source,
+                    WindowInvocationContext::complete_invocation(call_ordinal),
+                    Some(Arc::clone(&host)),
+                    &self.control,
+                )?;
+                let carrier = invocation.complete_carrier(&self.control)?;
+                let values = Arc::clone(carrier.values());
+                invocation.finish(&self.control)?;
+                results.try_push(
+                    CallOutput {
+                        values,
+                        carrier: Some(carrier),
+                    },
+                    &self.control,
+                )?;
+            } else {
+                // Mixed nodes retain the existing FixedZero partition owner
+                // and its errors, while preserving original call priority.
+                let mut outputs = Vec::with_capacity(partitions.len());
+                for (part_ordinal, part) in partitions.iter().enumerate() {
+                    let arguments = slice(&arguments, part.start, part.end - part.start);
+                    let logical = arguments
+                        .iter()
+                        .map(EvaluatedArgument::Column)
+                        .collect::<Vec<_>>();
+                    let mut local_peers = WindowInvocationScratch::try_with_capacity(
+                        part.end - part.start,
+                        host.clone(),
+                        &self.control,
+                    )?;
+                    for peer in peers
+                        .iter()
+                        .filter(|peer| peer.start >= part.start && peer.end <= part.end)
+                    {
+                        local_peers.try_push(
+                            WindowRowRange {
+                                start: peer.start - part.start,
+                                end: peer.end - part.start,
+                            },
+                            &self.control,
+                        )?;
+                    }
+                    let local_frames =
+                        frame_table(&call.frame, &local_peers).map_err(ExecutionFailure::from)?;
+                    outputs.push(
+                        evaluate_call(
+                            &call.kernel,
+                            call_ordinal,
+                            part_ordinal,
+                            part.end - part.start,
+                            &logical,
+                            &local_peers,
+                            &local_frames,
+                            &self.control,
+                        )?
+                        .values,
+                    );
+                }
+                let values = if outputs.len() == 1 {
+                    outputs.pop().expect("one partition")
+                } else {
+                    let parts = outputs
+                        .iter()
+                        .map(|array| array.as_ref())
+                        .collect::<Vec<&dyn Array>>();
+                    concat(&parts)
+                        .map_err(|error| failure("compiled window partition concat", error))?
+                };
+                results.try_push(
+                    CallOutput {
+                        values,
+                        carrier: None,
+                    },
+                    &self.control,
+                )?;
+            }
+        }
+        let mut columns = WindowInvocationScratch::try_with_capacity(
+            self.columns.len(),
+            host.clone(),
+            &self.control,
+        )?;
+        for source in &self.columns {
+            columns.try_push(
+                match source {
+                    OutputSource::Input(ordinal) => Arc::clone(batch.column(*ordinal)),
+                    OutputSource::Call(call) => Arc::clone(&results[*call].values),
+                },
+                &self.control,
+            )?;
+        }
+        validate_complete_output(
+            &columns,
+            &self.columns,
+            &results,
+            &self.output,
+            rows,
+            &self.control,
+        )?;
+        // Keep original arrival chunk boundaries; changing them would alter
+        // batch-sensitive downstream legacy semantics independently of BY.
+        let outputs = super::analytic_shared::split_analytic_output_chunks(
+            Arc::clone(&self.output),
+            &columns,
+            input,
+        )?;
+        self.pending = outputs;
+        self.partition_rows = None;
+        self.order_rows = None;
+        Ok(())
+    }
     /// Evaluate every root over the arriving rows, then split them at the
     /// partition boundaries; every partition the rows close is evaluated.
     fn consume(&mut self, chunk: &Chunk) -> ExecutionResult<()> {
@@ -418,7 +828,7 @@ impl CompiledWindowProcessor {
         };
         let first_argument = self.partition_keys + self.order_keys;
         let mut results = Vec::with_capacity(self.calls.len());
-        for call in &self.calls {
+        for (call_ordinal, call) in self.calls.iter().enumerate() {
             let frames = frame_table(&call.frame, &peers).map_err(ExecutionFailure::from)?;
             let start = call.first_root - first_argument;
             let logical = arguments[start..start + call.roots]
@@ -427,6 +837,8 @@ impl CompiledWindowProcessor {
                 .collect::<Vec<_>>();
             results.push(evaluate_call(
                 &call.kernel,
+                call_ordinal,
+                self.partition_ordinal,
                 rows,
                 &logical,
                 &peers,
@@ -439,11 +851,28 @@ impl CompiledWindowProcessor {
             .iter()
             .map(|source| match source {
                 OutputSource::Input(ordinal) => Arc::clone(batch.column(*ordinal)),
-                OutputSource::Call(call) => Arc::clone(&results[*call]),
+                OutputSource::Call(call) => Arc::clone(&results[*call].values),
             })
             .collect::<Vec<_>>();
-        RecordBatch::try_new(self.output.arrow_schema_ref(), columns)
-            .map_err(|error| failure("compiled window output", error))
+        // Only the new complete-carrier route invokes the original final
+        // analytic validator. Existing FixedZero rows retain their old route.
+        if results.iter().any(|result| result.carrier.is_some()) {
+            validate_complete_output(
+                &columns,
+                &self.columns,
+                &results,
+                &self.output,
+                rows,
+                &self.control,
+            )?;
+        }
+        let result = RecordBatch::try_new(self.output.arrow_schema_ref(), columns)
+            .map_err(|error| failure("compiled window output", error))?;
+        self.partition_ordinal = self
+            .partition_ordinal
+            .checked_add(1)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        Ok(result)
     }
 
     /// Emit the partitions one arrival closed as one chunk, in partition order.
@@ -472,20 +901,42 @@ fn slice(values: &[ArrayRef], offset: usize, len: usize) -> Vec<ArrayRef> {
 /// Run one call's exact kernel once over one complete partition. Its whole
 /// input is supplied even when no output were demanded; the partition latches
 /// any failure, which is returned as a required error.
+struct CallOutput {
+    values: ArrayRef,
+    carrier: Option<WindowResultCarrier>,
+}
 fn evaluate_call(
     kernel: &Arc<dyn PreparedWindowKernel>,
+    call_ordinal: usize,
+    partition_ordinal: usize,
     rows: usize,
     logical: &[EvaluatedArgument<'_>],
     peers: &[WindowRowRange],
     frames: &[WindowRowRange],
     control: &RuntimeKernelControl,
-) -> ExecutionResult<ArrayRef> {
+) -> ExecutionResult<CallOutput> {
     let contract = Arc::clone(kernel.contract());
     let full = FullPartitionWindowInput::try_new(contract.as_ref(), rows, logical, &[], control)?;
     let input = WindowPartitionInput::try_new(full, peers, frames, control)?;
-    let mut partition = WindowEvaluationPartition::begin(Arc::clone(kernel), input, control)?;
-    let output = partition.evaluate(Selection::all(rows), rows, control)?;
-    partition.finish(control)?;
+    let mut partition = WindowEvaluationPartition::begin_evaluated(
+        Arc::clone(kernel),
+        input,
+        WindowInvocationContext::partition(call_ordinal, partition_ordinal),
+        control.allocator(),
+        control,
+    )?;
+    if let Some(carrier) = partition.complete_carrier_evaluated(control)? {
+        // Original final output-layout validation is still pending. In
+        // particular a raw builder panic is never caught or reclassified here.
+        let values = Arc::clone(carrier.values());
+        partition.finish_evaluated(control)?;
+        return Ok(CallOutput {
+            values,
+            carrier: Some(carrier),
+        });
+    }
+    let output = partition.evaluate_evaluated(Selection::all(rows), rows, control)?;
+    partition.finish_evaluated(control)?;
     let (_, values, errors) = output.into_parts();
     if !errors.is_empty() {
         return Err(ExecutionFailure::from(
@@ -497,7 +948,108 @@ fn evaluate_call(
             "compiled window kernel output differs from its partition rows",
         ));
     }
-    Ok(values)
+    Ok(CallOutput {
+        values,
+        carrier: None,
+    })
+}
+
+// Count the ONE original Display without allocating or rendering a second
+// diagnostic. The caller requests real host capacity before invoking the
+// validator or constructing its full original String.
+fn validation_message_bytes(
+    error: &AnalyticOutputValidationFailure<'_>,
+) -> Result<usize, KernelFailure> {
+    struct Count(usize);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    use std::fmt::Write;
+    let mut count = Count(0);
+    write!(&mut count, "{error}").map_err(|_| KernelFailure::ResourceExhausted)?;
+    Ok(count.0)
+}
+fn validate_complete_output(
+    columns: &[ArrayRef],
+    sources: &[OutputSource],
+    results: &[CallOutput],
+    schema: &ChunkSchemaRef,
+    rows: usize,
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<()> {
+    use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
+    use std::fmt::Write;
+    control.checkpoint(0)?;
+    // The envelope covers every possible diagnostic of this actual complete
+    // schema/carrier. No payload value is formatted by the original validator.
+    let mut bytes = validation_message_bytes(&AnalyticOutputValidationFailure::ColumnCount {
+        expected: schema.slots().len(),
+        actual: columns.len(),
+    })?;
+    for (column, (array, slot)) in columns.iter().zip(schema.slots()).enumerate() {
+        bytes = bytes.max(validation_message_bytes(
+            &AnalyticOutputValidationFailure::Length {
+                column,
+                expected_rows: rows,
+                actual: array.len(),
+            },
+        )?);
+        bytes = bytes.max(validation_message_bytes(
+            &AnalyticOutputValidationFailure::Type {
+                column,
+                expected: slot.field().data_type(),
+                actual: array.data_type(),
+            },
+        )?);
+        control.checkpoint(1)?;
+    }
+    let host = control.allocator().ok_or_else(|| {
+        KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+            "complete window output requires its actual allocator",
+        ))
+    })?;
+    let charge = OpaqueRetainedCharge::try_new(host)?;
+    let reservation = charge.reserve_operation(bytes)?;
+    // Complete the admitted formatter backing before the original validator
+    // can publish Data. Its first Data therefore has no later fallible
+    // allocation, host request, checkpoint or error footer.
+    let mut message = String::new();
+    message
+        .try_reserve_exact(bytes)
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    if let Err(error) = validate_analytic_output_columns_typed(columns, schema, rows) {
+        let ordinal = error.output_ordinal().ok_or_else(|| {
+            KernelFailure::Internal(novarocks_functions::KernelDiagnostic::new(
+                "compiled window factory violated its exact output count",
+            ))
+        })?;
+        let source = sources.get(ordinal).ok_or_else(|| {
+            KernelFailure::Internal(novarocks_functions::KernelDiagnostic::new(
+                "compiled window output source ordinal is absent",
+            ))
+        })?;
+        let carrier = match source {
+            OutputSource::Call(call) => results
+                .get(*call)
+                .and_then(|result| result.carrier.as_ref()),
+            OutputSource::Input(_) => None,
+        }
+        .ok_or_else(|| {
+            KernelFailure::Internal(novarocks_functions::KernelDiagnostic::new(
+                "exact validated input or FixedZero output violated its immutable layout",
+            ))
+        })?;
+        write!(&mut message, "{error}")
+            .expect("original analytic Display writes the measured exact text");
+        let cause = carrier.original_output_validation_data(ordinal, message, reservation);
+        return Err(novarocks_functions::WindowEvaluationFailure::InvocationData(cause).into());
+    }
+    drop(reservation);
+    control.checkpoint(0)?;
+    Ok(())
 }
 
 impl Operator for CompiledWindowProcessor {
@@ -520,21 +1072,30 @@ impl Operator for CompiledWindowProcessor {
 
 impl ProcessorOperator for CompiledWindowProcessor {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished
+        self.failed.is_none() && !self.finishing && !self.finished
     }
     fn has_output(&self) -> bool {
-        !self.pending.is_empty()
+        self.failed.is_none() && !self.pending.is_empty()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Err("compiled Analytic received input after finishing".into());
+        if let Some(cause) = &self.failed {
+            return Err(cause.clone());
         }
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        self.consume(&chunk)
+        let result = if self.finishing || self.finished {
+            Err("compiled Analytic received input after finishing".into())
+        } else if chunk.is_empty() {
+            Ok(())
+        } else if self.original_function_major {
+            self.consume_invocation(chunk)
+        } else {
+            self.consume(&chunk)
+        };
+        self.failure_result(result)
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        if let Some(cause) = &self.failed {
+            return Err(cause.clone());
+        }
         let output = self.pending.pop_front();
         if self.finishing && self.pending.is_empty() {
             self.finished = true;
@@ -542,21 +1103,35 @@ impl ProcessorOperator for CompiledWindowProcessor {
         Ok(output)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Ok(());
+        if let Some(cause) = &self.failed {
+            return Err(cause.clone());
         }
-        self.finishing = true;
-        let closed = if self.open.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.close()?]
-        };
-        self.publish(closed)?;
-        self.instances = None;
-        if self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(())
+        let result = (|| {
+            if self.finishing || self.finished {
+                return Ok(());
+            }
+            self.finishing = true;
+            if self.original_function_major {
+                self.finish_invocation()?;
+                self.instances = None;
+                if self.pending.is_empty() {
+                    self.finished = true;
+                }
+                return Ok(());
+            }
+            let closed = if self.open.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.close()?]
+            };
+            self.publish(closed)?;
+            self.instances = None;
+            if self.pending.is_empty() {
+                self.finished = true;
+            }
+            Ok(())
+        })();
+        self.failure_result(result)
     }
 }
 

@@ -136,6 +136,9 @@ fn reserve(rows: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<i64>
 }
 
 impl PreparedWindowKernel for PreparedCountWindow {
+    fn original_partition_regroup_eligible(&self) -> bool {
+        true
+    }
     fn contract(&self) -> &Arc<WindowCallContract> {
         &self.contract
     }

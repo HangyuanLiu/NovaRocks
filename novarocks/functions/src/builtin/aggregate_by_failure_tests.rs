@@ -133,6 +133,15 @@ fn kernel(
     phase: AggregateKernelPhase,
 ) -> ByKernel {
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+    kernel_with_catalog(name, value, key, phase, &catalog)
+}
+fn kernel_with_catalog(
+    name: &str,
+    value: FunctionValueType,
+    key: FunctionValueType,
+    phase: AggregateKernelPhase,
+    catalog: &EngineFunctionCatalog,
+) -> ByKernel {
     let args = [
         FunctionArgument::Value {
             value_type: value,
@@ -634,3 +643,6 @@ fn by_actual_metadata_constructor_refusal_is_typed_and_never_published() {
         }
     }
 }
+
+#[path = "aggregate_by_window_tests.rs"]
+mod window_tests;

@@ -79,6 +79,12 @@ pub(super) const WINDOW: NodeId = NodeId::new(2);
 pub(super) fn window_catalog(definitions: &[(&str, FunctionKind)]) -> PureEngineFunctionCatalog {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    window_catalog_from_actual(definitions, &actual)
+}
+pub(super) fn window_catalog_from_actual(
+    definitions: &[(&str, FunctionKind)],
+    actual: &novarocks_functions::EngineFunctionCatalog,
+) -> PureEngineFunctionCatalog {
     let mut builder = EngineFunctionCatalogBuilder::new();
     let mut installed = Vec::new();
     for (name, kind) in definitions {
@@ -255,6 +261,95 @@ fn int64(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Int64, nullable)
 }
 
+/// Physical literals have no Int8/Int16/Int32 variant. Author those fixture
+/// cells as an exact Int64 literal followed by an explicit typed Cast. Keep
+/// the original Values author unchanged for every other fixture shape.
+fn typed_literal_values(
+    builder: &mut FragmentBuilder,
+    types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+) -> (Vec<novarocks_physical_plan::ValueId>, bool) {
+    let needs_cast = |literal: &LiteralValue, ty: &FunctionValueType| {
+        matches!(literal, LiteralValue::Int64(_))
+            && matches!(
+                ty.data_type,
+                DataType::Int8 | DataType::Int16 | DataType::Int32
+            )
+    };
+    let has_cast = rows.iter().any(|row| {
+        assert_eq!(row.len(), types.len());
+        row.iter()
+            .zip(types)
+            .any(|(literal, ty)| needs_cast(literal, ty))
+    });
+    if !has_cast {
+        return (
+            super::family_fixture::values(builder, VALUES, types, rows),
+            false,
+        );
+    }
+    let columns = types
+        .iter()
+        .enumerate()
+        .map(|(ordinal, ty)| {
+            builder
+                .add_value(
+                    ty.clone(),
+                    ValueOrigin::NodeOutput {
+                        node: VALUES,
+                        output_ordinal: u32::try_from(ordinal).unwrap(),
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let cells = rows
+        .iter()
+        .map(|row| {
+            assert_eq!(row.len(), types.len());
+            row.iter()
+                .zip(types)
+                .map(|(literal, ty)| {
+                    if needs_cast(literal, ty) {
+                        let source = builder
+                            .add_expression(
+                                VALUES,
+                                int64(false),
+                                ExprKind::Literal(literal.clone()),
+                            )
+                            .unwrap();
+                        builder
+                            .add_expression(
+                                VALUES,
+                                ty.clone(),
+                                ExprKind::Cast {
+                                    expr: source,
+                                    target: ty.data_type.clone(),
+                                    decimal_overflow_policy: POLICY,
+                                    allow_throw_exception: allow_throw(),
+                                },
+                            )
+                            .unwrap()
+                    } else {
+                        builder
+                            .add_expression(VALUES, ty.clone(), ExprKind::Literal(literal.clone()))
+                            .unwrap()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .add_values(
+            VALUES,
+            cells.into_boxed_slice(),
+            columns.clone().into_boxed_slice(),
+        )
+        .unwrap();
+    (columns, true)
+}
+
 /// The package of `Values(rows) -> Sort -> Window(shape) -> Result` over
 /// nullable BIGINT columns. A window without keys reads Values directly.
 pub(super) fn package(
@@ -264,9 +359,6 @@ pub(super) fn package(
     catalog: &PureEngineFunctionCatalog,
     max_dop: u32,
 ) -> Arc<FragmentPackage> {
-    let complete =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(43));
     let types = vec![int64(true); width];
     let literal_rows = rows
         .iter()
@@ -277,7 +369,24 @@ pub(super) fn package(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let columns = super::family_fixture::values(&mut builder, VALUES, &types, &literal_rows);
+    package_typed(&literal_rows, &types, shape, catalog, max_dop)
+}
+/// The SAME physical fixture author with explicit actual source types and
+/// literal values. No finished plan is cloned or relabelled; original BIGINT
+/// wrapper passes exactly its former types/values. Constant and overflowing
+/// test channels retain their original BIGINT contracts.
+pub(super) fn package_typed(
+    literal_rows: &[Vec<LiteralValue>],
+    types: &[FunctionValueType],
+    shape: &Shape,
+    catalog: &PureEngineFunctionCatalog,
+    max_dop: u32,
+) -> Arc<FragmentPackage> {
+    let complete =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let mut builder = FragmentBuilder::new(FragmentId::new(43));
+    let (columns, integral_literal_cast) =
+        typed_literal_values(&mut builder, types, literal_rows);
     // Constants: one non-null BIGINT pool, one ordinal per constant argument.
     let constants = shape
         .calls
@@ -320,7 +429,11 @@ pub(super) fn package(
             .iter()
             .map(|key| {
                 let expr = builder
-                    .add_expression(SORT, int64(true), ExprKind::Value(columns[key.column]))
+                    .add_expression(
+                        SORT,
+                        types[key.column].clone(),
+                        ExprKind::Value(columns[key.column]),
+                    )
                     .unwrap();
                 sort_expr(expr, key.ascending, key.nulls_first)
             })
@@ -334,7 +447,11 @@ pub(super) fn package(
                     .iter()
                     .map(|column| {
                         let expr = builder
-                            .add_expression(SORT, int64(true), ExprKind::Value(columns[*column]))
+                            .add_expression(
+                                SORT,
+                                types[*column].clone(),
+                                ExprKind::Value(columns[*column]),
+                            )
                             .unwrap();
                         sort_expr(expr, true, true)
                     })
@@ -349,7 +466,11 @@ pub(super) fn package(
         .iter()
         .map(|column| {
             let expr = builder
-                .add_expression(WINDOW, int64(true), ExprKind::Value(columns[*column]))
+                .add_expression(
+                    WINDOW,
+                    types[*column].clone(),
+                    ExprKind::Value(columns[*column]),
+                )
                 .unwrap();
             sort_expr(expr, true, true)
         })
@@ -359,7 +480,11 @@ pub(super) fn package(
         .iter()
         .map(|key| {
             let expr = builder
-                .add_expression(WINDOW, int64(true), ExprKind::Value(columns[key.column]))
+                .add_expression(
+                    WINDOW,
+                    types[key.column].clone(),
+                    ExprKind::Value(columns[key.column]),
+                )
                 .unwrap();
             sort_expr(expr, key.ascending, key.nulls_first)
         })
@@ -377,18 +502,31 @@ pub(super) fn package(
                 Arg::Column(column) => {
                     arguments.push(
                         builder
-                            .add_expression(WINDOW, int64(true), ExprKind::Value(columns[*column]))
+                            .add_expression(
+                                WINDOW,
+                                types[*column].clone(),
+                                ExprKind::Value(columns[*column]),
+                            )
                             .unwrap(),
                     );
                     request.push(FunctionArgument::Value {
-                        value_type: int64(true),
+                        value_type: types[*column].clone(),
                         constant: None,
                     });
                     static_request.push(None);
                 }
                 Arg::Overflowing(column) => {
+                    assert_eq!(
+                        types[*column],
+                        int64(true),
+                        "existing overflow fixture requires its actual BIGINT source"
+                    );
                     let value = builder
-                        .add_expression(WINDOW, int64(true), ExprKind::Value(columns[*column]))
+                        .add_expression(
+                            WINDOW,
+                            types[*column].clone(),
+                            ExprKind::Value(columns[*column]),
+                        )
                         .unwrap();
                     let max = builder
                         .add_expression(
@@ -628,16 +766,16 @@ pub(super) fn package(
         let id = u32::try_from(ordinal).unwrap();
         let definition = &fragment.expressions().get(root.expr).unwrap().kind;
         let mut children = Vec::new();
+        for reference in references(&fragment, root.expr) {
+            children.push(occurrence(
+                &fragment,
+                reference,
+                &mut uses,
+                &mut next_child,
+                &context,
+            ));
+        }
         if matches!(definition, ExprKind::WindowCall { .. }) {
-            for reference in references(&fragment, root.expr) {
-                children.push(occurrence(
-                    &fragment,
-                    reference,
-                    &mut uses,
-                    &mut next_child,
-                    &context,
-                ));
-            }
             window_uses.push((ExpressionUseId::new(id), root.expr, children.clone()));
         }
         uses.push(ExpressionInvocation {
@@ -669,10 +807,10 @@ pub(super) fn package(
         .iter()
         .flat_map(|call| call.args.iter())
         .any(|arg| matches!(arg, Arg::Overflowing(_)));
-    let parameters = if overflowing {
+    let parameters = if overflowing || integral_literal_cast {
         SemanticParameters::try_new([(
             allow_throw().id,
-            novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
+            novarocks_type_contract::SemanticParameterValue::AllowThrowException(overflowing),
         )])
         .unwrap()
     } else {

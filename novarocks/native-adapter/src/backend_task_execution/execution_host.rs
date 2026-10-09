@@ -1902,7 +1902,8 @@ fn failure_cause_category(
             | KernelFailure::Operational(_),
         )
         | ExecutionFailureCause::RequiredRow(_)
-        | ExecutionFailureCause::InvocationData(_) => TaskFailureCategory::Execution,
+        | ExecutionFailureCause::InvocationData(_)
+        | ExecutionFailureCause::WindowInvocationData(_) => TaskFailureCategory::Execution,
         ExecutionFailureCause::Pipeline(_) => opaque_category,
     }
 }

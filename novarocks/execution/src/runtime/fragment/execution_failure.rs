@@ -82,6 +82,7 @@ pub enum ExecutionFailureCause {
     Pipeline(String),
     Kernel(KernelFailure),
     InvocationData(novarocks_functions::InvocationData),
+    WindowInvocationData(novarocks_functions::WindowInvocationData),
     RequiredRow(RequiredExpressionRowError),
 }
 
@@ -118,6 +119,7 @@ impl ExecutionFailure {
             ExecutionFailureCause::Pipeline(message) => message,
             ExecutionFailureCause::RequiredRow(error) => error.error().message(),
             ExecutionFailureCause::InvocationData(error) => error.message(),
+            ExecutionFailureCause::WindowInvocationData(error) => error.message(),
             ExecutionFailureCause::Kernel(error) => match error {
                 KernelFailure::Cancelled => "kernel evaluation was cancelled",
                 KernelFailure::DeadlineExceeded => "kernel evaluation deadline was exceeded",
@@ -175,6 +177,17 @@ impl From<novarocks_functions::EvaluationFailure> for ExecutionFailure {
         }
     }
 }
+impl From<novarocks_functions::WindowEvaluationFailure> for ExecutionFailure {
+    fn from(error: novarocks_functions::WindowEvaluationFailure) -> Self {
+        match error {
+            novarocks_functions::WindowEvaluationFailure::Kernel(cause) => cause.into(),
+            novarocks_functions::WindowEvaluationFailure::InvocationData(cause) => Self {
+                cause: ExecutionFailureCause::WindowInvocationData(cause),
+                context: None,
+            },
+        }
+    }
+}
 impl From<RequiredExpressionRowError> for ExecutionFailure {
     fn from(error: RequiredExpressionRowError) -> Self {
         Self {
@@ -197,6 +210,7 @@ impl fmt::Display for ExecutionFailure {
             ExecutionFailureCause::Kernel(error) => error.fmt(f),
             ExecutionFailureCause::RequiredRow(error) => error.fmt(f),
             ExecutionFailureCause::InvocationData(error) => error.fmt(f),
+            ExecutionFailureCause::WindowInvocationData(error) => error.fmt(f),
         }
     }
 }
@@ -207,6 +221,7 @@ impl Error for ExecutionFailure {
             ExecutionFailureCause::Kernel(error) => Some(error),
             ExecutionFailureCause::RequiredRow(error) => Some(error),
             ExecutionFailureCause::InvocationData(error) => Some(error),
+            ExecutionFailureCause::WindowInvocationData(error) => Some(error),
         }
     }
 }

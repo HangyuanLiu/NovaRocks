@@ -2714,3 +2714,28 @@ mod bitmap_decode_resources;
 pub mod percentile_approx_raw_core;
 
 pub mod approx_percentile_failure;
+
+mod arrow_result_custody;
+mod scalar_output_resources;
+mod scalar_output_operation;
+mod window_invocation_data;
+mod window_output_scalars;
+pub mod window_format;
+pub use window_invocation_data::{
+    WindowEvaluationFailure, WindowInvocationContext, WindowInvocationData, WindowInvocationPhase,
+};
+
+mod window_result_carrier;
+pub use window_result_carrier::WindowResultCarrier;
+
+mod window_invocation_input;
+pub use window_invocation_input::{FullWindowInvocationInput, WindowFrameOrigin, WindowInvocationInput};
+mod window_evaluation_invocation;
+pub use window_evaluation_invocation::WindowEvaluationInvocation;
+mod window_invocation_scratch;
+pub use window_invocation_scratch::WindowInvocationScratch;
+pub mod window_input_order;
+pub use window_invocation_data::WindowInvocationScope;
+
+mod array_backing_geometry;
+pub use arrow_result_custody::{SourceBackingOwner, retain_source_backing};

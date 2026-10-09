@@ -224,22 +224,13 @@ impl<'call, 'a> FullPartitionWindowInput<'call, 'a> {
         order_arguments: &'a [EvaluatedArgument<'a>],
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
-        control.checkpoint(0)?;
-        if logical_arguments.len() != contract.logical_argument_types().len()
-            || order_arguments.len() != contract.order_argument_types().len()
-        {
-            return Err(invalid(
-                "window partition differs from its exact logical/order channels",
-            ));
-        }
-        let selection = Selection::all(partition_rows);
-        for (argument, value_type) in logical_arguments
-            .iter()
-            .zip(contract.logical_argument_types())
-            .chain(order_arguments.iter().zip(contract.order_argument_types()))
-        {
-            validate_argument_observed(*argument, selection, value_type, control)?;
-        }
+        validate_full_window_arguments(
+            contract,
+            partition_rows,
+            logical_arguments,
+            order_arguments,
+            control,
+        )?;
         Ok(Self {
             contract,
             partition_rows,
@@ -269,6 +260,35 @@ impl<'call, 'a> FullPartitionWindowInput<'call, 'a> {
         }
         Ok(())
     }
+}
+
+/// ONE exact full-input validator, shared by original partition loans and
+/// explicitly authored whole-invocation loans. Neither grants permission to
+/// gather, reorder, reuse an occurrence or skip required argument failures.
+pub(crate) fn validate_full_window_arguments(
+    contract: &WindowCallContract,
+    partition_rows: usize,
+    logical_arguments: &[EvaluatedArgument<'_>],
+    order_arguments: &[EvaluatedArgument<'_>],
+    control: &dyn KernelEvaluationControl,
+) -> Result<(), KernelFailure> {
+    control.checkpoint(0)?;
+    if logical_arguments.len() != contract.logical_argument_types().len()
+        || order_arguments.len() != contract.order_argument_types().len()
+    {
+        return Err(invalid(
+            "window partition differs from its exact logical/order channels",
+        ));
+    }
+    let selection = Selection::all(partition_rows);
+    for (argument, value_type) in logical_arguments
+        .iter()
+        .zip(contract.logical_argument_types())
+        .chain(order_arguments.iter().zip(contract.order_argument_types()))
+    {
+        validate_argument_observed(*argument, selection, value_type, control)?;
+    }
+    Ok(())
 }
 
 /// An output projection bound to one complete partition input borrow. Sparse

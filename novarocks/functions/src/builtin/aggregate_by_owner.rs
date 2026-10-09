@@ -19,7 +19,7 @@
 //! DISTINCT and encoded-source aggregate OVER retain separate obligations.
 
 use super::{
-    aggregate_by::{ByKernel, validate_contract},
+    aggregate_by::{ByKernel, ByPreparationDomain, validate_contract},
     catalogue::BuiltinAggregateResolver,
 };
 use crate::kernel_control::{compile_failure, invalid};
@@ -58,6 +58,7 @@ pub(super) fn definition(
     )
 }
 struct ByOwner {
+    preparation_domain: ByPreparationDomain,
     resolver: Arc<BuiltinAggregateResolver>,
     declaration: FunctionBindingDeclaration,
     direction: super::aggregate_by_core::ByDirection,
@@ -99,6 +100,7 @@ impl ByOwner {
             })
             .collect();
         Ok(Self {
+            preparation_domain: ByPreparationDomain::InstalledAggregate,
             resolver,
             declaration,
             direction: if name == "max_by" {
@@ -317,7 +319,7 @@ impl PureAggregateImplementation for ByOwner {
                     ));
                 }
             }
-            validate_contract(&contract, &mut work)?;
+            validate_contract(&contract, self.preparation_domain, &mut work)?;
             work.flush().map_err(compile_failure)?;
             let prepared = Arc::new(ByKernel {
                 contract,
@@ -336,5 +338,37 @@ impl PureAggregateImplementation for ByOwner {
         }
         work.finish().map_err(compile_failure)?;
         result
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn private_window_definition_for_test(
+    name: &str,
+    declaration: FunctionBindingDeclaration,
+    resolver: Arc<BuiltinAggregateResolver>,
+) -> Result<FunctionDefinition, FunctionCatalogError> {
+    let mut owner = ByOwner::new(name, declaration, resolver)?;
+    owner.preparation_domain = ByPreparationDomain::OriginalWindow;
+    for implementation in &mut owner.implementations {
+        implementation.abi = PureKernelAbi::AggregateWindowV1;
+    }
+    FunctionDefinition::try_new_pure_aggregate_window(
+        name,
+        FunctionVisibility::Public,
+        Arc::new(owner),
+    )
+    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+        subject: "test-only original BY window definition",
+        value: error.to_string().into(),
+    })
+}
+impl PureAggregateWindowImplementation for ByOwner {
+    fn prepare_aggregate_window(
+        &self,
+        aggregate: Arc<ByKernel>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        super::aggregate_by_window::prepare(aggregate, contract, control)
     }
 }

@@ -86,24 +86,78 @@ pub(crate) fn frame_table(
     frame: &WindowFrame,
     peers: &[WindowRowRange],
 ) -> Result<Vec<WindowRowRange>, String> {
-    admit_frame(frame)?;
+    match frame_table_authored::<_, std::convert::Infallible>(
+        frame,
+        peers,
+        |rows| Ok(Vec::with_capacity(rows)),
+        |frames, range| {
+            frames.push(range);
+            Ok(())
+        },
+    ) {
+        Ok(frames) => Ok(frames),
+        Err(WindowGeometryFailure::Original(message)) => Err(message),
+        Err(WindowGeometryFailure::Host(never)) => match never {},
+    }
+}
+
+enum WindowGeometryFailure<E> {
+    Original(String),
+    Host(E),
+}
+
+/// SAME frame arithmetic with host-owned structural output backing. Callback
+/// failure stays typed; original geometry errors retain their full String.
+pub(crate) fn frame_table_tracked(
+    frame: &WindowFrame,
+    peers: &[WindowRowRange],
+    host: std::sync::Arc<dyn novarocks_functions::AggregateStateAllocator>,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> crate::runtime::fragment::ExecutionResult<
+    novarocks_functions::WindowInvocationScratch<WindowRowRange>,
+> {
+    match frame_table_authored(
+        frame,
+        peers,
+        |rows| {
+            novarocks_functions::WindowInvocationScratch::try_with_capacity(
+                rows,
+                host.clone(),
+                control,
+            )
+        },
+        |frames, range| frames.try_push(range, control),
+    ) {
+        Ok(frames) => Ok(frames),
+        Err(WindowGeometryFailure::Original(message)) => Err(message.into()),
+        Err(WindowGeometryFailure::Host(cause)) => Err(cause.into()),
+    }
+}
+
+fn frame_table_authored<T, E>(
+    frame: &WindowFrame,
+    peers: &[WindowRowRange],
+    mut initialize: impl FnMut(usize) -> Result<T, E>,
+    mut push: impl FnMut(&mut T, WindowRowRange) -> Result<(), E>,
+) -> Result<T, WindowGeometryFailure<E>> {
+    admit_frame(frame).map_err(WindowGeometryFailure::Original)?;
     let rows = peers.last().map_or(0, |peer| peer.end);
     let range = frame.window_type == WindowType::Range;
     let start = match frame.start {
         None => None,
         Some(WindowBoundary::Preceding(value) | WindowBoundary::Following(value)) => {
-            Some(offset(value)?)
+            Some(offset(value).map_err(WindowGeometryFailure::Original)?)
         }
         Some(WindowBoundary::CurrentRow) => Some(0),
     };
     let end = match frame.end {
         None => None,
         Some(WindowBoundary::Preceding(value) | WindowBoundary::Following(value)) => {
-            Some(offset(value)?)
+            Some(offset(value).map_err(WindowGeometryFailure::Original)?)
         }
         Some(WindowBoundary::CurrentRow) => Some(0),
     };
-    let mut frames = Vec::with_capacity(rows);
+    let mut frames = initialize(rows).map_err(WindowGeometryFailure::Host)?;
     for peer in peers {
         for row in peer.start..peer.end {
             let first = match (frame.start, start) {
@@ -124,10 +178,14 @@ pub(crate) fn frame_table(
                 }
                 _ => unreachable!("every bounded end has its offset"),
             };
-            frames.push(WindowRowRange {
-                start: first.min(last),
-                end: last,
-            });
+            push(
+                &mut frames,
+                WindowRowRange {
+                    start: first.min(last),
+                    end: last,
+                },
+            )
+            .map_err(WindowGeometryFailure::Host)?;
         }
     }
     Ok(frames)

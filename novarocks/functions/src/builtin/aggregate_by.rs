@@ -69,6 +69,66 @@ fn observed<T>(
     observation.finish(result)
 }
 impl ByKernel {
+    /// The one original emitter before either caller projects its error.
+    /// LegacyData remains full text here; the old aggregate entry still uses
+    /// exactly its original KernelFailure boundary below.
+    pub(super) fn build_final_scalar<'s, I>(
+        &self,
+        states: I,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<ArrayRef, ScalarStateError>
+    where
+        I: ExactSizeIterator<Item = &'s ByState<HostAggregateAllocator>>,
+    {
+        let expected = states.len();
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(expected)
+            .map_err(|_| ScalarStateError::Kernel(KernelFailure::ResourceExhausted))?;
+        for state in states {
+            if values.len() == expected {
+                return Err(internal("max_by/min_by state iterator exceeded its extent").into());
+            }
+            if state.failed {
+                return Err(KernelFailure::InstanceFailed.into());
+            }
+            work.step()?;
+            values.push(state.output(work)?);
+        }
+        if values.len() != expected {
+            return Err(internal("max_by/min_by state iterator shortened its extent").into());
+        }
+        scalar::build_scalar_array(self.output_type(), values, work)
+    }
+    /// ONE original row update before the caller's error projection/latch.
+    pub(super) fn update_row_scalar<'a>(
+        &self,
+        state: &mut ByState<HostAggregateAllocator>,
+        input: &SelectedAggregateUpdateInput<'a, 'a>,
+        ordinal: usize,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        let row = input
+            .selection()
+            .row(ordinal)
+            .ok_or_else(|| invalid("max_by/min_by selected ordinal is out of bounds"))?;
+        work.step()?;
+        let values = input.logical_arguments()[0];
+        let keys = input.logical_arguments()[1];
+        let value_row = values.value_row(ordinal, row);
+        let key_row = keys.value_row(ordinal, row);
+        if value_row >= values.array().len() || key_row >= keys.array().len() {
+            return Err(internal("max_by/min_by selected address is out of bounds").into());
+        }
+        state.update_from_arrays(
+            self.direction,
+            values.array(),
+            value_row,
+            keys.array(),
+            key_row,
+            work,
+        )
+    }
     fn output_type(&self) -> &DataType {
         let FunctionResultType::Scalar(output) = &self.contract.call().selected().result_type
         else {
@@ -158,27 +218,7 @@ impl PreparedAggregateKernel for ByKernel {
             return Err(KernelFailure::InstanceFailed);
         }
         let result = observed(control, |work| {
-            let row = input
-                .selection()
-                .row(ordinal)
-                .ok_or_else(|| invalid("max_by/min_by selected ordinal is out of bounds"))?;
-            work.step()?;
-            let values = input.logical_arguments()[0];
-            let keys = input.logical_arguments()[1];
-            let value_row = values.value_row(ordinal, row);
-            let key_row = keys.value_row(ordinal, row);
-            if value_row >= values.array().len() || key_row >= keys.array().len() {
-                return Err(internal("max_by/min_by selected address is out of bounds"));
-            }
-            state
-                .update_from_arrays(
-                    self.direction,
-                    values.array(),
-                    value_row,
-                    keys.array(),
-                    key_row,
-                    &mut ScalarWork::new(Some(work)),
-                )
+            self.update_row_scalar(state, input, ordinal, &mut ScalarWork::new(Some(work)))
                 .map_err(ScalarStateError::into_kernel_failure)
         });
         if result.is_err() {
@@ -299,38 +339,23 @@ impl PreparedAggregateKernel for ByKernel {
         I: ExactSizeIterator<Item = &'s Self::State>,
     {
         observed(control, |work| {
-            let expected = states.len();
-            let mut values = Vec::new();
-            values
-                .try_reserve_exact(expected)
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
-            let mut work = ScalarWork::new(Some(work));
-            for state in states {
-                if values.len() == expected {
-                    return Err(internal("max_by/min_by state iterator exceeded its extent"));
-                }
-                if state.failed {
-                    return Err(KernelFailure::InstanceFailed);
-                }
-                work.step().map_err(ScalarStateError::into_kernel_failure)?;
-                values.push(
-                    state
-                        .output(&mut work)
-                        .map_err(ScalarStateError::into_kernel_failure)?,
-                );
-            }
-            if values.len() != expected {
-                return Err(internal(
-                    "max_by/min_by state iterator shortened its extent",
-                ));
-            }
-            scalar::build_scalar_array(self.output_type(), values, &mut work)
+            self.build_final_scalar(states, &mut ScalarWork::new(Some(work)))
                 .map_err(ScalarStateError::into_kernel_failure)
         })
     }
 }
+/// The installed aggregate CPU and the original generic window have different
+/// failure boundaries. Only the private window route admits original reader
+/// Data so that its whole-invocation author can retain the complete message.
+#[derive(Clone, Copy)]
+pub(super) enum ByPreparationDomain {
+    InstalledAggregate,
+    #[cfg(any(test, feature = "test-support"))]
+    OriginalWindow,
+}
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
+    domain: ByPreparationDomain,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
     let [
@@ -345,10 +370,17 @@ pub(super) fn validate_contract(
     let FunctionResultType::Scalar(output) = &contract.call().selected().result_type else {
         return Err(invalid("max_by/min_by requires a scalar result"));
     };
-    // Only domains installed by the original recursive scalar reader; no
-    // catalogue derivation is changed to fit the selected implementation.
-    if !super::aggregate_any_value::supported(&value.data_type, work)?
-        || !super::aggregate_any_value::supported(&key.data_type, work)?
+    // Preserve the installed aggregate domain. The private original window
+    // keeps generic reader failures at their original whole-call Data boundary;
+    // neither route changes the catalogue derivation or exact result type.
+    let installed_reader_required = match domain {
+        ByPreparationDomain::InstalledAggregate => true,
+        #[cfg(any(test, feature = "test-support"))]
+        ByPreparationDomain::OriginalWindow => false,
+    };
+    if installed_reader_required
+        && (!super::aggregate_any_value::supported(&value.data_type, work)?
+            || !super::aggregate_any_value::supported(&key.data_type, work)?)
     {
         return Err(invalid(&format!(
             "{} has no installed max_by/min_by input profile for {:?}",
