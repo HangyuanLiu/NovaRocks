@@ -165,72 +165,48 @@ impl Drop for ConnectorBlockingIoJoinPin {
     }
 }
 
-struct JobOutcome<T> {
+struct JobOutcome<T: Send + 'static> {
     value: Mutex<Option<Result<T, ConnectorBlockingIoError>>>,
-    // Unclaimed outputs are destroyed before their original join pins.
+    // Unclaimed output retirement receives the same cells before these pins
+    // retire. Its own original join keeps the backing through actual cleanup.
     pins: Box<[ConnectorBlockingIoJoinPin]>,
     retirement: ConnectorBlockingIoSupervisor,
 }
 
-impl<T> Drop for JobOutcome<T> {
+impl<T: Send + 'static> Drop for JobOutcome<T> {
     fn drop(&mut self) {
         let outcome = self
             .value
             .get_mut()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        let failure = match outcome {
-            Some(Err(error)) => Some(error),
-            Some(Ok(value)) => {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
-                    .err()
-                    .map(|payload| ConnectorBlockingIoError {
-                        detail: "connector blocking-I/O unclaimed outcome panicked during cleanup"
-                            .to_owned(),
-                        original: Arc::new(OriginalFailure {
-                            cause: OriginalFailureCause::OutcomeDrop(Mutex::new(payload)),
-                            _backing: self
-                                .pins
-                                .iter()
-                                .map(|pin| ConnectorBlockingIoBacking(Arc::clone(&pin.cell)))
-                                .collect(),
-                        }),
-                    })
+        match outcome {
+            Some(Err(error)) => self.retirement.publish_original_failure(error),
+            Some(Ok(value)) if std::mem::needs_drop::<T>() => {
+                let pins = self
+                    .pins
+                    .iter()
+                    .map(|pin| ConnectorBlockingIoJoinPin::new(&pin.cell))
+                    .collect();
+                self.retirement.spawn_cleanup(
+                    pins,
+                    move || drop(value),
+                    "connector blocking-I/O unclaimed outcome panicked during cleanup",
+                );
             }
-            None => None,
-        };
-        if let Some(error) = failure {
-            let rejected = {
-                let mut first = self
-                    .retirement
-                    .failure
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if first.is_none() {
-                    *first = Some(error);
-                    None
-                } else {
-                    Some(error)
-                }
-            };
-            // Keep the first unclaimed failure. A later original payload is
-            // still provider code: retire it off the dropped waiter's thread
-            // with the same responsibility and observed original join pins.
-            if let Some(error) = rejected {
-                self.retirement.retire_original_failure(error);
-            }
-            self.retirement.failure_ready.notify_one();
+            Some(Ok(value)) => drop(value),
+            None => {}
         }
     }
 }
 
 /// A submitted call whose result can be polled by an existing serial owner.
-pub(crate) struct ConnectorBlockingIoJob<T> {
+pub(crate) struct ConnectorBlockingIoJob<T: Send + 'static> {
     outcome: Arc<JobOutcome<T>>,
     ready: Arc<tokio::sync::Notify>,
 }
 
-impl<T> ConnectorBlockingIoJob<T> {
+impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
     pub(crate) fn try_take(&self) -> Option<Result<T, ConnectorBlockingIoError>> {
         self.outcome
             .value
@@ -404,7 +380,77 @@ impl ConnectorBlockingIoSupervisor {
             .iter()
             .map(|backing| ConnectorBlockingIoJoinPin::new(&backing.0))
             .collect();
-        let _ = self.spawn_pinned(pins, move || drop(error));
+        self.spawn_cleanup(
+            pins,
+            move || drop(error),
+            "connector blocking-I/O original failure panicked during cleanup",
+        );
+    }
+
+    fn publish_original_failure(&self, error: ConnectorBlockingIoError) {
+        let rejected = {
+            let mut first = self
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if first.is_none() {
+                *first = Some(error);
+                None
+            } else {
+                Some(error)
+            }
+        };
+        // A secondary provider payload must not run on a dropped waiter's
+        // thread or under the first-failure lock.
+        if let Some(error) = rejected {
+            self.retire_original_failure(error);
+        }
+        self.failure_ready.notify_one();
+    }
+
+    /// A cleanup has no consuming waiter or unclaimed output. Observe its
+    /// original blocking join directly, avoiding a new cleanup for a unit
+    /// output and preserving the raw panic payload if provider Drop panics.
+    fn spawn_cleanup<F>(
+        &self,
+        pins: Vec<ConnectorBlockingIoJoinPin>,
+        cleanup: F,
+        panic_detail: &'static str,
+    ) where
+        F: FnOnce() + Send + 'static,
+    {
+        let runtime = self.runtime.clone();
+        let retirement = self.clone();
+        self.runtime.spawn(async move {
+            let joined = runtime
+                .spawn_blocking(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup))
+                })
+                .await;
+            for pin in &pins {
+                pin.joined.store(true, Ordering::Release);
+            }
+            let cause = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(payload)) => Some(OriginalFailureCause::OutcomeDrop(Mutex::new(payload))),
+                Err(error) => Some(OriginalFailureCause::WorkerJoin(error)),
+            };
+            if let Some(cause) = cause {
+                retirement.publish_original_failure(ConnectorBlockingIoError {
+                    detail: panic_detail.to_owned(),
+                    original: Arc::new(OriginalFailure {
+                        cause,
+                        _backing: pins
+                            .iter()
+                            .map(|pin| ConnectorBlockingIoBacking(Arc::clone(&pin.cell)))
+                            .collect(),
+                    }),
+                });
+            }
+            // The actual original cleanup join has returned before these
+            // pins retire, including a failed cleanup's raw payload handoff.
+            drop(pins);
+        });
     }
 
     pub(crate) async fn wait_failure(&self) {
@@ -483,7 +529,9 @@ pub(crate) mod tests {
             .expect("runtime")
     }
 
-    fn wait<T>(job: &ConnectorBlockingIoJob<T>) -> Result<T, ConnectorBlockingIoError> {
+    fn wait<T: Send + 'static>(
+        job: &ConnectorBlockingIoJob<T>,
+    ) -> Result<T, ConnectorBlockingIoError> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if let Some(outcome) = job.try_take() {
@@ -976,6 +1024,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unclaimed_output_retires_outside_the_dropped_waiter() {
+        struct Payload {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            destroyed: Arc<AtomicBool>,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                self.destroyed.store(true, Ordering::Release);
+            }
+        }
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) =
+            admitted_class(novarocks_workload_control::ResultWindowClass::Local);
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let (started, entered) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let payload = Payload {
+            started,
+            release: held,
+            destroyed: Arc::clone(&destroyed),
+        };
+        let job = supervisor
+            .spawn_admitted(&root.owner.scope(), &window.retain_alias(), move || payload)
+            .unwrap();
+        // The original blocking call has really joined and its publisher no
+        // longer owns this outcome. Dropping the waiter now owns raw cleanup.
+        until(|| {
+            Arc::strong_count(&job.outcome) == 1 && job.outcome.value.lock().unwrap().is_some()
+        });
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        let (disarm, watch) = mpsc::channel();
+        let rescue = release.clone();
+        let watchdog = std::thread::spawn(move || {
+            if watch.recv_timeout(Duration::from_millis(500)).is_err() {
+                let _ = rescue.send(());
+            }
+        });
+        let began = Instant::now();
+        drop(job);
+        let elapsed = began.elapsed();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let retained = control.snapshot();
+        let _ = release.send(());
+        let _ = disarm.send(());
+        watchdog.join().unwrap();
+        until(|| control.snapshot().scopes.is_empty());
+        assert!(supervisor.take_original_failure().is_none());
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "unclaimed output blocked the dropped waiter: {elapsed:?}"
+        );
+        assert_eq!(retained.result_windows.held_positions, [0, 1, 0, 0]);
+        assert_eq!(retained.root_responsibilities, 1);
+        assert!(destroyed.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn another_admitted_call_starts_while_the_first_is_held() {
         let runtime = runtime();
         let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
@@ -1042,3 +1155,7 @@ pub(crate) mod tests {
         assert_eq!(runtime.block_on(job.finish()).expect("finished job"), 17);
     }
 }
+
+#[cfg(test)]
+#[path = "blocking_io/opaque_split_drop_tests.rs"]
+mod opaque_split_drop_tests;

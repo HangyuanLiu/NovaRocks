@@ -234,7 +234,7 @@ impl AttemptInitializationLifecycle {
         Ok(())
     }
 
-    async fn await_job<T>(
+    async fn await_job<T: Send + 'static>(
         &self,
         job: ConnectorBlockingIoJob<T>,
         supervisor: &ConnectorBlockingIoSupervisor,
