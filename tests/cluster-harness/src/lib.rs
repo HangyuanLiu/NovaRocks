@@ -20,6 +20,8 @@ mod effective_launch_config;
 mod exact_mysql_fixture_exit;
 #[cfg(unix)]
 mod exact_mysql_fixture_identity;
+#[cfg(unix)]
+mod exact_mysql_fixture_sources;
 
 pub use effective_launch_config::EffectiveLaunchConfigEvidence;
 pub mod delayed_s3;
@@ -4099,21 +4101,9 @@ impl CrossProcessServerHandle {
         &self,
         original_deadline: Instant,
     ) -> Result<novarocks_types::FrontendProcessId> {
-        ensure!(
-            self.fe_log_history.is_empty(),
-            "exact MySQL observer refuses FE replacement history"
-        );
-        ensure!(
-            self.fe_process.is_running()? && self.fe_process.pid() == self.fe_launch_identity.pid,
-            "exact MySQL observer requires original live FE child"
-        );
-        let _ = process_resources::recheck_process_launch_identity(&self.fe_launch_identity)?;
-        let identity = self.fe_process.log_source().with_bounded_snapshot_reader(
-            exact_mysql_fixture_identity::SCAN_BYTES,
-            |reader, length| exact_mysql_fixture_identity::scan(reader, length, original_deadline),
-        )?;
-        let _ = process_resources::recheck_process_launch_identity(&self.fe_launch_identity)?;
-        Ok(identity)
+        self.with_original_frontend_log_snapshot(original_deadline, |reader, length| {
+            exact_mysql_fixture_identity::scan(reader, length, original_deadline)
+        })
     }
     /// Explicit fixture-only success gate, using the original four role owners.
     /// A failed FE success gate never skips cleanup or becomes successful generic stop.

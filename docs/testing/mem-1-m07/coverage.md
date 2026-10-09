@@ -546,3 +546,16 @@ FE 成功门复查原 deadline 前后并要求实际 ExitSuccess，任何失败�
 原 `hub.bind_statement` 成功 Some 后、writer 前输出原 connection/session/statement/hash 入参的一次有限 marker；三个 generation/epoch 域分别读取，session CID 单独保留，不从 Gate snapshot/v2 DTO 回填 expected。默认/无 hub/None 路径不输出不锁 stdout。固定384B ASCII栈、一行最大289B、无SQL/nonce/Root/body alias/新query/registry/task。write/flush 原 IO cause 随原 async outcome/terminal.complete/registered protocol ledger 保留，错误封目标原scope，不能按kind/string豁免。
 
 定向6 PASS，adapter里程碑146 PASS/0FAIL/0ignored/2.56s；feature/default server check、fmt、diffcheck PASS。收据 `docs/testing/mem-1-m07/evidence/p09-original-bind-marker-components-20261009.json` 保存实际源/草稿/日志pins。sink及ledger move是组件证据，未实际stdout/intermediary/join；本slice Native/Docker0。有限同步stdout不声称blockedhost sink硬期限；独立external parser/actualsameFE marker、完整Root/握手/wire/取消矩阵与原FE成功及四role实际退出仍OPEN。
+
+
+### P09 independent original source and one-row geometry checkpoint (2026-10-09)
+
+原 FE/BE durable log visitor 接到同一个 original managed child，保留 spawn-time file identity、原 PID/birth token 与前后 live/deadline 检查；同一次 snapshot 有限扫描完整 FE identity + successful raw bind marker，expected FE/CID/SQL hash 分别来自独立原源，不从 Gate/v2 reply 回填。2MiB / 512B scratch / 384B line 不变，新增全 offset reserved-stem recognition，合法 pair 后的 embedded/overline marker 也整份拒绝。connection generation、session epoch、statement generation 三个原域分别保留。
+
+Root observer沿原三BE日志 baseline prefix hash与原四launch实例，严格实际 live descriptor UUID库存；最多每BE8个fresh markers，按真实fresh task/context集合找唯一 prepared ClientRows Root，不猜2task/最高stage/BE0，不增加RootFetch/proxy/target SQL。descriptor UUID独立保留；ActualBinding从raw bind +独立Root source投影并核对FE/BE，不以被验响应补expected。prepared事实不冒充Installed、running/End/ACK或physical last-alias。
+
+独立one-row oracle补writer remaining在current Data before/after内与buffer≤remaining-after的几何约束，拒绝S−1处Native2/body8+buffer9伪完整尾部及借next body缓冲；保留合法Some(empty)、原zero-length tail parts。原tiny1..6、x S−1/S/S+1、wide q17 S+1 missing-tail十个cut/outcome tuple锁定，不改原SQL、规模、caps或期限。V2 Unix client实际io::Error移入私有nonclone source槽，有限Debug/Display不展开；实际OS connect错误与synthetic inner-source Arc identity在owner close/anyhow move后保留。wire/literals不改。
+
+定向73 PASS/1.14s、Root8 PASS/0.01s、harness11 PASS/2.07s；补whole-source5反例、source projection1、actual IOcause2后，完整runner组件里程碑 **217 PASS / 0 FAIL / 2 existing ignored / 7.09s**。迭代用dev/test unoptimized、jobs1/incremental0/threads1；首次ClientFailure手工fixture缺cause的E0063 compile FAIL原日志保留，已修。fmt/diffcheck PASS。收据 `docs/testing/mem-1-m07/evidence/p09-independent-original-sources-components-20261009.json` pin实际源/原草稿/两次独立review/failed+passed日志；旧input/oracle draft保留原字节。
+
+本slice Native/Docker0，不把paired Unix/host shell/scalar DTO测试当真实FE/BE证据。bounded original MySQL reader、clean-source new inputfreeze、scene driver和actual Unix/握手/Root/wire精确取消矩阵仍待接入运行；fullClosing64/latealias/ACK/recovery/四role实际退出及其余P09/P00b/P10/final门仍OPEN。同步topology/file syscalls只作deadline前后拒晚成功，不声称物理whole-launch/scan硬20s；census不声称FE/BE原子cut。HMS非只读按IRU-7用户授权excluded，两个待裁决语义/caps/clock不变。无push/PR/归档。

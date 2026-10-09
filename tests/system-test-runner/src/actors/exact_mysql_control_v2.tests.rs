@@ -352,6 +352,7 @@ fn wire_hashes_and_secret_free_debug_have_independent_known_answers() {
         response: PrefixSummary::empty(),
         io_kind: None,
         raw_os_error: None,
+        cause: None,
     };
     assert!(format!("{failure:?}").len() < 1024);
     assert_eq!(format!("{failure:?}"), format!("{failure}"));
@@ -902,4 +903,83 @@ fn v2_independent_maximum_literal_has_frozen_wire_digest() {
         Sha256::digest(&bytes).as_slice(),
         literal("fa2bf60464f62472d009606c0f019b845ba7a713c5ca1876b98d0a066fa50dd7").as_slice()
     );
+}
+
+#[test]
+fn actual_io_source_survives_owner_close_and_error_move_without_raw_presentation() {
+    use std::error::Error;
+    use std::sync::Arc;
+    #[derive(Debug)]
+    struct OriginalSource(Arc<()>);
+    impl std::fmt::Display for OriginalSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("synthetic-raw-source-canary")
+        }
+    }
+    impl Error for OriginalSource {}
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut client = UnixControlClient::from_stream(
+            stream,
+            frontend(),
+            [3; 16],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let identity = Arc::new(());
+        let cause = io::Error::new(io::ErrorKind::BrokenPipe, OriginalSource(identity.clone()));
+        let failure = client.failure(ClientClass::Io, Some(cause));
+        assert_eq!(failure.io_kind, Some(io::ErrorKind::BrokenPipe));
+        assert!(!format!("{failure:?} {failure}").contains("synthetic-raw-source-canary"));
+        client.close_incomplete();
+        drop(peer);
+        let error = anyhow::Error::new(failure);
+        let retained = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<io::Error>())
+            .unwrap();
+        let original = retained
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<OriginalSource>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&original.0, &identity));
+    });
+}
+
+#[test]
+fn actual_unix_connect_failure_keeps_original_os_error_source() {
+    use std::error::Error;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let failure = match UnixControlClient::connect(
+            std::path::Path::new("/dev/null/novarocks-exact-source-test"),
+            frontend(),
+            [3; 16],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("non-directory connect unexpectedly succeeded"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.class, ClientClass::Io);
+        assert_eq!(failure.stage, ClientStage::Connect);
+        let source = failure
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(source.kind(), failure.io_kind.unwrap());
+        assert_eq!(source.raw_os_error(), failure.raw_os_error);
+        assert!(source.raw_os_error().is_some());
+        assert!(!format!("{failure:?} {failure}").contains("novarocks-exact-source-test"));
+    });
 }

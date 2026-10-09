@@ -18,6 +18,8 @@
 pub mod actors;
 mod cli;
 mod config;
+#[cfg(unix)]
+mod exact_mysql_target_binding;
 mod performance;
 mod runner;
 pub mod scenario;

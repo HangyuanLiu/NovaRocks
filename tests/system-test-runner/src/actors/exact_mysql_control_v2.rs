@@ -677,6 +677,7 @@ pub struct ClientFailure {
     pub response: PrefixSummary,
     pub io_kind: Option<io::ErrorKind>,
     pub raw_os_error: Option<i32>,
+    cause: Option<io::Error>,
 }
 impl fmt::Debug for ClientFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -692,7 +693,13 @@ impl fmt::Display for ClientFailure {
         )
     }
 }
-impl std::error::Error for ClientFailure {}
+impl std::error::Error for ClientFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|cause| cause as &dyn std::error::Error)
+    }
+}
 
 /// Sole actual UnixStream owner. No task, reconnect, response history or renewed clock.
 /// Dropping an exchange future leaves this owner and its observed prefixes intact.
@@ -732,6 +739,7 @@ impl UnixControlClient {
             response: PrefixSummary::empty(),
             io_kind: cause.as_ref().map(io::Error::kind),
             raw_os_error: cause.as_ref().and_then(io::Error::raw_os_error),
+            cause,
         };
         if nonce == [0; 16] {
             return Err(empty(ClientClass::Decode(DecodeError::Identity), None));
@@ -774,6 +782,7 @@ impl UnixControlClient {
                 response: PrefixSummary::empty(),
                 io_kind: None,
                 raw_os_error: None,
+                cause: None,
             });
         }
         Ok(Self {
@@ -805,6 +814,7 @@ impl UnixControlClient {
             response: self.last_response,
             io_kind: cause.as_ref().map(io::Error::kind),
             raw_os_error: cause.as_ref().and_then(io::Error::raw_os_error),
+            cause,
         }
     }
     fn deadline_check(&self) -> Result<(), ClientFailure> {

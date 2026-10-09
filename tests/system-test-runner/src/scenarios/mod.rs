@@ -4,12 +4,16 @@ mod backend_membership;
 mod catalog_state;
 mod connector;
 mod distributed_writer;
+#[cfg(unix)]
+mod exact_mysql_native_oracle;
 mod exchange_normal_close;
 mod frontend_lifecycle;
 pub(crate) mod hms_classification_preflight;
 mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;
+#[cfg(unix)]
+mod independent_root_target;
 mod listing;
 mod listing_real_rest;
 mod memory_attribution;
