@@ -1,0 +1,570 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "scope": "private stock Java HMS capability only",
+  "source_revision": "6e052ec1ed78c9d40fad541baf734265514b4fe1",
+  "source_dirty": false,
+  "status": "PASS",
+  "native_started": false,
+  "bulk_ready": false,
+  "binding": {
+    "catalog_id": "cat-ff2bcfd3257a",
+    "env_id": "m07-hms-cap-8637013885cc-b4e2d972",
+    "hms_container_id": "c49b6909e1a0d3afc7ea7f6fc915fd54b3cbeab97f6c321b7a41a6d639b50ae3",
+    "hms_image_id": "sha256:b748d30841d84294c2c2f0e0f9115adb65080695c09861beb58dbd10c18ea2fc",
+    "hms_manifest_sha256": "b8d7e0c38a6718659522f6eda5240ce4809e8be9d6b2692abeb947c9f8cc9fbb",
+    "hms_project": "nr-hms-5bfe99-cat-ff2bcfd3257a",
+    "hms_uri": "thrift://127.0.0.1:28254",
+    "manifest_sha256": "47b73a2bdb71660e3bd9f1068fd2593ef427b357a654595a0099bd542765f8b7",
+    "object_store_id": "os-eec671f90159",
+    "owner_locator": {
+      "control_root": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/fixture-owner",
+      "daemon_id": "b79582e0-9a8f-4fa8-93bc-71e5d8ccba24"
+    },
+    "publication": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/m07-hms-cap-8637013885cc443e9d3a08c04bdc8c0f/docker/iceberg-rest/runtime/m07-hms-cap-8637013885cc-b4e2d972/publications/c7e57a99fe234201ac63bc0dc29d2c6b",
+    "warehouse": "s3://warehouse/cat-ff2bcfd3257a/rest/hms"
+  },
+  "freeze_file_sha256": "4c343f9c4d992af0e8796c4ba793f7d1d1ade4f4bb6ba11ce3a12ba7273b5cfd",
+  "helper_sha256": "df41536c1102a08b9a8f5c4332cca30f36907011e96da863d1006901aaf10b34",
+  "actual_phases": [
+    {
+      "container_id": "1ac504758eecb07afcb1041ec1cbc0600d83b559e0d51757a82d64c34e7eacf8",
+      "container_name": "nr-m07-hms-cap-8637013885cc443e9d3a08c04bdc8c0f-create",
+      "exit_code": 0,
+      "output_bytes": 3361,
+      "output_sha256": "17f0e07fccc776fa0d7199f2c812384b6d2048258686da739302c24383401729",
+      "phase": "create",
+      "program_sha256": "8dad76a65cbd51bd72828f4bd6067847501e26f915faf2d9b9cea40823f26591",
+      "record_sha256": [
+        "695373d9cf38c5ec6e24c74f2bc83ec5ed035845f6109d6ac463c8ce16496f5b",
+        "18e2b7b927a085ce6b1c8dac66bc0755729338fcb9487e2995f3d425defe25f7",
+        "1085287ef1a9a27742106b9097eac299c53e85df7278434afce025469cd9362d",
+        "08c0fb19c80a50ba76c81f26bf06852ee371aec96abf8a99cec76780516b7c47",
+        "2e48e7f07b3fd60ef950496f4d868322fbbe418c0c9f6a6cb6469128cdfdb1e7",
+        "4eb52b6b3dcadcd4e28349e7c07ff16a66ea049a37866cfc5e24b6b2d1796efc",
+        "63ead44810cd63fd157f4e94338ff538ed67f53e11ac629b8f227f2063a6e164",
+        "b65d2f9686a065468a820c9f0755f860119aff31fe74119dc4f238e3df2f5a3b",
+        "40f73d1f6248175a7a8bb8921d4df8afcc6059a1e391f3eb736453ecbde3b5ce",
+        "679766e75a54d73b75059ff39876095c018d5af4a0b0c8e26c71beb093ca16c5"
+      ],
+      "records": [
+        {
+          "kind": "baseline",
+          "phase": "create",
+          "value": [
+            "default"
+          ]
+        },
+        {
+          "kind": "mutation",
+          "phase": "create",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "operation": "create_namespace",
+            "state": "attempt"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "create",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "operation": "create_namespace",
+            "state": "applied"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "create",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_table",
+            "operation": "create_table",
+            "state": "attempt"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "create",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_table",
+            "operation": "create_table",
+            "state": "applied"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "create",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_view",
+            "operation": "create_view",
+            "state": "attempt"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "create",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_view",
+            "operation": "create_view",
+            "state": "applied"
+          }
+        },
+        {
+          "kind": "table",
+          "phase": "create",
+          "value": {
+            "default_spec_id": 0,
+            "format_version": 2,
+            "location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_table",
+            "metadata_location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_table/metadata/00000-dbc94150-7811-4f17-98af-b464a28f0ed9.metadata.json",
+            "partition_spec": {
+              "fields": [],
+              "spec-id": 0
+            },
+            "raw_metadata": {
+              "bytes": 724,
+              "sha256": "009bc7250fbbfca69130e389c41bc82a3bf961fd2d38eaef5474ded05f6aa2bf"
+            },
+            "schema": {
+              "fields": [
+                {
+                  "id": 1,
+                  "name": "id",
+                  "required": true,
+                  "type": "long"
+                }
+              ],
+              "schema-id": 0,
+              "type": "struct"
+            },
+            "schema_count": 1,
+            "schema_id": 0,
+            "snapshot_count": 0,
+            "snapshot_id": null,
+            "spec_count": 1,
+            "uuid": "ed7c01dc-88b9-4720-8c35-95d940397e53"
+          }
+        },
+        {
+          "kind": "view",
+          "phase": "create",
+          "value": {
+            "default_catalog": "m07_hms_preflight",
+            "default_namespace": [
+              "m07_cap_8637013885cc443e9d3a08c04bdc8c0f"
+            ],
+            "format_version": 1,
+            "location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_view",
+            "metadata_location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_view/metadata/00000-0620186f-0d0e-45f5-b0d3-b5eb7058a121.gz.metadata.json",
+            "raw_metadata": {
+              "bytes": 442,
+              "sha256": "a0e28fef8319a5cb8be17967b1ba26848ce8e1682cc2a0e0a227944740ccbb27"
+            },
+            "representations": [
+              {
+                "dialect": "spark",
+                "sql": "SELECT id FROM cap_table"
+              }
+            ],
+            "schema": {
+              "fields": [
+                {
+                  "id": 1,
+                  "name": "id",
+                  "required": true,
+                  "type": "long"
+                }
+              ],
+              "schema-id": 0,
+              "type": "struct"
+            },
+            "schema_count": 1,
+            "schema_id": 0,
+            "uuid": "1687132a-4671-43ca-948f-d9ffeaf3c19c",
+            "version_count": 1,
+            "version_id": 1
+          }
+        },
+        {
+          "kind": "complete",
+          "phase": "create",
+          "value": {
+            "status": "complete"
+          }
+        }
+      ],
+      "unconfirmed_mutations": [],
+      "writer_exited": true
+    },
+    {
+      "container_id": "3a20a56592e3377b2a3e340fb246cec5a881d40955e48e786d2a0206d53b08a5",
+      "container_name": "nr-m07-hms-cap-8637013885cc443e9d3a08c04bdc8c0f-oracle",
+      "exit_code": 0,
+      "output_bytes": 7196,
+      "output_sha256": "20722f3ff014f38af9d546eb040fd87f868dd66cf284f504a2cc01f78dad6705",
+      "phase": "oracle",
+      "program_sha256": "e83a1d6726e3dc8a08be04a865dcab673afb93ad428b553870d57db987153853",
+      "record_sha256": [
+        "25f732b266ef6e102c918ae6dd82502f2d987d4043b9cb1fec1eb5b8958c0e09",
+        "90168f8b78e04344a4f974660b0911f7326e26f578a4288a5942445ee972e56e",
+        "fbae8cf11e99aff66c698ddacac2b600e8682ac496bf7237519e607a98cb6ad7",
+        "0b59d9980f7ee7eee05757db965f0571f3ba279debab96ec2dfcf9f8d96971db",
+        "72027b62db22879aa37a6336a4b177066367b24230215cd337617e250b09aa88",
+        "6bc6e98908348c6fae545e50e93f5d2d3c47cdec17c7e4b52b4aa0882dd26993",
+        "c6e30e80e4525822eea4cc6dea316b935e996f1d04306289500d316e17b8fd91"
+      ],
+      "records": [
+        {
+          "kind": "namespaces",
+          "phase": "oracle",
+          "value": [
+            "default",
+            "m07_cap_8637013885cc443e9d3a08c04bdc8c0f"
+          ]
+        },
+        {
+          "kind": "tables",
+          "phase": "oracle",
+          "value": [
+            "cap_table"
+          ]
+        },
+        {
+          "kind": "views",
+          "phase": "oracle",
+          "value": [
+            "cap_view"
+          ]
+        },
+        {
+          "kind": "all_objects",
+          "phase": "oracle",
+          "value": [
+            "cap_table",
+            "cap_view"
+          ]
+        },
+        {
+          "kind": "table",
+          "phase": "oracle",
+          "value": {
+            "default_spec_id": 0,
+            "format_version": 2,
+            "location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_table",
+            "metadata_location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_table/metadata/00000-dbc94150-7811-4f17-98af-b464a28f0ed9.metadata.json",
+            "partition_spec": {
+              "fields": [],
+              "spec-id": 0
+            },
+            "raw_metadata": {
+              "bytes": 724,
+              "sha256": "009bc7250fbbfca69130e389c41bc82a3bf961fd2d38eaef5474ded05f6aa2bf"
+            },
+            "schema": {
+              "fields": [
+                {
+                  "id": 1,
+                  "name": "id",
+                  "required": true,
+                  "type": "long"
+                }
+              ],
+              "schema-id": 0,
+              "type": "struct"
+            },
+            "schema_count": 1,
+            "schema_id": 0,
+            "snapshot_count": 0,
+            "snapshot_id": null,
+            "spec_count": 1,
+            "uuid": "ed7c01dc-88b9-4720-8c35-95d940397e53"
+          }
+        },
+        {
+          "kind": "view",
+          "phase": "oracle",
+          "value": {
+            "default_catalog": "m07_hms_preflight",
+            "default_namespace": [
+              "m07_cap_8637013885cc443e9d3a08c04bdc8c0f"
+            ],
+            "format_version": 1,
+            "location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_view",
+            "metadata_location": "s3://warehouse/cat-ff2bcfd3257a/rest/hms/m07_cap_8637013885cc443e9d3a08c04bdc8c0f/cap_view/metadata/00000-0620186f-0d0e-45f5-b0d3-b5eb7058a121.gz.metadata.json",
+            "raw_metadata": {
+              "bytes": 442,
+              "sha256": "a0e28fef8319a5cb8be17967b1ba26848ce8e1682cc2a0e0a227944740ccbb27"
+            },
+            "representations": [
+              {
+                "dialect": "spark",
+                "sql": "SELECT id FROM cap_table"
+              }
+            ],
+            "schema": {
+              "fields": [
+                {
+                  "id": 1,
+                  "name": "id",
+                  "required": true,
+                  "type": "long"
+                }
+              ],
+              "schema-id": 0,
+              "type": "struct"
+            },
+            "schema_count": 1,
+            "schema_id": 0,
+            "uuid": "1687132a-4671-43ca-948f-d9ffeaf3c19c",
+            "version_count": 1,
+            "version_id": 1
+          }
+        },
+        {
+          "kind": "complete",
+          "phase": "oracle",
+          "value": {
+            "status": "complete"
+          }
+        }
+      ],
+      "unconfirmed_mutations": [],
+      "writer_exited": true
+    },
+    {
+      "container_id": "30deaec8ba1ed679d13353d38df4212c81c1e949266d2cf251172e32a602ef07",
+      "container_name": "nr-m07-hms-cap-8637013885cc443e9d3a08c04bdc8c0f-drop",
+      "exit_code": 0,
+      "output_bytes": 1633,
+      "output_sha256": "96872cd9ab429b1ccda596dc5adcf3c40890a23d6724fe6edae921dba86ef288",
+      "phase": "drop",
+      "program_sha256": "ebd5ade613c082471e5d24278fe8a1345e2e9a497182bbd9e71ad76bbadfef3b",
+      "record_sha256": [
+        "465d2943087d72410b8d9593b05248ef6f82f35502f0a124238411addba900fd",
+        "31d30c542cadb134dc203a33b3aa892a153d573b58d42f430cdefabae5f19ba1",
+        "5e5a92911bab5272f8d5e09de4425de7bad6139deab5de1e408cb3f459900d1c",
+        "47f1876c793036a29ce46633bd8c110fdce37e3439cee309a51438970517c2c8",
+        "8cad013bec3c78f5c78b2297366cbc5ca5656cb1ec716d03ac4e3ee6d539aaad",
+        "587186e07d1fe4fc4179be2796baa6abd45043a513d7903315f9d45e40f77514",
+        "b49a48eec2829a714b8d886d1cee0fcb6066b15965ed1d5eed1fc6b4b011c7e4"
+      ],
+      "records": [
+        {
+          "kind": "mutation",
+          "phase": "drop",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_view",
+            "operation": "drop_view",
+            "state": "attempt"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "drop",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_view",
+            "operation": "drop_view",
+            "state": "applied"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "drop",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_table",
+            "operation": "drop_table",
+            "state": "attempt"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "drop",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "cap_table",
+            "operation": "drop_table",
+            "state": "applied"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "drop",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "operation": "drop_namespace",
+            "state": "attempt"
+          }
+        },
+        {
+          "kind": "mutation",
+          "phase": "drop",
+          "value": {
+            "namespace": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "object": "m07_cap_8637013885cc443e9d3a08c04bdc8c0f",
+            "operation": "drop_namespace",
+            "state": "applied"
+          }
+        },
+        {
+          "kind": "complete",
+          "phase": "drop",
+          "value": {
+            "status": "complete"
+          }
+        }
+      ],
+      "unconfirmed_mutations": [],
+      "writer_exited": true
+    },
+    {
+      "container_id": "7845e4e315563e6038a79a1dffada65e5d97464ac604e334e76d9a966bfdf764",
+      "container_name": "nr-m07-hms-cap-8637013885cc443e9d3a08c04bdc8c0f-restored",
+      "exit_code": 0,
+      "output_bytes": 558,
+      "output_sha256": "c1c94952ba476a167255d486927bd74f941db73c76da20ddafccf691dea20ad1",
+      "phase": "restored",
+      "program_sha256": "aa6d19537879a92565c2e9f26c719801851b33cfd0f2e4f384014f17073b2ec5",
+      "record_sha256": [
+        "aa7141803d71b9cd2f0fb1b12d4e41968d82d11238f41b4d4597df1c8d4d94a0",
+        "040bb78fef19a1f81318d7934e60077d725100414264b586bcd40c3272a4467c"
+      ],
+      "records": [
+        {
+          "kind": "namespaces",
+          "phase": "restored",
+          "value": [
+            "default"
+          ]
+        },
+        {
+          "kind": "complete",
+          "phase": "restored",
+          "value": {
+            "status": "complete"
+          }
+        }
+      ],
+      "unconfirmed_mutations": [],
+      "writer_exited": true
+    }
+  ],
+  "provider_oracle": {
+    "baseline_namespaces": [
+      "default"
+    ],
+    "restored_namespaces": [
+      "default"
+    ],
+    "tables": [
+      "cap_table"
+    ],
+    "views": [
+      "cap_view"
+    ],
+    "all_objects_public_second_catalog": [
+      "cap_table",
+      "cap_view"
+    ],
+    "independent_loaded_metadata_identical": true
+  },
+  "cleanup": {
+    "complete": true,
+    "errors": [],
+    "retention_barriers": [],
+    "host_commands_actual_exit_and_groups_gone": 48,
+    "all_command_pids_absent": true,
+    "four_writer_and_hms_actual_ids_absent": [
+      "c49b6909e1a0d3afc7ea7f6fc915fd54b3cbeab97f6c321b7a41a6d639b50ae3",
+      "1ac504758eecb07afcb1041ec1cbc0600d83b559e0d51757a82d64c34e7eacf8",
+      "3a20a56592e3377b2a3e340fb246cec5a881d40955e48e786d2a0206d53b08a5",
+      "30deaec8ba1ed679d13353d38df4212c81c1e949266d2cf251172e32a602ef07",
+      "7845e4e315563e6038a79a1dffada65e5d97464ac604e334e76d9a966bfdf764"
+    ],
+    "actual_private_owner_records_absent": [
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/hms/cat-ff2bcfd3257a/manifest.json",
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/cat-ff2bcfd3257a/record.json",
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/os-eec671f90159/record.json"
+    ]
+  },
+  "evidence_scope": [
+    "Four independent stock Spark JVM invocations create/oracle/drop/restored",
+    "Actual required-long empty table format2/unpartitioned/spec0/no snapshot and view format1/version1/schema/default catalog/namespace/SQL",
+    "Fresh Java HiveCatalog filtered tables/views and second public LIST_ALL_TABLES=true exact sets",
+    "Real raw table metadata724B and view gzip metadata442B hashes match independent load",
+    "Successful effect ledgers, actual namespace baseline restored, exact private cleanup"
+  ],
+  "limitations": [
+    "Not native Rust HMS mixed object classification or views support",
+    "Not original32x512 tables+512views full CL or bulk READY",
+    "Not performance, SDK hard internal bytes or FE owner envelope acceptance",
+    "No NovaRocks processes started"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/status.json",
+      "sha256": "d46a9d99a4c91a0283a41a9b4903da39aa005bf262748328f52bcc2bb4c77eb3",
+      "bytes": 42651
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/CAPABILITY_PREFLIGHT_PASS.json",
+      "sha256": "9b9be2a4af848967aab6f8d56227c0e383a404ea8f2ddb7095e90c5e9399954a",
+      "bytes": 166
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/bound-input.json",
+      "sha256": "0508c9e90fd9a081724b6a62eb12789165e9580c8476ef9119961d7cdafbc7c5",
+      "bytes": 5241
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/create-receipt.json",
+      "sha256": "89898aaacb47f03d975750e7f29d533a883c661db49ff451a223ae92d966ac6d",
+      "bytes": 3913
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/oracle-receipt.json",
+      "sha256": "155b404b0c500eaea477e0af24ec30178493ddfe6e5d3f1d42baf4bdac51be76",
+      "bytes": 2868
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/drop-receipt.json",
+      "sha256": "15b1e67929b9d2917e5e2036e8483474a5ae9a2003bc55af0c2cc68ffb78ffdf",
+      "bytes": 2034
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009/restored-receipt.json",
+      "sha256": "b31a6a534387a29649d61fd2aeb902ae324a975f3439251138137af5ccbae216",
+      "bytes": 721
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-execution-freeze-v3-20261009.json",
+      "sha256": "4c343f9c4d992af0e8796c4ba793f7d1d1ade4f4bb6ba11ce3a12ba7273b5cfd",
+      "bytes": 4955
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-capture-boundary-client-region-20261009.log",
+      "sha256": "919544438af833403cb501e31d6cdedca36bdce17175e6285e2af99ec25f8760",
+      "bytes": 722
+    },
+    {
+      "path": "logs/mem-1-m07/p09-stock-spark-aws-client-bytecode-20261009.log",
+      "sha256": "6923c7e2b2f1663d8770a917a6ae9f457530286ffe09a0411c475ed74cc28a1e",
+      "bytes": 24092
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v3-20261009-driver.log",
+      "sha256": "fbabe957882f47e35cf1abc0bcdd5706f289daf723dc96aa87ffc518b3ef899c",
+      "bytes": 160
+    }
+  ]
+}

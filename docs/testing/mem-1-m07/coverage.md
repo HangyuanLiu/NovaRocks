@@ -343,3 +343,11 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - clean50a932335第二次预检实际baseline/default与create_namespace applied；create_table attempt后SdkClientException，尚无table/view创建成功记录，不能把未执行view写成Unsupported。safe effect ledger/原freeze保留于p09-hms-capability-preflight-v2-failed-20261009.json。全部host groups/PIDs、实际HMS/writer IDs/privateownerrecords消失，cleanup成功，未改共享fixture。
 - actual locked Spark javap确认AwsClientProperties只读取client.region；helper旧copy owner s3.region没有映射公开SDK region，one-shot容器亦没有标准Compose AWS_REGION环境。当前显式派生owner已发布region→public CLIENT_REGION并getter核对，无默认/猜测region。原exception cause仅hash，需新真实run确认因果；不以修正接线声称PASS，不重试旧unknowncreate。其余caps/clocks/input与zeroextra retries不变。
+
+
+### 2026-10-09 P09：真实stock Java HMS table/view能力预检PASS
+
+- clean6e052ec1ed78c9d40fad541baf734265514b4fe1，新的immutable freeze/privateUUID；四个独立stock Spark JVM create/oracle/drop/restored均exit0。实际namespace基线/default最终恢复，三项create与三项drop均actual applied，无unknown effects；零extra connection/failure retry，所有bounds/deadlines未放宽。
+- required long id空table真实format2/spec0/unpartitioned/snapshots0，真实view format1/version1/defaultcatalog+namespace/唯一Spark SQL。独立fresh HiveCatalog filtered tables={cap_table}/views={cap_view}，第二public LIST_ALL_TABLES=true准确{cap_table,cap_view}；真实UUID/schema/location及table724B/view gzip442B metadata hashes在独立load完全一致。
+- host-only修正后四测试PASS/0.037s；实际48条host commands leaderreaped/groupgone/PID absent，4个writer+HMS实际容器ID均消失，private HMS/catalog/objectstore records消失，cleanup complete/无errors/无stickybarriers。收据p09-hms-capability-preflight-v3-pass-20261009.json保存actual identities/freeze/effects/metadata/raw hashes，v1/v2失败完整保留，共享fixture未改。
+- 此证据只闭合stock Java真实view capability/独立oracle和私有工具退出；没有启动NovaRocks、没有READY，不证明Native Rust mixed分类/list_views支持、原32×512+512大CL、性能或SDK/FE硬字节包络。其余P09/P00b/P10/final及既有两人工语义门OPEN，无push/PR/归档。
