@@ -19,6 +19,47 @@ use crate::aggregate_scalar::{AggScalarValue, ScalarStateError, ScalarWork};
 use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDate};
+use std::fmt;
+
+/// The original aggregate batch boundary's diagnostic stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateFailureStage {
+    Input,
+    CreateState,
+    Update,
+    Merge,
+    BuildIntermediate,
+    BuildFinal,
+}
+
+impl AggregateFailureStage {
+    pub fn message<T: fmt::Display + ?Sized>(self, message: &T) -> AggregateFailureMessage<'_, T> {
+        AggregateFailureMessage {
+            stage: self,
+            message,
+        }
+    }
+}
+
+/// Borrow the original diagnostic without allocating or changing its text.
+pub struct AggregateFailureMessage<'a, T: fmt::Display + ?Sized> {
+    stage: AggregateFailureStage,
+    message: &'a T,
+}
+
+impl<T: fmt::Display + ?Sized> fmt::Display for AggregateFailureMessage<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.stage {
+            AggregateFailureStage::Input => "aggregate input: ",
+            AggregateFailureStage::CreateState => "create aggregate state: ",
+            AggregateFailureStage::Update => "update aggregate state: ",
+            AggregateFailureStage::Merge => "merge aggregate state: ",
+            AggregateFailureStage::BuildIntermediate => "build aggregate intermediate output: ",
+            AggregateFailureStage::BuildFinal => "build aggregate final output: ",
+        })?;
+        write!(formatter, "{}", self.message)
+    }
+}
 
 fn date32_to_naive(days: i32) -> Option<NaiveDate> {
     NaiveDate::from_num_days_from_ce_opt(719163 + days)

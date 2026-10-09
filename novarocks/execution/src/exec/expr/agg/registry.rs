@@ -234,21 +234,26 @@ pub(crate) enum PreparedAggregateError {
 
 impl fmt::Display for PreparedAggregateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use novarocks_functions::aggregate_format::AggregateFailureStage;
         match self {
             Self::StatePointerCount { expected, actual } => write!(
                 formatter,
                 "aggregate state pointer count {actual} does not match input row count {expected}"
             ),
-            Self::Input(message) => write!(formatter, "aggregate input: {message}"),
-            Self::CreateState(message) => write!(formatter, "create aggregate state: {message}"),
-            Self::Update(message) => write!(formatter, "update aggregate state: {message}"),
-            Self::Merge(message) => write!(formatter, "merge aggregate state: {message}"),
-            Self::BuildIntermediate(message) => {
-                write!(formatter, "build aggregate intermediate output: {message}")
-            }
-            Self::BuildFinal(message) => {
-                write!(formatter, "build aggregate final output: {message}")
-            }
+            Self::Input(message) => AggregateFailureStage::Input.message(message).fmt(formatter),
+            Self::CreateState(message) => AggregateFailureStage::CreateState
+                .message(message)
+                .fmt(formatter),
+            Self::Update(message) => AggregateFailureStage::Update
+                .message(message)
+                .fmt(formatter),
+            Self::Merge(message) => AggregateFailureStage::Merge.message(message).fmt(formatter),
+            Self::BuildIntermediate(message) => AggregateFailureStage::BuildIntermediate
+                .message(message)
+                .fmt(formatter),
+            Self::BuildFinal(message) => AggregateFailureStage::BuildFinal
+                .message(message)
+                .fmt(formatter),
         }
     }
 }

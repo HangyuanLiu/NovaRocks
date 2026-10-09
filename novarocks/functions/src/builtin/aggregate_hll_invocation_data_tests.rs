@@ -274,10 +274,13 @@ fn ndv_actual_column_long_actual_metadata_diagnostic_keeps_full_bytes_and_last_l
             .collect(),
         Some(arrow_buffer::NullBuffer::from(vec![false, true, true])),
     ));
-    let original = format!(
+    let original_core = format!(
         "hll_raw does not support input type {:?}",
         values.data_type()
     );
+    let original = crate::aggregate_format::AggregateFailureStage::Update
+        .message(&original_core)
+        .to_string();
     assert!(original.len() > 512);
     let host = Arc::new(Host::default());
     let mut column = column(
@@ -595,8 +598,18 @@ fn ndv_actual_merge_all_original_reachable_data_branches_preserve_full_message_a
             panic!("whole Data");
         };
         assert!(std::ptr::eq(data.aggregate_contract(), contract.as_ref()));
-        assert_eq!(data.message(), expected);
-        assert_eq!(data.to_string(), original.to_string());
+        assert_eq!(
+            data.message(),
+            crate::aggregate_format::AggregateFailureStage::Merge
+                .message(expected)
+                .to_string()
+        );
+        assert_eq!(
+            data.to_string(),
+            crate::aggregate_format::AggregateFailureStage::Merge
+                .message(&original)
+                .to_string()
+        );
         assert_eq!(data.aggregate_phase(), AggregateInvocationPhase::Merge);
         assert_eq!(data.aggregate_call_phase(), AggregateKernelPhase::Final);
         assert_eq!(data.input_rows(), &[0, 1, 2, 3]);

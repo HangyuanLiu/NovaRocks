@@ -3058,6 +3058,7 @@ pub fn contribute_builtin_functions(
                     "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
                         Some(super::aggregate_array_owner::effects())
                     }
+                    "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
                     "count" => Some(super::aggregate_count_owner::effects()),
                     "multi_distinct_count" => {
                         Some(super::aggregate_count_distinct_owner::effects())
@@ -3148,6 +3149,14 @@ pub fn contribute_builtin_functions(
         }
         if declaration.name == "multi_distinct_count" {
             builder.register(super::aggregate_count_distinct_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if matches!(declaration.name, "ndv" | "approx_count_distinct") {
+            builder.register(super::aggregate_hll_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,

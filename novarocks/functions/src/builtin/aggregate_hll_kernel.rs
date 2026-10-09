@@ -206,7 +206,8 @@ impl PreparedAggregateKernel for NdvKernel {
             write!(
                 writer,
                 "{}",
-                core::HllInputFailure::Unsupported(array.data_type())
+                crate::aggregate_format::AggregateFailureStage::Update
+                    .message(&core::HllInputFailure::Unsupported(array.data_type()))
             )
         })?;
         prepared.diagnostic = Some(InvocationData::prepare_aggregate(
@@ -344,7 +345,11 @@ impl PreparedAggregateKernel for NdvKernel {
             allocator.ok_or_else(|| invalid("NDV invocation Data requires its host allocator"))?,
         )?;
         let diagnostic = HostDiagnostic::prepare(&allocator, &mut work, |writer| {
-            writer.write_str(failure.message())
+            write!(
+                writer,
+                "{}",
+                crate::aggregate_format::AggregateFailureStage::Merge.message(failure.message())
+            )
         })?;
         let data = InvocationData::prepare_aggregate(
             &allocator,
