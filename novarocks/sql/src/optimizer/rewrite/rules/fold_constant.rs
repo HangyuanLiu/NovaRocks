@@ -203,7 +203,8 @@ impl LogicalRewriteRule for FoldConstant {
 
         let arena = ctx.scalar_arena();
         let evaluator =
-            crate::compiler::SqlFoldEvaluatorLoan::new(evaluator, ctx.fold_dependency_observer());
+            crate::compiler::SqlFoldEvaluatorLoan::new(evaluator, ctx.fold_dependency_observer())
+                .with_catalog(ctx.function_catalog());
         let changed = {
             let mut arena = arena.borrow_mut();
             let mut folder = ConstantFolder::new(&mut arena, &evaluator, work);
@@ -542,6 +543,31 @@ fn fold_scalar_uncached(
     let value_type = arena.value_type(id).clone();
     work.step()?;
     let mut node = arena.node(id).clone();
+
+    // Borrow the original selected parent before post-order child work. This
+    // is the existing traversal, not a second scanner or a payload evaluator.
+    use novarocks_functions::PureCallLifecycle as Lifecycle;
+    match &node {
+        ScalarNode::FunctionCall { binding, .. } => {
+            evaluator.admit_fold_parent_observed(binding, Lifecycle::Scalar, work.control())?;
+        }
+        ScalarNode::AggregateCall { resolved, .. } => {
+            evaluator.admit_fold_parent_observed(resolved, Lifecycle::Aggregate, work.control())?;
+        }
+        ScalarNode::WindowCall {
+            binding,
+            aggregate_binding,
+            ..
+        } => {
+            let lifecycle = if aggregate_binding.is_some() {
+                Lifecycle::AggregateWindow
+            } else {
+                Lifecycle::Window
+            };
+            evaluator.admit_fold_parent_observed(binding, lifecycle, work.control())?;
+        }
+        _ => {}
+    }
 
     // Post-order: children first, so a node only ever sees already-folded
     // children and "all children are literals" is decidable locally.

@@ -743,6 +743,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let novarocks_functions::FunctionBindingError::Control(error) = error {
                     return AnalyzeError::control(error);
                 }
+                if matches!(
+                    error,
+                    novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+                ) {
+                    return AnalyzeError::function_binding(error).at_invalid_argument(span);
+                }
                 AnalyzeError::invalid_argument(format!("failed to bind UNNEST: {error}"), span)
             })?;
         let novarocks_functions::FunctionResultType::Relation(result_columns) =

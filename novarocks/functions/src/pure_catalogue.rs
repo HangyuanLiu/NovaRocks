@@ -55,6 +55,43 @@ pub enum PureKernelAbi {
     TableV1,
     ControlIntrinsicV1,
 }
+/// Actual SQL invocation lifecycle, selected by the original call constructor.
+/// This is compile-time source evidence, not a wire ABI or a name classifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PureCallLifecycle {
+    Scalar,
+    Aggregate,
+    AggregateWindow,
+    Window,
+    Table,
+}
+impl PureCallLifecycle {
+    pub const fn from_kind(kind: FunctionKind) -> Self {
+        match kind {
+            FunctionKind::Scalar => Self::Scalar,
+            FunctionKind::Aggregate => Self::Aggregate,
+            FunctionKind::Window => Self::Window,
+            FunctionKind::Table => Self::Table,
+        }
+    }
+    const fn accepts(self, abi: PureKernelAbi) -> bool {
+        matches!(
+            (self, abi),
+            (
+                Self::Scalar,
+                PureKernelAbi::ScalarV1
+                    | PureKernelAbi::HigherOrderV1
+                    | PureKernelAbi::ControlIntrinsicV1
+            ) | (
+                Self::Aggregate,
+                PureKernelAbi::AggregateV1 | PureKernelAbi::AggregateWindowV1
+            ) | (Self::AggregateWindow, PureKernelAbi::AggregateWindowV1)
+                | (Self::Window, PureKernelAbi::WindowV1)
+                | (Self::Table, PureKernelAbi::TableV1)
+        )
+    }
+}
+
 impl PureKernelAbi {
     const fn tag(self) -> u8 {
         match self {
@@ -156,6 +193,51 @@ impl PureOverloadDeclaration<'_> {
     }
     pub const fn effects(&self) -> &FunctionEffectDeclaration {
         self.effects
+    }
+    /// Check the actual typed registration adapter, not a manifest copied from
+    /// metadata. The original selected profile is borrowed without preparation.
+    /// This proves installed lifecycle/static admission only; emitted-source
+    /// facts, full environment refinement and preparation remain mandatory.
+    pub fn admit_selected_lifecycle_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        lifecycle: PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        let implementation = self.implementation();
+        if selected.overload != implementation.overload {
+            return Err(FunctionBindingError::InvalidBinding(
+                "lifecycle admission differs from the exact selected overload".into(),
+            ));
+        }
+        if !self
+            .attachment
+            .owner
+            .accepts_installed_abi(implementation.abi)
+            || !lifecycle.accepts(implementation.abi)
+        {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                implementation.overload.clone(),
+            ));
+        }
+        // Aggregate requests retain ORDER channels after the logical prefix.
+        // Scalar/window/table argument lists retain exactly their logical N.
+        let valid_count = match lifecycle {
+            PureCallLifecycle::Aggregate | PureCallLifecycle::AggregateWindow => {
+                logical_argument_count <= selected.argument_types.len()
+            }
+            _ => logical_argument_count == selected.argument_types.len(),
+        };
+        if !valid_count {
+            return Err(FunctionBindingError::InvalidBinding(
+                "lifecycle admission differs from the original logical argument count".into(),
+            ));
+        }
+        self.attachment
+            .metadata_owner
+            .admit_selected_profile_observed(selected, logical_argument_count, control)
     }
     /// Borrow the exact installed metadata owner; no fresh resolution or
     /// prepared instance is constructed at this static FE admission boundary.
@@ -385,6 +467,9 @@ struct PreparedPureCallDraft {
 }
 
 trait InstalledPureOwner: Send + Sync {
+    /// Implemented by the closed typed adapter that owns real preparation.
+    /// Metadata alone cannot claim an uninstalled lifecycle.
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool;
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -587,6 +672,9 @@ fn wrong_options() -> FunctionSpecializationFailure {
 impl<O: PureFunctionMetadataOwner + PureScalarImplementation> InstalledPureOwner
     for ScalarOwner<O>
 {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::ScalarV1)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -618,6 +706,9 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation> InstalledPureOwner
 impl<O: PureFunctionMetadataOwner + PureHigherOrderImplementation> InstalledPureOwner
     for HigherOrderOwner<O>
 {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::HigherOrderV1)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -649,6 +740,9 @@ impl<O: PureFunctionMetadataOwner + PureHigherOrderImplementation> InstalledPure
 impl<O: PureFunctionMetadataOwner + PureScalarImplementation + PureHigherOrderImplementation>
     InstalledPureOwner for ScalarHigherOrderOwner<O>
 {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::ScalarV1 | PureKernelAbi::HigherOrderV1)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -671,6 +765,9 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation + PureHigherOrderIm
 impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> InstalledPureOwner
     for AggregateOwner<O>
 {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::AggregateV1)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -719,6 +816,12 @@ fn prepare_aggregate_handle<O: PureAggregateImplementation>(
 impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation> InstalledPureOwner
     for AggregateWindowOwner<O>
 {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(
+            abi,
+            PureKernelAbi::AggregateV1 | PureKernelAbi::AggregateWindowV1
+        )
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -769,6 +872,9 @@ impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation> Installed
 impl<O: PureFunctionMetadataOwner + PureWindowImplementation> InstalledPureOwner
     for WindowOwner<O>
 {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::WindowV1)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -806,6 +912,9 @@ impl<O: PureFunctionMetadataOwner + PureWindowImplementation> InstalledPureOwner
     }
 }
 impl<O: PureFunctionMetadataOwner + PureTableImplementation> InstalledPureOwner for TableOwner<O> {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::TableV1)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -835,6 +944,9 @@ impl<O: PureFunctionMetadataOwner + PureTableImplementation> InstalledPureOwner 
     }
 }
 impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::ControlIntrinsicV1)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,

@@ -2665,6 +2665,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 args_typed = coerced;
                 binding
             };
+            // OVER is authored here; aggregate presence alone is not an OVER ABI.
+            let lifecycle = if aggregate_binding.is_some() {
+                novarocks_functions::PureCallLifecycle::AggregateWindow
+            } else {
+                novarocks_functions::PureCallLifecycle::Window
+            };
+            self.function_catalog
+                .admit_bound_lifecycle_observed(binding.resolved(), lifecycle, self.control)
+                .map_err(|error| {
+                    AnalyzeError::function_binding(error).at_type_mismatch(func.span)
+                })?;
             let result = match &binding.selected.result_type {
                 novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
                 novarocks_functions::FunctionResultType::Relation(_) => {
@@ -5737,6 +5748,12 @@ pub(super) fn bind_window_function_call_with_catalog(
                 if let novarocks_functions::FunctionBindingError::Control(error) = error {
                     return AnalyzeError::control(error);
                 }
+                if matches!(
+                    error,
+                    novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+                ) {
+                    return AnalyzeError::function_binding(error).at_type_mismatch(span);
+                }
                 AnalyzeError::type_mismatch(
                     format!(
                         "cannot bind window function `{name}` for argument types {:?}: {error}",
@@ -5949,6 +5966,12 @@ fn resolve_aggregate_function_call_with_order(
     .map_err(|error| {
         if let novarocks_functions::FunctionBindingError::Control(error) = error {
             return AnalyzeError::control(error);
+        }
+        if matches!(
+            error,
+            novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+        ) {
+            return AnalyzeError::function_binding(error).at_type_mismatch(span);
         }
         AnalyzeError::type_mismatch(
             format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}"),

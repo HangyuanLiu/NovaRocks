@@ -55,6 +55,9 @@ struct CountedOwner {
     calls: Arc<AtomicUsize>,
 }
 impl InstalledPureOwner for CountedOwner {
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        self.original.accepts_installed_abi(abi)
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,

@@ -80,8 +80,13 @@ pub trait SqlFoldDependencyObserver: Send + Sync {
 pub(crate) struct SqlFoldEvaluatorLoan<'a> {
     calculator: &'static dyn SqlConstantEvaluator,
     observer: Option<&'a dyn SqlFoldDependencyObserver>,
+    catalog: Option<&'a dyn super::SqlFunctionCatalog>,
 }
 impl<'a> SqlFoldEvaluatorLoan<'a> {
+    pub(crate) fn with_catalog(mut self, catalog: &'a dyn super::SqlFunctionCatalog) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
     pub(crate) fn new(
         calculator: &'static dyn SqlConstantEvaluator,
         observer: Option<&'a dyn SqlFoldDependencyObserver>,
@@ -89,10 +94,23 @@ impl<'a> SqlFoldEvaluatorLoan<'a> {
         Self {
             calculator,
             observer,
+            catalog: None,
         }
     }
 }
 impl SqlConstantEvaluator for SqlFoldEvaluatorLoan<'_> {
+    fn admit_fold_parent_observed(
+        &self,
+        binding: &SqlFunctionBinding,
+        lifecycle: novarocks_functions::PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        if let Some(catalog) = self.catalog {
+            catalog.admit_bound_lifecycle_observed(binding.resolved(), lifecycle, control)?;
+        }
+        self.calculator
+            .admit_fold_parent_observed(binding, lifecycle, control)
+    }
     fn eval_scalar(
         &self,
         request: &FoldRequest,

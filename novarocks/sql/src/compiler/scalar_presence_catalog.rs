@@ -14,7 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Candidate-request scalar implementation presence; this is not full support preparation.
+//! Candidate-only exact installed lifecycle/static-profile admission.
+//! Full source/environment refinement and preparation remain separate gates.
 use super::SqlFunctionCatalog;
 use novarocks_functions::{
     FunctionBindingError, FunctionKind, FunctionSpecializationFailure, ResolvedFunctionBinding,
@@ -38,19 +39,19 @@ impl ScalarPresenceCatalog {
         overload: &novarocks_functions::FunctionOverloadId,
         selected: &novarocks_functions::FunctionBindingSelection,
         logical_argument_count: usize,
+        lifecycle: novarocks_functions::PureCallLifecycle,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        // Table/operator, window and aggregate lifecycle admission have separate authors.
-        if kind != FunctionKind::Scalar {
-            return Ok(());
-        }
         match self
             .original
             .pure_overload_declaration_observed(function, kind, overload, control)
         {
-            Ok(loan) => {
-                loan.admit_selected_profile_observed(selected, logical_argument_count, control)
-            }
+            Ok(loan) => loan.admit_selected_lifecycle_observed(
+                selected,
+                logical_argument_count,
+                lifecycle,
+                control,
+            ),
             Err(FunctionSpecializationFailure::Control(cause)) => {
                 Err(FunctionBindingError::Control(cause))
             }
@@ -74,12 +75,29 @@ impl ScalarPresenceCatalog {
             &binding.selected.overload,
             &binding.selected,
             binding.logical_argument_count,
+            novarocks_functions::PureCallLifecycle::from_kind(binding.kind),
             control,
         )?;
         Ok(binding)
     }
 }
 impl SqlFunctionCatalog for ScalarPresenceCatalog {
+    fn admit_bound_lifecycle_observed(
+        &self,
+        binding: &ResolvedFunctionBinding,
+        lifecycle: novarocks_functions::PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.admit_identity(
+            &binding.function_id,
+            binding.kind,
+            &binding.selected.overload,
+            &binding.selected,
+            binding.logical_argument_count,
+            lifecycle,
+            control,
+        )
+    }
     fn admit_native_bitnot_source_observed(
         &self,
         source: &novarocks_functions::FunctionValueType,
@@ -115,6 +133,7 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             _overload,
             &selected,
             _request.logical_argument_count,
+            novarocks_functions::PureCallLifecycle::from_kind(_kind),
             control,
         )?;
         Ok(selected)
@@ -209,8 +228,10 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
-        self.original
-            .resolve_window_binding(_name, _arguments, control)
+        let binding = self
+            .original
+            .resolve_window_binding(_name, _arguments, control)?;
+        self.admit(binding, control)
     }
     fn resolve_table_binding(
         &self,
@@ -221,8 +242,10 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
-        self.original
-            .resolve_table_binding(_name, _arguments, control)
+        let binding = self
+            .original
+            .resolve_table_binding(_name, _arguments, control)?;
+        self.admit(binding, control)
     }
     fn contains_aggregate(&self, name: &str) -> bool {
         self.original.contains_aggregate(name)
@@ -237,8 +260,13 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
-        self.original
-            .resolve_aggregate_binding(_name, _logical_argument_count, _arguments, control)
+        let binding = self.original.resolve_aggregate_binding(
+            _name,
+            _logical_argument_count,
+            _arguments,
+            control,
+        )?;
+        self.admit(binding, control)
     }
     fn resolve_aggregate_binding_trusted(
         &self,
@@ -250,12 +278,13 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
-        self.original.resolve_aggregate_binding_trusted(
+        let binding = self.original.resolve_aggregate_binding_trusted(
             name,
             logical_argument_count,
             arguments,
             control,
-        )
+        )?;
+        self.admit(binding, control)
     }
     fn resolve_aggregate_signature(
         &self,

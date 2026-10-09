@@ -217,6 +217,18 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     /// analysis so optimizer rewrites cannot consult ambient state.
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog>;
 
+    /// Candidate-only admission of the original selected call and its actual
+    /// invocation lifecycle. Original catalogues perform no lookup or work.
+    /// This does not prepare data or supply absent environment/source facts.
+    fn admit_bound_lifecycle_observed(
+        &self,
+        _binding: &novarocks_functions::ResolvedFunctionBinding,
+        _lifecycle: novarocks_functions::PureCallLifecycle,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
     /// Original catalogues retain the original intrinsic input domain. Only
     /// the explicit Exact request scope installs this source-shape admission.
     /// No query mode is inferred from a runtime value or constant payload.
@@ -551,6 +563,18 @@ pub trait SqlConstantEvaluator: Send + Sync {
         request: &FoldRequest,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>;
+
+    /// Static selected-call admission at the original parent node, before any
+    /// child is folded. The request loan supplies the actual immutable catalog;
+    /// legacy calculators retain their original behavior by default.
+    fn admit_fold_parent_observed(
+        &self,
+        _binding: &crate::binding::SqlFunctionBinding,
+        _lifecycle: novarocks_functions::PureCallLifecycle,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
 
     /// Optional observation before the original evaluator performs any work.
     /// An observer must admit and reserve its complete receipt storage here.
