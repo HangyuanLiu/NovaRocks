@@ -241,3 +241,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 干净80e28e5b18c3083e704c87b7005e93f47a737e94，实际相同build identity，五个独立native1FE+3BE场景全部PASS（9.711s），20精确PID均退出。ZeroAck两次不退休且normal wire独立oracle通过；FinalAck准确Data1=1048576B、Data2=8B均无End，实际单独End3/rows1后才proof3，replay1摘要相同、ACK3两次、Retired1，逐操作fresh census成立。非root exactUnknownRoot/status5为真正headers-only/零DATA。
 - 相同矩阵复跑请求profile/kind拒绝、resident完整行+ERR1317/Closing独立位置/同socket健康，以及large partial EOF/后续zero response且无native task，均PASS。收据 p09-installed-root-native-v3-pass-20261009.json 保存准确source/binary/input/raw hashes与实际观测。FinalAck干扰不宣称normal结果；逻辑Data0/EndACK不证明物理last alias/allocator退出。
 - 共享Native响应包装器修改已完成定向及native证据，按执行合同触发一次干净C0里程碑，待执行；不是final同HEAD全量。exact partial framing/full-pool/real CL/CM/CP/P00b/P10/final以及两项待裁决语义仍OPEN。无push/PR/归档，goal active。
+
+
+### 2026-10-09：共享Native空拒绝包装器 C0 PASS
+
+- 干净b6b3ad232（完整source见收据）dev cargo-only C0全部PASS，564s，12295 PASS/0 FAIL/7既有ignored；repository guards/fmt/all-targets/System allocator/Clippy/build/error manifest/component/Server owner/binary smoke全部通过。原始目录logs/ci-full/20261009-075644，收据p09-empty-grpc-refusal-c0-pass-20261009.json包含raw hashes及post-C0二进制hash。
+- 该共享Native响应契约的里程碑收敛完成；cargo-only不含SQL/native/performance，前一五场景native准确绑定80e源码，不混用post-C0 feature-unified binary。不是M07完成或final同HEAD验收。下一独立test-only切片是S+1行的一字节合法续行，仍须执行；real CL/CM/CP/P00b/P10/final与两个待裁决语义OPEN，无push/PR/归档。
