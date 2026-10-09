@@ -55,6 +55,7 @@ pub(crate) struct PlannedChannels {
     /// Each table function's planned channels. Its argument Project's
     /// pass-through reads are its one branch in `unions`.
     pub table_functions: BTreeMap<NodeId, crate::table_function::PlannedTableFunction>,
+    pub series: BTreeMap<NodeId, crate::generate_series::PlannedGenerateSeries>,
 }
 
 pub(crate) struct NodeChannels {
@@ -191,6 +192,7 @@ fn resolve_core(
     let mut finish_statistics = BTreeMap::new();
     let mut joins = BTreeMap::new();
     let mut table_functions = BTreeMap::new();
+    let mut series = BTreeMap::new();
     for &source in root_first.iter().rev() {
         let node = fragment
             .nodes()
@@ -215,8 +217,11 @@ fn resolve_core(
             }
         ) {
             node.inputs.len()
-        } else if matches!(node.kind, NodeKind::TableFunction { .. }) {
-            // The argument Project directly precedes its table function.
+        } else if matches!(
+            node.kind,
+            NodeKind::TableFunction { .. } | NodeKind::GenerateSeries { .. }
+        ) {
+            // The argument Project or bounds Values directly precedes its owner.
             1
         } else {
             join_shape
@@ -707,6 +712,24 @@ fn resolve_core(
                 joins.insert(source, planned.planned);
                 (planned.slots, planned.port)
             }
+            NodeKind::GenerateSeries { .. } => {
+                let width = crate::generate_series::resource_bound(node)
+                    .ok_or(ChannelLoweringError::Invalid("missing series shape"))?
+                    .1;
+                let parameter_slots = fresh_slots(width, &mut next_slot, work)?;
+                let (slots, port) = fresh_relation(fragment, node, &mut next_slot, work)?;
+                series.insert(
+                    source,
+                    crate::generate_series::PlannedGenerateSeries {
+                        bounds: ProgramNodeId::new(local.index().checked_sub(1).ok_or(
+                            ChannelLoweringError::Invalid("series bounds schedule underflow"),
+                        )?),
+                        node: local,
+                        parameter_slots,
+                    },
+                );
+                (slots, port)
+            }
             // A table function produces its output itself; its argument
             // Project reads the one outer input.
             NodeKind::TableFunction { .. } => {
@@ -801,6 +824,7 @@ fn resolve_core(
         joins,
         join_values,
         table_functions,
+        series,
     })
 }
 

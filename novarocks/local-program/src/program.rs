@@ -384,6 +384,11 @@ pub enum ProgramNodeKind {
     Values {
         values: StaticValues,
     },
+    /// Original integer-series computation over the subordinate bounds Values.
+    GenerateSeries {
+        input: ProgramNodeId,
+        parameter_slots: Arc<[SlotId]>,
+    },
     Project {
         input: ProgramNodeId,
         is_subordinate: bool,
@@ -541,6 +546,7 @@ impl ProgramNodeKind {
             | Self::Limit { input, .. }
             | Self::Sort { input, .. }
             | Self::TableFunction { input, .. }
+            | Self::GenerateSeries { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Analytic { input, .. }
             | Self::RuntimeFilterConsumer { input, .. }
@@ -572,6 +578,7 @@ impl ProgramNodeKind {
             | Self::UnionAll { .. }
             | Self::Limit { .. }
             | Self::TableFunction { .. }
+            | Self::GenerateSeries { .. }
             | Self::SetOp { .. }
             | Self::TableWriter { .. } => {}
             Self::Project { exprs, .. } => {
@@ -1485,6 +1492,21 @@ fn validate_relationships(
                 return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
+        ProgramNodeKind::GenerateSeries {
+            input,
+            parameter_slots,
+        } => {
+            let child = &nodes[input.index()];
+            let ProgramNodeKind::Values { values } = child.kind() else {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            };
+            let same =
+                values.num_rows() == 1 && child.output_layout().slots() == parameter_slots.as_ref();
+            work.step()?;
+            if !same {
+                return Err(LocalProgramError::LayoutMismatch.into());
+            }
+        }
         ProgramNodeKind::RuntimeFilterConsumer { input, .. } => {
             if !layout_matches(nodes, *input, &node.output_layout, work)? {
                 return Err(LocalProgramError::LayoutMismatch.into());
@@ -1523,6 +1545,16 @@ fn validate_shape(
                 != work.identity(&node.output_layout, LocalProgramError::LayoutMismatch)?
             {
                 return Err(LocalProgramError::LayoutMismatch.into());
+            }
+        }
+        ProgramNodeKind::GenerateSeries {
+            parameter_slots, ..
+        } => {
+            let bad =
+                !matches!(parameter_slots.len(), 2 | 3) || node.output_layout.slots().len() != 1;
+            work.step()?;
+            if bad {
+                return Err(LocalProgramError::InvalidNodeShape.into());
             }
         }
         ProgramNodeKind::Project {

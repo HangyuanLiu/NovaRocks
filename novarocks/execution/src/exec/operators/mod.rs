@@ -34,6 +34,7 @@ mod change_event_expand_processor;
 pub(crate) mod compiled_aggregate;
 pub(crate) mod compiled_change_events;
 pub(crate) mod compiled_expression;
+pub(crate) mod compiled_generate_series;
 pub(crate) mod compiled_nljoin;
 pub(crate) mod compiled_repeat;
 pub(crate) mod compiled_sort;

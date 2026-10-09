@@ -312,6 +312,7 @@ impl RootCollector<'_> {
             | ProgramNodeKind::UnionAll { .. }
             | ProgramNodeKind::Limit { .. }
             | ProgramNodeKind::TableFunction { .. }
+            | ProgramNodeKind::GenerateSeries { .. }
             | ProgramNodeKind::SetOp { .. } => {}
             ProgramNodeKind::Project { exprs, .. } => {
                 for (expression, definition) in exprs.iter().enumerate() {

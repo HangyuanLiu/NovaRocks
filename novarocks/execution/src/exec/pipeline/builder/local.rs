@@ -222,7 +222,8 @@ fn validate_runtime_binding_shape(
             | lp::ProgramNodeKind::RuntimeFilterConsumer { input, .. }
             | lp::ProgramNodeKind::TableWriter { input, .. }
             | lp::ProgramNodeKind::Sort { input, .. }
-            | lp::ProgramNodeKind::TableFunction { input, .. } => stack.push(*input),
+            | lp::ProgramNodeKind::TableFunction { input, .. }
+            | lp::ProgramNodeKind::GenerateSeries { input, .. } => stack.push(*input),
             lp::ProgramNodeKind::Join { left, right, .. }
             | lp::ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
                 stack.push(*left);
@@ -1297,6 +1298,9 @@ fn build_pipeline_for_program_node(
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
             Ok(build)
+        }
+        lp::ProgramNodeKind::GenerateSeries { .. } => {
+            Err("compiled GenerateSeries cannot enter the legacy pipeline bridge".to_string())
         }
         lp::ProgramNodeKind::TableFunction {
             input,

@@ -368,6 +368,26 @@ impl ProgramTypedChannels {
                         )?;
                     }
                 }
+                ProgramNodeKind::GenerateSeries {
+                    input,
+                    parameter_slots,
+                } => {
+                    let input_layout = program.nodes()[input.index()].output_layout();
+                    for slot in parameter_slots.iter() {
+                        let ordinal = input_layout
+                            .slots()
+                            .iter()
+                            .position(|candidate| candidate == slot)
+                            .ok_or(ProgramChannelTypeError::WrongShape)?;
+                        same_value(
+                            self.output(*input, ordinal)?,
+                            self.output(node_id, 0)?,
+                            false,
+                            work,
+                        )?;
+                        work.step()?;
+                    }
+                }
                 ProgramNodeKind::Aggregate {
                     group_by,
                     functions,

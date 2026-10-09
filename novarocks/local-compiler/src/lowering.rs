@@ -368,6 +368,14 @@ fn lower(
                 .checked_add(definitions)
                 .ok_or(CompileControlError::ResourceExhausted)?;
         }
+        if let Some((pieces, channels)) = crate::generate_series::resource_bound(node) {
+            expanded_nodes = expanded_nodes
+                .checked_add(pieces)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            channel_count = channel_count
+                .checked_add(channels)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+        }
         // A table function also owns its argument Project, that Project's
         // channels and pass-through reads, and its relation result channels.
         if let Some((pieces, channels, definitions)) = crate::table_function::resource_bound(node)?
@@ -511,6 +519,16 @@ fn lower(
             }
         );
         let supported = match &node.kind {
+            NodeKind::GenerateSeries { .. } => {
+                crate::generate_series::admit(package, node, work)?;
+                if depth
+                    .checked_add(1)
+                    .is_none_or(|depth| depth > MAX_PROGRAM_NODE_DEPTH)
+                {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+                true
+            }
             NodeKind::Values { .. } | NodeKind::ExchangeSource { .. } | NodeKind::Scan { .. } => {
                 node.inputs.is_empty()
             }
@@ -868,6 +886,33 @@ fn lower(
             channels.extend(lowered.channels);
             operators.extend(lowered.operators);
             union_roots.extend(lowered.selection_roots);
+            allowed.insert(DiagnosticSourceNodeId::new(source.get()));
+            local_ids.insert(source, id);
+            continue;
+        }
+        if let Some(series) = channels_plan.series.get(&source) {
+            let lowered = crate::generate_series::lower(
+                package,
+                node,
+                series,
+                &planned.slots,
+                &expressions.ids,
+                work,
+            )?;
+            for emitted in lowered.nodes {
+                if emitted
+                    .local_id()
+                    .is_none_or(|id| id.index() != nodes.len())
+                {
+                    return Err(FragmentCompileError::Invalid(
+                        "series node schedule differs",
+                    ));
+                }
+                nodes.push(emitted);
+                work.step()?;
+            }
+            channels.extend(lowered.channels);
+            operators.extend(lowered.operators);
             allowed.insert(DiagnosticSourceNodeId::new(source.get()));
             local_ids.insert(source, id);
             continue;
@@ -1612,6 +1657,15 @@ fn lower(
                 },
                 use_id: *use_id,
             });
+            continue;
+        }
+        if let Some(root) = crate::generate_series::argument_root(
+            &channels_plan.series,
+            site.node,
+            site.role,
+            *use_id,
+        )? {
+            roots.push(root);
             continue;
         }
         // A table function's argument roots belong to its argument Project.

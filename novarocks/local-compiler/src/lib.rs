@@ -27,6 +27,7 @@ mod change_events_lowering_tests;
 mod channels;
 mod exchange;
 mod expressions;
+mod generate_series;
 mod join;
 #[cfg(test)]
 mod join_lowering_tests;

@@ -52,6 +52,7 @@ use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessor
 use crate::exec::operators::compiled_expression::{
     CompiledFilterProcessorFactory, CompiledProjectProcessorFactory,
 };
+use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
 use crate::exec::operators::compiled_repeat::CompiledRepeatProcessorFactory;
 use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
 use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
@@ -414,6 +415,17 @@ fn build_node(
                 extra_pipelines: Vec::new(),
                 stream: StreamDesc::any(1),
             })
+        }
+        ProgramNodeKind::GenerateSeries { input, .. } => {
+            let mut build = build_node(program, *input, ctx, error)?;
+            build.pipeline.factories.push(Box::new(
+                CompiledGenerateSeriesProcessorFactory::try_new(
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
+                )?,
+            ));
+            Ok(build)
         }
         ProgramNodeKind::Project { input, .. } => {
             let mut build = build_node(program, *input, ctx, error)?;
@@ -865,6 +877,10 @@ mod topn_split_tests;
 #[cfg(test)]
 #[path = "compiled_values_tests.rs"]
 mod values_tests;
+
+#[cfg(test)]
+#[path = "compiled_generate_series_tests.rs"]
+mod generate_series_tests;
 
 #[cfg(test)]
 #[path = "compiled_aggregate_fixture.rs"]
