@@ -317,3 +317,6 @@ mod string_field;
 mod string_field_owner;
 #[cfg(test)]
 mod string_field_tests;
+
+mod hll_hash_owner;
+mod hll_hash_selected;

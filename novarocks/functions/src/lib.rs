@@ -2700,3 +2700,5 @@ pub mod integral_decimal128;
 
 pub mod native_inlist;
 pub use native_inlist::PreparedNativeInListRecipe;
+
+pub mod hll_hash_core;
