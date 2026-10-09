@@ -70,6 +70,50 @@ pub(super) fn sql_source_with_semantics(
     emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_explicit_single_field(
+        sql,
+        Field::new("k", dtype, false),
+        emission_mode,
+        sql_semantics,
+        None,
+    )
+}
+/// A fixture source fact is explicit; it is never inferred from test data.
+pub(super) fn sql_source_with_single_field(
+    sql: &str,
+    field: Field,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_explicit_single_field(
+        sql,
+        field,
+        emission_mode,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        None,
+    )
+}
+/// Same SQL semantics, with a real admitted optimizer setting preserving a
+/// Core ScanResidual. This is not the original native default plan/site.
+pub(super) fn sql_source_with_single_field_and_core_residuals(
+    sql: &str,
+    field: Field,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_explicit_single_field(
+        sql,
+        field,
+        emission_mode,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        Some(false),
+    )
+}
+fn sql_source_with_explicit_single_field(
+    sql: &str,
+    field: Field,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+    static_predicate_offer: Option<bool>,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
@@ -82,6 +126,7 @@ pub(super) fn sql_source_with_semantics(
             optimizer_settings: SessionOptimizerSettings {
                 enable_materialized_view_rewrite: Some(false),
                 enable_common_subexpr_reuse: Some(false),
+                enable_connector_static_predicate_pushdown: static_predicate_offer,
                 ..SessionOptimizerSettings::default()
             },
         },
@@ -128,16 +173,15 @@ pub(super) fn sql_source_with_semantics(
                     .iter()
                     .map(|need| {
                         let relation = need.relation();
-                        let schema =
-                            Arc::new(Schema::new(vec![Field::new("k", dtype.clone(), false)]));
+                        let schema = Arc::new(Schema::new(vec![field.clone()]));
                         let resolved = materialize_connector_read_table(ConnectorReadTableFacts {
                             catalog: relation.catalog.clone(),
                             namespace: relation.namespace.clone(),
                             table: relation.table.clone(),
                             columns: vec![ColumnDef {
-                                name: "k".into(),
-                                data_type: dtype.clone(),
-                                nullable: false,
+                                name: field.name().clone(),
+                                data_type: field.data_type().clone(),
+                                nullable: field.is_nullable(),
                                 write_default: None,
                                 logical_type: None,
                             }],
@@ -149,7 +193,11 @@ pub(super) fn sql_source_with_semantics(
                         })
                         .unwrap()
                         .into_resolved_table();
-                        assert!(!catalog_table(&resolved).columns[0].nullable);
+                        if field.is_nullable() {
+                            assert!(catalog_table(&resolved).columns[0].nullable);
+                        } else {
+                            assert!(!catalog_table(&resolved).columns[0].nullable);
+                        }
                         CatalogRelationFact::resolved(need, resolved).unwrap()
                     })
                     .collect::<Vec<_>>()

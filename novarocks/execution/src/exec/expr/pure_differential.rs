@@ -1826,3 +1826,7 @@ mod percentile_hash_tests;
 #[cfg(test)]
 #[path = "pure_differential_percentile_hash_native_n1_tests.rs"]
 mod percentile_hash_native_n1_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_bitmap_to_string_tests.rs"]
+mod bitmap_to_string_tests;

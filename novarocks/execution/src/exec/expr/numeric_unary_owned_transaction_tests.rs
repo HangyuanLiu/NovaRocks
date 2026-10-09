@@ -153,6 +153,13 @@ fn frozen_reads_with_residual_mode(
     source: &SqlAuthoredPhysicalPlan,
     admit_original_scan_residuals: bool,
 ) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
+    frozen_reads_with_explicit_source_shape(source, admit_original_scan_residuals, false)
+}
+fn frozen_reads_with_explicit_source_shape(
+    source: &SqlAuthoredPhysicalPlan,
+    admit_original_scan_residuals: bool,
+    admit_required_inlist_shape: bool,
+) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
     let mut reads = BTreeMap::new();
     for fragment in source.plan().fragments().values() {
         for node in fragment.nodes().values() {
@@ -181,12 +188,18 @@ fn frozen_reads_with_residual_mode(
                 assert_eq!(provider_outputs.len(), 1);
                 assert_eq!(provider_outputs[0].0, relation.schema()[0].column);
                 let field = &relation.schema()[0];
-                assert!(!field.ty.nullable);
+                if !admit_required_inlist_shape {
+                    assert!(!field.ty.nullable);
+                }
                 let carrier = match field.ty.data_type {
                     DataType::Int8 => ConnectorValueType::TinyInt,
                     DataType::Int16 => ConnectorValueType::SmallInt,
                     DataType::Int32 => ConnectorValueType::Integer,
                     DataType::Int64 => ConnectorValueType::BigInt,
+                    DataType::Utf8 if admit_required_inlist_shape => connector_type_for_value_type(
+                        &field.ty,
+                    )
+                    .expect("actual required Utf8 source has its exact connector projection"),
                     // Keep full precision/signed scale and logical class from
                     // the sole connector assignment projection author.
                     DataType::Decimal128(..) => connector_type_for_value_type(&field.ty).expect(
@@ -228,7 +241,11 @@ fn frozen_reads_with_residual_mode(
                 let public = ConnectorReadPublicFacts::try_new(
                     facts,
                     None,
-                    Schema::new(vec![Field::new("k", field.ty.data_type.clone(), false)]),
+                    if admit_required_inlist_shape {
+                        Schema::new(vec![field.ty.try_to_field("k").unwrap()])
+                    } else {
+                        Schema::new(vec![Field::new("k", field.ty.data_type.clone(), false)])
+                    },
                     vec![field.ty.logical_type],
                 )
                 .unwrap();
@@ -255,18 +272,25 @@ pub(super) fn programs_with_catalogue(
     source: &SqlAuthoredPhysicalPlan,
     functions: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
-    programs_with_original_frozen_reads(source, functions, false)
+    programs_with_original_frozen_reads(source, functions, false, false)
 }
 pub(super) fn programs_with_catalogue_and_original_scan_residuals(
     source: &SqlAuthoredPhysicalPlan,
     functions: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
-    programs_with_original_frozen_reads(source, functions, true)
+    programs_with_original_frozen_reads(source, functions, true, false)
+}
+pub(super) fn programs_with_catalogue_and_original_inlist_source(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
+    programs_with_original_frozen_reads(source, functions, true, true)
 }
 fn programs_with_original_frozen_reads(
     source: &SqlAuthoredPhysicalPlan,
     functions: &PureEngineFunctionCatalog,
     admit_original_scan_residuals: bool,
+    admit_required_inlist_shape: bool,
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
     let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
     let uses = semantics
@@ -302,7 +326,9 @@ fn programs_with_original_frozen_reads(
         .collect();
     let packages = extract_fragment_packages(
         source.plan(),
-        &if admit_original_scan_residuals {
+        &if admit_required_inlist_shape {
+            frozen_reads_with_explicit_source_shape(source, admit_original_scan_residuals, true)
+        } else if admit_original_scan_residuals {
             frozen_reads_with_residual_mode(source, true)
         } else {
             frozen_reads(source)

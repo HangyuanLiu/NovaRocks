@@ -1503,3 +1503,17 @@ mod percentile_hash_native_n1_frame_tests;
 
 #[cfg(test)]
 mod percentile_hash_native_n1_availability_tests;
+
+#[cfg(test)]
+mod legacy_inlist_required_baseline_tests;
+#[cfg(test)]
+mod inlist_required_actual_sql_tests;
+
+#[cfg(test)]
+mod legacy_inlist_variant_local_baseline_tests;
+
+#[cfg(test)]
+mod legacy_bitmap_to_string_original_tests;
+
+#[cfg(test)]
+mod bitmap_to_string_actual_sql_source_tests;
