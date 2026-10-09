@@ -6588,31 +6588,64 @@ mod tests {
         let old_path = bucket_dir.join("old.parquet");
         write_int_parquet_file(&old_path, vec![("id", vec![3, 4])], None);
 
-        let table = two_col_evolution_table(table_path);
+        let table_schema = TableSchema::new(
+            1,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "resid_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+        // The old file predates the added value field; its exact schema has id only.
+        let old_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        write_schema_file(&table, &old_schema).await;
         let split_merged = DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
-            .with_data_files(vec![
-                data_file_meta_with_path(
-                    "id.parquet",
-                    0,
-                    2,
-                    1,
-                    id_path.metadata().unwrap().len() as i64,
-                    Some(vec!["id"]),
-                ),
-                data_file_meta_with_path(
-                    "value.parquet",
-                    0,
-                    2,
-                    2,
-                    value_path.metadata().unwrap().len() as i64,
-                    Some(vec!["value"]),
-                ),
-            ])
+            .with_data_files(
+                vec![
+                    data_file_meta_with_path(
+                        "id.parquet",
+                        0,
+                        2,
+                        1,
+                        id_path.metadata().unwrap().len() as i64,
+                        Some(vec!["id"]),
+                    ),
+                    data_file_meta_with_path(
+                        "value.parquet",
+                        0,
+                        2,
+                        2,
+                        value_path.metadata().unwrap().len() as i64,
+                        Some(vec!["value"]),
+                    ),
+                ]
+                .into_iter()
+                .map(|mut file| {
+                    file.schema_id = table.schema().id();
+                    file
+                })
+                .collect(),
+            )
             .build()
             .unwrap();
         let split_raw = DataSplitBuilder::new()
