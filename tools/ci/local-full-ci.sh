@@ -1358,8 +1358,8 @@ main() {
   run_cargo_gates
   # System Scenarios run before the SQL suites so a topology, readiness,
   # restart, fault or cleanup break surfaces before the much longer SQL tier.
-  # The stage needs no Docker fixture: every registered scenario builds its
-  # Iceberg warehouse on the local filesystem.
+  # Most default scenarios use local warehouses. Target replacement owns an
+  # isolated REST/S3 fixture using the inputs verified during runtime preparation.
   run_system_scenario_fixture_stage
   run_system_scenarios_stage
   reset_frontend_state_store_stage
