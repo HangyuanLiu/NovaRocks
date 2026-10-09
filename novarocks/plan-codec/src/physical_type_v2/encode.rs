@@ -37,6 +37,8 @@ use std::{collections::BTreeSet, sync::Arc};
 use wire::carrier_type_definition::Kind;
 
 type Error = TypeCodecError;
+type HostError<H> = crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>;
+use crate::host_projection_v2::AdmissionRefusal;
 
 /// The only non-strict selector carries an actual checked recipe source.
 /// It is never constructed from a DTO, nominal carrier or caller boolean.
@@ -58,25 +60,25 @@ impl SourceLaw<'_> {
     }
 }
 
-struct Admission<'a> {
+struct Admission<'a, H> {
     model: Model,
     limits: PackageTypeProjectionLimits,
-    admit: &'a mut dyn FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    admit: &'a mut dyn FnMut(&PackageTypeProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
 }
-impl Admission<'_> {
-    fn gate(&mut self) -> Result<(), Error> {
-        self.model.gate(self.limits, self.admit)
+impl<H> Admission<'_, H> {
+    fn gate(&mut self) -> Result<(), HostError<H>> {
+        self.model.gate_with_host(self.limits, self.admit)
     }
 }
 
-struct Counts<'a> {
+struct Counts<'a, H> {
     definitions: usize,
     expanded: usize,
     strings: usize,
     carriers: usize,
     fields: usize,
     limits: TypeProjectionLimits,
-    resources: Option<Admission<'a>>,
+    resources: Option<Admission<'a, H>>,
 }
 
 fn add(total: &mut usize, count: usize, bound: usize) -> Result<(), Error> {
@@ -89,8 +91,8 @@ fn add(total: &mut usize, count: usize, bound: usize) -> Result<(), Error> {
     Ok(())
 }
 
-impl Counts<'_> {
-    fn definition(&mut self) -> Result<(), Error> {
+impl<H> Counts<'_, H> {
+    fn definition(&mut self) -> Result<(), HostError<H>> {
         add(&mut self.definitions, 1, self.limits.max_definitions)
             .map_err(|error| self.envelope_error(error))?;
         if let Some(resources) = &mut self.resources {
@@ -99,7 +101,7 @@ impl Counts<'_> {
         }
         Ok(())
     }
-    fn expansion(&mut self, count: usize) -> Result<(), Error> {
+    fn expansion(&mut self, count: usize) -> Result<(), HostError<H>> {
         add(&mut self.expanded, count, self.limits.max_expanded_nodes)
             .map_err(|error| self.envelope_error(error))?;
         if let Some(resources) = &mut self.resources {
@@ -108,18 +110,18 @@ impl Counts<'_> {
         }
         Ok(())
     }
-    fn string(&mut self, length: usize) -> Result<(), Error> {
+    fn string(&mut self, length: usize) -> Result<(), HostError<H>> {
         add(&mut self.strings, length, self.limits.max_string_bytes)
             .map_err(|error| self.envelope_error(error))
     }
-    fn envelope_error(&self, error: Error) -> Error {
+    fn envelope_error(&self, error: Error) -> HostError<H> {
         if self.resources.is_some() {
             CompileControlError::ResourceExhausted.into()
         } else {
-            error
+            error.into()
         }
     }
-    fn carrier(&mut self) -> Result<(), Error> {
+    fn carrier(&mut self) -> Result<(), HostError<H>> {
         self.definition()?;
         // Separate namespaces allocate by occurrence count, never a source ID.
         u32::try_from(self.carriers)
@@ -130,7 +132,7 @@ impl Counts<'_> {
             .ok_or(Error::InvalidShape("carrier definition count overflow"))?;
         Ok(())
     }
-    fn field(&mut self) -> Result<(), Error> {
+    fn field(&mut self) -> Result<(), HostError<H>> {
         self.definition()?;
         u32::try_from(self.fields)
             .map_err(|_| Error::InvalidShape("field definition IDs are exhausted"))?;
@@ -153,12 +155,12 @@ fn add_child(nodes: &mut usize, child: usize) -> Result<(), Error> {
 // nodes; immutable Writer recipes retain their original 32-level/schema law.
 // Counts include each
 // definition's full referenced subtree, including repeated FieldRef uses.
-fn count_type(
+fn count_type<H>(
     ty: &DataType,
-    counts: &mut Counts<'_>,
+    counts: &mut Counts<'_, H>,
     work: &mut CompileCheckpoints<'_>,
     law: SourceLaw<'_>,
-) -> Result<usize, Error> {
+) -> Result<usize, HostError<H>> {
     if let Some(resources) = &mut counts.resources {
         resources.model.carrier(ty)?;
         resources.gate()?;
@@ -204,12 +206,12 @@ fn count_type(
     Ok(nodes)
 }
 
-fn count_field(
+fn count_field<H>(
     field: &Field,
-    counts: &mut Counts<'_>,
+    counts: &mut Counts<'_, H>,
     work: &mut CompileCheckpoints<'_>,
     law: SourceLaw<'_>,
-) -> Result<usize, Error> {
+) -> Result<usize, HostError<H>> {
     if let Some(resources) = &mut counts.resources {
         resources.model.field(field)?;
         resources.gate()?;
@@ -222,9 +224,7 @@ fn count_field(
     #[allow(deprecated)]
     let dictionary_id = field.dict_id();
     if !law.is_strict() && dictionary_id.is_some() != field.dict_is_ordered().is_some() {
-        return Err(Error::InvalidShape(
-            "incomplete field dictionary attributes",
-        ));
+        return Err(Error::InvalidShape("incomplete field dictionary attributes").into());
     }
     counts.string(field.name().len())?;
     let observed = counts.resources.is_some();
@@ -268,7 +268,10 @@ fn count_field(
 
 /// Admit `count` actual nodes of one strict validator walk before it reaches
 /// them. Without an admission (the unmetered DTO-only API) nothing is owed.
-fn admit_strict_nodes(resources: &mut Option<Admission<'_>>, count: usize) -> Result<(), Error> {
+fn admit_strict_nodes<H>(
+    resources: &mut Option<Admission<'_, H>>,
+    count: usize,
+) -> Result<(), HostError<H>> {
     if count != 0
         && let Some(resources) = resources
     {
@@ -298,27 +301,27 @@ pub(super) fn strict_children(ty: &DataType) -> usize {
 /// has admitted. Each visited carrier admits its direct children before the
 /// walker visits their Fields or pushes them, so the charge follows the
 /// actual type rather than the per-type node maximum.
-fn validate_strict_type(
+fn validate_strict_type<H>(
     ty: &DataType,
-    resources: &mut Option<Admission<'_>>,
+    resources: &mut Option<Admission<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), Error> {
+) -> Result<(), HostError<H>> {
     validate_value_type_structure_observed(ty, |visit| {
         if let ValueTypeVisit::TypeNode(node) = visit {
             admit_strict_nodes(resources, strict_children(node))?;
         }
-        validate_type_visit(visit, work)
+        validate_type_visit(visit, work).map_err(Into::into)
     })
 }
 
-fn preflight<'a>(
+fn preflight<'a, H>(
     values: ValueRootSources<'_>,
     fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     limits: TypeProjectionLimits,
-    resources: Option<Admission<'a>>,
+    resources: Option<Admission<'a, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(Counts<'a>, BTreeSet<u32>), Error> {
+) -> Result<(Counts<'a, H>, BTreeSet<u32>), HostError<H>> {
     let root_count = values
         .len()
         .checked_add(fields.len())
@@ -329,9 +332,7 @@ fn preflight<'a>(
         })
         .ok_or(Error::InvalidShape("root definition count overflow"))?;
     if root_count > limits.max_definitions {
-        return Err(Error::InvalidShape(
-            "type projection exceeds its admitted envelope",
-        ));
+        return Err(Error::InvalidShape("type projection exceeds its admitted envelope").into());
     }
     let observed = resources.is_some();
     let mut reserved_fields = BTreeSet::new();
@@ -347,14 +348,15 @@ fn preflight<'a>(
             work.flush()?;
         }
         if !unique {
-            return Err(Error::InvalidShape("duplicate field definition ID"));
+            return Err(Error::InvalidShape("duplicate field definition ID").into());
         }
     }
     for source in writers {
         if source.field_ids.len() != source.recipe.input().field_count() {
             return Err(Error::InvalidShape(
                 "writer field IDs do not cover the original input occurrences",
-            ));
+            )
+            .into());
         }
         for id in source.field_ids {
             work.flush()?;
@@ -362,7 +364,7 @@ fn preflight<'a>(
             work.step()?;
             work.flush()?;
             if !unique {
-                return Err(Error::InvalidShape("duplicate field definition ID"));
+                return Err(Error::InvalidShape("duplicate field definition ID").into());
             }
         }
     }
@@ -401,7 +403,7 @@ fn preflight<'a>(
             work.flush()?;
         }
         if !unique {
-            return Err(Error::InvalidShape("duplicate value type definition ID"));
+            return Err(Error::InvalidShape("duplicate value type definition ID").into());
         }
         value.logical_type.validate_carrier(&value.data_type)?;
         validate_strict_type(&value.data_type, &mut counts.resources, work)?;
@@ -418,9 +420,7 @@ fn preflight<'a>(
         #[allow(deprecated)]
         let dictionary_id = field.dict_id();
         if dictionary_id.is_some() != field.dict_is_ordered().is_some() {
-            return Err(Error::InvalidShape(
-                "incomplete field dictionary attributes",
-            ));
+            return Err(Error::InvalidShape("incomplete field dictionary attributes").into());
         }
         count_field(field, &mut counts, work, SourceLaw::Strict)?;
     }
@@ -599,7 +599,7 @@ pub(super) fn encode_with_fields(
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::TypeTable, Error> {
-    encode_roots(
+    encode_roots::<std::convert::Infallible>(
         ValueRootSources::Owned(values),
         FieldRootSources::Owned(fields),
         &[],
@@ -607,16 +607,17 @@ pub(super) fn encode_with_fields(
         None,
         work,
     )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
-fn encode_roots<'a>(
+fn encode_roots<'a, H>(
     values: ValueRootSources<'_>,
     fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     limits: TypeProjectionLimits,
-    resources: Option<Admission<'a>>,
+    resources: Option<Admission<'a, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<wire::TypeTable, Error> {
+) -> Result<wire::TypeTable, HostError<H>> {
     let (mut counts, reserved) = preflight(values, fields, writers, limits, resources, work)?;
     if let Some(resources) = &mut counts.resources {
         resources
@@ -690,6 +691,27 @@ pub(super) fn encode_writer_sources(
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::TypeTable, Error> {
+    encode_writer_sources_with_host(
+        values,
+        fields,
+        writers,
+        source_retained_bytes,
+        limits,
+        &mut |facts| admit(facts).map_err(AdmissionRefusal::<std::convert::Infallible>::Control),
+        work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+
+pub(super) fn encode_writer_sources_with_host<H>(
+    values: ValueRootSources<'_>,
+    fields: FieldRootSources<'_>,
+    writers: &[WriterTypeSource<'_>],
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::TypeTable, HostError<H>> {
     let writer_fields = writers
         .iter()
         .try_fold(0usize, |count, source| {

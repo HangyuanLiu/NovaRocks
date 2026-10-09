@@ -380,9 +380,31 @@ impl Model {
                  impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError> + ?Sized
              ),
     ) -> Result<(), E> {
+        self.gate_with_host(limits, &mut |facts| {
+            admit(facts).map_err(
+                crate::host_projection_v2::AdmissionRefusal::<std::convert::Infallible>::Control,
+            )
+        })
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+    }
+    pub(super) fn gate_with_host<H>(
+        &self,
+        limits: PackageTypeProjectionLimits,
+        admit: &mut (
+                 impl FnMut(
+            &PackageTypeProjectionFacts,
+        ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>
+                 + ?Sized
+             ),
+    ) -> Result<(), crate::host_projection_v2::ProjectionFailure<E, H>> {
         let facts = self.facts(limits)?;
-        admit(&facts)?;
-        Ok(())
+        match admit(&facts) {
+            Ok(()) => Ok(()),
+            Err(crate::host_projection_v2::AdmissionRefusal::Control(cause)) => Err(cause.into()),
+            Err(crate::host_projection_v2::AdmissionRefusal::Host(error)) => {
+                Err(crate::host_projection_v2::ProjectionFailure::Host(error))
+            }
+        }
     }
 }
 

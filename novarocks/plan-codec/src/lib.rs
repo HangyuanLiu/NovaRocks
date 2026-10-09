@@ -25,6 +25,7 @@ mod binding_index_v2;
 mod borrowed_type_resources;
 mod btree_resources_v2;
 mod hashmap_resources_v2;
+pub mod host_projection_v2;
 pub mod ipc_flat_batch_v2;
 pub mod ipc_flat_pool_v2;
 pub mod ipc_flat_stream_v2;

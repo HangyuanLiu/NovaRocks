@@ -93,6 +93,33 @@ impl From<novarocks_connector_contract::ConnectorError> for TypeCodecError {
     }
 }
 
+impl<H> From<CompileControlError>
+    for crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>
+{
+    fn from(cause: CompileControlError) -> Self {
+        Self::Codec(TypeCodecError::Control(cause))
+    }
+}
+impl<H> From<ValueTypeError> for crate::host_projection_v2::ProjectionFailure<TypeCodecError, H> {
+    fn from(error: ValueTypeError) -> Self {
+        Self::Codec(TypeCodecError::ValueType(error))
+    }
+}
+impl<H> From<CarrierParameterError>
+    for crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>
+{
+    fn from(error: CarrierParameterError) -> Self {
+        Self::Codec(TypeCodecError::Carrier(error))
+    }
+}
+impl<H> From<novarocks_connector_contract::ConnectorError>
+    for crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>
+{
+    fn from(error: novarocks_connector_contract::ConnectorError) -> Self {
+        Self::Codec(TypeCodecError::Writer(error))
+    }
+}
+
 /// Explicit whole-package Type projection ceilings. These numerical bounds
 /// admit the actual original source, graph, Arrow requests and opaque work;
 /// they neither grant host memory nor validate the rest of the package.
@@ -509,6 +536,42 @@ pub fn encode_borrowed_type_table_writer_sources_in<'source>(
     let values = ValueRootSources::Borrowed(values);
     let fields = FieldRootSources::Borrowed(fields);
     let table = encode::encode_writer_sources(
+        values,
+        fields,
+        writers,
+        source_retained_bytes,
+        limits,
+        admit,
+        work,
+    )?;
+    Ok(EncodedTypeTable {
+        table,
+        values,
+        fields,
+        writers,
+    })
+}
+
+/// The same original type sender with a nominal host-refusal channel. Only the
+/// host owns the payload; a host refusal stops this capture without a Control lie.
+/// Existing Control-only APIs remain adapters to the same computational body.
+pub fn encode_borrowed_type_table_writer_sources_with_host_in<'source, H>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [(u32, &'source Arc<Field>)],
+    writers: &'source [WriterTypeSource<'source>],
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(
+        &PackageTypeProjectionFacts,
+    ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    EncodedTypeTable<'source>,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+> {
+    let values = ValueRootSources::Borrowed(values);
+    let fields = FieldRootSources::Borrowed(fields);
+    let table = encode::encode_writer_sources_with_host(
         values,
         fields,
         writers,
