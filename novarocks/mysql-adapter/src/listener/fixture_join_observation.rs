@@ -23,8 +23,39 @@ pub(crate) use watcher_join_owner::{
     WatcherAbortGuard, WatcherExitKind, WatcherFacts, WatcherPermit,
 };
 
+use crate::connection_registry::MysqlConnectionClass;
+use novarocks_query_application::client_connection::ClientConnectionToken;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinError;
+
+pub(crate) struct MysqlFixtureProtocolFailure {
+    pub connection: ClientConnectionToken,
+    pub class: MysqlConnectionClass,
+    pub cause: std::io::Error,
+}
+impl std::fmt::Display for MysqlFixtureProtocolFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "original MySQL protocol IO failure: connection_id={} generation={} class={:?} io_kind={:?} raw_os={:?}",
+            self.connection.connection_id(),
+            self.connection.generation(),
+            self.class,
+            self.cause.kind(),
+            self.cause.raw_os_error()
+        )
+    }
+}
+impl std::fmt::Debug for MysqlFixtureProtocolFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for MysqlFixtureProtocolFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MysqlFixtureJoinFacts {
@@ -34,11 +65,13 @@ pub(crate) struct MysqlFixtureJoinFacts {
     pub unexpected_cancelled: u64,
     pub aborted: u64,
     pub counter_overflow: bool,
+    pub protocol_io_failures: u64,
 }
 #[derive(Default)]
 struct State {
     facts: MysqlFixtureJoinFacts,
     first_failure: Option<JoinError>,
+    first_protocol_failure: Option<MysqlFixtureProtocolFailure>,
 }
 #[derive(Default)]
 pub(crate) struct MysqlFixtureSessionJoins {
@@ -56,6 +89,35 @@ fn increment(value: &mut u64) -> bool {
     }
 }
 impl MysqlFixtureSessionJoins {
+    pub(crate) fn observe_protocol_failure(
+        &self,
+        connection: ClientConnectionToken,
+        class: MysqlConnectionClass,
+        cause: std::io::Error,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("MySQL fixture join observation lock");
+        let overflow = increment(&mut state.facts.protocol_io_failures);
+        state.facts.counter_overflow |= overflow;
+        if state.first_protocol_failure.is_none() {
+            state.first_protocol_failure = Some(MysqlFixtureProtocolFailure {
+                connection,
+                class,
+                cause,
+            });
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    pub(crate) fn take_protocol_failure_after_join(&self) -> Option<MysqlFixtureProtocolFailure> {
+        self.state
+            .lock()
+            .expect("MySQL fixture join observation lock")
+            .first_protocol_failure
+            .take()
+    }
     pub(crate) fn reserve_watcher(
         self: &Arc<Self>,
         owner: Arc<crate::connection_registry::RegisteredConnectionLifetime>,
@@ -131,7 +193,11 @@ impl MysqlFixtureSessionJoins {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let facts = self.snapshot();
-            if facts.panicked != 0 || facts.unexpected_cancelled != 0 || facts.counter_overflow {
+            if facts.panicked != 0
+                || facts.unexpected_cancelled != 0
+                || facts.counter_overflow
+                || facts.protocol_io_failures != 0
+            {
                 return;
             }
             tokio::select! {
@@ -139,5 +205,95 @@ impl MysqlFixtureSessionJoins {
                 _ = self.watchers.wait_for_failure() => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[derive(Debug)]
+    struct ActualCause(Arc<()>);
+    impl std::fmt::Display for ActualCause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("private protocol cause must not enter fixture summaries")
+        }
+    }
+    impl Error for ActualCause {}
+
+    #[tokio::test]
+    async fn protocol_failure_moves_actual_first_cause_and_wakes_original_ledger() {
+        let observation = MysqlFixtureSessionJoins::default();
+        let identity = Arc::new(());
+        let token = ClientConnectionToken::new(37, 91).unwrap();
+        let pending = observation.wait_for_failure();
+        tokio::pin!(pending);
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        observation.observe_protocol_failure(
+            token,
+            MysqlConnectionClass::Control,
+            std::io::Error::other(ActualCause(identity.clone())),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .unwrap();
+        observation.observe_protocol_failure(
+            ClientConnectionToken::new(38, 92).unwrap(),
+            MysqlConnectionClass::Ordinary,
+            std::io::Error::from_raw_os_error(5),
+        );
+        let actual = observation.take_protocol_failure_after_join().unwrap();
+        assert_eq!(actual.connection, token);
+        assert_eq!(actual.class, MysqlConnectionClass::Control);
+        assert!(Arc::ptr_eq(
+            &actual
+                .cause
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<ActualCause>()
+                .unwrap()
+                .0,
+            &identity
+        ));
+        assert!(
+            actual
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
+        );
+        let summary = format!("{actual:?}");
+        assert!(summary.contains("connection_id=37 generation=91 class=Control"));
+        assert!(!summary.contains("private protocol cause"));
+        assert!(observation.take_protocol_failure_after_join().is_none());
+        assert_eq!(observation.snapshot().protocol_io_failures, 2);
+        assert_eq!(observation.snapshot().joined, 0);
+    }
+
+    #[test]
+    fn protocol_counter_overflow_is_sticky_without_replacing_original_error() {
+        let observation = MysqlFixtureSessionJoins::default();
+        observation.state.lock().unwrap().facts.protocol_io_failures = u64::MAX;
+        observation.observe_protocol_failure(
+            ClientConnectionToken::new(9, 3).unwrap(),
+            MysqlConnectionClass::Ordinary,
+            std::io::Error::from_raw_os_error(5),
+        );
+        assert!(observation.snapshot().counter_overflow);
+        assert_eq!(observation.snapshot().protocol_io_failures, u64::MAX);
+        assert_eq!(
+            observation
+                .take_protocol_failure_after_join()
+                .unwrap()
+                .cause
+                .raw_os_error(),
+            Some(5)
+        );
     }
 }

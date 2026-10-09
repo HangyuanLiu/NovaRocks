@@ -238,6 +238,8 @@ where
             fixture_hub.clone(),
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             watcher_permit,
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            fixture_watchers.clone(),
         ))
     };
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -309,6 +311,8 @@ pub async fn serve_query_application_mysql_connection(
         registration,
         stream,
         peer_addr,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        None,
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         None,
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -386,6 +390,9 @@ async fn serve_registered_mysql_connection(
     >,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")] watcher_permit: Option<
         crate::listener::WatcherPermit,
+    >,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] fixture_protocol: Option<
+        Arc<crate::listener::MysqlFixtureSessionJoins>,
     >,
 ) {
     let connection = registration.token();
@@ -479,6 +486,10 @@ async fn serve_registered_mysql_connection(
             connection.connection_id(),
             err
         );
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if let Some(observation) = fixture_protocol {
+            observation.observe_protocol_failure(connection, registration.class(), err);
+        }
     }
 }
 
@@ -1066,6 +1077,88 @@ mod tests {
             ));
             controller.stop();
         }
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[tokio::test]
+    async fn fixture_original_registered_intermediary_retains_actual_io_after_socket_exit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = MysqlClientConnectionRegistry::new();
+        let registration = connections.register().unwrap();
+        let actual_token = registration.token();
+        let observation = Arc::new(crate::listener::MysqlFixtureSessionJoins::default());
+        let permit = observation
+            .reserve_watcher(registration.retain_owner())
+            .unwrap();
+        let server = async {
+            let (stream, peer) = listener.accept().await.unwrap();
+            serve_registered_mysql_connection(
+                "root".into(),
+                "test".into(),
+                Arc::new(RawResultFactory),
+                registration,
+                stream,
+                peer,
+                None,
+                Some(permit),
+                Some(observation.clone()),
+            )
+            .await;
+            observation.abort_remaining_watchers();
+            while observation.next_watcher().await.is_some() {}
+            connections.wait_drained().await;
+        };
+        let client = async {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).await.unwrap();
+                header[3] = 0;
+                let len = u32::from_le_bytes(header) as usize;
+                assert!(len < 4096);
+                let mut body = vec![0; len];
+                stream.read_exact(&mut body).await.unwrap();
+                body
+            }
+            assert_eq!(read_packet(&mut stream).await[0], 10);
+            let flags = CapabilityFlags::CLIENT_PROTOCOL_41
+                | CapabilityFlags::CLIENT_SECURE_CONNECTION
+                | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+            let mut auth = Vec::new();
+            auth.extend_from_slice(&flags.bits().to_le_bytes());
+            auth.extend_from_slice(&(64_u32 * 1024 * 1024).to_le_bytes());
+            auth.push(33);
+            auth.extend_from_slice(&[0; 23]);
+            auth.extend_from_slice(b"root\0");
+            auth.push(0);
+            auth.extend_from_slice(b"mysql_native_password\0");
+            let mut header = (auth.len() as u32).to_le_bytes();
+            header[3] = 1;
+            stream.write_all(&header).await.unwrap();
+            stream.write_all(&auth).await.unwrap();
+            assert_eq!(read_packet(&mut stream).await[0], 0);
+            let query = b"\x03SELECT raw_result";
+            let mut header = (query.len() as u32).to_le_bytes();
+            header[3] = 0;
+            stream.write_all(&header).await.unwrap();
+            stream.write_all(query).await.unwrap();
+            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(server, client);
+        })
+        .await
+        .unwrap();
+        let actual = observation.take_protocol_failure_after_join().unwrap();
+        assert_eq!(actual.connection, actual_token);
+        assert_eq!(actual.class, MysqlConnectionClass::Ordinary);
+        assert_eq!(actual.cause.kind(), io::ErrorKind::InvalidData);
+        assert!(actual.cause.to_string().contains("original governed owner"));
+        assert_eq!(observation.snapshot().protocol_io_failures, 1);
+        assert_eq!(observation.watcher_snapshot().joined, 1);
+        assert!(observation.watchers_empty());
     }
 
     async fn authenticate(

@@ -26,6 +26,8 @@ use tracing::warn;
 #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
 mod fixture_join_observation;
 #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+pub(crate) use fixture_join_observation::MysqlFixtureProtocolFailure;
+#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
 pub(crate) use fixture_join_observation::MysqlFixtureSessionJoins;
 #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
 pub(crate) use fixture_join_observation::{WatcherAbortGuard, WatcherFacts, WatcherPermit};

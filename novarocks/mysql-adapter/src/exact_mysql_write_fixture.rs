@@ -59,6 +59,7 @@ pub struct MysqlWriteFixtureError {
     close: Option<ControlFailure>,
     join: Option<JoinError>,
     watcher_join: Option<JoinError>,
+    protocol: Option<crate::listener::MysqlFixtureProtocolFailure>,
     gate: Option<io::Error>,
     invalid_facts: bool,
     aborted_sessions: u64,
@@ -96,6 +97,9 @@ impl fmt::Display for MysqlWriteFixtureError {
                 error.is_cancelled()
             )?;
         }
+        if let Some(error) = &self.protocol {
+            write!(f, "; {error}")?;
+        }
         if let Some(facts) = &self.watcher_facts {
             write!(f, "; original_watchers={facts:?}")?;
         }
@@ -129,6 +133,9 @@ impl std::error::Error for MysqlWriteFixtureError {
             return Some(error);
         }
         if let Some(error) = &self.watcher_join {
+            return Some(error);
+        }
+        if let Some(error) = &self.protocol {
             return Some(error);
         }
         self.gate.as_ref().map(|error| error as _)
@@ -232,11 +239,14 @@ impl MysqlWriteFixture {
                 gate.failure.is_none() && gate.cancel_receipt.is_some() && gate.writer_exited
             });
         let join = self.joins.take_failure_after_join();
+        let protocol = self.joins.take_protocol_failure_after_join();
         let watcher_join = self.joins.take_watcher_failure_after_join();
         let gate = self.control.finish_after_protocol_join().err();
         if invalid_facts
             || join.is_some()
             || watcher_join.is_some()
+            || protocol.is_some()
+            || joins.protocol_io_failures != 0
             || gate.is_some()
             || joins.aborted != 0
             || joins.counter_overflow
@@ -245,6 +255,7 @@ impl MysqlWriteFixture {
                 invalid_facts,
                 join,
                 watcher_join,
+                protocol,
                 gate,
                 aborted_sessions: joins.aborted,
                 counter_overflow: joins.counter_overflow,

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "5ee78468f52f05e3847e97ac20ea0ce41d36e68a",
+  "status": "IO_SOURCE_COMPONENT_PASS_NATIVE_OPEN",
+  "source_files": [
+    {
+      "path": "novarocks/mysql-adapter/src/exact_mysql_write_fixture.rs",
+      "bytes": 10016,
+      "sha256": "5ffd53101a9dafc4c423c1c64a628862150a97a22af3f8845785c57bcdc10a38"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/listener.rs",
+      "bytes": 32231,
+      "sha256": "1eff05914f4f399d90e228c460f83faa002bbea438692b64f05a7da1ee3bd353"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/listener/fixture_join_observation.rs",
+      "bytes": 10566,
+      "sha256": "d411c1532900e01eae980b51a896723d0543abbda18c18975aa95ed8ae3afbb5"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/query_application_shim.rs",
+      "bytes": 47662,
+      "sha256": "da05bcc723f11ea1bb144c0fad4fcbbd1d76b9c7ca9740ad8ab3967171a2c908"
+    }
+  ],
+  "raw_logs": [
+    {
+      "path": "logs/mem-1-m07/p09-protocol-io-retention-ledger-v1-20261009.log",
+      "bytes": 56449,
+      "sha256": "36a7f803791d439e98107816765028df6ae4ca7cef4df3783e34c6d40b07824a"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-protocol-io-retention-ledger-v2-20261009.log",
+      "bytes": 53833,
+      "sha256": "9ade9ca1147f451471112d8d746107a7e0a7f9faa6fd51bdf2e60298a01e413b"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-protocol-io-retention-adapter-v1-20261009.log",
+      "bytes": 69104,
+      "sha256": "d70be3705b17e5888c8d8b3e6108a263afdbfa07b1705f3b1ec9d2ddd811d3a7"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-protocol-io-retention-default-server-v1-20261009.log",
+      "bytes": 184437,
+      "sha256": "b0182bd10e402b16b39c22e173489f53c3af502dd279ace8474e72e3df1350ea"
+    }
+  ],
+  "verification": {
+    "feature_adapter_tests": {
+      "passed": 130,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 2.46
+    },
+    "default_server_check": "PASS",
+    "initial_compile": "FAIL: test was mistakenly inserted into trait impl as well as tests; corrected before rerun; raw log retained"
+  },
+  "behavior": [
+    "Original registered intermediary moves actual IO error with full actual connection token and original Ordinary/Control class into same ledger.",
+    "One first actual IO cause retained; bounded count and overflow sticky; original failure observation wakes.",
+    "Owner finish fails on any unknown protocol IO; keeps actual source within original fourth finish stage.",
+    "Actual registered TCP handshake + ungoverned-result refusal test confirms EOF, original watcher actual join, registry drain, and retained cause."
+  ],
+  "open": [
+    "Prescribed missing-tail/pool-refusal EOF structural disposition is still OPEN; current blanket failure is deliberately not waived by ErrorKind/string.",
+    "Native auth/KILL/window/wire/healthy and actual four role exits remain OPEN."
+  ],
+  "scope": "Opt-in fixture only; default features and IO semantics unchanged; no native or HMS write correctness claim"
+}
