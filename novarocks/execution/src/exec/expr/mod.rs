@@ -1436,3 +1436,6 @@ mod legacy_field_baseline_tests;
 mod legacy_text_time_cast_baseline_tests;
 #[cfg(test)]
 mod cast_text_time_oracle_tests;
+
+#[cfg(test)]
+mod ndv_filter_actual_sql_source_tests;
