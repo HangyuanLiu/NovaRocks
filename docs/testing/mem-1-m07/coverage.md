@@ -379,3 +379,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - clean d19ccfed6原生v3 FAILED/5.478s，仍claimed/emitted0。三个accept reset均正确完整preface、acceptedRPC0、完整87/96/96B边界，实际settings1/2/2、connection window1、GOAWAY1，noapplicationframe；typed IO ConnectionReset/resetfalse。GOAWAY payload此前尚unknown，不能称正常close。独立第四条是downstream response copy capacity closed，仍wholefailure。四PID独立不存在/所有actorowners实际退出，收据p09-native-root-reply-native-v3-failed-20261009.json。
 - 本增量完整control parser仅一个8B scratch、标量frameheaders，校验known settings/WU/PING/GOAWAY公开值，保留GOAWAY laststream/error/debug长度而不留debug/Auth/HPACK/body；固定计数overflow sticky失去候选资格。加入RPC有限path/stream/authclass、capacityNone单次nonblocking poll_reset观察，不等待/不合成typedreset/不豁免。原caps/clock/三输入不变。
 - 13actor/153harness PASS，既有ignored3；wholecontrol frames逐cut/bytewise、partial/badpreface/应用帧/unknownsetting/value/错误GOAWAY等反例通过。draft初始debug字面长度14纠正15在apply前完成，无执行失败。收据p09-root-reply-goaway-diagnostic-focused-20261009.json；下一cleanHEAD v4只进一步诊断，尚无native负例PASS或新close分类。
+
+
+### 2026-10-09 P09：第四次GOAWAY内容确认与no-RPC关闭窄分类
+
+- clean95dfb793a原生v4 FAILED/5.39s，实际唯一failure为downstreamaccept typedIO ConnectionReset；完整87B含合法settings(4entries)/window/GOAWAY，实际NO_ERROR/laststream0/debug0，acceptedRPC0/noapp/全部完整边界。claimed/emitted仍0，四PID消失/actorjoin与positions0，未注入，收据p09-native-root-reply-native-v4-failed-20261009.json。旧capacityclosed未在本次复现，旧v2/v3 cause不抹除。
+- 新test-only分类仅上述完整no-RPC peerclose、capture未开始/未shutdown或disconnect、actualoriginal children全join/no cleanup failure；同Core锁结算两个sticky fence和实际listener inventory，每BE≤3关闭、第四次失败。合法控制帧不充分，必须恰一个NO_ERROR/last0/debug0 GOAWAY；rawIo/string/Reason不冒充typed h2acceptIO。任何existing failure、application/partial/protocol/timeout/upstream/stream/capacity原因仍wholefailure。没有产品代码/配置/SQL/cap/deadline改变。
+- 三组新增真实h2 server accept typedIO与边界反例、原actor总16PASS；harness156/0/3ignored、runner117/0/2ignored（最终shutdown/disconnect fence另focused16PASS）。收据p09-root-reply-preapplication-close-focused-20261009.json如实限定scripted IO组件范围；需要新cleanHEAD v5实际stock readiness与三FE负例验证，不能先称native PASS。

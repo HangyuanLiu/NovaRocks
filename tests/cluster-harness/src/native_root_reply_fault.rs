@@ -179,6 +179,8 @@ pub struct RootReplyFaultObservation {
     pub last_overflow: Option<FailureDigest>,
     pub overflow_failures: u64,
     pub non_target_peer_cancels: u64,
+    pub preapplication_backend_indices: [Option<usize>; 3],
+    pub preapplication_peer_closes: [u8; 3],
     pub target_attempts: u64,
     pub not_ready_observed: u64,
     pub not_ready_forwarded: u64,
@@ -224,6 +226,8 @@ struct Slot {
 #[derive(Default)]
 struct State {
     used_capture: bool,
+    lifecycle_closed: bool,
+    preapplication_closes: PreapplicationCloseLedger,
     deadline: Option<Instant>,
     slot: Option<Slot>,
     pending_capture: bool,
@@ -414,6 +418,8 @@ impl RootReplyFaultControl {
             last_overflow: state.last_overflow.clone(),
             overflow_failures: state.overflow_failures,
             non_target_peer_cancels: state.non_target_peer_cancels,
+            preapplication_backend_indices: state.preapplication_closes.backend_indices,
+            preapplication_peer_closes: state.preapplication_closes.closes,
             target_attempts: state.target_attempts,
             not_ready_observed: state.not_ready_observed,
             not_ready_forwarded: state.not_ready_forwarded,
@@ -469,6 +475,11 @@ impl RootReplyFaultProxy {
                 joined_children: AtomicU64::new(0),
             })
         };
+        core.state
+            .lock()
+            .expect("root fault state lock")
+            .preapplication_closes
+            .register(backend_index)?;
         core.listeners.fetch_add(1, Ordering::AcqRel);
         core.state
             .lock()
@@ -525,11 +536,21 @@ impl RootReplyFaultProxy {
         }
     }
     pub(crate) fn disconnect_all(&self) {
+        self.core
+            .state
+            .lock()
+            .expect("root fault state lock")
+            .lifecycle_closed = true;
         self.control().disarm();
         self.generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
     pub(crate) fn stop(&mut self) {
+        self.core
+            .state
+            .lock()
+            .expect("root fault state lock")
+            .lifecycle_closed = true;
         self.control().disarm();
         self.core.stop.send_replace(true);
         if let Some(thread) = self.thread.take() {
@@ -1158,6 +1179,432 @@ mod preapplication_framing_tests {
         }
     }
 }
+// Only completed pre-capture, no-RPC peer shutdowns can enter this ledger.
+const PREAPPLICATION_CLOSES_PER_BACKEND: u8 = 3;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum ConnectionFailureStage {
+    DownstreamAccept,
+    DownstreamHandshake,
+    UpstreamConnect,
+    UpstreamHandshake,
+    UpstreamDriver,
+    ResponseCopy,
+    Timeout,
+    Shutdown,
+    GenerationChange,
+}
+#[derive(Clone, Copy)]
+struct PreapplicationExitFacts {
+    stage: ConnectionFailureStage,
+    accepted_rpcs: u64,
+    unresolved_rpcs: u64,
+    never_provisional_target: bool,
+    all_children_joined: bool,
+    cleanup_failed: bool,
+}
+// At most three explicitly enabled actor listeners, with arbitrary actual BE
+// indexes. This is not a guessed BE0 placement or a process-identity authority.
+#[derive(Default)]
+struct PreapplicationCloseLedger {
+    backend_indices: [Option<usize>; 3],
+    closes: [u8; 3],
+}
+impl PreapplicationCloseLedger {
+    #[cfg(test)]
+    fn new(indices: &[usize]) -> Result<Self> {
+        ensure!(
+            !indices.is_empty() && indices.len() <= 3,
+            "invalid candidate listener inventory"
+        );
+        let mut result = Self {
+            backend_indices: [None; 3],
+            closes: [0; 3],
+        };
+        for (slot, index) in indices.iter().copied().enumerate() {
+            ensure!(
+                !result.backend_indices[..slot].contains(&Some(index)),
+                "duplicate candidate listener index"
+            );
+            result.backend_indices[slot] = Some(index);
+        }
+        Ok(result)
+    }
+    fn register(&mut self, backend_index: usize) -> Result<()> {
+        ensure!(
+            self.slot(backend_index).is_none(),
+            "duplicate root fault listener index"
+        );
+        let slot = self
+            .backend_indices
+            .iter()
+            .position(Option::is_none)
+            .context("root reply fault supports at most three explicit listeners")?;
+        self.backend_indices[slot] = Some(backend_index);
+        Ok(())
+    }
+    fn slot(&self, backend_index: usize) -> Option<usize> {
+        self.backend_indices
+            .iter()
+            .position(|index| *index == Some(backend_index))
+    }
+}
+fn preapplication_close_candidate(
+    state: &State,
+    ledger: &PreapplicationCloseLedger,
+    backend_index: usize,
+    facts: PreapplicationExitFacts,
+    frames: &IngressFrames,
+    error: &anyhow::Error,
+) -> bool {
+    // Sticky used_capture is the phase fence. deadline None after expiry,
+    // disarm, or a successful claim never returns this actor to bootstrap.
+    !state.used_capture
+        && !state.lifecycle_closed
+        && state.deadline.is_none()
+        && state.slot.is_none()
+        && !state.pending_capture
+        && state.claimed == 0
+        && state.frozen_root.is_none()
+        && state.armed_mutation.is_none()
+        && state.target_attempts == 0
+        && state.failures.is_empty()
+        && !state.failure_overflow
+        && facts.stage == ConnectionFailureStage::DownstreamAccept
+        && facts.accepted_rpcs == 0
+        && facts.unresolved_rpcs == 0
+        && facts.never_provisional_target
+        && facts.all_children_joined
+        && !facts.cleanup_failed
+        && frames.complete_control_sequence()
+        && frames.goaways == 1
+        && frames.goaway_debug_bytes == 0
+        && ledger
+            .slot(backend_index)
+            .is_some_and(|slot| ledger.closes[slot] < PREAPPLICATION_CLOSES_PER_BACKEND)
+        && error.downcast_ref::<h2::Error>().is_some_and(|error| {
+            error.is_io()
+                && !error.is_reset()
+                && error.reason().is_none()
+                && matches!(
+                    error.get_io().map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe)
+                )
+        })
+}
+// The production path holds this same Core mutex through eligibility and
+// increment, atomically with begin_capture. The helper tests each fence.
+#[cfg(test)]
+fn settle_preapplication_close_locked(
+    state: &State,
+    ledger: &mut PreapplicationCloseLedger,
+    backend_index: usize,
+    facts: PreapplicationExitFacts,
+    frames: &IngressFrames,
+    error: &anyhow::Error,
+) -> bool {
+    if !preapplication_close_candidate(state, ledger, backend_index, facts, frames, error) {
+        return false;
+    }
+    let slot = ledger
+        .slot(backend_index)
+        .expect("validated candidate listener");
+    ledger.closes[slot] += 1;
+    true
+}
+
+#[cfg(test)]
+mod preapplication_close_candidate_tests {
+    use super::*;
+    use std::io::ErrorKind;
+    // Typed h2 IO errors are obtained from a real h2 server accept operation;
+    // h2::Error::from(Reason::CANCEL) would not be a typed RST_STREAM cancel.
+    struct FailingRead {
+        bytes: std::io::Cursor<Vec<u8>>,
+        kind: ErrorKind,
+    }
+    impl tokio::io::AsyncRead for FailingRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let position = this.bytes.position() as usize;
+            if position == this.bytes.get_ref().len() {
+                return std::task::Poll::Ready(Err(this.kind.into()));
+            }
+            let count = buf.remaining().min(this.bytes.get_ref().len() - position);
+            buf.put_slice(&this.bytes.get_ref()[position..position + count]);
+            this.bytes.set_position((position + count) as u64);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for FailingRead {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    fn controls() -> IngressFrames {
+        let mut frames = IngressFrames::new();
+        frames.observe(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        frames.observe(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        frames.observe(&[0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        frames
+    }
+    fn exit() -> PreapplicationExitFacts {
+        PreapplicationExitFacts {
+            stage: ConnectionFailureStage::DownstreamAccept,
+            accepted_rpcs: 0,
+            unresolved_rpcs: 0,
+            never_provisional_target: true,
+            all_children_joined: true,
+            cleanup_failed: false,
+        }
+    }
+    async fn typed_accept_error(kind: ErrorKind) -> anyhow::Error {
+        let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        let io = FailingRead {
+            bytes: std::io::Cursor::new(bytes),
+            kind,
+        };
+        let mut connection = server::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("complete preface handshake");
+        let accepted = tokio::time::timeout(Duration::from_millis(500), connection.accept())
+            .await
+            .expect("finite typed accept");
+        let error = match accepted {
+            Some(Err(error)) => error,
+            _ => panic!("expected typed H2 accept IO error"),
+        };
+        assert!(error.is_io());
+        assert_eq!(error.get_io().map(std::io::Error::kind), Some(kind));
+        anyhow::Error::new(error).context("actual downstream accept stage")
+    }
+    #[tokio::test]
+    async fn only_two_typed_accept_io_kinds_can_settle_three_closes_per_actual_backend() {
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+            let error = typed_accept_error(kind).await;
+            let state = State::default();
+            let mut ledger = PreapplicationCloseLedger::new(&[2, 7, 11]).unwrap();
+            let frames = controls();
+            for _ in 0..3 {
+                assert!(settle_preapplication_close_locked(
+                    &state,
+                    &mut ledger,
+                    7,
+                    exit(),
+                    &frames,
+                    &error
+                ));
+            }
+            assert!(!settle_preapplication_close_locked(
+                &state,
+                &mut ledger,
+                7,
+                exit(),
+                &frames,
+                &error
+            ));
+            assert!(settle_preapplication_close_locked(
+                &state,
+                &mut ledger,
+                2,
+                exit(),
+                &frames,
+                &error
+            ));
+            assert!(!settle_preapplication_close_locked(
+                &state,
+                &mut ledger,
+                0,
+                exit(),
+                &frames,
+                &error
+            ));
+            assert_eq!(ledger.closes, [1, 3, 0]);
+        }
+        let error = typed_accept_error(ErrorKind::ConnectionAborted).await;
+        assert!(!preapplication_close_candidate(
+            &State::default(),
+            &PreapplicationCloseLedger::new(&[0]).unwrap(),
+            0,
+            exit(),
+            &controls(),
+            &error
+        ));
+    }
+    #[tokio::test]
+    async fn sticky_capture_join_cleanup_stage_and_rpc_evidence_are_mandatory() {
+        let error = typed_accept_error(ErrorKind::ConnectionReset).await;
+        let frames = controls();
+        let mut ledger = PreapplicationCloseLedger::new(&[1]).unwrap();
+        let mut state = State::default();
+        assert!(preapplication_close_candidate(
+            &state,
+            &ledger,
+            1,
+            exit(),
+            &frames,
+            &error
+        ));
+        state.used_capture = true;
+        state.deadline = None;
+        assert!(!settle_preapplication_close_locked(
+            &state,
+            &mut ledger,
+            1,
+            exit(),
+            &frames,
+            &error
+        ));
+        state.used_capture = false;
+        state.lifecycle_closed = true;
+        assert!(!preapplication_close_candidate(
+            &state,
+            &ledger,
+            1,
+            exit(),
+            &frames,
+            &error
+        ));
+        state.lifecycle_closed = false;
+        for stage in [
+            ConnectionFailureStage::DownstreamHandshake,
+            ConnectionFailureStage::UpstreamConnect,
+            ConnectionFailureStage::UpstreamHandshake,
+            ConnectionFailureStage::UpstreamDriver,
+            ConnectionFailureStage::ResponseCopy,
+            ConnectionFailureStage::Timeout,
+            ConnectionFailureStage::Shutdown,
+            ConnectionFailureStage::GenerationChange,
+        ] {
+            assert!(!preapplication_close_candidate(
+                &state,
+                &ledger,
+                1,
+                PreapplicationExitFacts { stage, ..exit() },
+                &frames,
+                &error
+            ));
+        }
+        for facts in [
+            PreapplicationExitFacts {
+                accepted_rpcs: 1,
+                ..exit()
+            },
+            PreapplicationExitFacts {
+                unresolved_rpcs: 1,
+                ..exit()
+            },
+            PreapplicationExitFacts {
+                never_provisional_target: false,
+                ..exit()
+            },
+            PreapplicationExitFacts {
+                all_children_joined: false,
+                ..exit()
+            },
+            PreapplicationExitFacts {
+                cleanup_failed: true,
+                ..exit()
+            },
+        ] {
+            assert!(!preapplication_close_candidate(
+                &state, &ledger, 1, facts, &frames, &error
+            ));
+        }
+        state.failures.push("cleanup failed".to_owned());
+        assert!(!preapplication_close_candidate(
+            &state,
+            &ledger,
+            1,
+            exit(),
+            &frames,
+            &error
+        ));
+        state.failures.clear();
+        state.failure_overflow = true;
+        assert!(!preapplication_close_candidate(
+            &state,
+            &ledger,
+            1,
+            exit(),
+            &frames,
+            &error
+        ));
+        state.failure_overflow = false;
+        for (goaways, debug_bytes) in [(0, 0), (2, 0), (1, 1)] {
+            let mut changed = controls();
+            changed.goaways = goaways;
+            changed.goaway_payloads_validated = goaways;
+            changed.goaway_no_error_last_stream_zero = goaways;
+            changed.goaway_debug_bytes = debug_bytes;
+            assert!(
+                changed.complete_control_sequence(),
+                "fixture must isolate the additional exact GOAWAY condition"
+            );
+            assert!(!preapplication_close_candidate(
+                &state,
+                &ledger,
+                1,
+                exit(),
+                &changed,
+                &error
+            ));
+        }
+        assert_eq!(ledger.closes, [0, 0, 0]);
+    }
+    #[test]
+    fn raw_io_strings_protocol_reasons_partial_and_application_frames_never_qualify() {
+        let state = State::default();
+        let ledger = PreapplicationCloseLedger::new(&[0]).unwrap();
+        let frames = controls();
+        for error in [
+            anyhow::Error::new(std::io::Error::from(ErrorKind::ConnectionReset)),
+            anyhow::anyhow!("root downstream accept ConnectionReset"),
+            anyhow::Error::new(h2::Error::from(h2::Reason::PROTOCOL_ERROR)),
+            anyhow::Error::new(h2::Error::from(h2::Reason::CANCEL)),
+            anyhow::anyhow!("root output capacity closed reset=CANCEL"),
+        ] {
+            assert!(!preapplication_close_candidate(
+                &state,
+                &ledger,
+                0,
+                exit(),
+                &frames,
+                &error
+            ));
+        }
+        // All parser failure facts remain sticky even if the tail is legal.
+        let mut bad = controls();
+        bad.observe(&[0, 0, 0, 1, 4, 0, 0, 0, 1]);
+        assert!(!bad.complete_control_sequence());
+        let mut partial = controls();
+        partial.observe(&[0, 0]);
+        assert!(!partial.complete_control_sequence());
+    }
+}
+
 struct ObservedIngress {
     stream: tokio::net::TcpStream,
     frames: Arc<Mutex<IngressFrames>>,
@@ -1279,6 +1726,8 @@ async fn serve_connection(
         Ok::<_, anyhow::Error>(ChildExit::Upstream)
     });
     let mut accepted_rpcs = 0u64;
+    let mut failed_at_downstream_accept = false;
+    let mut unresolved_rpcs_at_failure = 0;
     let outcome = async {
         loop {
             tokio::select! {
@@ -1296,6 +1745,10 @@ async fn serve_connection(
                 accepted = downstream.accept() => {
                     let Some((request,mut response)) = accepted.transpose()
                         .map_err(|error| {
+                            failed_at_downstream_accept = true;
+                            // With zero accepted RPCs the sole child is the
+                            // upstream driver, never an application stream.
+                            unresolved_rpcs_at_failure = children.len().saturating_sub(1) as u64;
                             let context = format!("root downstream H2 accept (accepted_rpcs={}, children={}, frames={:?}, io={}, io_kind={:?}, raw_os_error={:?}, reset={}, remote={}, reason={:?})",
                                 accepted_rpcs, children.len(), downstream_frames.lock().expect("root ingress facts lock"),
                                 error.is_io(), error.get_io().map(std::io::Error::kind), error.get_io().and_then(std::io::Error::raw_os_error),
@@ -1323,12 +1776,17 @@ async fn serve_connection(
     .await;
     // Abort is only harness shutdown/failure cleanup, never a production task
     // terminal. Await every original child JoinHandle before returning.
+    let mut cleanup_failed = false;
     children.abort_all();
     while let Some(joined) = children.join_next().await {
         core.joined_children.fetch_add(1, Ordering::AcqRel);
         match joined {
-            Ok(Err(error)) => core.failure(&format!("root child cleanup failure: {error:#}")),
+            Ok(Err(error)) => {
+                cleanup_failed = true;
+                core.failure(&format!("root child cleanup failure: {error:#}"));
+            }
             Err(error) if !error.is_cancelled() => {
+                cleanup_failed = true;
                 core.failure(&format!("root child cleanup join: {error}"))
             }
             Ok(Ok(_)) | Err(_) => {}
@@ -1336,6 +1794,33 @@ async fn serve_connection(
     }
     drop(sender);
     drop(downstream);
+    if failed_at_downstream_accept && let Err(error) = &outcome {
+        let frames = downstream_frames.lock().expect("root ingress facts lock");
+        let mut state = core.state.lock().expect("root fault state lock");
+        let facts = PreapplicationExitFacts {
+            stage: ConnectionFailureStage::DownstreamAccept,
+            accepted_rpcs,
+            unresolved_rpcs: unresolved_rpcs_at_failure,
+            never_provisional_target: accepted_rpcs == 0,
+            all_children_joined: children.is_empty(),
+            cleanup_failed,
+        };
+        if preapplication_close_candidate(
+            &state,
+            &state.preapplication_closes,
+            backend_index,
+            facts,
+            &frames,
+            error,
+        ) {
+            let slot = state
+                .preapplication_closes
+                .slot(backend_index)
+                .expect("validated actual root fault listener");
+            state.preapplication_closes.closes[slot] += 1;
+            return Ok(());
+        }
+    }
     outcome
 }
 

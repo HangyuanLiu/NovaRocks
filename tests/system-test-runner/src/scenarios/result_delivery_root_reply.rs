@@ -992,6 +992,8 @@ mod root_reply_predicate_tests {
             not_ready_observed: 0,
             not_ready_forwarded: 0,
             non_target_peer_cancels: 0,
+            preapplication_backend_indices: [Some(0), Some(1), Some(2)],
+            preapplication_peer_closes: [0; 3],
             not_ready_replies: vec![],
             target_attempt_requests: vec![],
             original: Some(original),
