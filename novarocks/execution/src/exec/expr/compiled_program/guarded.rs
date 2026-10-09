@@ -1368,6 +1368,15 @@ fn evaluate_cast<'a>(
     };
     use novarocks_functions::CastRowResult as R;
     let ty = &recipe.result_type().data_type;
+    if recipe.is_collection() {
+        work.flush()?;
+        return recipe.evaluate_collection(
+            child.argument(),
+            selection,
+            child.errors(),
+            work.control,
+        );
+    }
     // An unzoned primitive rendering fits within 64 bytes, including the
     // widest Chrono year and nanosecond fraction. Check Arrow's i32 offset
     // extent before producing text. This is not a host memory grant.

@@ -1137,3 +1137,7 @@ mod decimal128_rescale_profile_tests;
 
 #[path = "cast_observed_list_tests.rs"]
 mod observed_list_cast_profile_tests;
+
+#[cfg(test)]
+#[path = "cast_observed_list_after_tests.rs"]
+mod observed_list_after_tests;

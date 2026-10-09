@@ -1535,7 +1535,10 @@ fn cast_with_special_rules_with_field_schema(
         return Ok(new_null_array(&DataType::Null, array.len()));
     }
     if array.data_type() == &DataType::Null {
-        return Ok(new_null_array(target_type, array.len()));
+        return Ok(novarocks_functions::list_cast_core::null_source(
+            array.len(),
+            target_type,
+        ));
     }
     if !matches!(
         array.data_type(),
@@ -1774,41 +1777,13 @@ fn cast_with_special_rules_with_field_schema(
             cast_list_to_map(array, target_entries, *ordered)
         }
         (DataType::List(_), DataType::List(target_field)) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
-            // A nested-field metadata change reuses every value, offset, and
-            // validity buffer. It neither parses JSON nor reinterprets Utf8.
-            if list.values().data_type() == target_field.data_type() {
-                return Ok(Arc::new(ListArray::new(
-                    target_field.clone(),
-                    list.offsets().clone(),
-                    list.values().clone(),
-                    list.nulls().cloned(),
-                )) as ArrayRef);
-            }
-            // Empty list values can be safely retagged to any target item type.
-            // This matches StarRocks behavior for casts around empty array literals.
-            let cast_values = if list.values().is_empty() {
-                arrow::array::new_empty_array(target_field.data_type())
-            } else if list.values().null_count() == list.values().len() {
-                // Preserve all-null list literals while adapting the target item type.
-                arrow::array::new_null_array(target_field.data_type(), list.values().len())
-            } else {
+            novarocks_functions::list_cast_core::cast(array, target_field, &mut |child, target| {
                 cast_with_special_rules_with_field_schema(
-                    list.values(),
-                    target_field.data_type(),
+                    child,
+                    target,
                     target_field_schema.and_then(ChunkFieldSchema::list_item),
-                )?
-            };
-            let out = ListArray::new(
-                target_field.clone(),
-                OffsetBuffer::new(list.value_offsets().to_vec().into()),
-                cast_values,
-                list.nulls().cloned(),
-            );
-            Ok(Arc::new(out) as ArrayRef)
+                )
+            })
         }
         (DataType::Struct(_), DataType::Struct(target_fields)) => {
             cast_struct_to_struct(array, target_fields)

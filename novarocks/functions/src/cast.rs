@@ -346,6 +346,8 @@ impl DecimalTextSource {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    /// Original List retag/null-child computation on an exact selected domain.
+    Collection,
     DecimalRescale {
         precision: u8,
         scale: i8,
@@ -466,6 +468,21 @@ impl PreparedCastRecipe {
             let physical = source.logical_type == ValueLogicalType::Physical
                 && result.logical_type == ValueLogicalType::Physical;
             work.step()?;
+            if operation == CastOperation::Carrier
+                && crate::list_cast_selected::profile(source, result)
+            {
+                if source.nullable && !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::Collection,
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
             if physical
                 && matches!(
                     source.data_type,
@@ -779,6 +796,31 @@ impl PreparedCastRecipe {
     pub fn is_identity(&self) -> bool {
         self.body == CastBody::Identity
     }
+    /// The selected controller delegates this exact body as one invocation.
+    pub fn is_collection(&self) -> bool {
+        self.body == CastBody::Collection
+    }
+    pub fn evaluate_collection<'a>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        selection: crate::Selection<'a>,
+        inherited: &[RowDataError],
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
+        if !self.is_collection() {
+            return Err(invalid(
+                "collection invocation requires a prepared List CAST",
+            ));
+        }
+        crate::list_cast_selected::evaluate(
+            &self.source,
+            &self.result,
+            argument,
+            selection,
+            inherited,
+            control,
+        )
+    }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
             CastBody::DecimalRescale { scale, .. } => {
@@ -815,7 +857,8 @@ impl PreparedCastRecipe {
             }
             CastBody::FloatDate { .. } => true,
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
-            CastBody::TimeCalendar
+            CastBody::Collection
+            | CastBody::TimeCalendar
             | CastBody::TimeText { .. }
             | CastBody::BinaryText
             | CastBody::LargeIntText
@@ -854,6 +897,9 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if self.is_collection() {
+                return Err(invalid("List CAST requires its actual selected invocation"));
+            }
             if let CastBody::DecimalRescale { precision, scale } = self.body {
                 let row = self.checked_row_with_shape(
                     argument,
@@ -1801,3 +1847,7 @@ mod decimal_float32_tests;
 #[cfg(test)]
 #[path = "cast_decimal128_rescale_tests.rs"]
 mod decimal128_rescale_tests;
+
+#[cfg(test)]
+#[path = "cast_observed_list_tests.rs"]
+mod observed_list_tests;
