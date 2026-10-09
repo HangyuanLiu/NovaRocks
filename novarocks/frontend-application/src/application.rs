@@ -136,6 +136,10 @@ pub enum FrontendApplicationErrorKind {
 pub struct FrontendApplicationError {
     kind: FrontendApplicationErrorKind,
     message: String,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    fixture_failures: [Option<
+        Box<novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixtureError>,
+    >; 4],
 }
 
 impl FrontendApplicationError {
@@ -143,12 +147,38 @@ impl FrontendApplicationError {
         Self {
             kind,
             message: error.to_string(),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            fixture_failures: std::array::from_fn(|_| None),
         }
     }
 
     /// Constructs a role-composition failure for the outer Server owner.
     pub fn server(error: impl fmt::Display) -> Self {
         Self::new(FrontendApplicationErrorKind::Server, error)
+    }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn server_fixture(
+        error: novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixtureError,
+    ) -> Self {
+        let mut result = Self::server(&error);
+        result.fixture_failures[0] = Some(Box::new(error));
+        result
+    }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn with_role_cleanup(mut self, cleanup: Self) -> Self {
+        self.message
+            .push_str(&format!("; cleanup failed: {cleanup}"));
+        for source in cleanup.fixture_failures.into_iter().flatten() {
+            // The fixture has exactly four possible verdict stages: control,
+            // socket cleanup, registry verification and original-owner finish.
+            let slot = self
+                .fixture_failures
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .expect("fixed MySQL fixture verdict stages");
+            *slot = Some(source);
+        }
+        self
     }
 
     /// Retains the first role failure while recording bounded cleanup failure.
@@ -169,7 +199,15 @@ impl fmt::Display for FrontendApplicationError {
     }
 }
 
-impl std::error::Error for FrontendApplicationError {}
+impl std::error::Error for FrontendApplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if let Some(error) = self.fixture_failures.iter().flatten().next() {
+            return Some(error.as_ref());
+        }
+        None
+    }
+}
 
 /// Unique owner aggregate for the query-application runtime.
 ///

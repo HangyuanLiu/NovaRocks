@@ -18,7 +18,8 @@
 //! Test-only exact socket acceptance gate. No listener, registry or external control API.
 //! Counts actual inner AsyncWrite acceptance; retains no offered bytes or body aliases.
 
-mod late_binding;
+pub(crate) mod late_binding;
+pub(crate) mod unix_control;
 
 use std::future::Future;
 use std::io::{self, IoSlice};

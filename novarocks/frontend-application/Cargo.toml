@@ -10,6 +10,9 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+mem-1-m07-exact-mysql-write = ["novarocks-mysql-adapter/mem-1-m07-exact-mysql-write"]
+
 [dependencies]
 novarocks-type-contract.workspace = true
 allocator-api2.workspace = true

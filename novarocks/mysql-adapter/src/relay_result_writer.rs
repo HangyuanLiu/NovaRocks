@@ -53,6 +53,9 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
     schema: SchemaDelivery,
     results: QueryResultWriter<'writer, W>,
     more_results: bool,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] hook: Option<
+        crate::mysql_write_gate::late_binding::MysqlWriteRelayHook,
+    >,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     let limits = results.protocol_limits();
     let profile = match schema.row_carrier() {
@@ -104,6 +107,10 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
         outcome = tokio::time::timeout_at(deadline, lease.writer().finish_metadata()) => outcome.map_err(|_| timeout_error()).and_then(|outcome| outcome).map_err(WriteInterruption::Io),
     };
     if let Err(error) = started {
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if let Some(hook) = &hook {
+            hook.fail_fixture(crate::mysql_write_gate::GateFailure::Transition);
+        }
         return match error {
             WriteInterruption::Query(error) => {
                 schema.fail(error.clone());
@@ -116,6 +123,15 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                 Err(error)
             }
         };
+    }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    if let Some(hook) = &hook {
+        if let Err(error) = hook.begin_rows(lease.receipt()) {
+            schema.fail(invalid(error.to_string()));
+            drop(lease);
+            let _ = result.fail();
+            return Err(error);
+        }
     }
     schema.complete();
     let mut resident_window = None;
@@ -130,6 +146,10 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
         let delivery = match next {
             Ok(delivery) => delivery,
             Err(error) => {
+                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                if let Some(hook) = &hook {
+                    hook.fail_fixture(crate::mysql_write_gate::GateFailure::Transition);
+                }
                 return close_relay(result, lease, error, None, resident_window).await;
             }
         };
@@ -166,9 +186,30 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                 if let Err(error) = written {
                     return match error {
                         WriteInterruption::Query(error) => {
+                            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                            if let Some(hook) = &hook {
+                                // select! has returned: its actual Data write future
+                                // has dropped before borrowing this original receipt.
+                                if error.kind() == QueryExecutionErrorKind::Cancelled
+                                    && matches!(cancellation.reason(), Some(novarocks_query_application::cancellation::QueryCancellationReason::ExplicitKill { .. }))
+                                {
+                                    if let Err(gate_error) = hook.record_cancel_and_resume(lease.receipt()) {
+                                        delivery.fail(error);
+                                        drop(lease);
+                                        let _ = result.fail();
+                                        return Err(gate_error);
+                                    }
+                                } else {
+                                    hook.fail_fixture(crate::mysql_write_gate::GateFailure::Transition);
+                                }
+                            }
                             close_relay(result, lease, error, Some(delivery), resident_window).await
                         }
                         WriteInterruption::Io(error) => {
+                            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                            if let Some(hook) = &hook {
+                                hook.fail_fixture(crate::mysql_write_gate::GateFailure::Transition);
+                            }
                             delivery.fail(invalid(error.to_string()));
                             drop(lease);
                             let _ = result.client_disconnected();
@@ -179,6 +220,17 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                 delivery.complete();
             }
             ResultDelivery::End(delivery) => {
+                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                if let Some(hook) = &hook {
+                    // The armed target must observe its exact interrupted Data
+                    // cut; ordinary success End is not experiment acceptance.
+                    hook.fail_fixture(crate::mysql_write_gate::GateFailure::Transition);
+                    let error = invalid("fixture target ended without an exact cancelled Data cut");
+                    delivery.fail(error.clone());
+                    drop(lease);
+                    let _ = result.fail();
+                    return Err(io_error(error));
+                }
                 if lease.receipt().phase != opensrv_mysql::WritePhase::Boundary {
                     let error = invalid("root End arrived inside a MySQL row");
                     delivery.fail(error.clone());

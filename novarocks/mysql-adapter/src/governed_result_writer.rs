@@ -71,9 +71,39 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
 }
 
 pub(crate) async fn write_streaming_query_result_with_more<'writer, W: AsyncWrite + Unpin>(
+    result: StreamingStatementResult,
+    results: QueryResultWriter<'writer, W>,
+    more_results: bool,
+) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
+    write_streaming_query_result_kernel(
+        result,
+        results,
+        more_results,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+pub(crate) async fn write_streaming_query_result_with_gate<W: AsyncWrite + Unpin>(
+    result: StreamingStatementResult,
+    results: QueryResultWriter<'_, W>,
+    hook: Option<crate::mysql_write_gate::late_binding::MysqlWriteRelayHook>,
+) -> io::Result<()> {
+    match write_streaming_query_result_kernel(result, results, false, hook).await? {
+        MysqlStatementWriteOutcome::Continue(results) => results.no_more_results().await,
+        MysqlStatementWriteOutcome::Terminated => Ok(()),
+    }
+}
+
+async fn write_streaming_query_result_kernel<'writer, W: AsyncWrite + Unpin>(
     mut result: StreamingStatementResult,
     results: QueryResultWriter<'writer, W>,
     more_results: bool,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] hook: Option<
+        crate::mysql_write_gate::late_binding::MysqlWriteRelayHook,
+    >,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     let schema_delivery = match result.begin_schema() {
         Some(delivery) => delivery,
@@ -89,6 +119,8 @@ pub(crate) async fn write_streaming_query_result_with_more<'writer, W: AsyncWrit
         schema_delivery,
         results,
         more_results,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        hook,
     )
     .await
 }

@@ -258,7 +258,29 @@ impl MysqlWriteGateHub {
             Err(hub_fail(state, GateFailure::Transition))
         })
     }
-    fn is_selected_connection(&self, connection: ClientConnectionToken) -> bool {
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn reject_unsupported_batch(
+        &self,
+        actual_connection: ClientConnectionToken,
+    ) -> io::Result<()> {
+        if !self.is_selected_connection(actual_connection) {
+            return Ok(());
+        }
+        self.checked(|state| Err(hub_fail(state, GateFailure::Transition)))
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn fail_selected(
+        &self,
+        actual_connection: ClientConnectionToken,
+        reason: GateFailure,
+    ) {
+        if self.is_selected_connection(actual_connection) {
+            self.fail(reason);
+        }
+    }
+
+    pub(crate) fn is_selected_connection(&self, connection: ClientConnectionToken) -> bool {
         let state = self.state.lock().expect("MySQL fixture hub lock");
         state
             .arm
@@ -414,6 +436,11 @@ impl Drop for MysqlWriteGateController {
     }
 }
 impl MysqlWriteRelayHook {
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn fail_fixture(&self, reason: GateFailure) {
+        self.hub.fail(reason);
+    }
+
     /// Synchronous: after complete metadata, before any target row writes.
     pub(crate) fn begin_rows(&self, actual_receipt: FramingCursor) -> io::Result<()> {
         let result = self.scope.begin_rows(self.statement, actual_receipt);

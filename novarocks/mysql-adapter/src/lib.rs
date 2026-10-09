@@ -21,11 +21,13 @@ mod authentication;
 mod connection_registry;
 mod disconnect_watcher;
 mod error_mapping;
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+pub mod exact_mysql_write_fixture;
 mod governed_result_writer;
 mod listener;
 mod listener_settings;
 mod local_result_writer;
-#[cfg(test)]
+#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
 mod mysql_write_gate;
 mod query_application_shim;
 mod relay_metadata;
@@ -137,3 +139,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+pub use query_application_shim::serve_query_application_mysql_until_drain_then_shutdown_fixture as query_application_fixture_listener;

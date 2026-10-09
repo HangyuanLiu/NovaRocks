@@ -24,6 +24,9 @@ use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
 use tracing::info;
 
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+mod exact_mysql_write_fixture;
+
 use crate::capabilities as core_capabilities;
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
@@ -919,6 +922,8 @@ where
         }
     };
     let server_result = run_mysql_with_listener_supervision(
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        Arc::clone(&config.native_trust),
         config.mysql_listener,
         session_factory,
         client_connections,
@@ -945,6 +950,7 @@ where
 }
 
 async fn run_mysql_with_listener_supervision<F>(
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] native_trust: Arc<NativeTrust>,
     mysql_listener: ResolvedMysqlListenerSettings,
     session_factory: Arc<dyn QuerySessionFactory>,
     client_connections: Arc<MysqlClientConnectionRegistry>,
@@ -958,6 +964,22 @@ async fn run_mysql_with_listener_supervision<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    if let Some(fixture) = exact_mysql_write_fixture::bind_from_environment(&native_trust)? {
+        return exact_mysql_write_fixture::serve(
+            fixture,
+            mysql_listener,
+            session_factory,
+            client_connections,
+            shutdown,
+            report_server,
+            management_server,
+            host,
+            drain_timeout,
+            cleanup_timeout,
+        )
+        .await;
+    }
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let (finalize_tx, finalize_rx) = tokio::sync::watch::channel(false);
     let wait_for_signal = |mut receiver: tokio::sync::watch::Receiver<bool>| async move {
@@ -1158,6 +1180,9 @@ fn combine_server_and_shutdown(
         (Err(server_error), Ok(())) => Err(server_error),
         (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
         (Err(server_error), Err(shutdown_error)) => {
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            return Err(server_error.with_role_cleanup(shutdown_error));
+            #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
             Err(server_error.with_cleanup_context(shutdown_error))
         }
     }

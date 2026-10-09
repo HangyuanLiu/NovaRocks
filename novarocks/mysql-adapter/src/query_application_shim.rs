@@ -144,25 +144,134 @@ where
     G: Future<Output = ()> + Send,
     R: FnOnce(SocketAddr),
 {
+    serve_query_application_mysql_kernel(
+        settings,
+        server_version,
+        session_factory,
+        connections,
+        drain,
+        finalize,
+        cleanup_timeout,
+        on_ready,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        None,
+    )
+    .await
+}
+
+/// Opt-in binding stays inside the adapter; it carries no public Hub capability.
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+pub async fn serve_query_application_mysql_until_drain_then_shutdown_fixture<F, G, R>(
+    settings: crate::ResolvedMysqlListenerSettings,
+    server_version: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
+    drain: F,
+    finalize: G,
+    cleanup_timeout: Duration,
+    on_ready: R,
+    binding: crate::exact_mysql_write_fixture::MysqlWriteFixtureListenerBinding,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
+    R: FnOnce(SocketAddr),
+{
+    serve_query_application_mysql_kernel(
+        settings,
+        server_version,
+        session_factory,
+        connections,
+        drain,
+        finalize,
+        cleanup_timeout,
+        on_ready,
+        Some(binding),
+    )
+    .await
+}
+
+async fn serve_query_application_mysql_kernel<F, G, R>(
+    settings: crate::ResolvedMysqlListenerSettings,
+    server_version: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
+    drain: F,
+    finalize: G,
+    cleanup_timeout: Duration,
+    on_ready: R,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] binding: Option<
+        crate::exact_mysql_write_fixture::MysqlWriteFixtureListenerBinding,
+    >,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
+    R: FnOnce(SocketAddr),
+{
     let (bind_addr, session_user) = settings.into_parts();
     let drain_registry = Arc::clone(&connections);
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    let (fixture_hub, fixture_joins) = match binding {
+        Some(binding) => (Some(binding.hub), Some(binding.joins)),
+        None => (None, None),
+    };
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    let fixture_watchers = fixture_joins.clone();
+    let handler = move |stream, peer_addr| {
+        // Acquire a finite position before creating the task, watcher or
+        // intermediary and its protocol buffers. Full admission closes IO.
+        let registration = connections.register().ok()?;
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        let watcher_permit = match &fixture_watchers {
+            Some(joins) => Some(joins.reserve_watcher(registration.retain_owner()).ok()?),
+            None => None,
+        };
+        Some(serve_registered_mysql_connection(
+            session_user.clone(),
+            server_version.clone(),
+            Arc::clone(&session_factory),
+            registration,
+            stream,
+            peer_addr,
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            fixture_hub.clone(),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            watcher_permit,
+        ))
+    };
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    let serve_result = match fixture_joins {
+        Some(joins) => {
+            crate::listener::serve_tcp_until_drain_then_shutdown_admitted_observed(
+                bind_addr,
+                drain,
+                finalize,
+                handler,
+                on_ready,
+                cleanup_timeout,
+                joins,
+            )
+            .await
+        }
+        None => {
+            crate::listener::serve_tcp_until_drain_then_shutdown_admitted(
+                bind_addr,
+                drain,
+                finalize,
+                handler,
+                on_ready,
+                cleanup_timeout,
+            )
+            .await
+        }
+    };
+    #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
     let serve_result = crate::listener::serve_tcp_until_drain_then_shutdown_admitted(
         bind_addr,
         drain,
         finalize,
-        move |stream, peer_addr| {
-            // Acquire a finite position before creating the task, watcher or
-            // intermediary and its protocol buffers. Full admission closes IO.
-            let registration = connections.register().ok()?;
-            Some(serve_registered_mysql_connection(
-                session_user.clone(),
-                server_version.clone(),
-                Arc::clone(&session_factory),
-                registration,
-                stream,
-                peer_addr,
-            ))
-        },
+        handler,
         on_ready,
         cleanup_timeout,
     )
@@ -200,8 +309,69 @@ pub async fn serve_query_application_mysql_connection(
         registration,
         stream,
         peer_addr,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        None,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        None,
     )
     .await;
+}
+
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+enum FixtureMysqlWriter {
+    Raw(tokio::net::tcp::OwnedWriteHalf),
+    Gated(
+        crate::mysql_write_gate::late_binding::InitiallyRawMysqlWriter<
+            tokio::net::tcp::OwnedWriteHalf,
+        >,
+    ),
+}
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+impl AsyncWrite for FixtureMysqlWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Raw(io) => std::pin::Pin::new(io).poll_write(cx, bytes),
+            Self::Gated(io) => std::pin::Pin::new(io).poll_write(cx, bytes),
+        }
+    }
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Raw(io) => std::pin::Pin::new(io).poll_write_vectored(cx, bytes),
+            Self::Gated(io) => std::pin::Pin::new(io).poll_write_vectored(cx, bytes),
+        }
+    }
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Raw(io) => io.is_write_vectored(),
+            Self::Gated(io) => io.is_write_vectored(),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Raw(io) => std::pin::Pin::new(io).poll_flush(cx),
+            Self::Gated(io) => std::pin::Pin::new(io).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Raw(io) => std::pin::Pin::new(io).poll_shutdown(cx),
+            Self::Gated(io) => std::pin::Pin::new(io).poll_shutdown(cx),
+        }
+    }
 }
 
 async fn serve_registered_mysql_connection(
@@ -211,6 +381,12 @@ async fn serve_registered_mysql_connection(
     mut registration: MysqlClientConnectionRegistration,
     stream: TcpStream,
     peer_addr: SocketAddr,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] fixture_hub: Option<
+        Arc<crate::mysql_write_gate::late_binding::MysqlWriteGateHub>,
+    >,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] watcher_permit: Option<
+        crate::listener::WatcherPermit,
+    >,
 ) {
     let connection = registration.token();
     let session: Arc<OnceLock<Arc<dyn QuerySession>>> = Arc::new(OnceLock::new());
@@ -222,6 +398,11 @@ async fn serve_registered_mysql_connection(
             session.cancel_current(QueryCancellationReason::ClientDisconnected);
         }
     });
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    let disconnect_watcher = match watcher_permit {
+        Some(permit) => permit.attach(disconnect_watcher),
+        None => disconnect_watcher,
+    };
     let shim = QueryApplicationMysqlShim::new(
         user,
         connection,
@@ -231,7 +412,22 @@ async fn serve_registered_mysql_connection(
         server_version,
     )
     .with_connection_class(registration.class());
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    let shim = shim.with_fixture_hub(if registration.class() == MysqlConnectionClass::Ordinary {
+        fixture_hub.clone()
+    } else {
+        None
+    });
     let (reader, writer) = stream.into_split();
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    let writer = match (registration.class(), fixture_hub) {
+        (MysqlConnectionClass::Ordinary, Some(hub)) => FixtureMysqlWriter::Gated(
+            crate::mysql_write_gate::late_binding::InitiallyRawMysqlWriter::new(
+                writer, connection, hub,
+            ),
+        ),
+        _ => FixtureMysqlWriter::Raw(writer),
+    };
     let result = {
         let mut limits = opensrv_mysql::ProtocolLimits::default();
         if registration.class() == MysqlConnectionClass::Control {
@@ -309,6 +505,8 @@ pub struct QueryApplicationMysqlShim {
     _disconnect_watcher: ClientDisconnectWatcher,
     server_version: String,
     connection_class: MysqlConnectionClass,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    fixture_hub: Option<Arc<crate::mysql_write_gate::late_binding::MysqlWriteGateHub>>,
 }
 
 impl QueryApplicationMysqlShim {
@@ -328,12 +526,31 @@ impl QueryApplicationMysqlShim {
             _disconnect_watcher: disconnect_watcher,
             server_version,
             connection_class: MysqlConnectionClass::Ordinary,
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            fixture_hub: None,
         }
     }
 
     fn with_connection_class(mut self, class: MysqlConnectionClass) -> Self {
         self.connection_class = class;
         self
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    fn with_fixture_hub(
+        mut self,
+        hub: Option<Arc<crate::mysql_write_gate::late_binding::MysqlWriteGateHub>>,
+    ) -> Self {
+        self.fixture_hub = hub;
+        self
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    fn reject_fixture_non_streaming(&self, sql_sha256: [u8; 32]) -> io::Result<()> {
+        if let Some(hub) = &self.fixture_hub {
+            hub.reject_non_streaming_target(self.connection, sql_sha256)?;
+        }
+        Ok(())
     }
 
     fn session(&self) -> Result<&Arc<dyn QuerySession>, QueryServiceError> {
@@ -359,6 +576,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
     type Error = io::Error;
 
     fn permits_query_shortcuts(&self) -> bool {
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if self
+            .fixture_hub
+            .as_ref()
+            .is_some_and(|hub| hub.is_selected_connection(self.connection))
+        {
+            return false;
+        }
         self.connection_class == MysqlConnectionClass::Ordinary
     }
 
@@ -499,6 +724,19 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        let fixture_sql_sha256: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(query.as_bytes()).into()
+        };
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if let Some(hub) = &self.fixture_hub {
+            if hub.is_selected_connection(self.connection)
+                && negotiated_query_statements(query).is_ok_and(|statements| statements.len() > 1)
+            {
+                hub.reject_unsupported_batch(self.connection)?;
+            }
+        }
         if self.connection_class == MysqlConnectionClass::Control {
             if let Err(error) =
                 novarocks_query_application::sql::admission::admit_control_connection_batch(query)
@@ -511,6 +749,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         let session = match self.session() {
             Ok(session) => session,
             Err(error) => {
+                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                self.reject_fixture_non_streaming(fixture_sql_sha256)?;
                 return results
                     .error(crate::mysql_error_kind(&error), error.message().as_bytes())
                     .await;
@@ -524,6 +764,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
             match negotiated_query_statements(query) {
                 Ok(statements) => statements,
                 Err(error) => {
+                    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                    self.reject_fixture_non_streaming(fixture_sql_sha256)?;
                     return results
                         .error(crate::mysql_error_kind(&error), error.message().as_bytes())
                         .await;
@@ -533,6 +775,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
             Vec::new()
         };
         if statements.len() > 1 {
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            if let Some(hub) = &self.fixture_hub {
+                hub.reject_unsupported_batch(self.connection)?;
+            }
             let mut results = results;
             let count = statements.len();
             for (index, statement_sql) in statements.into_iter().enumerate() {
@@ -558,11 +804,21 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         let (statement, terminal) = match session.execute_batch(query).await {
             Ok(statement) => statement.into_parts(),
             Err(error) => {
+                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                self.reject_fixture_non_streaming(fixture_sql_sha256)?;
                 return results
                     .error(crate::mysql_error_kind(&error), error.message().as_bytes())
                     .await;
             }
         };
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if !matches!(&statement, StatementResult::StreamingQuery(_)) {
+            if let Err(error) = self.reject_fixture_non_streaming(fixture_sql_sha256) {
+                drop(statement);
+                terminal.complete();
+                return Err(error);
+            }
+        }
         let outcome = match statement {
             StatementResult::Query(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -572,6 +828,31 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 crate::write_governed_query_result(result, results).await
             }
             StatementResult::StreamingQuery(result) => {
+                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                {
+                    // Keep the original terminal completion below on every fixture error.
+                    async {
+                        if let Some(hub) = &self.fixture_hub {
+                            let token = result.statement_token().ok_or_else(|| {
+                                hub.fail_selected(self.connection, crate::mysql_write_gate::GateFailure::Identity);
+                                io::Error::new(io::ErrorKind::InvalidData, "fixture streaming result has no original statement token")
+                            })?;
+                            let hook = hub.bind_statement(self.connection, token, fixture_sql_sha256)?;
+                            let outcome = crate::governed_result_writer::write_streaming_query_result_with_gate(
+                                result, results, hook,
+                            ).await;
+                            if outcome.is_err() {
+                                // A bounded fixture summary keeps original scope first cause;
+                                // the original typed IO error is still returned unchanged.
+                                hub.fail_selected(self.connection, crate::mysql_write_gate::GateFailure::Transition);
+                            }
+                            outcome
+                        } else {
+                            crate::write_streaming_query_result(result, results).await
+                        }
+                    }.await
+                }
+                #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
                 crate::write_streaming_query_result(result, results).await
             }
             StatementResult::GovernedCompletion(result) => {
@@ -754,6 +1035,37 @@ mod tests {
             ClientDisconnectWatcher::inactive(),
             "test".to_string(),
         )
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[test]
+    fn armed_fixture_target_reaches_query_dispatch_instead_of_shortcut() {
+        type Shim = QueryApplicationMysqlShim;
+        for target in [1, 2] {
+            let (hub, mut controller) =
+                crate::mysql_write_gate::late_binding::MysqlWriteGateHub::new(
+                    novarocks_types::FrontendProcessId::new_v7(),
+                    [1; 16],
+                    std::time::Instant::now() + Duration::from_secs(3),
+                )
+                .unwrap();
+            let shim = rejecting_shim().with_fixture_hub(Some(hub));
+            assert!(<Shim as AsyncMysqlShim<Vec<u8>>>::permits_query_shortcuts(
+                &shim
+            ));
+            controller
+                .arm(controller.snapshot().frontend, [1; 16], target, [2; 32], 1)
+                .unwrap();
+            assert_eq!(
+                <Shim as AsyncMysqlShim<Vec<u8>>>::permits_query_shortcuts(&shim),
+                target != 1
+            );
+            let control = shim.with_connection_class(MysqlConnectionClass::Control);
+            assert!(!<Shim as AsyncMysqlShim<Vec<u8>>>::permits_query_shortcuts(
+                &control
+            ));
+            controller.stop();
+        }
     }
 
     async fn authenticate(
