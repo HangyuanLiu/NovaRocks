@@ -52,6 +52,7 @@ pub mod bitmap_to_string_core;
 pub mod bit_numeric;
 pub mod builtin;
 pub mod calendar_julian;
+pub mod invocation_arity;
 pub mod calendar_numeric;
 pub mod calendar_period_numeric;
 mod call_contract;

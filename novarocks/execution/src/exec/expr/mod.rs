@@ -347,14 +347,12 @@ impl ExprArena {
             } => case::eval_case(self, *has_case_expr, *has_else_expr, children, chunk),
             ExprNode::FunctionCall { kind, args } => {
                 let metadata = function::function_metadata(*kind);
-                if args.len() < metadata.min_args || args.len() > metadata.max_args {
-                    return Err(format!(
-                        "{} expects {} to {} arguments, got {}",
-                        metadata.name,
-                        metadata.min_args,
-                        metadata.max_args,
-                        args.len()
-                    ));
+                let arity = novarocks_functions::invocation_arity::InvocationArity {
+                    minimum: metadata.min_args,
+                    maximum: metadata.max_args,
+                };
+                if let Some(failure) = arity.failure(args.len()) {
+                    return Err(failure.with_original_message(metadata.name, std::fmt::format));
                 }
                 match kind {
                     FunctionKind::Abs => function::eval_abs(self, id, args[0], chunk),
