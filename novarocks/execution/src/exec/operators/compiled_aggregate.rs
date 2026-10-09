@@ -796,8 +796,13 @@ impl CompiledAggregateProcessor {
         for column in states {
             columns.push(column.emit_evaluation(&indices, groups, &self.control)?);
         }
-        let batch = RecordBatch::try_new(fields, columns)
-            .map_err(|error| failure("compiled aggregate output", error))?;
+        let batch = if columns.is_empty() {
+            let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(groups));
+            RecordBatch::try_new_with_options(fields, columns, &options)
+        } else {
+            RecordBatch::try_new(fields, columns)
+        }
+        .map_err(|error| failure("compiled aggregate output", error))?;
         let mut offset = 0;
         while offset < groups {
             let len = OUTPUT_CHUNK_ROWS.min(groups - offset);
