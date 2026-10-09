@@ -237,10 +237,13 @@ impl AttemptInitializationLifecycle {
     async fn await_job<T>(
         &self,
         job: ConnectorBlockingIoJob<T>,
+        supervisor: &ConnectorBlockingIoSupervisor,
     ) -> Result<T, DistributedQueryError> {
         tokio::select! {
             outcome = job.finish() => {
-                let outcome = outcome.map_err(|error| failed(error.to_string()))?;
+                let outcome = outcome.map_err(|error| {
+                    failed(supervisor.present_and_retire_failure(error))
+                })?;
                 self.check()?;
                 Ok(outcome)
             }
@@ -272,7 +275,7 @@ async fn drive_attempt_initialization<S: SerialAttemptInitialization>(
         }
         let pins = S::source_join_pin(&recipe).into_iter().collect();
         let job = supervisor.spawn_pinned(pins, move || S::open_source(recipe));
-        let opened = lifecycle.await_job(job).await??;
+        let opened = lifecycle.await_job(job, &supervisor).await??;
         if opened.identity != expected {
             return Err(failed(format!(
                 "attempt initializer received a source from another identity: expected={expected:?}, actual={:?}",

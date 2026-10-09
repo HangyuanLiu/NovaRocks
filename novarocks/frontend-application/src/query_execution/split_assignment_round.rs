@@ -505,20 +505,18 @@ impl SplitAssignmentPump {
         let outcome = Arc::clone(&self.outcome);
         let wake = Arc::clone(&self.wake);
         let pins = assignment.join_pins();
-        let job = self
-            .data_runtime
-            .connector_blocking_io()
-            .spawn_pinned(pins, move || {
-                let profile = assignment.profile_snapshot();
-                assignment.close();
-                profile
-            });
+        let blocking_io = self.data_runtime.connector_blocking_io().clone();
+        let job = blocking_io.spawn_pinned(pins, move || {
+            let profile = assignment.profile_snapshot();
+            assignment.close();
+            profile
+        });
         self.data_runtime.spawn(async move {
             let result = match job.finish().await {
                 Ok(profile) => error.map_or(Ok(profile), Err),
                 Err(worker_error) => Err(SplitAssignmentDriverError::SplitSource {
                     scan: None,
-                    detail: worker_error.to_string(),
+                    detail: blocking_io.present_and_retire_failure(worker_error),
                 }),
             };
             if let Err(error) = &result {
@@ -548,7 +546,11 @@ impl SplitAssignmentPump {
         let runtime = self.data_runtime.clone();
         let wake = Arc::clone(&self.wake);
         self.data_runtime.spawn(async move {
-            let result = job.finish().await.map_err(|error| error.to_string());
+            let result = job.finish().await.map_err(|error| {
+                runtime
+                    .connector_blocking_io()
+                    .present_and_retire_failure(error)
+            });
             let reap = {
                 let mut slot = slot.lock().unwrap_or_else(|lock| lock.into_inner());
                 slot.publish(result).err().and_then(Result::ok)

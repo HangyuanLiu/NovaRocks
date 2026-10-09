@@ -1167,7 +1167,7 @@ impl FrontendQuerySession {
                     governed.timeout_ms(),
                 );
                 if let Err(error) = self
-                    .init_database_with_cancellation(&schema, cancellation)
+                    .init_database_with_cancellation(&schema, cancellation, &governed)
                     .await
                 {
                     return Ok(self.governed_typed_error(error, governed));
@@ -1273,7 +1273,14 @@ impl FrontendQuerySession {
         &self,
         schema: &str,
         cancellation: QueryCancellationView,
+        statement: &novarocks_query_application::session_control::GovernedQueryStatementOwner,
     ) -> Result<(), QueryServiceError> {
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            statement.scope(),
+            statement.result_window_alias().ok_or_else(|| {
+                internal_error("session namespace lookup requires its admitted result window")
+            })?,
+        ).map_err(|error| internal_error(error.to_string()))?;
         let current_catalog = self
             .state
             .lock()
@@ -1291,6 +1298,7 @@ impl FrontendQuerySession {
             current_catalog.as_deref(),
             schema,
             connector_context,
+            &capacity,
         )
         .await?;
         let mut state = self.state.lock().map_err(poisoned_state)?;
@@ -2586,7 +2594,7 @@ impl QuerySession for FrontendQuerySession {
             statement.timeout_ms(),
         );
         match self
-            .init_database_with_cancellation(schema, cancellation)
+            .init_database_with_cancellation(schema, cancellation, &statement)
             .await
         {
             Ok(()) => Ok(
@@ -2682,6 +2690,7 @@ async fn resolve_database_context(
     current_catalog: Option<&str>,
     schema: &str,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<DatabaseContext, QueryServiceError> {
     let parts = schema
         .split('.')
@@ -2694,7 +2703,7 @@ async fn resolve_database_context(
             match current_catalog {
                 Some(catalog) => {
                     if resolver
-                        .external_namespace_exists(connector_context, catalog, &database)
+                        .external_namespace_exists(connector_context, capacity, catalog, &database)
                         .await?
                     {
                         Ok(DatabaseContext {
@@ -2730,7 +2739,7 @@ async fn resolve_database_context(
             match catalog {
                 Some(catalog) => {
                     if resolver
-                        .external_namespace_exists(connector_context, &catalog, &database)
+                        .external_namespace_exists(connector_context, capacity, &catalog, &database)
                         .await?
                     {
                         Ok(DatabaseContext {

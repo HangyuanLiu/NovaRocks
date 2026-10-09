@@ -260,6 +260,35 @@ pub(crate) struct ConnectorBlockingIoSupervisor {
 }
 
 impl ConnectorBlockingIoSupervisor {
+    /// Derive the job's responsibility from the caller's exact admission
+    /// before submitting any synchronous provider code.
+    pub(crate) fn spawn_admitted<T, F>(
+        &self,
+        scope: &WorkScope,
+        window: &ResultWindowAlias,
+        call: F,
+    ) -> Result<ConnectorBlockingIoJob<T>, WorkError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let responsibility = ConnectorBlockingIoResponsibility::admit(scope, window)?;
+        let pin = responsibility.join_pin();
+        Ok(self.spawn_pinned(vec![pin], move || {
+            let _responsibility = responsibility;
+            call()
+        }))
+    }
+
+    /// A claimed lane error may cross a String-only application port. Move its
+    /// original payload into protected retirement before returning that finite
+    /// presentation, so caller cancellation cannot destroy it on the async lane.
+    pub(crate) fn present_and_retire_failure(&self, error: ConnectorBlockingIoError) -> String {
+        let detail = error.to_string();
+        self.retire_original_failure(error);
+        detail
+    }
+
     pub(crate) fn new(runtime: Handle) -> Self {
         Self {
             runtime,
@@ -277,6 +306,7 @@ impl ConnectorBlockingIoSupervisor {
     }
 
     /// Submit credential or lifecycle work and retain its actual completion.
+    #[cfg(test)]
     pub(crate) fn spawn_protected<T, F>(&self, call: F) -> ConnectorBlockingIoJob<T>
     where
         T: Send + 'static,
@@ -290,6 +320,7 @@ impl ConnectorBlockingIoSupervisor {
     /// Only the synchronous Connector call belongs inside `call`; transport
     /// acknowledgement and retry waits must run after this job has finished so
     /// the blocking worker owns only the actual Connector call.
+    #[cfg(test)]
     pub(crate) fn spawn_ordinary<T, F>(&self, call: F) -> ConnectorBlockingIoJob<T>
     where
         T: Send + 'static,
@@ -401,9 +432,17 @@ pub(crate) mod tests {
         novarocks_workload_control::RootWork,
         novarocks_workload_control::ResultWindowGrant,
     ) {
-        use novarocks_workload_control::{
-            ResultCapacityConfig, ResultWindowClass, WorkloadConfig, WorkloadControl,
-        };
+        admitted_class(novarocks_workload_control::ResultWindowClass::Internal)
+    }
+
+    pub(crate) fn admitted_class(
+        class: novarocks_workload_control::ResultWindowClass,
+    ) -> (
+        novarocks_workload_control::WorkloadControl,
+        novarocks_workload_control::RootWork,
+        novarocks_workload_control::ResultWindowGrant,
+    ) {
+        use novarocks_workload_control::{ResultCapacityConfig, WorkloadConfig, WorkloadControl};
         let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
             .expect("workload")
             .owner;
@@ -413,10 +452,7 @@ pub(crate) mod tests {
         control.mark_ready().expect("ready");
         let (root, window) = control
             .root_admission()
-            .try_begin_root_with_result(
-                WorkRequest::new(WorkClass::Management),
-                ResultWindowClass::Internal,
-            )
+            .try_begin_root_with_result(WorkRequest::new(WorkClass::Management), class)
             .expect("original admitted work");
         (control, root, window)
     }
@@ -732,6 +768,135 @@ pub(crate) mod tests {
             actual_terminal.scopes.is_empty(),
             "actual source join/backing exit left its local Cancel waiting for Host shutdown: {:?}",
             actual_terminal.scopes
+        );
+    }
+
+    #[test]
+    fn a_claimed_failure_retires_its_original_payload_outside_the_caller() {
+        struct Payload {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            destroyed: Arc<AtomicBool>,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                self.destroyed.store(true, Ordering::Release);
+            }
+        }
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (control, root, window) =
+            admitted_class(novarocks_workload_control::ResultWindowClass::Local);
+        let (release, held) = mpsc::channel();
+        let (started, entered) = mpsc::channel();
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let payload = Payload {
+            started,
+            release: held,
+            destroyed: Arc::clone(&destroyed),
+        };
+        let job = supervisor
+            .spawn_admitted(&root.owner.scope(), &window.retain_alias(), move || {
+                std::panic::panic_any(payload);
+            })
+            .unwrap();
+        let error = wait(&job).expect_err("original worker panic");
+        drop(job);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        let (disarm, watch) = mpsc::channel();
+        let rescue = release.clone();
+        let watchdog = std::thread::spawn(move || {
+            if watch.recv_timeout(Duration::from_millis(500)).is_err() {
+                let _ = rescue.send(());
+            }
+        });
+        let began = Instant::now();
+        let detail = supervisor.present_and_retire_failure(error);
+        let elapsed = began.elapsed();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let retained = control.snapshot();
+        let _ = release.send(());
+        let _ = disarm.send(());
+        watchdog.join().unwrap();
+        until(|| control.snapshot().scopes.is_empty());
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+        assert_eq!(detail, "connector blocking-I/O worker panicked");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "claimed payload blocked its caller: {elapsed:?}"
+        );
+        assert_eq!(retained.result_windows.held_positions, [0, 1, 0, 0]);
+        assert_eq!(retained.root_responsibilities, 1);
+        assert!(destroyed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn admitted_provider_work_refuses_foreign_window_and_scope_record_saturation() {
+        let runtime = runtime();
+        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first, first_root, first_window) = admitted();
+        let (second, second_root, second_window) = admitted();
+        let observed = Arc::clone(&calls);
+        let refused = supervisor.spawn_admitted(
+            &first_root.owner.scope(),
+            &second_window.retain_alias(),
+            move || {
+                observed.fetch_add(1, Ordering::AcqRel);
+            },
+        );
+        assert!(matches!(refused, Err(WorkError::Conflict)));
+        for (control, root, window) in [
+            (first, first_root, first_window),
+            (second, second_root, second_window),
+        ] {
+            root.owner.complete();
+            root.business.release();
+            drop(window);
+            control.close_admission();
+            assert!(control.shutdown().is_ok());
+        }
+        let control = novarocks_workload_control::WorkloadControl::try_new_counted(
+            novarocks_workload_control::WorkloadConfig {
+                scope_records_limit: 1,
+                root_limit: 1,
+                business_limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .owner;
+        control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                novarocks_workload_control::ResultWindowClass::Local,
+            )
+            .unwrap();
+        let observed = Arc::clone(&calls);
+        let refused =
+            supervisor.spawn_admitted(&root.owner.scope(), &window.retain_alias(), move || {
+                observed.fetch_add(1, Ordering::AcqRel);
+            });
+        assert!(matches!(refused, Err(WorkError::Capacity(_))));
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            0,
+            "refused provider code ran"
         );
     }
 
