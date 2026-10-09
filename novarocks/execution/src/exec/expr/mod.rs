@@ -1448,3 +1448,6 @@ mod filter_conjunction_actual_sql_compiler_tests;
 
 #[cfg(test)]
 mod filter_conjunction_frame_tests;
+
+#[cfg(test)]
+mod native_bitnot_intrinsic_baseline_tests;
