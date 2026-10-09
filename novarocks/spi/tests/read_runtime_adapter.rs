@@ -114,6 +114,8 @@ where
     T: Clone + std::fmt::Debug + Send + Sync + 'static,
     C: ColumnHandle,
 {
+    type FrozenSource = novarocks_spi::connector::read_stack::adapter::UnsupportedFrozenReadSource;
+
     fn get_table_handle(
         &self,
         _session: &ConnectorSession,

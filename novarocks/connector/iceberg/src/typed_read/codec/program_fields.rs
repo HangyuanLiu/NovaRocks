@@ -345,6 +345,18 @@ fn source_column_field(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(FieldRef, bool), Failure> {
     if let Some(metadata) = IcebergMetadataColumn::from_field_id(column.base_field_id()) {
+        if let Some(source) = table.and_then(IcebergTableHandle::frozen_cow_source) {
+            let expected = source
+                .metadata_columns()
+                .iter()
+                .find(|expected| expected.base_field_id() == column.base_field_id());
+            work.step()?;
+            if expected != Some(column) {
+                return Err(invalid(
+                    "read metadata column differs from the original COW source",
+                ));
+            }
+        }
         let field = opaque_source(work, || metadata_target_field(column, metadata))?;
         return Ok((field, column.nullable()));
     }

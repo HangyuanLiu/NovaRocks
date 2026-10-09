@@ -2084,6 +2084,9 @@ fn build_cow_update_distributed_write(
                 let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                     pinned: source.pinned_source().clone(),
                     owner: source.source().owner().clone(),
+                    frozen_source: Some(source.frozen_read_source().cloned().ok_or_else(|| {
+                        "copy-on-write source lost its original provider read receipt".to_string()
+                    })?),
                     planning_lease: planning_lease.clone(),
                 };
                 let query = build_cow_rewrite_query(

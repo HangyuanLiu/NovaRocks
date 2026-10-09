@@ -200,7 +200,27 @@ impl<T> ProviderReadSystemTablePlan<T> {
     }
 }
 
+/// No value of this type can be manufactured for a provider without an
+/// exact frozen-source producer. Its adoption port remains unsupported.
+#[derive(Debug)]
+pub enum UnsupportedFrozenReadSource {}
+
 pub trait ProviderReadMetadata: ProviderReadRuntime {
+    type FrozenSource: Debug + Send + Sync + 'static;
+
+    /// Source validation belongs to the provider. In particular a write
+    /// incarnation must not be interpreted as a read CatalogHandle version.
+    fn adopt_frozen_source(
+        &self,
+        _session: &ConnectorSession,
+        _owner: &crate::connector::ConnectorProviderBindingKey,
+        _source: &Self::FrozenSource,
+    ) -> Result<Self::Table, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not adopt frozen write sources",
+        ))
+    }
     fn get_table_handle(
         &self,
         session: &ConnectorSession,
@@ -606,6 +626,15 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
 }
 
 impl<P: ProviderReadMetadata> ReadRuntimeAdapter<P> {
+    /// Called only at a provider-owned source producer. FE retains the opaque
+    /// result; only the matching installed adapter recovers the typed value.
+    pub fn freeze_source(
+        owner: crate::connector::ConnectorProviderBindingKey,
+        source: P::FrozenSource,
+    ) -> super::runtime::ConnectorFrozenReadSource {
+        super::runtime::frozen_read_source(owner, source)
+    }
+
     fn bridge_filter(
         &self,
         session: &ConnectorSession,
@@ -764,6 +793,21 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
         self.provider
             .get_table_handle(session, name, version, reference)
             .map(|value| value.map(|table| self.wrap_table(table)))
+    }
+
+    fn adopt_frozen_source(
+        &self,
+        session: &ConnectorSession,
+        source: &super::runtime::ConnectorFrozenReadSource,
+    ) -> Result<ConnectorReadTableHandle, ConnectorError> {
+        if source.owner().instance_id != self.provider.descriptor().instance_id {
+            return Err(binding_error());
+        }
+        let typed = super::runtime::frozen_read_source_value::<P::FrozenSource>(source)
+            .ok_or_else(type_error)?;
+        self.provider
+            .adopt_frozen_source(session, source.owner(), typed)
+            .map(|table| self.wrap_table(table))
     }
 
     fn get_pinned_file_set_handle(
@@ -1601,6 +1645,8 @@ mod tests {
     }
 
     impl ProviderReadMetadata for Probe {
+        type FrozenSource = UnsupportedFrozenReadSource;
+
         fn get_table_handle(
             &self,
             _session: &ConnectorSession,

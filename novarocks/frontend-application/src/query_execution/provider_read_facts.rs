@@ -421,44 +421,6 @@ pub(crate) fn freeze_one_read(
         .map(|assignment| assignment.column().clone())
         .collect::<Vec<_>>();
     let public_schema = metadata.read_public_schema(session, &negotiated.handle, &assigned_columns);
-    // Observe the actual pinned cohort and projection; do not derive a source
-    // receipt from these facts or change the original public-schema Result.
-    if let AdmittedRead::Cohort(
-        crate::catalog_application::query_bindings::QueryFrozenCohortRead::PinnedFileSet(cohort),
-    ) = &admitted
-        && tracing::enabled!(tracing::Level::INFO)
-    {
-        use sha2::Digest;
-        for path in cohort.pinned.files() {
-            tracing::info!(
-                target: "novarocks::cow_source_receipt_probe",
-                snapshot_id = cohort.pinned.version_ordinal(),
-                path_digest = format_args!("{:x}", sha2::Sha256::digest(path.as_bytes())),
-                "Original FE pinned cohort read"
-            );
-        }
-        for column in need.columns() {
-            tracing::info!(
-                target: "novarocks::cow_source_receipt_probe",
-                snapshot_id = cohort.pinned.version_ordinal(),
-                ordinal = column.ordinal(), field_name = column.name(),
-                nullable = column.engine_type().nullable,
-                carrier = %column.engine_type().data_type,
-                "Original FE required source field"
-            );
-        }
-        if let Ok(public) = &public_schema {
-            for (ordinal, field) in public.schema().fields().iter().enumerate() {
-                tracing::info!(
-                    target: "novarocks::cow_source_receipt_probe",
-                    snapshot_id = cohort.pinned.version_ordinal(),
-                    ordinal, field_name = %field.name(), nullable = field.is_nullable(),
-                    carrier = %field.data_type(),
-                    "Original provider public source field"
-                );
-            }
-        }
-    }
 
     // 5. Assemble everything the freeze leaves behind, so that taking the
     //    capability and accounting for it are adjacent: nothing may happen
@@ -647,7 +609,18 @@ fn open_relation(
             (
                 ProviderReadRelationNeed::PinnedFileSet { .. },
                 QueryFrozenCohortRead::PinnedFileSet(read),
-            ) => metadata
+            ) => {
+                if let Some(source) = &read.frozen_source {
+                    // The actual read generation adopts the provider's source;
+                    // FE neither interprets it nor substitutes generic reopening.
+                    return metadata
+                        .adopt_frozen_source(session, source)
+                        .map(|handle| (handle, None))
+                        .map_err(|error| {
+                            format!("provider read of {name} cannot adopt its original frozen source: {error}")
+                        });
+                }
+                metadata
                 .get_pinned_file_set_handle(session, table, &read.pinned)
                 .map_err(|error| {
                     format!(
@@ -659,7 +632,8 @@ fn open_relation(
                 .ok_or_else(|| {
                     format!("provider read of {name} exposes no pinned file set read")
                 })
-                .map(|handle| (handle, None)),
+                .map(|handle| (handle, None))
+            }
             (
                 ProviderReadRelationNeed::TableExecute { .. },
                 QueryFrozenCohortRead::TableExecute(read),

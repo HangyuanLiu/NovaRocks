@@ -263,6 +263,7 @@ enum Schema {
     ReadView,
     Pinned,
     ReadDomain,
+    CowSourceProof,
     Table,
     TableFunction,
     ChangeWindowHandle,
@@ -417,6 +418,11 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             6 | 7 => repeated(MapI32String),
             _ => return None,
         },
+        CowSourceProof => match field {
+            1..=3 => singular(Scalar),
+            4 => repeated(Message(Column)),
+            _ => return None,
+        },
         Table => match field {
             1 => singular(Message(SchemaName)),
             2 | 4 | 6 | 9 => singular(Varint),
@@ -427,6 +433,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             13 => repeated(MapStringString),
             14 => singular(Message(Pinned)),
             15 => singular(Message(ReadDomain)),
+            17 => singular(Message(CowSourceProof)),
             _ => return None,
         },
         TableFunction => match field {
@@ -579,6 +586,7 @@ fn scan_message(
     context.ledger().check_depth(depth)?;
     let mut seen = BTreeSet::new();
     let mut seen_oneof = false;
+    let mut cow_metadata_members = 0_usize;
     let mut map_keys: BTreeMap<u32, BTreeSet<Vec<u8>>> = BTreeMap::new();
     while !input.is_empty() {
         context.ledger().charge_items(1)?;
@@ -620,6 +628,19 @@ fn scan_message(
                 "Iceberg private payload repeats a singular or oneof field",
             ));
         }
+        if matches!(schema, Schema::CowSourceProof) && field == 4 {
+            cow_metadata_members += 1;
+            if cow_metadata_members
+                > crate::typed_read::ALWAYS_BOUND_METADATA_COLUMNS.len()
+                    + crate::typed_read::ROW_LINEAGE_METADATA_COLUMNS.len()
+            {
+                return Err(codec_error(
+                    "iceberg_table.frozen_cow_source.metadata_columns",
+                    ConnectorCodecErrorKind::InvalidValue,
+                    "Iceberg COW metadata proof exceeds its original four-field shape",
+                ));
+            }
+        }
         match rule.value {
             WireValue::Varint => {
                 read_varint(&mut input, context, &path)?;
@@ -647,6 +668,17 @@ fn scan_message(
                 }
             }
             WireValue::Message(child) => {
+                // The DTO proof and its inline column elements survive Prost
+                // decode separately from the later typed proof representation.
+                // Preflight charges that real raw extent before Prost allocates.
+                if matches!(schema, Schema::Table) && field == 17 {
+                    context.ledger().charge_retained(
+                        size_of::<dto::IcebergCowSourceProof>()
+                            + (crate::typed_read::ALWAYS_BOUND_METADATA_COLUMNS.len()
+                                + crate::typed_read::ROW_LINEAGE_METADATA_COLUMNS.len())
+                                * size_of::<dto::IcebergColumnHandle>(),
+                    )?;
+                }
                 let len = usize::try_from(read_varint(&mut input, context, &path)?)
                     .map_err(|_| malformed(&path))?;
                 let nested = take(&mut input, len, &path)?;
@@ -1563,6 +1595,9 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
         read_domain: value.read_domain().map(|domain| encode_read_domain(domain)),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
         snapshot_id: value.snapshot_id(),
+        frozen_cow_source: value
+            .frozen_cow_source()
+            .map(crate::typed_read::cow_source_proof::IcebergCowSourceProof::to_proto),
         table_schema_json: value.table_schema_json().to_string(),
         spec_id: value.spec_id(),
         partition_spec_jsons: value
@@ -1592,6 +1627,54 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
                 paths: files.paths().iter().map(ToString::to_string).collect(),
             }),
     }
+}
+
+fn decode_cow_source_proof(
+    raw: &dto::IcebergCowSourceProof,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<crate::typed_read::cow_source_proof::IcebergCowSourceProof, ConnectorCodecError> {
+    use crate::typed_read::cow_source_proof::IcebergCowSourceProof;
+    let result = (|| {
+        let digest = raw.source_digest.as_slice().try_into().map_err(|_| {
+            codec_error(
+                "iceberg_table.frozen_cow_source.source_digest",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg COW source digest must be 32 bytes",
+            )
+        })?;
+        let base = raw.signed_base.as_slice().try_into().map_err(|_| {
+            codec_error(
+                "iceberg_table.frozen_cow_source.signed_base",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg COW signed base must be 32 bytes",
+            )
+        })?;
+        if raw.metadata_columns.len() > 4 {
+            return Err(codec_error(
+                "iceberg_table.frozen_cow_source.metadata_columns",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg COW metadata proof exceeds its original four-field shape",
+            ));
+        }
+        // Admit the actual typed representation before its Vec/path copies.
+        // These decode limits do not confer execution memory capacity.
+        context.ledger().charge_retained(
+            size_of::<IcebergCowSourceProof>()
+                + raw.metadata_columns.len() * size_of::<IcebergColumnHandle>(),
+        )?;
+        let path = copy_string(&raw.data_file_path, context)?;
+        let mut columns = Vec::with_capacity(raw.metadata_columns.len());
+        for column in &raw.metadata_columns {
+            columns.push(decode_column(column, context)?);
+            context.observe_compile_step()?;
+        }
+        observe_opaque(context, || {
+            IcebergCowSourceProof::try_new(digest, base, path, columns)
+        })?
+        .map_err(|error| domain_error("iceberg_table.frozen_cow_source", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn decode_table(
@@ -1681,10 +1764,17 @@ fn decode_table(
             scalar_integer_domains.insert(*id, domain);
             context.observe_compile_step()?;
         }
-        observe_opaque(context, || {
+        let table = observe_opaque(context, || {
             table.with_scalar_integer_domains(scalar_integer_domains)
         })?
-        .map_err(|error| domain_error("iceberg_table", error))
+        .map_err(|error| domain_error("iceberg_table", error))?;
+        let source = raw
+            .frozen_cow_source
+            .as_ref()
+            .map(|source| decode_cow_source_proof(source, context))
+            .transpose()?;
+        observe_opaque(context, || table.with_frozen_cow_source(source))?
+            .map_err(|error| domain_error("iceberg_table.frozen_cow_source", error))
     })();
     context.observe_compile_step()?;
     finish_decode(result, context)

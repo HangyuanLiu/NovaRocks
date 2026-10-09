@@ -319,6 +319,7 @@ pub struct ConnectorWriteTargetPlan {
 #[derive(Clone, Debug)]
 pub struct ConnectorWriteRewriteSource {
     source: ConnectorTableHandle,
+    frozen_read_source: Option<crate::connector::read_stack::ConnectorFrozenReadSource>,
     /// Exactly the files this target rewrites. Its commit replaces precisely
     /// these, so the read that produces its rows is defined by the same set
     /// rather than by anything re-derived.
@@ -343,6 +344,7 @@ impl ConnectorWriteRewriteSource {
     ) -> Self {
         Self {
             source,
+            frozen_read_source: None,
             pinned_source,
             base_version_digest,
             scan_schema,
@@ -350,6 +352,22 @@ impl ConnectorWriteRewriteSource {
             match_tokens,
             written_version_token,
         }
+    }
+
+    /// Attach the provider's exact observation after original source signing.
+    /// This does not reinterpret the signed schema, tokens or file set.
+    pub fn with_frozen_read_source(
+        mut self,
+        source: crate::connector::read_stack::ConnectorFrozenReadSource,
+    ) -> Self {
+        self.frozen_read_source = Some(source);
+        self
+    }
+
+    pub fn frozen_read_source(
+        &self,
+    ) -> Option<&crate::connector::read_stack::ConnectorFrozenReadSource> {
+        self.frozen_read_source.as_ref()
     }
 
     pub const fn source(&self) -> &ConnectorTableHandle {

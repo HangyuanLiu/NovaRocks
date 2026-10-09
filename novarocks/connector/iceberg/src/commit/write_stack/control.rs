@@ -2882,23 +2882,33 @@ impl IcebergWriteSessionControl {
             ),
             _ => None,
         };
-        let (table, metadata) = match &staged {
+        let (table, metadata, cow_read_access) = match &staged {
             Some(staged) => {
                 if staged.namespace != namespace || staged.table != table_name {
                     return Err(invalid(
                         "Iceberg staged write target names a different table than its frozen facts",
                     ));
                 }
-                (None, staged.metadata.clone())
+                (None, staged.metadata.clone(), None)
             }
             None => {
                 let physical = self
                     .runtime
                     .load_table_for_request(namespace, table_name, &request.context)
                     .map_err(|error| unavailable(error.to_string()))?;
+                let cow_read_access = if matches!(
+                    &request.flavor,
+                    ConnectorWriteSessionFlavor::CopyOnWrite { .. }
+                ) {
+                    Some(Arc::new(
+                        crate::loaded_table::IcebergAttemptTableAccess::freeze(physical.clone()),
+                    ))
+                } else {
+                    None
+                };
                 let table = physical.into_table();
                 let metadata = table.metadata().clone();
-                (Some(table), metadata)
+                (Some(table), metadata, cow_read_access)
             }
         };
         if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
@@ -3202,7 +3212,12 @@ impl IcebergWriteSessionControl {
                             table_name,
                             metadata: &metadata,
                             snapshot_id,
-                            base_files: self.frozen_base_data_files(table, snapshot_id)?,
+                            base_files: self.frozen_base_data_files(
+                                table, snapshot_id,
+                                cow_read_access.as_ref().ok_or_else(|| invalid(
+                                    "Iceberg copy-on-write source lost its original access recipe"
+                                ))?,
+                            )?,
                             input: &material.input,
                             base_version_digest,
                             max_handle_payload_bytes: request.context.max_handle_payload_bytes(),
@@ -3248,13 +3263,33 @@ impl IcebergWriteSessionControl {
         &self,
         table: &crate::iceberg::table::Table,
         snapshot_id: i64,
-    ) -> Result<Vec<crate::manifest::DataFileWithStats>, ConnectorError> {
+        access: &Arc<crate::loaded_table::IcebergAttemptTableAccess>,
+    ) -> Result<
+        Vec<crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile>,
+        ConnectorError,
+    > {
         let owned = table.clone();
+        let metadata = table.metadata_ref();
+        let access = access.clone();
         self.runtime
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
+                crate::manifest::extract_data_files_with_stats_at_projected(
+                    &owned,
+                    snapshot_id,
+                    None,
+                    |stats, manifest, deletes| {
+                        crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile::new(
+                            crate::manifest::FrozenReadFileWithStats::retain(
+                                stats, manifest, deletes,
+                            ),
+                            metadata.clone(),
+                            access.clone(),
+                        )
+                    },
+                )
+                .await
             })
             .map_err(|error| unavailable(error.to_string()))?
             .map_err(unavailable)

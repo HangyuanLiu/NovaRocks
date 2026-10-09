@@ -1522,6 +1522,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
                 owner: owner.clone(),
+                frozen_source: None,
                 planning_lease: session.lease().planning_lease(),
             };
             let source_binding =
