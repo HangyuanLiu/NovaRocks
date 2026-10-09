@@ -2439,25 +2439,9 @@ mod tests {
                 let _ = started.send(());
                 std::panic::panic_any(payload);
             });
-        tokio::time::timeout(Duration::from_secs(1), entered)
-            .await
-            .unwrap()
-            .unwrap();
-        root.owner.complete();
-        root.business.release();
-        drop(window);
-        drop(job);
-        // The callback's start precedes its original blocking join. Establish
-        // the actual unclaimed failure before testing Host payload retirement,
-        // so another shutdown phase cannot consume this fixture's deadline.
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            host.connector_blocking_io_supervisor().wait_failure(),
-        )
-        .await
-        .expect("original panic join published its unclaimed failure");
-        // A real external releaser makes the former synchronous-Drop path a
-        // bounded failing test instead of leaving the original barrier held.
+        // Arm rescue before any prerequisite can fail. Capture the facts and
+        // settle the actual Host before asserting, including when an earlier
+        // shutdown phase consumes the short fixture deadline.
         let (disarm_watchdog, watch) = std::sync::mpsc::channel();
         let rescue = release_payload.clone();
         let watchdog = std::thread::spawn(move || {
@@ -2465,6 +2449,23 @@ mod tests {
                 let _ = rescue.send(());
             }
         });
+        let callback_entered = matches!(
+            tokio::time::timeout(Duration::from_secs(1), entered).await,
+            Ok(Ok(()))
+        );
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        drop(job);
+        // The callback's start precedes its original blocking join. Establish
+        // the actual unclaimed failure before testing Host payload retirement,
+        // so another shutdown phase cannot consume this fixture's deadline.
+        let failure_published = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.connector_blocking_io_supervisor().wait_failure(),
+        )
+        .await
+        .is_ok();
         let began = Instant::now();
         let blocked = host
             .shutdown_until(Instant::now() + Duration::from_millis(40))
@@ -2474,21 +2475,20 @@ mod tests {
         let held = host.execution_runtime_owner.workload_observation.snapshot();
         let _ = release_payload.send(());
         let _ = disarm_watchdog.send(());
-        watchdog
-            .join()
-            .expect("original payload rescue thread actually joined");
-        tokio::time::timeout(Duration::from_secs(1), payload_entered)
-            .await
-            .unwrap()
-            .unwrap();
+        let watchdog_joined = watchdog.join().is_ok();
         let verdict = host
             .shutdown_until(Instant::now() + Duration::from_secs(2))
             .await;
+        let payload_entered = matches!(
+            tokio::time::timeout(Duration::from_secs(1), payload_entered).await,
+            Ok(Ok(()))
+        );
         let after = host.execution_runtime_owner.workload_observation.snapshot();
         let cleanup_complete = host.execution_runtime_owner.is_shutdown_complete();
         host.shutdown_until(Instant::now() + Duration::from_secs(2))
             .await
             .expect("cleaned Host remains closed");
+        assert!(callback_entered && failure_published && payload_entered && watchdog_joined);
         assert!(blocked.is_err() && payload_started_by_deadline);
         assert!(
             shutdown_elapsed < Duration::from_millis(500),

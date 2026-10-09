@@ -165,6 +165,74 @@ impl Drop for ConnectorBlockingIoJoinPin {
     }
 }
 
+/// Carries the same admitted backing through Tokio's original blocking task,
+/// including a queued callback, its output, and an original panic payload.
+/// Cancellation of the observing publisher must not release this backing.
+struct BackedBlockingValue<T> {
+    value: Option<T>,
+    backing: Option<Box<[ConnectorBlockingIoBacking]>>,
+}
+
+impl<T> BackedBlockingValue<T> {
+    fn new(value: T, pins: &[ConnectorBlockingIoJoinPin]) -> Self {
+        Self {
+            value: Some(value),
+            backing: Some(
+                pins.iter()
+                    .map(|pin| ConnectorBlockingIoBacking(Arc::clone(&pin.cell)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn take_value(&mut self) -> T {
+        self.value.take().expect("one original blocking value")
+    }
+}
+
+impl<F> BackedBlockingValue<F> {
+    fn run<T>(mut self) -> BackedBlockingValue<T>
+    where
+        F: FnOnce() -> T,
+    {
+        let call = self.take_value();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+        let backing = self.backing.take();
+        match result {
+            Ok(value) => BackedBlockingValue {
+                value: Some(value),
+                backing,
+            },
+            Err(payload) => resume_backed_panic(payload, backing),
+        }
+    }
+}
+
+impl<T> Drop for BackedBlockingValue<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            // Provider destructors can themselves return a new panic payload.
+            // Transfer the existing backing before unwinding, rather than
+            // releasing it while Tokio still owns that successor payload.
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
+            {
+                resume_backed_panic(payload, self.backing.take());
+            }
+        }
+    }
+}
+
+fn resume_backed_panic(
+    payload: Box<dyn std::any::Any + Send>,
+    backing: Option<Box<[ConnectorBlockingIoBacking]>>,
+) -> ! {
+    std::panic::resume_unwind(Box::new(BackedBlockingValue {
+        value: Some(payload),
+        backing,
+    }))
+}
+
 struct JobOutcome<T: Send + 'static> {
     value: Mutex<Option<Result<T, ConnectorBlockingIoError>>>,
     // Unclaimed output retirement receives the same cells before these pins
@@ -204,6 +272,10 @@ impl<T: Send + 'static> Drop for JobOutcome<T> {
 pub(crate) struct ConnectorBlockingIoJob<T: Send + 'static> {
     outcome: Arc<JobOutcome<T>>,
     ready: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    publisher: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    original_blocking_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
@@ -327,26 +399,40 @@ impl ConnectorBlockingIoSupervisor {
         let published = Arc::clone(&outcome);
         let ready = Arc::new(tokio::sync::Notify::new());
         let publish_ready = Arc::clone(&ready);
-        self.runtime.spawn(async move {
-            let joined = runtime.spawn_blocking(call).await;
+        let call = BackedBlockingValue::new(call, &published.pins);
+        #[cfg(test)]
+        let original_blocking_abort = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let publish_blocking_abort = Arc::clone(&original_blocking_abort);
+        let publisher = self.runtime.spawn(async move {
+            let blocking = runtime.spawn_blocking(move || call.run());
+            #[cfg(test)]
+            {
+                *publish_blocking_abort.lock().unwrap() = Some(blocking.abort_handle());
+            }
+            let joined = blocking.await;
             for pin in &published.pins {
                 pin.joined.store(true, Ordering::Release);
             }
-            let completed = joined.map_err(|error| ConnectorBlockingIoError {
-                detail: if error.is_panic() {
-                    "connector blocking-I/O worker panicked"
-                } else {
-                    "connector blocking-I/O worker was cancelled"
+            // The original outcome pins already guard the claimed value
+            // before the task-local carrier is retired.
+            let completed = joined.map(|mut value| value.take_value()).map_err(|error| {
+                ConnectorBlockingIoError {
+                    detail: if error.is_panic() {
+                        "connector blocking-I/O worker panicked"
+                    } else {
+                        "connector blocking-I/O worker was cancelled"
+                    }
+                    .to_owned(),
+                    original: Arc::new(OriginalFailure {
+                        cause: OriginalFailureCause::WorkerJoin(error),
+                        _backing: published
+                            .pins
+                            .iter()
+                            .map(|pin| ConnectorBlockingIoBacking(Arc::clone(&pin.cell)))
+                            .collect(),
+                    }),
                 }
-                .to_owned(),
-                original: Arc::new(OriginalFailure {
-                    cause: OriginalFailureCause::WorkerJoin(error),
-                    _backing: published
-                        .pins
-                        .iter()
-                        .map(|pin| ConnectorBlockingIoBacking(Arc::clone(&pin.cell)))
-                        .collect(),
-                }),
             });
             *published
                 .value
@@ -357,7 +443,16 @@ impl ConnectorBlockingIoSupervisor {
             // `notify_waiters` would lose that notification.
             publish_ready.notify_one();
         });
-        ConnectorBlockingIoJob { outcome, ready }
+        #[cfg(not(test))]
+        drop(publisher);
+        ConnectorBlockingIoJob {
+            outcome,
+            ready,
+            #[cfg(test)]
+            publisher,
+            #[cfg(test)]
+            original_blocking_abort,
+        }
     }
 
     /// Move the original unclaimed failure out of the fixed process slot.
@@ -421,16 +516,16 @@ impl ConnectorBlockingIoSupervisor {
     {
         let runtime = self.runtime.clone();
         let retirement = self.clone();
+        let cleanup = BackedBlockingValue::new(
+            move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)),
+            &pins,
+        );
         self.runtime.spawn(async move {
-            let joined = runtime
-                .spawn_blocking(move || {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup))
-                })
-                .await;
+            let joined = runtime.spawn_blocking(move || cleanup.run()).await;
             for pin in &pins {
                 pin.joined.store(true, Ordering::Release);
             }
-            let cause = match joined {
+            let cause = match joined.map(|mut value| value.take_value()) {
                 Ok(Ok(())) => None,
                 Ok(Err(payload)) => Some(OriginalFailureCause::OutcomeDrop(Mutex::new(payload))),
                 Err(error) => Some(OriginalFailureCause::WorkerJoin(error)),
@@ -1159,3 +1254,10 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "blocking_io/opaque_split_drop_tests.rs"]
 mod opaque_split_drop_tests;
+
+#[cfg(test)]
+#[path = "blocking_io/aborted_publisher_tests.rs"]
+mod aborted_publisher_tests;
+
+#[cfg(test)]
+mod queued_successor_tests;
