@@ -358,3 +358,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - harness仅显式opt-in的3个Data H2 actor共享single-target slot/global credit/有限positions，原Control TCP默认与budget不变；three closed mutation仅profile2/kindfalse/准确4Bprefix。原真实reply先production decode+cursor校验，再共享creditedVec strictcanonical bytes；NotReady真实透传/no claim/no deadline refresh。typed peer CANCEL只对authenticated/decode完整/frozen fulltarget不同且非provisional ROOT单stream豁免，target/unknown/非ROOT/driver等wholefailure保留。特殊actor先实际stop/join再停FE/BE。
 - 9actor组件PASS/0.01s，harness全149/0/3ignored/2.48s；runner全117/0/2ignored/5.90s。真实duplex同长度非canonical、共享cap/Bytes最后alias、H2typedCANCEL后同连接健康stream、NotReady透传、stop实际join及MySQL partialdeadline/oversize/严格ERR拒绝反例通过。old3test calls E0061及test observation E0063均准确补齐、保留初始失败日志；未改caps/clocks/input。
 - 真实runner.rs dispatch已接Option/defaultNone，optional Data1 End无piggy合法/Some严格一致；observer同一absolute20s connect+read时钟在内返回有限partial证据，decoder-specific1105/HY000/sequence4原因必须完整。Cargo.lock仅9direct dependency edges、无版本/source/checksum升级。收据p09-native-root-reply-focused-20261009.json；实际FE三负例尚未执行，不冒充native拒绝/noACK/正常恢复与最终M07验收。无push/PR/归档。
+
+
+### 2026-10-09 P09：真实RootReply首跑在注入前失败；阶段诊断与失败日志保留
+
+- clean2d6f1960c实际原生1FE+3BE首跑5.367s/exit1，正常baseline成功；actor此前三条reset/broken-pipe导致begin_capture拒绝，claimed/emitted/target_attempts全部0。没有注入非法reply，不把它称FE负例PASS。actor所有positions/credit0、listeners3实际join、四个精确PID已独立确认不存在；whole actor join verdict仍失败。收据p09-native-root-reply-native-v1-failed-20261009.json绑定raw hashes与原cause。原runtime role logs被explicit shutdown提前删除，缺失不可重建。
+- 本增量仅给downstream H2 handshake/accept、upstream TCP/H2加准确context，固定原position内一个AtomicU64记录实际读取bytes；任何reset/error判据均不放宽，bytes0也不当无输入proof。失败scene在explicit shutdown前retain，shutdown自身有failure亦保留runtime，供下一次实际定位。9actor/149harness/117runner全部PASS，既有ignored3/2不变；收据p09-root-reply-stage-diagnostic-focused-20261009.json。
+- 将用新cleanHEAD与新immutable v2 artifact保持原三scene/caps/clocks/SQL运行。真实FE非法RootReply及M07最终验收仍OPEN，无push/PR/归档。

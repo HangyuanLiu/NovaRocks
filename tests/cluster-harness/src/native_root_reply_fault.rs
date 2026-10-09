@@ -724,6 +724,54 @@ async fn capture_expiry(core: Arc<Core>) {
     }
 }
 
+// A fixed-size counter observes the actual downstream bytes consumed by H2.
+// It stores no payload and remains under the existing connection position.
+struct ObservedIngress {
+    stream: tokio::net::TcpStream,
+    read_bytes: Arc<AtomicU64>,
+}
+impl tokio::io::AsyncRead for ObservedIngress {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut this.stream).poll_read(cx, buf);
+        let received = buf.filled().len().saturating_sub(before) as u64;
+        if received != 0 {
+            let _ = this
+                .read_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    Some(value.saturating_add(received))
+                });
+        }
+        result
+    }
+}
+impl tokio::io::AsyncWrite for ObservedIngress {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
 enum ChildExit {
     Upstream,
     Stream,
@@ -741,6 +789,11 @@ async fn serve_connection(
     }
     let handshake_deadline =
         tokio::time::Instant::now() + Duration::from_millis(core.bounds.handshake_timeout_millis);
+    let downstream_read_bytes = Arc::new(AtomicU64::new(0));
+    let observed_stream = ObservedIngress {
+        stream,
+        read_bytes: downstream_read_bytes.clone(),
+    };
     let connect = async {
         let mut server_builder = server::Builder::new();
         server_builder
@@ -753,8 +806,18 @@ async fn serve_connection(
             .max_concurrent_reset_streams(H2_RESETS)
             .max_local_error_reset_streams(Some(H2_RESETS))
             .max_send_buffer_size(H2_SEND_BUFFER);
-        let downstream = server_builder.handshake::<_, Bytes>(stream).await?;
-        let socket = tokio::net::TcpStream::connect(upstream).await?;
+        let downstream = server_builder
+            .handshake::<_, Bytes>(observed_stream)
+            .await
+            .with_context(|| {
+                format!(
+                    "root downstream H2 handshake (read_bytes={})",
+                    downstream_read_bytes.load(Ordering::Acquire)
+                )
+            })?;
+        let socket = tokio::net::TcpStream::connect(upstream)
+            .await
+            .context("root upstream TCP connect")?;
         let mut client_builder = client::Builder::new();
         client_builder
             .initial_window_size(H2_WINDOW)
@@ -769,7 +832,10 @@ async fn serve_connection(
             .max_send_buffer_size(H2_SEND_BUFFER)
             .enable_push(false)
             .header_table_size(4096);
-        let (sender, driver) = client_builder.handshake::<_, Bytes>(socket).await?;
+        let (sender, driver) = client_builder
+            .handshake::<_, Bytes>(socket)
+            .await
+            .context("root upstream H2 handshake")?;
         Ok::<_, anyhow::Error>((downstream, sender, driver))
     };
     let (mut downstream, sender, driver) = tokio::select! {
@@ -797,7 +863,10 @@ async fn serve_connection(
                     }
                 }
                 accepted = downstream.accept() => {
-                    let Some((request,mut response)) = accepted.transpose()? else {break Ok(())};
+                    let Some((request,mut response)) = accepted.transpose()
+                        .with_context(|| format!("root downstream H2 accept (read_bytes={}, children={})",
+                            downstream_read_bytes.load(Ordering::Acquire), children.len()))?
+                        else {break Ok(())};
                     let Ok(position) = core.stream_positions.clone().try_acquire_owned() else {
                         response.send_reset(h2::Reason::REFUSED_STREAM);
                         core.failure("root actor stream positions exhausted"); continue;

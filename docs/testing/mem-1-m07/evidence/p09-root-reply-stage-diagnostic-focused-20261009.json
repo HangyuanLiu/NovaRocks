@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "purpose": "RootReply actor diagnostic stages and failed-artifact retention",
+  "source_base_revision": "2d6f1960c52eb75962b834616428d9fd430d7827",
+  "changes": [
+    "Fixed-size actual downstream read counter; finite handshake/connect/accept error contexts; no error verdict exemptions",
+    "Retain failed scenario runtime artifacts before explicit shutdown; retain runtime if actor or role shutdown itself fails"
+  ],
+  "checks": [
+    {
+      "suite": "RootReply actor",
+      "passed": 9,
+      "failed": 0
+    },
+    {
+      "suite": "Full cluster harness",
+      "passed": 149,
+      "failed": 0,
+      "ignored": 3
+    },
+    {
+      "suite": "Full system runner",
+      "passed": 117,
+      "failed": 0,
+      "ignored": 2
+    }
+  ],
+  "limitations": [
+    "Actual native reply negatives remain open; first run failed before capture",
+    "Read bytes zero alone does not prove a no-input probe; no classification change"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-stage-diagnostic-focused-20261009.log",
+      "sha256": "fd767dab5682f59a1b89ec99356f546800c9361a65c14296c6a9b3be2b720043",
+      "bytes": 1320
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-stage-diagnostic-harness-regression-20261009.log",
+      "sha256": "f0a82610f5faed0d12dcc8971fc65c2d9e71e7fe23a87a20d7f3854e8642ed55",
+      "bytes": 14294
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-stage-diagnostic-runner-regression-20261009.log",
+      "sha256": "bd4c0923c1e39807bb512a7d0a6ca6225474b06c3b34e8d2fd7daeb231170dfc",
+      "bytes": 17264
+    }
+  ]
+}

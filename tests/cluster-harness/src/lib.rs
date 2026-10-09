@@ -4108,7 +4108,8 @@ impl CrossProcessServerHandle {
             }
         }
         self.native_fault_proxies.stop();
-        if !self.retain_runtime_artifacts
+        if failures.is_empty()
+            && !self.retain_runtime_artifacts
             && let Err(error) = fs::remove_dir_all(&self.runtime_dir)
             && error.kind() != std::io::ErrorKind::NotFound
         {

@@ -423,6 +423,13 @@ impl Scenario for NativeRootReplyRefusal {
             "owner_cleanup": failure_summary("owner-cleanup", cleanup_owners.as_ref().err()),
         });
         evidence["actor_before_shutdown"] = serde_json::to_value(control.observation())?;
+        if outcome.is_err()
+            || cleanup_join.is_err()
+            || cleanup_owners.is_err()
+            || !control.observation().failures.is_empty()
+        {
+            context.retain_artifacts();
+        }
         let shutdown = context.shutdown();
         let post = control.observation();
         let joined = check_shutdown(&post);
