@@ -72,6 +72,8 @@ mod aggregate_hll_owner;
 mod aggregate_n;
 pub mod aggregate_n_core;
 mod aggregate_n_owner;
+mod aggregate_percentile;
+mod aggregate_percentile_owner;
 mod aggregate_sum;
 mod aggregate_sum_owner;
 mod aggregate_window_adapter;

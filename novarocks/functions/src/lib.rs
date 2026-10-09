@@ -62,6 +62,7 @@ mod effect_refinement;
 mod evaluation;
 mod evaluation_failure;
 pub mod exact_percentile_core;
+pub mod exact_percentile_failure;
 #[cfg(test)]
 mod exact_installed_owner_selection_tests;
 #[cfg(test)]

@@ -75,7 +75,32 @@ fn complete_original_shapes(name: &str) {
     }
     for shape in shapes {
         let ty = FunctionValueType::new(shape.clone(), true);
-        let values = InputGenerator::new(9871).column(&ty, 17, &InputProfile::default());
+        let values = if shape == DataType::FixedSizeBinary(16) {
+            // The generic Physical generator has no fixed-width binary author.
+            // Keep the admitted original carrier and use its real byte builder.
+            novarocks_functions::largeint::array_from_i128(&[
+                None,
+                Some(i128::MIN),
+                Some(i128::MAX),
+                Some(-1),
+                Some(0),
+                Some(1),
+                Some(i64::MIN as i128),
+                Some(i64::MAX as i128),
+                None,
+                Some(-17),
+                Some(17),
+                Some(1_i128 << 64),
+                Some(-(1_i128 << 64)),
+                Some(42),
+                Some(-42),
+                None,
+                Some(7),
+            ])
+            .unwrap()
+        } else {
+            InputGenerator::new(9871).column(&ty, 17, &InputProfile::default())
+        };
         for rate in [0.0, 0.25, 0.5, 1.0] {
             check(name, shape.clone(), values.clone(), rate);
         }

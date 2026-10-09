@@ -20,6 +20,9 @@
 use crate::aggregate_scalar::{
     AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
 };
+use crate::exact_percentile_failure::{
+    LegacyPercentileFailure, PercentileDataRecipe, PercentileFailureSink,
+};
 use crate::percentile_input::{PercentileInputDiagnostic, numeric_value_at, payload_bytes_at};
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::ArrayRef;
@@ -36,6 +39,22 @@ pub trait ExactPercentileAllocator: ScalarStateAllocator {
         bytes: usize,
         operation: &str,
     ) -> Result<Self::ParserReservation, String>;
+    fn reserve_percentile_transient_lossless(
+        &self,
+        bytes: usize,
+        operation: &str,
+    ) -> Result<Self::ParserReservation, crate::aggregate_scalar::ScalarStateError> {
+        self.reserve_percentile_transient(bytes, operation)
+            .map_err(crate::aggregate_scalar::ScalarStateError::Legacy)
+    }
+    fn percentile_allocation_failure(
+        &self,
+        operation: &str,
+    ) -> crate::aggregate_scalar::ScalarStateError {
+        crate::aggregate_scalar::ScalarStateError::Legacy(
+            self.percentile_allocation_error(operation),
+        )
+    }
     fn percentile_allocation_error(&self, operation: &str) -> String {
         self.scalar_allocation_error(operation).to_string()
     }
@@ -45,25 +64,6 @@ fn scalar_bytes_legacy<A: ExactPercentileAllocator>(
     bytes: &[u8],
 ) -> Result<ScalarVec<u8, A>, String> {
     crate::aggregate_scalar::scalar_bytes(allocator, bytes, &mut ScalarWork::new(None))
-        .map_err(|error| error.to_string())
-}
-fn tracked_scalar_from_array<A: ExactPercentileAllocator>(
-    array: &ArrayRef,
-    row: usize,
-    allocator: &A,
-) -> Result<Option<TrackedAggScalarValue<A>>, String> {
-    crate::aggregate_scalar::tracked_scalar_from_array(
-        array,
-        row,
-        allocator,
-        &mut ScalarWork::new(None),
-    )
-    .map_err(|error| error.to_string())
-}
-fn tracked_scalar_to_output<A: ExactPercentileAllocator>(
-    value: &TrackedAggScalarValue<A>,
-) -> Result<AggScalarValue, String> {
-    crate::aggregate_scalar::tracked_scalar_to_output(value, &mut ScalarWork::new(None))
         .map_err(|error| error.to_string())
 }
 fn compare_scalar_values(
@@ -77,8 +77,8 @@ fn compare_scalar_values(
     )
     .map_err(|error| error.to_string())
 }
-const EXACT_PERCENTILE_MAGIC: u8 = 0xC3;
-const EXACT_PERCENTILE_VERSION: u8 = 1;
+pub(crate) const EXACT_PERCENTILE_MAGIC: u8 = 0xC3;
+pub(crate) const EXACT_PERCENTILE_VERSION: u8 = 1;
 
 #[derive(Debug, Deserialize)]
 enum BorrowedSerializableScalar<'a> {
@@ -106,9 +106,18 @@ impl<A: ExactPercentileAllocator> ExactPercentileState<A> {
     }
 
     pub fn push(&mut self, value: TrackedAggScalarValue<A>) -> Result<(), String> {
+        self.push_with_sink(value, &mut LegacyPercentileFailure)
+    }
+    pub fn push_with_sink<S: PercentileFailureSink<A>>(
+        &mut self,
+        value: TrackedAggScalarValue<A>,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
         self.values.try_reserve(1).map_err(|_| {
-            self.allocator
-                .percentile_allocation_error("reserve exact percentile value")
+            sink.scalar(
+                self.allocator
+                    .percentile_allocation_failure("reserve exact percentile value"),
+            )
         })?;
         self.values.push(value);
         Ok(())
@@ -322,23 +331,24 @@ pub fn decode_state_into<A: ExactPercentileAllocator>(
     payload: &[u8],
     allocator: &A,
 ) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), String> {
+    decode_state_into_with_sink(payload, allocator, &mut LegacyPercentileFailure)
+}
+pub fn decode_state_into_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    payload: &[u8],
+    allocator: &A,
+    sink: &mut S,
+) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), S::Error> {
     if payload.is_empty() {
         return Ok((None, ScalarVec::new_in(allocator.clone())));
     }
     if payload.len() < 2 {
-        return Err("exact percentile payload too short".to_string());
+        return Err(sink.data(PercentileDataRecipe::ShortPayload));
     }
     if payload[0] != EXACT_PERCENTILE_MAGIC {
-        return Err(format!(
-            "unsupported exact percentile payload magic: expected=0x{:02x} actual=0x{:02x}",
-            EXACT_PERCENTILE_MAGIC, payload[0]
-        ));
+        return Err(sink.data(PercentileDataRecipe::Magic(payload[0])));
     }
     if payload[1] != EXACT_PERCENTILE_VERSION {
-        return Err(format!(
-            "unsupported exact percentile payload version: expected={} actual={}",
-            EXACT_PERCENTILE_VERSION, payload[1]
-        ));
+        return Err(sink.data(PercentileDataRecipe::Version(payload[1])));
     }
     // serde_json only needs an owned scratch buffer when a string contains
     // escapes. At most one token is decoded at a time; its decoded and encoded
@@ -348,29 +358,40 @@ pub fn decode_state_into<A: ExactPercentileAllocator>(
     let scratch_bound = payload
         .len()
         .checked_mul(2)
-        .ok_or_else(|| "exact percentile parser scratch bound overflow".to_string())?;
-    let _scratch = allocator.reserve_percentile_transient(
-        scratch_bound,
-        "reserve exact percentile JSON parser scratch",
-    )?;
+        .ok_or_else(|| sink.data(PercentileDataRecipe::ScratchOverflow))?;
+    let _scratch = allocator
+        .reserve_percentile_transient_lossless(
+            scratch_bound,
+            "reserve exact percentile JSON parser scratch",
+        )
+        .map_err(|error| sink.scalar(error))?;
     let mut deserializer = serde_json::Deserializer::from_slice(&payload[2..]);
     StateSeed { allocator }
         .deserialize(&mut deserializer)
-        .map_err(|error| error.to_string())
+        .map_err(|error| sink.json(&error, allocator))
 }
 
 pub fn apply_rate<A: ExactPercentileAllocator>(
     state: &mut ExactPercentileState<A>,
     rate: f64,
 ) -> Result<(), String> {
+    apply_rate_with_sink(state, rate, &mut LegacyPercentileFailure)
+}
+pub fn apply_rate_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    state: &mut ExactPercentileState<A>,
+    rate: f64,
+    sink: &mut S,
+) -> Result<(), S::Error> {
     if !(0.0..=1.0).contains(&rate) {
-        return Err("Percentile rate must be between 0 and 1".to_string());
+        return Err(sink.data(PercentileDataRecipe::RateOutOfRange));
     }
     match state.rate {
-        Some(existing) if (existing - rate).abs() > f64::EPSILON => Err(format!(
-            "percentile rate mismatch while merging states: existing={} incoming={}",
-            existing, rate
-        )),
+        Some(existing) if (existing - rate).abs() > f64::EPSILON => {
+            Err(sink.data(PercentileDataRecipe::RateMismatch {
+                existing,
+                incoming: rate,
+            }))
+        }
         Some(_) => Ok(()),
         None => {
             state.rate = Some(rate);
@@ -382,6 +403,12 @@ pub fn apply_rate<A: ExactPercentileAllocator>(
 pub fn validate_exact_scalar<A: ExactPercentileAllocator>(
     value: TrackedAggScalarValue<A>,
 ) -> Result<TrackedAggScalarValue<A>, String> {
+    validate_exact_scalar_with_sink(value, &mut LegacyPercentileFailure)
+}
+pub fn validate_exact_scalar_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    value: TrackedAggScalarValue<A>,
+    sink: &mut S,
+) -> Result<TrackedAggScalarValue<A>, S::Error> {
     match value {
         value @ (TrackedAggScalarValue::Int64(_)
         | TrackedAggScalarValue::Float64(_)
@@ -389,36 +416,34 @@ pub fn validate_exact_scalar<A: ExactPercentileAllocator>(
         | TrackedAggScalarValue::Date32(_)
         | TrackedAggScalarValue::Timestamp(_)
         | TrackedAggScalarValue::Decimal128(_)) => Ok(value),
-        other => Err(format!(
-            "unsupported percentile_disc/cont input scalar {:?}",
-            other
-        )),
+        other => Err(sink.data(PercentileDataRecipe::InvalidScalar(&other))),
     }
 }
 
-fn numeric_from_scalar(value: &AggScalarValue, context: &str) -> Result<f64, String> {
+fn numeric_from_scalar_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    value: &AggScalarValue,
+    sink: &mut S,
+) -> Result<f64, S::Error> {
     match value {
         AggScalarValue::Int64(v) => Ok(*v as f64),
         AggScalarValue::Float64(v) => Ok(*v),
         AggScalarValue::Date32(v) => Ok(*v as f64),
         AggScalarValue::Timestamp(v) => Ok(*v as f64),
         AggScalarValue::Decimal128(v) => Ok(*v as f64),
-        other => Err(format!(
-            "{context}: unsupported percentile_cont interpolation input {:?}",
-            other
-        )),
+        other => Err(sink.data(PercentileDataRecipe::InterpolationInput(other))),
     }
 }
 
-fn scalar_from_numeric(output_type: &DataType, value: f64) -> Result<AggScalarValue, String> {
+fn scalar_from_numeric_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    output_type: &DataType,
+    value: f64,
+    sink: &mut S,
+) -> Result<AggScalarValue, S::Error> {
     match output_type {
         DataType::Float64 => Ok(AggScalarValue::Float64(value)),
         DataType::Date32 => Ok(AggScalarValue::Date32(value as i32)),
         DataType::Timestamp(_, _) => Ok(AggScalarValue::Timestamp(value as i64)),
-        other => Err(format!(
-            "unsupported percentile_cont output type {:?}",
-            other
-        )),
+        other => Err(sink.data(PercentileDataRecipe::OutputType(other))),
     }
 }
 
@@ -430,13 +455,41 @@ pub fn update_from_arrays<A: ExactPercentileAllocator>(
     rates: &ArrayRef,
     rate_row: usize,
 ) -> Result<(), String> {
-    if let Some(rate) = numeric_value_at(rates, rate_row, PercentileInputDiagnostic::ExactUpdate)? {
-        apply_rate(state, rate)?;
+    update_from_arrays_with_sink(
+        state,
+        values,
+        value_row,
+        rates,
+        rate_row,
+        &mut ScalarWork::new(None),
+        &mut LegacyPercentileFailure,
+    )
+}
+pub fn update_from_arrays_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    state: &mut ExactPercentileState<A>,
+    values: &ArrayRef,
+    value_row: usize,
+    rates: &ArrayRef,
+    rate_row: usize,
+    work: &mut ScalarWork<'_, '_>,
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    if let Some(rate) = numeric_value_at(rates, rate_row, PercentileInputDiagnostic::ExactUpdate)
+        .map_err(|error| sink.reader(error))?
+    {
+        apply_rate_with_sink(state, rate, sink)?;
     }
-    let Some(value) = tracked_scalar_from_array(values, value_row, &state.allocator)? else {
+    let Some(value) = crate::aggregate_scalar::tracked_scalar_from_array(
+        values,
+        value_row,
+        &state.allocator,
+        work,
+    )
+    .map_err(|error| sink.scalar(error))?
+    else {
         return Ok(());
     };
-    state.push(validate_exact_scalar(value)?)?;
+    state.push_with_sink(validate_exact_scalar_with_sink(value, sink)?, sink)?;
     Ok(())
 }
 /// Original merge; update can also consume the original binary-like state.
@@ -446,23 +499,48 @@ pub fn merge_from_array<A: ExactPercentileAllocator>(
     row: usize,
     diagnostic: ExactMergeDiagnostic,
 ) -> Result<(), String> {
+    merge_from_array_with_sink(
+        state,
+        array,
+        row,
+        diagnostic,
+        &mut ScalarWork::new(None),
+        &mut LegacyPercentileFailure,
+    )
+}
+pub fn merge_from_array_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    state: &mut ExactPercentileState<A>,
+    array: &ArrayRef,
+    row: usize,
+    diagnostic: ExactMergeDiagnostic,
+    work: &mut ScalarWork<'_, '_>,
+    sink: &mut S,
+) -> Result<(), S::Error> {
     let context = match diagnostic {
         ExactMergeDiagnostic::Update => PercentileInputDiagnostic::ExactUpdate,
         ExactMergeDiagnostic::Merge => PercentileInputDiagnostic::ExactMerge,
     };
-    let Some(payload) = payload_bytes_at(array, row, context)? else {
+    let Some(payload) =
+        payload_bytes_at(array, row, context).map_err(|error| sink.reader(error))?
+    else {
         return Ok(());
     };
-    let (rate, incoming) = decode_state_into(payload, &state.allocator)?;
+    work.flush().map_err(|error| sink.scalar(error))?;
+    let (rate, incoming) = decode_state_into_with_sink(payload, &state.allocator, sink)?;
     if let Some(rate) = rate {
-        apply_rate(state, rate)?;
+        apply_rate_with_sink(state, rate, sink)?;
     }
+    work.flush().map_err(|error| sink.scalar(error))?;
     state.values.try_reserve(incoming.len()).map_err(|_| {
-        state
-            .allocator
-            .percentile_allocation_error("reserve merged exact percentile values")
+        sink.scalar(
+            state
+                .allocator
+                .percentile_allocation_failure("reserve merged exact percentile values"),
+        )
     })?;
+    // Extend remains the original owned-vector operation, observed as opaque work.
     state.values.extend(incoming);
+    work.flush().map_err(|error| sink.scalar(error))?;
     Ok(())
 }
 #[derive(Clone, Copy, Debug)]
@@ -475,6 +553,19 @@ pub fn finalize_cont<A: ExactPercentileAllocator>(
     state: &ExactPercentileState<A>,
     output_type: &DataType,
 ) -> Result<Option<AggScalarValue>, String> {
+    finalize_cont_with_sink(
+        state,
+        output_type,
+        &mut ScalarWork::new(None),
+        &mut LegacyPercentileFailure,
+    )
+}
+pub fn finalize_cont_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    state: &ExactPercentileState<A>,
+    output_type: &DataType,
+    work: &mut ScalarWork<'_, '_>,
+    sink: &mut S,
+) -> Result<Option<AggScalarValue>, S::Error> {
     if state.values.is_empty() {
         return Ok(None);
     }
@@ -482,28 +573,29 @@ pub fn finalize_cont<A: ExactPercentileAllocator>(
     let mut values: Vec<AggScalarValue> = state
         .values
         .iter()
-        .map(tracked_scalar_to_output)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|value| crate::aggregate_scalar::tracked_scalar_to_output(value, work))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| sink.scalar(error))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
     values.sort_by(|left, right| {
         compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal)
     });
+    work.flush().map_err(|error| sink.scalar(error))?;
 
     if values.len() == 1 || rate == 1.0 {
         return match output_type {
-            DataType::Float64 => Ok(Some(AggScalarValue::Float64(numeric_from_scalar(
-                values.last().expect("last"),
-                "percentile_cont",
-            )?))),
+            DataType::Float64 => Ok(Some(AggScalarValue::Float64(
+                numeric_from_scalar_with_sink::<A, S>(values.last().expect("last"), sink)?,
+            ))),
             _ => Ok(Some(values.last().expect("last").clone())),
         };
     }
 
     if rate == 0.0 {
         return match output_type {
-            DataType::Float64 => Ok(Some(AggScalarValue::Float64(numeric_from_scalar(
-                values.first().expect("first"),
-                "percentile_cont",
-            )?))),
+            DataType::Float64 => Ok(Some(AggScalarValue::Float64(
+                numeric_from_scalar_with_sink::<A, S>(values.first().expect("first"), sink)?,
+            ))),
             _ => Ok(Some(values.first().expect("first").clone())),
         };
     }
@@ -513,23 +605,33 @@ pub fn finalize_cont<A: ExactPercentileAllocator>(
     let fraction = u - index as f64;
     if fraction == 0.0 {
         return match output_type {
-            DataType::Float64 => Ok(Some(AggScalarValue::Float64(numeric_from_scalar(
-                &values[index],
-                "percentile_cont",
-            )?))),
+            DataType::Float64 => Ok(Some(AggScalarValue::Float64(
+                numeric_from_scalar_with_sink::<A, S>(&values[index], sink)?,
+            ))),
             _ => Ok(Some(values[index].clone())),
         };
     }
 
-    let lower = numeric_from_scalar(&values[index], "percentile_cont")?;
-    let upper = numeric_from_scalar(&values[index + 1], "percentile_cont")?;
+    let lower = numeric_from_scalar_with_sink::<A, S>(&values[index], sink)?;
+    let upper = numeric_from_scalar_with_sink::<A, S>(&values[index + 1], sink)?;
     let interpolated = lower + fraction * (upper - lower);
-    scalar_from_numeric(output_type, interpolated).map(Some)
+    scalar_from_numeric_with_sink::<A, S>(output_type, interpolated, sink).map(Some)
 }
 
 pub fn finalize_disc<A: ExactPercentileAllocator>(
     state: &ExactPercentileState<A>,
 ) -> Result<Option<AggScalarValue>, String> {
+    finalize_disc_with_sink(
+        state,
+        &mut ScalarWork::new(None),
+        &mut LegacyPercentileFailure,
+    )
+}
+pub fn finalize_disc_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
+    state: &ExactPercentileState<A>,
+    work: &mut ScalarWork<'_, '_>,
+    sink: &mut S,
+) -> Result<Option<AggScalarValue>, S::Error> {
     if state.values.is_empty() {
         return Ok(None);
     }
@@ -537,11 +639,14 @@ pub fn finalize_disc<A: ExactPercentileAllocator>(
     let mut values: Vec<AggScalarValue> = state
         .values
         .iter()
-        .map(tracked_scalar_to_output)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|value| crate::aggregate_scalar::tracked_scalar_to_output(value, work))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| sink.scalar(error))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
     values.sort_by(|left, right| {
         compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal)
     });
+    work.flush().map_err(|error| sink.scalar(error))?;
     if values.len() == 1 || rate == 1.0 {
         return Ok(values.last().cloned());
     }

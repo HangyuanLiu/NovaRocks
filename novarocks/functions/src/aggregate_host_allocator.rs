@@ -67,12 +67,24 @@ impl HostAggregateAllocator {
     pub(super) fn metadata_bytes(&self) -> usize {
         Layout::new::<HostAllocatorInner>().size()
     }
-    pub(super) fn take_failure(&self) -> KernelFailure {
+    /// Borrow the originating allocator refusal without consuming its journal.
+    /// serde's custom error carrier must not erase the distinct Kernel cause.
+    pub(super) fn recorded_failure(&self) -> Option<KernelFailure> {
+        self.inner()
+            .failure
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+    pub(super) fn take_recorded_failure(&self) -> Option<KernelFailure> {
         self.inner()
             .failure
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take()
+    }
+    pub(super) fn take_failure(&self) -> KernelFailure {
+        self.take_recorded_failure()
             .unwrap_or(KernelFailure::ResourceExhausted)
     }
     fn refuse(&self, error: KernelFailure) -> AllocError {
