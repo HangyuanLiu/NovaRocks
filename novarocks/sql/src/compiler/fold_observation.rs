@@ -107,6 +107,7 @@ impl SqlConstantEvaluator for SqlFoldEvaluatorLoan<'_> {
     ) -> Result<(), novarocks_functions::FunctionBindingError> {
         if let Some(catalog) = self.catalog {
             catalog.admit_bound_lifecycle_observed(binding.resolved(), lifecycle, control)?;
+            catalog.admit_authored_environment_observed(binding, control)?;
         }
         self.calculator
             .admit_fold_parent_observed(binding, lifecycle, control)

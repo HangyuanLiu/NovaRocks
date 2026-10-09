@@ -196,6 +196,21 @@ impl<'a> super::AnalyzerContext<'a> {
         self.check_control()?;
         let resolved = self.analyze_expr_impl(expr, scope)?;
         self.check_control()?;
+        // Borrow only this root's original authored binding. Child analysis has
+        // already used this same recursion; do not rescan or rebind its graph.
+        let binding = match &resolved.kind {
+            ExprKind::FunctionCall { binding, .. }
+            | ExprKind::WindowCall { binding, .. } => Some(binding),
+            ExprKind::AggregateCall { resolved, .. } => Some(resolved),
+            _ => None,
+        };
+        if let Some(binding) = binding {
+            self.function_catalog
+                .admit_authored_environment_observed(binding, self.control)
+                .map_err(|error| {
+                    AnalyzeError::function_binding(error).at_type_mismatch(expr.span())
+                })?;
+        }
         if self.sql_semantics.sql_mode().decimal_overflow_policy()
             == novarocks_type_contract::DecimalOverflowPolicy::ReportError
         {

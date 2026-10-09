@@ -326,6 +326,12 @@ impl<'a, 'control> ConstantFolder<'a, 'control> {
             Operator::LogicalAggregate(agg) => {
                 let mut changed = self.fold_slots(&mut agg.group_by)?;
                 for aggregate in &mut agg.aggregates {
+                    // Normalized calls retain their original binding outside ScalarArena.
+                    self.evaluator.admit_fold_parent_observed(
+                        aggregate.source.binding(),
+                        novarocks_functions::PureCallLifecycle::Aggregate,
+                        self.work.control(),
+                    )?;
                     changed |= aggregate.source.rewrite_channels(|arguments, order_by| {
                         let args_changed = self.fold_slots(arguments)?;
                         Ok::<_, SqlCompileError>(args_changed | self.fold_sort_keys(order_by)?)
@@ -336,6 +342,12 @@ impl<'a, 'control> ConstantFolder<'a, 'control> {
             Operator::PhysicalHashAggregate(agg) => {
                 let mut changed = self.fold_slots(&mut agg.group_by)?;
                 for aggregate in &mut agg.aggregates {
+                    // Normalized calls retain their original binding outside ScalarArena.
+                    self.evaluator.admit_fold_parent_observed(
+                        aggregate.source.binding(),
+                        novarocks_functions::PureCallLifecycle::Aggregate,
+                        self.work.control(),
+                    )?;
                     changed |= aggregate.source.rewrite_channels(|arguments, order_by| {
                         let args_changed = self.fold_slots(arguments)?;
                         Ok::<_, SqlCompileError>(args_changed | self.fold_sort_keys(order_by)?)
@@ -367,6 +379,17 @@ impl<'a, 'control> ConstantFolder<'a, 'control> {
                 self.work.step()?;
                 let mut changed = false;
                 for spec in &mut window.window_exprs {
+                    // OVER's lifecycle comes from the original normalized source author.
+                    let lifecycle = if spec.aggregate_binding.is_some() {
+                        novarocks_functions::PureCallLifecycle::AggregateWindow
+                    } else {
+                        novarocks_functions::PureCallLifecycle::Window
+                    };
+                    self.evaluator.admit_fold_parent_observed(
+                        &spec.binding,
+                        lifecycle,
+                        self.work.control(),
+                    )?;
                     changed |= self.fold_slots(&mut spec.args)?;
                     changed |= self.fold_slots(&mut spec.partition_by)?;
                     changed |= self.fold_sort_keys(&mut spec.order_by)?;
@@ -382,6 +405,11 @@ impl<'a, 'control> ConstantFolder<'a, 'control> {
                 changed
             }
             Operator::LogicalTableFunction(func) | Operator::PhysicalTableFunction(func) => {
+                self.evaluator.admit_fold_parent_observed(
+                    &func.binding,
+                    novarocks_functions::PureCallLifecycle::Table,
+                    self.work.control(),
+                )?;
                 self.fold_slots(&mut func.args)?
             }
             Operator::LogicalChangeEventExpand(expand)

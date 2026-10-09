@@ -5744,17 +5744,13 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             let original_binding = lower_aggregate_binding(call, phase, &mut self.work)?;
             if let Some(facts) = call.source.binding().group_concat_source() {
-                let raw = facts
-                    .max_len
+                let [(mode_id, mode), (max_id, value)] = facts
+                    .parameter_entries()
                     .ok_or(ContractLoweringError::InvalidAggregate {
                         detail: "group_concat has no admitted max length source",
                     })?;
-                let mode = SemanticParameterValue::GroupConcatLegacy(facts.legacy);
-                let mode_id = SemanticParameterId::new(if facts.legacy { 2 } else { 1 });
                 self.work.flush()?;
                 self.group_concat_parameters.insert(mode_id, mode);
-                let max_id = SemanticParameterId::new(3);
-                let value = SemanticParameterValue::GroupConcatMaxLen(raw);
                 if self
                     .group_concat_parameters
                     .get(&max_id)

@@ -242,6 +242,16 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Borrow the original lexical call facts at the existing fold-parent frontier.
+    /// Original catalogues do no work and construct no semantic table here.
+    fn admit_authored_environment_observed(
+        &self,
+        _binding: &crate::binding::SqlFunctionBinding,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
     /// Original catalogues retain the original intrinsic input domain. Only
     /// the explicit Exact request scope installs this source-shape admission.
     /// No query mode is inferred from a runtime value or constant payload.

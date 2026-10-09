@@ -1619,3 +1619,18 @@ mod e08s1_environment_original_tests;
 
 #[cfg(test)]
 mod e08s1_environment_tests;
+
+#[cfg(test)]
+mod e08s1_fold_environment_original_tests;
+
+#[cfg(test)]
+mod e08s1_fold_environment_tests;
+
+#[cfg(test)]
+mod e08s1_logical_environment_original_tests;
+
+#[cfg(test)]
+mod e08s1_logical_environment_tests;
+
+#[cfg(test)]
+mod e08s1_table_fold_parent_tests;

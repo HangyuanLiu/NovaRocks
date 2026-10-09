@@ -115,6 +115,45 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             Err(error) => Err(FunctionBindingError::InvalidBinding(error.to_string().into())),
         }
     }
+    fn admit_authored_environment_observed(
+        &self,
+        binding: &crate::binding::SqlFunctionBinding,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        use novarocks_type_contract::{
+            CompileCheckpoints, CompilePhase, SemanticParameterProjectionError, SemanticParameters,
+        };
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            if let Some(facts) = binding.group_concat_source() {
+                let entries = facts.parameter_entries().ok_or_else(|| {
+                    FunctionBindingError::UnavailableImplementation(binding.selected.overload.clone())
+                })?;
+                // These are the original two primitive lexical values, not inferred defaults.
+                // This existing observed constructor controls its actual tree operations;
+                // a formal FE capacity port remains an explicit separate interface gate.
+                let parameters = SemanticParameters::try_new_observed(entries, &mut work)
+                    .map_err(|error| match error {
+                        SemanticParameterProjectionError::Control(cause) => FunctionBindingError::Control(cause),
+                        SemanticParameterProjectionError::Parameter(_) =>
+                            FunctionBindingError::UnavailableImplementation(binding.selected.overload.clone()),
+                    })?;
+                self.admit_bound_environment_observed(
+                    binding.resolved(), &facts.environment(), &parameters, control,
+                )
+            } else {
+                // No ordinary lexical environment author exists on this original binding.
+                self.admit_bound_environment_observed(
+                    binding.resolved(), &[], &SemanticParameters::default(), control,
+                )
+            }
+        })();
+        if matches!(&result, Err(FunctionBindingError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
     fn admit_native_bitnot_source_observed(
         &self,
         source: &novarocks_functions::FunctionValueType,
