@@ -673,3 +673,6 @@ fn sql_fold_dependency_original_unconstrained_binding_is_not_selected_result_con
 
 #[path = "sql_call_dependency_loan_tests.rs"]
 mod sql_call_dependency_loan_tests;
+
+#[path = "ds_hll_state_fold_source_tests.rs"]
+mod ds_hll_state_fold_source_tests;

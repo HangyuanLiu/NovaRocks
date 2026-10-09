@@ -1814,3 +1814,7 @@ mod field_tests;
 #[cfg(test)]
 #[path = "pure_differential_approx_percentile_tests.rs"]
 mod approx_percentile_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_percentile_hash_tests.rs"]
+mod percentile_hash_tests;

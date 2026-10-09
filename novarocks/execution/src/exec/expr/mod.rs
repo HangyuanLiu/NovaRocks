@@ -1471,7 +1471,18 @@ mod legacy_decimal128_rescale_baseline_tests;
 mod approx_percentile_actual_sql_source_tests;
 
 #[cfg(test)]
+mod legacy_percentile_hash_original_tests;
+
+#[cfg(test)]
+mod percentile_hash_original_sql_source_tests;
+
+#[cfg(test)]
 mod legacy_observed_list_cast_baseline_tests;
 
 #[cfg(test)]
 mod sql_dependency_resolved_binding_source_tests;
+
+#[cfg(test)]
+mod legacy_between_observed_baseline_tests;
+#[cfg(test)]
+mod between_actual_sql_compiler_tests;
