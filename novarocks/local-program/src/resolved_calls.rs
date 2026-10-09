@@ -86,6 +86,10 @@ pub enum ProgramStateTemplate<'a> {
         scope: ProgramExpressionCallScope,
         kernel: &'a Arc<dyn PreparedScalarKernel>,
     },
+    ScalarInvocation {
+        scope: ProgramExpressionCallScope,
+        kernel: &'a Arc<dyn novarocks_functions::PreparedInvocationScalarKernel>,
+    },
     HigherOrder {
         scope: ProgramExpressionCallScope,
         kernel: &'a Arc<dyn PreparedHigherOrderKernel>,
@@ -140,6 +144,9 @@ impl ProgramResolvedCall {
         match (self.specialization.prepared(), self.scope) {
             (PreparedPureKernel::Scalar(kernel), CheckedScope::Expression(scope)) => {
                 ProgramStateTemplate::Scalar { scope, kernel }
+            }
+            (PreparedPureKernel::ScalarInvocation(kernel), CheckedScope::Expression(scope)) => {
+                ProgramStateTemplate::ScalarInvocation { scope, kernel }
             }
             (PreparedPureKernel::HigherOrder(kernel), CheckedScope::Expression(scope)) => {
                 ProgramStateTemplate::HigherOrder { scope, kernel }
@@ -602,6 +609,7 @@ fn validate_expression(
     if !matches!(
         token.prepared(),
         PreparedPureKernel::Scalar(_)
+            | PreparedPureKernel::ScalarInvocation(_)
             | PreparedPureKernel::HigherOrder(_)
             | PreparedPureKernel::ControlIntrinsic(_)
     ) {
@@ -662,9 +670,30 @@ fn validate_expression(
         }
     } else if call.temporal_source().is_some() {
         return Err(ProgramResolvedCallsError::WrongArguments);
-    } else if invocation.control == ControlShape::TypeOnly {
+    } else if matches!(
+        invocation.control,
+        ControlShape::TypeOnly | ControlShape::NoArguments
+    ) {
         if !invocation.arguments.is_empty() {
             return Err(ProgramResolvedCallsError::WrongArguments);
+        }
+        if invocation.control == ControlShape::NoArguments {
+            // Demand-zero removes actual uses, never static definition/type
+            // validation. Retain every original full-N source association.
+            for (definition, ty) in args.iter().zip(&call.selected().argument_types) {
+                work.step()?;
+                let FunctionArgumentType::Value(ty) = ty else {
+                    return Err(ProgramResolvedCallsError::WrongArguments);
+                };
+                check_arrow(
+                    definitions
+                        .node(*definition)
+                        .ok_or(ProgramResolvedCallsError::InvalidSite)?
+                        .data_type(),
+                    &ty.data_type,
+                    work,
+                )?;
+            }
         }
     } else {
         if invocation.arguments.len() != args.len() {

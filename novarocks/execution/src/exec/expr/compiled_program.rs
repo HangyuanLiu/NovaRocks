@@ -59,7 +59,8 @@ pub struct CompiledExpressionInstance {
     /// input. A join key reads its own side's layout and a join residual the
     /// join scope; every other root reads a node output.
     input: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
-    instances: BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
+    instances: BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
+    has_invocation_data: bool,
     effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     failed: bool,
     allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
@@ -254,6 +255,7 @@ impl CompiledExpressionInstance {
         let mut stack = vec![(root_use, false)];
         let mut seen = BTreeSet::new();
         let mut effects = BTreeMap::<ProgramUseRef, ScopedExpressionEffects>::new();
+        let mut has_invocation_data = false;
         while let Some((use_id, exiting)) = stack.pop() {
             work.step()?;
             let invocation = flow
@@ -269,6 +271,10 @@ impl CompiledExpressionInstance {
                     StaticExprKind::BoundCall { .. } => {
                         let call = &checked.channels().expressions().resolved_calls().calls()
                             [&ProgramCallSite::Expression(occurrence)];
+                        has_invocation_data |= matches!(
+                            call.specialization().prepared(),
+                            PreparedPureKernel::ScalarInvocation(_)
+                        );
                         let summary = call.effects();
                         summary.for_use(invocation.context).map_err(|_| {
                             invalid("prepared call effects differ from actual occurrence")
@@ -506,8 +512,10 @@ impl CompiledExpressionInstance {
                         .ok_or_else(|| invalid("missing actual prepared scalar occurrence"))?;
                     let supported = match (invocation.control, call.specialization().prepared()) {
                         (
-                            ControlShape::Eager | ControlShape::TypeOnly,
-                            PreparedPureKernel::Scalar(_),
+                            ControlShape::Eager
+                            | ControlShape::TypeOnly
+                            | ControlShape::NoArguments,
+                            PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_),
                         ) => {
                             call.call_contract().effects().null_behavior
                                 != FunctionNullBehavior::ControlDefined
@@ -547,6 +555,7 @@ impl CompiledExpressionInstance {
             root,
             input,
             instances: BTreeMap::new(),
+            has_invocation_data,
             effects,
             failed: false,
             allocator: None,
@@ -564,6 +573,12 @@ impl CompiledExpressionInstance {
         if self.failed {
             return Err(KernelFailure::InstanceFailed);
         }
+        if self.has_invocation_data {
+            self.failed = true;
+            return Err(invalid(
+                "whole-invocation scalar requires the lossless evaluation entry",
+            ));
+        }
         let observed = ObservedControl {
             original: control,
             refused: AtomicBool::new(false),
@@ -573,23 +588,71 @@ impl CompiledExpressionInstance {
             control: &observed,
             pending: 0,
         };
-        let result = observed
-            .checkpoint(0)
-            .and_then(|()| self.evaluate_once(input, selection, &mut work));
+        let result = observed.checkpoint(0).and_then(|()| {
+            self.evaluate_once::<KernelFailure>(
+                input,
+                selection,
+                novarocks_functions::ScalarInvocationActivation::Activated,
+                &mut work,
+            )
+        });
         let result = work.finish(result);
         if result.is_err() {
             self.failed = true;
         }
         result
     }
-    fn evaluate_once<'a>(
+    /// Actual caller demand, independent of empty Selection. This entry owns
+    /// atomic invocation Data while the old adapter remains Kernel-only.
+    pub fn evaluate_evaluation<'a>(
         &mut self,
         input: &RecordBatch,
         selection: Selection<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, novarocks_functions::ScalarInvocationFailure> {
+        use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationFailure};
+        if self.failed {
+            return Err(KernelFailure::InstanceFailed.into());
+        }
+        if activation == ScalarInvocationActivation::ValidateOnly && !selection.is_empty() {
+            self.failed = true;
+            return Err(invalid("nonempty root demand cannot be validation-only").into());
+        }
+        let observed = ObservedControl {
+            original: control,
+            refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
+        };
+        let mut work = Work {
+            control: &observed,
+            pending: 0,
+        };
+        let result = (|| {
+            observed.checkpoint(0)?;
+            self.evaluate_once::<ScalarInvocationFailure>(input, selection, activation, &mut work)
+        })();
+        // A positively installed whole-invocation root preserves every first
+        // failure, including entry validation before any leaf is created.
+        let result = if self.has_invocation_data && result.is_err() {
+            result
+        } else {
+            <ScalarInvocationFailure as scalar_invocation::FrameFailure>::finish(&mut work, result)
+        };
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn evaluate_once<'a, E: scalar_invocation::FrameFailure>(
+        &mut self,
+        input: &RecordBatch,
+        selection: Selection<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
         work: &mut Work<'_>,
-    ) -> Result<SelectedValues<'a>, KernelFailure> {
+    ) -> Result<SelectedValues<'a>, E> {
         if input.num_rows() != selection.batch_rows() {
-            return Err(invalid("selection differs from actual input batch rows"));
+            return Err(invalid("selection differs from actual input batch rows").into());
         }
         let Some((input_node, input_role)) = self.input else {
             // The explicit empty port: no field, no metadata and one row, so
@@ -600,11 +663,11 @@ impl CompiledExpressionInstance {
                 schema.fields().is_empty() && schema.metadata().is_empty() && input.num_rows() == 1;
             work.flush()?;
             if !empty {
-                return Err(invalid(
-                    "actual input differs from the root's empty one-row port",
-                ));
+                return Err(
+                    invalid("actual input differs from the root's empty one-row port").into(),
+                );
             }
-            return self.evaluate_root(input, None, selection, work);
+            return self.evaluate_root::<E>(input, None, selection, activation, work);
         };
         let channels = self.program.checked().channels();
         let layout = channels
@@ -619,15 +682,11 @@ impl CompiledExpressionInstance {
         let same_metadata = schema.metadata() == frozen.metadata();
         work.flush()?;
         if !same_metadata || schema.fields().len() != frozen.fields().len() {
-            return Err(invalid(
-                "actual input fields differ from the frozen root port",
-            ));
+            return Err(invalid("actual input fields differ from the frozen root port").into());
         }
         for (actual, expected) in schema.fields().iter().zip(frozen.fields()) {
             if !arrow_fields_exact_observed(actual, expected, || work.step())? {
-                return Err(invalid(
-                    "actual input fields differ from the frozen root port",
-                ));
+                return Err(invalid("actual input fields differ from the frozen root port").into());
             }
         }
         // Validate the entire incoming port, including columns not referenced
@@ -650,25 +709,33 @@ impl CompiledExpressionInstance {
             )?;
             work.step()?;
         }
-        self.evaluate_root(input, Some((input_node, input_role)), selection, work)
+        self.evaluate_root::<E>(
+            input,
+            Some((input_node, input_role)),
+            selection,
+            activation,
+            work,
+        )
     }
-    fn evaluate_root<'a>(
+    fn evaluate_root<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
         input: &RecordBatch,
         input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
         selection: Selection<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
         work: &mut Work<'_>,
-    ) -> Result<SelectedValues<'a>, KernelFailure> {
+    ) -> Result<SelectedValues<'a>, E> {
         let checked = self.program.checked();
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
         let flow = &snapshot.flows()[&self.root.arena()];
-        let result = guarded::evaluate_tree(
+        let result = guarded::evaluate_tree::<E>(
             &self.program,
             self.root,
             input,
             input_node,
             selection,
+            activation,
             &mut self.instances,
             self.allocator.as_ref(),
             &self.effects,
@@ -680,7 +747,7 @@ impl CompiledExpressionInstance {
             .definition_type(self.root.arena(), invocation.definition)
             .ok_or_else(|| invalid("missing actual root value type"))?
         else {
-            return Err(invalid("actual root is not a value"));
+            return Err(invalid("actual root is not a value").into());
         };
         let result = result.materialize(selection, &ty.data_type, work)?;
         if !ty.nullable {
@@ -699,7 +766,8 @@ impl CompiledExpressionInstance {
                     } else if is_null {
                         return Err(internal(
                             "non-null compiled root returned a successful SQL NULL",
-                        ));
+                        )
+                        .into());
                     }
                     Ok(())
                 },
@@ -709,15 +777,16 @@ impl CompiledExpressionInstance {
     }
 }
 
-fn evaluate_scalar<'a>(
+fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
     occurrence: ProgramUseRef,
-    prepared: &Arc<dyn novarocks_functions::PreparedScalarKernel>,
+    prepared: scalar_invocation::PreparedCall<'_>,
     children: &[Value<'a>],
     selection: Selection<'a>,
-    instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
+    activation: novarocks_functions::ScalarInvocationActivation,
+    instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_>,
-) -> Result<SelectedValues<'a>, KernelFailure> {
+) -> Result<SelectedValues<'a>, E> {
     let mut blocked = Vec::with_capacity(selection.len());
     for _ in 0..selection.len() {
         blocked.push(false);
@@ -756,7 +825,12 @@ fn evaluate_scalar<'a>(
         }
         work.step()?;
     }
-    if active_rows.is_empty() {
+    if active_rows.is_empty()
+        && !(E::ACTIVATE_EMPTY
+            && prepared.is_invocation()
+            && selection.is_empty()
+            && activation == novarocks_functions::ScalarInvocationActivation::Activated)
+    {
         work.flush()?;
         let values = new_null_array(
             &prepared.contract().result_type().data_type,
@@ -774,7 +848,8 @@ fn evaluate_scalar<'a>(
             values,
             errors.into_boxed_slice(),
             || work.step(),
-        );
+        )
+        .map_err(E::from);
     }
     let full_call = active_rows.len() == selection.len();
     let call_selection = if full_call {
@@ -821,26 +896,27 @@ fn evaluate_scalar<'a>(
     if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence) {
         // The actual host must authorize this instance's immutable lifetime
         // bound before entry. Representability/postchecks are not that grant.
-        let instance = match ScalarEvaluationInstance::instantiate_with_allocator(
-            Arc::clone(prepared),
-            allocator.cloned(),
-        ) {
+        let instance = match prepared.instantiate(allocator.cloned()) {
             Ok(instance) => instance,
             Err(cause) => {
                 work.control
                     .operation_aborted
                     .store(true, Ordering::Relaxed);
-                return Err(cause);
+                return Err(cause.into());
             }
         };
         work.control.checkpoint(0)?;
         entry.insert(instance);
     }
-    let output = match instances
-        .get_mut(&occurrence)
-        .ok_or_else(|| internal("scalar instance was not installed"))?
-        .evaluate(call_selection, &arguments, work.control)
-    {
+    let output = match E::invoke(
+        instances
+            .get_mut(&occurrence)
+            .ok_or_else(|| internal("scalar instance was not installed"))?,
+        call_selection,
+        &arguments,
+        activation,
+        work.control,
+    ) {
         Ok(output) => output,
         Err(cause) => {
             // A real typed leaf failure owns the first cause. Do not add a
@@ -849,7 +925,7 @@ fn evaluate_scalar<'a>(
             work.control
                 .operation_aborted
                 .store(true, Ordering::Relaxed);
-            return Err(cause);
+            return Err(cause.into());
         }
     };
     let (_, array, own_errors) = output.into_parts();
@@ -886,6 +962,7 @@ fn evaluate_scalar<'a>(
         errors.into_boxed_slice(),
         || work.step(),
     )
+    .map_err(E::from)
 }
 
 fn gather(
@@ -932,6 +1009,7 @@ pub(crate) mod tests;
 mod copy_tests;
 
 mod guarded;
+mod scalar_invocation;
 
 #[cfg(test)]
 pub(crate) mod guarded_tests;

@@ -24,6 +24,8 @@ pub mod resolver;
 pub mod signature;
 
 pub mod catalogue;
+#[cfg(feature = "test-support")]
+mod array_invocation_diagnostic_probe_owner;
 
 pub mod value_conversion;
 mod value_conversion_kernel;
@@ -340,7 +342,7 @@ mod percentile_approx_raw_selected;
 mod aggregate_by_window;
 
 // Private transport/lifecycle probes; no scalar owner or ABI is registered.
-mod scalar_invocation_data;
+pub(crate) mod scalar_invocation_data;
 
 // Private original ARRAY diagnostic producer; no owner or ABI is registered.
 mod array_scalar_diagnostic_source;

@@ -1192,7 +1192,10 @@ fn validate_definition_correspondence(
         if temporal.is_none()
             && !matches!(
                 (&definition.kind, invocation.control),
-                (ExprKind::FunctionCall { .. }, ControlShape::TypeOnly)
+                (
+                    ExprKind::FunctionCall { .. },
+                    ControlShape::TypeOnly | ControlShape::NoArguments
+                )
             )
         {
             definition

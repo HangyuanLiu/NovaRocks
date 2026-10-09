@@ -181,9 +181,12 @@ impl CompiledFilterConjunctionInstance {
         input: &RecordBatch,
         selection: Selection<'a>,
         work: &mut Work<'_>,
-    ) -> Result<(SelectedValues<'a>, Box<[ProgramExpressionRootSite]>), KernelFailure> {
+    ) -> Result<
+        (SelectedValues<'a>, Box<[ProgramExpressionRootSite]>),
+        novarocks_functions::ScalarInvocationFailure,
+    > {
         if input.num_rows() != selection.batch_rows() {
-            return Err(invalid("Filter selection differs from its actual batch"));
+            return Err(invalid("Filter selection differs from its actual batch").into());
         }
         let mut boolean = BooleanRows::new(selection.len(), work)?;
         let mut terminal = BTreeMap::new();
@@ -203,7 +206,12 @@ impl CompiledFilterConjunctionInstance {
                 if selection.is_empty() {
                     // A zero-row invocation validates the entire original port,
                     // but the existing Frame enters no child/kernel constructor.
-                    let output = root.evaluate(input, selection, work.control)?;
+                    let output = root.evaluate_evaluation(
+                        input,
+                        selection,
+                        novarocks_functions::ScalarInvocationActivation::ValidateOnly,
+                        work.control,
+                    )?;
                     work.flush()?;
                     drop(output);
                     work.flush()?;
@@ -222,7 +230,12 @@ impl CompiledFilterConjunctionInstance {
             }
             let actual_selection =
                 Selection::try_sparse_observed(input.num_rows(), &batch_rows, || work.step())?;
-            let output = root.evaluate(input, actual_selection, work.control)?;
+            let output = root.evaluate_evaluation(
+                input,
+                actual_selection,
+                novarocks_functions::ScalarInvocationActivation::Activated,
+                work.control,
+            )?;
             for error in output.errors() {
                 let parent = *remaining.get(error.selected_ordinal()).ok_or_else(|| {
                     internal("Filter child error ordinal is outside its actual selection")
@@ -282,11 +295,11 @@ impl CompiledFilterConjunctionInstance {
             control: &observed,
             pending: 0,
         };
-        let result = work
-            .control
-            .checkpoint(0)
-            .and_then(|()| self.evaluate_once(input, selection, &mut work));
-        let result = work.finish(result);
+        let result = (|| {
+            work.control.checkpoint(0)?;
+            self.evaluate_once(input, selection, &mut work)
+        })();
+        let result = <novarocks_functions::ScalarInvocationFailure as scalar_invocation::FrameFailure>::finish(&mut work, result);
         let result = result
             .map_err(crate::runtime::fragment::ExecutionFailure::from)
             .and_then(|(selected, sites)| {

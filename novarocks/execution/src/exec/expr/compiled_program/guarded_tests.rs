@@ -414,6 +414,9 @@ impl FlowAuthor {
             None
         };
         let (shape, args) = match &definition.kind {
+            ExprKind::FunctionCall { .. } if authors[&expr].shape == ControlShape::NoArguments => {
+                (ControlShape::NoArguments, &[][..])
+            }
             ExprKind::FunctionCall { args, .. } => {
                 temporal
                     .as_ref()
@@ -782,11 +785,15 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                     children.join_same_domain(summaries[child]).unwrap()
                 };
             }
-            let argument_uses = invocation
-                .arguments
-                .iter()
-                .map(|id| Some(*id))
-                .collect::<Vec<_>>();
+            let argument_uses = if owner.shape == ControlShape::NoArguments {
+                vec![None; owner.logical_argument_count]
+            } else {
+                invocation
+                    .arguments
+                    .iter()
+                    .map(|id| Some(*id))
+                    .collect::<Vec<_>>()
+            };
             let preparation = if matches!(
                 owner.shape,
                 ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
@@ -1467,3 +1474,6 @@ mod ds_hll_state_private_frame_tests;
 
 #[path = "percentile_raw_private_frame_tests.rs"]
 mod percentile_raw_private_frame_tests;
+
+#[path = "scalar_invocation_frame_tests.rs"]
+mod scalar_invocation_frame_tests;

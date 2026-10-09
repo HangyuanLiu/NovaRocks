@@ -123,6 +123,11 @@ pub(crate) fn evaluate_all(
         site,
         input,
         Selection::all(input.num_rows()),
+        if input.num_rows() == 0 {
+            novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        } else {
+            novarocks_functions::ScalarInvocationActivation::Activated
+        },
         control,
     )
 }
@@ -143,7 +148,12 @@ pub(crate) fn evaluate_selected(
             "compiled root selection is not ordered within its batch",
         )))
     })?;
-    evaluate_selection(instance, site, input, selection, control)
+    let activation = if rows.is_empty() {
+        novarocks_functions::ScalarInvocationActivation::ValidateOnly
+    } else {
+        novarocks_functions::ScalarInvocationActivation::Activated
+    };
+    evaluate_selection(instance, site, input, selection, activation, control)
 }
 
 fn evaluate_selection(
@@ -151,9 +161,12 @@ fn evaluate_selection(
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
     selection: Selection<'_>,
+    activation: novarocks_functions::ScalarInvocationActivation,
     control: &dyn KernelEvaluationControl,
 ) -> ExecutionResult<ArrayRef> {
-    let result = instance.evaluate(input, selection, control)?;
+    // Required callers supply their actual row-demand policy. Direct Frame
+    // callers may activate an empty invocation (e.g. the original IF else).
+    let result = instance.evaluate_evaluation(input, selection, activation, control)?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());

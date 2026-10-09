@@ -5481,3 +5481,40 @@ pub fn percentile_union_private_test_catalog() -> EngineFunctionCatalog {
         .unwrap();
     builder.seal().unwrap()
 }
+
+/// Cross-crate transport probes borrow the REAL ARRAY dynamic declaration and
+/// resolver. This private catalogue is not a public supported capability.
+#[cfg(feature = "test-support")]
+pub fn array_projection_diagnostic_private_test_catalog() -> EngineFunctionCatalog {
+    let (raw, resolver) = dynamic_definition_parts("__array_struct_subfield").unwrap();
+    let declaration = FunctionBindingDeclaration::try_new(
+        raw.function_id().clone(),
+        raw.kind(),
+        raw.overloads().iter().cloned().map(|mut overload| {
+            overload.effects = Some(super::array_invocation_diagnostic_probe_owner::effects());
+            overload
+        }),
+    )
+    .unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(
+            super::array_invocation_diagnostic_probe_owner::definition(
+                "__array_struct_subfield",
+                declaration,
+                resolver,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let original = build_builtin_engine_function_catalog().unwrap();
+    builder
+        .register(
+            original
+                .definition("if", FunctionKind::Scalar)
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    builder.seal().unwrap()
+}

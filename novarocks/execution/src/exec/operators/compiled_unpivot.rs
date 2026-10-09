@@ -539,6 +539,10 @@ fn build_output(
 }
 
 impl Operator for CompiledUnpivotProcessor {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }

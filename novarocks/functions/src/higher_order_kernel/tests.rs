@@ -189,6 +189,7 @@ impl Owner {
             body_effects: ScopedExpressionEffects::primitive(
                 inner,
                 ExpressionEffects {
+                    may_raise_invocation_data: false,
                     value_stability: FunctionVolatility::Stable,
                     may_raise_row_error: true,
                     has_instance_state: true,

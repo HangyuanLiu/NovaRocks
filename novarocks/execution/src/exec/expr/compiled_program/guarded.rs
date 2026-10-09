@@ -66,6 +66,7 @@ struct Child {
 }
 struct Frame {
     occurrence: ProgramUseRef,
+    activation: novarocks_functions::ScalarInvocationActivation,
     rows: Vec<usize>,
     parent_ordinals: Vec<usize>,
     next: usize,
@@ -86,10 +87,14 @@ impl Frame {
         shape: ControlShape,
         result_type: &DataType,
         rows: Vec<usize>,
+        activation: novarocks_functions::ScalarInvocationActivation,
         parent_ordinals: Vec<usize>,
         work: &mut Work<'_>,
     ) -> Result<Self, KernelFailure> {
-        if supports_result(result_type) {
+        // A demand-zero invocation does not construct or interleave a result
+        // before its original arity Data. Retain the actual domain storage,
+        // but do not invent an output-copy admission for nonexistent values.
+        if shape != ControlShape::NoArguments && supports_result(result_type) {
             novarocks_functions::selected_copy::guarded_interleave_extent(result_type, rows.len())
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
             work.step()?;
@@ -136,6 +141,7 @@ impl Frame {
         };
         Ok(Self {
             occurrence,
+            activation,
             rows,
             parent_ordinals,
             next: 0,
@@ -169,6 +175,13 @@ impl Frame {
                 .as_mut()
                 .ok_or_else(|| internal("missing Boolean continuation"))?
                 .boundary(&mut self.errors, &mut self.remaining, work)?;
+        }
+        if self.rows.is_empty()
+            && self.activation == novarocks_functions::ScalarInvocationActivation::Activated
+            && shape == ControlShape::If
+            && self.next == 1
+        {
+            self.next = 2;
         }
         if self.next >= arity
             || (matches!(
@@ -872,17 +885,18 @@ impl Frame {
     clippy::too_many_arguments,
     reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
 )]
-pub(super) fn evaluate_tree<'a>(
+pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     program: &novarocks_local_program::LocalProgram,
     root: ProgramExpressionRootSite,
     input: &RecordBatch,
     input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
     selection: Selection<'a>,
-    instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
+    activation: novarocks_functions::ScalarInvocationActivation,
+    instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     work: &mut Work<'_>,
-) -> Result<Value<'a>, KernelFailure> {
+) -> Result<Value<'a>, E> {
     let checked = program.checked();
     let typed = checked.channels().expressions();
     let resolved = typed.resolved_calls();
@@ -903,7 +917,7 @@ pub(super) fn evaluate_tree<'a>(
         .checked_mul(element_width)
         .is_none_or(|bytes| bytes > isize::MAX as usize)
     {
-        return Err(KernelFailure::ResourceExhausted);
+        return Err(KernelFailure::ResourceExhausted.into());
     }
     work.step()?;
     let mut rows = Vec::with_capacity(selection.len());
@@ -921,6 +935,11 @@ pub(super) fn evaluate_tree<'a>(
         root_invocation.control,
         root_type,
         rows,
+        if E::ACTIVATE_EMPTY {
+            activation
+        } else {
+            novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        },
         Vec::new(),
         work,
     )?];
@@ -934,12 +953,12 @@ pub(super) fn evaluate_tree<'a>(
             .definition_type(frame.occurrence.arena, invocation.definition)
             .ok_or_else(|| invalid("missing exact compiled definition type"))?
         else {
-            return Err(invalid(
-                "ordinary root cannot materialize a lambda definition",
-            ));
+            return Err(invalid("ordinary root cannot materialize a lambda definition").into());
         };
         // An empty actual domain never enters children, constructors or kernels.
-        let next = if frame.rows.is_empty() {
+        let next = if frame.rows.is_empty()
+            && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        {
             None
         } else {
             let next_is_pure = invocation
@@ -986,6 +1005,15 @@ pub(super) fn evaluate_tree<'a>(
                     .ok_or_else(|| invalid("missing actual child definition"))?
                     .data_type(),
                 rows,
+                if !ordinals.is_empty()
+                    || frame.activation
+                        == novarocks_functions::ScalarInvocationActivation::Activated
+                        && frame.rows.is_empty()
+                {
+                    novarocks_functions::ScalarInvocationActivation::Activated
+                } else {
+                    novarocks_functions::ScalarInvocationActivation::ValidateOnly
+                },
                 ordinals,
                 work,
             )?;
@@ -995,7 +1023,9 @@ pub(super) fn evaluate_tree<'a>(
         }
         let local_selection =
             Selection::try_sparse_observed(input.num_rows(), &frame.rows, || work.step())?;
-        let value = if frame.rows.is_empty() {
+        let value = if frame.rows.is_empty()
+            && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        {
             work.flush()?;
             let array = new_empty_array(&result_type.data_type);
             work.flush()?;
@@ -1019,12 +1049,16 @@ pub(super) fn evaluate_tree<'a>(
                         ordinal,
                     })) = checked.slots().get(&frame.occurrence)
                     else {
-                        return Err(invalid("slot requires its actual compiled input source"));
+                        return Err(
+                            invalid("slot requires its actual compiled input source").into()
+                        );
                     };
                     // An empty-port root has no input source at all; every
                     // other root reads exactly its own (node, role) port.
                     if Some((*node, *role)) != input_node {
-                        return Err(invalid("slot source differs from actual root input port"));
+                        return Err(
+                            invalid("slot source differs from actual root input port").into()
+                        );
                     }
                     OwnedValue::Column(Arc::clone(
                         input
@@ -1035,7 +1069,7 @@ pub(super) fn evaluate_tree<'a>(
                 }
                 StaticExprKind::PreparedLike { negated, .. } => {
                     if frame.children.len() != 2 {
-                        return Err(invalid("LIKE requires its original ordered operands"));
+                        return Err(invalid("LIKE requires its original ordered operands").into());
                     }
                     let mut children = std::mem::take(&mut frame.children).into_iter();
                     let text = children
@@ -1054,7 +1088,8 @@ pub(super) fn evaluate_tree<'a>(
                     if recipe.negated() != *negated {
                         return Err(invalid(
                             "LIKE negative expansion differs from original source",
-                        ));
+                        )
+                        .into());
                     }
                     work.flush()?;
                     let output = recipe.evaluate_selected(
@@ -1072,7 +1107,7 @@ pub(super) fn evaluate_tree<'a>(
                         .native_inlist_recipe(frame.occurrence)
                         .ok_or_else(|| invalid("missing IN completion recipe"))?;
                     if recipe.negated() != *is_not_in || frame.children.len() != 1 {
-                        return Err(invalid("IN completion differs from its ordered source"));
+                        return Err(invalid("IN completion differs from its ordered source").into());
                     }
                     let source = frame
                         .children
@@ -1116,7 +1151,7 @@ pub(super) fn evaluate_tree<'a>(
                 }
                 StaticExprKind::PreparedBetween { plan, .. } => {
                     if !frame.children.is_empty() {
-                        return Err(invalid("BETWEEN comparison phase was not completed"));
+                        return Err(invalid("BETWEEN comparison phase was not completed").into());
                     }
                     let state = frame
                         .boolean
@@ -1157,7 +1192,7 @@ pub(super) fn evaluate_tree<'a>(
                 }
                 StaticExprKind::PreparedCast { .. } => {
                     if frame.children.len() != 1 {
-                        return Err(invalid("cast requires its exact operand"));
+                        return Err(invalid("cast requires its exact operand").into());
                     }
                     let child = std::mem::take(&mut frame.children)
                         .into_iter()
@@ -1187,7 +1222,9 @@ pub(super) fn evaluate_tree<'a>(
                 }
                 StaticExprKind::PreparedNativeNegate(_) => {
                     if frame.children.len() != 1 {
-                        return Err(invalid("native negate requires its exact ordered operand"));
+                        return Err(
+                            invalid("native negate requires its exact ordered operand").into()
+                        );
                     }
                     let child = frame
                         .children
@@ -1211,7 +1248,8 @@ pub(super) fn evaluate_tree<'a>(
                     if frame.children.len() != 1 {
                         return Err(invalid(
                             "native BitwiseNot requires its exact ordered operand",
-                        ));
+                        )
+                        .into());
                     }
                     let child = frame
                         .children
@@ -1233,7 +1271,9 @@ pub(super) fn evaluate_tree<'a>(
                 }
                 StaticExprKind::PreparedArithmetic { .. } => {
                     if frame.children.len() != 2 {
-                        return Err(invalid("arithmetic requires its exact ordered operands"));
+                        return Err(
+                            invalid("arithmetic requires its exact ordered operands").into()
+                        );
                     }
                     let mut children = std::mem::take(&mut frame.children).into_iter();
                     let left = children
@@ -1261,7 +1301,9 @@ pub(super) fn evaluate_tree<'a>(
                     || matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) =>
                 {
                     if frame.children.len() != 2 {
-                        return Err(invalid("comparison requires its exact ordered operands"));
+                        return Err(
+                            invalid("comparison requires its exact ordered operands").into()
+                        );
                     }
                     let mut children = std::mem::take(&mut frame.children).into_iter();
                     let left = children
@@ -1314,7 +1356,7 @@ pub(super) fn evaluate_tree<'a>(
                 | StaticExprKind::IsNull(_)
                 | StaticExprKind::IsNotNull(_) => {
                     if frame.children.len() != 1 {
-                        return Err(invalid("unary occurrence requires its exact operand"));
+                        return Err(invalid("unary occurrence requires its exact operand").into());
                     }
                     let child = frame
                         .children
@@ -1331,17 +1373,31 @@ pub(super) fn evaluate_tree<'a>(
                 StaticExprKind::BoundCall { .. } => {
                     let call = &resolved.calls()[&ProgramCallSite::Expression(frame.occurrence)];
                     match call.specialization().prepared() {
-                        PreparedPureKernel::Scalar(prepared) => {
+                        PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
+                            let prepared = match call.specialization().prepared() {
+                                PreparedPureKernel::Scalar(p) => {
+                                    scalar_invocation::PreparedCall::Kernel(p)
+                                }
+                                PreparedPureKernel::ScalarInvocation(p) => {
+                                    scalar_invocation::PreparedCall::Invocation(p)
+                                }
+                                _ => {
+                                    return Err(E::from(invalid(
+                                        "ordinary call changed its prepared lifecycle",
+                                    )));
+                                }
+                            };
                             let mut children = Vec::with_capacity(frame.children.len());
                             for child in std::mem::take(&mut frame.children) {
                                 children.push(child.value.into_value(local_selection, work)?);
                                 work.step()?;
                             }
-                            OwnedValue::from_selected(evaluate_scalar(
+                            OwnedValue::from_selected(evaluate_scalar::<E>(
                                 frame.occurrence,
                                 prepared,
                                 &children,
                                 local_selection,
+                                frame.activation,
                                 instances,
                                 allocator,
                                 work,
@@ -1368,10 +1424,14 @@ pub(super) fn evaluate_tree<'a>(
                             local_selection,
                             work,
                         )?,
-                        _ => return Err(invalid("compiled occurrence has a different lifecycle")),
+                        _ => {
+                            return Err(
+                                invalid("compiled occurrence has a different lifecycle").into()
+                            );
+                        }
                     }
                 }
-                _ => return Err(invalid("unsupported compiled root definition")),
+                _ => return Err(invalid("unsupported compiled root definition").into()),
             }
         };
         if let Some(operand) = frame.operand.take() {
@@ -1401,10 +1461,10 @@ pub(super) fn evaluate_tree<'a>(
                 work,
             )?;
         } else {
-            return value.into_value(selection, work);
+            return value.into_value(selection, work).map_err(E::from);
         }
     }
-    Err(internal("actual compiled root result is absent"))
+    Err(internal("actual compiled root result is absent").into())
 }
 
 fn assemble(

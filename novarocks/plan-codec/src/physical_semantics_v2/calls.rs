@@ -123,6 +123,7 @@ fn encode_argument_control(value: ArgumentControl) -> wire::ArgumentControl {
         }),
         ArgumentControl::Eager => Kind::Simple(W::Eager as i32),
         ArgumentControl::TypeOnly => Kind::Simple(W::TypeOnly as i32),
+        ArgumentControl::NoArguments => Kind::Simple(W::NoArguments as i32),
         ArgumentControl::If => Kind::Simple(W::If as i32),
         ArgumentControl::Coalesce => Kind::Simple(W::Coalesce as i32),
         ArgumentControl::SimpleCase => Kind::Simple(W::SimpleCase as i32),
@@ -172,6 +173,7 @@ fn decode_argument_control(input: &wire::ArgumentControl) -> Result<ArgumentCont
             Kind::Simple(value) => match W::try_from(*value) {
                 Ok(W::Eager) => ArgumentControl::Eager,
                 Ok(W::TypeOnly) => ArgumentControl::TypeOnly,
+                Ok(W::NoArguments) => ArgumentControl::NoArguments,
                 Ok(W::If) => ArgumentControl::If,
                 Ok(W::Coalesce) => ArgumentControl::Coalesce,
                 Ok(W::SimpleCase) => ArgumentControl::SimpleCase,

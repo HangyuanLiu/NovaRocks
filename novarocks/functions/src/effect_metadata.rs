@@ -54,6 +54,7 @@ pub(crate) fn digest_effect_declaration(hasher: &mut Sha256, effects: &FunctionE
     match argument_control {
         ArgumentControl::Eager => hasher.update([1]),
         ArgumentControl::TypeOnly => hasher.update([2]),
+        ArgumentControl::NoArguments => hasher.update([12]),
         ArgumentControl::If => hasher.update([3]),
         ArgumentControl::Coalesce => hasher.update([4]),
         ArgumentControl::SimpleCase => hasher.update([5]),

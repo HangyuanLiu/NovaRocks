@@ -853,13 +853,16 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
                 novarocks_functions::FunctionKind::Scalar,
                 "a non-row binding cannot be consumed as a scalar function"
             );
-            match binding.semantics.intrinsic_row_error {
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
-                novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
-                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
-                    unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+            binding
+                .admitted_execution_abi
+                .is_some_and(|abi| abi.may_raise_invocation_data())
+                || match binding.semantics.intrinsic_row_error {
+                    novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
+                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
+                        unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+                    }
                 }
-            }
         }
         ScalarNode::BinaryOp {
             op,

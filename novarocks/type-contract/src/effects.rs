@@ -49,6 +49,9 @@ impl ExpressionUseId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ArgumentControl {
     Eager,
+    /// Invoke the exact owner without evaluating any argument value. Full
+    /// logical definitions/types remain checked; this is not TypeOnly.
+    NoArguments,
     /// Validate argument types without creating any value-evaluation demand.
     TypeOnly,
     If,
@@ -80,6 +83,7 @@ impl ArgumentControl {
         match (self, shape) {
             (Self::Eager, ControlShape::Eager)
             | (Self::TypeOnly, ControlShape::TypeOnly)
+            | (Self::NoArguments, ControlShape::NoArguments)
             | (Self::If, ControlShape::If)
             | (Self::Coalesce, ControlShape::Coalesce)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
@@ -197,6 +201,7 @@ impl FunctionEffectDeclaration {
                 matches!(
                     self.argument_control,
                     ArgumentControl::Eager
+                        | ArgumentControl::NoArguments
                         | ArgumentControl::TypeOnly
                         | ArgumentControl::If
                         | ArgumentControl::Coalesce
@@ -275,6 +280,20 @@ pub struct CallEffects {
     pub environment: Box<[SemanticParameterRef]>,
     pub proof_scope: CallProofScope,
 }
+/// A selected original demand-zero is the only added specialization. This
+/// validates an owner fact; it never infers that fact from arity or payload.
+pub fn validate_selected_argument_control(
+    base: ArgumentControl,
+    selected: ArgumentControl,
+) -> Result<(), EffectContractError> {
+    if base == selected
+        || (base == ArgumentControl::Eager && selected == ArgumentControl::NoArguments)
+    {
+        Ok(())
+    } else {
+        Err(EffectContractError::ControlMismatch)
+    }
+}
 impl CallEffects {
     /// Refinement may prove fewer row errors or environment dependencies. It
     /// cannot change the control protocol or silently erase observable effects.
@@ -283,12 +302,23 @@ impl CallEffects {
         base: &FunctionEffectDeclaration,
         scope: CallProofScope,
     ) -> Result<(), EffectContractError> {
+        self.validate_refinement_with_argument_control(base, scope, base.argument_control)
+    }
+    /// The selected control was authenticated by the exact installed owner
+    /// before runtime child uses were authored. Other refinements are unchanged.
+    pub fn validate_refinement_with_argument_control(
+        &self,
+        base: &FunctionEffectDeclaration,
+        scope: CallProofScope,
+        selected_control: ArgumentControl,
+    ) -> Result<(), EffectContractError> {
+        validate_selected_argument_control(base.argument_control, selected_control)?;
         if self.proof_scope != scope {
             return Err(EffectContractError::ProofScopeMismatch);
         }
         if self.failure_behavior != base.failure_behavior
             || self.null_behavior != base.null_behavior
-            || self.argument_control != base.argument_control
+            || self.argument_control != selected_control
             || self.observable_effects != base.observable_effects
         {
             return Err(EffectContractError::ControlMismatch);
@@ -344,6 +374,9 @@ impl CallEffects {
 pub struct ExpressionEffects {
     pub value_stability: FunctionVolatility,
     pub may_raise_row_error: bool,
+    /// Whole invocation Data is atomic, cannot be masked as a row error, and
+    /// forbids reordering, replay or evaluation in an earlier domain.
+    pub may_raise_invocation_data: bool,
     pub has_instance_state: bool,
     pub observable_effects: ObservableEffects,
 }
@@ -351,6 +384,7 @@ impl ExpressionEffects {
     pub const PURE_VALUE: Self = Self {
         value_stability: FunctionVolatility::Immutable,
         may_raise_row_error: false,
+        may_raise_invocation_data: false,
         has_instance_state: false,
         observable_effects: ObservableEffects::NONE,
     };
@@ -359,6 +393,7 @@ impl ExpressionEffects {
         self.join(Self {
             value_stability: call.value_stability,
             may_raise_row_error: call.own_row_error == FunctionIntrinsicRowError::MayRaise,
+            may_raise_invocation_data: false,
             has_instance_state: call.instance_state != FunctionInstanceState::None,
             observable_effects: call.observable_effects,
         })
@@ -367,6 +402,8 @@ impl ExpressionEffects {
         Self {
             value_stability: self.value_stability.max(other.value_stability),
             may_raise_row_error: self.may_raise_row_error || other.may_raise_row_error,
+            may_raise_invocation_data: self.may_raise_invocation_data
+                || other.may_raise_invocation_data,
             has_instance_state: self.has_instance_state || other.has_instance_state,
             observable_effects: self.observable_effects.union(other.observable_effects),
         }
@@ -375,6 +412,7 @@ impl ExpressionEffects {
     /// Row errors are buffered there, rather than erased by this fact.
     pub const fn permits_boolean_reordering(self) -> bool {
         !matches!(self.value_stability, FunctionVolatility::Volatile)
+            && !self.may_raise_invocation_data
             && !self.has_instance_state
             && self.observable_effects.is_empty()
     }

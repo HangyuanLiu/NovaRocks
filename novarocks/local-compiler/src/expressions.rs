@@ -1965,6 +1965,9 @@ fn prepare_core(
                         match (invocation.control, frozen.effects.argument_control) {
                             (ControlShape::Eager, ArgumentControl::Eager) => (false, false),
                             (ControlShape::TypeOnly, ArgumentControl::TypeOnly) => (true, false),
+                            (ControlShape::NoArguments, ArgumentControl::NoArguments) => {
+                                (true, false)
+                            }
                             (ControlShape::If, ArgumentControl::If)
                             | (ControlShape::Coalesce, ArgumentControl::Coalesce) => (false, true),
                             (

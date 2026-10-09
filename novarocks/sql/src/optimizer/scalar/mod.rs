@@ -544,6 +544,7 @@ pub(crate) fn test_function_binding(
         .collect();
     crate::binding::SqlFunctionBinding::new(
         ResolvedFunctionBinding {
+            admitted_execution_abi: None,
             function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
                 .expect("test function identity"),
             kind: FunctionKind::Scalar,

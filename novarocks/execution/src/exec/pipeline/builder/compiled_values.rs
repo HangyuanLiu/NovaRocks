@@ -128,6 +128,13 @@ struct CompiledValuesSource {
 }
 
 impl Operator for CompiledValuesSource {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.control.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -212,7 +219,12 @@ fn materialize(
                 column: cell.column,
             },
         };
-        let mut instance = CompiledExpressionInstance::try_new(Arc::clone(program), site, control)?;
+        let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+            Arc::clone(program),
+            site,
+            control,
+            control.allocator(),
+        )?;
         let value = evaluate_all(&mut instance, site, &empty, control)?;
         let field = schema
             .fields()

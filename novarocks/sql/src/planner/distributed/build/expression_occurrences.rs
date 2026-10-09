@@ -475,9 +475,40 @@ impl Author<'_> {
                     }
                 })?;
             }
-            let shape = if let ArgumentControl::TemporalSource(kind) =
-                declaration.effects().argument_control
+            let selected_control = if declaration.implementation().abi
+                == novarocks_functions::PureKernelAbi::ScalarInvocationV1
             {
+                let owner = self
+                    .source_owner
+                    .ok_or(ExpressionOccurrenceError::TemporalSource(
+                        "selected invocation demand has no original SQL emission owner",
+                    ))?;
+                self.work.flush()?;
+                let original = owner
+                    .checked_expression_call_source_observed(self.fragment, node, &mut self.work)
+                    .map_err(|error| match error {
+                        SqlSourceJournalError::Control(cause) => {
+                            ExpressionOccurrenceError::Control(cause)
+                        }
+                        error => ExpressionOccurrenceError::Journal(error),
+                    })?;
+                let canonical = original.canonical_operational().ok_or(
+                    ExpressionOccurrenceError::TemporalSource(
+                        "selected invocation demand has no same-emission canonical request",
+                    ),
+                )?;
+                declaration
+                    .selected_argument_control_observed(
+                        &function.function_id,
+                        canonical.selected().as_ref(),
+                        canonical.request().logical_argument_count,
+                        self.work.control(),
+                    )
+                    .map_err(|error| ExpressionOccurrenceError::function(error.into()))?
+            } else {
+                declaration.effects().argument_control
+            };
+            let shape = if let ArgumentControl::TemporalSource(kind) = selected_control {
                 let owner = self
                     .source_owner
                     .ok_or(ExpressionOccurrenceError::TemporalSource(
@@ -508,7 +539,7 @@ impl Author<'_> {
                 source_definitions = Some(definitions);
                 Some(shape)
             } else {
-                scalar_shape(declaration.effects().argument_control, args.len())
+                scalar_shape(selected_control, args.len())
             };
             self.work.step()?;
             shape.ok_or(ExpressionOccurrenceError::InvalidFunctionControl(
@@ -542,7 +573,7 @@ impl Author<'_> {
                 children.push(*definition);
                 self.work.step()?;
             }
-        } else if shape != ControlShape::TypeOnly {
+        } else if !matches!(shape, ControlShape::TypeOnly | ControlShape::NoArguments) {
             node.kind.invocation_references_observed(|child| {
                 self.reference()?;
                 children
@@ -616,6 +647,7 @@ pub(super) fn scalar_shape(control: ArgumentControl, count: usize) -> Option<Con
     Some(match control {
         ArgumentControl::Eager => ControlShape::Eager,
         ArgumentControl::TypeOnly => ControlShape::TypeOnly,
+        ArgumentControl::NoArguments => ControlShape::NoArguments,
         ArgumentControl::If => ControlShape::If,
         ArgumentControl::Coalesce => ControlShape::Coalesce,
         ArgumentControl::SimpleCase | ArgumentControl::SearchedCase => {

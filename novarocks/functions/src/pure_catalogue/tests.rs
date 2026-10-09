@@ -524,6 +524,7 @@ pub(super) fn assert_borrowed_call(
 ) {
     let direct: &FunctionCallContract = match specialization.prepared() {
         PreparedPureKernel::Scalar(kernel) => kernel.contract().call(),
+        PreparedPureKernel::ScalarInvocation(kernel) => kernel.contract().call(),
         PreparedPureKernel::HigherOrder(kernel) => kernel.contract().call(),
         PreparedPureKernel::Aggregate(kernel) => kernel.contract().call(),
         PreparedPureKernel::Window(kernel) => kernel.contract().call(),

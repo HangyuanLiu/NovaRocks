@@ -2742,3 +2742,6 @@ mod array_backing_geometry;
 pub use arrow_result_custody::{SourceBackingOwner, retain_source_backing};
 
 pub mod string_repeat_pad_core;
+
+mod scalar_invocation;
+pub use scalar_invocation::*;

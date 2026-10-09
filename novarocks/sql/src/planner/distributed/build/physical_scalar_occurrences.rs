@@ -139,11 +139,25 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     let abi = declaration.implementation().abi;
     if !matches!(
         abi,
-        PureKernelAbi::ScalarV1 | PureKernelAbi::ControlIntrinsicV1
+        PureKernelAbi::ScalarV1
+            | PureKernelAbi::ScalarInvocationV1
+            | PureKernelAbi::ControlIntrinsicV1
     ) {
         return Err(PhysicalScalarOccurrenceError::UnsupportedAbi(abi));
     }
-    let shape = match declaration.effects().argument_control {
+    let selected_control = if abi == PureKernelAbi::ScalarInvocationV1 {
+        declaration
+            .selected_argument_control_observed(
+                &function.function_id,
+                input.request.selected().as_ref(),
+                input.request.request().logical_argument_count,
+                work.control(),
+            )
+            .map_err(|error| ExpressionOccurrenceError::function(error.into()))?
+    } else {
+        declaration.effects().argument_control
+    };
+    let shape = match selected_control {
         novarocks_type_contract::ArgumentControl::TemporalSource(kind) => {
             let source =
                 input
@@ -189,7 +203,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     let shape = shape.ok_or(PhysicalScalarOccurrenceError::InvalidSource(
         "installed scalar owner has no scalar control shape",
     ))?;
-    let type_only = shape == ControlShape::TypeOnly;
+    let type_only = matches!(shape, ControlShape::TypeOnly | ControlShape::NoArguments);
     let correct_shape = invocation.control == shape
         && invocation.arguments.len()
             == if type_only {
@@ -274,9 +288,11 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         work.step()?;
     }
     let options = match abi {
-        PureKernelAbi::ScalarV1 => PureCallPreparation::Scalar {
-            arguments: children,
-        },
+        PureKernelAbi::ScalarV1 | PureKernelAbi::ScalarInvocationV1 => {
+            PureCallPreparation::Scalar {
+                arguments: children,
+            }
+        }
         PureKernelAbi::ControlIntrinsicV1 => PureCallPreparation::ControlIntrinsic {
             arguments: children,
         },

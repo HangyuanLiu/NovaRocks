@@ -457,6 +457,7 @@ fn no_own_row_error_does_not_erase_guarded_child_errors_state_or_observables() {
     let catalog = catalog();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let child_summary = ExpressionEffects {
+        may_raise_invocation_data: false,
         value_stability: FunctionVolatility::Volatile,
         may_raise_row_error: true,
         has_instance_state: true,

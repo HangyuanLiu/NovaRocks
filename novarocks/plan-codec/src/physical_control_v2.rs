@@ -132,6 +132,7 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
     let simple = match shape {
         ControlShape::Eager => Some(wire::SimpleControl::Eager),
         ControlShape::TypeOnly => Some(wire::SimpleControl::TypeOnly),
+        ControlShape::NoArguments => Some(wire::SimpleControl::NoArguments),
         ControlShape::LambdaBody => Some(wire::SimpleControl::LambdaBody),
         ControlShape::Conjunction => Some(wire::SimpleControl::Conjunction),
         ControlShape::Disjunction => Some(wire::SimpleControl::Disjunction),
@@ -186,6 +187,7 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
         Kind::Simple(simple) => match wire::SimpleControl::try_from(*simple) {
             Ok(wire::SimpleControl::Eager) => Ok(ControlShape::Eager),
             Ok(wire::SimpleControl::TypeOnly) => Ok(ControlShape::TypeOnly),
+            Ok(wire::SimpleControl::NoArguments) => Ok(ControlShape::NoArguments),
             Ok(wire::SimpleControl::LambdaBody) => Ok(ControlShape::LambdaBody),
             Ok(wire::SimpleControl::Conjunction) => Ok(ControlShape::Conjunction),
             Ok(wire::SimpleControl::Disjunction) => Ok(ControlShape::Disjunction),

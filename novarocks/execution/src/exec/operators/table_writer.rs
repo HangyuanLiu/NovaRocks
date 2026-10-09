@@ -106,6 +106,9 @@ struct TableWriterPlan {
 /// writer and every embedded aggregate share.
 pub(crate) trait WriterPageProjection: Send {
     fn set_mem_tracker(&mut self, _tracker: Arc<MemTracker>) {}
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        Ok(())
+    }
     fn project(&mut self, chunk: &Chunk) -> ExecutionResult<Chunk>;
 }
 
@@ -602,6 +605,10 @@ impl Operator for TableWriterOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        if let Err(error) = self.projection.bind_runtime_state(state) {
+            self.state = TableWriterState::Failed;
+            return Err(error);
+        }
         self.target_multiplex_batch_bytes = state
             .execution_runtime()
             .map(|runtime| runtime.config().exchange_max_transmit_batched_bytes)

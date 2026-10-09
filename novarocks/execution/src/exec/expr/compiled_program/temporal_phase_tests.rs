@@ -56,6 +56,7 @@ fn frame(work: &mut Work<'_>) -> Frame {
         ControlShape::TemporalSource(S::SecondsCastOther),
         &DataType::Int64,
         vec![1, 3, 5],
+        novarocks_functions::ScalarInvocationActivation::Activated,
         vec![],
         work,
     )
@@ -273,6 +274,7 @@ fn deepest(control: &Control) -> Result<(), KernelFailure> {
         ControlShape::TemporalSource(S::SecondsCastOther),
         &DataType::Int64,
         vec![1, 3, 5],
+        novarocks_functions::ScalarInvocationActivation::Activated,
         vec![],
         &mut work,
     );

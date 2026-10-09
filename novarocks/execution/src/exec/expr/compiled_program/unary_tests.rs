@@ -308,7 +308,12 @@ fn next_actual_rand(evaluator: &mut CompiledExpressionInstance) -> u64 {
     let seed = Arc::new(Int64Array::from(vec![42])) as ArrayRef;
     let arguments = [EvaluatedArgument::Scalar(&seed)];
     let output = rand
-        .evaluate(Selection::all(1), &arguments, &Control)
+        .evaluate(
+            Selection::all(1),
+            &arguments,
+            novarocks_functions::ScalarInvocationActivation::Activated,
+            &Control,
+        )
         .unwrap();
     output
         .values()

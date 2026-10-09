@@ -82,6 +82,7 @@ pub enum ExecutionFailureCause {
     Pipeline(String),
     Kernel(KernelFailure),
     InvocationData(novarocks_functions::InvocationData),
+    ScalarInvocationData(novarocks_functions::ScalarInvocationData),
     WindowInvocationData(novarocks_functions::WindowInvocationData),
     RequiredRow(RequiredExpressionRowError),
 }
@@ -119,6 +120,7 @@ impl ExecutionFailure {
             ExecutionFailureCause::Pipeline(message) => message,
             ExecutionFailureCause::RequiredRow(error) => error.error().message(),
             ExecutionFailureCause::InvocationData(error) => error.message(),
+            ExecutionFailureCause::ScalarInvocationData(error) => error.message(),
             ExecutionFailureCause::WindowInvocationData(error) => error.message(),
             ExecutionFailureCause::Kernel(error) => match error {
                 KernelFailure::Cancelled => "kernel evaluation was cancelled",
@@ -177,6 +179,17 @@ impl From<novarocks_functions::EvaluationFailure> for ExecutionFailure {
         }
     }
 }
+impl From<novarocks_functions::ScalarInvocationFailure> for ExecutionFailure {
+    fn from(error: novarocks_functions::ScalarInvocationFailure) -> Self {
+        match error {
+            novarocks_functions::ScalarInvocationFailure::Kernel(cause) => cause.into(),
+            novarocks_functions::ScalarInvocationFailure::Data(cause) => Self {
+                cause: ExecutionFailureCause::ScalarInvocationData(cause),
+                context: None,
+            },
+        }
+    }
+}
 impl From<novarocks_functions::WindowEvaluationFailure> for ExecutionFailure {
     fn from(error: novarocks_functions::WindowEvaluationFailure) -> Self {
         match error {
@@ -210,6 +223,7 @@ impl fmt::Display for ExecutionFailure {
             ExecutionFailureCause::Kernel(error) => error.fmt(f),
             ExecutionFailureCause::RequiredRow(error) => error.fmt(f),
             ExecutionFailureCause::InvocationData(error) => error.fmt(f),
+            ExecutionFailureCause::ScalarInvocationData(error) => error.fmt(f),
             ExecutionFailureCause::WindowInvocationData(error) => error.fmt(f),
         }
     }
@@ -221,6 +235,7 @@ impl Error for ExecutionFailure {
             ExecutionFailureCause::Kernel(error) => Some(error),
             ExecutionFailureCause::RequiredRow(error) => Some(error),
             ExecutionFailureCause::InvocationData(error) => Some(error),
+            ExecutionFailureCause::ScalarInvocationData(error) => Some(error),
             ExecutionFailureCause::WindowInvocationData(error) => Some(error),
         }
     }

@@ -17,9 +17,7 @@
 
 use super::*;
 use crate::opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge};
-use crate::{
-    AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl,
-};
+use crate::{AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl};
 use arrow_schema::DataType;
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::{
@@ -472,3 +470,6 @@ fn scalar_whole_data_private_data_and_seven_kernel_causes_end_instance_without_f
     drop(allocator);
     host.released();
 }
+
+#[path = "scalar_invocation_lifecycle_tests.rs"]
+mod scalar_invocation_lifecycle_tests;

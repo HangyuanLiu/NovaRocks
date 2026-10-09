@@ -46,6 +46,9 @@ pub const MAX_CONTROL_USE_REFERENCES: usize = 65_536;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlShape {
     Eager,
+    /// Full call definitions are retained; this invocation has zero child
+    /// demand and still invokes its exact original owner.
+    NoArguments,
     TypeOnly,
     /// The exact higher-order call has already established the invocation
     /// guard. Ordered local definitions require Value, followed by the body
@@ -663,7 +666,7 @@ fn preflight_flow<D>(
 fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionControlFlowError> {
     let valid = match shape {
         ControlShape::Eager => true,
-        ControlShape::TypeOnly => count == 0,
+        ControlShape::TypeOnly | ControlShape::NoArguments => count == 0,
         ControlShape::LambdaBody => count > 0,
         ControlShape::Conjunction | ControlShape::Disjunction => count > 0,
         ControlShape::If => count == 3,
@@ -693,6 +696,7 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
     match shape {
         ControlShape::Eager
         | ControlShape::TypeOnly
+        | ControlShape::NoArguments
         | ControlShape::LambdaBody
         | ControlShape::Conjunction
         | ControlShape::Disjunction => None,
@@ -756,6 +760,7 @@ fn control_argument_demand(
     match shape {
         ControlShape::Eager
         | ControlShape::TypeOnly
+        | ControlShape::NoArguments
         | ControlShape::Coalesce
         | ControlShape::TemporalSource(_)
         | ControlShape::Between { .. }

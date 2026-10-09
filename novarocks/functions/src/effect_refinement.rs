@@ -139,6 +139,18 @@ pub trait FunctionEffectOwner: Send + Sync {
         function: &FunctionId,
         selected: &FunctionBindingSelection,
     ) -> Result<&FunctionEffectDeclaration, Self::Error>;
+    /// Exact selected demand before authoring child uses. The default borrows
+    /// the original base without a resolver, preparation or callback. A typed
+    /// invocation owner may prove original demand-zero from its complete N.
+    fn selected_argument_control_observed(
+        &self,
+        function: &FunctionId,
+        selected: &FunctionBindingSelection,
+        _logical_argument_count: usize,
+        _control: &dyn PureCompileControl,
+    ) -> Result<novarocks_type_contract::ArgumentControl, Self::Error> {
+        Ok(self.declaration(function, selected)?.argument_control)
+    }
     fn validate_and_refine(
         &self,
         input: CallEffectInput<'_>,
@@ -302,6 +314,19 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         declaration
             .validate(input.kind)
             .map_err(CallEffectRefinementError::Contract)?;
+        let selected_control = owner
+            .selected_argument_control_observed(
+                input.function_id,
+                input.selected,
+                input.request.logical_argument_count,
+                control,
+            )
+            .map_err(CallEffectRefinementError::Owner)?;
+        novarocks_type_contract::validate_selected_argument_control(
+            declaration.argument_control,
+            selected_control,
+        )
+        .map_err(CallEffectRefinementError::Contract)?;
         // Body demand is an exact owner fact, never inferred from a name or the
         // function result type. This ABI has one lambda body argument; another
         // lambda-bearing protocol must add its own closed declaration.
@@ -379,8 +404,11 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 }
                 for use_id in uses {
                     if use_id.is_none()
-                        != (declaration.argument_control
-                            == novarocks_type_contract::ArgumentControl::TypeOnly)
+                        != matches!(
+                            selected_control,
+                            novarocks_type_contract::ArgumentControl::TypeOnly
+                                | novarocks_type_contract::ArgumentControl::NoArguments
+                        )
                     {
                         return Err(CallEffectRefinementError::InvalidInput(
                             "call argument demand differs from its exact owner control",
@@ -479,7 +507,11 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(CallEffectRefinementError::Control)?;
         effects
-            .validate_refinement(declaration, input.proof_scope)
+            .validate_refinement_with_argument_control(
+                declaration,
+                input.proof_scope,
+                selected_control,
+            )
             .map_err(CallEffectRefinementError::Contract)?;
         for reference in &effects.environment {
             if !refs.contains(reference) {
@@ -793,6 +825,7 @@ impl ScopedExpressionEffects {
             effects: self
                 .effects
                 .join(novarocks_type_contract::ExpressionEffects {
+                    may_raise_invocation_data: false,
                     value_stability: call.value_stability,
                     may_raise_row_error: call.own_row_error
                         == novarocks_type_contract::FunctionIntrinsicRowError::MayRaise,
@@ -802,6 +835,12 @@ impl ScopedExpressionEffects {
                 }),
             ..self
         })
+    }
+    /// The complete typed ScalarInvocationV1 specialization is the ONE source
+    /// of this own capability. It never changes row-error or NULL behavior.
+    pub(crate) const fn with_invocation_data_capability(mut self) -> Self {
+        self.effects.may_raise_invocation_data = true;
+        self
     }
     /// Compose the conservative summary of one actual ordered control edge.
     /// The immutable flow has already checked its guards and child demand using

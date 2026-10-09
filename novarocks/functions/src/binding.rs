@@ -59,6 +59,7 @@ impl FunctionSemantics {
             | ArgumentControl::SearchedCase => FunctionArgumentEvaluation::ShortCircuit,
             ArgumentControl::Eager
             | ArgumentControl::TypeOnly
+            | ArgumentControl::NoArguments
             | ArgumentControl::HigherOrder { .. }
             | ArgumentControl::Aggregate
             | ArgumentControl::Window
@@ -318,6 +319,10 @@ pub trait FunctionBindingResolver: Send + Sync {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ResolvedFunctionBinding {
+    /// Positive execution-scope fact from the actual Exact catalogue's
+    /// admitted installed declaration. Original metadata binding publishes
+    /// None; absence is never evidence of a kernel-only implementation.
+    pub admitted_execution_abi: Option<crate::PureKernelAbi>,
     pub function_id: FunctionId,
     pub kind: FunctionKind,
     pub semantics: FunctionSemantics,
@@ -950,6 +955,7 @@ fn resolve_definition(
     let selected = binding.resolver.resolve(request, work.control())?;
     validate_selection(&binding.declaration, &selected, request, work)?;
     Ok(ResolvedFunctionBinding {
+        admitted_execution_abi: None,
         function_id: binding.declaration.function_id.clone(),
         kind: binding.declaration.kind,
         semantics: binding.declaration.overload(&selected.overload)?.semantics,

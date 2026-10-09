@@ -1809,7 +1809,11 @@ impl DataStreamSinkOperator {
     /// Evaluate a compiled branch's partition keys over the whole chunk.
     /// A legacy branch returns `None` and evaluates through its arena. Row
     /// data errors and kernel failures of a key root stay typed.
-    fn compiled_partition_keys(&mut self, chunk: &Chunk) -> ExecutionResult<Option<Vec<ArrayRef>>> {
+    fn compiled_partition_keys(
+        &mut self,
+        runtime_state: &RuntimeState,
+        chunk: &Chunk,
+    ) -> ExecutionResult<Option<Vec<ArrayRef>>> {
         let Some(state) = self.compiled_partition.as_mut() else {
             return Ok(None);
         };
@@ -1818,6 +1822,7 @@ impl DataStreamSinkOperator {
             .as_ref()
             .ok_or("compiled partition keys require the fragment error state")?;
         let mut control = RuntimeKernelControl::new(Arc::clone(error));
+        control.bind_runtime_memory(runtime_state);
         if let Some(tracker) = &self.pending_chunks_mem_tracker {
             control.bind_mem_tracker(Arc::clone(tracker));
         }
@@ -2493,7 +2498,7 @@ impl ProcessorOperator for DataStreamSinkOperator {
         if chunk.is_empty() {
             return Ok(());
         }
-        let compiled_keys = self.compiled_partition_keys(&chunk)?;
+        let compiled_keys = self.compiled_partition_keys(_state, &chunk)?;
         self.buffer_chunk_with_keys(chunk, compiled_keys)?;
         self.flush_pending(false, false)?;
         Ok(())

@@ -712,7 +712,10 @@ pub(crate) fn run_scalar_differential(
     if abi == PureKernelAbi::ControlIntrinsicV1 {
         return temporal::run(spec, &bound, &legacy_name, legacy_kind, rows, &result_type);
     }
-    if abi != PureKernelAbi::ScalarV1 {
+    if !matches!(
+        abi,
+        PureKernelAbi::ScalarV1 | PureKernelAbi::ScalarInvocationV1
+    ) {
         return Err(DifferentialFailure::UnsupportedPureAbi {
             overload: bound.selected.overload.clone(),
             abi: format!("{abi:?}"),
@@ -975,12 +978,29 @@ pub(crate) fn specialization_failure(
     }
 }
 
+enum PreparedScalarDiff {
+    Kernel(Arc<dyn PreparedScalarKernel>),
+    Invocation(Arc<dyn novarocks_functions::PreparedInvocationScalarKernel>),
+}
+impl PreparedScalarDiff {
+    fn contract(&self) -> &Arc<novarocks_functions::ScalarCallContract> {
+        match self {
+            Self::Kernel(p) => p.contract(),
+            Self::Invocation(p) => p.contract(),
+        }
+    }
+}
+enum PureScalarOutcome {
+    Selected(PureSelection),
+    InvocationData(novarocks_functions::ScalarInvocationData),
+}
+
 fn prepare_scalar(
     catalog: &EngineFunctionCatalog,
     spec: &ScalarDiffSpec,
     bound: &ResolvedFunctionBinding,
     dependencies: &[SemanticParameterKey],
-) -> Result<Arc<dyn PreparedScalarKernel>, DifferentialFailure> {
+) -> Result<PreparedScalarDiff, DifferentialFailure> {
     let (parameters, keys) = spec
         .semantics
         .parameter_table()
@@ -991,8 +1011,31 @@ fn prepare_scalar(
         .iter()
         .map(DiffArgument::request)
         .collect::<Vec<_>>();
+    let declaration = catalog
+        .pure_overload_declaration_observed(
+            &bound.function_id,
+            CatalogKind::Scalar,
+            &bound.selected.overload,
+            &HarnessControl,
+        )
+        .map_err(|failure| specialization_failure(&spec.name, bound, failure))?;
+    let selected_control = declaration
+        .selected_argument_control_observed(
+            &bound.function_id,
+            &bound.selected,
+            request_arguments.len(),
+            &HarnessControl,
+        )
+        .map_err(|error| specialization_failure(&spec.name, bound, error.into()))?;
+    let no_arguments = selected_control == novarocks_type_contract::ArgumentControl::NoArguments;
     let uses = (0..spec.arguments.len())
-        .map(|index| Some(ExpressionUseId::new(index as u32 + 1)))
+        .map(|index| {
+            if no_arguments {
+                None
+            } else {
+                Some(ExpressionUseId::new(index as u32 + 1))
+            }
+        })
         .collect::<Vec<_>>();
     let selected = Arc::new(bound.selected.clone());
     let context = harness_context();
@@ -1023,7 +1066,8 @@ fn prepare_scalar(
         )
         .map_err(|failure| specialization_failure(&spec.name, bound, failure))?;
     match specialization.into_prepared() {
-        PreparedPureKernel::Scalar(kernel) => Ok(kernel),
+        PreparedPureKernel::Scalar(kernel) => Ok(PreparedScalarDiff::Kernel(kernel)),
+        PreparedPureKernel::ScalarInvocation(kernel) => Ok(PreparedScalarDiff::Invocation(kernel)),
         _ => Err(DifferentialFailure::UnsupportedPureAbi {
             overload: bound.selected.overload.clone(),
             abi: "non-scalar prepared kernel".into(),
@@ -1065,7 +1109,7 @@ pub(crate) struct PureSelection {
 impl ScalarCall<'_> {
     fn check_selection(
         &self,
-        prepared: &Arc<dyn PreparedScalarKernel>,
+        prepared: &PreparedScalarDiff,
         rows: Option<&[usize]>,
         label: &str,
         summary: &mut ScalarDiffSummary,
@@ -1074,7 +1118,40 @@ impl ScalarCall<'_> {
         summary.selections += 1;
         let selected_rows = rows.map_or_else(|| (0..self.rows).collect::<Vec<_>>(), <[_]>::to_vec);
         let pure = match self.evaluate_pure(prepared, rows) {
-            Ok(pure) => pure,
+            Ok(PureScalarOutcome::Selected(pure)) => pure,
+            Ok(PureScalarOutcome::InvocationData(data)) => {
+                // Whole Data is compared to the actual legacy batch, never
+                // attributed to row 0 or normalized into a bounded row error.
+                let correct_domain = data.batch_rows() == self.rows
+                    && data.source_len() == selected_rows.len()
+                    && selected_rows
+                        .iter()
+                        .enumerate()
+                        .all(|(ordinal, row)| data.source_row(ordinal) == Some(*row))
+                    && Arc::ptr_eq(data.contract(), prepared.contract());
+                if !correct_domain {
+                    details.push(format!(
+                        "{label}: invocation Data has an unrelated source contract/domain"
+                    ));
+                }
+                match self.evaluate_legacy(rows) {
+                    Err(original)
+                        if !original.starts_with(LEGACY_PANIC_PREFIX)
+                            && original == data.message() =>
+                    {
+                        summary.legacy_batch_errors += 1;
+                    }
+                    Err(original) => details.push(format!(
+                        "{label}: whole Data differs: legacy `{original}`, pure `{}`",
+                        data.message()
+                    )),
+                    Ok(_) => details.push(format!(
+                        "{label}: pure whole Data where the actual legacy batch succeeded: {}",
+                        data.message()
+                    )),
+                }
+                return;
+            }
             Err(failure) => {
                 details.push(format!("{label}: pure outer failure: {failure}"));
                 return;
@@ -1113,15 +1190,18 @@ impl ScalarCall<'_> {
 
     fn evaluate_pure(
         &self,
-        prepared: &Arc<dyn PreparedScalarKernel>,
+        prepared: &PreparedScalarDiff,
         rows: Option<&[usize]>,
-    ) -> Result<PureSelection, String> {
-        let arguments = self
-            .spec
-            .arguments
-            .iter()
-            .map(DiffArgument::evaluated)
-            .collect::<Vec<_>>();
+    ) -> Result<PureScalarOutcome, String> {
+        let arguments = if prepared.contract().value_argument_types().len() == 0 {
+            Vec::new()
+        } else {
+            self.spec
+                .arguments
+                .iter()
+                .map(DiffArgument::evaluated)
+                .collect::<Vec<_>>()
+        };
         let selection = match rows {
             None => Selection::all(self.rows),
             Some(rows) => {
@@ -1129,20 +1209,46 @@ impl ScalarCall<'_> {
             }
         };
         let run = catch_unwind(AssertUnwindSafe(|| {
-            let mut instance = ScalarEvaluationInstance::instantiate_with_allocator(
-                Arc::clone(prepared),
-                Some(crate::exec::operators::compiled_aggregate::differential_aggregate_state_allocator(
-                    crate::runtime::mem_tracker::MemTracker::new_root("pure-differential-scalar-state"),
-                )),
-            ).map_err(|error| error.to_string())?;
-            let output = instance
-                .evaluate(selection, &arguments, &HarnessControl)
-                .map_err(|error| error.to_string())?;
+            let host = Some(
+                crate::exec::operators::compiled_aggregate::differential_aggregate_state_allocator(
+                    crate::runtime::mem_tracker::MemTracker::new_root(
+                        "pure-differential-scalar-state",
+                    ),
+                ),
+            );
+            let output = match prepared {
+                PreparedScalarDiff::Kernel(p) => {
+                    let mut instance =
+                        ScalarEvaluationInstance::instantiate_with_allocator(Arc::clone(p), host)
+                            .map_err(|error| error.to_string())?;
+                    instance
+                        .evaluate(selection, &arguments, &HarnessControl)
+                        .map_err(|error| error.to_string())?
+                }
+                PreparedScalarDiff::Invocation(p) => {
+                    let mut instance = novarocks_functions::InvocationScalarEvaluationInstance::instantiate_with_allocator(Arc::clone(p), host)
+                        .map_err(|error| error.to_string())?;
+                    match instance.evaluate(
+                        selection,
+                        &arguments,
+                        novarocks_functions::ScalarInvocationActivation::Activated,
+                        &HarnessControl,
+                    ) {
+                        Ok(output) => output,
+                        Err(novarocks_functions::ScalarInvocationFailure::Data(data)) => {
+                            return Ok(PureScalarOutcome::InvocationData(data));
+                        }
+                        Err(novarocks_functions::ScalarInvocationFailure::Kernel(cause)) => {
+                            return Err(cause.to_string());
+                        }
+                    }
+                }
+            };
             let (_, values, errors) = output.into_parts();
-            Ok(PureSelection {
+            Ok(PureScalarOutcome::Selected(PureSelection {
                 values,
                 errors: errors.into_vec(),
-            })
+            }))
         }));
         run.unwrap_or_else(|panic| Err(format!("pure kernel panicked: {}", panic_message(&panic))))
     }

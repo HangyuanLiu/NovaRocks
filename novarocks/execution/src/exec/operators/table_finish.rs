@@ -65,17 +65,13 @@ use crate::exec::node::table_write_relation::{
     WriterMultiplexRelationSchema,
 };
 #[cfg(debug_assertions)]
-use crate::exec::node::table_write_relation::{
-    TableWriteAggregateBoundary, TableWriteAggregateGuard,
-};
+use crate::exec::node::table_write_relation::{TableWriteAggregateBoundary, TableWriteAggregateGuard};
 use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
-use crate::exec::pipeline::operator::{
-    FinishWatch, Operator, ProcessorOperator, forward_observable,
-};
+use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator, forward_observable};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
@@ -132,10 +128,11 @@ pub(crate) trait FinishStatisticsFactory: Send + Sync {
     /// artifact rows.
     fn grouped_unpivot(
         &self,
+        state: &RuntimeState,
         final_chunk: Chunk,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<Box<dyn GroupedUnpivotSource>, String>;
+    ) -> ExecutionResult<Box<dyn GroupedUnpivotSource>>;
 }
 
 /// The Root artifact rows of one final aggregate batch, one target at a time.
@@ -824,9 +821,14 @@ impl TableFinishOperator {
         Ok(())
     }
 
-    fn start_grouped_unpivot(&mut self, final_chunk: Chunk) -> Result<(), String> {
+    fn start_grouped_unpivot(
+        &mut self,
+        state: &RuntimeState,
+        final_chunk: Chunk,
+    ) -> ExecutionResult<()> {
         let driver: Box<dyn GroupedUnpivotSource> = match self.statistics.as_ref() {
             Some(statistics) => statistics.grouped_unpivot(
+                state,
                 final_chunk,
                 Arc::clone(self.root_schema.chunk_schema()),
                 self.output_tracker.as_ref().map(Arc::clone),
@@ -849,7 +851,7 @@ impl TableFinishOperator {
             if !self.final_groups_seen.insert(target) {
                 return Err(format!(
                     "table finish final aggregate produced duplicate target {target} across output batches"
-                ));
+                ).into());
             }
         }
         self.install_grouped_unpivot_source(driver);
@@ -1654,7 +1656,7 @@ impl ProcessorOperator for TableFinishOperator {
                 }
                 match result {
                     Ok(Some(final_chunk)) => {
-                        if let Err(error) = self.start_grouped_unpivot(final_chunk) {
+                        if let Err(error) = self.start_grouped_unpivot(state, final_chunk) {
                             return self.fail(error);
                         }
                         continue;

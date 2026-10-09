@@ -131,6 +131,12 @@ pub(crate) struct CompiledRuntimeFilterKeys {
 }
 
 impl CompiledRuntimeFilterKeys {
+    pub(crate) fn bind_runtime_state(
+        &mut self,
+        state: &crate::runtime::runtime_state::RuntimeState,
+    ) {
+        self.control.bind_runtime_memory(state);
+    }
     pub(crate) fn bind_mem_tracker(
         &mut self,
         tracker: Arc<crate::runtime::mem_tracker::MemTracker>,

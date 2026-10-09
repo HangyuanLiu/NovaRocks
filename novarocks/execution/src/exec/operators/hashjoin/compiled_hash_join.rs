@@ -290,7 +290,8 @@ impl Operator for CompiledHashJoinBuildSink {
     fn name(&self) -> &str {
         &self.name
     }
-    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
         let Some(filters) = self.runtime_filters.as_mut() else {
             return Ok(());
         };
@@ -596,6 +597,10 @@ struct CompiledHashJoinProbe {
 }
 
 impl Operator for CompiledHashJoinProbe {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.control.bind_mem_tracker(tracker);
     }

@@ -25,9 +25,7 @@ use crate::runtime_filter as execution;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::runtime_filter::{
-    RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
-};
+use crate::exec::node::runtime_filter::{RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract};
 use crate::exec::pipeline::operator::{
     DriverBlockDeadline, Operator, ProcessorOperator, forward_observable,
 };
@@ -1235,6 +1233,11 @@ impl RuntimeFilterProcessorConsumers {
             keys.bind_mem_tracker(tracker);
         }
     }
+    fn bind_runtime_state(&mut self, state: &RuntimeState) {
+        if let Self::Compiled { keys, .. } = self {
+            keys.bind_runtime_state(state);
+        }
+    }
 }
 
 pub(crate) struct NativeRuntimeFilterProcessorFactory {
@@ -1316,7 +1319,7 @@ impl Operator for NativeRuntimeFilterProcessor {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        let _ = state;
+        self.consumers.bind_runtime_state(state);
         Ok(())
     }
 

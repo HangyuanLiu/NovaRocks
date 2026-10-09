@@ -398,10 +398,15 @@ impl CompiledWriterPartialProcessor {
 }
 
 impl Operator for CompiledWriterPartialProcessor {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.tracker = Some(tracker);
     }
     fn is_finished(&self) -> bool {
@@ -679,6 +684,7 @@ impl CompiledFinishStatistics {
     /// constant reads no channel, so the row only gives it its one row.
     fn evaluate_constants(
         &self,
+        state: &RuntimeState,
         tracker: Option<&Arc<MemTracker>>,
     ) -> ExecutionResult<Vec<ArrayRef>> {
         if self.constant_sites.is_empty() {
@@ -705,6 +711,7 @@ impl CompiledFinishStatistics {
             ExecutionFailure::from(format!("compiled grouped Unpivot constant row: {error}"))
         })?;
         let mut control = RuntimeKernelControl::new(Arc::clone(&self.error));
+        control.bind_runtime_memory(state);
         if let Some(tracker) = tracker {
             control.bind_mem_tracker(Arc::clone(tracker));
         }
@@ -741,10 +748,11 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
 
     fn grouped_unpivot(
         &self,
+        state: &RuntimeState,
         mut final_chunk: Chunk,
         root_schema: ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<Box<dyn GroupedUnpivotSource>, String> {
+    ) -> ExecutionResult<Box<dyn GroupedUnpivotSource>> {
         if let Some(tracker) = tracker.as_ref() {
             final_chunk.try_transfer_to(tracker).map_err(|error| {
                 format!(
@@ -762,7 +770,9 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
         let mut seen = std::collections::HashSet::with_capacity(groups.len());
         for row in 0..groups.len() {
             if groups.is_null(row) {
-                return Err("table finish final aggregate produced a null grouping key".to_string());
+                return Err("table finish final aggregate produced a null grouping key"
+                    .to_string()
+                    .into());
             }
             let target = target_ordinal_from_wire(groups.value(row))
                 .map_err(|error| format!("table finish final aggregate grouping key: {error}"))?;
@@ -770,7 +780,8 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                 return Err(format!(
                     "table finish final aggregate produced duplicate target {}",
                     target.get()
-                ));
+                )
+                .into());
             }
             if !self
                 .mappings
@@ -780,13 +791,11 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                 return Err(format!(
                     "table finish final aggregate produced target {} with no grouped Unpivot mapping",
                     target.get()
-                ));
+                ).into());
             }
             rows.push((target.get(), row));
         }
-        let constants = self
-            .evaluate_constants(tracker.as_ref())
-            .map_err(|error| error.to_string())?;
+        let constants = self.evaluate_constants(state, tracker.as_ref())?;
         // Expanded channels: the target ordinal, the value, then each literal.
         let mut output_slots = vec![
             self.plan.passthrough_output_slot_id,
@@ -998,10 +1007,15 @@ impl CompiledWriterFinalAggregate {
 }
 
 impl Operator for CompiledWriterFinalAggregate {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.tracker = Some(tracker);
     }
     fn is_finished(&self) -> bool {

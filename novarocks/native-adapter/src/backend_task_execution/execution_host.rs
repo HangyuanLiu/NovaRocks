@@ -68,9 +68,7 @@ use novarocks_execution::runtime::fragment::{
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_execution_contract::task_execution::creation::{
-    PreparedTaskFacts, TaskCreationInput,
-};
+use novarocks_execution_contract::task_execution::creation::{PreparedTaskFacts, TaskCreationInput};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
@@ -1903,6 +1901,7 @@ fn failure_cause_category(
         )
         | ExecutionFailureCause::RequiredRow(_)
         | ExecutionFailureCause::InvocationData(_)
+        | ExecutionFailureCause::ScalarInvocationData(_)
         | ExecutionFailureCause::WindowInvocationData(_) => TaskFailureCategory::Execution,
         ExecutionFailureCause::Pipeline(_) => opaque_category,
     }
@@ -2059,9 +2058,7 @@ mod tests {
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
     use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_execution::runtime::execution_runtime::{
-        ExecutionRuntime, ExecutionRuntimeConfig,
-    };
+    use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
     use novarocks_execution::runtime::fragment::io::{
         ExchangeDestinationKey, FragmentEvent, FragmentEventSink, FragmentProgress,
         NoopFragmentEventSink, UnavailableExchangeReceiverPort,
@@ -5245,9 +5242,7 @@ mod tests {
             PropertyProofProjectionLimits, ScanReadBudget, extract_fragment_packages,
         };
         use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
-        use novarocks_plan_codec::physical_package_v2::test_support::{
-            decode_limits, encode_limits,
-        };
+        use novarocks_plan_codec::physical_package_v2::test_support::{decode_limits, encode_limits};
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_sql::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,

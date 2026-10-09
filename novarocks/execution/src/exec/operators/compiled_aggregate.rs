@@ -833,6 +833,10 @@ impl Drop for CompiledAggregateProcessor {
 }
 
 impl Operator for CompiledAggregateProcessor {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }

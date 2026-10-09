@@ -62,6 +62,25 @@ impl ScalarCallContract {
         }
         crate::FunctionCallContract::from_refined(input, receipt, selected, control).map(Self)
     }
+    pub(crate) fn from_refined_invocation(
+        input: CallEffectInput<'_>,
+        receipt: &RefinedCallEffects<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, KernelFailure> {
+        if input.kind != FunctionKind::Scalar
+            || input.selected.aggregate.is_some()
+            || !matches!(
+                receipt.facts().argument_control,
+                ArgumentControl::Eager | ArgumentControl::NoArguments
+            )
+        {
+            return Err(invalid(
+                "whole-invocation scalar requires its exact argument demand",
+            ));
+        }
+        crate::FunctionCallContract::from_refined(input, receipt, selected, control).map(Self)
+    }
     pub const fn call(&self) -> &crate::FunctionCallContract {
         &self.0
     }
@@ -103,7 +122,10 @@ impl ScalarCallContract {
         }
     }
     pub fn value_argument_types(&self) -> impl ExactSizeIterator<Item = &FunctionValueType> {
-        let arguments = if self.effects().argument_control == ArgumentControl::TypeOnly {
+        let arguments = if matches!(
+            self.effects().argument_control,
+            ArgumentControl::TypeOnly | ArgumentControl::NoArguments
+        ) {
             &[][..]
         } else {
             self.selected().argument_types.as_ref()
@@ -375,93 +397,146 @@ impl ScalarEvaluationInstance {
         arguments: &'a [EvaluatedArgument<'a>],
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        control.checkpoint(0)?;
-        let contract = &self.contract;
-        let expected = contract.value_argument_types();
-        if arguments.len() != expected.len() {
-            return Err(invalid(
-                "evaluated scalar arguments differ from the exact call shape",
-            ));
-        }
-        for (argument, ty) in arguments.iter().zip(expected) {
-            validate_argument_observed(*argument, selection, ty, control)?;
-        }
-        if selection.is_empty() {
-            return SelectedValues::try_new(
-                selection,
-                &contract.result_type().data_type,
-                new_empty_array(&contract.result_type().data_type),
-                Box::default(),
-            )
-            .map_err(|_| internal("empty scalar result violates its contract"));
-        }
-        let result = self.instance.evaluate(
-            ScalarCallInput {
-                contract,
-                selection,
-                arguments,
-            },
+        evaluate_scalar_once(
+            self.instance.as_mut(),
+            &self.contract,
+            self.retained_upper_bound,
+            selection,
+            arguments,
+            false,
             control,
-        );
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            // A private owner can refuse without latching this wrapper's
-            // control. Its originating control cause wins over reconciliation.
-            return result;
-        }
-        if self.instance.retained_bytes() > self.retained_upper_bound {
-            return Err(internal(
-                "scalar instance exceeded its lifetime retained bound",
-            ));
-        }
-        let output = result?;
-        if !output.errors().is_empty()
-            && contract.effects().own_row_error != FunctionIntrinsicRowError::MayRaise
-        {
-            return Err(internal(
-                "never-failing scalar implementation returned a row data error",
-            ));
-        }
+        )
+    }
+}
+
+/// ONE original scalar argument/output validation and lifecycle traversal.
+/// Existing ScalarV1 retains its original empty-skip and three-cause footer
+/// policy. The whole-invocation ABI invokes actual activated empty calls and
+/// terminates ALL failures before reconciliation/output checks or callbacks.
+pub(crate) trait ScalarInvocationError: From<KernelFailure> {
+    fn omit_failure_footer(&self) -> bool;
+}
+impl ScalarInvocationError for KernelFailure {
+    fn omit_failure_footer(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::DeadlineExceeded | Self::ResourceExhausted
+        )
+    }
+}
+pub(crate) trait ScalarInvocationRuntime<E> {
+    fn invoke<'a>(
+        &mut self,
+        input: ScalarCallInput<'_, 'a>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, E>;
+    fn retained_bytes(&self) -> usize;
+}
+impl ScalarInvocationRuntime<KernelFailure> for dyn ScalarKernelInstance {
+    fn invoke<'a>(
+        &mut self,
+        input: ScalarCallInput<'_, 'a>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, KernelFailure> {
+        self.evaluate(input, control)
+    }
+    fn retained_bytes(&self) -> usize {
+        ScalarKernelInstance::retained_bytes(self)
+    }
+}
+pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
+    instance: &mut (impl ScalarInvocationRuntime<E> + ?Sized),
+    contract: &ScalarCallContract,
+    retained_upper_bound: usize,
+    selection: Selection<'a>,
+    arguments: &'a [EvaluatedArgument<'a>],
+    invoke_empty: bool,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, E> {
+    control.checkpoint(0)?;
+    let expected = contract.value_argument_types();
+    if arguments.len() != expected.len() {
+        return Err(E::from(invalid(
+            "evaluated scalar arguments differ from the exact call shape",
+        )));
+    }
+    for (argument, ty) in arguments.iter().zip(expected) {
+        validate_argument_observed(*argument, selection, ty, control)?;
+    }
+    if selection.is_empty() && !invoke_empty {
+        return SelectedValues::try_new(
+            selection,
+            &contract.result_type().data_type,
+            new_empty_array(&contract.result_type().data_type),
+            Box::default(),
+        )
+        .map_err(|_| E::from(internal("empty scalar result violates its contract")));
+    }
+    let result = instance.invoke(
+        ScalarCallInput {
+            contract,
+            selection,
+            arguments,
+        },
+        control,
+    );
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(ScalarInvocationError::omit_failure_footer)
+    {
+        // A private owner can refuse without latching this wrapper's
+        // control. Its originating control cause wins over reconciliation.
+        return result;
+    }
+    if instance.retained_bytes() > retained_upper_bound {
+        return Err(E::from(internal(
+            "scalar instance exceeded its lifetime retained bound",
+        )));
+    }
+    let output = result?;
+    if !output.errors().is_empty()
+        && contract.effects().own_row_error != FunctionIntrinsicRowError::MayRaise
+    {
+        return Err(E::from(internal(
+            "never-failing scalar implementation returned a row data error",
+        )));
+    }
+    let mut work = EvaluationCheckpoints::new(control);
+    if !output
+        .selection()
+        .same_rows_observed(selection, || work.step())?
+        || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+            output.values().data_type(),
+            &contract.result_type().data_type,
+            || work.step(),
+        )?
+    {
+        return Err(E::from(internal(
+            "scalar implementation returned an unrelated selection or type",
+        )));
+    }
+    work.finish()?;
+    if !contract.result_type().nullable {
         let mut work = EvaluationCheckpoints::new(control);
-        if !output
-            .selection()
-            .same_rows_observed(selection, || work.step())?
-            || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                output.values().data_type(),
-                &contract.result_type().data_type,
-                || work.step(),
-            )?
-        {
-            return Err(internal(
-                "scalar implementation returned an unrelated selection or type",
-            ));
+        let mut errors = output.errors().iter().peekable();
+        for row in 0..output.values().len() {
+            if errors
+                .peek()
+                .is_some_and(|error| error.selected_ordinal() == row)
+            {
+                errors.next();
+                work.step()?;
+            } else if logical_is_null(output.values().as_ref(), row, 1, &mut work)? {
+                return Err(E::from(internal(
+                    "non-null scalar implementation returned a successful SQL NULL",
+                )));
+            }
         }
         work.finish()?;
-        if !contract.result_type().nullable {
-            let mut work = EvaluationCheckpoints::new(control);
-            let mut errors = output.errors().iter().peekable();
-            for row in 0..output.values().len() {
-                if errors
-                    .peek()
-                    .is_some_and(|error| error.selected_ordinal() == row)
-                {
-                    errors.next();
-                    work.step()?;
-                } else if logical_is_null(output.values().as_ref(), row, 1, &mut work)? {
-                    return Err(internal(
-                        "non-null scalar implementation returned a successful SQL NULL",
-                    ));
-                }
-            }
-            work.finish()?;
-        }
-        control.checkpoint(0)?;
-        Ok(output)
     }
+    control.checkpoint(0)?;
+    Ok(output)
 }
 
 #[cfg(test)]

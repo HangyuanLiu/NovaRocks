@@ -198,6 +198,10 @@ struct CompiledNlJoinProbe {
 }
 
 impl Operator for CompiledNlJoinProbe {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.control.bind_mem_tracker(tracker);
     }

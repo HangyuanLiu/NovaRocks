@@ -72,37 +72,37 @@ struct ScalarDataInner {
     diagnostic_scope: OpaqueReservation,
 }
 #[derive(Clone)]
-pub(super) struct ScalarInvocationData(HostShared<ScalarDataInner>);
+pub struct ScalarInvocationData(HostShared<ScalarDataInner>);
 impl ScalarInvocationData {
-    pub(super) fn contract(&self) -> &Arc<ScalarCallContract> {
+    pub fn contract(&self) -> &Arc<ScalarCallContract> {
         &self.0.contract
     }
-    pub(super) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         self.0
             .original
             .get()
             .expect("published original scalar Data")
     }
-    pub(super) fn batch_rows(&self) -> usize {
+    pub fn batch_rows(&self) -> usize {
         self.0.domain.batch_rows()
     }
-    pub(super) fn source_len(&self) -> usize {
+    pub fn source_len(&self) -> usize {
         self.0.domain.len()
     }
     /// Source-domain evidence, never the ordinal of a maskable row error.
-    pub(super) fn source_row(&self, ordinal: usize) -> Option<usize> {
+    pub fn source_row(&self, ordinal: usize) -> Option<usize> {
         self.0.domain.row(ordinal)
     }
-    pub(super) fn same_backing(&self, other: &Self) -> bool {
+    pub fn same_backing(&self, other: &Self) -> bool {
         self.0.ptr_eq(&other.0)
     }
-    pub(super) fn retained_backing_bytes(&self) -> usize {
+    pub fn retained_backing_bytes(&self) -> usize {
         self.0.allocator_metadata_bytes
             + self.0.block_bytes()
             + self.0.domain.bytes()
             + self.0.original.get().expect("published Data").capacity()
     }
-    pub(super) fn retained_admission_bytes(&self) -> usize {
+    pub fn retained_admission_bytes(&self) -> usize {
         self.0.diagnostic_scope.remaining_bytes()
     }
 }
@@ -188,9 +188,15 @@ impl ScalarDataSlot {
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum ScalarInvocationFailure {
+pub enum ScalarInvocationFailure {
     Kernel(KernelFailure),
     Data(ScalarInvocationData),
+}
+
+impl From<KernelFailure> for ScalarInvocationFailure {
+    fn from(cause: KernelFailure) -> Self {
+        Self::Kernel(cause)
+    }
 }
 impl fmt::Display for ScalarInvocationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

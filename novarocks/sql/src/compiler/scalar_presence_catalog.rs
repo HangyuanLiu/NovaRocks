@@ -41,17 +41,20 @@ impl ScalarPresenceCatalog {
         logical_argument_count: usize,
         lifecycle: novarocks_functions::PureCallLifecycle,
         control: &dyn PureCompileControl,
-    ) -> Result<(), FunctionBindingError> {
+    ) -> Result<novarocks_functions::PureKernelAbi, FunctionBindingError> {
         match self
             .original
             .pure_overload_declaration_observed(function, kind, overload, control)
         {
-            Ok(loan) => loan.admit_selected_lifecycle_observed(
-                selected,
-                logical_argument_count,
-                lifecycle,
-                control,
-            ),
+            Ok(loan) => {
+                loan.admit_selected_lifecycle_observed(
+                    selected,
+                    logical_argument_count,
+                    lifecycle,
+                    control,
+                )?;
+                Ok(loan.implementation().abi)
+            }
             Err(FunctionSpecializationFailure::Control(cause)) => {
                 Err(FunctionBindingError::Control(cause))
             }
@@ -66,10 +69,10 @@ impl ScalarPresenceCatalog {
     }
     fn admit(
         &self,
-        binding: ResolvedFunctionBinding,
+        mut binding: ResolvedFunctionBinding,
         control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        self.admit_identity(
+        let actual_abi = self.admit_identity(
             &binding.function_id,
             binding.kind,
             &binding.selected.overload,
@@ -78,6 +81,7 @@ impl ScalarPresenceCatalog {
             novarocks_functions::PureCallLifecycle::from_kind(binding.kind),
             control,
         )?;
+        binding.admitted_execution_abi = Some(actual_abi);
         Ok(binding)
     }
 }
@@ -97,6 +101,7 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             lifecycle,
             control,
         )
+        .map(|_| ())
     }
     fn admit_bound_environment_observed(
         &self,
@@ -106,13 +111,27 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         match self.original.pure_overload_declaration_observed(
-            &binding.function_id, binding.kind, &binding.selected.overload, control,
+            &binding.function_id,
+            binding.kind,
+            &binding.selected.overload,
+            control,
         ) {
-            Ok(loan) => loan.admit_frozen_environment_observed(&binding.selected, environment, parameters, control),
-            Err(FunctionSpecializationFailure::Control(cause)) => Err(FunctionBindingError::Control(cause)),
-            Err(FunctionSpecializationFailure::MissingPureImplementation(overload)) => Err(FunctionBindingError::UnavailableImplementation(overload)),
+            Ok(loan) => loan.admit_frozen_environment_observed(
+                &binding.selected,
+                environment,
+                parameters,
+                control,
+            ),
+            Err(FunctionSpecializationFailure::Control(cause)) => {
+                Err(FunctionBindingError::Control(cause))
+            }
+            Err(FunctionSpecializationFailure::MissingPureImplementation(overload)) => {
+                Err(FunctionBindingError::UnavailableImplementation(overload))
+            }
             Err(FunctionSpecializationFailure::Binding(error)) => Err(error),
-            Err(error) => Err(FunctionBindingError::InvalidBinding(error.to_string().into())),
+            Err(error) => Err(FunctionBindingError::InvalidBinding(
+                error.to_string().into(),
+            )),
         }
     }
     fn admit_authored_environment_observed(
@@ -124,30 +143,44 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             CompileCheckpoints, CompilePhase, SemanticParameterProjectionError, SemanticParameters,
         };
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let result = (|| {
-            if let Some(facts) = binding.group_concat_source() {
-                let entries = facts.parameter_entries().ok_or_else(|| {
-                    FunctionBindingError::UnavailableImplementation(binding.selected.overload.clone())
-                })?;
-                // These are the original two primitive lexical values, not inferred defaults.
-                // This existing observed constructor controls its actual tree operations;
-                // a formal FE capacity port remains an explicit separate interface gate.
-                let parameters = SemanticParameters::try_new_observed(entries, &mut work)
-                    .map_err(|error| match error {
-                        SemanticParameterProjectionError::Control(cause) => FunctionBindingError::Control(cause),
-                        SemanticParameterProjectionError::Parameter(_) =>
-                            FunctionBindingError::UnavailableImplementation(binding.selected.overload.clone()),
+        let result =
+            (|| {
+                if let Some(facts) = binding.group_concat_source() {
+                    let entries = facts.parameter_entries().ok_or_else(|| {
+                        FunctionBindingError::UnavailableImplementation(
+                            binding.selected.overload.clone(),
+                        )
                     })?;
-                self.admit_bound_environment_observed(
-                    binding.resolved(), &facts.environment(), &parameters, control,
-                )
-            } else {
-                // No ordinary lexical environment author exists on this original binding.
-                self.admit_bound_environment_observed(
-                    binding.resolved(), &[], &SemanticParameters::default(), control,
-                )
-            }
-        })();
+                    // These are the original two primitive lexical values, not inferred defaults.
+                    // This existing observed constructor controls its actual tree operations;
+                    // a formal FE capacity port remains an explicit separate interface gate.
+                    let parameters = SemanticParameters::try_new_observed(entries, &mut work)
+                        .map_err(|error| match error {
+                            SemanticParameterProjectionError::Control(cause) => {
+                                FunctionBindingError::Control(cause)
+                            }
+                            SemanticParameterProjectionError::Parameter(_) => {
+                                FunctionBindingError::UnavailableImplementation(
+                                    binding.selected.overload.clone(),
+                                )
+                            }
+                        })?;
+                    self.admit_bound_environment_observed(
+                        binding.resolved(),
+                        &facts.environment(),
+                        &parameters,
+                        control,
+                    )
+                } else {
+                    // No ordinary lexical environment author exists on this original binding.
+                    self.admit_bound_environment_observed(
+                        binding.resolved(),
+                        &[],
+                        &SemanticParameters::default(),
+                        control,
+                    )
+                }
+            })();
         if matches!(&result, Err(FunctionBindingError::Control(_))) {
             return result;
         }

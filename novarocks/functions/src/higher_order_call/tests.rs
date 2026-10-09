@@ -236,6 +236,7 @@ fn checked_body(call: Arc<HigherOrderCallContract>, may_raise: bool) -> Arc<Lamb
     let effects = ScopedExpressionEffects::primitive(
         context,
         ExpressionEffects {
+            may_raise_invocation_data: false,
             value_stability: FunctionVolatility::Stable,
             may_raise_row_error: may_raise,
             has_instance_state: true,
@@ -818,6 +819,7 @@ fn body_effects(context: ExpressionEffectContext) -> ScopedExpressionEffects {
     ScopedExpressionEffects::primitive(
         context,
         ExpressionEffects {
+            may_raise_invocation_data: false,
             value_stability: FunctionVolatility::Stable,
             may_raise_row_error: true,
             has_instance_state: true,

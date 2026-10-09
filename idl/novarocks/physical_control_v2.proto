@@ -85,6 +85,7 @@ enum SimpleControl {
   SIMPLE_CONTROL_DISJUNCTION = 5;
   SIMPLE_CONTROL_IF = 6;
   SIMPLE_CONTROL_COALESCE = 7;
+  SIMPLE_CONTROL_NO_ARGUMENTS = 8;
 }
 message CaseControl {
   bool simple = 1;

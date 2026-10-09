@@ -374,6 +374,7 @@ fn argument_summary(input: CallEffectInput<'_>) -> ScopedExpressionEffects {
             ..input.context
         },
         ExpressionEffects {
+            may_raise_invocation_data: false,
             value_stability: FunctionVolatility::Volatile,
             may_raise_row_error: true,
             has_instance_state: true,

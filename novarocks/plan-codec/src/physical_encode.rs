@@ -1796,6 +1796,7 @@ fn validate_table_binding(
         .map(|argument| physical_function_argument(constants, fragment, *argument, control))
         .collect::<Result<Vec<_>, _>>()?;
     let bound = ResolvedFunctionBinding {
+        admitted_execution_abi: None,
         function_id: function.function_id.clone(),
         kind: novarocks_functions::FunctionKind::Table,
         semantics: FunctionSemantics {
@@ -1924,6 +1925,7 @@ fn validate_bound_function(
             .map_err(|reason| format!("aggregate intermediate: {reason}"))?;
     }
     let bound = ResolvedFunctionBinding {
+        admitted_execution_abi: None,
         function_id: function.function_id.clone(),
         kind: function.kind,
         semantics: FunctionSemantics {
@@ -5500,9 +5502,7 @@ pub(crate) mod tests {
     use super::*;
 
     fn unpivot_collection_pools(list_items: usize) -> novarocks_physical_plan::ConstantPools {
-        use arrow::array::{
-            Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray,
-        };
+        use arrow::array::{Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray};
         use arrow::buffer::OffsetBuffer;
         use arrow::datatypes::Field;
         use novarocks_constant_contract::ConstantPool;
@@ -6351,9 +6351,7 @@ pub(crate) mod tests {
             DataRelation, ExactInputVersion, ProviderReadOccurrenceId, Relation,
         };
         use novarocks_proto_models::connector_read as wire;
-        use novarocks_spi::connector::read_stack::{
-            ConnectorReadBinding, ConnectorReadRelationKind,
-        };
+        use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadRelationKind};
         use novarocks_spi::connector::{
             CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
             ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
@@ -6471,9 +6469,7 @@ pub(crate) mod tests {
     #[test]
     fn maximum_width_scan_index_resolves_exact_identities() {
         use novarocks_physical_plan::{ExactInputVersion, ProviderReadOccurrenceId};
-        use novarocks_spi::connector::read_stack::{
-            ConnectorReadBinding, ConnectorReadRelationKind,
-        };
+        use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadRelationKind};
         use novarocks_spi::connector::{
             CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
             ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,

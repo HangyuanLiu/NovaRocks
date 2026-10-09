@@ -293,6 +293,13 @@ struct CompiledWriterProjector {
 }
 
 impl WriterPageProjection for CompiledWriterProjector {
+    fn bind_runtime_state(
+        &mut self,
+        state: &crate::runtime::runtime_state::RuntimeState,
+    ) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.control.bind_mem_tracker(tracker);
     }

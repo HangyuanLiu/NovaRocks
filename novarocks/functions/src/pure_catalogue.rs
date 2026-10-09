@@ -48,6 +48,7 @@ impl PureImplementationId {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PureKernelAbi {
     ScalarV1,
+    ScalarInvocationV1,
     HigherOrderV1,
     AggregateV1,
     AggregateWindowV1,
@@ -80,6 +81,7 @@ impl PureCallLifecycle {
             (
                 Self::Scalar,
                 PureKernelAbi::ScalarV1
+                    | PureKernelAbi::ScalarInvocationV1
                     | PureKernelAbi::HigherOrderV1
                     | PureKernelAbi::ControlIntrinsicV1
             ) | (
@@ -93,9 +95,14 @@ impl PureCallLifecycle {
 }
 
 impl PureKernelAbi {
+    /// Stable typed capability, independent of names or payload samples.
+    pub const fn may_raise_invocation_data(self) -> bool {
+        matches!(self, Self::ScalarInvocationV1)
+    }
     const fn tag(self) -> u8 {
         match self {
             Self::ScalarV1 => 1,
+            Self::ScalarInvocationV1 => 8,
             Self::HigherOrderV1 => 2,
             Self::AggregateV1 => 3,
             Self::AggregateWindowV1 => 4,
@@ -107,8 +114,10 @@ impl PureKernelAbi {
     fn accepts_preparation(self, options: &PureCallPreparation) -> bool {
         matches!(
             (self, options),
-            (Self::ScalarV1, PureCallPreparation::Scalar { .. })
-                | (Self::HigherOrderV1, PureCallPreparation::HigherOrder(_))
+            (
+                Self::ScalarV1 | Self::ScalarInvocationV1,
+                PureCallPreparation::Scalar { .. }
+            ) | (Self::HigherOrderV1, PureCallPreparation::HigherOrder(_))
                 | (
                     Self::AggregateV1 | Self::AggregateWindowV1,
                     PureCallPreparation::Aggregate { .. },
@@ -133,6 +142,14 @@ impl PureKernelAbi {
                         base.argument_control,
                         ArgumentControl::Eager | ArgumentControl::TypeOnly
                     )
+            }
+            Self::ScalarInvocationV1 => {
+                kind == FunctionKind::Scalar
+                    && matches!(
+                        base.argument_control,
+                        ArgumentControl::Eager | ArgumentControl::NoArguments
+                    )
+                    && base.null_behavior == FunctionNullBehavior::CalledOnNull
             }
             Self::HigherOrderV1 => {
                 kind == FunctionKind::Scalar
@@ -194,6 +211,56 @@ impl PureOverloadDeclaration<'_> {
     pub const fn effects(&self) -> &FunctionEffectDeclaration {
         self.effects
     }
+    /// Borrow original selected argument demand from the same installed owner.
+    /// Only ScalarInvocationV1 can introduce original demand-zero; metadata and
+    /// other ABIs retain their exact original base. No input value is evaluated.
+    pub fn selected_argument_control_observed(
+        &self,
+        function: &FunctionId,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<ArgumentControl, FunctionBindingError> {
+        if selected.overload != self.implementation().overload
+            || logical_argument_count != selected.argument_types.len()
+            || function
+                != self
+                    .attachment
+                    .metadata_owner
+                    .binding_declaration()
+                    .function_id()
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "selected argument demand has a foreign full signature".into(),
+            ));
+        }
+        let actual = self
+            .attachment
+            .metadata_owner
+            .selected_argument_control_observed(
+                function,
+                selected,
+                logical_argument_count,
+                control,
+            )?;
+        novarocks_type_contract::validate_selected_argument_control(
+            self.effects.argument_control,
+            actual,
+        )
+        .map_err(|_| {
+            FunctionBindingError::InvalidBinding(
+                "selected argument demand differs from its original declaration".into(),
+            )
+        })?;
+        if actual != self.effects.argument_control
+            && self.implementation().abi != PureKernelAbi::ScalarInvocationV1
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "original demand-zero requires its actual invocation lifecycle".into(),
+            ));
+        }
+        Ok(actual)
+    }
     /// Check the actual typed registration adapter, not a manifest copied from
     /// metadata. The original selected profile is borrowed without preparation.
     /// This proves installed lifecycle/static admission only; emitted-source
@@ -254,9 +321,9 @@ impl PureOverloadDeclaration<'_> {
                 "environment admission differs from its exact selected overload".into(),
             ));
         }
-        self.attachment.metadata_owner.admit_frozen_environment_observed(
-            selected, environment, parameters, control,
-        )
+        self.attachment
+            .metadata_owner
+            .admit_frozen_environment_observed(selected, environment, parameters, control)
     }
     /// Borrow the exact installed metadata owner; no fresh resolution or
     /// prepared instance is constructed at this static FE admission boundary.
@@ -321,13 +388,16 @@ pub trait PureFunctionMetadataOwner:
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
-        let base = self.binding_declaration().effect_declaration(&selected.overload)?;
+        let base = self
+            .binding_declaration()
+            .effect_declaration(&selected.overload)?;
         if !base.environment_dependencies.is_empty() || !environment.is_empty() {
-            return Err(FunctionBindingError::UnavailableImplementation(selected.overload.clone()));
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
         }
         Ok(())
     }
-
 }
 
 /// An independently assembled record of actually installed CPU/control
@@ -413,6 +483,7 @@ pub enum PureCallPreparation {
 #[derive(Clone, Debug)]
 pub enum PreparedPureKernel {
     Scalar(Arc<dyn PreparedScalarKernel>),
+    ScalarInvocation(Arc<dyn PreparedInvocationScalarKernel>),
     HigherOrder(Arc<dyn PreparedHigherOrderKernel>),
     Aggregate(PreparedAggregateHandle),
     Window(Arc<dyn PreparedWindowKernel>),
@@ -428,6 +499,7 @@ impl PreparedPureKernel {
     pub fn call_contract(&self) -> &FunctionCallContract {
         match self {
             Self::Scalar(kernel) => kernel.contract().call(),
+            Self::ScalarInvocation(kernel) => kernel.contract().call(),
             Self::HigherOrder(kernel) => kernel.contract().call(),
             Self::Aggregate(kernel) => kernel.contract().call(),
             Self::Window(kernel) => kernel.contract().call(),
@@ -578,6 +650,22 @@ impl<O: PureFunctionMetadataOwner> FunctionEffectOwner for RegisteredOwner<O> {
         }
         self.declaration.effect_declaration(&selected.overload)
     }
+    fn selected_argument_control_observed(
+        &self,
+        function: &FunctionId,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<ArgumentControl, Self::Error> {
+        // RegisteredOwner retains the original immutable base and delegates
+        // selected demand to the SAME concrete metadata/effect owner.
+        self.owner.selected_argument_control_observed(
+            function,
+            selected,
+            logical_argument_count,
+            control,
+        )
+    }
     fn validate_and_refine(
         &self,
         input: CallEffectInput<'_>,
@@ -639,6 +727,12 @@ forward_preparation!(
     dyn PreparedScalarKernel
 );
 forward_preparation!(
+    PureInvocationScalarImplementation,
+    prepare_invocation_scalar,
+    ScalarCallContract,
+    dyn PreparedInvocationScalarKernel
+);
+forward_preparation!(
     PureWindowImplementation,
     prepare_window,
     WindowCallContract,
@@ -692,6 +786,7 @@ impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation>
 }
 
 struct ScalarOwner<O>(Arc<RegisteredOwner<O>>);
+struct InvocationScalarOwner<O>(Arc<RegisteredOwner<O>>);
 struct HigherOrderOwner<O>(Arc<RegisteredOwner<O>>);
 struct ScalarHigherOrderOwner<O>(Arc<RegisteredOwner<O>>);
 struct AggregateOwner<O>(Arc<RegisteredOwner<O>>);
@@ -737,6 +832,42 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation> InstalledPureOwner
         Ok(PreparedPureCallDraft {
             effects: value.effects(),
             prepared: PreparedPureKernel::Scalar(value.into_prepared()),
+        })
+    }
+}
+impl<O: PureFunctionMetadataOwner + PureInvocationScalarImplementation> InstalledPureOwner
+    for InvocationScalarOwner<O>
+{
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(abi, PureKernelAbi::ScalarInvocationV1)
+    }
+    fn prepare(
+        &self,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
+        let PureCallPreparation::Scalar { arguments } = options else {
+            return Err(wrong_options());
+        };
+        let value = match frozen {
+            Some(frozen) => specialize_frozen_invocation_scalar(
+                self.0.as_ref(),
+                input,
+                selected,
+                frozen,
+                arguments,
+                control,
+            ),
+            None => {
+                specialize_invocation_scalar(self.0.as_ref(), input, selected, arguments, control)
+            }
+        }?;
+        Ok(PreparedPureCallDraft {
+            effects: value.effects(),
+            prepared: PreparedPureKernel::ScalarInvocation(value.into_prepared()),
         })
     }
 }
@@ -1117,6 +1248,12 @@ ordinary_registration!(
     PureScalarImplementation,
     ScalarOwner,
     ScalarV1
+);
+ordinary_registration!(
+    try_new_pure_invocation_scalar,
+    PureInvocationScalarImplementation,
+    InvocationScalarOwner,
+    ScalarInvocationV1
 );
 ordinary_registration!(
     try_new_pure_higher_order,
