@@ -956,6 +956,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             PreparedTaskFacts::new(sink_kind),
             root_channel.clone(),
         )?;
+        if let Some(channel) = &root_channel {
+            crate::task_execution_observation::emit_prepared_client_root(
+                identity,
+                &channel.spec().contract,
+            );
+        }
 
         self.tasks.lock().expect(TASK_LOCK).insert(
             identity,

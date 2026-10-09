@@ -125,6 +125,20 @@ pub(crate) fn emit_prepared_task_dop(
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+/// Test-only identity of a successfully prepared ClientRows root. This
+/// renders the exact bound channel contract, with no installation authority.
+pub(crate) fn emit_prepared_client_root(
+    identity: TaskIdentity,
+    contract: &novarocks_result_contract::RootOutputContract,
+) {
+    if enabled()
+        && contract.profile() == novarocks_result_contract::RootProfileId::V1
+        && contract.kind() == novarocks_result_contract::RootOutputKind::ClientRows
+    {
+        emit_task("NOVAROCKS_TASK_PREPARED_CLIENT_ROOT", identity);
+    }
+}
+
 fn emit(event: TaskProtocolEvent) {
     if !enabled() {
         return;

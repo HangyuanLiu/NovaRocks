@@ -49,6 +49,9 @@ const LOG_CAP: usize = 2 * 1024 * 1024;
 const METRIC_CAP: usize = 1024 * 1024;
 const CREATE: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
 const ESTABLISH: &str = "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED";
+const PREPARED_ROOT: &str = "NOVAROCKS_TASK_PREPARED_CLIENT_ROOT";
+// Observation storage bound only; this does not change TaskGraph or admission caps.
+const MARKERS_PER_BACKEND: usize = 8;
 const SQL: &str = "SELECT REPEAT('x',64) AS payload";
 const HEALTH: &str = "SELECT SUM(generate_series) AS total FROM generate_series(1, 100)";
 
@@ -325,7 +328,7 @@ impl Scenario for NativeRootReplyRefusal {
                         {
                             let after = logs(context)?;
                             let (task, frontend) =
-                                independent_target(&before, &after, *be, processes[*be])?;
+                                independent_target(&before, &after, *be, &processes)?;
                             context.recheck_live_process_launch_identities()?;
                             if let Some(candidate) = control.candidate() {
                                 ensure!(
@@ -638,18 +641,21 @@ fn appended_markers(before: &[String], after: &[String]) -> Result<Vec<Vec<Strin
                 after.starts_with(before),
                 "task log was replaced or truncated"
             );
+            ensure!(
+                before.is_empty() || before.ends_with('\n'),
+                "task log baseline ends inside a line"
+            );
             let delta = &after[before.len()..];
             ensure!(
                 delta.is_empty() || delta.ends_with('\n'),
                 "partial appended task observation"
             );
-            let mut markers = Vec::with_capacity(2);
-            for line in delta
-                .lines()
-                .filter(|l| l.starts_with(CREATE) || l.starts_with(ESTABLISH))
-            {
+            let mut markers = Vec::with_capacity(MARKERS_PER_BACKEND);
+            for line in delta.lines().filter(|l| {
+                l.contains(CREATE) || l.contains(ESTABLISH) || l.contains(PREPARED_ROOT)
+            }) {
                 ensure!(
-                    markers.len() < 2 && line.len() <= 384,
+                    markers.len() < MARKERS_PER_BACKEND && line.len() <= 384,
                     "task marker inventory overflow"
                 );
                 markers.push(line.to_owned());
@@ -658,36 +664,97 @@ fn appended_markers(before: &[String], after: &[String]) -> Result<Vec<Vec<Strin
         })
         .collect()
 }
+// Only the closed marker name changes for the existing canonical parser.
+// Every exact identity field is retained and decoded at the production boundary.
+fn decode_prepared_root_marker(line: &str) -> Result<TaskIdentity> {
+    let suffix = line
+        .strip_prefix(PREPARED_ROOT)
+        .filter(|suffix| suffix.starts_with(' '))
+        .context("prepared root marker has unexpected prefix")?;
+    let normalized = format!("{CREATE}{suffix}\n");
+    let candidates = parse_created_task_candidates(&[String::new()], &[normalized], 0)?;
+    ensure!(
+        candidates.len() == 1,
+        "prepared root identity is not unique"
+    );
+    Ok(decode_task_identity(
+        &candidates[0],
+        FieldPath::root("independent_prepared_client_root"),
+    )?)
+}
 fn independent_target(
     before: &[String],
     after: &[String],
     occupied: usize,
-    process: BackendProcessId,
+    processes: &[BackendProcessId],
 ) -> Result<(TaskIdentity, FrontendProcessId)> {
+    ensure!(
+        processes.len() == 3 && occupied < processes.len(),
+        "actual backend process inventory is not three BEs"
+    );
     let markers = appended_markers(before, after)?;
-    let created: Vec<_> = markers
+    let marker_logs: Vec<_> = markers
+        .iter()
+        .map(|lines| {
+            let mut log = lines.join("\n");
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log
+        })
+        .collect();
+    let created_count = markers
+        .iter()
+        .flatten()
+        .filter(|line| line.contains(CREATE))
+        .count();
+    ensure!(
+        created_count == 2,
+        "whole three-BE set is not exactly two fresh SQL tasks"
+    );
+    let empty_logs = vec![String::new(); 3];
+    let mut tasks = Vec::with_capacity(2);
+    let mut participating = [false; 3];
+    for (be, lines) in markers.iter().enumerate() {
+        if !lines.iter().any(|line| line.contains(CREATE)) {
+            continue;
+        }
+        participating[be] = true;
+        for candidate in parse_created_task_candidates(&empty_logs, &marker_logs, be)? {
+            let task = decode_task_identity(&candidate, FieldPath::root("independent_sql_task"))?;
+            ensure!(
+                task.backend_process_id() == processes[be],
+                "created task backend UUID differs from actual process/descriptor"
+            );
+            tasks.push((be, task));
+        }
+    }
+    ensure!(tasks.len() == 2, "two unique SQL tasks were not decoded");
+    let execution = tasks[0].1.query_execution_id();
+    ensure!(
+        tasks
+            .iter()
+            .all(|(_, task)| task.query_execution_id() == execution),
+        "fresh SQL tasks span multiple executions"
+    );
+    let roots: Vec<_> = markers
         .iter()
         .enumerate()
         .flat_map(|(be, lines)| {
             lines
                 .iter()
-                .filter(|s| s.starts_with(CREATE))
-                .map(move |s| (be, s))
+                .filter(|line| line.contains(PREPARED_ROOT))
+                .map(move |line| (be, line))
         })
         .collect();
     ensure!(
-        created.len() == 1 && created[0].0 == occupied,
-        "whole three-BE set is not exactly one fresh task on occupied root backend"
+        roots.len() == 1 && roots[0].0 == occupied,
+        "unique prepared ClientRows root differs from occupied census backend"
     );
-    let candidates = parse_created_task_candidates(before, after, occupied)?;
+    let task = decode_prepared_root_marker(roots[0].1)?;
     ensure!(
-        candidates.len() == 1,
-        "unique native task identity was not decoded"
-    );
-    let task = decode_task_identity(&candidates[0], FieldPath::root("independent_root_task"))?;
-    ensure!(
-        task.backend_process_id() == process,
-        "sole task backend UUID differs from actual process/descriptor"
+        task.backend_process_id() == processes[occupied] && tasks.contains(&(occupied, task)),
+        "prepared root is not an exact created task on its actual backend"
     );
     let contexts: Vec<_> = markers
         .iter()
@@ -695,35 +762,63 @@ fn independent_target(
         .flat_map(|(be, lines)| {
             lines
                 .iter()
-                .filter(|s| s.starts_with(ESTABLISH))
-                .map(move |s| (be, s))
+                .filter(|line| line.contains(ESTABLISH))
+                .map(move |line| (be, line))
         })
         .collect();
     ensure!(
-        contexts.len() == 1 && contexts[0].0 == occupied,
-        "unique task has no unique independent fresh context establish"
+        contexts.len()
+            == participating
+                .iter()
+                .filter(|participates| **participates)
+                .count(),
+        "participating backends lack exactly one fresh context each"
     );
-    let fields: Vec<_> = contexts[0].1.split(' ').collect();
-    let execution = task.query_execution_id();
     let expected = format!(
         "execution_id={}:{}:{}",
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get()
     );
+    let mut seen_context = [false; 3];
+    let mut frontend = None;
+    for (be, line) in contexts {
+        ensure!(
+            participating[be] && !seen_context[be],
+            "duplicate context or context outside participating backend"
+        );
+        seen_context[be] = true;
+        let fields: Vec<_> = line.split(' ').collect();
+        ensure!(
+            fields.len() == 4 && fields[0] == ESTABLISH && fields[1] == expected,
+            "context establish execution differs from SQL task execution"
+        );
+        let frontend_text = fields[2]
+            .strip_prefix("frontend=")
+            .context("missing canonical frontend identity")?;
+        let observed_frontend: FrontendProcessId = frontend_text.parse()?;
+        ensure!(
+            observed_frontend.to_string() == frontend_text
+                && fields[3] == format!("backend={}", processes[be]),
+            "context establish has noncanonical frontend or different backend UUID"
+        );
+        if let Some(frontend) = frontend {
+            ensure!(
+                frontend == observed_frontend,
+                "fresh contexts span multiple frontend UUIDs"
+            );
+        } else {
+            frontend = Some(observed_frontend);
+        }
+    }
     ensure!(
-        fields.len() == 4 && fields[0] == ESTABLISH && fields[1] == expected,
-        "context establish execution differs from sole task"
+        seen_context == participating,
+        "fresh context membership differs from task membership"
     );
-    let frontend_text = fields[2]
-        .strip_prefix("frontend=")
-        .context("missing canonical frontend identity")?;
-    let frontend: FrontendProcessId = frontend_text.parse()?;
-    ensure!(
-        frontend.to_string() == frontend_text && fields[3] == format!("backend={process}"),
-        "context establish has a noncanonical frontend or different backend UUID"
-    );
-    Ok((task, frontend))
+    Ok((
+        task,
+        frontend.context("missing independent frontend context identity")?,
+    ))
 }
 fn census(
     context: &mut ScenarioContext,
@@ -888,6 +983,183 @@ fn failure_summary(class: &str, error: Option<&anyhow::Error>) -> Value {
 #[cfg(test)]
 mod root_reply_predicate_tests {
     use super::*;
+
+    fn identity_oracle_fixture(
+        split_tasks: bool,
+    ) -> (Vec<String>, Vec<String>, Vec<BackendProcessId>) {
+        let processes: Vec<BackendProcessId> = [
+            "01900000-0000-7000-8000-000000000001",
+            "01900000-0000-7000-8000-000000000002",
+            "01900000-0000-7000-8000-000000000003",
+        ]
+        .into_iter()
+        .map(|text| text.parse().expect("v7 backend"))
+        .collect();
+        let mut after = vec![String::new(); 3];
+        let upstream = if split_tasks { 2 } else { 1 };
+        after[upstream].push_str(&format!(
+            "{CREATE} execution_id=-7:23:2 stage=1 task=1 backend={}\n",
+            processes[upstream]
+        ));
+        after[1].push_str(&format!(
+            "{CREATE} execution_id=-7:23:2 stage=2 task=2 backend={}\n\
+             {PREPARED_ROOT} execution_id=-7:23:2 stage=2 task=2 backend={}\n",
+            processes[1], processes[1]
+        ));
+        for be in 0..3 {
+            if !after[be].is_empty() {
+                after[be].push_str(&format!(
+                    "{ESTABLISH} execution_id=-7:23:2 frontend=01900000-0000-7000-8000-000000000004 backend={}\n",
+                    processes[be]
+                ));
+            }
+        }
+        (vec![String::new(); 3], after, processes)
+    }
+    fn replace_marker(after: &[String], prefix: &str, from: &str, to: &str) -> Vec<String> {
+        after
+            .iter()
+            .map(|log| {
+                log.lines()
+                    .map(|line| {
+                        if line.starts_with(prefix) {
+                            line.replace(from, to)
+                        } else {
+                            line.to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + if log.is_empty() { "" } else { "\n" }
+            })
+            .collect()
+    }
+    #[test]
+    fn two_created_tasks_resolve_only_the_unique_prepared_root() {
+        for split in [false, true] {
+            let (before, after, processes) = identity_oracle_fixture(split);
+            let (root, frontend) =
+                independent_target(&before, &after, 1, &processes).expect("independent root");
+            assert_eq!(root.stage_id().get(), 2);
+            assert_eq!(root.task_id().get(), 2);
+            assert_eq!(root.backend_process_id(), processes[1]);
+            assert_eq!(frontend.to_string(), "01900000-0000-7000-8000-000000000004");
+            if !split {
+                // Root selection follows an exact marker even for a lower stage.
+                let lower =
+                    replace_marker(&after, PREPARED_ROOT, "stage=2 task=2", "stage=1 task=1");
+                let (root, _) = independent_target(&before, &lower, 1, &processes)
+                    .expect("explicit lower root");
+                assert_eq!(root.stage_id().get(), 1);
+            }
+        }
+    }
+    #[test]
+    fn missing_or_multiple_prepared_roots_fail_identity_oracle() {
+        let (before, mut after, processes) = identity_oracle_fixture(false);
+        let root = after[1]
+            .lines()
+            .find(|line| line.starts_with(PREPARED_ROOT))
+            .expect("root")
+            .to_owned();
+        after[1] = after[1].replace(&(root.clone() + "\n"), "");
+        assert!(independent_target(&before, &after, 1, &processes).is_err());
+        after[1].push_str(&(root.clone() + "\n"));
+        after[1].push_str(&(root + "\n"));
+        assert!(independent_target(&before, &after, 1, &processes).is_err());
+    }
+    #[test]
+    fn extra_or_duplicate_created_tasks_fail_identity_oracle() {
+        let (before, after, processes) = identity_oracle_fixture(false);
+        for task in [1, 3] {
+            let mut changed = after.clone();
+            changed[1].push_str(&format!(
+                "{CREATE} execution_id=-7:23:2 stage=1 task={task} backend={}\n",
+                processes[1]
+            ));
+            assert!(independent_target(&before, &changed, 1, &processes).is_err());
+        }
+        // Exactly two lines with a duplicate tuple also fail the typed parser.
+        let duplicate = replace_marker(&after, CREATE, "stage=2 task=2", "stage=1 task=1");
+        assert!(independent_target(&before, &duplicate, 1, &processes).is_err());
+    }
+    #[test]
+    fn other_execution_and_noncanonical_root_fields_fail_identity_oracle() {
+        let (before, after, processes) = identity_oracle_fixture(false);
+        for (from, to) in [
+            ("-7:23:2", "-7:24:2"),
+            ("stage=2 task=2", "stage=2 task=+2"),
+            ("stage=2 task=2", "task=2 stage=2"),
+            ("stage=2 task=2", "stage=2 task=2 extra=1"),
+            ("stage=2 task=2", "stage=2 task=3"),
+        ] {
+            let changed = replace_marker(&after, PREPARED_ROOT, from, to);
+            assert!(independent_target(&before, &changed, 1, &processes).is_err());
+        }
+        let mut changed = after.clone();
+        changed[1] = changed[1].replacen("-7:23:2", "-7:24:2", 1);
+        assert!(independent_target(&before, &changed, 1, &processes).is_err());
+    }
+    #[test]
+    fn backend_and_occupied_census_mismatches_fail_identity_oracle() {
+        let (before, after, processes) = identity_oracle_fixture(false);
+        for prefix in [CREATE, PREPARED_ROOT, ESTABLISH] {
+            let changed = replace_marker(
+                &after,
+                prefix,
+                &processes[1].to_string(),
+                &processes[0].to_string(),
+            );
+            assert!(independent_target(&before, &changed, 1, &processes).is_err());
+        }
+        assert!(independent_target(&before, &after, 0, &processes).is_err());
+    }
+    #[test]
+    fn context_membership_execution_and_full_frontend_must_match() {
+        let (before, after, processes) = identity_oracle_fixture(true);
+        for mode in 0..5 {
+            let mut changed = after.clone();
+            let context = changed[2]
+                .lines()
+                .find(|line| line.starts_with(ESTABLISH))
+                .expect("context")
+                .to_owned();
+            match mode {
+                0 => changed[2] = changed[2].replace(&(context.clone() + "\n"), ""),
+                1 => changed[2].push_str(&(context.clone() + "\n")),
+                2 => changed[0].push_str(
+                    &(context.replace(&processes[2].to_string(), &processes[0].to_string()) + "\n"),
+                ),
+                3 => changed[2] = changed[2].replace("8000-000000000004", "8000-000000000005"),
+                _ => changed = replace_marker(&after, ESTABLISH, "-7:23:2", "-7:24:2"),
+            }
+            assert!(independent_target(&before, &changed, 1, &processes).is_err());
+        }
+    }
+    #[test]
+    fn marker_slots_line_bound_and_full_newline_fail_closed() {
+        let (before, after, processes) = identity_oracle_fixture(false);
+        for prefix in [CREATE, ESTABLISH, PREPARED_ROOT] {
+            let mut overflow = after.clone();
+            overflow[0] = (0..=MARKERS_PER_BACKEND)
+                .map(|_| format!("{prefix} invalid\n"))
+                .collect();
+            assert!(appended_markers(&before, &overflow).is_err());
+        }
+        let mut long = after.clone();
+        long[0] = format!("{PREPARED_ROOT} {}\n", "x".repeat(384));
+        assert!(appended_markers(&before, &long).is_err());
+        let mut partial = after.clone();
+        partial[1].pop();
+        assert!(appended_markers(&before, &partial).is_err());
+        let mut midline = before.clone();
+        midline[1] = "partial".to_owned();
+        let mut appended = after.clone();
+        appended[1] = "partial".to_owned() + &appended[1];
+        assert!(appended_markers(&midline, &appended).is_err());
+        assert!(independent_target(&before, &after, 1, &processes[..2]).is_err());
+    }
+
     use crate::actors::mysql_stream::root_reply_test_peer::{Mode, script};
 
     #[tokio::test]
@@ -994,6 +1266,8 @@ mod root_reply_predicate_tests {
             non_target_peer_cancels: 0,
             preapplication_backend_indices: [Some(0), Some(1), Some(2)],
             preapplication_peer_closes: [0; 3],
+            status_subscription_peer_cancels: 0,
+            last_status_subscription_peer_cancel: None,
             not_ready_replies: vec![],
             target_attempt_requests: vec![],
             original: Some(original),

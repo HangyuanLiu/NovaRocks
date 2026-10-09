@@ -29,6 +29,7 @@ use novarocks_proto_models::{novarocks as wire, result as result_wire};
 use novarocks_result_contract::{
     ClientRowProfile, ClientRowStreamCursor, RootOutputKind, RootProfileId, RootProfileV1,
 };
+use novarocks_task_codec::operation::decode_covered_subscribe_task_status;
 use novarocks_task_codec::root_result::{decode_read, decode_reply};
 use novarocks_types::FrontendProcessId;
 use prost::Message;
@@ -44,6 +45,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 
 const ROOT_PATH: &str = "/novarocks.NovaRocksGrpc/FetchRootResult";
+const COVERED_STATUS_PATH: &str = "/novarocks.NovaRocksGrpc/SubscribeTaskStatus";
 const REQUEST_BYTES: usize = RootProfileV1::ENVELOPE_BYTES;
 const RESPONSE_BYTES: usize = RootProfileV1::SEGMENT_BYTES + RootProfileV1::ENVELOPE_BYTES;
 const FRAME_BYTES: usize = 16 * 1024;
@@ -126,7 +128,10 @@ impl RootReplyFaultBounds {
             "h2_send_buffer_bytes":H2_SEND_BUFFER, "h2_reset_positions":H2_RESETS,
             "client_hpack_table_bytes":4096, "server_hpack":"locked-h2-public-default",
             "failures":FAILURE_COUNT, "failure_bytes":FAILURE_BYTES,
-            "failure_digest_positions":3, "failure_digest_sha256_bytes":64,
+            "failure_digest_positions":3,
+            "covered_status_request_bytes":REQUEST_BYTES,
+            "status_subscription_peer_cancel_digest_positions":1,
+            "status_subscription_peer_cancel_policy":"authenticated-covered-request-response-capacity-none-actual-remote-cancel-only", "failure_digest_sha256_bytes":64,
             "overflow_policy":"fixed-first-cause-first-overflow-last-overflow-wholefailure",
             "accounting":"actor-owned-Vec-capacity-only-not-production-physical-envelope"
         })
@@ -179,6 +184,8 @@ pub struct RootReplyFaultObservation {
     pub last_overflow: Option<FailureDigest>,
     pub overflow_failures: u64,
     pub non_target_peer_cancels: u64,
+    pub status_subscription_peer_cancels: u64,
+    pub last_status_subscription_peer_cancel: Option<FailureDigest>,
     pub preapplication_backend_indices: [Option<usize>; 3],
     pub preapplication_peer_closes: [u8; 3],
     pub target_attempts: u64,
@@ -239,6 +246,8 @@ struct State {
     armed_mutation: Option<RootReplyMutation>,
     target_attempts: u64,
     non_target_peer_cancels: u64,
+    status_subscription_peer_cancels: u64,
+    last_status_subscription_peer_cancel: Option<FailureDigest>,
     not_ready_observed: u64,
     not_ready_forwarded: u64,
     not_ready_replies: Vec<serde_json::Value>,
@@ -418,6 +427,10 @@ impl RootReplyFaultControl {
             last_overflow: state.last_overflow.clone(),
             overflow_failures: state.overflow_failures,
             non_target_peer_cancels: state.non_target_peer_cancels,
+            status_subscription_peer_cancels: state.status_subscription_peer_cancels,
+            last_status_subscription_peer_cancel: state
+                .last_status_subscription_peer_cancel
+                .clone(),
             preapplication_backend_indices: state.preapplication_closes.backend_indices,
             preapplication_peer_closes: state.preapplication_closes.closes,
             target_attempts: state.target_attempts,
@@ -1832,6 +1845,7 @@ enum StreamClass {
     NonTarget,
     Target,
     ProvisionalCapture,
+    CoveredStatusSubscription,
 }
 
 fn classify_frozen_read(
@@ -1848,9 +1862,130 @@ fn classify_frozen_read(
 
 fn harmless_non_target_cancel(class: StreamClass, error: &anyhow::Error) -> bool {
     class == StreamClass::NonTarget
-        && error
-            .downcast_ref::<h2::Error>()
-            .is_some_and(|error| error.is_reset() && error.reason() == Some(h2::Reason::CANCEL))
+        && error.downcast_ref::<h2::Error>().is_some_and(|error| {
+            error.is_reset() && error.is_remote() && error.reason() == Some(h2::Reason::CANCEL)
+        })
+}
+
+fn authenticated_normal_frontend<T>(
+    request: &Request<T>,
+    core: &Core,
+) -> Option<FrontendProcessId> {
+    if request.method() != http::Method::POST
+        || !matches!(request.uri().path(), ROOT_PATH | COVERED_STATUS_PATH)
+    {
+        return None;
+    }
+    let caller = core.verifier.admit_headers(request.headers()).ok()?;
+    if caller.subject() != &core.normal_subject {
+        return None;
+    }
+    match caller.process_identity() {
+        Some(NativeProcessIdentity::Frontend(id)) => Some(id),
+        _ => None,
+    }
+}
+
+fn validate_covered_status(body: &Bytes, caller: FrontendProcessId) -> Result<()> {
+    let wire = wire::SubscribeTaskStatusRequest::decode(single_message(body)?)
+        .context("covered status request protobuf")?;
+    let decoded = decode_covered_subscribe_task_status(
+        &wire,
+        FieldPath::root("root_fault_covered_status_request"),
+    )?;
+    ensure!(
+        decoded.context.frontend_process_id() == caller,
+        "covered status context differs from authenticated frontend process"
+    );
+    Ok(())
+}
+
+// Only send_bytes' poll_capacity(None) constructs this private cause. Neither
+// send_data errors nor reset Reasons nor matching error text can construct it.
+#[derive(Debug)]
+struct CapacityClosed {
+    stream: u32,
+    reset: CapacityResetObservation,
+}
+#[derive(Debug)]
+enum CapacityResetObservation {
+    Pending,
+    Reason(u32),
+    Error(FailureDigest),
+}
+impl std::fmt::Display for CapacityClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "root output capacity closed (stream={}, reset_observation=",
+            self.stream
+        )?;
+        match &self.reset {
+            CapacityResetObservation::Pending => f.write_str("Pending")?,
+            CapacityResetObservation::Reason(reason) => write!(f, "Reason({reason})")?,
+            CapacityResetObservation::Error(digest) => write!(
+                f,
+                "Error(class={}, sha256={}, bytes={})",
+                digest.class, digest.sha256, digest.bytes
+            )?,
+        }
+        f.write_str(")")
+    }
+}
+impl std::error::Error for CapacityClosed {}
+
+fn digest_display(class: &'static str, value: &impl std::fmt::Display) -> FailureDigest {
+    struct Writer {
+        sha: Sha256,
+        bytes: usize,
+    }
+    impl std::fmt::Write for Writer {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.sha.update(s.as_bytes());
+            self.bytes = self.bytes.saturating_add(s.len());
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        sha: Sha256::new(),
+        bytes: 0,
+    };
+    let _ = std::fmt::write(&mut writer, format_args!("{value}"));
+    FailureDigest {
+        class,
+        bytes: writer.bytes,
+        sha256: format!("{:x}", writer.sha.finalize()),
+    }
+}
+
+async fn recover_covered_status_cancel(
+    class: StreamClass,
+    failure: &anyhow::Error,
+    inbound: &mut RecvStream,
+    core: &Core,
+) -> bool {
+    if class != StreamClass::CoveredStatusSubscription
+        || failure
+            .downcast_ref::<CapacityClosed>()
+            .is_none_or(|closed| closed.stream != inbound.stream_id().as_u32())
+    {
+        return false;
+    }
+    // One nonblocking poll, using the same request stream after its EOF/trailers.
+    // No diagnostic write, additional IO wait, retry or synthesized H2 error.
+    let observed = poll_fn(|cx| std::task::Poll::Ready(inbound.poll_data(cx))).await;
+    let std::task::Poll::Ready(Some(Err(error))) = observed else {
+        return false;
+    };
+    if !(error.is_reset() && error.is_remote() && error.reason() == Some(h2::Reason::CANCEL)) {
+        return false;
+    }
+    let digest = digest_display("covered-status-subscription-remote-cancel", &error);
+    let mut state = core.state.lock().expect("root fault state lock");
+    state.status_subscription_peer_cancels =
+        state.status_subscription_peer_cancels.saturating_add(1);
+    state.last_status_subscription_peer_cancel = Some(digest);
+    true
 }
 
 async fn forward_stream(
@@ -1868,22 +2003,10 @@ async fn forward_stream(
     };
     let downstream_stream = response.stream_id().as_u32();
     let mut stream_class = StreamClass::Unknown;
-    let normal = if request.method() == http::Method::POST && request.uri().path() == ROOT_PATH {
-        core.verifier
-            .admit_headers(request.headers())
-            .ok()
-            .and_then(|caller| {
-                if caller.subject() != &core.normal_subject {
-                    return None;
-                }
-                match caller.process_identity() {
-                    Some(NativeProcessIdentity::Frontend(id)) => Some(id),
-                    _ => None,
-                }
-            })
-    } else {
-        None
-    };
+    let normal_caller = authenticated_normal_frontend(&request, &core);
+    let normal = normal_caller.filter(|_| request.uri().path() == ROOT_PATH);
+    let covered_status_caller =
+        normal_caller.filter(|_| request.uri().path() == COVERED_STATUS_PATH);
     let capture = normal.and_then(|caller| {
         let state = core.state.lock().expect("root fault state lock");
         state.deadline.map(|deadline| (caller, deadline))
@@ -1925,6 +2048,21 @@ async fn forward_stream(
                 // exact TaskIdentity is excluded from these counters.
             }
             Some((body, read))
+        } else {
+            None
+        };
+        // This path consumes the bounded request once, but retains its original
+        // RecvStream until response forwarding exits. No new buffer or clock.
+        let saved_status = if let Some(caller) = covered_status_caller {
+            require_uncompressed(&parts.headers)?;
+            let (body, trailers) = read_bounded(&mut inbound, REQUEST_BYTES, core.clone()).await?;
+            ensure!(
+                trailers.as_ref().is_none_or(HeaderMap::is_empty),
+                "covered status request has trailers"
+            );
+            validate_covered_status(&body, caller)?;
+            stream_class = StreamClass::CoveredStatusSubscription;
+            Some(body)
         } else {
             None
         };
@@ -2043,6 +2181,31 @@ async fn forward_stream(
             upstream_send.send_data(Bytes::new(), true)?;
             let upstream_response = upstream_response.await?;
             inject_reply(upstream_response, response, read, deadline, core.clone()).await
+        } else if let Some(body) = saved_status {
+            let request_forward = async {
+                send_bytes(&mut upstream_send, body).await?;
+                upstream_send.send_data(Bytes::new(), true)?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let response_forward = async {
+                let upstream_response = upstream_response.await?;
+                let (parts, body) = upstream_response.into_parts();
+                let output = response.send_response(Response::from_parts(parts, ()), false)?;
+                match copy_body(body, output, core.clone()).await {
+                    Err(error) => {
+                        if recover_covered_status_cancel(stream_class, &error, &mut inbound, &core)
+                            .await
+                        {
+                            Ok(())
+                        } else {
+                            Err(error).context("root downstream response copy")
+                        }
+                    }
+                    Ok(()) => Ok(()),
+                }
+            };
+            tokio::try_join!(request_forward, response_forward)?;
+            Ok(())
         } else {
             let request_forward = async {
                 if let Some((body, _read)) = saved_request {
@@ -2148,13 +2311,22 @@ async fn send_bytes(output: &mut SendStream<Bytes>, mut bytes: Bytes) -> Result<
             match poll_fn(|cx| output.poll_capacity(cx)).await {
                 Some(capacity) => capacity?,
                 None => {
-                    // A single poll preserves the actual reset observation;
-                    // it does not wait, synthesize a typed reset, or exempt it.
+                    // This output-side Reason remains diagnostic only. The
+                    // original inbound must supply an actual remote typed reset.
                     let reset = poll_fn(|cx| std::task::Poll::Ready(output.poll_reset(cx))).await;
-                    bail!(
-                        "root output capacity closed (stream={}, reset_observation={reset:?})",
-                        output.stream_id().as_u32()
-                    );
+                    return Err(CapacityClosed {
+                        stream: output.stream_id().as_u32(),
+                        reset: match reset {
+                            std::task::Poll::Pending => CapacityResetObservation::Pending,
+                            std::task::Poll::Ready(Ok(reason)) => {
+                                CapacityResetObservation::Reason(u32::from(reason))
+                            }
+                            std::task::Poll::Ready(Err(error)) => CapacityResetObservation::Error(
+                                digest_display("output-reset-observation", &error),
+                            ),
+                        },
+                    }
+                    .into());
                 }
             }
         };
@@ -2690,6 +2862,441 @@ mod tests {
         })
         .await
         .context("component reset deadline")?
+    }
+
+    fn status_request(core: &Arc<Core>) -> Result<(Request<()>, Bytes, FrontendProcessId)> {
+        use novarocks_execution_contract::identity::QueryContextRef;
+        use novarocks_task_codec::identity::encode_query_context_ref;
+        let caller = FrontendProcessId::new_v7();
+        let trust = NativeTrust::new(
+            DeploymentId::parse("root-actor-component")?,
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))?,
+            core.normal_subject.clone(),
+            NativeTransportMode::Disabled,
+        );
+        trust.bind_process_identity(NativeProcessIdentity::Frontend(caller))?;
+        // Use the existing auth crate to mint the test-owned FE JWT; never
+        // parse, modify or fabricate token claims in the harness.
+        let mut metadata = Default::default();
+        trust.apply_client_authorization(&mut metadata)?;
+        let task = expected().root_task();
+        let context =
+            QueryContextRef::new(task.query_execution_id(), caller, task.backend_process_id());
+        let wire = wire::SubscribeTaskStatusRequest {
+            query_context: Some(encode_query_context_ref(context)),
+            generation: 1,
+            required_identities: vec![novarocks_task_codec::identity::encode_task_identity(task)],
+            ..Default::default()
+        };
+        let mut frame = OwnedBuffer::new(core.clone(), REQUEST_BYTES)?;
+        frame.append(&[0])?;
+        frame.append(&(u32::try_from(wire.encoded_len())?).to_be_bytes())?;
+        wire.encode(&mut frame.bytes)?;
+        let mut request = Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://localhost{COVERED_STATUS_PATH}"))
+            .header("content-type", "application/grpc")
+            .body(())?;
+        request.headers_mut().extend(metadata.into_headers());
+        Ok((request, frame.into_bytes(), caller))
+    }
+
+    #[test]
+    fn covered_status_requires_exact_route_auth_generation_and_all_context_scope() -> Result<()> {
+        let core = core();
+        let (mut request, body, caller) = status_request(&core)?;
+        assert_eq!(authenticated_normal_frontend(&request, &core), Some(caller));
+        validate_covered_status(&body, caller)?;
+        assert!(validate_covered_status(&body, FrontendProcessId::new_v7()).is_err());
+        request.headers_mut().remove("authorization");
+        assert!(authenticated_normal_frontend(&request, &core).is_none());
+        let (mut request, _, _) = status_request(&core)?;
+        *request.method_mut() = http::Method::GET;
+        assert!(authenticated_normal_frontend(&request, &core).is_none());
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = "http://localhost/SubscribeTaskStatus".parse()?;
+        assert!(authenticated_normal_frontend(&request, &core).is_none());
+        let mut wire = wire::SubscribeTaskStatusRequest::decode(single_message(&body)?)?;
+        wire.generation = 0;
+        assert!(decode_covered_subscribe_task_status(&wire, FieldPath::root("test")).is_err());
+        wire.generation = 1;
+        wire.required_identities
+            .push(novarocks_task_codec::identity::encode_task_identity(
+                expected().root_task(),
+            ));
+        assert!(decode_covered_subscribe_task_status(&wire, FieldPath::root("test")).is_err());
+        drop(body);
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    // Complete request END and auth/covered decode precede an actual peer RST.
+    // The response is blocked by a real zero stream window. A healthy next
+    // stream uses the same downstream H2 connection, and every fixture driver
+    // is joined even if the bounded observation fails.
+    #[tokio::test]
+    async fn covered_status_capacity_close_recovers_actual_remote_cancel_only() -> Result<()> {
+        for reason in [h2::Reason::CANCEL, h2::Reason::REFUSED_STREAM] {
+            let core = core();
+            let (request, body, caller) = status_request(&core)?;
+            core.failure("component preexisting failure retained");
+            let mut drivers = JoinSet::new();
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let (up_client, up_server) = tokio::io::duplex(65536);
+                let upstream_core = core.clone();
+                drivers.spawn(async move {
+                    let mut connection = server::handshake::<_>(up_server).await?;
+                    let (request, mut response) = connection
+                        .accept()
+                        .await
+                        .context("status upstream absent")??;
+                    let upstream_work = async {
+                        assert_eq!(
+                            authenticated_normal_frontend(&request, &upstream_core),
+                            Some(caller)
+                        );
+                        let mut inbound = request.into_body();
+                        let (body, trailers) =
+                            read_bounded(&mut inbound, REQUEST_BYTES, upstream_core).await?;
+                        assert!(trailers.is_none());
+                        validate_covered_status(&body, caller)?;
+                        drop(body);
+                        let mut output = response
+                            .send_response(Response::builder().status(200).body(())?, false)?;
+                        output.send_data(Bytes::from_static(b"bounded-status-response"), false)?;
+                        // Drive until the actor releases its upstream response.
+                        let _ = poll_fn(|cx| output.poll_reset(cx)).await;
+                        // Keep the server transport owner alive until fixture
+                        // cleanup aborts and joins both ends. Reset observation
+                        // alone is not permission to race the client driver.
+                        std::future::pending::<Result<()>>().await
+                    };
+                    tokio::select! {
+                        result = upstream_work => result,
+                        _ = async { while connection.accept().await.is_some() {} } => Ok(()),
+                    }
+                });
+                let (up_sender, up_driver) = client::handshake(up_client).await?;
+                drivers.spawn(async move { up_driver.await.context("status upstream driver") });
+                let (down_client, down_server) = tokio::io::duplex(65536);
+                let downstream_core = core.clone();
+                let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+                drivers.spawn(async move {
+                    let mut connection = server::handshake::<_>(down_server).await?;
+                    let (request, response) = connection
+                        .accept()
+                        .await
+                        .context("status downstream absent")??;
+                    let forwarding =
+                        forward_stream(request, response, up_sender, 1, downstream_core);
+                    let next_stream = async {
+                        let (request, mut response) = connection
+                            .accept()
+                            .await
+                            .context("healthy next stream absent")??;
+                        assert_eq!(request.uri().path(), "/healthy-next");
+                        response.send_response(Response::builder().status(200).body(())?, true)?;
+                        // Continue driving the same connection until the test closes it.
+                        while connection.accept().await.is_some() {}
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    let forwarding = async {
+                        let outcome = forwarding.await;
+                        let _ = outcome_tx.send(outcome);
+                    };
+                    tokio::join!(forwarding, next_stream).1
+                });
+                let mut builder = client::Builder::new();
+                builder.initial_window_size(0);
+                let (mut sender, driver) = builder.handshake::<_, Bytes>(down_client).await?;
+                drivers.spawn(async move { driver.await.context("status downstream driver") });
+                let (reply, mut send) = sender.send_request(request, false)?;
+                send.send_data(body, true)?;
+                let reply = reply.await?;
+                assert_eq!(reply.status(), http::StatusCode::OK);
+                // Headers establish that the request was consumed/validated and
+                // response copying has started; no test sleep or race guess.
+                send.send_reset(reason);
+                let outcome = outcome_rx.await?;
+                if reason == h2::Reason::CANCEL {
+                    outcome?;
+                    let observed = RootReplyFaultControl { core: core.clone() }.observation();
+                    assert_eq!(observed.status_subscription_peer_cancels, 1);
+                    assert_eq!(observed.non_target_peer_cancels, 0);
+                    assert_eq!(
+                        observed.failures,
+                        ["component preexisting failure retained"]
+                    );
+                    let digest = observed
+                        .last_status_subscription_peer_cancel
+                        .context("missing actual cancel digest")?;
+                    assert_eq!(digest.class, "covered-status-subscription-remote-cancel");
+                    assert_eq!(digest.sha256.len(), 64);
+                    assert!(digest.bytes > 0);
+                } else {
+                    let error = outcome.expect_err("non-CANCEL reset was incorrectly recovered");
+                    assert!(
+                        error.downcast_ref::<CapacityClosed>().is_some()
+                            || error.downcast_ref::<h2::Error>().is_some()
+                    );
+                    assert_eq!(
+                        core.state.lock().unwrap().status_subscription_peer_cancels,
+                        0
+                    );
+                }
+                drop(reply);
+                drop(send);
+                sender = sender.ready().await?;
+                let (reply, send) = sender.send_request(
+                    Request::builder()
+                        .uri("http://localhost/healthy-next")
+                        .body(())?,
+                    true,
+                )?;
+                assert_eq!(reply.await?.status(), http::StatusCode::OK);
+                drop(send);
+                drop(sender);
+                assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            let result =
+                match result {
+                    Ok(outcome) => outcome,
+                    Err(error) => Err(anyhow::Error::from(error)
+                        .context("covered status fixture absolute deadline")),
+                };
+            drivers.abort_all();
+            // Abort is a fixture cleanup request; actual exit is joined here.
+            let mut cleanup = None;
+            while let Some(joined) = drivers.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        cleanup.get_or_insert(error);
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        cleanup.get_or_insert(anyhow::Error::from(error));
+                    }
+                }
+            }
+            finish_fixture(result, cleanup)?;
+            assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        }
+        Ok(())
+    }
+
+    fn finish_fixture(primary: Result<()>, cleanup: Option<anyhow::Error>) -> Result<()> {
+        match (primary, cleanup) {
+            (Err(primary), Some(cleanup)) => {
+                let digest = digest_display("fixture-cleanup", &cleanup);
+                Err(primary).with_context(|| {
+                    format!(
+                        "fixture cleanup also failed (class={}, sha256={}, bytes={})",
+                        digest.class, digest.sha256, digest.bytes
+                    )
+                })
+            }
+            (Err(primary), None) => Err(primary),
+            (Ok(()), Some(cleanup)) => Err(cleanup).context("fixture cleanup"),
+            (Ok(()), None) => Ok(()),
+        }
+    }
+
+    // Exercise actual receive-stream causes, including late errors after EOF.
+    // These are local duplex classification fixtures, not FE/BE acceptance.
+    #[tokio::test]
+    async fn covered_status_refuses_wrong_class_none_goaway_and_io() -> Result<()> {
+        for mode in ["cancel", "none", "goaway", "io"] {
+            let core = core();
+            let (request, request_body, caller) = status_request(&core)?;
+            let mut drivers = JoinSet::new();
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let (client_io, server_io) = tokio::io::duplex(65536);
+                let server_core = core.clone();
+                let (facts_tx, facts_rx) = tokio::sync::oneshot::channel();
+                let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+                drivers.spawn(async move {
+                    let mut connection = server::handshake::<_>(server_io).await?;
+                    let (request, mut response) = connection
+                        .accept()
+                        .await
+                        .context("negative fixture request absent")??;
+                    let mut inbound = request.into_body();
+                    let work = async {
+                        let (body, trailers) =
+                            read_bounded(&mut inbound, REQUEST_BYTES, server_core.clone()).await?;
+                        validate_covered_status(&body, caller)?;
+                        assert!(trailers.is_none());
+                        drop(body);
+                        let mut output = response.send_response(
+                            Response::builder().status(200).body(())?,
+                            mode == "none",
+                        )?;
+                        if mode == "cancel" || mode == "none" {
+                            let error = send_bytes(
+                                &mut output,
+                                Bytes::from_static(b"never-sent-zero-window"),
+                            )
+                            .await
+                            .expect_err("closed output unexpectedly sent DATA");
+                            assert!(error.downcast_ref::<CapacityClosed>().is_some());
+                            for class in [
+                                StreamClass::Unknown,
+                                StreamClass::Target,
+                                StreamClass::ProvisionalCapture,
+                                StreamClass::NonTarget,
+                            ] {
+                                assert!(
+                                    !recover_covered_status_cancel(
+                                        class,
+                                        &error,
+                                        &mut inbound,
+                                        &server_core
+                                    )
+                                    .await
+                                );
+                            }
+                            for error in [
+                                anyhow::anyhow!("root output capacity closed"),
+                                anyhow::Error::from(h2::Error::from(h2::Reason::CANCEL)),
+                                anyhow::Error::from(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "fixture IO",
+                                )),
+                            ] {
+                                assert!(
+                                    !recover_covered_status_cancel(
+                                        StreamClass::CoveredStatusSubscription,
+                                        &error,
+                                        &mut inbound,
+                                        &server_core
+                                    )
+                                    .await
+                                );
+                            }
+                            let recovered = recover_covered_status_cancel(
+                                StreamClass::CoveredStatusSubscription,
+                                &error,
+                                &mut inbound,
+                                &server_core,
+                            )
+                            .await;
+                            assert_eq!(recovered, mode == "cancel");
+                            let _ = facts_tx.send(());
+                            close_rx.await?;
+                            Ok::<_, anyhow::Error>(None)
+                        } else {
+                            // Return the connection to the owner after response
+                            // HEADERS; the owner makes a real GOAWAY or IO close.
+                            close_rx.await?;
+                            Ok(Some(output))
+                        }
+                    };
+                    let driving = async {
+                        while connection.accept().await.is_some() {}
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    if mode == "goaway" || mode == "io" {
+                        // The driver must flush HEADERS before the termination
+                        // handshake requests abrupt shutdown or drops transport.
+                        let held_output = tokio::select! {
+                            result = work => result?,
+                            result = driving => { result?; None },
+                        };
+                        if mode == "goaway" {
+                            connection.abrupt_shutdown(h2::Reason::PROTOCOL_ERROR);
+                            while connection.accept().await.is_some() {}
+                        }
+                        // Preserve the SendStream until its connection owner
+                        // actually performs the requested termination.
+                        drop(connection);
+                        drop(held_output);
+                        Ok::<_, anyhow::Error>(())
+                    } else {
+                        tokio::select! { result = work => result.map(|_| ()), result = driving => result }
+                    }
+                });
+                let mut builder = client::Builder::new();
+                builder.initial_window_size(0);
+                let (mut sender, driver) = builder.handshake::<_, Bytes>(client_io).await?;
+                let (driver_cause_tx, driver_cause_rx) = tokio::sync::oneshot::channel();
+                drivers.spawn(async move {
+                    let outcome = driver.await;
+                    if mode == "goaway" {
+                        let _ = driver_cause_tx.send(outcome.err());
+                        Ok(())
+                    } else {
+                        outcome.context("negative fixture client driver")
+                    }
+                });
+                let (reply, mut send) = sender.send_request(request, false)?;
+                send.send_data(request_body, true)?;
+                let mut inbound = reply.await?.into_body();
+                let mut close_tx = Some(close_tx);
+                if mode == "cancel" {
+                    send.send_reset(h2::Reason::CANCEL);
+                    facts_rx.await?;
+                } else if mode == "none" {
+                    facts_rx.await?;
+                    assert!(inbound.data().await.is_none());
+                } else {
+                    let _ = close_tx.take().unwrap().send(());
+                    if mode == "goaway" {
+                        // The actual connection driver supplies the GOAWAY
+                        // error. It is not manufactured from its Reason.
+                        let cause = driver_cause_rx.await?.context("GOAWAY driver cause absent")?;
+                        assert!(cause.is_go_away());
+                        assert!(cause.is_remote());
+                        let failure = anyhow::Error::from(cause);
+                        assert!(!recover_covered_status_cancel(StreamClass::CoveredStatusSubscription, &failure, &mut inbound, &core).await);
+                    } else {
+                        // IO discrimination uses an actual received response
+                        // stream; this is not a request-EOF recovery claim.
+                        let actual = inbound.data().await.context("negative cause absent")?.expect_err("negative cause unexpectedly produced DATA");
+                        assert!(actual.is_io());
+                        let failure = anyhow::Error::from(actual);
+                        assert!(!recover_covered_status_cancel(StreamClass::CoveredStatusSubscription, &failure, &mut inbound, &core).await);
+                    }
+                }
+                if let Some(close_tx) = close_tx.take() { let _ = close_tx.send(()); }
+                assert_eq!(
+                    core.state.lock().unwrap().status_subscription_peer_cancels,
+                    u64::from(mode == "cancel")
+                );
+                drop(inbound);
+                drop(send);
+                drop(sender);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            let result = result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+            drivers.abort_all();
+            let mut cleanup = None;
+            while let Some(joined) = drivers.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error))
+                        if error.downcast_ref::<h2::Error>().is_some_and(|cause| {
+                            (mode == "io" && cause.is_io())
+                                || (mode == "goaway" && cause.is_go_away())
+                        }) => {}
+                    Ok(Err(error)) => {
+                        cleanup.get_or_insert(error);
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        cleanup.get_or_insert(anyhow::Error::from(error));
+                    }
+                }
+            }
+            finish_fixture(result, cleanup)?;
+            assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        }
+        Ok(())
     }
 
     #[test]
