@@ -40,13 +40,32 @@ fn plus(a: usize, b: usize) -> Result<usize, KernelFailure> {
     a.checked_add(b).ok_or(KernelFailure::ResourceExhausted)
 }
 
+/// A borrowed node from the SAME source traversal. No ArrayData, payload,
+/// metadata clone, or authorization is created by this loan.
+pub(crate) struct BorrowedSourceNode<'a> {
+    pub(crate) array: &'a dyn Array,
+    pub(crate) data_buffers: usize,
+    pub(crate) child_count: usize,
+    pub(crate) copy_nulls: bool,
+}
+pub(crate) trait BorrowedSourceObservation<'source> {
+    /// The observer owns any work or allocation it elects to perform. The
+    /// source author adds neither a scope nor an extra success checkpoint.
+    fn node(
+        &mut self,
+        node: BorrowedSourceNode<'source>,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<(), KernelFailure>;
+}
+
 /// Use ONE custody metadata arithmetic with borrowed actual table counts. The
 /// returned bytes cover metadata construction only; existing input lease owners
 /// retain the original payload independently and are never replaced by this sum.
-fn source_metadata_graph(
-    array: &dyn Array,
+fn source_metadata_graph<'source>(
+    array: &'source dyn Array,
     work: &mut EvaluationCheckpoints<'_>,
     copy_nulls: bool,
+    observer: &mut Option<&mut dyn BorrowedSourceObservation<'source>>,
 ) -> Result<usize, KernelFailure> {
     work.step()?;
     let mut child_bytes = 0;
@@ -56,7 +75,7 @@ fn source_metadata_graph(
         ($array:expr) => {{
             child_bytes = plus(
                 child_bytes,
-                source_metadata_graph($array.as_ref(), work, copy_nulls)?,
+                source_metadata_graph($array.as_ref(), work, copy_nulls, observer)?,
             )?;
         }};
     }
@@ -118,8 +137,12 @@ fn source_metadata_graph(
         DataType::Map(_, _) => {
             buffers = 1;
             children = 1;
-            child_bytes =
-                source_metadata_graph(concrete::<MapArray>(array)?.entries(), work, copy_nulls)?;
+            child_bytes = source_metadata_graph(
+                concrete::<MapArray>(array)?.entries(),
+                work,
+                copy_nulls,
+                observer,
+            )?;
         }
         DataType::Dictionary(key, _) => {
             buffers = 1;
@@ -186,6 +209,17 @@ fn source_metadata_graph(
             children = 0;
         }
     }
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.node(
+            BorrowedSourceNode {
+                array,
+                data_buffers: buffers,
+                child_count: children,
+                copy_nulls,
+            },
+            work,
+        )?;
+    }
     let own = crate::arrow_result_custody::custody_typed_node_metadata_upper_bound(
         array.data_type(),
         buffers,
@@ -202,7 +236,7 @@ pub(crate) fn source_metadata_bytes(
     // Four envelopes cover pinned Arrow to_data transient table growth,
     // clone/into_builder/make_array coexistence, and custom-buffer metadata.
     // Apply it ONCE to the complete actual graph, not exponentially by depth.
-    source_metadata_graph(array, work, false)?
+    source_metadata_graph(array, work, false, &mut None)?
         .checked_mul(4)
         .ok_or(KernelFailure::ResourceExhausted)
 }
@@ -215,7 +249,24 @@ pub(crate) fn copy_metadata_bytes(
     array: &dyn Array,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<usize, KernelFailure> {
-    source_metadata_graph(array, work, true)?
+    source_metadata_graph(array, work, true, &mut None)?
         .checked_mul(4)
         .ok_or(KernelFailure::ResourceExhausted)
 }
+
+/// Explicit resource observation borrows the existing parent work. Legacy
+/// entrypoints keep their original None path and original checkpoint trace.
+pub(crate) fn observe_source_metadata<'source>(
+    array: &'source dyn Array,
+    copy_nulls: bool,
+    work: &mut EvaluationCheckpoints<'_>,
+    observer: &mut dyn BorrowedSourceObservation<'source>,
+) -> Result<usize, KernelFailure> {
+    source_metadata_graph(array, work, copy_nulls, &mut Some(observer))?
+        .checked_mul(4)
+        .ok_or(KernelFailure::ResourceExhausted)
+}
+
+#[cfg(test)]
+#[path = "array_backing_geometry_observation_tests.rs"]
+mod observation_tests;

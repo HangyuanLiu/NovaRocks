@@ -63,6 +63,51 @@ impl CopyBufferPeak {
             transient_upper: bytes,
         })
     }
+    /// Rust 1.92 RawVec::grow_amortized uses
+    /// max(2*capacity, required, min_non_zero_cap). The initial reservation
+    /// comes from the original builder; this describes its request layouts,
+    /// not a caller budget or the eventual allocator usable-size statistic.
+    pub(super) fn vec<T>(
+        initial_elements: usize,
+        maximum_elements: usize,
+    ) -> Result<Self, CopyError> {
+        let width = size_of::<T>();
+        if width == 0 {
+            return Self::exact(0);
+        }
+        let initial = mul(initial_elements, width)?;
+        let required = mul(maximum_elements, width)?;
+        let (retained_upper, transient_upper) = if maximum_elements > initial_elements {
+            let minimum = if width == 1 {
+                8
+            } else if width <= 1024 {
+                4
+            } else {
+                1
+            };
+            let high = initial_elements.max(maximum_elements).max(minimum);
+            let previous = mul(high, width)?;
+            let retained = mul(previous, 2)?;
+            (retained, add(previous, retained)?)
+        } else {
+            (initial, initial)
+        };
+        buffer_extent(transient_upper, 1)?;
+        Ok(Self {
+            initial,
+            maximum_required: required,
+            retained_upper,
+            transient_upper,
+        })
+    }
+    /// Original String::new + fmt/write uses the SAME u8 RawVec growth.
+    /// An original format! capacity hint must be passed as its initial fact.
+    pub(super) fn string(
+        original_hint: usize,
+        maximum_rendered_bytes: usize,
+    ) -> Result<Self, CopyError> {
+        Self::vec::<u8>(original_hint, maximum_rendered_bytes)
+    }
     pub(super) fn retained_upper(self) -> usize {
         self.retained_upper
     }
@@ -70,3 +115,7 @@ impl CopyBufferPeak {
         self.transient_upper
     }
 }
+
+#[cfg(test)]
+#[path = "copy_buffer_peak_tests.rs"]
+mod tests;
