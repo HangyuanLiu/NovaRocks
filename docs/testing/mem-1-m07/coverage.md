@@ -254,3 +254,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 新单行S+1冻结：x×1048569，MySQL payload1048573B，Native Data1=1048576B/Data2=1B准确x、End3/rows1；独立Python literal摘要与新两份one-byte-continuation freeze一致，保留全部原输入/收据。复用1FE+3BE原 paused actor、freshTaskCreate identity、严格h2/protobuf/生产decoder；capacity/profile/5s链/20s actor不变。
 - 实际Data1/2分别通过生产ClientRowStreamCursor，明确remaining1→0、completed_rows0→1，尾span starts_row=None、bytes=x、completes_row=true；不ACK、不改变原FE消费，恢复后要求完整normal wire独立schema/rowhash/5packets。可选Data2 End只接受准确End3/rows1，同时仍读独立End3。不是非法prefix-only或最小新行载荷证明。
 - 真实NativeRootResultSession组件新例1PASS，runner112PASS/0FAIL/2既有ignored，新增test-only result-contract直接依赖；收据p09-one-byte-continuation-focused-20261009.json。独立review/native尚待；其它门与两个裁决仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09：P09 一字节合法续行 native PASS
+
+- 干净f25aca4b4c1d9e9b92062bde1d7f117b87a682b6及实际同build identity，三场景native1FE+3BE全部PASS（7.435s）；12精确PID均退出。新场景实际Data1=S/cursor R1/rows0、Data2=1B准确x/cursor R0/rows1且唯一continuation span、单独End3/rows1；全部direct请求consumed0，fresh census不退休。
+- 恢复后严格normal MySQL一行1048573B/5packets/schema/hash均符合独立oracle，无错误且正常End；旧ZeroAck与FinalAck/replay同矩阵复跑均PASS。收据p09-one-byte-continuation-native-pass-20261009.json保存准确source/binary/input、实际probe/wire/raw hashes。只闭合一字节合法续行，不冒充非法prefix-only、具体partial framing/fullpool或physical last alias退出。
+- 产品代码未变；上一共享Native产品切片C0在b6b3ad232为12295/0/7 PASS，本次仅test-only增量，最终同HEAD门仍OPEN。real CL/CM/CP/P00b/P10/final与两个语义裁决仍OPEN，无push/PR/归档。

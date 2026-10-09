@@ -1,0 +1,429 @@
+{
+  "source_revision": "f25aca4b4c1d9e9b92062bde1d7f117b87a682b6",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "server_sha256": "d54294357551618473a816f41b39eac63091cd52c7da6ef7b6a7ad78cc8e84f1",
+  "runner_sha256": "947c791b488004c5a624f868f8c8043bcd0903d38f9067ca5003d8899963ff80",
+  "input_sha256": "8d1a0657534109a892af0b920d0e3d30c6fdeaad0e033d5524acf7c134cd4b9a",
+  "protocol_input_sha256": "f0b30e249490dee2404633793a65134c98f03f9402ee36ad3119ecdc5845d188",
+  "exit_code": 0,
+  "duration_seconds": 7.435,
+  "task": "MEM-1-M07",
+  "outcome": "native-passed",
+  "pids": [
+    63580,
+    63593,
+    63594,
+    63595,
+    63661,
+    63662,
+    63663,
+    63664,
+    63730,
+    63731,
+    63732,
+    63733
+  ],
+  "pids_gone": true,
+  "scenes": [
+    "installed-root-zero-ack-normal-wire",
+    "installed-root-replay-final-ack-interference",
+    "one-byte-continuation-normal-wire"
+  ],
+  "actual_one_byte_protocol": [
+    {
+      "accepted_consumed_sequence": 0,
+      "actual_grpc_port": 51607,
+      "backend_index": 1,
+      "body_bytes": 0,
+      "body_sha256": null,
+      "end": null,
+      "grpc_status": 0,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "operation": "discover-exact-root-by-zero-ack",
+      "outcome": "ack_only",
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "response_frame_bytes": 58,
+      "sequence": null
+    },
+    {
+      "actual_grpc_port": 51607,
+      "backend_index": 1,
+      "body_bytes": 0,
+      "grpc_message": "unknown context root",
+      "grpc_status": 5,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 2,
+        "task": 2
+      },
+      "operation": "discover-exact-root-by-zero-ack",
+      "outcome": "unknown_root",
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 2,
+        "task": 2
+      },
+      "response_frame_bytes": 0
+    },
+    {
+      "accepted_consumed_sequence": 0,
+      "actual_grpc_port": 51607,
+      "backend_index": 1,
+      "body_bytes": 0,
+      "body_sha256": null,
+      "end": null,
+      "grpc_status": 0,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "matches": true,
+      "operation": "ack0",
+      "outcome": "ack_only",
+      "proven_delivered_consumed": 0,
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "response_frame_bytes": 58,
+      "sequence": null
+    },
+    {
+      "accepted_consumed_sequence": 0,
+      "actual_grpc_port": 51607,
+      "backend_index": 1,
+      "body_bytes": 0,
+      "body_sha256": null,
+      "end": null,
+      "grpc_status": 0,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "matches": true,
+      "operation": "ack0",
+      "outcome": "ack_only",
+      "proven_delivered_consumed": 0,
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "response_frame_bytes": 58,
+      "sequence": null
+    },
+    {
+      "accepted_consumed_sequence": 0,
+      "actual_grpc_port": 51607,
+      "backend_index": 1,
+      "body_bytes": 1048576,
+      "body_sha256": "7ef5c43e87847e47568399269cf16f3054310ae7b8181b966810e94178e7cd98",
+      "client_row_cursor": {
+        "after_remaining": 1,
+        "before_remaining": 0,
+        "completed_rows": 0,
+        "one_byte_continuation": false,
+        "spans": 1
+      },
+      "end": null,
+      "grpc_status": 0,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "matches": true,
+      "operation": "fetch1",
+      "outcome": "data",
+      "proven_delivered_consumed": 0,
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "response_frame_bytes": 1048642,
+      "sequence": 1
+    },
+    {
+      "accepted_consumed_sequence": 0,
+      "actual_grpc_port": 51607,
+      "backend_index": 1,
+      "body_bytes": 1,
+      "body_sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "client_row_cursor": {
+        "after_remaining": 0,
+        "before_remaining": 1,
+        "completed_rows": 1,
+        "one_byte_continuation": true,
+        "spans": 1
+      },
+      "end": null,
+      "grpc_status": 0,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "matches": true,
+      "operation": "fetch2",
+      "outcome": "data",
+      "proven_delivered_consumed": 0,
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "response_frame_bytes": 63,
+      "sequence": 2
+    },
+    {
+      "accepted_consumed_sequence": 0,
+      "actual_grpc_port": 51607,
+      "backend_index": 1,
+      "body_bytes": 0,
+      "body_sha256": null,
+      "end": {
+        "output_rows": 1,
+        "sequence": 3
+      },
+      "grpc_status": 0,
+      "identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "matches": true,
+      "operation": "fetch-end3",
+      "outcome": "end",
+      "proven_delivered_consumed": 3,
+      "request_identity": {
+        "attempt": 1,
+        "backend": "01a11e01-a6e1-74c0-8505-9ec5f2b7beb9",
+        "query_hi": -8113010856992396260,
+        "query_lo": 1,
+        "stage": 1,
+        "task": 1
+      },
+      "response_frame_bytes": 62,
+      "sequence": 3
+    }
+  ],
+  "actual_one_byte_wire": {
+    "rows": 1,
+    "row_payload_bytes": 1048573,
+    "wire_bytes": 1048633,
+    "packets": 5,
+    "columns": 1,
+    "schema": [
+      {
+        "name": "payload",
+        "mysql_type": 253
+      }
+    ],
+    "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+    "wire_prefix_sha256": "866c5f7b0800391d63099d5b9c1fe5e1661b4b218bb1c945b1340e06bd04c2b9",
+    "first_payload_chunk_micros": 391792,
+    "first_row_micros": 443546,
+    "elapsed_micros": 443558,
+    "row_sha256": "20928da92f8b9c02438d16e3f2cb70910c0826822f970ab5da39044a07b52dea",
+    "error": null
+  },
+  "scope": "Three actual1FE+3BE scenes passed. One-byte actual Data2=x validates production cursor remaining1->0, completed_rows0->1 and one continuation span without a new prefix. All direct probes ACK0; held logical root remains S+1. Resume yields exact full normal MySQL schema/row bytes/digest/5packets/normal end. Existing zero-ACK and final-ACK/replay modes re-ran unchanged. Does not close prefix-only refusal, physical last-alias, exact partial framing or full pools.",
+  "raw_files": [
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/driver-status.json",
+      "sha256": "358e37207d4386aac3f8632d641d23c2d5b8466e92cc5e173c6cad37a5714d9a"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/driver.log",
+      "sha256": "df0c36391bca415f7c949aab87431bdb822b5b26e13fc9f04ce7bb8994a736f1"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-0.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-1.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-2.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-3.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-4.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-5.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-6.json",
+      "sha256": "6d08d636f31049895c9e525557eafa50e18c0debfdd19cc64e0dfa3deff88a8e"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-7.json",
+      "sha256": "6d08d636f31049895c9e525557eafa50e18c0debfdd19cc64e0dfa3deff88a8e"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-8.json",
+      "sha256": "6d08d636f31049895c9e525557eafa50e18c0debfdd19cc64e0dfa3deff88a8e"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-protocol.json",
+      "sha256": "27e65f7a0581214f8c8dfc618b8a4fd2e01b257eee5034dbc5d4443cbd999283"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/owner-barrier-root-retention-after.json",
+      "sha256": "d95345ed511be060759c7e61be8ba66b617a04be7bcdf1346a4aa50d3701b091"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/owner-barrier-root-retention-before.json",
+      "sha256": "f825f3d132b280275815cb5c74593b1456424ac5514237737ec260b789a130f5"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/root-context-held-census.json",
+      "sha256": "2866e5b574852e523289d63168fbedc9e2846b6c8ec5ea9916fbb2dd794a7a4f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/root-context-retention-wire.json",
+      "sha256": "0adb31a72cb48d4b7c59a8857f921d9f8ac5aa07e2c83088946f4b8f6123cc9f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/scenario-evidence.json",
+      "sha256": "fa8e4a645f7e5c6de440bd1a7dcd11cd2e941702880f41b0ed0c608294be0976"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/installed-root-census-0.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/installed-root-census-1.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/installed-root-protocol.json",
+      "sha256": "4c2c0b25a0eea5ef9f1fc2c7f9155d036ff2d64deb86ac219d1679571ad56066"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/owner-barrier-root-retention-after.json",
+      "sha256": "6ba31a6d8ad6daa64902383deff52455b536f75edb3a1d9deadbc8f46575ab5b"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/owner-barrier-root-retention-before.json",
+      "sha256": "19ee95ee6c80c602700a90a06698a2887e5cf940d679ad5a150178fd3b835d13"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/root-context-held-census.json",
+      "sha256": "91558e53c19f4959b71dd69ee24e96b96a9975986498e321359a143f2eed4b75"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/root-context-retention-wire.json",
+      "sha256": "1a9a8a58ae2dce588ef2ee49b57683adebe4d1421f7036b88451166efd9e0936"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/scenario-evidence.json",
+      "sha256": "237323a35705fe5c108e98896322288a3656241b2e93c00e199be92d0de97446"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-0.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-1.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-2.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-3.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-4.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-protocol.json",
+      "sha256": "219e9de8da8299d53fc695575068a70a38d340c28da568597416c122d266270f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/owner-barrier-root-retention-after.json",
+      "sha256": "25c6413ac74901ef0791edd4c0b0313f15002a3de3e9eac6ad7c6d5efea32a9f"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/owner-barrier-root-retention-before.json",
+      "sha256": "08e0f56a5c5ed088568b95e15571ed58a339a546d30508131a928f4ce08e3a2c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/root-context-held-census.json",
+      "sha256": "8e0debf08fdf3779cb5e64d7b7b24d4784079db9dbf016613efb2fb2d74f2e25"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/root-context-retention-wire.json",
+      "sha256": "cc5a37f5c047dae776510bb510e319aa5687a45d87a8f97ceda74332ccb240ef"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-one-byte-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/scenario-evidence.json",
+      "sha256": "d7d1ab7296870aedb34cc3a539f627711f034812202e5bc09ce736304047b284"
+    }
+  ]
+}
