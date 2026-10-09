@@ -2739,3 +2739,5 @@ pub use window_invocation_data::WindowInvocationScope;
 
 mod array_backing_geometry;
 pub use arrow_result_custody::{SourceBackingOwner, retain_source_backing};
+
+pub mod string_repeat_pad_core;

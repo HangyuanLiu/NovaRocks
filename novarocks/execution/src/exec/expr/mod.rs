@@ -1655,3 +1655,6 @@ mod e08s1_time_original_profile_tests;
 
 #[cfg(test)]
 mod e08s1_time_static_profile_tests;
+
+#[cfg(test)]
+mod legacy_repeat_pad_shared_baseline_tests;

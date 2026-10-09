@@ -23,6 +23,7 @@ use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
+    string_repeat_pad_core::{self, CyclicCharacters, PadProjection, SourceCharacters},
 };
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
@@ -59,98 +60,142 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
 
 // The original string::common owner applies this independently to target
 // Unicode scalar count and resulting UTF-8 bytes. Oversize is successful NULL.
-const MAX_PAD_LENGTH: usize = 1_048_576;
+#[cfg(test)]
+const MAX_PAD_LENGTH: usize = string_repeat_pad_core::MAX_STRING_BYTES;
 
-struct RowPlan<'a> {
-    prefix: &'a str,
-    pad: &'a str,
-    needed: usize,
-    bytes: usize,
-}
-
-fn row_plan<'a>(
+struct BorrowedCharacters<'a> {
     text: &'a str,
-    pad: &'a str,
-    count: i64,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<RowPlan<'a>>, KernelFailure> {
-    if count < 0 {
-        return Ok(None);
-    }
-    // A target not representable on this platform remains oversize SQL NULL;
-    // truncating Int64 to usize must not turn it into a small accepted target.
-    let Ok(target) = usize::try_from(count) else {
-        return Ok(None);
-    };
-    if target > MAX_PAD_LENGTH {
-        return Ok(None);
-    }
-    let mut source_chars = 0usize;
-    let mut end = 0usize;
-    for (byte, ch) in text.char_indices().take(target) {
-        source_chars += 1;
-        end = byte + ch.len_utf8();
-        work.step()?;
-    }
-    let prefix = &text[..end];
-    if prefix.len() > MAX_PAD_LENGTH {
-        return Ok(None);
-    }
-    let needed = if source_chars == target || pad.is_empty() {
-        0
-    } else {
-        target - source_chars
-    };
-    let mut bytes = prefix.len();
-    for ch in pad.chars().cycle().take(needed) {
-        bytes = bytes
-            .checked_add(ch.len_utf8())
-            .ok_or(KernelFailure::ResourceExhausted)?;
-        work.step()?;
-        if bytes > MAX_PAD_LENGTH {
-            return Ok(None);
-        }
-    }
-    Ok(Some(RowPlan {
-        prefix,
-        pad,
-        needed,
-        bytes,
-    }))
+    len: usize,
 }
-
-fn write_plan(
-    op: StringPadOp,
-    plan: RowPlan<'_>,
-    bytes: &mut Vec<u8>,
+impl SourceCharacters for BorrowedCharacters<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn iter(&self) -> impl Iterator<Item = char> {
+        self.text.chars()
+    }
+}
+struct BorrowedCycle<'a> {
+    text: &'a str,
+    len: usize,
+    cursor: std::str::Chars<'a>,
+    next: usize,
+}
+impl CyclicCharacters for BorrowedCycle<'_> {
+    type Error = KernelFailure;
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn get(&mut self, index: usize) -> Result<char, KernelFailure> {
+        if index == 0 {
+            self.cursor = self.text.chars();
+            self.next = 0;
+        }
+        if index != self.next {
+            return Err(internal(
+                "lpad/rpad cyclic projection differs from its source order",
+            ));
+        }
+        let ch = self
+            .cursor
+            .next()
+            .ok_or_else(|| internal("lpad/rpad cyclic projection has no original character"))?;
+        self.next += 1;
+        Ok(ch)
+    }
+}
+/// Inline storage projection: no per-row String, Vec<char>, or scratch grant.
+/// The shared original program alone selects prefix, fill count, side, and caps.
+struct CompactPadProjection<'a, 'control> {
+    bytes: Option<&'a mut Vec<u8>>,
     total: usize,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<(), KernelFailure> {
-    if plan.bytes > total - bytes.len() {
-        return Err(internal("lpad/rpad exceeded its measured output extent"));
-    }
-    let copy_source = |bytes: &mut Vec<u8>, work: &mut EvaluationCheckpoints<'_>| {
-        for byte in plan.prefix.bytes() {
+    extent: usize,
+    work: &'a mut EvaluationCheckpoints<'control>,
+}
+impl CompactPadProjection<'_, '_> {
+    fn push(&mut self, byte: u8) -> Result<(), KernelFailure> {
+        self.extent = self
+            .extent
+            .checked_add(1)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        if let Some(bytes) = &mut self.bytes {
+            if bytes.len() >= self.total {
+                return Err(internal("lpad/rpad exceeded its measured output extent"));
+            }
             bytes.push(byte);
-            work.step()?;
         }
-        Ok::<_, KernelFailure>(())
-    };
-    if op == StringPadOp::Right {
-        copy_source(bytes, work)?;
+        self.work.step()
     }
-    for ch in plan.pad.chars().cycle().take(plan.needed) {
+    fn copy(&mut self, source: &str) -> Result<(), KernelFailure> {
+        for byte in source.bytes() {
+            self.push(byte)?;
+        }
+        Ok(())
+    }
+    fn characters(&mut self, text: &str) -> Result<usize, KernelFailure> {
+        let mut count = 0;
+        for _ in text.chars() {
+            count += 1;
+            self.work.step()?;
+        }
+        Ok(count)
+    }
+}
+impl<'source> PadProjection<'source> for CompactPadProjection<'_, '_> {
+    type Error = KernelFailure;
+    type Source = BorrowedCharacters<'source>;
+    type Pad = BorrowedCycle<'source>;
+    type Fill = ();
+    type Output = usize;
+    type Emission = Option<usize>;
+    fn source(&mut self, text: &'source str) -> Result<Self::Source, KernelFailure> {
+        Ok(BorrowedCharacters {
+            text,
+            len: self.characters(text)?,
+        })
+    }
+    fn pad(&mut self, text: &'source str) -> Result<Self::Pad, KernelFailure> {
+        Ok(BorrowedCycle {
+            text,
+            len: self.characters(text)?,
+            cursor: text.chars(),
+            next: 0,
+        })
+    }
+    fn prefix(&mut self, chars: impl Iterator<Item = char>) -> Result<usize, KernelFailure> {
+        for ch in chars {
+            self.push_fill(&mut (), ch)?;
+        }
+        Ok(self.extent)
+    }
+    fn new_fill(&mut self, source: &str, left: bool) -> Result<(), KernelFailure> {
+        // Direct compact output stores the right-prefix before its fill; this
+        // is storage projection only. The original owned projection is unchanged.
+        if !left {
+            self.copy(source)?;
+        }
+        Ok(())
+    }
+    fn push_fill(&mut self, _fill: &mut (), ch: char) -> Result<(), KernelFailure> {
         let mut utf8 = [0u8; 4];
-        let encoded = ch.encode_utf8(&mut utf8);
-        for byte in encoded.bytes() {
-            bytes.push(byte);
-            work.step()?;
+        for byte in ch.encode_utf8(&mut utf8).bytes() {
+            self.push(byte)?;
         }
+        Ok(())
     }
-    if op == StringPadOp::Left {
-        copy_source(bytes, work)?;
+    fn compose_left(&mut self, _fill: (), source: &str) -> Result<usize, KernelFailure> {
+        self.copy(source)?;
+        Ok(self.extent)
     }
-    Ok(())
+    fn compose_right(&mut self, _source: &str, _fill: ()) -> Result<usize, KernelFailure> {
+        Ok(self.extent)
+    }
+    fn result_len(&self, result: &usize) -> usize {
+        *result
+    }
+    fn emit(&mut self, result: Option<usize>) -> Result<Option<usize>, KernelFailure> {
+        Ok(result)
+    }
 }
 
 /// Original static failures are shared without constructing CPU diagnostics during admission.
@@ -242,7 +287,7 @@ pub(super) fn evaluate_string_pad<'a>(
         let selected_plan = |ordinal,
                              batch_row,
                              work: &mut EvaluationCheckpoints<'_>|
-         -> Result<Option<RowPlan<'_>>, KernelFailure> {
+         -> Result<Option<(&str, i64, usize)>, KernelFailure> {
             let mut rows = [0usize; 3];
             let mut is_null = false;
             for (index, argument) in arguments.iter().enumerate() {
@@ -267,21 +312,33 @@ pub(super) fn evaluate_string_pad<'a>(
             if is_null {
                 return Ok(None);
             }
-            row_plan(
+            Ok(Some((
                 strings.value(rows[0]),
-                pads.value(rows[2]),
                 lengths.value(rows[1]),
-                work,
-            )
+                rows[2],
+            )))
         };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            if let Some(plan) = selected_plan(ordinal, batch_row, &mut work)? {
-                total = total
-                    .checked_add(plan.bytes)
-                    .ok_or(KernelFailure::ResourceExhausted)?;
+            if let Some((text, count, pad_row)) = selected_plan(ordinal, batch_row, &mut work)? {
+                if let Some(extent) = string_repeat_pad_core::pad_into(
+                    text,
+                    count,
+                    || pads.value(pad_row),
+                    op == StringPadOp::Left,
+                    CompactPadProjection {
+                        bytes: None,
+                        total: 0,
+                        extent: 0,
+                        work: &mut work,
+                    },
+                )? {
+                    total = total
+                        .checked_add(extent)
+                        .ok_or(KernelFailure::ResourceExhausted)?;
+                }
             }
         }
         output_capacity(selection.len(), total)?;
@@ -301,13 +358,45 @@ pub(super) fn evaluate_string_pad<'a>(
         offsets.push(0i32);
         let mut has_null = false;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            match selected_plan(ordinal, batch_row, &mut work)? {
+            let measured = match selected_plan(ordinal, batch_row, &mut work)? {
+                None => None,
+                Some((text, count, pad_row)) => string_repeat_pad_core::pad_into(
+                    text,
+                    count,
+                    || pads.value(pad_row),
+                    op == StringPadOp::Left,
+                    CompactPadProjection {
+                        bytes: None,
+                        total: 0,
+                        extent: 0,
+                        work: &mut work,
+                    },
+                )?
+                .map(|extent| (text, count, pad_row, extent)),
+            };
+            match measured {
                 None => {
                     has_null = true;
                     validity.append(false);
                 }
-                Some(plan) => {
-                    write_plan(op, plan, &mut bytes, total, &mut work)?;
+                Some((text, count, pad_row, extent)) => {
+                    let written = string_repeat_pad_core::pad_into(
+                        text,
+                        count,
+                        || pads.value(pad_row),
+                        op == StringPadOp::Left,
+                        CompactPadProjection {
+                            bytes: Some(&mut bytes),
+                            total,
+                            extent: 0,
+                            work: &mut work,
+                        },
+                    )?;
+                    if written != Some(extent) {
+                        return Err(internal(
+                            "lpad/rpad differs from its measured output extent",
+                        ));
+                    }
                     validity.append(true);
                 }
             }

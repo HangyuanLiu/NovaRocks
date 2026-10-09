@@ -22,6 +22,7 @@ use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
+    string_repeat_pad_core::{self, RepeatPlan, RepeatWriter},
 };
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
@@ -58,7 +59,8 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
 
 // Existing execution string::common::OLAP_STRING_MAX_LENGTH. This is a
 // semantic per-row successful-NULL cap, not a resource budget or default.
-const MAX_ROW_BYTES: usize = 1_048_576;
+#[cfg(test)]
+const MAX_ROW_BYTES: usize = crate::string_repeat_pad_core::MAX_STRING_BYTES;
 
 /// Original static failures are shared without constructing CPU diagnostics during admission.
 #[derive(Clone, Copy)]
@@ -122,6 +124,32 @@ pub(super) fn check_result(target: &crate::FunctionValueType) -> Result<(), Stat
     Ok(())
 }
 
+struct CompactRepeatWriter<'a, 'control> {
+    bytes: &'a mut Vec<u8>,
+    total: usize,
+    work: &'a mut EvaluationCheckpoints<'control>,
+}
+impl RepeatWriter for CompactRepeatWriter<'_, '_> {
+    type Error = KernelFailure;
+    type Output = ();
+    fn empty(&mut self) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn repeat(&mut self, span: &str, repeats: usize, extent: usize) -> Result<(), KernelFailure> {
+        if extent > self.total - self.bytes.len() {
+            return Err(internal("repeat/space exceeded its measured output extent"));
+        }
+        for _ in 0..repeats {
+            for byte in span.bytes() {
+                self.bytes.push(byte);
+                self.work.step()?;
+            }
+            self.work.step()?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn evaluate_string_repeat<'a>(
     op: StringRepeatOp,
     input: ScalarCallInput<'_, 'a>,
@@ -160,7 +188,7 @@ pub(super) fn evaluate_string_repeat<'a>(
         let row_output = |ordinal,
                           batch_row,
                           work: &mut EvaluationCheckpoints<'_>|
-         -> Result<Option<(&str, usize, usize)>, KernelFailure> {
+         -> Result<RepeatPlan<'_>, KernelFailure> {
             let mut rows = [0usize; 2];
             let mut is_null = false;
             for (index, argument) in arguments.iter().enumerate() {
@@ -186,35 +214,18 @@ pub(super) fn evaluate_string_repeat<'a>(
             }
             if is_null {
                 work.step()?;
-                return Ok(None);
+                return Ok(RepeatPlan::Null);
             }
-            let output = (|| -> Result<Option<(&str, usize, usize)>, KernelFailure> {
+            let output = (|| -> Result<RepeatPlan<'_>, KernelFailure> {
                 let count = counts.value(rows[count_index]);
-                match op {
-                    StringRepeatOp::Space => {
-                        if count < 0 || count as u128 > MAX_ROW_BYTES as u128 {
-                            return Ok(None);
-                        }
-                        let count = count as usize;
-                        Ok(Some((" ", count, count)))
-                    }
+                Ok(match op {
+                    StringRepeatOp::Space => string_repeat_pad_core::space_plan(count),
                     StringRepeatOp::Repeat => {
-                        if count <= 0 {
-                            return Ok(Some(("", 0, 0)));
-                        }
-                        let text = strings
-                            .ok_or_else(|| internal("repeat has no checked Utf8 carrier"))?
-                            .value(rows[0]);
-                        if text.is_empty() {
-                            return Ok(Some(("", 0, 0)));
-                        }
-                        let bytes = (text.len() as u128).saturating_mul(count as u128);
-                        if bytes > MAX_ROW_BYTES as u128 {
-                            return Ok(None);
-                        }
-                        Ok(Some((text, count as usize, bytes as usize)))
+                        let strings = strings
+                            .ok_or_else(|| internal("repeat has no checked Utf8 carrier"))?;
+                        string_repeat_pad_core::repeat_plan(|| strings.value(rows[0]), count)
                     }
-                }
+                })
             })()?;
             work.step()?;
             Ok(output)
@@ -223,7 +234,7 @@ pub(super) fn evaluate_string_repeat<'a>(
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            if let Some((_, _, bytes)) = row_output(ordinal, batch_row, &mut work)? {
+            if let Some(bytes) = row_output(ordinal, batch_row, &mut work)?.bytes() {
                 total = total
                     .checked_add(bytes)
                     .ok_or(KernelFailure::ResourceExhausted)?;
@@ -246,24 +257,21 @@ pub(super) fn evaluate_string_repeat<'a>(
         offsets.push(0i32);
         let mut has_null = false;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            match row_output(ordinal, batch_row, &mut work)? {
+            let plan = row_output(ordinal, batch_row, &mut work)?;
+            let result = string_repeat_pad_core::render_repeat(
+                plan,
+                &mut CompactRepeatWriter {
+                    bytes: &mut bytes,
+                    total,
+                    work: &mut work,
+                },
+            )?;
+            match result {
                 None => {
                     has_null = true;
                     validity.append(false);
                 }
-                Some((span, repeats, extent)) => {
-                    if extent > total - bytes.len() {
-                        return Err(internal("repeat/space exceeded its measured output extent"));
-                    }
-                    for _ in 0..repeats {
-                        for byte in span.bytes() {
-                            bytes.push(byte);
-                            work.step()?;
-                        }
-                        work.step()?;
-                    }
-                    validity.append(true);
-                }
+                Some(()) => validity.append(true),
             }
             offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
             work.step()?;
