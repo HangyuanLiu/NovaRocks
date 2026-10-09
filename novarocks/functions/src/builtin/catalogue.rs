@@ -3097,7 +3097,7 @@ pub fn contribute_builtin_functions(
                         Some(super::aggregate_count_distinct_owner::effects())
                     }
                     "any_value" => Some(super::aggregate_any_value_owner::effects()),
-                    "percentile_approx" | "percentile_approx_weighted" => {
+                    "percentile_approx" | "percentile_approx_weighted" | "percentile_union" => {
                         Some(super::aggregate_approx_percentile_owner::effects())
                     }
                     "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
@@ -3172,7 +3172,7 @@ pub fn contribute_builtin_functions(
         }
         if matches!(
             declaration.name,
-            "percentile_approx" | "percentile_approx_weighted"
+            "percentile_approx" | "percentile_approx_weighted" | "percentile_union"
         ) {
             builder.register(super::aggregate_approx_percentile_owner::definition(
                 declaration.name,
@@ -5328,6 +5328,44 @@ pub fn percentile_raw_private_test_catalog() -> EngineFunctionCatalog {
     builder
         .register(
             super::percentile_approx_raw_owner::definition(&name, declaration, resolver).unwrap(),
+        )
+        .unwrap();
+    builder.seal().unwrap()
+}
+
+/// Private Union capability for original full-domain binding/runtime probes.
+/// This attachment enables no public production registration.
+#[cfg(any(test, feature = "test-support"))]
+pub fn percentile_union_private_test_catalog() -> EngineFunctionCatalog {
+    let original = build_builtin_engine_function_catalog().unwrap();
+    let raw = original
+        .definition("percentile_union", FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap();
+    let binding = FunctionBindingDeclaration::try_new(
+        raw.function_id().clone(),
+        raw.kind(),
+        raw.overloads().iter().cloned().map(|mut overload| {
+            overload.effects = Some(super::aggregate_approx_percentile_owner::effects());
+            overload
+        }),
+    )
+    .unwrap();
+    let declaration = builtin_aggregate_declarations()
+        .into_iter()
+        .find(|item| item.name == "percentile_union")
+        .unwrap();
+    let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(
+            super::aggregate_approx_percentile_owner::definition(
+                "percentile_union",
+                binding,
+                resolver,
+            )
+            .unwrap(),
         )
         .unwrap();
     builder.seal().unwrap()

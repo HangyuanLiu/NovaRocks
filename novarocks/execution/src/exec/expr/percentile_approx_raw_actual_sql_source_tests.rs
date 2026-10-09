@@ -139,3 +139,7 @@ fn percentile_approx_raw_actual_original_required_sql_compiler_closure() {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "percentile_union_actual_sql_source_tests.rs"]
+mod percentile_union_actual_sql_source_tests;

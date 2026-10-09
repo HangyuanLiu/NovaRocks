@@ -250,3 +250,6 @@ mod compiled_aggregate_zero_calls_tests;
 #[cfg(test)]
 #[path = "ds_hll_grouped_local_before_tests.rs"]
 mod ds_hll_grouped_local_before_tests;
+
+#[path = "percentile_union_private_factory_tests.rs"]
+mod percentile_union_private_factory_tests;

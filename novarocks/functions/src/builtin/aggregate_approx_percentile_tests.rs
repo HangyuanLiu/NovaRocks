@@ -123,7 +123,11 @@ fn kernel(
     types: Vec<FunctionValueType>,
     phase: AggregateKernelPhase,
 ) -> ApproxPercentileKernel {
-    let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let catalog = if name == "percentile_union" {
+        super::super::catalogue::percentile_union_private_test_catalog()
+    } else {
+        super::super::catalogue::build_builtin_engine_function_catalog().unwrap()
+    };
     let args = types
         .into_iter()
         .map(|value_type| FunctionArgument::Value {
@@ -198,10 +202,11 @@ fn kernel(
     };
     ApproxPercentileKernel {
         contract: handle.contract().clone(),
-        operation: if name == "percentile_approx" {
-            ApproxPercentileOperation::Unweighted
-        } else {
-            ApproxPercentileOperation::Weighted
+        operation: match name {
+            "percentile_approx" => ApproxPercentileOperation::Unweighted,
+            "percentile_approx_weighted" => ApproxPercentileOperation::Weighted,
+            "percentile_union" => ApproxPercentileOperation::Union,
+            _ => panic!("test requested an unknown immutable owner"),
         },
     }
 }
@@ -983,3 +988,9 @@ fn approximate_percentile_owner_final_callback_seven_causes_no_tail() {
 
 #[path = "aggregate_approx_percentile_intermediate_tests.rs"]
 mod intermediate_supplement;
+
+#[path = "aggregate_percentile_union_private_tests.rs"]
+mod percentile_union_private_tests;
+
+#[path = "aggregate_percentile_union_core_control_tests.rs"]
+mod percentile_union_core_control_tests;

@@ -21,7 +21,9 @@
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
-use crate::approx_percentile_aggregate_core::{self as core, ApproxPercentileDiagnostic as Diagnostic};
+use crate::approx_percentile_aggregate_core::{
+    self as core, ApproxPercentileDiagnostic as Diagnostic,
+};
 use crate::approx_percentile_core as digest;
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
@@ -35,23 +37,25 @@ use std::sync::Arc;
 pub(super) enum ApproxPercentileOperation {
     Unweighted,
     Weighted,
+    Union,
 }
 impl ApproxPercentileOperation {
     pub(super) fn accepts_arity(self, count: usize) -> bool {
         match self {
             Self::Unweighted => matches!(count, 2 | 3),
             Self::Weighted => matches!(count, 3 | 4),
+            Self::Union => count == 1,
         }
     }
     fn update(self) -> Diagnostic {
         match self {
-            Self::Unweighted => Diagnostic::UnweightedUpdate,
+            Self::Unweighted | Self::Union => Diagnostic::UnweightedUpdate,
             Self::Weighted => Diagnostic::WeightedUpdate,
         }
     }
     fn merge(self) -> Diagnostic {
         match self {
-            Self::Unweighted => Diagnostic::UnweightedMerge,
+            Self::Unweighted | Self::Union => Diagnostic::UnweightedMerge,
             Self::Weighted => Diagnostic::WeightedMerge,
         }
     }
@@ -83,6 +87,7 @@ pub(super) struct ApproxPercentileUpdate<'a> {
 enum UpdateChannels {
     Unweighted(core::UnweightedInput),
     Weighted(core::WeightedInput),
+    Payload(ArrayRef),
 }
 pub(super) struct ApproxPercentileMerge<'a> {
     input: SelectedAggregateMergeInput<'a, 'a>,
@@ -179,6 +184,45 @@ impl FailureSink<'_, '_> {
             ScalarStateError::OutputAllocation(_) => KernelFailure::ResourceExhausted.into(),
             ScalarStateError::Legacy(message) => self.diagnostic(&message),
         }
+    }
+}
+// The observer/sink borrows the actual phase receipt and actual allocators.
+// It never classifies a diagnostic string as a Kernel cause.
+struct ObservedFailureSink<'a, 'host, 'control> {
+    failure: FailureSink<'a, 'host>,
+    state_allocator: HostAggregateAllocator,
+    work: &'a mut EvaluationCheckpoints<'control>,
+}
+impl crate::approx_percentile_failure::ApproxPercentileFailureSink
+    for ObservedFailureSink<'_, '_, '_>
+{
+    type Error = EvaluationFailure;
+    fn data(
+        &mut self,
+        recipe: crate::approx_percentile_failure::ApproxPercentileDataRecipe<'_>,
+    ) -> EvaluationFailure {
+        self.failure.diagnostic(&recipe)
+    }
+    fn allocation(
+        &mut self,
+        _recipe: crate::approx_percentile_failure::ApproxPercentileDataRecipe<'_>,
+    ) -> EvaluationFailure {
+        self.state_allocator
+            .take_recorded_failure()
+            .or_else(|| self.failure.allocator.take_recorded_failure())
+            .unwrap_or(KernelFailure::ResourceExhausted)
+            .into()
+    }
+    fn observe(
+        &mut self,
+        observation: crate::approx_percentile_failure::ApproxPercentileObservation,
+    ) -> Result<(), EvaluationFailure> {
+        use crate::approx_percentile_failure::ApproxPercentileObservation as O;
+        match observation {
+            O::Step => self.work.step(),
+            O::SortBegin(_) | O::SortEnd | O::JsonBegin(_) | O::JsonEnd => self.work.flush(),
+        }
+        .map_err(EvaluationFailure::from)
     }
 }
 fn observed<T>(
@@ -287,6 +331,11 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
     }
     fn has_invocation_data(&self) -> bool {
         true
+    }
+    fn requires_empty_update_preparation(&self) -> bool {
+        // The original packed Struct validator runs before its row loop,
+        // including an actually invoked zero-row Union update.
+        matches!(self.operation, ApproxPercentileOperation::Union)
     }
     fn requires_emission_context(&self) -> bool {
         true
@@ -421,6 +470,31 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                         args.get(3).map(|arg| arg.array().clone()),
                     ))
                 }
+                ApproxPercentileOperation::Union => {
+                    let array = args[0].array();
+                    if let Some(structure) =
+                        array.as_any().downcast_ref::<arrow_array::StructArray>()
+                    {
+                        let channels =
+                            core::UnweightedInput::try_new(structure, self.operation.update())
+                                .map_err(|original| {
+                                    FailureSink {
+                                        allocator: &allocator,
+                                        domain: FailureDomain::Mutation {
+                                            contract: &self.contract,
+                                            phase: AggregateInvocationPhase::Update,
+                                            selection: input.selection(),
+                                            mapping: &mapping,
+                                        },
+                                        control,
+                                    }
+                                    .diagnostic(&original)
+                                })?;
+                        UpdateChannels::Unweighted(channels)
+                    } else {
+                        UpdateChannels::Payload(array.clone())
+                    }
+                }
             };
             work.step()?;
             Ok(ApproxPercentileUpdate {
@@ -494,30 +568,49 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 },
                 control,
             };
-            // Existing core reader/digest/codec work is opaque. Refusals on
-            // the opaque-entry boundary precede computation; no success
-            // footer may replace an already constructed whole Data capsule.
+            // Observe original owned loops through the same core sink. Real
+            // library sort boundaries remain opaque and receive no grant from
+            // this observer; published Data has no success footer.
             work.flush()?;
-            let original = match &prepared.row_input {
-                UpdateChannels::Unweighted(channels) => channels.update_addresses(
+            // Packed Union children inherit their sole parent address. The
+            // original Struct reader intentionally ignores the root NULL mask.
+            let packed = matches!(self.operation, ApproxPercentileOperation::Union);
+            let allocator = state.core.allocator();
+            let scratch = core::AllocatedQuantileScratch(prepared.allocator.clone());
+            let mut observed_sink = ObservedFailureSink {
+                failure: sink,
+                state_allocator: allocator,
+                work,
+            };
+            match &prepared.row_input {
+                UpdateChannels::Payload(array) => core::merge_row_with_sink(
+                    &mut state.core,
+                    array,
+                    addresses[0],
+                    self.operation.update(),
+                    &mut observed_sink,
+                )?,
+                UpdateChannels::Unweighted(channels) => channels.update_addresses_with_sink(
                     &mut state.core,
                     addresses[0],
-                    addresses[1],
-                    addresses[2],
+                    if packed { addresses[0] } else { addresses[1] },
+                    if packed { addresses[0] } else { addresses[2] },
                     self.operation.update(),
-                ),
-                UpdateChannels::Weighted(channels) => channels.update_addresses(
+                    &scratch,
+                    &mut observed_sink,
+                )?,
+                UpdateChannels::Weighted(channels) => channels.update_addresses_with_sink(
                     &mut state.core,
                     addresses[0],
                     addresses[1],
                     addresses[2],
                     addresses[3],
                     self.operation.update(),
-                ),
-            };
-            if let Err(error) = original {
-                return Err(sink.original(error, &state.core.allocator()));
+                    &scratch,
+                    &mut observed_sink,
+                )?,
             }
+            drop(observed_sink);
             work.flush()?;
             Ok(())
         });
@@ -562,15 +655,20 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 control,
             };
             work.flush()?;
-            let original = core::merge_row(
+            let allocator = state.core.allocator();
+            let mut observed_sink = ObservedFailureSink {
+                failure: sink,
+                state_allocator: allocator,
+                work,
+            };
+            core::merge_row_with_sink(
                 &mut state.core,
                 arg.array(),
                 address,
                 self.operation.merge(),
-            );
-            if let Err(error) = original {
-                return Err(sink.original(error, &state.core.allocator()));
-            }
+                &mut observed_sink,
+            )?;
+            drop(observed_sink);
             work.flush()?;
             Ok(())
         });
@@ -606,7 +704,15 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 }
                 work.step()?;
                 work.flush()?;
-                let encoded = digest::encode_state(&state.core);
+                let encoded =
+                    digest::encode_state_observed(
+                        &state.core,
+                        &mut |observation| match observation {
+                            digest::PercentileEncodeObservation::Step => work.step(),
+                            digest::PercentileEncodeObservation::OpaqueBegin
+                            | digest::PercentileEncodeObservation::OpaqueEnd => work.flush(),
+                        },
+                    )?;
                 work.flush()?;
                 builder.append_value(encoded);
                 work.flush()?;
@@ -633,6 +739,11 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
         Self::State: 's,
         I: ExactSizeIterator<Item = &'s Self::State>,
     {
+        if matches!(self.operation, ApproxPercentileOperation::Union) {
+            // Original Union Final and Intermediate share the exact state
+            // encoding and Binary writer, with this real emission receipt.
+            return self.build_intermediate_evaluation_with_context(states, context, control);
+        }
         observed(control, |work| {
             let expected = states.len();
             self.check_emit(context, expected)?;

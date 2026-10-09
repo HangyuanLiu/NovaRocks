@@ -70,8 +70,11 @@ impl ApproxPercentileOwner {
         resolver: Arc<BuiltinAggregateResolver>,
     ) -> Result<Self, FunctionCatalogError> {
         let expected = effects();
-        let valid = matches!(name, "percentile_approx" | "percentile_approx_weighted")
-            && declaration.function_id().as_str() == format!("builtin.aggregate/{name}/v1")
+        let valid = matches!(
+            name,
+            "percentile_approx" | "percentile_approx_weighted" | "percentile_union"
+        ) && declaration.function_id().as_str()
+            == format!("builtin.aggregate/{name}/v1")
             && declaration.kind() == FunctionKind::Aggregate
             && declaration.overloads().len() == 1
             && declaration.overloads().iter().all(|overload| {
@@ -101,10 +104,17 @@ impl ApproxPercentileOwner {
         Ok(Self {
             resolver,
             declaration,
-            operation: if name == "percentile_approx" {
-                super::aggregate_approx_percentile::ApproxPercentileOperation::Unweighted
-            } else {
-                super::aggregate_approx_percentile::ApproxPercentileOperation::Weighted
+            operation: match name {
+                "percentile_approx" => {
+                    super::aggregate_approx_percentile::ApproxPercentileOperation::Unweighted
+                }
+                "percentile_approx_weighted" => {
+                    super::aggregate_approx_percentile::ApproxPercentileOperation::Weighted
+                }
+                "percentile_union" => {
+                    super::aggregate_approx_percentile::ApproxPercentileOperation::Union
+                }
+                _ => unreachable!("checked immutable aggregate owner identity"),
             },
             implementations,
         })

@@ -465,3 +465,7 @@ fn original_approx_percentile_nan_is_skipped_and_signed_inf_singletons_preserved
         }
     }
 }
+
+#[cfg(test)]
+#[path = "percentile_union_original_baseline_tests.rs"]
+mod percentile_union_original_baseline_tests;

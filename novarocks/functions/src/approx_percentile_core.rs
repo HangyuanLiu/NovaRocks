@@ -175,25 +175,46 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn add(&mut self, value: f32, weight: f32) -> Result<(), String> {
+        self.add_with_sink(value, weight, &mut LegacyApproxPercentileFailure)
+    }
+    fn add_with_sink<S: ApproxPercentileFailureSink>(
+        &mut self,
+        value: f32,
+        weight: f32,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
         if value.is_nan() || weight <= 0.0 {
             return Ok(());
         }
-        self.unprocessed
-            .try_reserve(1)
-            .map_err(|_| "ResourceExhausted: reserve TDigest centroid".to_string())?;
+        self.unprocessed.try_reserve(1).map_err(|_| {
+            sink.allocation(DataRecipe::Static(
+                "ResourceExhausted: reserve TDigest centroid",
+            ))
+        })?;
         self.unprocessed.push(Centroid::new(value, weight));
         self.unprocessed_weight += weight;
-        self.process_if_necessary()
+        self.process_if_necessary_with_sink(sink)
     }
 
     fn merge(&mut self, other: &TDigest<A>) -> Result<(), String> {
+        self.merge_with_sink(other, &mut LegacyApproxPercentileFailure)
+    }
+    fn merge_with_sink<S: ApproxPercentileFailureSink>(
+        &mut self,
+        other: &TDigest<A>,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
         if other.is_empty() {
             return Ok(());
         }
         if !other.processed.is_empty() {
             self.processed_weight += other.processed_weight;
-            self.processed =
-                merge_sorted_centroids(&self.processed, &other.processed, self.allocator.clone())?;
+            self.processed = merge_sorted_centroids_with_sink(
+                &self.processed,
+                &other.processed,
+                self.allocator.clone(),
+                sink,
+            )?;
             if let Some(first) = self.processed.first() {
                 self.min = self.min.min(first.mean);
             }
@@ -204,14 +225,25 @@ impl<A: Allocator + Clone> TDigest<A> {
         if !other.unprocessed.is_empty() {
             self.unprocessed
                 .try_reserve(other.unprocessed.len())
-                .map_err(|_| "ResourceExhausted: reserve merged TDigest centroids".to_string())?;
-            self.unprocessed.extend_from_slice(&other.unprocessed);
+                .map_err(|_| {
+                    sink.allocation(DataRecipe::Static(
+                        "ResourceExhausted: reserve merged TDigest centroids",
+                    ))
+                })?;
+            // The original complete reserve precedes the same ordered byte copies.
+            // Split only the copies into bounded observed work quanta.
+            for chunk in other.unprocessed.chunks(256) {
+                self.unprocessed.extend_from_slice(chunk);
+                for _ in chunk {
+                    sink.observe(WorkObservation::Step)?;
+                }
+            }
             self.unprocessed_weight += other.unprocessed_weight;
         }
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
-        self.process_if_necessary()?;
-        self.update_cumulative()
+        self.process_if_necessary_with_sink(sink)?;
+        self.update_cumulative_with_sink(sink)
     }
 
     fn quantile(&mut self, q: f32) -> Result<Option<f32>, String> {
@@ -233,6 +265,16 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn serialize_binary(&self) -> Vec<u8> {
+        match self.serialize_binary_observed(&mut |_| Ok::<_, std::convert::Infallible>(())) {
+            Ok(bytes) => bytes,
+            Err(never) => match never {},
+        }
+    }
+    fn serialize_binary_observed<E>(
+        &self,
+        observe: &mut dyn FnMut(PercentileEncodeObservation) -> Result<(), E>,
+    ) -> Result<Vec<u8>, E> {
+        observe(PercentileEncodeObservation::OpaqueBegin)?;
         let mut out = Vec::with_capacity(
             4 * std::mem::size_of::<f32>()
                 + 2 * std::mem::size_of::<u64>()
@@ -241,6 +283,7 @@ impl<A: Allocator + Clone> TDigest<A> {
                 + self.unprocessed.len() * 2 * std::mem::size_of::<f32>()
                 + self.cumulative.len() * std::mem::size_of::<f32>(),
         );
+        observe(PercentileEncodeObservation::OpaqueEnd)?;
         out.extend_from_slice(&self.compression.to_le_bytes());
         out.extend_from_slice(&self.min.to_le_bytes());
         out.extend_from_slice(&self.max.to_le_bytes());
@@ -250,19 +293,22 @@ impl<A: Allocator + Clone> TDigest<A> {
         out.extend_from_slice(&self.unprocessed_weight.to_le_bytes());
         out.extend_from_slice(&(self.processed.len() as u32).to_le_bytes());
         for centroid in &self.processed {
+            observe(PercentileEncodeObservation::Step)?;
             out.extend_from_slice(&centroid.mean.to_le_bytes());
             out.extend_from_slice(&centroid.weight.to_le_bytes());
         }
         out.extend_from_slice(&(self.unprocessed.len() as u32).to_le_bytes());
         for centroid in &self.unprocessed {
+            observe(PercentileEncodeObservation::Step)?;
             out.extend_from_slice(&centroid.mean.to_le_bytes());
             out.extend_from_slice(&centroid.weight.to_le_bytes());
         }
         out.extend_from_slice(&(self.cumulative.len() as u32).to_le_bytes());
         for value in &self.cumulative {
+            observe(PercentileEncodeObservation::Step)?;
             out.extend_from_slice(&value.to_le_bytes());
         }
-        out
+        Ok(out)
     }
 
     fn deserialize_binary_in(payload: &[u8], allocator: A) -> Result<Self, String> {
@@ -407,8 +453,14 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn process_if_necessary(&mut self) -> Result<(), String> {
+        self.process_if_necessary_with_sink(&mut LegacyApproxPercentileFailure)
+    }
+    fn process_if_necessary_with_sink<S: ApproxPercentileFailureSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
         if self.is_dirty() {
-            self.process()?;
+            self.process_with_sink(sink)?;
         }
         Ok(())
     }
@@ -730,17 +782,23 @@ impl<A: Allocator + Clone> PercentileState<A> {
 }
 
 pub fn normalize_compression(compression: Option<f64>) -> Result<usize, String> {
+    normalize_compression_with_sink(compression, &mut LegacyApproxPercentileFailure)
+}
+pub fn normalize_compression_with_sink<S: ApproxPercentileFailureSink>(
+    compression: Option<f64>,
+    sink: &mut S,
+) -> Result<usize, S::Error> {
     let Some(value) = compression else {
         return Ok(DEFAULT_COMPRESSION_FACTOR);
     };
     if !value.is_finite() {
-        return Err("percentile compression must be finite".to_string());
+        return Err(sink.data(DataRecipe::Static("percentile compression must be finite")));
     }
     if value <= 0.0 {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "compression parameter must be positive in percentile_approx_weighted, but got: {}",
             value
-        ));
+        ))));
     }
     if !(MIN_COMPRESSION..=MAX_COMPRESSION).contains(&value) {
         return Ok(DEFAULT_COMPRESSION_FACTOR);
@@ -752,8 +810,15 @@ pub fn add_value<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     value: f64,
 ) -> Result<(), String> {
-    state.digest.add(value as f32, 1.0)?;
-    validate_state(state)
+    add_value_with_sink(state, value, &mut LegacyApproxPercentileFailure)
+}
+pub fn add_value_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    state: &mut PercentileState<A>,
+    value: f64,
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    state.digest.add_with_sink(value as f32, 1.0, sink)?;
+    validate_state_with_sink(state, sink)
 }
 
 pub fn add_weighted_value<A: Allocator + Clone>(
@@ -761,39 +826,55 @@ pub fn add_weighted_value<A: Allocator + Clone>(
     value: f64,
     weight: i64,
 ) -> Result<(), String> {
+    add_weighted_value_with_sink(state, value, weight, &mut LegacyApproxPercentileFailure)
+}
+pub fn add_weighted_value_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    state: &mut PercentileState<A>,
+    value: f64,
+    weight: i64,
+    sink: &mut S,
+) -> Result<(), S::Error> {
     if weight < 0 {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "percentile weight must be non-negative, got {}",
             weight
-        ));
+        ))));
     }
     if weight == 0 {
         return Ok(());
     }
-    state.digest.add(value as f32, weight as f32)?;
-    validate_state(state)
+    state
+        .digest
+        .add_with_sink(value as f32, weight as f32, sink)?;
+    validate_state_with_sink(state, sink)
 }
 
 pub fn set_quantile<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     quantile: f64,
 ) -> Result<(), String> {
-    validate_quantile(quantile)?;
+    set_quantile_with_sink(state, quantile, &mut LegacyApproxPercentileFailure)
+}
+pub fn set_quantile_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    state: &mut PercentileState<A>,
+    quantile: f64,
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    validate_quantile_with_sink(quantile, sink)?;
     match &state.quantiles {
         Some(QuantileSpec::Scalar(existing)) => {
             if (existing - quantile).abs() > QUANTILE_TOLERANCE {
-                return Err(format!(
+                return Err(sink.data(DataRecipe::Arguments(format_args!(
                     "percentile quantile mismatch while merging states: existing={} incoming={}",
                     existing, quantile
-                ));
+                ))));
             }
         }
         Some(QuantileSpec::Array(existing)) => {
             if existing.len() != 1 || (existing[0] - quantile).abs() > QUANTILE_TOLERANCE {
-                return Err(
-                    "percentile quantile mismatch while merging states: scalar/array mismatch"
-                        .to_string(),
-                );
+                return Err(sink.data(DataRecipe::Static(
+                    "percentile quantile mismatch while merging states: scalar/array mismatch",
+                )));
             }
         }
         None => state.quantiles = Some(QuantileSpec::Scalar(quantile)),
@@ -805,38 +886,58 @@ pub fn set_quantiles<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     quantiles: &[f64],
 ) -> Result<(), String> {
+    set_quantiles_with_sink(state, quantiles, &mut LegacyApproxPercentileFailure)
+}
+pub fn set_quantiles_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    state: &mut PercentileState<A>,
+    quantiles: &[f64],
+    sink: &mut S,
+) -> Result<(), S::Error> {
     if quantiles.is_empty() {
-        return Err("percentile array cannot be empty".to_string());
+        return Err(sink.data(DataRecipe::Static("percentile array cannot be empty")));
     }
     if quantiles.len() > MAX_QUANTILE_COUNT {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "percentile quantile count {} exceeds {}",
             quantiles.len(),
             MAX_QUANTILE_COUNT
-        ));
+        ))));
     }
-    for &quantile in quantiles {
-        validate_quantile(quantile)?;
+    for &q in quantiles {
+        sink.observe(WorkObservation::Step)?;
+        validate_quantile_with_sink(q, sink)?;
     }
     match &state.quantiles {
         Some(QuantileSpec::Scalar(existing)) => {
             if quantiles.len() != 1 || (existing - quantiles[0]).abs() > QUANTILE_TOLERANCE {
-                return Err(
-                    "percentile quantile mismatch while merging states: scalar/array mismatch"
-                        .to_string(),
-                );
+                return Err(sink.data(DataRecipe::Static(
+                    "percentile quantile mismatch while merging states: scalar/array mismatch",
+                )));
             }
         }
         Some(QuantileSpec::Array(existing)) => {
-            if !same_quantile_vec(existing, quantiles) {
-                return Err("percentile quantile array mismatch while merging states".to_string());
+            let mut same = existing.len() == quantiles.len();
+            if same {
+                for (l, r) in existing.iter().zip(quantiles) {
+                    sink.observe(WorkObservation::Step)?;
+                    if !((*l - *r).abs() <= QUANTILE_TOLERANCE) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if !same {
+                return Err(sink.data(DataRecipe::Static(
+                    "percentile quantile array mismatch while merging states",
+                )));
             }
         }
         None => {
-            state.quantiles = Some(QuantileSpec::Array(try_copy_slice_in(
+            state.quantiles = Some(QuantileSpec::Array(try_copy_slice_with_sink(
                 quantiles,
                 state.allocator.clone(),
                 "percentile quantile array",
+                sink,
             )?))
         }
     }
@@ -847,7 +948,14 @@ pub fn set_compression<A: Allocator + Clone>(
     state: &mut PercentileState<A>,
     compression: f64,
 ) -> Result<(), String> {
-    let normalized = normalize_compression(Some(compression))?;
+    set_compression_with_sink(state, compression, &mut LegacyApproxPercentileFailure)
+}
+pub fn set_compression_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    state: &mut PercentileState<A>,
+    compression: f64,
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    let normalized = normalize_compression_with_sink(Some(compression), sink)?;
     state.compression = normalized;
     if state.digest.is_empty() {
         state.digest = TDigest::new_in(normalized as f32, state.allocator.clone());
@@ -859,20 +967,27 @@ pub fn merge_state<A: Allocator + Clone>(
     target: &mut PercentileState<A>,
     incoming: &PercentileState<A>,
 ) -> Result<(), String> {
-    if let Some(quantiles) = &incoming.quantiles {
-        match quantiles {
-            QuantileSpec::Scalar(q) => set_quantile(target, *q)?,
-            QuantileSpec::Array(qs) => set_quantiles(target, qs)?,
+    merge_state_with_sink(target, incoming, &mut LegacyApproxPercentileFailure)
+}
+pub fn merge_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    target: &mut PercentileState<A>,
+    incoming: &PercentileState<A>,
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    if let Some(q) = &incoming.quantiles {
+        match q {
+            QuantileSpec::Scalar(q) => set_quantile_with_sink(target, *q, sink)?,
+            QuantileSpec::Array(qs) => set_quantiles_with_sink(target, qs, sink)?,
         }
     }
     if target.digest.is_empty() {
         target.compression = incoming.compression;
-        target.digest = incoming.digest.try_clone()?;
-        return validate_state(target);
+        target.digest = incoming.digest.try_clone_with_sink(sink)?;
+        return validate_state_with_sink(target, sink);
     }
     target.compression = target.compression.max(incoming.compression);
-    target.digest.merge(&incoming.digest)?;
-    validate_state(target)
+    target.digest.merge_with_sink(&incoming.digest, sink)?;
+    validate_state_with_sink(target, sink)
 }
 
 pub fn merge_serialized_state_into(
@@ -891,14 +1006,28 @@ pub fn merge_bounded_serialized_state_into(
     target: &mut PercentileState<impl Allocator + Clone>,
     payload: &[u8],
 ) -> Result<(), String> {
+    merge_bounded_serialized_state_into_with_sink(
+        target,
+        payload,
+        &mut LegacyApproxPercentileFailure,
+    )
+}
+pub fn merge_bounded_serialized_state_into_with_sink<
+    A: Allocator + Clone,
+    S: ApproxPercentileFailureSink,
+>(
+    target: &mut PercentileState<A>,
+    payload: &[u8],
+    sink: &mut S,
+) -> Result<(), S::Error> {
     if payload.get(1).copied() != Some(PERCENTILE_STATE_VERSION) {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "bounded percentile aggregate requires state version {PERCENTILE_STATE_VERSION}"
-        ));
+        ))));
     }
-    let decoded = decode_state_v4_in(payload, target.allocator())?;
-    merge_state(target, &decoded)?;
-    validate_state(target)
+    let decoded = decode_state_v4_with_sink(payload, target.allocator(), sink)?;
+    merge_state_with_sink(target, &decoded, sink)?;
+    validate_state_with_sink(target, sink)
 }
 
 pub fn encode_empty_state() -> Vec<u8> {
@@ -955,7 +1084,23 @@ pub fn scalar_hash_codec_extent<A: Allocator + Clone>(state: &PercentileState<A>
         .checked_add(actual_length)
 }
 
+/// Work observation at the original serializer, never memory permission.
+#[derive(Clone, Copy, Debug)]
+pub enum PercentileEncodeObservation {
+    Step,
+    OpaqueBegin,
+    OpaqueEnd,
+}
 pub fn encode_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Vec<u8> {
+    match encode_state_observed(state, &mut |_| Ok::<_, std::convert::Infallible>(())) {
+        Ok(bytes) => bytes,
+        Err(never) => match never {},
+    }
+}
+pub fn encode_state_observed<A: Allocator + Clone, E>(
+    state: &PercentileState<A>,
+    observe: &mut dyn FnMut(PercentileEncodeObservation) -> Result<(), E>,
+) -> Result<Vec<u8>, E> {
     let (quantile_kind, quantiles) = match &state.quantiles {
         Some(QuantileSpec::Scalar(q)) => (QUANTILE_KIND_SCALAR, std::slice::from_ref(q)),
         Some(QuantileSpec::Array(values)) => (QUANTILE_KIND_ARRAY, values.as_slice()),
@@ -964,20 +1109,29 @@ pub fn encode_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Vec<u8>
     let digest_payload = if state.digest.is_empty() {
         Vec::new()
     } else {
-        state.digest.serialize_binary()
+        state.digest.serialize_binary_observed(observe)?
     };
+    observe(PercentileEncodeObservation::OpaqueBegin)?;
     let mut out =
         Vec::with_capacity(HEADER_LEN + std::mem::size_of_val(quantiles) + digest_payload.len());
+    observe(PercentileEncodeObservation::OpaqueEnd)?;
     out.push(PERCENTILE_STATE_MAGIC);
     out.push(PERCENTILE_STATE_VERSION);
     out.push(quantile_kind);
     out.extend_from_slice(&(state.compression as u32).to_le_bytes());
     out.extend_from_slice(&(quantiles.len() as u32).to_le_bytes());
     for quantile in quantiles {
+        observe(PercentileEncodeObservation::Step)?;
         out.extend_from_slice(&quantile.to_le_bytes());
     }
+    if !digest_payload.is_empty() {
+        observe(PercentileEncodeObservation::OpaqueBegin)?;
+    }
     out.extend_from_slice(&digest_payload);
-    out
+    if !digest_payload.is_empty() {
+        observe(PercentileEncodeObservation::OpaqueEnd)?;
+    }
+    Ok(out)
 }
 
 pub fn decode_state(payload: &[u8]) -> Result<PercentileState, String> {
@@ -1179,24 +1333,22 @@ pub fn validate_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailure
 }
 
 fn validate_quantile(quantile: f64) -> Result<(), String> {
+    validate_quantile_with_sink(quantile, &mut LegacyApproxPercentileFailure)
+}
+fn validate_quantile_with_sink<S: ApproxPercentileFailureSink>(
+    quantile: f64,
+    sink: &mut S,
+) -> Result<(), S::Error> {
     if !quantile.is_finite() {
-        return Err("percentile quantile must be finite".to_string());
+        return Err(sink.data(DataRecipe::Static("percentile quantile must be finite")));
     }
     if !(0.0..=1.0).contains(&quantile) {
-        return Err(format!(
+        return Err(sink.data(DataRecipe::Arguments(format_args!(
             "percentile quantile must be between 0 and 1, got {}",
             quantile
-        ));
+        ))));
     }
     Ok(())
-}
-
-fn same_quantile_vec(left: &[f64], right: &[f64]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(l, r)| (*l - *r).abs() <= QUANTILE_TOLERANCE)
 }
 
 fn merge_sorted_centroids<A: Allocator + Clone>(
@@ -1204,33 +1356,49 @@ fn merge_sorted_centroids<A: Allocator + Clone>(
     right: &[Centroid],
     allocator: A,
 ) -> Result<AllocVec<Centroid, A>, String> {
+    merge_sorted_centroids_with_sink(left, right, allocator, &mut LegacyApproxPercentileFailure)
+}
+fn merge_sorted_centroids_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
+    left: &[Centroid],
+    right: &[Centroid],
+    allocator: A,
+    sink: &mut S,
+) -> Result<AllocVec<Centroid, A>, S::Error> {
     if left.is_empty() {
-        return try_copy_slice_in(right, allocator, "TDigest right centroids");
+        return try_copy_slice_with_sink(right, allocator, "TDigest right centroids", sink);
     }
     if right.is_empty() {
-        return try_copy_slice_in(left, allocator, "TDigest left centroids");
+        return try_copy_slice_with_sink(left, allocator, "TDigest left centroids", sink);
     }
     let capacity = left
         .len()
         .checked_add(right.len())
-        .ok_or_else(|| "TDigest merge length overflow".to_string())?;
+        .ok_or_else(|| sink.data(DataRecipe::Static("TDigest merge length overflow")))?;
     let mut merged = AllocVec::new_in(allocator);
-    merged
-        .try_reserve_exact(capacity)
-        .map_err(|_| "ResourceExhausted: reserve TDigest merge".to_string())?;
-    let mut left_idx = 0usize;
-    let mut right_idx = 0usize;
-    while left_idx < left.len() && right_idx < right.len() {
-        if left[left_idx].mean <= right[right_idx].mean {
-            merged.push(left[left_idx]);
-            left_idx += 1;
+    merged.try_reserve_exact(capacity).map_err(|_| {
+        sink.allocation(DataRecipe::Static(
+            "ResourceExhausted: reserve TDigest merge",
+        ))
+    })?;
+    let (mut li, mut ri) = (0usize, 0usize);
+    while li < left.len() && ri < right.len() {
+        sink.observe(WorkObservation::Step)?;
+        if left[li].mean <= right[ri].mean {
+            merged.push(left[li]);
+            li += 1;
         } else {
-            merged.push(right[right_idx]);
-            right_idx += 1;
+            merged.push(right[ri]);
+            ri += 1;
         }
     }
-    merged.extend_from_slice(&left[left_idx..]);
-    merged.extend_from_slice(&right[right_idx..]);
+    for value in &left[li..] {
+        sink.observe(WorkObservation::Step)?;
+        merged.push(*value);
+    }
+    for value in &right[ri..] {
+        sink.observe(WorkObservation::Step)?;
+        merged.push(*value);
+    }
     Ok(merged)
 }
 
