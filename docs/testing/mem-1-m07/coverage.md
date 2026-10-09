@@ -522,3 +522,11 @@ Unix v1字节/16tests和旧freezes未变；wire-v2/newfreeze/strictdecoder仅新
 Unix组件 **20 PASS / 0 FAIL / 0 ignored，0.99s**（原v1 16＋v2 4）；runner组件 **43 PASS / 0 FAIL / 0 ignored，0.61s**（v1 17＋v2 26）；feature adapter milestone **139 PASS / 0 FAIL / 0 ignored，2.58s**；feature/default server check PASS，13.04s/9.73s。首次误用dev-opt造成无关profile重编译，root停止task-owned进程，原中断log保留；随后module path/import编译FAIL日志保留，修正后PASS。新Unix测试固定49B读缓冲、同原3s绝对clock，先originalowner close/exactinode清理再断言；Drop只作物理兜底，不作cleanup收据。
 
 744B独立literal只是最大option布局模型，不当实际W2历史。实际v2 Unix Stop/version拒绝和runner pair-stream证明组件协议，不证明实际FE身份、prelaunch时钟、Root/backing/ACK或four-role exit。真实1FE+3BE exact矩阵仍OPEN，本slice Native/Docker为0；formalrelease性能排除fixture feature。收据 `docs/testing/mem-1-m07/evidence/p09-private-unix-frame-v2-components-20261009.json`。HMS仍按IRU-7用户只读范围，其余人工语义门不改，无push/PR/归档。
+
+### P09 HMS readonly CL external preparation host checkpoint (2026-10-09)
+
+新增caller-owned库式bulk helper，不改旧small helper/freezes：沿原RuntimeOwner/HiveOwner持有全生命周期，原32namespace×512真实table＋512trueview分128pair×4shard，正常external生命周期预计514个fresh stock JVM。caller必须供一次immutable prepare/verification/cleanup绝对clock；原每child cap只向其clamp。未知mutation prefix/实际child或Native依赖未退出时保留owner，不重Create、不把预先/后置oracle当transient observer。Native未settle时拒fixture销毁；validator由主线真实四role/source/config/exit证据另行实现。
+
+host unittest **27 PASS / 0 FAIL，0.197s**，保留全部参数组合与两项真实短Pythonchild capture/实际退出检查；不引入pytest依赖。反例覆盖final cleanup/fsync late失败、不刷新clock、迟到成功收据改FAILED/覆盖失败则撤销精确private artifact、原异常对象和次错。源码模板/合成metadata验证器并非Java/HMS执行，库不启动Nova/HMS/provider。
+
+本slice stockJVM/Native/Docker均0。可执行clean-source/base/bulk冻结、外部固定预算、真实stock准备成本、大只读CL native driver、8positions/SDK future实际退出/取消恢复、真实四role退出仍OPEN。ignored新freeze保持draft/null/false，不能执行；旧规模/caps和产品期限不放宽。HMS Nova写/FORCE正确性继续IRU-7用户excluded，stock外部create/drop属于fixture必要工作；REST/Hadoop/Paimon边界无改。收据 `docs/testing/mem-1-m07/evidence/p09-hms-readonly-cl-bulk-host-components-20261009.json`。无push/PR/归档。
