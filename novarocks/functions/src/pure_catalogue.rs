@@ -239,6 +239,25 @@ impl PureOverloadDeclaration<'_> {
             .metadata_owner
             .admit_selected_profile_observed(selected, logical_argument_count, control)
     }
+    /// Check the actual owner's frozen semantic references without preparing
+    /// a kernel, evaluating constants or refining runtime effects again.
+    pub fn admit_frozen_environment_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        environment: &[novarocks_type_contract::SemanticParameterRef],
+        parameters: &novarocks_type_contract::SemanticParameters,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        if selected.overload != self.implementation().overload {
+            return Err(FunctionBindingError::InvalidBinding(
+                "environment admission differs from its exact selected overload".into(),
+            ));
+        }
+        self.attachment.metadata_owner.admit_frozen_environment_observed(
+            selected, environment, parameters, control,
+        )
+    }
     /// Borrow the exact installed metadata owner; no fresh resolution or
     /// prepared instance is constructed at this static FE admission boundary.
     pub fn admit_selected_profile_observed(
@@ -291,6 +310,24 @@ pub trait PureFunctionMetadataOwner:
         control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
         Ok(())
     }
+    /// An owner with semantic dependencies supplies its original checker.
+    /// The empty-dependency branch grants only this exact environment shape;
+    /// it is not a complete profile or runtime-effects certificate.
+    fn admit_frozen_environment_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        environment: &[novarocks_type_contract::SemanticParameterRef],
+        _parameters: &novarocks_type_contract::SemanticParameters,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        let base = self.binding_declaration().effect_declaration(&selected.overload)?;
+        if !base.environment_dependencies.is_empty() || !environment.is_empty() {
+            return Err(FunctionBindingError::UnavailableImplementation(selected.overload.clone()));
+        }
+        Ok(())
+    }
+
 }
 
 /// An independently assembled record of actually installed CPU/control

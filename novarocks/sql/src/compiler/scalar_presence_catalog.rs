@@ -98,6 +98,23 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             control,
         )
     }
+    fn admit_bound_environment_observed(
+        &self,
+        binding: &ResolvedFunctionBinding,
+        environment: &[novarocks_type_contract::SemanticParameterRef],
+        parameters: &novarocks_type_contract::SemanticParameters,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        match self.original.pure_overload_declaration_observed(
+            &binding.function_id, binding.kind, &binding.selected.overload, control,
+        ) {
+            Ok(loan) => loan.admit_frozen_environment_observed(&binding.selected, environment, parameters, control),
+            Err(FunctionSpecializationFailure::Control(cause)) => Err(FunctionBindingError::Control(cause)),
+            Err(FunctionSpecializationFailure::MissingPureImplementation(overload)) => Err(FunctionBindingError::UnavailableImplementation(overload)),
+            Err(FunctionSpecializationFailure::Binding(error)) => Err(error),
+            Err(error) => Err(FunctionBindingError::InvalidBinding(error.to_string().into())),
+        }
+    }
     fn admit_native_bitnot_source_observed(
         &self,
         source: &novarocks_functions::FunctionValueType,

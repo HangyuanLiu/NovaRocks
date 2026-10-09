@@ -195,6 +195,19 @@ impl PureFunctionMetadataOwner for ConcatOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_frozen_environment_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        environment: &[novarocks_type_contract::SemanticParameterRef],
+        parameters: &novarocks_type_contract::SemanticParameters,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        valid_environment_references(environment, parameters)
+            .map(|_| ())
+            .map_err(|_| FunctionBindingError::UnavailableImplementation(selected.overload.clone()))
+    }
+
 }
 impl FunctionEffectOwner for ConcatOwner {
     type Error = FunctionBindingError;
@@ -364,16 +377,21 @@ impl PureAggregateImplementation for ConcatOwner {
 }
 
 fn valid_environment(input: CallEffectInput<'_>) -> Result<(bool, i64), FunctionBindingError> {
-    if input.environment.len() != 2 {
+    valid_environment_references(input.environment, input.parameters)
+}
+fn valid_environment_references(
+    environment: &[novarocks_type_contract::SemanticParameterRef],
+    parameters: &novarocks_type_contract::SemanticParameters,
+) -> Result<(bool, i64), FunctionBindingError> {
+    if environment.len() != 2 {
         return Err(FunctionBindingError::InvalidBinding(
             "group_concat requires exactly its two semantic references".into(),
         ));
     }
     let mut mode = None;
     let mut max_len = None;
-    for reference in input.environment {
-        let value = input
-            .parameters
+    for reference in environment {
+        let value = parameters
             .require(*reference)
             .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
         match value {

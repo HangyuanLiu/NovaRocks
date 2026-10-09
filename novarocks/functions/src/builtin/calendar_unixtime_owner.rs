@@ -176,6 +176,19 @@ impl PureFunctionMetadataOwner for FromUnixtimeOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_frozen_environment_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        environment: &[novarocks_type_contract::SemanticParameterRef],
+        parameters: &novarocks_type_contract::SemanticParameters,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        valid_environment_references(environment, parameters)
+            .map(|_| ())
+            .map_err(|_| FunctionBindingError::UnavailableImplementation(selected.overload.clone()))
+    }
+
 }
 
 impl FunctionEffectOwner for FromUnixtimeOwner {
@@ -327,11 +340,15 @@ impl ScalarKernelInstance for FromUnixtimeInstance {
     }
 }
 
-fn valid_environment(
-    input: CallEffectInput<'_>,
+fn valid_environment(input: CallEffectInput<'_>) -> Result<super::calendar_unixtime::TimeZoneSpec, FunctionBindingError> {
+    valid_environment_references(input.environment, input.parameters)
+}
+fn valid_environment_references(
+    environment: &[novarocks_type_contract::SemanticParameterRef],
+    parameters: &novarocks_type_contract::SemanticParameters,
 ) -> Result<super::calendar_unixtime::TimeZoneSpec, FunctionBindingError> {
     use novarocks_type_contract::{SemanticParameterKey, SemanticParameterValue};
-    let [reference] = input.environment else {
+    let [reference] = environment else {
         return Err(FunctionBindingError::InvalidBinding(
             "from_unixtime requires exactly its original frozen TimeZone reference".into(),
         ));
@@ -341,8 +358,7 @@ fn valid_environment(
             "from_unixtime semantic reference is not TimeZone".into(),
         ));
     }
-    let value = input
-        .parameters
+    let value = parameters
         .require(*reference)
         .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
     let SemanticParameterValue::TimeZone(zone) = value else {

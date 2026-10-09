@@ -1613,3 +1613,9 @@ mod e08s1_mv_original_catalogue_tests;
 
 #[cfg(test)]
 mod e08s1_mv_catalogue_retention_tests;
+
+#[cfg(test)]
+mod e08s1_environment_original_tests;
+
+#[cfg(test)]
+mod e08s1_environment_tests;

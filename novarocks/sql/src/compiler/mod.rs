@@ -230,6 +230,18 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Actual same-source frozen environment admission. Original catalogues
+    /// retain their original path without lookup, preparation or added work.
+    fn admit_bound_environment_observed(
+        &self,
+        _binding: &novarocks_functions::ResolvedFunctionBinding,
+        _environment: &[novarocks_type_contract::SemanticParameterRef],
+        _parameters: &novarocks_type_contract::SemanticParameters,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
     /// Original catalogues retain the original intrinsic input domain. Only
     /// the explicit Exact request scope installs this source-shape admission.
     /// No query mode is inferred from a runtime value or constant payload.
