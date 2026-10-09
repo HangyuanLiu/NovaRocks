@@ -128,6 +128,7 @@ fn external_sql_contract_analyzes_and_optimizes_query() {
                 max_library_validation_work: 1 << 24,
                 max_library_validation_bytes: 1 << 24,
             },
+            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         );
 

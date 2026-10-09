@@ -391,6 +391,7 @@ fn catalogue_dml_read_completion_retains_its_optimized_owner_without_recapture()
         noop_constant_evaluator(),
         None,
         crate::constant::test_constant_policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
     ))
     .expect("actual analysis")

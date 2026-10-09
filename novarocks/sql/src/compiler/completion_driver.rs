@@ -548,6 +548,7 @@ fn analyze_with_catalog(
         common.constant_evaluator,
         mv_definitions,
         common.constant_policy,
+        common.emission_mode,
         control.clone(),
     );
     match SqlCompiler::analyze(request)? {
@@ -1355,6 +1356,7 @@ mod tests {
                 input.constant_evaluator,
                 None,
                 crate::constant::test_constant_policy(),
+                input.emission_mode,
                 input.control.clone(),
             ))
             .unwrap()
@@ -3033,6 +3035,7 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         ))
         .expect("analysis")

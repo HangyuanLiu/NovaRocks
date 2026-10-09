@@ -102,6 +102,8 @@ pub enum AnalyzeErrorKind {
     InvalidArgument,
     InvalidQueryShape,
     UnsupportedExpression,
+    /// Candidate-carrier implementation admission; the public code remains unsupported_expression.
+    UnavailableImplementation,
     UnsupportedQueryShape,
     Internal,
 }
@@ -117,7 +119,7 @@ impl AnalyzeErrorKind {
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
-            Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
+            Self::UnsupportedExpression | Self::UnavailableImplementation => UNSUPPORTED_EXPRESSION,
             Self::UnsupportedQueryShape => UNSUPPORTED_QUERY_SHAPE,
             Self::Internal => INTERNAL,
         }
@@ -207,6 +209,14 @@ impl AnalyzeError {
     pub(crate) fn function_binding(error: novarocks_functions::FunctionBindingError) -> Self {
         match error {
             novarocks_functions::FunctionBindingError::Control(error) => Self::control(error),
+            error @ novarocks_functions::FunctionBindingError::UnavailableImplementation(_) => {
+                Self {
+                    kind: AnalyzeErrorKind::UnavailableImplementation,
+                    message: error.to_string(),
+                    span: None,
+                    control: None,
+                }
+            }
             error => Self::internal(error.to_string()),
         }
     }
@@ -223,6 +233,11 @@ impl AnalyzeError {
     pub(crate) fn at_type_mismatch(self, span: Span) -> Self {
         if self.control.is_some() {
             self
+        } else if self.kind == AnalyzeErrorKind::UnavailableImplementation {
+            Self {
+                span: Some(span),
+                ..self
+            }
         } else {
             Self::type_mismatch(self.message, span)
         }
@@ -231,6 +246,11 @@ impl AnalyzeError {
     pub(crate) fn at_invalid_argument(self, span: Span) -> Self {
         if self.control.is_some() {
             self
+        } else if self.kind == AnalyzeErrorKind::UnavailableImplementation {
+            Self {
+                span: Some(span),
+                ..self
+            }
         } else {
             Self::invalid_argument(self.message, span)
         }

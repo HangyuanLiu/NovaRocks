@@ -319,6 +319,7 @@ pub fn analyze_mv_first_refresh_connector_write(
         context.constant_evaluator,
         None,
         context.constant_policy,
+        context.emission_mode,
         context.control,
     );
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
@@ -447,6 +448,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
+        context.emission_mode,
         context.control.clone(),
     );
     let logical_output = crate::compiler::SqlCompiler::analyze(request)?
@@ -483,6 +485,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.environment,
         Some(context.constant_evaluator),
         context.constant_policy,
+        context.emission_mode,
         context.control,
     )
     .with_function_catalog(context.functions.snapshot());
@@ -623,6 +626,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
+        context.emission_mode,
         context.control.clone(),
     );
     let logical_output = crate::compiler::SqlCompiler::analyze(request)?
@@ -657,6 +661,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         crate::compiler::SqlPlanningEnvironment::NotApplicable,
         Some(context.constant_evaluator),
         context.constant_policy,
+        context.emission_mode,
         context.control,
     )
     .with_function_catalog(context.functions.snapshot());
@@ -845,6 +850,7 @@ pub fn analyze_mv_incremental_refresh_change_stream(
         context.functions,
         context.constant_evaluator,
         context.constant_policy,
+        context.emission_mode,
         context.control,
     );
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
@@ -974,6 +980,7 @@ fn canonical_incremental_change_stream_request<'a>(
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
     crate::compiler::SqlAnalyzeRequest::new(
@@ -991,6 +998,7 @@ fn canonical_incremental_change_stream_request<'a>(
         constant_evaluator,
         None,
         constant_policy,
+        emission_mode,
         control,
     )
     .with_imv_rewrite(imv_rewrite)
@@ -1691,6 +1699,7 @@ fn plain_join_first_refresh_logical_request<'a>(
     constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     sql_semantics: crate::sql_mode::SqlSemanticSettings,
     constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
     crate::compiler::SqlAnalyzeRequest::new(
@@ -1708,6 +1717,7 @@ fn plain_join_first_refresh_logical_request<'a>(
         constant_evaluator,
         None,
         constant_policy,
+        emission_mode,
         control,
     )
 }
@@ -3149,6 +3159,7 @@ mod tests {
             crate::compiler::noop_constant_evaluator(),
             crate::sql_mode::SqlSemanticSettings::default(),
             crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_none());
@@ -3176,6 +3187,7 @@ mod tests {
             crate::compiler::noop_constant_evaluator(),
             crate::sql_mode::SqlSemanticSettings::default(),
             crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_none());
@@ -3206,6 +3218,7 @@ mod tests {
             &functions,
             crate::compiler::noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_some());
@@ -4014,6 +4027,7 @@ mod tests {
             crate::compiler::noop_constant_evaluator(),
             effective.clone(),
             constant_policy,
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
         );
         let logical = crate::compiler::SqlCompiler::analyze(request)
@@ -4035,6 +4049,7 @@ mod tests {
             crate::compiler::SqlPlanningEnvironment::NotApplicable,
             Some(crate::compiler::noop_constant_evaluator()),
             constant_policy,
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
         )
         .with_function_catalog(functions.snapshot());

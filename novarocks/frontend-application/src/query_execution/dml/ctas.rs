@@ -652,6 +652,7 @@ fn plan_query_for_ctas_source(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         state.constant_policy(),
+        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)

@@ -5883,7 +5883,13 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                 binding: exact,
             })
         }
-        Err(error) if error.control_error().is_some() => Err(error),
+        Err(error)
+            if error.control_error().is_some()
+                || error.kind()
+                    == crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
+        {
+            Err(error)
+        }
         Err(error) => Err(AnalyzeError::internal(format!(
             "cannot bind scalar function `{name}` for argument types {arg_types:?}: {error}"
         ))),

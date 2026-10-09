@@ -442,6 +442,7 @@ fn compile_dml_change_stream_write(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         state.constant_policy(),
+        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -3038,6 +3039,7 @@ fn execute_exact_cow_match_query(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         state.constant_policy(),
+        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)

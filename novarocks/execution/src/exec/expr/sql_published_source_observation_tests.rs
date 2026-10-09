@@ -181,6 +181,7 @@ fn dml(
         noop_constant_evaluator(),
         None,
         super::pure_differential::constant_policy(),
+        mode,
         control.clone(),
     ))?
     .into_pending()?;

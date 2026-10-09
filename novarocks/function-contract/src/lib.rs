@@ -201,6 +201,9 @@ impl<C> Clone for FunctionBindingRequest<'_, C> {
 pub enum FunctionBindingError {
     Control(CompileControlError),
     MissingEffectDeclaration(FunctionOverloadId),
+    /// A selected implementation is unavailable in the host-selected carrier.
+    /// This is compile admission, not a data error from evaluating the call.
+    UnavailableImplementation(FunctionOverloadId),
     UnknownFunction,
     HiddenFunction,
     MissingBindingDeclaration,
@@ -222,6 +225,11 @@ impl fmt::Display for FunctionBindingError {
             Self::MissingEffectDeclaration(identity) => write!(
                 formatter,
                 "selected overload `{}` has no complete effect declaration",
+                identity.as_str()
+            ),
+            Self::UnavailableImplementation(identity) => write!(
+                formatter,
+                "selected overload `{}` has no installed implementation for the selected carrier",
                 identity.as_str()
             ),
             Self::UnknownFunction => formatter.write_str("function is not registered"),

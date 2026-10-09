@@ -70,6 +70,7 @@ fn analyze(sql: &str) {
         &EVALUATOR,
         None,
         super::pure_differential::constant_policy(),
+        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         SqlCompileControl::unbounded(),
     );
     SqlCompiler::analyze(request)

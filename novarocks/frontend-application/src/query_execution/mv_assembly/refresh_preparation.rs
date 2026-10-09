@@ -270,6 +270,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
         &visible_query,
         ports.function_catalog().as_ref(),
         ports.constant_policy(),
+        ports.sql_emission_mode(),
         crate::query_execution::planning::sql_compile_control_from_connector_request(
             connector_context,
         ),
@@ -606,6 +607,7 @@ fn prepare_managed_repartition_transition(
         &query,
         source.function_catalog().as_ref(),
         source.constant_policy(),
+        source.sql_emission_mode(),
         completion_control.clone(),
     )?;
     validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;

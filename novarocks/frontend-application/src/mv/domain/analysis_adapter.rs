@@ -325,6 +325,7 @@ pub fn analyze_mv_select_with_provider(
     query: &novarocks_parser::ast::Query,
     functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
     constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     control: novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError> {
     let prepared =
@@ -332,6 +333,7 @@ pub fn analyze_mv_select_with_provider(
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(provider);
     let refresh_input = novarocks_sql::compiler::analyze_mv_refresh_input(
         novarocks_sql::compiler::SqlMvRefreshAnalysisContext {
+            emission_mode,
             query: Box::new(prepared.query_for_analysis().clone()),
             current_database: current_database.to_string(),
             catalog: &catalog,
@@ -738,6 +740,7 @@ mod compile_control_tests {
                 &query,
                 novarocks_sql::compiler::builtin_sql_function_catalog(),
                 crate::application::test_constant_policy(),
+                novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control,
             );
             assert!(matches!(

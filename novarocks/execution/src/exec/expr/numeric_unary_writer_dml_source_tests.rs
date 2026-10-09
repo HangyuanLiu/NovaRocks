@@ -88,6 +88,7 @@ fn source(
         novarocks_sql::compiler::noop_constant_evaluator(),
         None,
         super::pure_differential::constant_policy(),
+        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
     ))
     .unwrap()

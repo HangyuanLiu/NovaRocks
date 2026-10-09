@@ -4080,6 +4080,7 @@ mod tests {
                     crate::compiler::noop_constant_evaluator(),
                     None,
                     constant_policy,
+                    crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                     SqlCompileControl::unbounded(),
                 ))
                 .unwrap()
@@ -4138,6 +4139,7 @@ mod tests {
                 crate::compiler::noop_constant_evaluator(),
                 None,
                 crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 SqlCompileControl::unbounded(),
             ))
             .unwrap()

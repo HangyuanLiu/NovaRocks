@@ -1430,6 +1430,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         DmlQueryExecutionKernel::constant_policy(state),
+        DmlQueryExecutionKernel::static_plan_carrier(state).sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)

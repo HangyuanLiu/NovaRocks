@@ -111,6 +111,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
     novarocks_sql::compiler::compile_imv_refresh_explain_lines(
         novarocks_sql::compiler::SqlImvRefreshExplainContext {
+            emission_mode: ports.sql_emission_mode(),
             canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
             imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput::new(
                 rewrite.to_sql_rewrite_snapshot(target_binding_id)?,

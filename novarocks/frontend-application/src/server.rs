@@ -132,6 +132,7 @@ pub struct FrontendServingConfig {
 /// assembly consumes these products; it does not start maintenance or MV
 /// workers as a side effect of creating a client-facing factory.
 struct FrontendRoleProducts {
+    sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     /// The complete catalog lifecycle moves here only after all fallible
     /// product construction has succeeded, so Host retains it for startup
     /// rollback and role products retain it for serving shutdown.
@@ -192,6 +193,7 @@ impl FrontendRoleProducts {
                         .management_entrance()
                         .expect("serving MV product owns document-management authority"),
                     self.constant_policy,
+                    self.sql_emission_mode,
                 ),
                 Arc::clone(&self.maintenance_engine),
             ))
@@ -482,6 +484,7 @@ async fn build_frontend_role_products(
     // MV product.
     let catalog_runtime = host.take_catalog_role_runtime()?;
     Ok(FrontendRoleProducts {
+        sql_emission_mode: host.static_plan_carrier().sql_emission_mode(),
         catalog_runtime,
         catalog_service,
         unified_statistics,
@@ -610,6 +613,7 @@ fn build_frontend_query_session_factory_from_role_products(
             products.mv_product_service.management_continuation(),
             host.mv_management_audit_sink(),
             host.constant_policy(),
+            host.static_plan_carrier().sql_emission_mode(),
         ));
     let mv_command_consumer: Arc<
         dyn novarocks_query_application::api::MaterializedViewCommandConsumer,

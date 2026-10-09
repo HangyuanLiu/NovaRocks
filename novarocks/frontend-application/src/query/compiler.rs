@@ -891,6 +891,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::constant_eval::constant_evaluator(),
             mv_definitions,
             self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
             sql_compile_control_from_execution(execution),
         ))
     }
