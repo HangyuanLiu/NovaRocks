@@ -852,7 +852,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                             let outcome = crate::governed_result_writer::write_streaming_query_result_with_gate(
                                 result, results, hook,
                             ).await;
-                            if outcome.is_err() {
+                            if outcome.as_ref().is_err_and(|error| {
+                                !crate::mysql_write_gate::late_binding::PrescribedRelayEof::from_error(error)
+                                    .is_some_and(|eof| eof.matches(self.connection, Some(token)))
+                            }) {
                                 // A bounded fixture summary keeps original scope first cause;
                                 // the original typed IO error is still returned unchanged.
                                 hub.fail_selected(self.connection, crate::mysql_write_gate::GateFailure::Transition);
@@ -1261,3 +1264,7 @@ mod tests {
         assert_eq!(reason, ClientConnectionTerminationReason::ServerShutdown);
     }
 }
+
+#[cfg(all(test, feature = "mem-1-m07-exact-mysql-write"))]
+#[path = "query_application_shim/exact_eof_tests.rs"]
+mod exact_eof_tests;

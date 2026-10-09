@@ -498,3 +498,11 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 独立 Unix frame-v1 codec/client 已接入 system runner actors（而非草稿 SQL runner 路径），无 adapter/gate/private token 依赖；原 source/tests 字节不变，manifest/lock 未改。严格 4096 全 wire、完整 FE UUID、canonical TLVs/bool/options/enums/尾随拒绝、真实 partial EOF/长度/hash、单原 UnixStream owner、取消借用后禁止复用及跨命令原 absolute deadline 定向 **17 PASS / 0 FAIL / 0 ignored，0.22s**。
 
 这仍是 component evidence：原 scene 20s / FE child fixture locator、actual FE 独立来源、真实服务端三指令互通、精确 native cut/W2/Closing/ACK/恢复/四 role 退出保持 OPEN。实际 server 16 指令包括 Stop，第16次非Stop失败；client pair-stream cap测试不能当 server 健康证明。收据 `docs/testing/mem-1-m07/evidence/p09-runner-unix-frame-v1-components-20261009.json`。HMS继续按已记录只读scope；其它容量、期限、待裁决语义无改动。
+
+### P09 prescribed relay EOF component checkpoint (2026-10-09)
+
+仅 opt-in fixture：原 close_relay 实际 typed Capacity 准入拒绝 / 已验证连续 row 缺尾分支，在精确原 hook、statement 和 cancel receipt 验真后给这**一个**返回错误附 opaque 非clone原因；actual原 IO source move 保留。不按 ErrorKind、字符串或全连接 bit 放行；未知/已规定 EOF 的首 cause 分别固定槽留存，Control、错 generation、第二 EOF不豁免；原第四 ownerfinish 同原 gate receipt 检查。
+
+真实注册 TCP 握手 / 原 intermediary / socket EOF / watcher actual join / registry drain 的三项定向 PASS；缺尾使用一个真实V1 partial1MiB body，满池使用实际64个原V1 Closing grant，不改配置。feature adapter full **133 PASS / 0 FAIL / 0 ignored，2.56s**；后加 mint/geometry 两项 focused PASS；default和feature server编译PASS。初次missing import与test select返回值编译失败日志保留。
+
+严格边界：这未证明 native W2双item、原生fullpool/Root/wire/ACK/健康恢复/四role退出；同kind字符串/Control/第二EOF是ledger组件负例。非Capacity/backing拒绝与完整facade混合cause尚无独立用例。actual FE独立marker和prelaunch20s原clock仍待接线；generic stop不代表FE ownerfinish成功。收据 `docs/testing/mem-1-m07/evidence/p09-prescribed-relay-eof-components-20261009.json`；默认产品失败返回、cap、30s/5s/20s无变更，无push/PR/归档。

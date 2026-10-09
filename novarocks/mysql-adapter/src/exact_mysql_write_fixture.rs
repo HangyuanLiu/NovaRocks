@@ -60,6 +60,7 @@ pub struct MysqlWriteFixtureError {
     join: Option<JoinError>,
     watcher_join: Option<JoinError>,
     protocol: Option<crate::listener::MysqlFixtureProtocolFailure>,
+    prescribed_eof: Option<crate::listener::MysqlFixtureProtocolFailure>,
     gate: Option<io::Error>,
     invalid_facts: bool,
     aborted_sessions: u64,
@@ -100,6 +101,9 @@ impl fmt::Display for MysqlWriteFixtureError {
         if let Some(error) = &self.protocol {
             write!(f, "; {error}")?;
         }
+        if let Some(error) = &self.prescribed_eof {
+            write!(f, "; retained prescribed exit: {error}")?;
+        }
         if let Some(facts) = &self.watcher_facts {
             write!(f, "; original_watchers={facts:?}")?;
         }
@@ -138,7 +142,10 @@ impl std::error::Error for MysqlWriteFixtureError {
         if let Some(error) = &self.protocol {
             return Some(error);
         }
-        self.gate.as_ref().map(|error| error as _)
+        if let Some(error) = &self.gate {
+            return Some(error);
+        }
+        self.prescribed_eof.as_ref().map(|error| error as _)
     }
 }
 impl MysqlWriteFixture {
@@ -240,9 +247,19 @@ impl MysqlWriteFixture {
             });
         let join = self.joins.take_failure_after_join();
         let protocol = self.joins.take_protocol_failure_after_join();
+        let prescribed_eof = self.joins.take_prescribed_eof_after_join();
+        let invalid_prescribed = match (&prescribed_eof, joins.prescribed_protocol_eofs) {
+            (None, 0) => false,
+            (Some(exit), 1) => !hub.gate.is_some_and(|gate| {
+                crate::mysql_write_gate::late_binding::PrescribedRelayEof::from_error(&exit.cause)
+                    .is_some_and(|eof| eof.matches_gate(&gate))
+            }),
+            _ => true,
+        };
         let watcher_join = self.joins.take_watcher_failure_after_join();
         let gate = self.control.finish_after_protocol_join().err();
         if invalid_facts
+            || invalid_prescribed
             || join.is_some()
             || watcher_join.is_some()
             || protocol.is_some()
@@ -252,10 +269,11 @@ impl MysqlWriteFixture {
             || joins.counter_overflow
         {
             return Err(MysqlWriteFixtureError {
-                invalid_facts,
+                invalid_facts: invalid_facts || invalid_prescribed,
                 join,
                 watcher_join,
                 protocol,
+                prescribed_eof,
                 gate,
                 aborted_sessions: joins.aborted,
                 counter_overflow: joins.counter_overflow,

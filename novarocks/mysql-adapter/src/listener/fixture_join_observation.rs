@@ -66,12 +66,16 @@ pub(crate) struct MysqlFixtureJoinFacts {
     pub aborted: u64,
     pub counter_overflow: bool,
     pub protocol_io_failures: u64,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub prescribed_protocol_eofs: u64,
 }
 #[derive(Default)]
 struct State {
     facts: MysqlFixtureJoinFacts,
     first_failure: Option<JoinError>,
     first_protocol_failure: Option<MysqlFixtureProtocolFailure>,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    first_prescribed_eof: Option<MysqlFixtureProtocolFailure>,
 }
 #[derive(Default)]
 pub(crate) struct MysqlFixtureSessionJoins {
@@ -99,6 +103,23 @@ impl MysqlFixtureSessionJoins {
             .state
             .lock()
             .expect("MySQL fixture join observation lock");
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if class == MysqlConnectionClass::Ordinary
+            && crate::mysql_write_gate::late_binding::PrescribedRelayEof::from_error(&cause)
+                .is_some_and(|eof| eof.matches(connection, None))
+            && state.facts.prescribed_protocol_eofs == 0
+        {
+            let overflow = increment(&mut state.facts.prescribed_protocol_eofs);
+            state.facts.counter_overflow |= overflow;
+            state.first_prescribed_eof = Some(MysqlFixtureProtocolFailure {
+                connection,
+                class,
+                cause,
+            });
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
         let overflow = increment(&mut state.facts.protocol_io_failures);
         state.facts.counter_overflow |= overflow;
         if state.first_protocol_failure.is_none() {
@@ -116,6 +137,14 @@ impl MysqlFixtureSessionJoins {
             .lock()
             .expect("MySQL fixture join observation lock")
             .first_protocol_failure
+            .take()
+    }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn take_prescribed_eof_after_join(&self) -> Option<MysqlFixtureProtocolFailure> {
+        self.state
+            .lock()
+            .expect("MySQL fixture join observation lock")
+            .first_prescribed_eof
             .take()
     }
     pub(crate) fn reserve_watcher(

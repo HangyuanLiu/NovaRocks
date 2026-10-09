@@ -114,7 +114,16 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
         return match error {
             WriteInterruption::Query(error) => {
                 schema.fail(error.clone());
-                close_relay(result, lease, error, None, None).await
+                close_relay(
+                    result,
+                    lease,
+                    error,
+                    None,
+                    None,
+                    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                    hook.as_ref(),
+                )
+                .await
             }
             WriteInterruption::Io(error) => {
                 schema.fail(invalid(error.to_string()));
@@ -150,7 +159,16 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                 if let Some(hook) = &hook {
                     hook.fail_fixture(crate::mysql_write_gate::GateFailure::Transition);
                 }
-                return close_relay(result, lease, error, None, resident_window).await;
+                return close_relay(
+                    result,
+                    lease,
+                    error,
+                    None,
+                    resident_window,
+                    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                    hook.as_ref(),
+                )
+                .await;
             }
         };
         match delivery {
@@ -203,7 +221,16 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                                     hook.fail_fixture(crate::mysql_write_gate::GateFailure::Transition);
                                 }
                             }
-                            close_relay(result, lease, error, Some(delivery), resident_window).await
+                            close_relay(
+                                result,
+                                lease,
+                                error,
+                                Some(delivery),
+                                resident_window,
+                                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+                                hook.as_ref(),
+                            )
+                            .await
                         }
                         WriteInterruption::Io(error) => {
                             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -275,6 +302,9 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
     error: QueryExecutionError,
     delivery: Option<RootSegmentDelivery>,
     resident_window: Option<novarocks_query_application::api::RootRelayResidentWindow>,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] hook: Option<
+        &crate::mysql_write_gate::late_binding::MysqlWriteRelayHook,
+    >,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     if matches!(result.cancellation().reason(),
         Some(novarocks_query_application::cancellation::QueryCancellationReason::ExplicitKillConnection { .. }
@@ -291,13 +321,30 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
         is_terminal_cancellation(&error) && result.cancellation().is_cancelled(),
     ) {
         Ok(capacity) => capacity,
-        Err(_) => {
+        Err(admission) => {
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            let receipt = lease.receipt();
             if let Some(delivery) = delivery {
                 delivery.fail(error.clone());
             }
             drop(lease);
             let _ = result.client_disconnected();
-            return Err(io_error(error));
+            let original = io_error(error);
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            let original = if matches!(
+                admission,
+                novarocks_workload_control::WorkError::Capacity(_)
+            ) {
+                match hook {
+                    Some(hook) => hook.prescribed_eof(crate::mysql_write_gate::late_binding::PrescribedRelayEofKind::ClosingAdmissionCapacityRefused, receipt, original),
+                    None => original,
+                }
+            } else {
+                original
+            };
+            #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
+            let _ = admission;
+            return Err(original);
         }
     };
     let resident_items = resident_window
@@ -318,13 +365,35 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
         current_body.as_ref(),
         next_body.as_ref(),
     );
-    if capacity.check_backing_total(CLOSING_OBJECT_BYTES).is_err() || resident.is_none() {
+    let backing_check = capacity.check_backing_total(CLOSING_OBJECT_BYTES);
+    if backing_check.is_err() || resident.is_none() {
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        let prescribed_missing = backing_check.is_ok()
+            && resident.is_none()
+            && has_missing_resident_tail(
+                lease.receipt(),
+                lease.writer().buffered_row_bytes(),
+                current_body.as_ref(),
+                next_body.as_ref(),
+            );
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        let receipt = lease.receipt();
         if let Some(delivery) = delivery {
             delivery.fail(error.clone());
         }
         drop(lease);
         let _ = result.client_disconnected();
-        return Err(io_error(error));
+        let original = io_error(error);
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        let original = if prescribed_missing {
+            match hook {
+                Some(hook) => hook.prescribed_eof(crate::mysql_write_gate::late_binding::PrescribedRelayEofKind::MissingResidentTail, receipt, original),
+                None => original,
+            }
+        } else {
+            original
+        };
+        return Err(original);
     }
     // The full new position covers old+new coexistence before this compact
     // copy. Only the current row's unsent bytes survive, never following rows.
@@ -395,6 +464,37 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
             Err(timeout_error())
         }
     }
+}
+
+/// Classify only a validated, contiguous prefix whose current row ends after W2.
+/// No second freeze, body traversal, decode, clone, or repaired framing state.
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+fn has_missing_resident_tail(
+    cursor: opensrv_mysql::FramingCursor,
+    buffered_row_bytes: usize,
+    current: Option<&ValidatedClientBody<'_>>,
+    next: Option<&ValidatedClientBody<'_>>,
+) -> bool {
+    if cursor.phase != opensrv_mysql::WritePhase::Row
+        || !cursor.row_has_started()
+        || !cursor
+            .logical_remaining()
+            .checked_sub(buffered_row_bytes)
+            .is_some_and(|remaining| remaining > 0)
+    {
+        return false;
+    }
+    let Some(current) = current else {
+        return false;
+    };
+    if next.is_some_and(|next| next.before() != current.after()) {
+        return false;
+    }
+    let last = next.unwrap_or(current);
+    current.before().completed_rows() <= cursor.rows_completed
+        && current.after().completed_rows() == cursor.rows_completed
+        && last.after().completed_rows() == cursor.rows_completed
+        && last.after().remaining() > 0
 }
 
 pub(crate) fn resident_tail<'a>(
@@ -581,6 +681,53 @@ mod tests {
                 .concat(),
             b"e"
         );
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[tokio::test]
+    async fn prescribed_missing_tail_rejects_other_none_geometries() {
+        let profile = ClientRowProfile::try_new(16, 64).unwrap();
+        let first = ClientRowStreamCursor::new()
+            .validate_body(profile, &[5, 0, 0, 0, b'a', b'b'])
+            .unwrap();
+        let complete = first.after().validate_body(profile, b"cde").unwrap();
+        let unrelated = ClientRowStreamCursor::new()
+            .validate_body(profile, &[5, 0, 0, 0, b'a'])
+            .unwrap();
+        let mut writer =
+            OwnedStreamingMysqlWriter::new(Vec::new(), ProtocolLimits::default(), 1).unwrap();
+        let boundary = writer.receipt();
+        writer.start_row(5).unwrap();
+        writer.write_slice(b"a").await.unwrap();
+        let cursor = writer.receipt();
+        assert!(resident_tail(cursor, 0, Some(&first), None).is_none());
+        assert!(has_missing_resident_tail(cursor, 0, Some(&first), None));
+        assert!(!has_missing_resident_tail(boundary, 0, Some(&first), None));
+        assert!(!has_missing_resident_tail(cursor, 5, Some(&first), None));
+        assert!(!has_missing_resident_tail(cursor, 0, None, None));
+        assert!(!has_missing_resident_tail(
+            cursor,
+            0,
+            Some(&first),
+            Some(&unrelated)
+        ));
+        assert!(!has_missing_resident_tail(
+            cursor,
+            0,
+            Some(&first),
+            Some(&complete)
+        ));
+        let mut wrong_rows = cursor;
+        wrong_rows.rows_completed = 1;
+        assert!(!has_missing_resident_tail(
+            wrong_rows,
+            0,
+            Some(&first),
+            None
+        ));
+        let mut poisoned = cursor;
+        poisoned.phase = WritePhase::Poisoned;
+        assert!(!has_missing_resident_tail(poisoned, 0, Some(&first), None));
     }
 
     #[tokio::test]

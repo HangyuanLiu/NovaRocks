@@ -435,10 +435,103 @@ impl Drop for MysqlWriteGateController {
         self.hub.stop()
     }
 }
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrescribedRelayEofKind {
+    MissingResidentTail,
+    ClosingAdmissionCapacityRefused,
+}
+
+/// An opaque provenance on this one returned error, never a connection-wide waiver.
+/// Construction requires the original hook's exact accepted cancellation receipt.
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+pub(crate) struct PrescribedRelayEof {
+    kind: PrescribedRelayEofKind,
+    connection: ClientConnectionToken,
+    statement: StatementToken,
+    receipt: FramingCursor,
+    original: io::Error,
+}
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+impl PrescribedRelayEof {
+    pub(crate) fn matches(
+        &self,
+        connection: ClientConnectionToken,
+        statement: Option<StatementToken>,
+    ) -> bool {
+        self.connection == connection && statement.is_none_or(|token| self.statement == token)
+    }
+    pub(crate) fn matches_gate(&self, gate: &MysqlWriteGateSnapshot) -> bool {
+        self.connection == gate.connection
+            && Some(self.statement) == gate.statement
+            && Some(self.receipt) == gate.cancel_receipt
+            && gate.failure.is_none()
+    }
+    pub(crate) fn from_error(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+impl std::fmt::Display for PrescribedRelayEof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prescribed relay EOF: kind={:?} connection_id={} generation={} receipt={:?}",
+            self.kind,
+            self.connection.connection_id(),
+            self.connection.generation(),
+            self.receipt
+        )
+    }
+}
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+impl std::fmt::Debug for PrescribedRelayEof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+impl std::error::Error for PrescribedRelayEof {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
+    }
+}
+
 impl MysqlWriteRelayHook {
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     pub(crate) fn fail_fixture(&self, reason: GateFailure) {
         self.hub.fail(reason);
+    }
+
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn prescribed_eof(
+        &self,
+        kind: PrescribedRelayEofKind,
+        actual_receipt: FramingCursor,
+        original: io::Error,
+    ) -> io::Error {
+        let facts = self.scope.snapshot();
+        let hub = self.hub.snapshot();
+        if facts.statement != Some(self.statement)
+            || facts.connection.connection_id() != self.statement.session().connection_id()
+            || facts.cancel_receipt != Some(actual_receipt)
+            || facts.phase != GatePhase::Resumed
+            || facts.failure.is_some()
+            || hub.failure.is_some()
+        {
+            self.hub.fail(GateFailure::Receipt);
+            return original;
+        }
+        io::Error::new(
+            original.kind(),
+            PrescribedRelayEof {
+                kind,
+                connection: facts.connection,
+                statement: self.statement,
+                receipt: actual_receipt,
+                original,
+            },
+        )
     }
 
     /// Synchronous: after complete metadata, before any target row writes.
@@ -733,6 +826,77 @@ mod tests {
             }
         }
     }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[tokio::test]
+    async fn prescribed_eof_mint_refuses_wrong_receipt_statement_phase_and_prior_failure() {
+        for case in 0..4 {
+            let connection = ClientConnectionToken::new(71, 19).unwrap();
+            let original_statement = StatementToken::new(SessionToken::new(71, 23), 30);
+            let (hub, mut controller) = MysqlWriteGateHub::new(
+                FrontendProcessId::new_v7(),
+                NONCE,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            controller
+                .arm(controller.snapshot().frontend, NONCE, 71, SQL, 2)
+                .unwrap();
+            let mut hook = hub
+                .bind_statement(connection, original_statement, SQL)
+                .unwrap()
+                .unwrap();
+            let original = InitiallyRawMysqlWriter::new(Vec::new(), connection, hub.clone());
+            let mut writer =
+                OwnedStreamingMysqlWriter::new(original, ProtocolLimits::default(), 1).unwrap();
+            writer.start_metadata(metadata().unwrap()).unwrap();
+            writer.finish_metadata().await.unwrap();
+            hook.begin_rows(writer.receipt()).unwrap();
+            writer.start_row(4).unwrap();
+            writer.push_slice(b"\x03abc").unwrap();
+            {
+                let flushing = writer.flush_pending();
+                tokio::pin!(flushing);
+                tokio::select! {
+                    result=&mut flushing => panic!("cut must block: {result:?}"),
+                    blocked=hook.scope.wait_blocked() => { blocked.unwrap(); },
+                }
+            }
+            let mut receipt = writer.receipt();
+            if case != 0 {
+                hook.record_cancel_and_resume(receipt).unwrap();
+            }
+            match case {
+                1 => receipt.rows_completed += 1,
+                2 => hook.statement = StatementToken::new(original_statement.session(), 31),
+                3 => hook.fail_fixture(GateFailure::Identity),
+                _ => {}
+            }
+            let returned = hook.prescribed_eof(
+                PrescribedRelayEofKind::MissingResidentTail,
+                receipt,
+                io::Error::from_raw_os_error(5),
+            );
+            assert!(PrescribedRelayEof::from_error(&returned).is_none());
+            assert_eq!(
+                returned.raw_os_error(),
+                Some(5),
+                "original IO source stays intact"
+            );
+            assert_eq!(
+                controller.snapshot().failure,
+                Some(if case == 3 {
+                    GateFailure::Identity
+                } else {
+                    GateFailure::Receipt
+                })
+            );
+            drop(writer);
+            drop(hook);
+            controller.stop();
+            controller.finish_after_protocol_join().unwrap();
+        }
+    }
+
     const SQL: [u8; 32] = [7; 32];
     const HEALTHY_SQL: [u8; 32] = [8; 32];
     const NONCE: [u8; 16] = [9; 16];
