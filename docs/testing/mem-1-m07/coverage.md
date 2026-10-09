@@ -316,3 +316,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - result_pump 新准确4B body及完整合法row后4B suffix均在完整body校验时以ContractViolation拒绝；consumer首个观察为failure，实际scripted port仅wanted1/consumed0，无Segment/ACK-only/positive ACK；drop测试held grant后window positions归零。新测试1PASS，相关relay_refuses三测试PASS；不称实际native FE reply或physical backing退出。
 - 新ordered两行 S+5 scene：首row占满S、第二empty String新row准确Native `[1,0,0,0,0]`，cursor starts_row=1、remaining0→0、rows1→2，实际End3/rows2；独立MySQL两row1048573B/6packets/sequence1..6/hash冻结。保留旧zeroACK/finalACK/1B continuation、W2/caps/deadlines。runner113PASS/0FAIL/2既有ignored，收据 `p09-prefix-minimum-row-focused-20261009.json`，原生四scene矩阵待执行。
 - 初始误选--lib与随后test-only &Bytes比较E0277均保留日志，已改正确bin target与借用slice比较；无生产行为或输入修改。前一生产source C0/真实REST已在cleanefb完成，本增量仅测试，最终同HEAD门仍OPEN。无push/PR/归档。
+
+
+### 2026-10-09 P09：最小5B新行及旧Root协议四场景原生PASS
+
+- clean `cae99549748f05a49c35e310bb3833b617cf6930`，同HEAD dev build 74s；原生1FE+3BE四scene全部PASS/8.348s。实际Data1准确S/完成row1；Data2准确5B `[1,0,0,0,0]`，cursor starts_row=1、remaining0→0、rows1→2，实际piggyEnd3/rows2及随后独立Read End3均成立。未改变caps、期限、输入或重试。
+- 正常MySQL实际2rows/1048573B/6packets，actor逐包检查sequence1..6，literal row hash `a6884c6ae4c93d904c319ba5e87b9215745812b1b5be3edb1591762f820aea46`、normalEnd/error null。旧zeroACK、finalACK/replay与1B continuation同HEAD回归通过；四scene均两次owner idle，实际16个精确FE/BE PID全部消失。
+- 收据 `p09-minimum-new-row-native-v1-pass-20261009.json` 保存actual source/binaries/input/protocol/effective config/身份与raw hashes。5B新行原生门闭合；4B非法prefix仍仅组件证据，实际FE reply负例及其他stress、P00b/CM/CP/HMS/Paimon大CL、P10/最终同HEAD门与两个人工语义裁决仍OPEN，无push/PR/归档。

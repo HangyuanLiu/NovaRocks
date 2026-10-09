@@ -1,0 +1,1493 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "purpose": "native installed minimum new row and prior root protocol regression",
+  "source_revision": "cae99549748f05a49c35e310bb3833b617cf6930",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "server_sha256": "78e00498c4c3922ecc62341e889e6702d8ba5da0ab254458d739fb2848428b1e",
+  "runner_sha256": "918dcbb00c3a97a3d2e74e293a502f45f29a015f8e9be279c3c479f9093f4846",
+  "input_sha256": "3ff9ec431822edad6c4ae134b8ad454c1863f7249e6975644fffaaf90532f927",
+  "protocol_input_sha256": "711638b29244f75066f3422d1df4027a48855d1189f516f3bfeaf5e1654084db",
+  "exit_code": 0,
+  "duration_seconds": 8.348,
+  "profile": "dev",
+  "build_command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo build -p novarocks-server -p novarocks-system-test-runner --profile dev --locked",
+  "cases": [
+    {
+      "scenario": "result-delivery/installed-root-replay-final-ack-interference",
+      "outcome": "passed",
+      "source_tree_sha256": "8507e310a17165eddc86c24753815b09538a9fdfeaae9ee5a5bb4770067d4bc7",
+      "effective_launch_config_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "effective_launch_config_semantics_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "wire": {
+        "rows": 1,
+        "row_payload_bytes": 1048580,
+        "wire_bytes": 1048675,
+        "packets": 5,
+        "columns": 1,
+        "schema": [
+          {
+            "name": "payload",
+            "mysql_type": 253
+          }
+        ],
+        "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+        "wire_prefix_sha256": "a3514dfc55c1908f64d4fecbd9548901ae4739d02f79213d857923aa1deac0db",
+        "first_payload_chunk_micros": 442774,
+        "first_row_micros": 495277,
+        "elapsed_micros": 495426,
+        "row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+        "error": "server result error code 1317: Query execution was interrupted"
+      },
+      "installed_protocol": [
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "ack_only",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "grpc_message": "unknown context root",
+          "grpc_status": 5,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "unknown_root",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "response_frame_bytes": 0
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 1048576,
+          "body_sha256": "e1778a1a63f0deff423d34c267bbc2be60c018adde82cf23dfcc9926582d0b42",
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch1",
+          "outcome": "data",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 1048642,
+          "sequence": 1
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 8,
+          "body_sha256": "4cf0c1012276f46af31e44d2fbb03ae7af56f03c9996eb9452b99b3e6273698e",
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch2",
+          "outcome": "data",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 70,
+          "sequence": 2
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": {
+            "output_rows": 1,
+            "sequence": 3
+          },
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch-end3",
+          "outcome": "end",
+          "proven_delivered_consumed": 3,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 62,
+          "sequence": 3
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 1048576,
+          "body_sha256": "e1778a1a63f0deff423d34c267bbc2be60c018adde82cf23dfcc9926582d0b42",
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "replay1",
+          "outcome": "data",
+          "proven_delivered_consumed": 3,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 1048642,
+          "sequence": 1
+        },
+        {
+          "accepted_consumed_sequence": 3,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack3",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 3,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 60,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 3,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack3",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 3,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 60,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 3,
+          "actual_grpc_port": 59598,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "retired1",
+          "outcome": "retired",
+          "proven_delivered_consumed": 3,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a295-7802-95d0-1221cb0795fb",
+            "query_hi": -6537156656968348065,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 60,
+          "sequence": null
+        }
+      ],
+      "phase_observations": [
+        {
+          "phase": "producer-retired-context-held-root",
+          "phase_sequence": 1,
+          "logical_read_ordinal": 1,
+          "attempt_ordinal": 1,
+          "capability_path": "public-mysql-native-root",
+          "provider_call_sequence": 1,
+          "outcome": "passed",
+          "counters": {
+            "census_samples": 3,
+            "held_data_positions": 2,
+            "rows": 1
+          }
+        }
+      ],
+      "owner_barrier_two_idle_samples": true
+    },
+    {
+      "scenario": "result-delivery/installed-root-zero-ack-normal-wire",
+      "outcome": "passed",
+      "source_tree_sha256": "8507e310a17165eddc86c24753815b09538a9fdfeaae9ee5a5bb4770067d4bc7",
+      "effective_launch_config_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "effective_launch_config_semantics_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "wire": {
+        "rows": 1,
+        "row_payload_bytes": 1048580,
+        "wire_bytes": 1048640,
+        "packets": 5,
+        "columns": 1,
+        "schema": [
+          {
+            "name": "payload",
+            "mysql_type": 253
+          }
+        ],
+        "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+        "wire_prefix_sha256": "ebbaa292c9a7a161de303b213233dbc0a0fbbdb17588546af94aa4233bdf7aaa",
+        "first_payload_chunk_micros": 294158,
+        "first_row_micros": 346850,
+        "elapsed_micros": 346870,
+        "row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+        "error": null
+      },
+      "installed_protocol": [
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59521,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "ack_only",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "actual_grpc_port": 59521,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "grpc_message": "unknown context root",
+          "grpc_status": 5,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "unknown_root",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "response_frame_bytes": 0
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59521,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59521,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-9e60-7610-9012-d9249695b1df",
+            "query_hi": -9093498883288580436,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        }
+      ],
+      "phase_observations": [
+        {
+          "phase": "producer-retired-context-held-root",
+          "phase_sequence": 1,
+          "logical_read_ordinal": 1,
+          "attempt_ordinal": 1,
+          "capability_path": "public-mysql-native-root",
+          "provider_call_sequence": 1,
+          "outcome": "passed",
+          "counters": {
+            "census_samples": 3,
+            "held_data_positions": 2,
+            "rows": 1
+          }
+        }
+      ],
+      "owner_barrier_two_idle_samples": true
+    },
+    {
+      "scenario": "result-delivery/minimum-new-row-normal-wire",
+      "outcome": "passed",
+      "source_tree_sha256": "8507e310a17165eddc86c24753815b09538a9fdfeaae9ee5a5bb4770067d4bc7",
+      "effective_launch_config_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "effective_launch_config_semantics_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "wire": {
+        "rows": 2,
+        "row_payload_bytes": 1048573,
+        "wire_bytes": 1048637,
+        "packets": 6,
+        "columns": 1,
+        "schema": [
+          {
+            "name": "payload",
+            "mysql_type": 253
+          }
+        ],
+        "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+        "wire_prefix_sha256": "c7e27fbb5a282ba92d63963a553bc9ee447c0340e1e5521e710fefe2dc6b1fe2",
+        "first_payload_chunk_micros": 356318,
+        "first_row_micros": 409104,
+        "elapsed_micros": 409124,
+        "row_sha256": "a6884c6ae4c93d904c319ba5e87b9215745812b1b5be3edb1591762f820aea46",
+        "error": null
+      },
+      "installed_protocol": [
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59756,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "ack_only",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "actual_grpc_port": 59756,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "grpc_message": "unknown context root",
+          "grpc_status": 5,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "unknown_root",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "response_frame_bytes": 0
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59756,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59756,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59756,
+          "backend_index": 1,
+          "body_bytes": 1048576,
+          "body_sha256": "73bcee5333b6179d0ae451558bd9e2463ce3bbe903e907bf7ff6fe52e9d243d2",
+          "client_row_cursor": {
+            "after_remaining": 0,
+            "before_completed_rows": 0,
+            "before_remaining": 0,
+            "completed_rows": 1,
+            "minimum_new_row": false,
+            "spans": 1,
+            "starts_row_payload_bytes": 1048572
+          },
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch1",
+          "outcome": "data",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 1048642,
+          "sequence": 1
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59756,
+          "backend_index": 1,
+          "body_bytes": 5,
+          "body_sha256": "957b88b12730e646e0f33d3618b77dfa579e8231e3c59c7104be7165611c8027",
+          "client_row_cursor": {
+            "after_remaining": 0,
+            "before_completed_rows": 1,
+            "before_remaining": 0,
+            "completed_rows": 2,
+            "minimum_new_row": true,
+            "spans": 1,
+            "starts_row_payload_bytes": 1
+          },
+          "end": {
+            "output_rows": 2,
+            "sequence": 3
+          },
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch2",
+          "outcome": "data",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 73,
+          "sequence": 2
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59756,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": {
+            "output_rows": 2,
+            "sequence": 3
+          },
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch-end3",
+          "outcome": "end",
+          "proven_delivered_consumed": 3,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-ab9b-7141-ae8a-49aab57aa79f",
+            "query_hi": -8876434635989769933,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 62,
+          "sequence": 3
+        }
+      ],
+      "phase_observations": [
+        {
+          "phase": "producer-retired-context-held-root",
+          "phase_sequence": 1,
+          "logical_read_ordinal": 1,
+          "attempt_ordinal": 1,
+          "capability_path": "public-mysql-native-root",
+          "provider_call_sequence": 1,
+          "outcome": "passed",
+          "counters": {
+            "census_samples": 3,
+            "held_data_positions": 2,
+            "rows": 2
+          }
+        }
+      ],
+      "owner_barrier_two_idle_samples": true
+    },
+    {
+      "scenario": "result-delivery/one-byte-continuation-normal-wire",
+      "outcome": "passed",
+      "source_tree_sha256": "8507e310a17165eddc86c24753815b09538a9fdfeaae9ee5a5bb4770067d4bc7",
+      "effective_launch_config_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "effective_launch_config_semantics_sha256": "41f44da5de9803317f598afe20e3169fbf275a8bd6f794205b5bbc82d498921b",
+      "wire": {
+        "rows": 1,
+        "row_payload_bytes": 1048573,
+        "wire_bytes": 1048633,
+        "packets": 5,
+        "columns": 1,
+        "schema": [
+          {
+            "name": "payload",
+            "mysql_type": 253
+          }
+        ],
+        "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+        "wire_prefix_sha256": "866c5f7b0800391d63099d5b9c1fe5e1661b4b218bb1c945b1340e06bd04c2b9",
+        "first_payload_chunk_micros": 360436,
+        "first_row_micros": 415304,
+        "elapsed_micros": 415323,
+        "row_sha256": "20928da92f8b9c02438d16e3f2cb70910c0826822f970ab5da39044a07b52dea",
+        "error": null
+      },
+      "installed_protocol": [
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59680,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "ack_only",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "actual_grpc_port": 59680,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "grpc_message": "unknown context root",
+          "grpc_status": 5,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "operation": "discover-exact-root-by-zero-ack",
+          "outcome": "unknown_root",
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 2,
+            "task": 2
+          },
+          "response_frame_bytes": 0
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59680,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59680,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "ack0",
+          "outcome": "ack_only",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 58,
+          "sequence": null
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59680,
+          "backend_index": 1,
+          "body_bytes": 1048576,
+          "body_sha256": "7ef5c43e87847e47568399269cf16f3054310ae7b8181b966810e94178e7cd98",
+          "client_row_cursor": {
+            "after_remaining": 1,
+            "before_remaining": 0,
+            "completed_rows": 0,
+            "one_byte_continuation": false,
+            "spans": 1
+          },
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch1",
+          "outcome": "data",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 1048642,
+          "sequence": 1
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59680,
+          "backend_index": 1,
+          "body_bytes": 1,
+          "body_sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+          "client_row_cursor": {
+            "after_remaining": 0,
+            "before_remaining": 1,
+            "completed_rows": 1,
+            "one_byte_continuation": true,
+            "spans": 1
+          },
+          "end": null,
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch2",
+          "outcome": "data",
+          "proven_delivered_consumed": 0,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 63,
+          "sequence": 2
+        },
+        {
+          "accepted_consumed_sequence": 0,
+          "actual_grpc_port": 59680,
+          "backend_index": 1,
+          "body_bytes": 0,
+          "body_sha256": null,
+          "end": {
+            "output_rows": 1,
+            "sequence": 3
+          },
+          "grpc_status": 0,
+          "identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "matches": true,
+          "operation": "fetch-end3",
+          "outcome": "end",
+          "proven_delivered_consumed": 3,
+          "request_identity": {
+            "attempt": 1,
+            "backend": "01a11e94-a742-73b1-9c1a-ef6415724d0f",
+            "query_hi": -7306789521347782523,
+            "query_lo": 1,
+            "stage": 1,
+            "task": 1
+          },
+          "response_frame_bytes": 62,
+          "sequence": 3
+        }
+      ],
+      "phase_observations": [
+        {
+          "phase": "producer-retired-context-held-root",
+          "phase_sequence": 1,
+          "logical_read_ordinal": 1,
+          "attempt_ordinal": 1,
+          "capability_path": "public-mysql-native-root",
+          "provider_call_sequence": 1,
+          "outcome": "passed",
+          "counters": {
+            "census_samples": 3,
+            "held_data_positions": 2,
+            "rows": 1
+          }
+        }
+      ],
+      "owner_barrier_two_idle_samples": true
+    }
+  ],
+  "process_exit": [
+    {
+      "role": "fe",
+      "pid": 51062,
+      "process_start_token": "macos:1791514419:688371",
+      "scenario": "result-delivery/installed-root-replay-final-ack-interference",
+      "pid_absent": true
+    },
+    {
+      "role": "be-0",
+      "pid": 51063,
+      "process_start_token": "macos:1791514419:750954",
+      "scenario": "result-delivery/installed-root-replay-final-ack-interference",
+      "pid_absent": true
+    },
+    {
+      "role": "be-1",
+      "pid": 51064,
+      "process_start_token": "macos:1791514419:813291",
+      "scenario": "result-delivery/installed-root-replay-final-ack-interference",
+      "pid_absent": true
+    },
+    {
+      "role": "be-2",
+      "pid": 51065,
+      "process_start_token": "macos:1791514419:864217",
+      "scenario": "result-delivery/installed-root-replay-final-ack-interference",
+      "pid_absent": true
+    },
+    {
+      "role": "fe",
+      "pid": 50987,
+      "process_start_token": "macos:1791514415:850051",
+      "scenario": "result-delivery/installed-root-zero-ack-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-0",
+      "pid": 50992,
+      "process_start_token": "macos:1791514418:672656",
+      "scenario": "result-delivery/installed-root-zero-ack-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-1",
+      "pid": 50993,
+      "process_start_token": "macos:1791514418:731054",
+      "scenario": "result-delivery/installed-root-zero-ack-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-2",
+      "pid": 50994,
+      "process_start_token": "macos:1791514418:788418",
+      "scenario": "result-delivery/installed-root-zero-ack-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "fe",
+      "pid": 51200,
+      "process_start_token": "macos:1791514421:999149",
+      "scenario": "result-delivery/minimum-new-row-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-0",
+      "pid": 51201,
+      "process_start_token": "macos:1791514422:61390",
+      "scenario": "result-delivery/minimum-new-row-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-1",
+      "pid": 51202,
+      "process_start_token": "macos:1791514422:121917",
+      "scenario": "result-delivery/minimum-new-row-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-2",
+      "pid": 51203,
+      "process_start_token": "macos:1791514422:182266",
+      "scenario": "result-delivery/minimum-new-row-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "fe",
+      "pid": 51131,
+      "process_start_token": "macos:1791514420:888116",
+      "scenario": "result-delivery/one-byte-continuation-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-0",
+      "pid": 51132,
+      "process_start_token": "macos:1791514420:952967",
+      "scenario": "result-delivery/one-byte-continuation-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-1",
+      "pid": 51133,
+      "process_start_token": "macos:1791514421:10335",
+      "scenario": "result-delivery/one-byte-continuation-normal-wire",
+      "pid_absent": true
+    },
+    {
+      "role": "be-2",
+      "pid": 51134,
+      "process_start_token": "macos:1791514421:70007",
+      "scenario": "result-delivery/one-byte-continuation-normal-wire",
+      "pid_absent": true
+    }
+  ],
+  "evidence_scope": [
+    "Native 1FE+3BE actual installed Data1(S), Data2 exact 5B new empty-String row, production cursor and End3 rows2",
+    "Independent MySQL 2-row literal oracle and six checked packet sequences",
+    "Previous zero-ACK, final-ACK/replay and one-byte continuation regression",
+    "Two owner-idle samples and actual absence of all 16 exact launched PIDs"
+  ],
+  "remaining": [
+    "Actual FE malformed RootReply negatives",
+    "Full cursor/small-large stress and owner retention matrix",
+    "Formal release P00b/CM/CP/CL",
+    "HMS/Paimon original large CL",
+    "Pending ingress and MySQL write-deadline design decisions",
+    "Final same-HEAD C0/C10/P10 acceptance"
+  ],
+  "limitations": [
+    "Functional dev-profile evidence; not formal performance acceptance",
+    "Owner counter convergence is not a physical backing last-alias oracle",
+    "Four-byte prefix-only proof remains component-level until actual FE negative scenes run"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/driver-status.json",
+      "sha256": "68f82ec1169c556914683d37a4fbbd7ed85e55e03fbd76371516e307940bb871",
+      "bytes": 520
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/driver.log",
+      "sha256": "ac18fd8021f966b89c1403204a146d352b6f1bcdc05c08a67288046cac47c327",
+      "bytes": 12947
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-0.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-1.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-2.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-3.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-4.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-5.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-6.json",
+      "sha256": "6d08d636f31049895c9e525557eafa50e18c0debfdd19cc64e0dfa3deff88a8e",
+      "bytes": 326
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-7.json",
+      "sha256": "6d08d636f31049895c9e525557eafa50e18c0debfdd19cc64e0dfa3deff88a8e",
+      "bytes": 326
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-census-8.json",
+      "sha256": "6d08d636f31049895c9e525557eafa50e18c0debfdd19cc64e0dfa3deff88a8e",
+      "bytes": 326
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/installed-root-protocol.json",
+      "sha256": "ff8d7f83be791411e076b75b8cc430612050fe6209e2e32d5e493eaffec3a3e1",
+      "bytes": 8380
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/owner-barrier-root-retention-after.json",
+      "sha256": "5bdd25c152f42da52e184cdb33445c782edfd4861b3ac20fb2b67444406e2b9e",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/owner-barrier-root-retention-before.json",
+      "sha256": "12503a9b29e9268ef182ab19f7d4e56d3c3fa52c207294e0a52de17d9cfb55f1",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/root-context-held-census.json",
+      "sha256": "d4be2e6737e351c79ef60f633b5bf301a709e883b326138030bf8de031cc41cc",
+      "bytes": 4176
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/root-context-retention-wire.json",
+      "sha256": "d1cb05a4da76b6b14a3e756f0fc81c2f42ffb557f6ddbaa527289e5fc72fc95d",
+      "bytes": 624
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-replay-final-ack-interference/scenario-evidence.json",
+      "sha256": "ff8e6f5374d697158ad5adf54a2ac6f1a9bab27b4f69e3966f991b0e4e218b1e",
+      "bytes": 19086
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/installed-root-census-0.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/installed-root-census-1.json",
+      "sha256": "32dbe64f0ecf77533adce9fec19876fefa138c5192d1c9fb3cdc1c9df427c97f",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/installed-root-protocol.json",
+      "sha256": "a9d1f864ee679c96d5e18fa32985bcfbb3cfc8a4a68b76007951ff2957530c17",
+      "bytes": 2888
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/owner-barrier-root-retention-after.json",
+      "sha256": "b7684e8598b700a82dd5585c477242efb7f3c110a89e7e4fe6c3bd04aee5db89",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/owner-barrier-root-retention-before.json",
+      "sha256": "2dcdf34bdb189980e0edf6786eac35ab29e3bbc5770b1da65971a5af4d638aeb",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/root-context-held-census.json",
+      "sha256": "28612ff2163c6bef28f4e3946fab69024f7bef9af94f17028a8684b5383bfec6",
+      "bytes": 4176
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/root-context-retention-wire.json",
+      "sha256": "7cee98ffec8fe53b9e17de0d80eb48bc46417fc53ef2a11a0a2359e2d24eb0ab",
+      "bytes": 564
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-installed-root-zero-ack-normal-wire/scenario-evidence.json",
+      "sha256": "59b213d543b491800b1ba456ffa7263247a617828c5c1a5613f1c09530ebd8a0",
+      "bytes": 19068
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/installed-root-census-0.json",
+      "sha256": "47857b9c6ef4a22a65b15e1c27329562510765e182159f1af7bd842304ee4fe0",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/installed-root-census-1.json",
+      "sha256": "47857b9c6ef4a22a65b15e1c27329562510765e182159f1af7bd842304ee4fe0",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/installed-root-census-2.json",
+      "sha256": "47857b9c6ef4a22a65b15e1c27329562510765e182159f1af7bd842304ee4fe0",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/installed-root-census-3.json",
+      "sha256": "47857b9c6ef4a22a65b15e1c27329562510765e182159f1af7bd842304ee4fe0",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/installed-root-census-4.json",
+      "sha256": "47857b9c6ef4a22a65b15e1c27329562510765e182159f1af7bd842304ee4fe0",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/installed-root-protocol.json",
+      "sha256": "a58906b4db85299525f89b777daed338240cd2b27d668b827608fc3bb3d3ac9f",
+      "bytes": 5836
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/owner-barrier-root-retention-after.json",
+      "sha256": "6ae50fd0eb1a53097457cbe7818836a7ea9fd3a2a93dcf05fa7406889505b528",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/owner-barrier-root-retention-before.json",
+      "sha256": "2b545e42f5c81adcb6f483368b095757dd10407f04ef22a08b14feedce5d0fd4",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/root-context-held-census.json",
+      "sha256": "b592342b071354d150db46e5fc883710f55989931197eb57d335faf92d40194f",
+      "bytes": 4176
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/root-context-retention-wire.json",
+      "sha256": "6f469a908dc6028f8e73a01d890ad98168192cc15d21bb984fba10222fc4b468",
+      "bytes": 564
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-minimum-new-row-normal-wire/scenario-evidence.json",
+      "sha256": "4e80dce0770d0750324ff74ab7812bab2afe885bea3291726177b0fc51340734",
+      "bytes": 19051
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-0.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-1.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-2.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-3.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-census-4.json",
+      "sha256": "1e1c9e4833b320951be79689125634f9eff92f203df4fca679c7323b95fd70d4",
+      "bytes": 332
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/installed-root-protocol.json",
+      "sha256": "9eeb8f087a8185da80137219b32670bc732c93b331689711e4ae329911de00f3",
+      "bytes": 5653
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/owner-barrier-root-retention-after.json",
+      "sha256": "8e68cbde7eeb0bb410d3fa9d3d3757bc1df09f65277043358d154a4934f107fc",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/owner-barrier-root-retention-before.json",
+      "sha256": "bb668d8a3d5668503556194f2aec18859cbdbb32f888b2dfb86a34e44b90610b",
+      "bytes": 7391
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/root-context-held-census.json",
+      "sha256": "8d4c14822e0bbcf24710c97b715e3bf2e0821c8faa44cb0a8a45c9c35a604b9d",
+      "bytes": 4176
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/root-context-retention-wire.json",
+      "sha256": "97f0d92eb826046e567d3b8037ec58e7be79b957eeef9d49fe160fa583e578f7",
+      "bytes": 564
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-native-v1-20261009/result-delivery-one-byte-continuation-normal-wire/scenario-evidence.json",
+      "sha256": "9a029ce058f28d2d028da1afa6971cf8941adc74828684989902eef91bf2567b",
+      "bytes": 19062
+    },
+    {
+      "path": "logs/mem-1-m07/p09-minimum-new-row-dev-build-20261009.log",
+      "sha256": "a76c4a77201023fab57530784ab02207c2d5349d8e1c997d0256992cf7d7f42f",
+      "bytes": 185060
+    }
+  ]
+}
