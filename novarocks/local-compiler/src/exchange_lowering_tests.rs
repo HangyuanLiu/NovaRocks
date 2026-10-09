@@ -19,9 +19,7 @@
 //! package extraction: a Values producer streaming over one edge and an
 //! ExchangeSource consumer. Both sides compile independently.
 
-use crate::{
-    FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers,
-};
+use crate::{FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers};
 use arrow_schema::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
@@ -484,6 +482,7 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
                 receiver_node: RECEIVER.get(),
                 edge: EDGE.get(),
                 source_fragment: PRODUCER.get(),
+                hash_partition_slots: Box::default(),
             },
         )])
     );

@@ -35,8 +35,8 @@
 //! Writer statistics are compiled by `writer_statistics`: a writer's partial
 //! calls write its multiplex relation's auxiliary channels, and a finish's
 //! final calls and grouped Unpivot expand them into Root artifact rows.
-//! Multi-writer finishes and a partitioned writer input at more than one
-//! driver remain explicit refusals.
+//! Multi-writer finishes remain explicit refusals. A partitioned receiver
+//! retains its exact edge keys for the original per-driver local shuffle.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use arrow_schema::Schema;
@@ -91,7 +91,8 @@ pub(crate) fn extra_channels(package: &FragmentPackage, node: &PhysicalNode) -> 
 /// Admit one writer-family node before channels or expressions exist.
 ///
 /// A `TableWriter` is the one root of its fragment and streams exactly its
-/// writer relation; a partitioned input runs on one driver only. A
+/// writer relation; a partitioned input at multiple drivers requires an exact
+/// exchange receiver whose edge keys can be shuffled locally. A
 /// `TableFinish` is the root of a Result fragment over exactly one
 /// writer-result receiver. Statistics are admitted by their own owner.
 pub(crate) fn admit_writer_family(
@@ -117,15 +118,31 @@ pub(crate) fn admit_writer_family(
             if !matches!(fragment.sink(), FragmentSink::Stream { .. }) {
                 return Err(unsupported("table writer without a writer-result stream"));
             }
-            // A partitioned input is co-located per instance only; the legacy
-            // writer re-shuffles it per driver. Without a compiled local
-            // shuffle a partitioned writer runs on one driver.
+            // An edge co-locates keys per instance. The runtime uses those
+            // exact receiver keys to restore co-location per writer driver.
             if matches!(
                 target.required_distribution,
                 Distribution::Hash { .. } | Distribution::BucketShuffle { .. }
             ) && pipeline_dop.get() != 1
             {
-                return Err(unsupported("partitioned writer input at pipeline DOP > 1"));
+                let input = match node.inputs.as_ref() {
+                    [id] => fragment.nodes().get(id),
+                    _ => None,
+                };
+                let mut exact = false;
+                if let Some(input) = input {
+                    if matches!(input.kind, NodeKind::ExchangeSource { .. }) {
+                        for cut in package.cuts().inbound.iter() {
+                            let addressed = cut.destination_node == input.id;
+                            let same = cut.partitioning.destination == target.required_distribution;
+                            work.step()?;
+                            exact |= addressed && same;
+                        }
+                    }
+                }
+                if !exact {
+                    return Err(unsupported("partitioned writer input at pipeline DOP > 1"));
+                }
             }
             let recipe = recipe.ok_or(FragmentCompileError::Invalid(
                 "table writer has no provider write recipe",

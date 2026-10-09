@@ -22,7 +22,7 @@
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use arrow_schema::{Field, Schema};
 use novarocks_local_program::{CompiledExchangeInput, ProgramNodeKind, StaticLayout};
-use novarocks_physical_plan::{EdgeKind, FragmentPackage, NodeKind, PhysicalNode};
+use novarocks_physical_plan::{Distribution, EdgeKind, FragmentPackage, NodeKind, PhysicalNode};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::SlotId;
 use std::{sync::Arc, time::Duration};
@@ -123,6 +123,38 @@ fn lower_core(
             ));
         }
     }
+    // The edge names keys in the destination value domain. Project each
+    // actual imported occurrence onto its exact channel, preserving key order.
+    let keys = match &cut.partitioning.destination {
+        Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
+            if keys.is_empty() {
+                return Err(FragmentCompileError::Invalid(
+                    "ExchangeSource hash cut has no keys",
+                ));
+            }
+            keys.as_ref()
+        }
+        Distribution::Unconstrained
+        | Distribution::Singleton
+        | Distribution::RoundRobin
+        | Distribution::Broadcast => &[],
+    };
+    let mut hash_partition_slots = Vec::new();
+    reserve_vec(&mut hash_partition_slots, keys.len(), work)?;
+    for key in keys {
+        let mut found = None;
+        for (ordinal, value) in node.output.columns.iter().enumerate() {
+            work.step()?;
+            if value == key && found.replace(slots[ordinal]).is_some() {
+                return Err(FragmentCompileError::Invalid(
+                    "ExchangeSource hash key has more than one output occurrence",
+                ));
+            }
+        }
+        hash_partition_slots.push(found.ok_or(FragmentCompileError::Invalid(
+            "ExchangeSource hash key is absent from its output",
+        ))?);
+    }
     let result = package
         .result()
         .filter(|result| result.output.columns == node.output.columns);
@@ -187,6 +219,7 @@ fn lower_core(
             receiver_node: node.id.get(),
             edge: edge.get(),
             source_fragment: cut.source_fragment.get(),
+            hash_partition_slots: hash_partition_slots.into_boxed_slice(),
         },
     })
 }

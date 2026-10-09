@@ -29,9 +29,7 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::ConstantPolicy;
-use novarocks_local_compiler::{
-    LocalCompileOptions, compile_fragment, validate_fragment_providers,
-};
+use novarocks_local_compiler::{LocalCompileOptions, compile_fragment, validate_fragment_providers};
 use novarocks_local_program::{
     DataStreamPartitionType, KernelAbiVersion, LocalProgram, ProgramNodeKind, StaticSinkProgram,
 };
@@ -115,6 +113,14 @@ fn dop() -> PipelineDopDomain {
 /// [1, 0]` while the receiver expects `[slot(b'), slot(a')] = [0, 1]`: every
 /// wire id exists in the receiver namespace in the other order.
 fn plan(hashed: bool, values_rows: &[(i64, i64)]) -> (PhysicalPlan, NodeId) {
+    plan_with_key_order(hashed, values_rows, false)
+}
+
+fn plan_with_key_order(
+    hashed: bool,
+    values_rows: &[(i64, i64)],
+    reverse_keys: bool,
+) -> (PhysicalPlan, NodeId) {
     let edge = EdgeId::new(5);
     let producer_id = FragmentId::new(1);
     let consumer_id = FragmentId::new(2);
@@ -191,7 +197,11 @@ fn plan(hashed: bool, values_rows: &[(i64, i64)]) -> (PhysicalPlan, NodeId) {
             Box::from([(b, b_import), (a, a_import)]),
             Box::from([b_import, a_import]),
             if hashed {
-                hash([b_import, a_import])
+                hash(if reverse_keys {
+                    [a_import, b_import]
+                } else {
+                    [b_import, a_import]
+                })
             } else {
                 Distribution::Singleton
             },
@@ -202,7 +212,14 @@ fn plan(hashed: bool, values_rows: &[(i64, i64)]) -> (PhysicalPlan, NodeId) {
         .finish_definition(exchange, FragmentSink::Result, dop())
         .unwrap();
     let (source_distribution, destination_distribution) = if hashed {
-        (hash([b, a]), hash([b_import, a_import]))
+        (
+            hash(if reverse_keys { [a, b] } else { [b, a] }),
+            hash(if reverse_keys {
+                [a_import, b_import]
+            } else {
+                [b_import, a_import]
+            }),
+        )
     } else {
         (Distribution::Singleton, Distribution::Singleton)
     };
@@ -414,6 +431,38 @@ fn hash(keys: [ValueId; 2]) -> Distribution {
 
 fn programs() -> Programs {
     programs_shaped(false, &ROWS)
+}
+
+#[test]
+fn compiled_receivers_preserve_exact_destination_hash_key_slots() {
+    let compiled = programs_shaped(true, &HASH_ROWS);
+    let (id, receiver) = compiled.consumer.exchange_inputs().iter().next().unwrap();
+    let slots = compiled.consumer.graph().nodes()[id.index()]
+        .output_layout()
+        .slots();
+    // The wire order is (b, a), independently of the producer's value order.
+    assert_eq!(receiver.hash_partition_slots.as_ref(), slots);
+    assert_eq!(slots.len(), 2);
+    let (plan, _) = plan_with_key_order(true, &HASH_ROWS, true);
+    let mut cut_packages = packages(&plan);
+    let reversed = compile(
+        cut_packages.remove(&FragmentId::new(2)).unwrap(),
+        Some(NonZeroUsize::new(1).unwrap()),
+    );
+    let (id, receiver) = reversed.exchange_inputs().iter().next().unwrap();
+    let slots = reversed.graph().nodes()[id.index()].output_layout().slots();
+    assert_eq!(
+        receiver.hash_partition_slots.as_ref(),
+        &[slots[1], slots[0]]
+    );
+    let unpartitioned = programs();
+    assert!(
+        unpartitioned
+            .consumer
+            .exchange_inputs()
+            .values()
+            .all(|input| input.hash_partition_slots.is_empty())
+    );
 }
 
 fn programs_shaped(hashed: bool, values_rows: &[(i64, i64)]) -> Programs {

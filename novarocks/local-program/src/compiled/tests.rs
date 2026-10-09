@@ -569,6 +569,7 @@ fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
         receiver_node: 3,
         edge: 5,
         source_fragment: 1,
+        hash_partition_slots: Box::default(),
     };
     // A non-exchange node and a node outside the graph both refuse an address.
     for node in [ProgramNodeId::new(0), ProgramNodeId::new(9)] {
@@ -579,7 +580,7 @@ fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
                 &allowed(),
                 CompiledProgramFacts {
                     writes: BTreeMap::new(),
-                    exchange_inputs: BTreeMap::from([(node, address)]),
+                    exchange_inputs: BTreeMap::from([(node, address.clone())]),
                     scan_inputs: BTreeMap::new(),
                     aggregates: BTreeMap::new(),
                 },

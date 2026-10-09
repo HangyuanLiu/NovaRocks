@@ -18,9 +18,9 @@
 //! Compiled writer-family pipelines.
 //!
 //! A TableWriter runs on its input's drivers, one independent writer per
-//! driver, exactly as the plan-tree writer does; the compiler admits a
-//! partitioned writer input only at one driver, so no driver needs a local
-//! re-shuffle. A TableFinish owns the complete prepared write set, so its one
+//! driver, exactly as the plan-tree writer does. An immediate partitioned
+//! receiver is re-shuffled on its exact edge keys at driver granularity.
+//! A TableFinish owns the complete prepared write set, so its one
 //! writer-result input is gathered to one driver first: DOP 1 is the finish
 //! operator's own law.
 
@@ -47,6 +47,27 @@ pub(super) fn build_table_writer(
     })?;
     let factory = compiled_table_writer_factory(program, id, node_id, binding, error)?;
     let mut build = build_node(program, input, ctx, error)?;
+    if matches!(
+        program.graph().nodes()[input.index()].kind(),
+        ProgramNodeKind::ExchangeSource { .. }
+    ) {
+        let receiver = program.exchange_inputs().get(&input).ok_or_else(|| {
+            format!(
+                "missing compiled exchange input for table writer at local node {}",
+                id.index()
+            )
+        })?;
+        if !receiver.hash_partition_slots.is_empty() {
+            let partitions = build.pipeline.dop.max(1) as usize;
+            build = shuffle_compiled_group_input_slots(
+                build,
+                ctx,
+                node_id,
+                receiver.hash_partition_slots.to_vec(),
+                partitions,
+            );
+        }
+    }
     build.pipeline.factories.push(Box::new(factory));
     build.stream = StreamDesc::any(build.pipeline.dop);
     Ok(build)

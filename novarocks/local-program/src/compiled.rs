@@ -28,6 +28,7 @@ use crate::{
     ProviderLinkError,
 };
 use novarocks_connector_contract::ConnectorWriteRecipe;
+use novarocks_types::SlotId;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
@@ -39,7 +40,7 @@ use std::{
 /// Compiled-only receiver address of one actual `ExchangeSource` node. A
 /// compiled node has no legacy native identity, so the program carries the
 /// physical routing facts explicitly instead of deriving them from a node ID.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledExchangeInput {
     /// Physical NodeId of the receiving ExchangeSource; senders address it.
     pub receiver_node: u32,
@@ -47,6 +48,9 @@ pub struct CompiledExchangeInput {
     pub edge: u32,
     /// Physical FragmentId of the sending fragment.
     pub source_fragment: u32,
+    /// Exact destination hash keys, in the inbound cut's key order, projected
+    /// onto this receiver's input slots. Unpartitioned cuts carry no keys.
+    pub hash_partition_slots: Box<[SlotId]>,
 }
 
 /// Compiled-only physical address of one actual provider `Scan` node. A
@@ -408,7 +412,30 @@ fn validate_exchange_inputs(
             duplicate: LocalProgramCompileError::DuplicateExchangeReceiver,
         },
         control,
-    )
+    )?;
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
+        .map_err(LocalProgramCompileError::Control)?;
+    let result = (|| {
+        for (id, input) in exchange_inputs {
+            let slots = graph.nodes()[id.index()].output_layout().slots();
+            for key in &input.hash_partition_slots {
+                let mut occurrences = 0usize;
+                for slot in slots {
+                    occurrences += usize::from(slot == key);
+                    work.step().map_err(LocalProgramCompileError::Control)?;
+                }
+                if occurrences != 1 {
+                    return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+                }
+            }
+        }
+        Ok(())
+    })();
+    if matches!(result, Err(LocalProgramCompileError::Control(_))) {
+        return result;
+    }
+    work.finish().map_err(LocalProgramCompileError::Control)?;
+    result
 }
 
 /// Require one address per actual scan and per declared scan requirement, and
