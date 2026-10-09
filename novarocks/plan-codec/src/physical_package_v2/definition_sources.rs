@@ -252,6 +252,79 @@ enum Destination {
     Cut,
     Result,
 }
+/// One original definition lent from an unsealed or packaged fragment.
+/// The expression loan retains its exact kind, full value type and original
+/// scalar/window binding. A request retains its own definition identity,
+/// logical argument count, constant references and optional result constraint.
+/// No installed owner, execution use, inferred source or copied type is needed.
+#[derive(Clone, Copy, Debug)]
+pub enum FragmentDefinitionSource<'source> {
+    Value {
+        id: p::ValueId,
+        value: &'source p::ValueDef,
+    },
+    Expression {
+        id: p::ExprId,
+        expression: &'source p::ExprNode,
+    },
+    Request {
+        definition: p::PhysicalCallDefinition,
+        request: &'source p::PhysicalCallRequest,
+    },
+}
+
+/// Observe all stored fragment definitions on the caller's original meter.
+/// Captures include dead and TypeOnly definitions, in original source order.
+/// Before capture, the caller admits its actual lookup/copy/encoding work and
+/// backing requests. Original source admission and completed observations are
+/// the callback's responsibility; this port adds no successful callback step.
+/// No entry/footer, resource grant, package validation, lookup or owner prepare
+/// occurs here. The first callback/control error stops the original traversal.
+/// Constants/cuts and relational binding lifecycles remain their own authors;
+/// request rows preserve relational definition keys without rebuilding them.
+pub fn visit_fragment_definitions_observed<'source, E>(
+    fragment: &'source p::Fragment,
+    work: &mut CompileCheckpoints<'_>,
+    capture: impl FnMut(FragmentDefinitionSource<'source>, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    visit_fragment_definitions(fragment, work, capture)
+}
+
+/// Single source-order author. The package callbacks keep their original
+/// header admission, CountPass/FillPass operations and completed checkpoints.
+/// The public observation wrapper delegates without adding another step.
+fn visit_fragment_definitions<'source, E>(
+    fragment: &'source p::Fragment,
+    work: &mut CompileCheckpoints<'_>,
+    mut capture: impl FnMut(
+        FragmentDefinitionSource<'source>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), E>,
+) -> Result<(), E> {
+    for (id, value) in fragment.values() {
+        capture(FragmentDefinitionSource::Value { id: *id, value }, work)?;
+    }
+    for (id, expression) in fragment.expressions().iter() {
+        capture(
+            FragmentDefinitionSource::Expression {
+                id: *id,
+                expression,
+            },
+            work,
+        )?;
+    }
+    for (definition, request) in fragment.call_requests().entries() {
+        capture(
+            FragmentDefinitionSource::Request {
+                definition: *definition,
+                request,
+            },
+            work,
+        )?;
+    }
+    Ok(())
+}
+
 /// Only source-order/header enumeration lives here. Original codecs retain
 /// expression, cut, request, Writer-schema and full-type validation grammars.
 fn visit<'source>(
@@ -264,39 +337,42 @@ fn visit<'source>(
     for (id, pool) in package.constants().entries() {
         visitor.constant(*id, pool, budget, work)?;
     }
-    for (id, value) in fragment.values() {
-        visitor.value(*id, value, budget, work)?;
-    }
-    for (id, expression) in fragment.expressions().iter() {
-        let parameters = match &expression.kind {
-            p::ExprKind::Lambda {
-                parameter_types, ..
-            } => parameter_types.len(),
-            _ => 0,
-        };
-        visitor.header(
-            Counts {
-                expression_parameters: parameters,
-                ..Counts::default()
-            },
-            add(parameters, 4)?,
-            budget,
-            work,
-        )?;
-        visitor.expression(*id, expression, budget, work)?;
-    }
-    for (definition, request) in fragment.call_requests().entries() {
-        visitor.header(
-            Counts {
-                arguments: request.arguments.len(),
-                ..Counts::default()
-            },
-            add(request.arguments.len(), 4)?,
-            budget,
-            work,
-        )?;
-        visitor.request(*definition, request, budget, work)?;
-    }
+    visit_fragment_definitions(fragment, work, |source, work| match source {
+        FragmentDefinitionSource::Value { id, value } => visitor.value(id, value, budget, work),
+        FragmentDefinitionSource::Expression { id, expression } => {
+            let parameters = match &expression.kind {
+                p::ExprKind::Lambda {
+                    parameter_types, ..
+                } => parameter_types.len(),
+                _ => 0,
+            };
+            visitor.header(
+                Counts {
+                    expression_parameters: parameters,
+                    ..Counts::default()
+                },
+                add(parameters, 4)?,
+                budget,
+                work,
+            )?;
+            visitor.expression(id, expression, budget, work)
+        }
+        FragmentDefinitionSource::Request {
+            definition,
+            request,
+        } => {
+            visitor.header(
+                Counts {
+                    arguments: request.arguments.len(),
+                    ..Counts::default()
+                },
+                add(request.arguments.len(), 4)?,
+                budget,
+                work,
+            )?;
+            visitor.request(definition, request, budget, work)
+        }
+    })?;
     for (ordinal, cut) in package.cuts().inbound.iter().enumerate() {
         let fields = cut.writer_result.as_ref().map_or(0, |r| r.fields.len());
         visitor.header(

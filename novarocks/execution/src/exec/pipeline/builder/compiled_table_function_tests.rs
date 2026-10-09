@@ -1215,3 +1215,6 @@ fn unnest_at_four_drivers_keeps_every_row_and_each_parent_in_order() {
         assert_eq!(of(&rows), of(&expected), "parent {k}");
     }
 }
+
+#[path = "compiled_all_definition_source_tests.rs"]
+mod all_definition_source_tests;

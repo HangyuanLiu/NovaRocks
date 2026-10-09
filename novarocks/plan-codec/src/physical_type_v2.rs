@@ -497,7 +497,7 @@ pub fn encode_type_table_writer_sources_observed<'source>(
 /// Whole-package source views lend original roots; no owned type/Field
 /// copies are made to adapt a namespace input. The caller retains all views
 /// for the token lifetime and owns admission and completion on this meter.
-pub(crate) fn encode_borrowed_type_table_writer_sources_in<'source>(
+pub fn encode_borrowed_type_table_writer_sources_in<'source>(
     values: &'source [(u32, &'source FunctionValueType)],
     fields: &'source [(u32, &'source Arc<Field>)],
     writers: &'source [WriterTypeSource<'source>],

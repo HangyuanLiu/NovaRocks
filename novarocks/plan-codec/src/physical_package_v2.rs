@@ -41,7 +41,9 @@ mod type_views;
 
 pub use binding_sources::BindingSourceLimits;
 pub use decode::{PackageDecodeError, PackageDecodeLimits, decode_fragment_package};
-pub use definition_sources::DefinitionSourceLimits;
+pub use definition_sources::{
+    DefinitionSourceLimits, FragmentDefinitionSource, visit_fragment_definitions_observed,
+};
 pub use encode::{PackageEncodeError, PackageEncodeLimits, encode_fragment_package};
 pub use provider_sources::{ProviderSourceError, ProviderSourceLimits};
 pub use type_views::{TypeViewError, TypeViewLimits};
