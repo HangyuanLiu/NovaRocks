@@ -217,7 +217,7 @@ fn ordered_root(truth: bool) -> ProgramExpressionRootSite {
     if truth {
         ProgramExpressionRootSite::Node {
             node: ProgramNodeId::new(2),
-            role: ProgramNodeExpressionRole::FilterPredicate,
+            role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
         }
     } else {
         root()

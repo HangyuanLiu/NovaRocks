@@ -513,7 +513,7 @@ fn resolve_core(
                 work.flush()?;
                 (slots, port)
             }
-            NodeKind::Filter { predicates } if predicates.len() == 1 => {
+            NodeKind::Filter { predicates } if !predicates.is_empty() => {
                 passthrough(fragment, node, &nodes, &ports, work)?
             }
             NodeKind::Limit { .. } => passthrough(fragment, node, &nodes, &ports, work)?,

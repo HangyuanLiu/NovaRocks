@@ -898,7 +898,7 @@ fn root(mode: Mode) -> ProgramExpressionRootSite {
     ProgramExpressionRootSite::Node {
         node: ProgramNodeId::new(2),
         role: match mode {
-            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate,
+            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
             _ => ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
         },
     }

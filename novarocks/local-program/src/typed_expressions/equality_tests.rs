@@ -132,10 +132,10 @@ fn assembled(
         EvaluationDemand::TruthOnly => (
             ProgramNodeKind::Filter {
                 input: ProgramNodeId::new(0),
-                predicate: root,
+                predicates: vec![root].into_boxed_slice(),
             },
             input.clone(),
-            ProgramNodeExpressionRole::FilterPredicate,
+            ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
         ),
     };
     let graph = LocalProgramGraph::try_new(

@@ -263,7 +263,7 @@ fn unary_root(case: UnaryCase) -> ProgramExpressionRootSite {
     ProgramExpressionRootSite::Node {
         node: ProgramNodeId::new(2),
         role: if matches!(case, UnaryCase::NotFilter) {
-            ProgramNodeExpressionRole::FilterPredicate
+            ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
         } else {
             ProgramNodeExpressionRole::ProjectOutput { expression: 0 }
         },

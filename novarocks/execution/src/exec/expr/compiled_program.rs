@@ -813,3 +813,6 @@ mod unary;
 
 #[cfg(test)]
 mod nary_tests;
+
+mod filter_conjunction;
+pub(crate) use filter_conjunction::CompiledFilterConjunctionInstance;

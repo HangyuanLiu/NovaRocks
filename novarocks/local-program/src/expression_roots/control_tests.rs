@@ -198,7 +198,7 @@ fn mixed_program(arena: Arc<ImmutableExpressions>, predicate: usize) -> LocalPro
                 20,
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(0),
-                    predicate: ProgramExprId::new(predicate),
+                    predicates: vec![ProgramExprId::new(predicate)].into_boxed_slice(),
                 },
                 layout.clone(),
             ),
@@ -224,7 +224,13 @@ fn mixed_program(arena: Arc<ImmutableExpressions>, predicate: usize) -> LocalPro
 }
 fn mixed_bindings() -> Vec<ProgramRootUseBinding> {
     vec![
-        binding(node_site(1, ProgramNodeExpressionRole::FilterPredicate), 0),
+        binding(
+            node_site(
+                1,
+                ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
+            ),
+            0,
+        ),
         binding(
             node_site(
                 2,
@@ -353,7 +359,10 @@ fn wrong_site_demand_definition_and_unknown_use_are_rejected() {
         );
     }
     let mut wrong_site = mixed_bindings();
-    wrong_site[0].site = node_site(99, ProgramNodeExpressionRole::FilterPredicate);
+    wrong_site[0].site = node_site(
+        99,
+        ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
+    );
     let mut wrong_role = mixed_bindings();
     wrong_role[0].site = node_site(
         1,
@@ -768,7 +777,10 @@ fn equally_sized_program_with_same_arena_cannot_reuse_changed_root_bindings() {
     )
     .unwrap();
     assert_eq!(
-        rebound.roots().sites()[&node_site(1, ProgramNodeExpressionRole::FilterPredicate)]
+        rebound.roots().sites()[&node_site(
+            1,
+            ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
+        )]
             .definition,
         ProgramExprId::new(1)
     );

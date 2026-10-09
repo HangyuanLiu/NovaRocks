@@ -539,7 +539,7 @@ fn lower(
             | NodeKind::Unpivot { .. }
             | NodeKind::ChangeEventExpand { .. }
             | NodeKind::Aggregate { .. } => node.inputs.len() == 1,
-            NodeKind::Filter { predicates } => predicates.len() == 1 && node.inputs.len() == 1,
+            NodeKind::Filter { predicates } => !predicates.is_empty() && node.inputs.len() == 1,
             // Every row-count TopN phase; a grouped-state reduction has no
             // local owner.
             NodeKind::Sort {
@@ -1168,13 +1168,20 @@ fn lower(
                     let child = *local_ids
                         .get(&node.inputs[0])
                         .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
-                    let predicate = *expressions.ids.get(&predicates[0]).ok_or(
-                        FragmentCompileError::Invalid("missing predicate definition"),
-                    )?;
+                    let mut local_predicates = Vec::with_capacity(predicates.len());
+                    for predicate in predicates {
+                        local_predicates.push(*expressions.ids.get(predicate).ok_or(
+                            FragmentCompileError::Invalid("missing predicate definition"),
+                        )?);
+                        work.step()?;
+                    }
+                    work.flush()?;
+                    let local_predicates = local_predicates.into_boxed_slice();
+                    work.flush()?;
                     (
                         ProgramNodeKind::Filter {
                             input: child,
-                            predicate,
+                            predicates: local_predicates,
                         },
                         nodes[child.index()].output_layout().clone(),
                     )
@@ -1696,8 +1703,8 @@ fn lower(
             ExpressionRootRole::FinishUnpivotConstant { mapping, constant } => {
                 ProgramNodeExpressionRole::FinishUnpivotConstant { mapping, constant }
             }
-            ExpressionRootRole::FilterPredicate { predicate: 0 } => {
-                ProgramNodeExpressionRole::FilterPredicate
+            ExpressionRootRole::FilterPredicate { predicate } => {
+                ProgramNodeExpressionRole::FilterPredicate { predicate }
             }
             ExpressionRootRole::ScanResidual { predicate: 0 } => {
                 ProgramNodeExpressionRole::ScanResidual

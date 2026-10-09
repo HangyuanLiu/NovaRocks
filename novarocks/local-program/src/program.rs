@@ -408,7 +408,7 @@ pub enum ProgramNodeKind {
     },
     Filter {
         input: ProgramNodeId,
-        predicate: ProgramExprId,
+        predicates: Box<[ProgramExprId]>,
     },
     Repeat {
         input: ProgramNodeId,
@@ -597,7 +597,11 @@ impl ProgramNodeKind {
                     }
                 }
             }
-            Self::Filter { predicate, .. } => visit(Some(*predicate))?,
+            Self::Filter { predicates, .. } => {
+                for predicate in predicates {
+                    visit(Some(*predicate))?;
+                }
+            }
             Self::Scan {
                 runtime_filters,
                 conjunct_predicate,
@@ -1540,6 +1544,13 @@ fn validate_shape(
     work: &mut ProgramWork<'_>,
 ) -> Result<(), ProgramCompileError> {
     match &node.kind {
+        ProgramNodeKind::Filter { predicates, .. } => {
+            let empty = predicates.is_empty();
+            work.step()?;
+            if empty {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+        }
         ProgramNodeKind::Values { values } => {
             if work.identity(values.layout(), LocalProgramError::LayoutMismatch)?
                 != work.identity(&node.output_layout, LocalProgramError::LayoutMismatch)?
@@ -1955,7 +1966,7 @@ mod tests {
                 2,
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(0),
-                    predicate: ProgramExprId::new(0),
+                    predicates: vec![ProgramExprId::new(0)].into_boxed_slice(),
                 },
                 layout.clone(),
             ),
@@ -2457,14 +2468,14 @@ mod tests {
             (
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(1),
-                    predicate: ProgramExprId::new(999),
+                    predicates: vec![ProgramExprId::new(999)].into_boxed_slice(),
                 },
                 LocalProgramError::InvalidChild,
             ),
             (
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(0),
-                    predicate: ProgramExprId::new(999),
+                    predicates: vec![ProgramExprId::new(999)].into_boxed_slice(),
                 },
                 LocalProgramError::InvalidExpression,
             ),

@@ -1598,7 +1598,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
             let output_kind = if truth {
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(0),
-                    predicate: crate::ProgramExprId::new(2),
+                    predicates: vec![crate::ProgramExprId::new(2)].into_boxed_slice(),
                 }
             } else {
                 ProgramNodeKind::Project {
@@ -1637,7 +1637,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
             let site = if truth {
                 ProgramExpressionRootSite::Node {
                     node: ProgramNodeId::new(1),
-                    role: ProgramNodeExpressionRole::FilterPredicate,
+                    role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
                 }
             } else {
                 root(0)

@@ -1151,7 +1151,7 @@ fn transparent_filter_over_the_unconstrained_scan_reads_the_scan_port() {
     let snapshot = checked.channels().expressions().resolved_calls().snapshot();
     let filter = snapshot.bindings()[&ProgramExpressionRootSite::Node {
         node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::FilterPredicate,
+        role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
     }];
     let root = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[&filter];
     // The Filter's `v1` reads its input, the scan's output ordinal 1.

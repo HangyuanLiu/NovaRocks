@@ -50,7 +50,9 @@ pub enum ProgramNodeExpressionRole {
         mapping: u32,
         constant: u32,
     },
-    FilterPredicate,
+    FilterPredicate {
+        predicate: u32,
+    },
     ScanResidual,
     RuntimeFilter {
         binding: u32,
@@ -345,8 +347,21 @@ impl RootCollector<'_> {
                     }
                 }
             }
-            ProgramNodeKind::Filter { predicate, .. } => {
-                self.node_root(node, Role::FilterPredicate, *predicate, TruthOnly)?
+            ProgramNodeKind::Filter { predicates, .. } => {
+                if predicates.is_empty() {
+                    return Err(ProgramExpressionRootError::InvalidDefinition);
+                }
+                for (predicate, definition) in predicates.iter().enumerate() {
+                    self.step()?;
+                    self.node_root(
+                        node,
+                        Role::FilterPredicate {
+                            predicate: ordinal(predicate)?,
+                        },
+                        *definition,
+                        TruthOnly,
+                    )?;
+                }
             }
             ProgramNodeKind::Scan {
                 conjunct_predicate,

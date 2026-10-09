@@ -116,13 +116,19 @@ fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
     assert!(
         CompiledFilterProcessorFactory::try_new(
             Arc::clone(&program),
-            site(filter, ProgramNodeExpressionRole::FilterPredicate),
+            site(
+                filter,
+                ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
+            ),
             Arc::clone(&error),
         )
         .is_ok()
     );
     for refused in [
-        site(project, ProgramNodeExpressionRole::FilterPredicate),
+        site(
+            project,
+            ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
+        ),
         site(filter, ProgramNodeExpressionRole::ScanResidual),
         site(
             filter,

@@ -71,7 +71,7 @@ fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
                 1,
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(0),
-                    predicate: ProgramExprId::new(0),
+                    predicates: vec![ProgramExprId::new(0)].into_boxed_slice(),
                 },
                 source_layout,
             ),
@@ -124,7 +124,7 @@ fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
     )
     .unwrap();
     let bindings = [
-        ProgramNodeExpressionRole::FilterPredicate,
+        ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
         ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
     ]
     .into_iter()

@@ -643,7 +643,7 @@ fn root(mode: Mode) -> ProgramExpressionRootSite {
             Mode::Project | Mode::IfArgument => {
                 ProgramNodeExpressionRole::ProjectOutput { expression: 0 }
             }
-            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate,
+            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
         },
     }
 }

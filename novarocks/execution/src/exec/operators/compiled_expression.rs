@@ -307,9 +307,9 @@ impl ProcessorOperator for CompiledProjectProcessor {
     }
 }
 
-/// Filter by one compiled TruthOnly predicate root: keep exactly the rows
-/// whose root is TRUE; FALSE and NULL are both excluded. The rows keep the
-/// root's input port unchanged.
+/// Filter by the original ordered TruthOnly predicate roots. The single
+/// Scan residual retains its original consumer. Both preserve the exact
+/// input port and keep only rows whose complete predicate is TRUE.
 pub struct CompiledFilterProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
@@ -317,9 +317,9 @@ pub struct CompiledFilterProcessorFactory {
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledFilterProcessorFactory {
-    /// `site` names the predicate root this filter owns: a Filter node's
-    /// `FilterPredicate` or a Scan node's `ScanResidual`. Its input port is the
-    /// root's single NodeOutput layout, which is also the filtered output.
+    /// `site` identifies the Filter owner through original predicate zero,
+    /// or the single original ScanResidual. All Filter roots share its
+    /// checked NodeOutput input port, which is also the filtered output.
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
         site: ProgramExpressionRootSite,
@@ -336,9 +336,10 @@ impl CompiledFilterProcessorFactory {
             .get(node.index())
             .ok_or_else(|| format!("compiled filter node {} is absent", node.index()))?;
         let label = match (graph_node.kind(), role) {
-            (ProgramNodeKind::Filter { .. }, ProgramNodeExpressionRole::FilterPredicate) => {
-                "COMPILED_FILTER"
-            }
+            (
+                ProgramNodeKind::Filter { .. },
+                ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
+            ) => "COMPILED_FILTER",
             (ProgramNodeKind::Scan { .. }, ProgramNodeExpressionRole::ScanResidual) => {
                 "COMPILED_SCAN_RESIDUAL"
             }
@@ -391,10 +392,14 @@ struct CompiledFilterProcessor {
     program: Arc<LocalProgram>,
     site: ProgramExpressionRootSite,
     control: RuntimeKernelControl,
-    instance: Option<Vec<CompiledExpressionInstance>>,
+    instance: Option<CompiledFilterEvaluation>,
     pending: Option<Chunk>,
     finishing: bool,
     finished: bool,
+}
+enum CompiledFilterEvaluation {
+    Filter(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance),
+    Scan(Vec<CompiledExpressionInstance>),
 }
 impl Operator for CompiledFilterProcessor {
     fn name(&self) -> &str {
@@ -421,14 +426,28 @@ impl ProcessorOperator for CompiledFilterProcessor {
         if self.pending.is_some() {
             return Err("compiled Filter received input while output is pending".into());
         }
-        instances(
-            &mut self.instance,
-            &self.program,
-            std::slice::from_ref(&self.site),
-            &self.control,
-        )?;
-        let instance = &mut self.instance.as_mut().expect("instance was created")[0];
-        let truth = evaluate_all(instance, self.site, &chunk.batch, &self.control)?;
+        if self.instance.is_none() {
+            let created = match self.site {
+                ProgramExpressionRootSite::Node { node, role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 } } =>
+                    CompiledFilterEvaluation::Filter(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new(Arc::clone(&self.program), node, &self.control)?),
+                _ => {
+                    let mut instances_slot = None;
+                    instances(&mut instances_slot, &self.program, std::slice::from_ref(&self.site), &self.control)?;
+                    CompiledFilterEvaluation::Scan(instances_slot.expect("scan instance was created"))
+                }
+            };
+            self.instance = Some(created);
+        }
+        let truth = match self.instance.as_mut().expect("instance was created") {
+            CompiledFilterEvaluation::Filter(instance) => instance.evaluate_required(
+                &chunk.batch,
+                Selection::all(chunk.batch.num_rows()),
+                &self.control,
+            )?,
+            CompiledFilterEvaluation::Scan(instances) => {
+                evaluate_all(&mut instances[0], self.site, &chunk.batch, &self.control)?
+            }
+        };
         let truth = truth
             .as_any()
             .downcast_ref::<BooleanArray>()

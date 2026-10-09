@@ -448,7 +448,7 @@ fn root(mode: Use) -> ProgramExpressionRootSite {
         node: ProgramNodeId::new(2),
         role: match mode {
             Use::Value => ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-            Use::TruthOnly => ProgramNodeExpressionRole::FilterPredicate,
+            Use::TruthOnly => ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
         },
     }
 }
@@ -1032,3 +1032,5 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         },
     }
 }
+
+mod filter_conjunction_list_tests;

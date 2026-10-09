@@ -448,7 +448,7 @@ fn build_node(
                     Arc::clone(program),
                     ProgramExpressionRootSite::Node {
                         node: id,
-                        role: ProgramNodeExpressionRole::FilterPredicate,
+                        role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
                     },
                     Arc::clone(error),
                 )?));

@@ -135,7 +135,7 @@ fn graph(arena: Arc<ImmutableExpressions>, demand: EvaluationDemand) -> LocalPro
                 20,
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(0),
-                    predicate: ProgramExprId::new(2),
+                    predicates: vec![ProgramExprId::new(2)].into_boxed_slice(),
                 },
                 layout.clone(),
             ),
@@ -161,7 +161,7 @@ fn snapshot(
     let role = if demand == EvaluationDemand::Value {
         ProgramNodeExpressionRole::ProjectOutput { expression: 0 }
     } else {
-        ProgramNodeExpressionRole::FilterPredicate
+        ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
     };
     ProgramRootControlBindings::try_new(
         graph(arena, demand),

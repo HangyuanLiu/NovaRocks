@@ -433,7 +433,7 @@ impl Lowering<'_> {
                     n.node_id,
                     P::Filter {
                         input,
-                        predicate: expr(n.predicate),
+                        predicates: vec![expr(n.predicate)].into_boxed_slice(),
                     },
                 )
             }
@@ -1378,7 +1378,7 @@ mod tests {
             lp::ProgramNodeKind::Values { .. }
         ));
         assert!(
-            matches!(program.nodes()[1].kind(), lp::ProgramNodeKind::Filter { predicate, .. } if *predicate == lp::ProgramExprId::new(0))
+            matches!(program.nodes()[1].kind(), lp::ProgramNodeKind::Filter { predicates, .. } if predicates.as_ref() == [lp::ProgramExprId::new(0)])
         );
         assert_eq!(program.requirements().entries().len(), 1);
         assert!(matches!(

@@ -604,7 +604,7 @@ fn root(mode: Mode) -> ProgramExpressionRootSite {
         node: ProgramNodeId::new(2),
         role: match mode {
             Mode::Project => ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate,
+            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
         },
     }
 }

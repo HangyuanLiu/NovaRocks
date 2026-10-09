@@ -206,10 +206,9 @@ fn frozen_reads(
     }
     reads
 }
-fn compiler_results(
+pub(super) fn source_packages(
     source: &SqlAuthoredPhysicalPlan,
-    functions: &PureEngineFunctionCatalog,
-) -> BTreeMap<FragmentId, Result<LocalProgram, novarocks_local_compiler::FragmentCompileError>> {
+) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
     let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
     let uses = semantics
         .iter()
@@ -253,25 +252,43 @@ fn compiler_results(
         &Control,
     )
     .unwrap();
-    let providers = providers();
     packages
         .into_iter()
+        .map(|(id, package)| (id, Arc::new(package)))
+        .collect()
+}
+pub(super) fn compile_options() -> LocalCompileOptions {
+    LocalCompileOptions {
+        pipeline_dop: NonZeroUsize::new(1).unwrap(),
+        root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
+        kernel_abi: KernelAbiVersion::CURRENT,
+        exchange_wait: Duration::from_secs(120),
+        constants: policy(),
+    }
+}
+pub(super) fn compiler_results(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+) -> BTreeMap<FragmentId, Result<LocalProgram, novarocks_local_compiler::FragmentCompileError>> {
+    source_packages(source)
+        .into_iter()
         .map(|(id, package)| {
-            let compiled = compile_fragment(
-                validate_fragment_providers(Arc::new(package), &providers, &Control).unwrap(),
-                functions,
-                LocalCompileOptions {
-                    pipeline_dop: NonZeroUsize::new(1).unwrap(),
-                    root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
-                    kernel_abi: KernelAbiVersion::CURRENT,
-                    exchange_wait: Duration::from_secs(120),
-                    constants: policy(),
-                },
-                &Control,
-            );
-            (id, compiled)
+            (
+                id,
+                compile_fragment(
+                    validate_fragment_providers(package, &providers(), &Control).unwrap(),
+                    functions,
+                    compile_options(),
+                    &Control,
+                ),
+            )
         })
         .collect()
+}
+pub(super) fn validate_package(
+    package: Arc<FragmentPackage>,
+) -> novarocks_local_compiler::ProviderValidatedFragment {
+    validate_fragment_providers(package, &providers(), &Control).unwrap()
 }
 
 const HAVING: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;";

@@ -1099,7 +1099,10 @@ fn build_pipeline_for_program_node(
             runtime_filters,
             ctx,
         ),
-        lp::ProgramNodeKind::Filter { input, predicate } => {
+        lp::ProgramNodeKind::Filter { input, predicates } => {
+            let [predicate] = predicates.as_ref() else {
+                return Err("legacy Filter adapter requires its one original predicate".into());
+            };
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             build
                 .pipeline

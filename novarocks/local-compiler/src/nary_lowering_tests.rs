@@ -438,7 +438,7 @@ fn ordered_nullable_nary_three_and_wide_320_lower_into_one_intrinsic_definition_
                     (
                         Use::TruthOnly,
                         ProgramExpressionRootSite::Node {
-                            role: ProgramNodeExpressionRole::FilterPredicate,
+                            role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
                             ..
                         },
                     ) => {}
