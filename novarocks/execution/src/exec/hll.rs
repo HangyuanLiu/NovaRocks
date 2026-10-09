@@ -844,3 +844,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_ds_hll_decoder_error_baseline.rs"]
+mod legacy_ds_hll_decoder_error_baseline;
