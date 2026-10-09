@@ -387,11 +387,28 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
                     None
                 }
             };
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            let pressure_original = match (pressure_hook, pressure_record) {
+                (Some(pressure), Some(Ok(()))) => {
+                    // Freeze the opaque classification before this actual W exits.
+                    Some(pressure.capacity_eof(receipt, io_error(error.clone())))
+                }
+                (_, Some(Err(hook_source))) => Some(
+                    crate::closing_pressure_gate::relay::preserve_refusal_hook_failure(
+                        io_error(error.clone()),
+                        hook_source,
+                    ),
+                ),
+                _ => None,
+            };
             if let Some(delivery) = delivery {
                 delivery.fail(error.clone());
             }
             drop(lease);
             let _ = result.client_disconnected();
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            let original = pressure_original.unwrap_or_else(|| io_error(error));
+            #[cfg(not(feature = "mem-1-m07-closing-pressure"))]
             let original = io_error(error);
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             let original = if legacy_capacity_refused {
@@ -401,16 +418,6 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
                 }
             } else {
                 original
-            };
-            #[cfg(feature = "mem-1-m07-closing-pressure")]
-            let original = match pressure_record {
-                Some(Err(hook_source)) => {
-                    crate::closing_pressure_gate::relay::preserve_refusal_hook_failure(
-                        original,
-                        hook_source,
-                    )
-                }
-                _ => original,
             };
             #[cfg(not(any(
                 feature = "mem-1-m07-exact-mysql-write",

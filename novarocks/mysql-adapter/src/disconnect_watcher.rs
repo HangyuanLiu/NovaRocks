@@ -34,16 +34,28 @@ use tracing::warn;
 /// The socket observation task retained by one protocol connection.
 pub struct ClientDisconnectWatcher {
     join_handle: Option<JoinHandle<()>>,
-    #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+    #[cfg(any(
+        test,
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     fixture_abort: Option<crate::listener::WatcherAbortGuard>,
 }
 
 impl ClientDisconnectWatcher {
-    #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+    #[cfg(any(
+        test,
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     pub(crate) fn take_original_handle_for_fixture(&mut self) -> Option<JoinHandle<()>> {
         self.join_handle.take()
     }
-    #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+    #[cfg(any(
+        test,
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     pub(crate) fn install_fixture_abort_guard(
         &mut self,
         guard: crate::listener::WatcherAbortGuard,
@@ -61,7 +73,11 @@ impl ClientDisconnectWatcher {
     pub const fn inactive() -> Self {
         Self {
             join_handle: None,
-            #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+            #[cfg(any(
+                test,
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            ))]
             fixture_abort: None,
         }
     }
@@ -124,7 +140,11 @@ pub fn spawn_disconnect_watcher(
     });
     ClientDisconnectWatcher {
         join_handle: Some(join_handle),
-        #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+        #[cfg(any(
+            test,
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         fixture_abort: None,
     }
 }

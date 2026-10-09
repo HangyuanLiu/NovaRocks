@@ -225,6 +225,8 @@ async fn original_intermediary_eof(pool_refusal: bool) {
             Some(hub.clone()),
             Some(permit),
             Some(observation.clone()),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            None,
         )
         .await;
         observation.abort_remaining_watchers();

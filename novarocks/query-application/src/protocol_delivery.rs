@@ -52,6 +52,17 @@ impl GovernedProtocolOwner {
             .map(GovernedQueryStatementOwner::token)
     }
 
+    /// Match a read-only observer to this original statement's workload owner.
+    /// No scope, grant, or new observer escapes the protocol owner.
+    pub fn is_observed_by(
+        &self,
+        observer: &novarocks_workload_control::WorkloadObservationHandle,
+    ) -> bool {
+        self.statement
+            .as_ref()
+            .is_some_and(|statement| observer.observes_scope(statement.scope()))
+    }
+
     pub fn cancellation(&self) -> QueryCancellationView {
         let statement = self
             .statement
@@ -457,6 +468,13 @@ impl StreamingStatementResult {
     /// Project the protocol owner's exact identity; observation grants no control.
     pub fn statement_token(&self) -> Option<StatementToken> {
         self.protocol.statement_token()
+    }
+
+    pub fn is_observed_by(
+        &self,
+        observer: &novarocks_workload_control::WorkloadObservationHandle,
+    ) -> bool {
+        self.protocol.is_observed_by(observer)
     }
 
     pub fn begin_schema(&mut self) -> Option<SchemaDelivery> {

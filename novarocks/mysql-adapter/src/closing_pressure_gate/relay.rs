@@ -100,9 +100,15 @@ impl PressureOwner {
     ) -> io::Result<()> {
         for index in 0..TARGETS {
             let state = self.core.state(index)?;
-            if state.facts.handshake_connection_id == Some(connection.connection_id())
-                && actual_sql_sha256 == ORIGINAL_SQL_SHA256
-            {
+            if state.facts.handshake_connection_id == Some(connection.connection_id()) {
+                self.core.check()?;
+                if state.facts.phase == Phase::Released
+                    && state.facts.connection == Some(connection)
+                    && actual_sql_sha256 != ORIGINAL_SQL_SHA256
+                    && state.facts.cancel_receipt.is_some()
+                {
+                    return Ok(());
+                }
                 return Err(self.core.fail(Failure::Transition));
             }
         }
@@ -128,6 +134,43 @@ impl PressureRelayHook {
         self.scope
             .observe_capacity_refused(self.statement, actual, original)
     }
+    /// Mint only while this exact original writer is live, after its one real capacity refusal.
+    pub(crate) fn capacity_eof(&self, receipt: FramingCursor, original: io::Error) -> io::Error {
+        let checked = (|| {
+            self.scope.core.check()?;
+            let mut state = self.scope.core.state(self.scope.slot)?;
+            if self.scope.slot != CLOSING_TARGETS
+                || state.facts.phase != Phase::CapacityRefused
+                || state.facts.statement != Some(self.statement)
+                || state.facts.cancel_receipt != Some(receipt)
+                || !state.facts.writer_attached
+                || state.facts.writer_destructor_returned
+                || !matches!(state.refusal, Some(WorkError::Capacity(_)))
+                || state.capacity_eof_minted
+            {
+                return Err(self.scope.core.fail(Failure::Identity));
+            }
+            let connection = state
+                .facts
+                .connection
+                .ok_or_else(|| self.scope.core.fail(Failure::Identity))?;
+            state.capacity_eof_minted = true;
+            Ok(connection)
+        })();
+        match checked {
+            Ok(connection) => io::Error::new(
+                original.kind(),
+                PressureCapacityEof {
+                    core: Arc::clone(&self.scope.core),
+                    connection,
+                    statement: self.statement,
+                    receipt,
+                    original,
+                },
+            ),
+            Err(hook) => preserve_refusal_hook_failure(original, hook),
+        }
+    }
     /// Invoke ONLY from inside the original timeout(CLOSING_DEADLINE, ...).
     /// The real ClosingDelivery stays owned in outer close_relay on every branch.
     pub(crate) async fn finish_original_closing<'slot, W: AsyncWrite + Unpin>(
@@ -140,6 +183,51 @@ impl PressureRelayHook {
         let original = closing.writer_mut().finish();
         tokio::pin!(original);
         paired_finish(&self.scope, original).await
+    }
+}
+
+/// Private same-returned-error classification. Identity conveys no resource rights.
+pub(crate) struct PressureCapacityEof {
+    core: Arc<Core>,
+    connection: ClientConnectionToken,
+    statement: StatementToken,
+    receipt: FramingCursor,
+    original: io::Error,
+}
+impl PressureCapacityEof {
+    pub(crate) fn from_error(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+    pub(crate) fn matches(&self, connection: ClientConnectionToken) -> bool {
+        if self.connection != connection || self.core.first_failure.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.core.state(CLOSING_TARGETS).is_ok_and(|state| {
+            state.capacity_eof_minted
+                && state.facts.phase == Phase::CapacityRefused
+                && state.facts.connection == Some(connection)
+                && state.facts.statement == Some(self.statement)
+                && state.facts.cancel_receipt == Some(self.receipt)
+                && matches!(state.refusal, Some(WorkError::Capacity(_)))
+        })
+    }
+    pub(crate) fn matches_controller(&self, controller: &PressureController) -> bool {
+        Arc::ptr_eq(&self.core, &controller.core) && self.matches(self.connection)
+    }
+}
+impl std::fmt::Debug for PressureCapacityEof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("pressure original Closing capacity refusal retained")
+    }
+}
+impl std::fmt::Display for PressureCapacityEof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+impl std::error::Error for PressureCapacityEof {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
     }
 }
 

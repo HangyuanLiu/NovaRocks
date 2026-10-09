@@ -19,6 +19,8 @@
 
 mod authentication;
 #[cfg(feature = "mem-1-m07-closing-pressure")]
+pub mod closing_pressure_fixture;
+#[cfg(feature = "mem-1-m07-closing-pressure")]
 mod closing_pressure_gate;
 mod connection_registry;
 mod disconnect_watcher;
@@ -150,3 +152,6 @@ pub use startup_profile::{
     MysqlInputLimits, MysqlInputStartupParameters, MysqlStartupParameters,
     frozen_mysql_startup_parameters,
 };
+
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+pub use query_application_shim::serve_query_application_mysql_until_drain_then_shutdown_pressure as closing_pressure_fixture_listener;

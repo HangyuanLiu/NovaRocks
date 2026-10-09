@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Private pressure instrumentation. No listener/export/Closing authority is implemented.
+//! Private pressure instrumentation; the original listener and statement retain authority.
 //! Install ClosingHeld inside the existing original Closing finish timeout only.
 pub(crate) mod relay;
 
@@ -53,7 +53,7 @@ pub(crate) const ORIGINAL_SQL_SHA256: [u8; 32] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum Failure {
+pub enum Failure {
     Identity = 1,
     Transition,
     Deadline,
@@ -97,7 +97,7 @@ fn error(reason: Failure) -> io::Error {
     )
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Phase {
+pub enum Phase {
     Unarmed,
     Armed,
     Bound,
@@ -108,12 +108,12 @@ pub(crate) enum Phase {
     CapacityRefused,
 }
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ArmInput {
+pub struct ArmInput {
     pub handshake_connection_id: u32,
     pub original_sql_sha256: [u8; 32],
 }
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SlotSnapshot {
+pub struct SlotSnapshot {
     pub slot: usize,
     pub phase: Phase,
     pub failure: Option<Failure>,
@@ -148,6 +148,7 @@ struct State {
     digest: Sha256,
     refusal: Option<WorkError>,
     closing_poll_active: bool,
+    capacity_eof_minted: bool,
 }
 struct Slot {
     state: Mutex<State>,
@@ -163,6 +164,7 @@ struct Core {
     selection: Mutex<()>,
     slots: Box<[Slot; TARGETS]>,
     changed: Notify,
+    workload: Option<novarocks_workload_control::WorkloadObservationHandle>,
 }
 /// Listener-local diagnostic ownership only. No payload/credit/runtime capability.
 pub(crate) struct PressureOwner {
@@ -242,6 +244,13 @@ impl PressureOwner {
         actual_frontend: FrontendProcessId,
         original_deadline: Instant,
     ) -> io::Result<(Self, PressureController)> {
+        Self::with_workload(actual_frontend, original_deadline, None)
+    }
+    pub(crate) fn with_workload(
+        actual_frontend: FrontendProcessId,
+        original_deadline: Instant,
+        workload: Option<novarocks_workload_control::WorkloadObservationHandle>,
+    ) -> io::Result<(Self, PressureController)> {
         if Instant::now() >= original_deadline {
             return Err(error(Failure::Deadline));
         }
@@ -277,6 +286,7 @@ impl PressureOwner {
                 digest: Sha256::new(),
                 refusal: None,
                 closing_poll_active: false,
+                capacity_eof_minted: false,
             }),
             waiter: Mutex::new(None),
             inner_poll: AtomicBool::new(false),
@@ -290,6 +300,7 @@ impl PressureOwner {
             selection: Mutex::new(()),
             slots,
             changed: Notify::new(),
+            workload,
         });
         Ok((
             Self {
@@ -297,6 +308,47 @@ impl PressureOwner {
             },
             PressureController { core },
         ))
+    }
+    pub(crate) fn is_selected_connection(&self, connection: ClientConnectionToken) -> bool {
+        for index in 0..TARGETS {
+            match self.core.state(index) {
+                Ok(state)
+                    if state.facts.handshake_connection_id == Some(connection.connection_id()) =>
+                {
+                    return true;
+                }
+                Ok(_) => {}
+                // A poisoned selection cannot authorize a protocol shortcut.
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+    pub(crate) fn reject_unsupported_batch(
+        &self,
+        connection: ClientConnectionToken,
+    ) -> io::Result<()> {
+        if self.is_selected_connection(connection) {
+            return Err(self.core.fail(Failure::Transition));
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_streaming_owner(
+        &self,
+        result: &novarocks_query_application::protocol_delivery::StreamingStatementResult,
+    ) -> io::Result<()> {
+        if !self
+            .core
+            .workload
+            .as_ref()
+            .is_some_and(|observer| result.is_observed_by(observer))
+        {
+            return Err(self.core.fail(Failure::Identity));
+        }
+        self.core.check()
+    }
+    pub(crate) fn fail(&self, reason: Failure) {
+        let _ = self.core.fail(reason);
     }
     /// Unrelated original connections remain raw; selected conflicts fail the whole pressure attempt.
     pub(crate) fn bind_statement(
@@ -400,6 +452,62 @@ impl PressureController {
     /// Scalar-only single-slot response: no array-sized body or borrowed original IO.
     pub(crate) fn snapshot(&self, slot: usize) -> io::Result<SlotSnapshot> {
         self.core.snapshot(slot)
+    }
+    /// No Release can race this sole controller's synchronous held bracket.
+    /// Writers still run their original clocks; any exit/failure invalidates it.
+    pub(crate) fn joint_closing_snapshot(
+        &self,
+        require_refusal: bool,
+    ) -> io::Result<crate::closing_pressure_fixture::ClosingPressureJointSnapshot> {
+        let check_held = || -> io::Result<u64> {
+            self.core.check()?;
+            let mut minimum_polls = u64::MAX;
+            for index in 0..CLOSING_TARGETS {
+                let state = self.core.state(index)?;
+                if state.facts.phase != Phase::ClosingHeld
+                    || !state.facts.real_closing_observed
+                    || !state.facts.writer_attached
+                    || state.facts.writer_destructor_returned
+                    || state.facts.cancel_receipt.is_none()
+                    || state.facts.paired_closing_polls == 0
+                    || (!state.facts.closing_write_blocked && !state.facts.closing_flush_blocked)
+                {
+                    return Err(self.core.fail(Failure::Transition));
+                }
+                minimum_polls = minimum_polls.min(state.facts.paired_closing_polls);
+            }
+            if require_refusal {
+                let state = self.core.state(CLOSING_TARGETS)?;
+                if state.facts.phase != Phase::CapacityRefused
+                    || state.facts.cancel_receipt.is_none()
+                    || !state.capacity_eof_minted
+                    || !matches!(state.refusal, Some(WorkError::Capacity(_)))
+                {
+                    return Err(self.core.fail(Failure::Transition));
+                }
+            }
+            self.core.check()?;
+            Ok(minimum_polls)
+        };
+        let before = check_held()?;
+        let workload = self
+            .core
+            .workload
+            .as_ref()
+            .ok_or_else(|| self.core.fail(Failure::Identity))?;
+        let capacity = workload.result_capacity_snapshot();
+        if capacity.held_positions[3] != CLOSING_TARGETS {
+            return Err(self.core.fail(Failure::Identity));
+        }
+        let after = check_held()?;
+        Ok(
+            crate::closing_pressure_fixture::ClosingPressureJointSnapshot {
+                capacity,
+                closing_targets: CLOSING_TARGETS,
+                minimum_original_closing_polls: before.min(after),
+                original_capacity_refusal: require_refusal,
+            },
+        )
     }
     pub(crate) fn release(&mut self, slot: usize) -> io::Result<()> {
         self.core.check()?;

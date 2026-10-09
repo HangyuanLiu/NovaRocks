@@ -46,18 +46,40 @@ use novarocks_query_application::sql::admission::negotiated_query_statements;
 use crate::connection_registry::{MysqlClientConnectionRegistration, MysqlConnectionClass};
 use crate::{ClientDisconnectWatcher, MysqlClientConnectionRegistry, spawn_disconnect_watcher};
 
-/// One bounded source observation, not a gate snapshot or a token capability.
-/// The caller passes the exact raw inputs of its successful original bind.
 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
 fn write_exact_mysql_bound_marker_for_hook<W: std::io::Write>(
     writer: &mut W,
-    original_hook: Option<&crate::mysql_write_gate::late_binding::MysqlWriteRelayHook>,
+    hook: Option<&crate::mysql_write_gate::late_binding::MysqlWriteRelayHook>,
+    connection: ClientConnectionToken,
+    statement: novarocks_query_application::session_control::StatementToken,
+    sql_sha256: [u8; 32],
+) -> io::Result<()> {
+    write_original_mysql_bound_marker(
+        writer,
+        hook.is_some(),
+        "NOVAROCKS_EXACT_MYSQL_TARGET_BOUND",
+        connection,
+        statement,
+        sql_sha256,
+    )
+}
+
+/// One bounded source observation, not a gate snapshot or a token capability.
+/// The caller passes the exact raw inputs of its successful original bind.
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
+fn write_original_mysql_bound_marker<W: std::io::Write>(
+    writer: &mut W,
+    bound: bool,
+    marker: &'static str,
     connection: ClientConnectionToken,
     statement: novarocks_query_application::session_control::StatementToken,
     exact_sql_sha256: [u8; 32],
 ) -> io::Result<()> {
     // No-hook, non-target and follow-up paths produce no observation or IO.
-    if original_hook.is_none() {
+    if !bound {
         return Ok(());
     }
     use std::fmt::Write as _;
@@ -90,8 +112,8 @@ fn write_exact_mysql_bound_marker_for_hook<W: std::io::Write>(
         length: 0,
     };
     write!(&mut line,
-        "NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id={} connection_generation={} session_connection_id={} session_epoch={} statement_generation={} sql_sha256=",
-        connection.connection_id(), connection.generation(), statement.session().connection_id(),
+        "{} connection_id={} connection_generation={} session_connection_id={} session_epoch={} statement_generation={} sql_sha256=",
+        marker, connection.connection_id(), connection.generation(), statement.session().connection_id(),
         statement.session().session_epoch(), statement.generation(),
     ).map_err(invalid)?;
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -239,6 +261,8 @@ where
         on_ready,
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         None,
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        None,
     )
     .await
 }
@@ -271,6 +295,41 @@ where
         cleanup_timeout,
         on_ready,
         Some(binding),
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+pub async fn serve_query_application_mysql_until_drain_then_shutdown_pressure<F, G, R>(
+    settings: crate::ResolvedMysqlListenerSettings,
+    server_version: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
+    drain: F,
+    finalize: G,
+    cleanup_timeout: Duration,
+    on_ready: R,
+    binding: crate::closing_pressure_fixture::ClosingPressureListenerBinding,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
+    R: FnOnce(SocketAddr),
+{
+    serve_query_application_mysql_kernel(
+        settings,
+        server_version,
+        session_factory,
+        connections,
+        drain,
+        finalize,
+        cleanup_timeout,
+        on_ready,
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        None,
+        Some(binding),
     )
     .await
 }
@@ -287,6 +346,9 @@ async fn serve_query_application_mysql_kernel<F, G, R>(
     #[cfg(feature = "mem-1-m07-exact-mysql-write")] binding: Option<
         crate::exact_mysql_write_fixture::MysqlWriteFixtureListenerBinding,
     >,
+    #[cfg(feature = "mem-1-m07-closing-pressure")] pressure_binding: Option<
+        crate::closing_pressure_fixture::ClosingPressureListenerBinding,
+    >,
 ) -> Result<(), String>
 where
     F: Future<Output = ()> + Send,
@@ -295,18 +357,46 @@ where
 {
     let (bind_addr, session_user) = settings.into_parts();
     let drain_registry = Arc::clone(&connections);
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
+    let mut fixture_joins = None;
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    let (fixture_hub, fixture_joins) = match binding {
-        Some(binding) => (Some(binding.hub), Some(binding.joins)),
-        None => (None, None),
+    let fixture_hub = match binding {
+        Some(binding) => {
+            fixture_joins = Some(binding.joins);
+            Some(binding.hub)
+        }
+        None => None,
     };
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    let pressure_owner = match pressure_binding {
+        Some(binding) => {
+            if fixture_joins.is_some() {
+                binding
+                    .owner
+                    .fail(crate::closing_pressure_gate::Failure::Identity);
+                return Err("independent MySQL fixtures cannot share an active listener".into());
+            }
+            fixture_joins = Some(binding.joins);
+            Some(binding.owner)
+        }
+        None => None,
+    };
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     let fixture_watchers = fixture_joins.clone();
     let handler = move |stream, peer_addr| {
         // Acquire a finite position before creating the task, watcher or
         // intermediary and its protocol buffers. Full admission closes IO.
         let registration = connections.register().ok()?;
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         let watcher_permit = match &fixture_watchers {
             Some(joins) => Some(joins.reserve_watcher(registration.retain_owner()).ok()?),
             None => None,
@@ -320,13 +410,24 @@ where
             peer_addr,
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             fixture_hub.clone(),
-            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            ))]
             watcher_permit,
-            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            ))]
             fixture_watchers.clone(),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            pressure_owner.clone(),
         ))
     };
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     let serve_result = match fixture_joins {
         Some(joins) => {
             crate::listener::serve_tcp_until_drain_then_shutdown_admitted_observed(
@@ -352,7 +453,10 @@ where
             .await
         }
     };
-    #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
+    #[cfg(not(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    )))]
     let serve_result = crate::listener::serve_tcp_until_drain_then_shutdown_admitted(
         bind_addr,
         drain,
@@ -397,24 +501,45 @@ pub async fn serve_query_application_mysql_connection(
         peer_addr,
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         None,
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         None,
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
+        None,
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
         None,
     )
     .await;
 }
 
-#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 enum FixtureMysqlWriter {
     Raw(tokio::net::tcp::OwnedWriteHalf),
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     Gated(
         crate::mysql_write_gate::late_binding::InitiallyRawMysqlWriter<
             tokio::net::tcp::OwnedWriteHalf,
         >,
     ),
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    Pressure(
+        crate::closing_pressure_gate::relay::InitiallyRawPressureWriter<
+            tokio::net::tcp::OwnedWriteHalf,
+        >,
+    ),
 }
-#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 impl AsyncWrite for FixtureMysqlWriter {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -423,7 +548,10 @@ impl AsyncWrite for FixtureMysqlWriter {
     ) -> std::task::Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Raw(io) => std::pin::Pin::new(io).poll_write(cx, bytes),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             Self::Gated(io) => std::pin::Pin::new(io).poll_write(cx, bytes),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            Self::Pressure(io) => std::pin::Pin::new(io).poll_write(cx, bytes),
         }
     }
     fn poll_write_vectored(
@@ -433,13 +561,19 @@ impl AsyncWrite for FixtureMysqlWriter {
     ) -> std::task::Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Raw(io) => std::pin::Pin::new(io).poll_write_vectored(cx, bytes),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             Self::Gated(io) => std::pin::Pin::new(io).poll_write_vectored(cx, bytes),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            Self::Pressure(io) => std::pin::Pin::new(io).poll_write_vectored(cx, bytes),
         }
     }
     fn is_write_vectored(&self) -> bool {
         match self {
             Self::Raw(io) => io.is_write_vectored(),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             Self::Gated(io) => io.is_write_vectored(),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            Self::Pressure(io) => io.is_write_vectored(),
         }
     }
     fn poll_flush(
@@ -448,7 +582,10 @@ impl AsyncWrite for FixtureMysqlWriter {
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Raw(io) => std::pin::Pin::new(io).poll_flush(cx),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             Self::Gated(io) => std::pin::Pin::new(io).poll_flush(cx),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            Self::Pressure(io) => std::pin::Pin::new(io).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -457,9 +594,49 @@ impl AsyncWrite for FixtureMysqlWriter {
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Raw(io) => std::pin::Pin::new(io).poll_shutdown(cx),
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             Self::Gated(io) => std::pin::Pin::new(io).poll_shutdown(cx),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            Self::Pressure(io) => std::pin::Pin::new(io).poll_shutdown(cx),
         }
     }
+}
+
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
+fn fixture_original_writer(
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    connection: ClientConnectionToken,
+    class: MysqlConnectionClass,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")] legacy: Option<
+        Arc<crate::mysql_write_gate::late_binding::MysqlWriteGateHub>,
+    >,
+    #[cfg(feature = "mem-1-m07-closing-pressure")] pressure: Option<
+        Arc<crate::closing_pressure_gate::PressureOwner>,
+    >,
+) -> FixtureMysqlWriter {
+    if class == MysqlConnectionClass::Control {
+        return FixtureMysqlWriter::Raw(writer);
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    if let Some(owner) = pressure {
+        return FixtureMysqlWriter::Pressure(
+            crate::closing_pressure_gate::relay::InitiallyRawPressureWriter::new(
+                writer, connection, owner,
+            ),
+        );
+    }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    if let Some(hub) = legacy {
+        return FixtureMysqlWriter::Gated(
+            crate::mysql_write_gate::late_binding::InitiallyRawMysqlWriter::new(
+                writer, connection, hub,
+            ),
+        );
+    }
+    FixtureMysqlWriter::Raw(writer)
 }
 
 async fn serve_registered_mysql_connection(
@@ -472,11 +649,18 @@ async fn serve_registered_mysql_connection(
     #[cfg(feature = "mem-1-m07-exact-mysql-write")] fixture_hub: Option<
         Arc<crate::mysql_write_gate::late_binding::MysqlWriteGateHub>,
     >,
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")] watcher_permit: Option<
-        crate::listener::WatcherPermit,
-    >,
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")] fixture_protocol: Option<
-        Arc<crate::listener::MysqlFixtureSessionJoins>,
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
+    watcher_permit: Option<crate::listener::WatcherPermit>,
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
+    fixture_protocol: Option<Arc<crate::listener::MysqlFixtureSessionJoins>>,
+    #[cfg(feature = "mem-1-m07-closing-pressure")] pressure_owner: Option<
+        Arc<crate::closing_pressure_gate::PressureOwner>,
     >,
 ) {
     let connection = registration.token();
@@ -489,7 +673,10 @@ async fn serve_registered_mysql_connection(
             session.cancel_current(QueryCancellationReason::ClientDisconnected);
         }
     });
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     let disconnect_watcher = match watcher_permit {
         Some(permit) => permit.attach(disconnect_watcher),
         None => disconnect_watcher,
@@ -509,16 +696,27 @@ async fn serve_registered_mysql_connection(
     } else {
         None
     });
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    let shim =
+        shim.with_pressure_owner(if registration.class() == MysqlConnectionClass::Ordinary {
+            pressure_owner.clone()
+        } else {
+            None
+        });
     let (reader, writer) = stream.into_split();
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    let writer = match (registration.class(), fixture_hub) {
-        (MysqlConnectionClass::Ordinary, Some(hub)) => FixtureMysqlWriter::Gated(
-            crate::mysql_write_gate::late_binding::InitiallyRawMysqlWriter::new(
-                writer, connection, hub,
-            ),
-        ),
-        _ => FixtureMysqlWriter::Raw(writer),
-    };
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
+    let writer = fixture_original_writer(
+        writer,
+        connection,
+        registration.class(),
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        fixture_hub,
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        pressure_owner,
+    );
     let result = {
         let input_policy = mysql_input_policy(registration.class());
         let intermediary = AsyncMysqlIntermediary::run_with_input_deadlines(
@@ -561,16 +759,85 @@ async fn serve_registered_mysql_connection(
         }
     };
     if let Some(Err(err)) = result {
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if fixture_protocol
+            .as_ref()
+            .is_some_and(|observer| observer.is_closing_pressure())
+        {
+            observe_pressure_protocol_failure(
+                fixture_protocol.as_ref().unwrap(),
+                connection,
+                registration.class(),
+                peer_addr,
+                err,
+            );
+            return;
+        }
         warn!(
             "standalone mysql connection failed: peer={}, connection_id={}, err={}",
             peer_addr,
             connection.connection_id(),
             err
         );
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         if let Some(observation) = fixture_protocol {
             observation.observe_protocol_failure(connection, registration.class(), err);
         }
+    }
+}
+
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+fn observe_pressure_protocol_failure(
+    observation: &crate::listener::MysqlFixtureSessionJoins,
+    connection: ClientConnectionToken,
+    class: MysqlConnectionClass,
+    peer: SocketAddr,
+    original: io::Error,
+) {
+    // Never execute unknown source formatters before the original error is retained.
+    let kind = original.kind();
+    let raw_os = original.raw_os_error();
+    observation.observe_protocol_failure(connection, class, original);
+    warn!(
+        "Closing pressure original MySQL IO: peer={} connection_id={} generation={} class={:?} kind={:?} raw_os={:?}",
+        peer,
+        connection.connection_id(),
+        connection.generation(),
+        class,
+        kind,
+        raw_os
+    );
+}
+
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+struct PressureQueryRejection {
+    original: QueryServiceError,
+    guard: io::Error,
+}
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+impl std::fmt::Display for PressureQueryRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pressure query rejected: original_kind={:?} guard_kind={:?}",
+            self.original.kind(),
+            self.guard.kind()
+        )
+    }
+}
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+impl std::fmt::Debug for PressureQueryRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+impl std::error::Error for PressureQueryRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
     }
 }
 
@@ -599,6 +866,8 @@ pub struct QueryApplicationMysqlShim {
     connection_class: MysqlConnectionClass,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     fixture_hub: Option<Arc<crate::mysql_write_gate::late_binding::MysqlWriteGateHub>>,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pressure_owner: Option<Arc<crate::closing_pressure_gate::PressureOwner>>,
 }
 
 impl QueryApplicationMysqlShim {
@@ -620,6 +889,8 @@ impl QueryApplicationMysqlShim {
             connection_class: MysqlConnectionClass::Ordinary,
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             fixture_hub: None,
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            pressure_owner: None,
         }
     }
 
@@ -637,12 +908,53 @@ impl QueryApplicationMysqlShim {
         self
     }
 
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    fn with_pressure_owner(
+        mut self,
+        owner: Option<Arc<crate::closing_pressure_gate::PressureOwner>>,
+    ) -> Self {
+        self.pressure_owner = owner;
+        self
+    }
+
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     fn reject_fixture_non_streaming(&self, sql_sha256: [u8; 32]) -> io::Result<()> {
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         if let Some(hub) = &self.fixture_hub {
             hub.reject_non_streaming_target(self.connection, sql_sha256)?;
         }
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if let Some(owner) = &self.pressure_owner {
+            owner.reject_non_streaming(self.connection, sql_sha256)?;
+        }
         Ok(())
+    }
+
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
+    fn retain_fixture_query_error(
+        &self,
+        sql_sha256: [u8; 32],
+        original: QueryServiceError,
+    ) -> io::Result<QueryServiceError> {
+        match self.reject_fixture_non_streaming(sql_sha256) {
+            Ok(()) => Ok(original),
+            Err(guard) => {
+                #[cfg(feature = "mem-1-m07-closing-pressure")]
+                if self.pressure_owner.is_some() {
+                    return Err(io::Error::new(
+                        guard.kind(),
+                        PressureQueryRejection { original, guard },
+                    ));
+                }
+                Err(guard)
+            }
+        }
     }
 
     fn session(&self) -> Result<&Arc<dyn QuerySession>, QueryServiceError> {
@@ -668,6 +980,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
     type Error = io::Error;
 
     fn permits_query_shortcuts(&self) -> bool {
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if self
+            .pressure_owner
+            .as_ref()
+            .is_some_and(|owner| owner.is_selected_connection(self.connection))
+        {
+            return false;
+        }
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         if self
             .fixture_hub
@@ -816,7 +1136,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         let fixture_sql_sha256: [u8; 32] = {
             use sha2::{Digest, Sha256};
             Sha256::digest(query.as_bytes()).into()
@@ -827,6 +1150,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 && negotiated_query_statements(query).is_ok_and(|statements| statements.len() > 1)
             {
                 hub.reject_unsupported_batch(self.connection)?;
+            }
+        }
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if let Some(owner) = &self.pressure_owner {
+            if negotiated_query_statements(query).is_ok_and(|statements| statements.len() > 1) {
+                owner.reject_unsupported_batch(self.connection)?;
             }
         }
         if self.connection_class == MysqlConnectionClass::Control {
@@ -841,8 +1170,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         let session = match self.session() {
             Ok(session) => session,
             Err(error) => {
-                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-                self.reject_fixture_non_streaming(fixture_sql_sha256)?;
+                #[cfg(any(
+                    feature = "mem-1-m07-exact-mysql-write",
+                    feature = "mem-1-m07-closing-pressure"
+                ))]
+                let error = self.retain_fixture_query_error(fixture_sql_sha256, error)?;
                 return results
                     .error(crate::mysql_error_kind(&error), error.message().as_bytes())
                     .await;
@@ -856,8 +1188,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
             match negotiated_query_statements(query) {
                 Ok(statements) => statements,
                 Err(error) => {
-                    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-                    self.reject_fixture_non_streaming(fixture_sql_sha256)?;
+                    #[cfg(any(
+                        feature = "mem-1-m07-exact-mysql-write",
+                        feature = "mem-1-m07-closing-pressure"
+                    ))]
+                    let error = self.retain_fixture_query_error(fixture_sql_sha256, error)?;
                     return results
                         .error(crate::mysql_error_kind(&error), error.message().as_bytes())
                         .await;
@@ -896,14 +1231,20 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         let (statement, terminal) = match session.execute_batch(query).await {
             Ok(statement) => statement.into_parts(),
             Err(error) => {
-                #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-                self.reject_fixture_non_streaming(fixture_sql_sha256)?;
+                #[cfg(any(
+                    feature = "mem-1-m07-exact-mysql-write",
+                    feature = "mem-1-m07-closing-pressure"
+                ))]
+                let error = self.retain_fixture_query_error(fixture_sql_sha256, error)?;
                 return results
                     .error(crate::mysql_error_kind(&error), error.message().as_bytes())
                     .await;
             }
         };
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         if !matches!(&statement, StatementResult::StreamingQuery(_)) {
             if let Err(error) = self.reject_fixture_non_streaming(fixture_sql_sha256) {
                 drop(statement);
@@ -920,6 +1261,35 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 crate::write_governed_query_result(result, results).await
             }
             StatementResult::StreamingQuery(result) => {
+                async {
+                    #[cfg(feature = "mem-1-m07-closing-pressure")]
+                    if let Some(owner) = &self.pressure_owner {
+                        let token = result.statement_token().ok_or_else(|| {
+                            owner.fail(crate::closing_pressure_gate::Failure::Identity);
+                            io::Error::new(io::ErrorKind::InvalidData, "pressure streaming result has no original statement token")
+                        })?;
+                        let hook = owner.bind_relay(self.connection, token, fixture_sql_sha256)?;
+                        if hook.is_some() {
+                            owner.validate_streaming_owner(&result)?;
+                            let stdout = std::io::stdout();
+                            let mut output = stdout.lock();
+                            if let Err(source) = write_original_mysql_bound_marker(
+                                &mut output, true, "NOVAROCKS_CLOSING_PRESSURE_TARGET_BOUND",
+                                self.connection, token, fixture_sql_sha256,
+                            ) {
+                                owner.fail(crate::closing_pressure_gate::Failure::Transition);
+                                return Err(source);
+                            }
+                        }
+                        let outcome = crate::governed_result_writer::write_streaming_query_result_with_pressure(result, results, hook).await;
+                        if outcome.as_ref().is_err_and(|source| {
+                            !crate::closing_pressure_gate::relay::PressureCapacityEof::from_error(source)
+                                .is_some_and(|eof| eof.matches(self.connection))
+                        }) {
+                            owner.fail(crate::closing_pressure_gate::Failure::Transition);
+                        }
+                        return outcome;
+                    }
                 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
                 {
                     // Keep the original terminal completion below on every fixture error.
@@ -961,6 +1331,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 }
                 #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
                 crate::write_streaming_query_result(result, results).await
+                }.await
             }
             StatementResult::GovernedCompletion(result) => {
                 crate::write_governed_terminal_ok(result.into_protocol(), results).await
@@ -1200,6 +1571,8 @@ mod tests {
                 None,
                 Some(permit),
                 Some(observation.clone()),
+                #[cfg(feature = "mem-1-m07-closing-pressure")]
+                None,
             )
             .await;
             observation.abort_remaining_watchers();
@@ -1361,6 +1734,10 @@ mod tests {
 #[cfg(all(test, feature = "mem-1-m07-exact-mysql-write"))]
 #[path = "query_application_shim/exact_eof_tests.rs"]
 mod exact_eof_tests;
+
+#[cfg(all(test, feature = "mem-1-m07-closing-pressure"))]
+#[path = "query_application_shim/closing_pressure_tests.rs"]
+mod closing_pressure_tests;
 
 #[cfg(all(test, feature = "mem-1-m07-exact-mysql-write"))]
 mod exact_successful_bind_marker_tests {

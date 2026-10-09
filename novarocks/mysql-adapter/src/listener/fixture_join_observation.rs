@@ -68,6 +68,10 @@ pub(crate) struct MysqlFixtureJoinFacts {
     pub protocol_io_failures: u64,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     pub prescribed_protocol_eofs: u64,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub pressure_capacity_eofs: u64,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub listener_io_failures: u64,
 }
 #[derive(Default)]
 struct State {
@@ -76,6 +80,12 @@ struct State {
     first_protocol_failure: Option<MysqlFixtureProtocolFailure>,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     first_prescribed_eof: Option<MysqlFixtureProtocolFailure>,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pressure_enabled: bool,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    first_pressure_eof: Option<MysqlFixtureProtocolFailure>,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    first_listener_failure: Option<std::io::Error>,
 }
 #[derive(Default)]
 pub(crate) struct MysqlFixtureSessionJoins {
@@ -93,6 +103,53 @@ fn increment(value: &mut u64) -> bool {
     }
 }
 impl MysqlFixtureSessionJoins {
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn for_closing_pressure() -> Self {
+        Self {
+            state: Mutex::new(State {
+                pressure_enabled: true,
+                ..State::default()
+            }),
+            ..Self::default()
+        }
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn is_closing_pressure(&self) -> bool {
+        self.state
+            .lock()
+            .expect("MySQL fixture join observation lock")
+            .pressure_enabled
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn observe_listener_failure(&self, cause: std::io::Error) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("MySQL fixture join observation lock");
+        let overflow = increment(&mut state.facts.listener_io_failures);
+        state.facts.counter_overflow |= overflow;
+        if state.first_listener_failure.is_none() {
+            state.first_listener_failure = Some(cause);
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn take_listener_failure_after_join(&self) -> Option<std::io::Error> {
+        self.state
+            .lock()
+            .expect("MySQL fixture join observation lock")
+            .first_listener_failure
+            .take()
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn take_pressure_eof_after_join(&self) -> Option<MysqlFixtureProtocolFailure> {
+        self.state
+            .lock()
+            .expect("MySQL fixture join observation lock")
+            .first_pressure_eof
+            .take()
+    }
     pub(crate) fn observe_protocol_failure(
         &self,
         connection: ClientConnectionToken,
@@ -103,8 +160,35 @@ impl MysqlFixtureSessionJoins {
             .state
             .lock()
             .expect("MySQL fixture join observation lock");
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if state.pressure_enabled
+            && class == MysqlConnectionClass::Ordinary
+            && state.facts.pressure_capacity_eofs == 0
+            && crate::closing_pressure_gate::relay::PressureCapacityEof::from_error(&cause)
+                .is_some_and(|eof| eof.matches(connection))
+        {
+            let overflow = increment(&mut state.facts.pressure_capacity_eofs);
+            state.facts.counter_overflow |= overflow;
+            state.first_pressure_eof = Some(MysqlFixtureProtocolFailure {
+                connection,
+                class,
+                cause,
+            });
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-        if class == MysqlConnectionClass::Ordinary
+        if {
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            {
+                !state.pressure_enabled
+            }
+            #[cfg(not(feature = "mem-1-m07-closing-pressure"))]
+            {
+                true
+            }
+        } && class == MysqlConnectionClass::Ordinary
             && crate::mysql_write_gate::late_binding::PrescribedRelayEof::from_error(&cause)
                 .is_some_and(|eof| eof.matches(connection, None))
             && state.facts.prescribed_protocol_eofs == 0
@@ -222,6 +306,10 @@ impl MysqlFixtureSessionJoins {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let facts = self.snapshot();
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            if facts.listener_io_failures != 0 {
+                return;
+            }
             if facts.panicked != 0
                 || facts.unexpected_cancelled != 0
                 || facts.counter_overflow
