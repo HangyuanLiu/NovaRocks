@@ -69,7 +69,7 @@ BOUNDS = {
     "max_request_bytes": 65536, "page_size": 256,
 }
 SOURCE = {
-    "canonical_lock_sha256": "9f720cb5dfb932edbef57e34a08f9cbcb717664b70917790283660be482c9181",
+    "canonical_lock_sha256": "76512c5eb0aaef5b918c0fb551e32e1d9b3d51cccbf74b9e8ad8364cabc7c25b",
     "image_source": "apache/iceberg-rest-fixture", "platform": "linux/arm64",
     "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
     "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",

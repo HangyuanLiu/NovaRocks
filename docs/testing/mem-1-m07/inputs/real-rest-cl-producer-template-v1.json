@@ -29,7 +29,7 @@
     "page_size": 256
   },
   "source": {
-    "canonical_lock_sha256": "9f720cb5dfb932edbef57e34a08f9cbcb717664b70917790283660be482c9181",
+    "canonical_lock_sha256": "76512c5eb0aaef5b918c0fb551e32e1d9b3d51cccbf74b9e8ad8364cabc7c25b",
     "image_source": "apache/iceberg-rest-fixture",
     "platform": "linux/arm64",
     "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
@@ -40,7 +40,7 @@
     "iceberg_tag": "apache-iceberg-1.10.1",
     "iceberg_build_version": "1.11.0-SNAPSHOT"
   },
-  "producer_sha256": "50a317f12417d2d99936c9346024c03d5b3e5a483bca1ce86777a099c4e11dbf",
+  "producer_sha256": "76759b855ace774c5aa52d66eade61a78586f335d83d90983dc91bedfae0a289",
   "binding": {
     "compose_project": null,
     "fixture_id": null,
