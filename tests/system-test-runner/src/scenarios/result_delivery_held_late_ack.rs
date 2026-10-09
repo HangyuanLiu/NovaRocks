@@ -73,21 +73,29 @@ const ROOT_FIELDS: [&str; 14] = [
     "metadata_bytes",
 ];
 
-/// OPEN until root's prelaunch admission verifies the new immutable input and
-/// the actual neutral-marker feature diagnostic as well as all ordinary build pins.
-/// validate_shape is a local consistency check and does not perform that admission.
-pub(super) fn from_admitted(run: AdmittedExactNativeRun) -> Result<Box<dyn Scenario>> {
+/// Called after prelaunch admission verifies the immutable input, actual
+/// neutral-marker feature and original build pins. Shape checking below is local.
+pub(super) fn from_admitted(
+    run: AdmittedExactNativeRun,
+    live_fences: bool,
+) -> Result<Box<dyn Scenario>> {
     run.validate_shape()?;
     Ok(Box::new(HeldLateAck {
         run: Arc::new(run),
         clock: Mutex::new(None),
         prepared: Mutex::new(None),
+        source_fences: Mutex::new(if live_fences {
+            Some(crate::held_live_source_fence::SourceFenceOwner::from_original_stdin()?)
+        } else {
+            None
+        }),
     }))
 }
 struct HeldLateAck {
     run: Arc<AdmittedExactNativeRun>,
     clock: Mutex<Option<Instant>>,
     prepared: Mutex<Option<OriginalPreparedConfig>>,
+    source_fences: Mutex<Option<crate::held_live_source_fence::SourceFenceOwner>>,
 }
 impl HeldLateAck {
     fn clock(&self) -> Result<Instant> {
@@ -145,7 +153,29 @@ impl Scenario for HeldLateAck {
             .map_err(|_| anyhow::anyhow!("prepared owner poisoned"))?;
         ensure!(prepared.is_none(), "prepared config already frozen");
         *prepared = Some(OriginalPreparedConfig::freeze(artifact, root, deadline)?);
+        let mut fences = self
+            .source_fences
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+        if let Some(fences) = fences.as_mut() {
+            fences.prepared(deadline)?;
+        }
         Ok(())
+    }
+    fn observe_original_durable_log_owner(
+        &self,
+        role: &str,
+        device: u64,
+        inode: u64,
+    ) -> Result<()> {
+        let mut fences = self
+            .source_fences
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+        fences
+            .as_mut()
+            .context("original source fence owner is not enabled")?
+            .log_owner(role, device, inode, self.clock()?)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let deadline = self.clock()?;
@@ -165,7 +195,7 @@ impl Scenario for HeldLateAck {
             .enable_all()
             .build()?;
         context.retain_artifacts();
-        run_owned(context, &runtime, deadline, &self.run)
+        run_owned(context, &runtime, deadline, &self.run, &self.source_fences)
     }
     fn teardown(&self) -> Result<()> {
         let prepared = self
@@ -411,6 +441,7 @@ fn run_owned(
     runtime: &Runtime,
     deadline: Instant,
     admitted: &AdmittedExactNativeRun,
+    source_fences: &Mutex<Option<crate::held_live_source_fence::SourceFenceOwner>>,
 ) -> Result<()> {
     // Every original handle stays outside the primary operation and all fallible writes.
     let mut actor: Option<HeldRootResponse> = None;
@@ -438,6 +469,14 @@ fn run_owned(
             deadline,
             FrontendIdentitySource::RootObservation,
         )?;
+        {
+            let mut fences = source_fences
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+            if let Some(fences) = fences.as_mut() {
+                fences.baseline(observer.original_baseline_log_bytes(), deadline)?;
+            }
+        }
         let user = context.mysql_user().to_owned();
         let port = context.mysql_port();
         check(deadline)?;
@@ -494,6 +533,14 @@ fn run_owned(
                 .as_micros(),
         );
         let target = observer.observe_until(context, phase)?;
+        {
+            let mut fences = source_fences
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+            if let Some(fences) = fences.as_mut() {
+                fences.target(target.after_log_bytes, phase)?;
+            }
+        }
         facts.root = Some(identity(target.root));
         facts.target_source = Some(observer.source_evidence(&target)?);
         // Same closed whole-cluster inventory and two genuine retained Data positions.

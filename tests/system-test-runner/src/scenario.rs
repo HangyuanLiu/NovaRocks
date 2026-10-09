@@ -81,6 +81,16 @@ pub trait Scenario: Send + Sync {
         Ok(())
     }
 
+    /// Optional source-only event from the actual role log writer owner.
+    fn observe_original_durable_log_owner(
+        &self,
+        _role: &str,
+        _device: u64,
+        _inode: u64,
+    ) -> Result<()> {
+        anyhow::bail!("scenario has no explicit held live source owner")
+    }
+
     /// Releases an external fixture created while preparing this scenario.
     ///
     /// The runner calls this after both successful and failed cluster runs, as

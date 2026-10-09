@@ -47,8 +47,9 @@ mod held_late_ack;
 /// Only the separate admitted new selector may call this. Old ten cases are unchanged.
 pub(crate) fn held_late_ack_from_admitted(
     run: AdmittedExactNativeRun,
+    live_fences: bool,
 ) -> Result<Box<dyn Scenario>> {
-    held_late_ack::from_admitted(run)
+    held_late_ack::from_admitted(run, live_fences)
 }
 
 const S: u64 = 1_048_576;

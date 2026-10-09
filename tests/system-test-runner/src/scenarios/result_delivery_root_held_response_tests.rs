@@ -281,7 +281,7 @@ async fn real_h2_server(
     let mut trailers = http::HeaderMap::new();
     trailers.insert("grpc-status", HeaderValue::from_static("0"));
     send.send_trailers(trailers)?;
-    while let Some(next) = connection.accept().await {
+    if let Some(next) = connection.accept().await {
         let _ = next?;
         requests.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("actor issued another host H2 request");

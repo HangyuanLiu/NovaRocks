@@ -137,11 +137,11 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
         # replacing only old independent source/build admission with pure stubs.
         # No actual PID, role, process, binary or Native fact is asserted here.
         _,projection,reference=self.receipt()
-        # Resolve frozen tracked fixture paths from the existing old verifier;
-        # the promoted tests never depend on ignored logs/draft packages.
-        inputs=Path(old.__file__).resolve().parents[2]/"docs/testing/mem-1-m07/inputs"
+        # Share the actual Rust test fixture; execution templates stay outside Git.
+        repository=Path(old.__file__).resolve().parents[2]
+        inputs=repository/"docs/testing/mem-1-m07/inputs"
         held_input=(inputs/"held-late-ack-freeze-v2.json").read_bytes()
-        binding=json.loads((inputs/"held-native-execution-binding-template-v1.json").read_bytes())
+        binding=json.loads((repository/"tests/system-test-runner/src/held_native_admission_test_binding.json").read_bytes())
         commit="a"*40
         provenance={key:"b"*64 for key in old.PROVENANCE_FIELDS}
         provenance.update(clean_revision=commit,server_build_identity=commit,

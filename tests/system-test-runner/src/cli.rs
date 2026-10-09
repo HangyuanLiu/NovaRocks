@@ -22,6 +22,8 @@ pub struct Cli {
     pub exact_mysql_execution_binding: Option<PathBuf>,
     /// Independent new frozen input and neutral-feature admission.
     pub held_native_execution_binding: Option<PathBuf>,
+    /// Original stdin/stdout source fences for an independent live collector.
+    pub held_live_collector_fences: bool,
 }
 impl Cli {
     pub fn parse_env() -> Result<Self> {
@@ -45,6 +47,7 @@ impl Cli {
             hms_classification_binding: None,
             exact_mysql_execution_binding: None,
             held_native_execution_binding: None,
+            held_live_collector_fences: false,
         };
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -97,6 +100,12 @@ impl Cli {
                     cli.held_native_execution_binding =
                         Some(PathBuf::from(value("--held-native-execution-binding")?));
                 }
+                "--held-live-collector-fences-v1" => {
+                    if cli.held_live_collector_fences {
+                        bail!("--held-live-collector-fences-v1 must appear exactly once");
+                    }
+                    cli.held_live_collector_fences = true;
+                }
                 "--hms-classification-binding" => {
                     if cli.hms_classification_binding.is_some() {
                         bail!("--hms-classification-binding must appear exactly once");
@@ -111,6 +120,9 @@ impl Cli {
                 "--help" | "-h" => bail!(Self::usage()),
                 _ => bail!("unknown option {argument}\n{}", Self::usage()),
             }
+        }
+        if cli.held_live_collector_fences && cli.held_native_execution_binding.is_none() {
+            bail!("held live source fences require explicit held Native admission");
         }
         if cli.held_native_execution_binding.is_some()
             && (cli.list
@@ -171,7 +183,7 @@ impl Cli {
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
             "[--launch-profile <fault-scenario|performance>] ",
-            "[--uea1-workload-manifest <path>] [--hms-classification-binding <path>] [--exact-mysql-execution-binding <path>] [--held-native-execution-binding <path>]"
+            "[--uea1-workload-manifest <path>] [--hms-classification-binding <path>] [--exact-mysql-execution-binding <path>] [--held-native-execution-binding <path>] [--held-live-collector-fences-v1]"
         )
     }
 }
@@ -179,6 +191,35 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_fences_require_unique_exclusive_held_admission_in_both_orders() {
+        let fence = "--held-live-collector-fences-v1";
+        assert!(Cli::parse([fence.to_owned()]).is_err());
+        for args in [
+            vec![fence, "--held-native-execution-binding", "actual.json"],
+            vec!["--held-native-execution-binding", "actual.json", fence],
+        ] {
+            assert!(
+                Cli::parse(args.iter().map(|s| (*s).to_owned()))
+                    .unwrap()
+                    .held_live_collector_fences
+            );
+            for extra in [
+                vec![fence],
+                vec!["--exact-mysql-execution-binding", "old.json"],
+                vec!["--list"],
+                vec!["--cluster-size", "1"],
+            ] {
+                let mut changed = args.clone();
+                changed.extend(extra.clone());
+                assert!(Cli::parse(changed.iter().map(|s| (*s).to_owned())).is_err());
+                let mut changed = extra;
+                changed.extend(args.clone());
+                assert!(Cli::parse(changed.iter().map(|s| (*s).to_owned())).is_err());
+            }
+        }
+    }
 
     #[test]
     fn held_execution_binding_is_unique_exclusive_in_both_flag_orders() {

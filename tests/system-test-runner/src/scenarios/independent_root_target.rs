@@ -81,6 +81,11 @@ fn before_deadline(deadline: Instant) -> Result<()> {
     Ok(())
 }
 impl IndependentRootObserver {
+    /// Original snapshot sizes only; no new read, payload alias or target authority.
+    pub(crate) fn original_baseline_log_bytes(&self) -> [u64; BACKENDS] {
+        self.before.map(|anchor| anchor.bytes)
+    }
+
     /// Call only after original idle/root-zero baseline and before the sole target SQL.
     /// expected_frontend must come from the independent actual-FE stdout marker.
     pub(crate) fn capture_baseline(

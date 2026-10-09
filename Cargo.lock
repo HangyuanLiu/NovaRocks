@@ -4499,6 +4499,7 @@ dependencies = [
  "bytes",
  "h2",
  "http",
+ "libc",
  "mysql",
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
