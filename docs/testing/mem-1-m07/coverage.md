@@ -539,3 +539,10 @@ host unittest **27 PASS / 0 FAIL，0.197s**，保留全部参数组合与两项�
 FE 成功门复查原 deadline 前后并要求实际 ExitSuccess，任何失败仍 stop 同 FE+原三 BE；固定七槽保留 actual error。startup marker IO 首因与 close secondary 保留；exact terminal/diagnostics 有限呈现，内部原 cause 不丢。定向 **harness9 PASS / runner49 PASS / FE marker2 PASS / adapter140 PASS / process-support56 PASS**；其中四个真实 host shell child 分别覆盖 exit0/exit1/expired-exited/expired-live，先原 owner stop 再 actualPID ESRCH。feature/default server check、fmt、diff check 通过。最初 testsupport 缺 imports 的编译 FAIL 保留后已修。
 
 收据：`docs/testing/mem-1-m07/evidence/p09-fe-marker-prelaunch-owner-components-20261009.json`。原 v1/v2 codec/input 与旧 native freeze 字节未改。四 host child不是 Native FE/BE；output join 跨原 deadline 仅源码 postcheck、未定向 faultinject；appendable log identity 不证明原地内容不可变或 rawstdout 独立来源；同步 launch/forcedcleanup 不声称物理20s上界。本轮 Native/Docker0；完整 actual token/Root 独立源、真实Unix互通、W2/精确cut/ACK/recovery/四role实际退出及最终同HEAD验收仍 OPEN。
+
+
+### P09 original successful-bind raw marker component checkpoint (2026-10-09)
+
+原 `hub.bind_statement` 成功 Some 后、writer 前输出原 connection/session/statement/hash 入参的一次有限 marker；三个 generation/epoch 域分别读取，session CID 单独保留，不从 Gate snapshot/v2 DTO 回填 expected。默认/无 hub/None 路径不输出不锁 stdout。固定384B ASCII栈、一行最大289B、无SQL/nonce/Root/body alias/新query/registry/task。write/flush 原 IO cause 随原 async outcome/terminal.complete/registered protocol ledger 保留，错误封目标原scope，不能按kind/string豁免。
+
+定向6 PASS，adapter里程碑146 PASS/0FAIL/0ignored/2.56s；feature/default server check、fmt、diffcheck PASS。收据 `docs/testing/mem-1-m07/evidence/p09-original-bind-marker-components-20261009.json` 保存实际源/草稿/日志pins。sink及ledger move是组件证据，未实际stdout/intermediary/join；本slice Native/Docker0。有限同步stdout不声称blockedhost sink硬期限；独立external parser/actualsameFE marker、完整Root/握手/wire/取消矩阵与原FE成功及四role实际退出仍OPEN。

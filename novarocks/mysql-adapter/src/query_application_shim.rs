@@ -46,6 +46,67 @@ use novarocks_query_application::sql::admission::negotiated_query_statements;
 use crate::connection_registry::{MysqlClientConnectionRegistration, MysqlConnectionClass};
 use crate::{ClientDisconnectWatcher, MysqlClientConnectionRegistry, spawn_disconnect_watcher};
 
+/// One bounded source observation, not a gate snapshot or a token capability.
+/// The caller passes the exact raw inputs of its successful original bind.
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+fn write_exact_mysql_bound_marker_for_hook<W: std::io::Write>(
+    writer: &mut W,
+    original_hook: Option<&crate::mysql_write_gate::late_binding::MysqlWriteRelayHook>,
+    connection: ClientConnectionToken,
+    statement: novarocks_query_application::session_control::StatementToken,
+    exact_sql_sha256: [u8; 32],
+) -> io::Result<()> {
+    // No-hook, non-target and follow-up paths produce no observation or IO.
+    if original_hook.is_none() {
+        return Ok(());
+    }
+    use std::fmt::Write as _;
+    struct Line {
+        bytes: [u8; 384],
+        length: usize,
+    }
+    impl std::fmt::Write for Line {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let end = self
+                .length
+                .checked_add(value.len())
+                .ok_or(std::fmt::Error)?;
+            if !value.is_ascii() || end > self.bytes.len() {
+                return Err(std::fmt::Error);
+            }
+            self.bytes[self.length..end].copy_from_slice(value.as_bytes());
+            self.length = end;
+            Ok(())
+        }
+    }
+    fn invalid(_: std::fmt::Error) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact MySQL bound marker exceeds its fixed ASCII line",
+        )
+    }
+    let mut line = Line {
+        bytes: [0; 384],
+        length: 0,
+    };
+    write!(&mut line,
+        "NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id={} connection_generation={} session_connection_id={} session_epoch={} statement_generation={} sql_sha256=",
+        connection.connection_id(), connection.generation(), statement.session().connection_id(),
+        statement.session().session_epoch(), statement.generation(),
+    ).map_err(invalid)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in exact_sql_sha256 {
+        let pair = [HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]];
+        line.write_str(std::str::from_utf8(&pair).expect("fixed ASCII hex table"))
+            .map_err(invalid)?;
+    }
+    line.write_str("\n").map_err(invalid)?;
+    // Preserve the original write/flush error object. No println panic,
+    // generic error replacement, gate snapshot or unbounded formatted String.
+    writer.write_all(&line.bytes[..line.length])?;
+    writer.flush()
+}
+
 async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
     statement: StatementResult,
     results: QueryResultWriter<'writer, W>,
@@ -849,6 +910,18 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                                 io::Error::new(io::ErrorKind::InvalidData, "fixture streaming result has no original statement token")
                             })?;
                             let hook = hub.bind_statement(self.connection, token, fixture_sql_sha256)?;
+                            if hook.is_some() {
+                                // Copy only the raw inputs of this ONE successful original bind.
+                                // Stdout failure follows the existing retained protocol IO path.
+                                let stdout = std::io::stdout();
+                                let mut output = stdout.lock();
+                                if let Err(error) = write_exact_mysql_bound_marker_for_hook(
+                                    &mut output, hook.as_ref(), self.connection, token, fixture_sql_sha256,
+                                ) {
+                                    hub.fail_selected(self.connection, crate::mysql_write_gate::GateFailure::Transition);
+                                    return Err(error);
+                                }
+                            }
                             let outcome = crate::governed_result_writer::write_streaming_query_result_with_gate(
                                 result, results, hook,
                             ).await;
@@ -1268,3 +1341,270 @@ mod tests {
 #[cfg(all(test, feature = "mem-1-m07-exact-mysql-write"))]
 #[path = "query_application_shim/exact_eof_tests.rs"]
 mod exact_eof_tests;
+
+#[cfg(all(test, feature = "mem-1-m07-exact-mysql-write"))]
+mod exact_successful_bind_marker_tests {
+    use super::*;
+    use crate::mysql_write_gate::late_binding::{MysqlWriteGateController, MysqlWriteGateHub};
+    use novarocks_query_application::session_control::{SessionToken, StatementToken};
+    use novarocks_types::FrontendProcessId;
+    use std::time::Instant;
+
+    // Component-only original hub binding; no service, native scene or stdout mutation.
+    fn owner(
+        connection: ClientConnectionToken,
+        statement: StatementToken,
+        digest: [u8; 32],
+    ) -> (
+        Arc<MysqlWriteGateHub>,
+        MysqlWriteGateController,
+        crate::mysql_write_gate::late_binding::MysqlWriteRelayHook,
+    ) {
+        let frontend = FrontendProcessId::new_v7();
+        let (hub, mut controller) =
+            MysqlWriteGateHub::new(frontend, [1; 16], Instant::now() + Duration::from_secs(5))
+                .unwrap();
+        controller
+            .arm(frontend, [1; 16], connection.connection_id(), digest, 1)
+            .unwrap();
+        let hook = hub
+            .bind_statement(connection, statement, digest)
+            .unwrap()
+            .unwrap();
+        (hub, controller, hook)
+    }
+    struct Sink {
+        bytes: [u8; 384],
+        length: usize,
+        writes: usize,
+        flushes: usize,
+        quantum: usize,
+    }
+    impl Sink {
+        fn new(quantum: usize) -> Self {
+            Self {
+                bytes: [0; 384],
+                length: 0,
+                writes: 0,
+                flushes: 0,
+                quantum,
+            }
+        }
+    }
+    impl io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            let n = bytes.len().min(self.quantum);
+            assert!(self.length + n <= self.bytes.len());
+            self.bytes[self.length..self.length + n].copy_from_slice(&bytes[..n]);
+            self.length += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+    fn raw() -> (ClientConnectionToken, StatementToken) {
+        (
+            ClientConnectionToken::new(71, 19).unwrap(),
+            StatementToken::new(SessionToken::new(71, 23), 29),
+        )
+    }
+    #[test]
+    fn successful_original_bind_marker_keeps_distinct_raw_identity_domains_and_one_line() {
+        let (connection, statement) = raw();
+        let mut digest = [0; 32];
+        for (i, byte) in digest.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let (_hub, _controller, hook) = owner(connection, statement, digest);
+        let mut sink = Sink::new(3);
+        write_exact_mysql_bound_marker_for_hook(
+            &mut sink,
+            Some(&hook),
+            connection,
+            statement,
+            digest,
+        )
+        .unwrap();
+        let expected = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=71 connection_generation=19 session_connection_id=71 session_epoch=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n";
+        assert_eq!(&sink.bytes[..sink.length], expected);
+        assert!(sink.writes > 1);
+        assert_eq!(sink.flushes, 1);
+        assert_eq!(
+            sink.bytes[..sink.length]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1
+        );
+        assert!(sink.bytes[..sink.length].is_ascii());
+        assert!(sink.bytes[sink.length..].iter().all(|byte| *byte == 0));
+    }
+    #[test]
+    fn maximum_raw_numeric_identity_and_digest_fit_the_fixed_ascii_cap() {
+        let connection = ClientConnectionToken::new(u32::MAX, u64::MAX).unwrap();
+        let statement = StatementToken::new(SessionToken::new(u32::MAX, u64::MAX), u64::MAX);
+        let (_hub, _controller, hook) = owner(connection, statement, [255; 32]);
+        let mut sink = Sink::new(384);
+        write_exact_mysql_bound_marker_for_hook(
+            &mut sink,
+            Some(&hook),
+            connection,
+            statement,
+            [255; 32],
+        )
+        .unwrap();
+        let expected = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_epoch=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
+        assert_eq!(&sink.bytes[..sink.length], expected);
+        assert!(sink.length <= 384);
+        assert_eq!(sink.writes, 1);
+        assert_eq!(sink.flushes, 1);
+    }
+    #[test]
+    fn no_hook_and_actual_non_target_bind_do_not_touch_output_or_flush() {
+        let (connection, statement) = raw();
+        let frontend = FrontendProcessId::new_v7();
+        let (hub, mut controller) =
+            MysqlWriteGateHub::new(frontend, [1; 16], Instant::now() + Duration::from_secs(5))
+                .unwrap();
+        controller.arm(frontend, [1; 16], 72, [7; 32], 1).unwrap();
+        let hook = hub.bind_statement(connection, statement, [7; 32]).unwrap();
+        assert!(hook.is_none());
+        let mut sink = Sink::new(384);
+        write_exact_mysql_bound_marker_for_hook(
+            &mut sink,
+            hook.as_ref(),
+            connection,
+            statement,
+            [7; 32],
+        )
+        .unwrap();
+        write_exact_mysql_bound_marker_for_hook(&mut sink, None, connection, statement, [7; 32])
+            .unwrap();
+        assert_eq!((sink.length, sink.writes, sink.flushes), (0, 0, 0));
+    }
+    #[test]
+    fn duplicate_original_bind_refuses_before_a_second_marker() {
+        let (connection, statement) = raw();
+        let (hub, _controller, hook) = owner(connection, statement, [7; 32]);
+        let mut sink = Sink::new(384);
+        write_exact_mysql_bound_marker_for_hook(
+            &mut sink,
+            Some(&hook),
+            connection,
+            statement,
+            [7; 32],
+        )
+        .unwrap();
+        let first = sink.length;
+        assert!(hub.bind_statement(connection, statement, [7; 32]).is_err());
+        assert_eq!(sink.length, first);
+    }
+
+    #[derive(Debug)]
+    struct OriginalIo(Arc<()>);
+    impl std::fmt::Display for OriginalIo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("component original marker IO")
+        }
+    }
+    impl std::error::Error for OriginalIo {}
+    struct FaultSink {
+        inner: Sink,
+        identity: Arc<()>,
+        fail_flush: bool,
+    }
+    impl io::Write for FaultSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.fail_flush && self.inner.length >= 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    OriginalIo(Arc::clone(&self.identity)),
+                ));
+            }
+            std::io::Write::write(&mut self.inner, bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flushes += 1;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                OriginalIo(Arc::clone(&self.identity)),
+            ))
+        }
+    }
+    #[test]
+    fn partial_write_and_flush_keep_the_original_error_object_for_the_owner_path() {
+        for fail_flush in [false, true] {
+            let (connection, statement) = raw();
+            let (hub, _controller, hook) = owner(connection, statement, [7; 32]);
+            let identity = Arc::new(());
+            let mut sink = FaultSink {
+                inner: Sink::new(if fail_flush { 384 } else { 3 }),
+                identity: Arc::clone(&identity),
+                fail_flush,
+            };
+            let error = write_exact_mysql_bound_marker_for_hook(
+                &mut sink,
+                Some(&hook),
+                connection,
+                statement,
+                [7; 32],
+            )
+            .unwrap_err();
+            let actual = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<OriginalIo>()
+                .unwrap();
+            assert!(Arc::ptr_eq(&actual.0, &identity));
+            assert_eq!(
+                error.kind(),
+                if fail_flush {
+                    io::ErrorKind::PermissionDenied
+                } else {
+                    io::ErrorKind::BrokenPipe
+                }
+            );
+            assert_eq!(sink.inner.flushes, usize::from(fail_flush));
+            if !fail_flush {
+                assert_eq!(&sink.inner.bytes[..sink.inner.length], b"NOV");
+            }
+            // Same original error move used by the existing serve_registered caller;
+            // this is a ledger component, not an actual intermediary/join receipt.
+            hub.fail_selected(connection, crate::mysql_write_gate::GateFailure::Transition);
+            let ledger = crate::listener::MysqlFixtureSessionJoins::default();
+            ledger.observe_protocol_failure(connection, MysqlConnectionClass::Ordinary, error);
+            let retained = ledger.take_protocol_failure_after_join().unwrap();
+            assert!(Arc::ptr_eq(
+                &retained
+                    .cause
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<OriginalIo>()
+                    .unwrap()
+                    .0,
+                &identity
+            ));
+            assert_eq!(ledger.snapshot().protocol_io_failures, 1);
+            assert_eq!(ledger.snapshot().prescribed_protocol_eofs, 0);
+        }
+    }
+    #[test]
+    fn zero_write_is_refused_without_flush_or_claiming_a_complete_marker() {
+        let (connection, statement) = raw();
+        let (_hub, _controller, hook) = owner(connection, statement, [7; 32]);
+        let mut sink = Sink::new(0);
+        let error = write_exact_mysql_bound_marker_for_hook(
+            &mut sink,
+            Some(&hook),
+            connection,
+            statement,
+            [7; 32],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!((sink.length, sink.writes, sink.flushes), (0, 1, 0));
+    }
+}
