@@ -323,3 +323,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - clean `cae99549748f05a49c35e310bb3833b617cf6930`，同HEAD dev build 74s；原生1FE+3BE四scene全部PASS/8.348s。实际Data1准确S/完成row1；Data2准确5B `[1,0,0,0,0]`，cursor starts_row=1、remaining0→0、rows1→2，实际piggyEnd3/rows2及随后独立Read End3均成立。未改变caps、期限、输入或重试。
 - 正常MySQL实际2rows/1048573B/6packets，actor逐包检查sequence1..6，literal row hash `a6884c6ae4c93d904c319ba5e87b9215745812b1b5be3edb1591762f820aea46`、normalEnd/error null。旧zeroACK、finalACK/replay与1B continuation同HEAD回归通过；四scene均两次owner idle，实际16个精确FE/BE PID全部消失。
 - 收据 `p09-minimum-new-row-native-v1-pass-20261009.json` 保存actual source/binaries/input/protocol/effective config/身份与raw hashes。5B新行原生门闭合；4B非法prefix仍仅组件证据，实际FE reply负例及其他stress、P00b/CM/CP/HMS/Paimon大CL、P10/最终同HEAD门与两个人工语义裁决仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09 P09：私有HMS capability helper接入（host-only定向PASS）
+
+- v5 helper推广到scripts/prepare_real_hms_capability.py，实际repo寻址parents[4]；三项真实Python child边界测试PASS/0.035s：正常capture无多余kill、128B超界保留partial及whole-failure sticky、Popen后KeyboardInterrupt保留第一cause及未知detached owner。BaseException/退出/清理语义和1200s+240s总时钟均未改。17个source pins核对PASS。
+- tracked freeze保持draft/unfrozen/source_revision null，实际执行另建ignored immutable reviewed copy绑定clean已提交HEAD/hash/BOM/images。收据p09-hms-capability-host-focused-20261009.json。仅host capture与输入模板证据；真实HMS 1table+1view能力预检尚未执行，不冒充原32×512table+512view大CL/Native mixed分类或READY。无push/PR/归档。

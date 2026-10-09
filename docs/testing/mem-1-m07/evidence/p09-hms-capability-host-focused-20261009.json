@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "scope": "host-only private HMS capability capture boundary",
+  "command": "python3 docs/testing/mem-1-m07/scripts/test_prepare_real_hms_capability.py -v",
+  "tests": {
+    "passed": 3,
+    "failed": 0,
+    "duration_seconds": 0.035
+  },
+  "checks": [
+    "Actual normal Python child bounded output, leader/group gone, no post-reap signal",
+    "Actual output overflow128B preserves prefix and original safe reason; owner-wrapper detached settlement unknown retains whole failure",
+    "Actual Popen then KeyboardInterrupt preserves primary class, settled owned group and sticky owner-retention barrier",
+    "Promotion AST equivalent except header/docstring/repo locator; Scala and frozen bounds unchanged",
+    "Unfrozen template rejected before owner creation; execution source null",
+    "All seventeen actual source pins match"
+  ],
+  "not_executed": [
+    "Docker",
+    "HMS provider capability",
+    "Native",
+    "Original full CL"
+  ],
+  "artifacts": [
+    {
+      "path": "docs/testing/mem-1-m07/scripts/prepare_real_hms_capability.py",
+      "sha256": "ddcc92f163ec10e8778716c1a8c1f9704ccbf641302e9cb95e9a4f54b66d3a86",
+      "bytes": 75627
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/real-hms-capability-preflight-freeze-v1.json",
+      "sha256": "f9fd67e6c0bb5688d76be56efa7899d6700b6d4be24dbf36a678c26776f42d05",
+      "bytes": 4914
+    },
+    {
+      "path": "docs/testing/mem-1-m07/scripts/test_prepare_real_hms_capability.py",
+      "sha256": "73c0e878d9dae15497f8bbe3e3c2bf09b413d1ef3bab4c044b4b737ee617a838",
+      "bytes": 4106
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-capture-boundary-promoted-20261009.log",
+      "sha256": "e48209d3b30c728f5a625fde3fdc981cc1c00e0517b53f28685279778db366b4",
+      "bytes": 558
+    },
+    {
+      "path": "logs/mem-1-m07/hms-capability-v5-promotion-draft/promotion-sources.json",
+      "sha256": "7d5913eb3a2a7d416e243db288f4df5853e3fd01d2297102fcbee42f734399db",
+      "bytes": 2246
+    }
+  ]
+}
