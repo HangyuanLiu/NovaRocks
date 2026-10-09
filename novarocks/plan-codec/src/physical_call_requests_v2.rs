@@ -30,8 +30,9 @@ use std::fmt;
 
 mod encode;
 mod read;
+pub(crate) use encode::encode_call_requests_in;
+pub use encode::prepare_call_requests_encode_in;
 pub use encode::{PreparedCallRequestsEncode, encode_call_requests, prepare_call_requests_encode};
-pub(crate) use encode::{encode_call_requests_in, prepare_call_requests_encode_in};
 pub use read::{PreparedCallRequestsDecode, decode_call_requests, prepare_call_requests_decode};
 pub(crate) use read::{decode_call_requests_in, prepare_call_requests_decode_in};
 
@@ -64,7 +65,7 @@ pub struct CallRequestProjectionFacts {
 }
 
 /// Replace this child contribution on the caller's original package meter.
-pub(crate) type CallRequestAdmit<'a> =
+pub type CallRequestAdmit<'a> =
     dyn FnMut(&CallRequestProjectionFacts) -> Result<(), CompileControlError> + 'a;
 
 #[derive(Debug)]

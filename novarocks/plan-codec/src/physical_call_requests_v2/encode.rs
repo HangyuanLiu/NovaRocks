@@ -683,7 +683,7 @@ fn emit_core(
 
 /// Prepare on the caller's original meter, replacing this child contribution.
 /// No scope, entry, finish, type reconstruction or constant admission is added.
-pub(crate) fn prepare_call_requests_encode_in<'loan, 'source, 'control: 'loan>(
+pub fn prepare_call_requests_encode_in<'loan, 'source, 'control: 'loan>(
     source: &'loan FragmentCallRequests,
     types: &'loan EncodedTypeTable<'source>,
     type_ids: &'loan [CallRequestTypeIds<'loan>],
@@ -724,7 +724,7 @@ pub(crate) fn encode_call_requests_in(
     emit_core(token, work)
 }
 impl PreparedCallRequestsEncode<'_, '_> {
-    pub(crate) fn emit_in(
+    pub fn emit_in(
         self,
         admit: &mut CallRequestAdmit<'_>,
         work: &mut CompileCheckpoints<'_>,

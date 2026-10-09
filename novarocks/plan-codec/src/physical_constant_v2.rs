@@ -317,7 +317,7 @@ impl PreparedConstantRecordWrite<'_, '_> {
         let result = self.emit_core(None, &mut work);
         finish(work, result)
     }
-    pub(crate) fn emit_in(
+    pub fn emit_in(
         self,
         admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
@@ -384,7 +384,7 @@ pub fn prepare_constant_record_write<'pool, 'control>(
     finish(work, result)
 }
 
-pub(crate) fn prepare_constant_record_write_in<'pool, 'control>(
+pub fn prepare_constant_record_write_in<'pool, 'control>(
     id: ConstantPoolId,
     value_type_id: u32,
     field_id: u32,
