@@ -381,6 +381,54 @@ async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
 }
 
 #[tokio::test]
+async fn client_single_row_has_an_exact_one_byte_continuation_before_end() {
+    use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor, RootProfileV1};
+    let fixture = Fixture::new(client(1));
+    let value = "x".repeat(RootProfileV1::SEGMENT_BYTES - 7);
+    fixture
+        .session
+        .submit_input(strings(vec![Some(&value)]), input(&fixture.session).await)
+        .unwrap();
+    fixture.session.finish_input().unwrap();
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_exited()).await;
+    let profile = ClientRowProfile::try_new(
+        RootProfileV1::SEGMENT_BYTES,
+        RootProfileV1::ROW_PAYLOAD_BYTES,
+    )
+    .unwrap();
+    let first = read(&fixture.channel, Some(1), 0).await;
+    assert_eq!(body(&first).len(), RootProfileV1::SEGMENT_BYTES);
+    assert_eq!(
+        &body(&first)[..8],
+        &[0xfd, 0xff, 0x0f, 0x00, 0xfd, 0xf9, 0xff, 0x0f]
+    );
+    assert!(body(&first)[8..].iter().all(|byte| *byte == b'x'));
+    let cursor = ClientRowStreamCursor::new()
+        .validate_body(profile, body(&first))
+        .unwrap()
+        .after();
+    assert_eq!(cursor.remaining(), 1);
+    assert_eq!(cursor.completed_rows(), 0);
+    drop(first);
+    let second = read(&fixture.channel, Some(2), 0).await;
+    assert_eq!(body(&second), b"x");
+    let validated = cursor.validate_body(profile, body(&second)).unwrap();
+    let spans = validated.payload_spans().collect::<Vec<_>>();
+    assert_eq!(spans.len(), 1);
+    assert!(spans[0].starts_row.is_none());
+    assert!(spans[0].completes_row);
+    assert_eq!(validated.after().remaining(), 0);
+    assert_eq!(validated.after().completed_rows(), 1);
+    validated.after().validate_end().unwrap();
+    drop(second);
+    assert_end(&read(&fixture.channel, Some(3), 0).await, 3, 1);
+    assert_eq!(fixture.channel.snapshot().consumed_through, 0);
+    assert_eq!(fixture.channel.snapshot().data_positions, 2);
+    shutdown(&fixture.pool).await;
+}
+
+#[tokio::test]
 async fn empty_finish_has_end_without_a_prior_input_or_data_item() {
     for output in [client(1), FrozenRootOutput::CountOnly] {
         let fixture = Fixture::new(output);

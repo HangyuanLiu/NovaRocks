@@ -247,3 +247,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - 干净b6b3ad232（完整source见收据）dev cargo-only C0全部PASS，564s，12295 PASS/0 FAIL/7既有ignored；repository guards/fmt/all-targets/System allocator/Clippy/build/error manifest/component/Server owner/binary smoke全部通过。原始目录logs/ci-full/20261009-075644，收据p09-empty-grpc-refusal-c0-pass-20261009.json包含raw hashes及post-C0二进制hash。
 - 该共享Native响应契约的里程碑收敛完成；cargo-only不含SQL/native/performance，前一五场景native准确绑定80e源码，不混用post-C0 feature-unified binary。不是M07完成或final同HEAD验收。下一独立test-only切片是S+1行的一字节合法续行，仍须执行；real CL/CM/CP/P00b/P10/final与两个待裁决语义OPEN，无push/PR/归档。
+
+
+### 2026-10-09：P09 一字节合法续行独立冻结，native待执行
+
+- 新单行S+1冻结：x×1048569，MySQL payload1048573B，Native Data1=1048576B/Data2=1B准确x、End3/rows1；独立Python literal摘要与新两份one-byte-continuation freeze一致，保留全部原输入/收据。复用1FE+3BE原 paused actor、freshTaskCreate identity、严格h2/protobuf/生产decoder；capacity/profile/5s链/20s actor不变。
+- 实际Data1/2分别通过生产ClientRowStreamCursor，明确remaining1→0、completed_rows0→1，尾span starts_row=None、bytes=x、completes_row=true；不ACK、不改变原FE消费，恢复后要求完整normal wire独立schema/rowhash/5packets。可选Data2 End只接受准确End3/rows1，同时仍读独立End3。不是非法prefix-only或最小新行载荷证明。
+- 真实NativeRootResultSession组件新例1PASS，runner112PASS/0FAIL/2既有ignored，新增test-only result-contract直接依赖；收据p09-one-byte-continuation-focused-20261009.json。独立review/native尚待；其它门与两个裁决仍OPEN，无push/PR/归档。

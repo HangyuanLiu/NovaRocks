@@ -4495,6 +4495,7 @@ dependencies = [
  "novarocks-native-trust",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-secret",
  "novarocks-task-codec",
  "novarocks-types",

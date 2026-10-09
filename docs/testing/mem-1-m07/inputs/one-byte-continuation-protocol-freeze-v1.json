@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "topology": "1FE+3BE",
+  "scope": "Read actual Data1(S) and one-byte Data2 continuation without consuming ACK, validate each through the production cursor, then verify actual End3 and resume independent normal MySQL wire. Original caps/phase limits unchanged.",
+  "retention_input_sha256": "8d1a0657534109a892af0b920d0e3d30c6fdeaad0e033d5524acf7c134cd4b9a",
+  "phase_ms": 5000,
+  "request_frame_bytes": 4096,
+  "response_data_bytes": 1052672,
+  "data1_sha256": "7ef5c43e87847e47568399269cf16f3054310ae7b8181b966810e94178e7cd98",
+  "data2_sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+  "data1_bytes": 1048576,
+  "data2_bytes": 1,
+  "end_sequence": 3,
+  "output_rows": 1,
+  "operations": [
+    "ack0",
+    "ack0",
+    "fetch1",
+    "fetch2",
+    "fetch-end3"
+  ],
+  "cases": [
+    "result-delivery/one-byte-continuation-normal-wire"
+  ],
+  "max_identity_candidates": 8,
+  "max_wait_millis": 100,
+  "correction_of": {
+    "path": "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v3.json",
+    "sha256": "60425f90a0f7f6da0f81f85702e967d093c1360dcbbfc162e5c4d301c41054d8",
+    "reason": "Independent legal one-byte continuation coverage, preserving all capacity and phase bounds. Existing v3 input and its receipts remain unchanged."
+  }
+}

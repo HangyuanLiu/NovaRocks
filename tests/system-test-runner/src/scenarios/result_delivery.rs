@@ -61,6 +61,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(ContextRootRetention(RootProtocolMode::None)),
         Box::new(ContextRootRetention(RootProtocolMode::ZeroAck)),
         Box::new(ContextRootRetention(RootProtocolMode::FinalAck)),
+        Box::new(ContextRootRetention(RootProtocolMode::OneByte)),
     ]
 }
 
@@ -451,6 +452,7 @@ enum RootProtocolMode {
     None,
     ZeroAck,
     FinalAck,
+    OneByte,
 }
 struct ContextRootRetention(RootProtocolMode);
 
@@ -458,6 +460,7 @@ impl Scenario for ContextRootRetention {
     fn name(&self) -> &'static str {
         match self.0 {
             RootProtocolMode::None => "result-delivery/producer-exit-context-retention",
+            RootProtocolMode::OneByte => "result-delivery/one-byte-continuation-normal-wire",
             RootProtocolMode::ZeroAck => "result-delivery/installed-root-zero-ack-normal-wire",
             RootProtocolMode::FinalAck => {
                 "result-delivery/installed-root-replay-final-ack-interference"
@@ -470,9 +473,17 @@ impl Scenario for ContextRootRetention {
             context.handle().be_count() == 3,
             "root retention requires native 1FE+3BE"
         );
-        let manifest: RetentionManifest = serde_json::from_str(include_str!(
-            "../../../../docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json"
-        ))?;
+        let manifest: RetentionManifest = serde_json::from_str(
+            if self.0 == RootProtocolMode::OneByte {
+                include_str!(
+                    "../../../../docs/testing/mem-1-m07/inputs/one-byte-continuation-retention-freeze-v1.json"
+                )
+            } else {
+                include_str!(
+                    "../../../../docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json"
+                )
+            },
+        )?;
         ensure!(
             manifest.schema_version == 1
                 && manifest.topology == "1FE+3BE"
@@ -732,57 +743,74 @@ fn installed_root_protocol(
 ) -> Result<()> {
     use novarocks_execution_contract::root_result::RootReadOutcome;
     use sha2::{Digest, Sha256};
-    let freeze: InstalledProtocolManifest = serde_json::from_str(include_str!(
-        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v3.json"
-    ))?;
-    let retention_digest = format!(
-        "{:x}",
-        Sha256::digest(include_bytes!(
-            "../../../../docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json"
-        ))
-    );
+    let one_byte = mode == RootProtocolMode::OneByte;
+    let (protocol_json, retention_bytes, parent_path, parent_bytes) = if one_byte {
+        (
+            include_str!("../../../../docs/testing/mem-1-m07/inputs/one-byte-continuation-protocol-freeze-v1.json"),
+            include_bytes!("../../../../docs/testing/mem-1-m07/inputs/one-byte-continuation-retention-freeze-v1.json").as_slice(),
+            "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v3.json",
+            include_bytes!("../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v3.json").as_slice(),
+        )
+    } else {
+        (
+            include_str!(
+                "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v3.json"
+            ),
+            include_bytes!(
+                "../../../../docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json"
+            )
+            .as_slice(),
+            "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json",
+            include_bytes!(
+                "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
+            )
+            .as_slice(),
+        )
+    };
+    let freeze: InstalledProtocolManifest = serde_json::from_str(protocol_json)?;
+    let expected_cases: &[&str] = if one_byte {
+        &["result-delivery/one-byte-continuation-normal-wire"]
+    } else {
+        &[
+            "result-delivery/installed-root-zero-ack-normal-wire",
+            "result-delivery/installed-root-replay-final-ack-interference",
+        ]
+    };
+    let expected_operations: &[&str] = if one_byte {
+        &["ack0", "ack0", "fetch1", "fetch2", "fetch-end3"]
+    } else {
+        &[
+            "ack0",
+            "ack0",
+            "fetch1",
+            "fetch2",
+            "fetch-end3",
+            "replay1",
+            "ack3",
+            "ack3",
+            "retired1",
+        ]
+    };
     ensure!(
-        freeze.schema_version == 3
+        freeze.schema_version == if one_byte { 1 } else { 3 }
             && freeze.topology == "1FE+3BE"
             && !freeze.scope.is_empty()
-            && freeze.retention_input_sha256 == retention_digest
+            && freeze.retention_input_sha256 == format!("{:x}", Sha256::digest(retention_bytes))
             && freeze.phase_ms == 5000
             && freeze.max_wait_millis == 100
             && freeze.correction_of.len() == 3
-            && freeze.correction_of["path"]
-                == "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
+            && freeze.correction_of["path"] == parent_path
             && !freeze.correction_of["reason"].is_empty()
-            && freeze.correction_of["sha256"]
-                == format!(
-                    "{:x}",
-                    Sha256::digest(include_bytes!(
-                        "../../../../docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v2.json"
-                    ))
-                )
+            && freeze.correction_of["sha256"] == format!("{:x}", Sha256::digest(parent_bytes))
             && freeze.max_identity_candidates == 8
             && freeze.request_frame_bytes == 4096
             && freeze.response_data_bytes == 1048576 + 4096
             && freeze.data1_bytes == 1048576
-            && freeze.data2_bytes == 8
+            && freeze.data2_bytes == if one_byte { 1 } else { 8 }
             && freeze.end_sequence == 3
             && freeze.output_rows == 1
-            && freeze.cases
-                == [
-                    "result-delivery/installed-root-zero-ack-normal-wire",
-                    "result-delivery/installed-root-replay-final-ack-interference"
-                ]
-            && freeze.operations
-                == [
-                    "ack0",
-                    "ack0",
-                    "fetch1",
-                    "fetch2",
-                    "fetch-end3",
-                    "replay1",
-                    "ack3",
-                    "ack3",
-                    "retired1"
-                ],
+            && freeze.cases == expected_cases
+            && freeze.operations == expected_operations,
         "unsupported installed-root protocol freeze"
     );
     let deadline = Instant::now() + Duration::from_millis(freeze.phase_ms);
@@ -827,6 +855,11 @@ fn installed_root_protocol(
     let task = installed.context("no actual task identity routes to the held installed root")?;
     let mut proven = 0;
     let mut delivered_data = 0u8;
+    let mut cursor = novarocks_result_contract::ClientRowStreamCursor::new();
+    let row_profile = novarocks_result_contract::ClientRowProfile::try_new(
+        freeze.data1_bytes,
+        novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
+    )?;
     let count = if mode == RootProtocolMode::ZeroAck {
         2
     } else {
@@ -850,7 +883,7 @@ fn installed_root_protocol(
         let (reply, mut observation) = super::result_delivery_root_protocol::probe(
             context, backend, &request, proven, deadline,
         )?;
-        let matches = match (&reply.outcome, operation.as_str()) {
+        let mut matches = match (&reply.outcome, operation.as_str()) {
             (RootReadOutcome::AckOnly, "ack0") => reply.accepted_consumed == 0,
             (RootReadOutcome::AckOnly, "ack3") => {
                 proven == freeze.end_sequence && reply.accepted_consumed == proven
@@ -868,7 +901,14 @@ fn installed_root_protocol(
             }
             (RootReadOutcome::Data(data), "fetch2") => {
                 data.sequence().get() == 2
-                    && data.end_after_data().is_none()
+                    && match data.end_after_data() {
+                        None => true,
+                        Some(end) => {
+                            one_byte
+                                && end.sequence.get() == freeze.end_sequence
+                                && end.output_rows == freeze.output_rows
+                        }
+                    }
                     && data.body().len() == freeze.data2_bytes
                     && format!("{:x}", Sha256::digest(data.body())) == freeze.data2_sha256
                     && reply.accepted_consumed == 0
@@ -885,6 +925,41 @@ fn installed_root_protocol(
             }
             _ => false,
         };
+        if one_byte && matches && matches!(operation.as_str(), "fetch1" | "fetch2") {
+            if let RootReadOutcome::Data(data) = &reply.outcome {
+                match cursor.validate_body(row_profile, data.body()) {
+                    Ok(validated) => {
+                        let after = validated.after();
+                        let continuation = operation == "fetch2";
+                        let spans = validated.payload_spans().collect::<Vec<_>>();
+                        let exact_span = !continuation
+                            || (spans.len() == 1
+                                && spans[0].starts_row.is_none()
+                                && spans[0].bytes == b"x"
+                                && spans[0].completes_row);
+                        matches = after.remaining() == u32::from(!continuation)
+                            && after.completed_rows() == u64::from(continuation)
+                            && exact_span;
+                        observation["client_row_cursor"] = serde_json::json!({
+                            "before_remaining": cursor.remaining(), "after_remaining": after.remaining(),
+                            "completed_rows": after.completed_rows(), "spans": spans.len(),
+                            "one_byte_continuation": continuation && exact_span,
+                        });
+                        if matches {
+                            cursor = after;
+                        }
+                    }
+                    Err(error) => {
+                        observation["client_row_cursor_error"] =
+                            serde_json::json!(error.to_string());
+                        matches = false;
+                    }
+                }
+            }
+        }
+        if one_byte && operation == "fetch-end3" {
+            matches &= cursor.validate_end().is_ok() && cursor.completed_rows() == 1;
+        }
         if matches && operation == "fetch1" {
             delivered_data |= 1;
         }
@@ -933,7 +1008,12 @@ fn installed_root_protocol(
                 && census["sealed"] == 0
                 && census["ends_acknowledged"] == u64::from(retired)
                 && census["data_positions"] == if retired { 0 } else { 2 }
-                && census["payload_bytes"] == if retired { 0 } else { 1048584 },
+                && census["payload_bytes"]
+                    == if retired {
+                        0
+                    } else {
+                        u64::try_from(freeze.data1_bytes + freeze.data2_bytes)?
+                    },
             "installed root changed outside its proven ACK frontier"
         );
         let census_path = context
