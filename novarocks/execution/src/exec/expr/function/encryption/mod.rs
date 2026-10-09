@@ -53,3 +53,7 @@ pub(crate) mod legacy_aes_family_original_baseline_tests;
 
 #[cfg(test)]
 mod legacy_aes_demand_original_tests;
+
+#[cfg(test)]
+#[path = "legacy_aes_atomic_parent_baseline_tests.rs"]
+mod legacy_aes_atomic_parent_baseline_tests;
