@@ -2501,6 +2501,12 @@ async fn run_covered_subscription(
                                 }
                                 _ => None,
                             };
+                            let terminal = match &event.fact {
+                                CoveredStatusStreamFact::Status(status) if status.is_terminal() => {
+                                    Some((status.identity(), status.state()))
+                                }
+                                _ => None,
+                            };
                             if let Err(error) = permit.publish(
                                 ObservationFrame::Covered {
                                     context,
@@ -2525,6 +2531,16 @@ async fn run_covered_subscription(
                                     version = %receipt.version(),
                                     state = ?receipt.state(),
                                     "frontend retained worker stop and context fence"
+                                );
+                            }
+                            if let Some((identity, state)) = terminal {
+                                tracing::debug!(
+                                    execution_id = ?identity.query_execution_id(),
+                                    stage = identity.stage_id().get(),
+                                    task = identity.task_id().get(),
+                                    backend = %identity.backend_process_id(),
+                                    ?state,
+                                    "frontend retained task terminal"
                                 );
                             }
                             if new_liveness {
