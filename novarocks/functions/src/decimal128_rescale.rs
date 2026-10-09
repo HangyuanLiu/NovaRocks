@@ -159,6 +159,21 @@ fn relaxed_observed<E>(
 pub fn enforce_precision_legacy(array: ArrayRef) -> Result<ArrayRef, String> {
     raw(|observe| enforce_precision_observed(array, observe))
 }
+/// Sole original declared-precision admission and active-value predicate.
+pub(crate) struct DeclaredPrecision {
+    limit: u128,
+}
+impl DeclaredPrecision {
+    pub(crate) fn try_new(precision: u8) -> Option<Self> {
+        10_u128
+            .checked_pow(u32::from(precision))
+            .filter(|_| (1..=38).contains(&precision))
+            .map(|limit| Self { limit })
+    }
+    pub(crate) fn contains(&self, value: i128) -> bool {
+        value.unsigned_abs() < self.limit
+    }
+}
 pub(crate) fn enforce_precision_observed<E>(
     array: ArrayRef,
     observer: &mut dyn FnMut(DecimalRescaleObservation) -> Result<(), E>,
@@ -166,9 +181,7 @@ pub(crate) fn enforce_precision_observed<E>(
     let DataType::Decimal128(precision, scale) = *array.data_type() else {
         return Ok(array);
     };
-    let limit = 10_u128
-        .checked_pow(u32::from(precision))
-        .filter(|_| (1..=38).contains(&precision))
+    let declared_precision = DeclaredPrecision::try_new(precision)
         .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
     let source = array
         .as_any()
@@ -179,7 +192,7 @@ pub(crate) fn enforce_precision_observed<E>(
     let mut all_fit = true;
     for row in 0..source.len() {
         observe(observer, DecimalRescaleObservation::Step)?;
-        if !source.is_null(row) && source.value(row).unsigned_abs() >= limit {
+        if !source.is_null(row) && !declared_precision.contains(source.value(row)) {
             all_fit = false;
             break;
         }
@@ -192,7 +205,7 @@ pub(crate) fn enforce_precision_observed<E>(
         .map(|row| {
             observe(observer, DecimalRescaleObservation::Step)?;
             Ok::<_, DecimalRescaleError<E>>(
-                if source.is_null(row) || source.value(row).unsigned_abs() >= limit {
+                if source.is_null(row) || !declared_precision.contains(source.value(row)) {
                     None
                 } else {
                     Some(source.value(row))

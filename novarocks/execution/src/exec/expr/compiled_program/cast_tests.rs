@@ -1144,3 +1144,6 @@ mod observed_list_after_tests;
 
 #[path = "cast_integral_decimal128_tests.rs"]
 mod integral_decimal128_profile_tests;
+
+#[path = "compiled_float64_decimal128_tests.rs"]
+mod float64_decimal128_profile_tests;

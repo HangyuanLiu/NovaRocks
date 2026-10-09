@@ -176,6 +176,9 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
     {
         return true;
     }
+    if source == &DataType::Float64 && matches!(target, DataType::Decimal128(..)) {
+        return true;
+    }
     if source == &DataType::Binary && target == &DataType::Utf8 {
         return true;
     }
@@ -363,6 +366,10 @@ enum CastBody {
         precision: u8,
         scale: i8,
     },
+    FloatDecimal {
+        precision: u8,
+        scale: i8,
+    },
     TimeCalendar,
     TimeText {
         mode: crate::time_text_cast::TimeTextParseMode,
@@ -427,6 +434,27 @@ impl PreparedCastRecipe {
         let outcome = (|| {
             for ty in [source, result] {
                 validate_type_observed(ty, &mut work).map_err(CastPrepareError::Kernel)?;
+            }
+            if operation == CastOperation::Carrier
+                && source.logical_type == ValueLogicalType::Physical
+                && result.logical_type == ValueLogicalType::Physical
+                && source.data_type == DataType::Float64
+                && let DataType::Decimal128(precision, scale) = result.data_type
+            {
+                // Original successful NULLs occur for nonfinite/overflow input
+                // under every policy/ALLOW mode, even with a non-null source.
+                if !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                work.step()?;
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::FloatDecimal { precision, scale },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
             }
             if operation == CastOperation::Carrier
                 && source.logical_type == ValueLogicalType::Physical
@@ -885,6 +913,9 @@ impl PreparedCastRecipe {
                     self.allow_throw_exception,
                 )
             }
+            // Preserve original signed MIN abs and -128 negation panics; static
+            // factor errors also retain their real selected row attribution.
+            CastBody::FloatDecimal { .. } => true,
             // Raw Date32 admits invalid days and original unchecked arithmetic.
             // Preserve its data error and overflow panic rather than promising never-fails.
             CastBody::DateFloat { .. } => true,
@@ -950,6 +981,61 @@ impl PreparedCastRecipe {
         let outcome = (|| {
             if self.is_collection() {
                 return Err(invalid("List CAST requires its actual selected invocation"));
+            }
+            if let CastBody::FloatDecimal { precision, scale } = self.body {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| array.as_any().is::<Float64Array>(),
+                )?;
+                // Static factors precede NULL masking exactly as the original
+                // Types array conversion. No value is validated during prepare.
+                work.flush()?;
+                let factors = match crate::float_decimal128::Factors::try_new(precision, scale) {
+                    Ok(factors) => factors,
+                    Err(recipe) => {
+                        let message = format!(
+                            "CAST failed: from {:?} to {:?}: {recipe}",
+                            self.source.data_type, self.result.data_type,
+                        );
+                        return Ok(CastRowResult::RowError(RowDataError::new(
+                            ordinal, &message,
+                        )));
+                    }
+                };
+                work.flush()?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid(
+                            "non-null float Decimal cast argument contains a selected NULL",
+                        ))
+                    };
+                }
+                let value = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| internal("float Decimal source has a foreign carrier"))?
+                    .value(row);
+                work.step()?;
+                return Ok(
+                    match factors.expr_value(value, precision, self.decimal_overflow_policy) {
+                        crate::float_decimal128::ExprValue::Value(value) => {
+                            CastRowResult::Decimal128(value)
+                        }
+                        crate::float_decimal128::ExprValue::Null => CastRowResult::Null,
+                        crate::float_decimal128::ExprValue::Overflow => {
+                            CastRowResult::RowError(RowDataError::new(
+                                ordinal,
+                                "Expr evaluate meet error: The numeric type cast involving decimal overflows",
+                            ))
+                        }
+                    },
+                );
             }
             if let CastBody::IntegralDecimal { precision, scale } = self.body {
                 let source_kind = Source::from_type(&self.source.data_type).ok_or_else(|| {
@@ -1957,3 +2043,7 @@ mod decimal128_rescale_tests;
 #[cfg(test)]
 #[path = "cast_observed_list_tests.rs"]
 mod observed_list_tests;
+
+#[cfg(test)]
+#[path = "cast_float_decimal128_tests.rs"]
+mod float_decimal128_tests;

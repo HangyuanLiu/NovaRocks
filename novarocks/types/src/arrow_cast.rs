@@ -711,71 +711,11 @@ fn decimal256_value_within_precision(value: i256, precision: u8) -> bool {
 
 fn cast_float_to_decimal_with_rounding(
     len: usize,
-    mut value_at: impl FnMut(usize) -> Option<f64>,
+    value_at: impl FnMut(usize) -> Option<f64>,
     precision: u8,
     scale: i8,
 ) -> Result<ArrayRef, String> {
-    let scale_factor_f64 = if scale >= 0 {
-        let factor = pow10_i128(scale as u32).ok_or_else(|| {
-            format!(
-                "decimal scale overflow while casting float to DECIMAL: scale={}",
-                scale
-            )
-        })?;
-        factor as f64
-    } else {
-        let factor = pow10_i128((-scale) as u32).ok_or_else(|| {
-            format!(
-                "decimal scale overflow while casting float to DECIMAL: scale={}",
-                scale
-            )
-        })?;
-        1.0 / (factor as f64)
-    };
-    let effective_precision = if precision <= 18 { 18 } else { precision };
-    let abs_limit = decimal_precision_limit(effective_precision).ok_or_else(|| {
-        format!(
-            "decimal precision overflow while casting float to DECIMAL: precision={}",
-            effective_precision
-        )
-    })?;
-
-    let mut values: Vec<Option<i128>> = Vec::with_capacity(len);
-    for row in 0..len {
-        let Some(v) = value_at(row) else {
-            values.push(None);
-            continue;
-        };
-        if !v.is_finite() {
-            values.push(None);
-            continue;
-        }
-
-        // Match StarRocks DecimalV3Cast::from_float: nearest integer with half-up behavior.
-        let delta = if v >= 0.0 { 0.5 } else { -0.5 };
-        let scaled = v * scale_factor_f64 + delta;
-        if !scaled.is_finite() {
-            values.push(None);
-            continue;
-        }
-
-        let unscaled_f = scaled.trunc();
-        if unscaled_f > (i128::MAX as f64) || unscaled_f < (i128::MIN as f64) {
-            values.push(None);
-            continue;
-        }
-        let unscaled = unscaled_f as i128;
-        if unscaled.abs() >= abs_limit {
-            values.push(None);
-            continue;
-        }
-        values.push(Some(unscaled));
-    }
-
-    let wide = Decimal128Array::from(values)
-        .with_precision_and_scale(38, scale)
-        .map_err(|e| e.to_string())?;
-    retag_decimal_array(&wide, precision, scale)
+    novarocks_functions::float_decimal128::evaluate_legacy(len, value_at, precision, scale)
 }
 
 pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str>) -> String {
