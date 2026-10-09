@@ -1428,3 +1428,6 @@ mod sql_dependency_constant_host_abort_tests;
 
 #[cfg(test)]
 mod exact_percentile_actual_sql_rate_source_tests;
+
+#[cfg(test)]
+mod legacy_field_baseline_tests;

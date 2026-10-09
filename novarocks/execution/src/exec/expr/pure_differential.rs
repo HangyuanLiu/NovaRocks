@@ -1800,3 +1800,6 @@ mod ndv_invocation_data_tests;
 #[cfg(test)]
 #[path = "pure_differential_exact_percentile_rate_tests.rs"]
 mod exact_percentile_rate_tests;
+
+#[path = "pure_differential_field_tests.rs"]
+mod field_tests;
