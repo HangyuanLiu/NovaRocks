@@ -111,6 +111,11 @@ pub struct FrontendApplicationOpenConfig {
     pub native_transport: FrontendNativeTransport,
 }
 
+/// Feature-only observer supplied by Server; it owns no provider capability.
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub type HmsListingObservationHandler =
+    Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, &'static str> + Send + Sync>;
+
 /// Inputs for the Frontend-owned management listener.
 #[derive(Clone)]
 pub struct FrontendManagementConfig {
@@ -123,6 +128,8 @@ pub struct FrontendManagementConfig {
     /// This process's allocator and physical memory readings for `/metrics`;
     /// `None` exports no process memory series.
     pub process_memory: Option<crate::metrics::FrontendProcessMemoryObservation>,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub hms_listing_observation: Option<HmsListingObservationHandler>,
 }
 
 /// Inputs for serving one ready Frontend application through native and MySQL
@@ -808,6 +815,8 @@ pub fn start_frontend_management_server(
         management_island_reader,
         Some(management_convergence_reader),
         Arc::clone(&config.memory_authority),
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        config.hms_listing_observation.clone(),
     )
     .map_err(FrontendApplicationError::server)?;
     Ok(FrontendManagementServer {

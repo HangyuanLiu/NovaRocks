@@ -56,6 +56,8 @@ use crate::typed_read::page_source_provider::IcebergPageSourceProviderOptions;
 #[derive(Clone)]
 pub struct IcebergControlRoleBindingFactory {
     resources: IcebergMetadataResources,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    hms_listing_probe: Option<Arc<crate::hms_listing_probe::HmsListingProbe>>,
     blocking_materialization_permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -66,10 +68,20 @@ impl IcebergControlRoleBindingFactory {
     ) -> Self {
         Self {
             resources,
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            hms_listing_probe: None,
             blocking_materialization_permits: Arc::new(tokio::sync::Semaphore::new(
                 max_blocking_materializations.get(),
             )),
         }
+    }
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn with_hms_listing_probe(
+        mut self,
+        probe: Arc<crate::hms_listing_probe::HmsListingProbe>,
+    ) -> Self {
+        self.hms_listing_probe = Some(probe);
+        self
     }
 }
 
@@ -93,6 +105,8 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
     ) -> BoxFuture<'static, Result<ConnectorControlRoleBinding, ConnectorMaterializationError>>
     {
         let resources = self.resources.clone();
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        let probe = self.hms_listing_probe.clone();
         let permits = Arc::clone(&self.blocking_materialization_permits);
         Box::pin(async move {
             context.check_active()?;
@@ -111,7 +125,13 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
             let worker_context = context.clone();
             let binding = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                materialize_control_blocking(resources, properties, worker_context)
+                materialize_control_blocking(
+                    resources,
+                    properties,
+                    worker_context,
+                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+                    probe,
+                )
             })
             .await
             .map_err(|error| {
@@ -131,6 +151,9 @@ fn materialize_control_blocking(
     resources: IcebergMetadataResources,
     properties: NormalizedCatalogProperties,
     context: MaterializationContext,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")] probe: Option<
+        Arc<crate::hms_listing_probe::HmsListingProbe>,
+    >,
 ) -> Result<ConnectorControlRoleBinding, ConnectorMaterializationError> {
     context.check_active()?;
     let catalog_properties = properties.as_catalog_properties().clone();
@@ -182,6 +205,8 @@ fn materialize_control_blocking(
     let control = control
         .with_catalog_properties(catalog_properties)
         .map_err(ConnectorMaterializationError::from)?;
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    let observed_catalog = Arc::clone(runtime.novarocks_catalog());
     let document_storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
         control.descriptor().clone(),
         control.incarnation(),
@@ -246,8 +271,30 @@ fn materialize_control_blocking(
         None => None,
     };
     context.check_active()?;
-    ConnectorControlRoleBinding::try_new(properties, Arc::new(control), Some(read), write)
-        .map_err(ConnectorMaterializationError::from)
+    let binding =
+        ConnectorControlRoleBinding::try_new(properties, Arc::new(control), Some(read), write)
+            .map_err(ConnectorMaterializationError::from)?;
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    if let Some(probe) = probe {
+        probe
+            .capture(
+                binding
+                    .control()
+                    .catalog_handle()
+                    .map_err(ConnectorMaterializationError::from)?,
+                binding.control().incarnation(),
+                observed_catalog.implementation_name(),
+                &observed_catalog.listing_admission(),
+            )
+            .map_err(|message| {
+                ConnectorMaterializationError::new(
+                    ConnectorMaterializationErrorClass::Internal,
+                    ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    message,
+                )
+            })?;
+    }
+    Ok(binding)
 }
 
 /// BE-only factory for a frozen Iceberg catalog definition.

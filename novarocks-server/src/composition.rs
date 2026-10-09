@@ -768,6 +768,11 @@ pub fn compose_frontend_role_config(
             native_compatibility_id,
             memory_authority: std::sync::Arc::clone(&memory_authority),
             process_memory: Some(frontend_process_memory_observation()),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            hms_listing_observation: provider_manifest.hms_listing_probe().map(|probe| {
+                std::sync::Arc::new(move |body: &[u8]| probe.handle_json(body))
+                    as novarocks_frontend_application::HmsListingObservationHandler
+            }),
         },
         serving: FrontendServingConfig {
             report_bind_host: config.server.host.clone(),

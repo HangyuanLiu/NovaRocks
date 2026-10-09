@@ -39,6 +39,8 @@ mod query_execution;
 pub(crate) mod runtime_filter;
 pub(crate) mod server;
 pub use metrics::FrontendProcessMemoryObservation;
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub use server::HmsListingObservationHandler;
 pub use server::{
     FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
     open_frontend_application_for_server, serve_ready_frontend_session_factory,

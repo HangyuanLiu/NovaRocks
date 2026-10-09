@@ -358,7 +358,17 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         }
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
-    let provider_manifest = Arc::new(ServerProviderManifest::seal()?);
+    let provider_manifest = ServerProviderManifest::seal()?;
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    let provider_manifest = match std::env::var("NOVAROCKS_HMS_LISTING_OBSERVATION_CATALOG") {
+        Ok(name) => provider_manifest.with_hms_listing_probe(Arc::new(
+            novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe::new(&name)
+                .map_err(anyhow::Error::msg)?,
+        )),
+        Err(std::env::VarError::NotPresent) => provider_manifest,
+        Err(_) => anyhow::bail!("HMS observation catalog selection is not Unicode"),
+    };
+    let provider_manifest = Arc::new(provider_manifest);
     let runtime = init_process(process_config)?;
     // After `init_process`, because composing the authority is the first thing
     // this process reports about its own memory and logging is not installed
