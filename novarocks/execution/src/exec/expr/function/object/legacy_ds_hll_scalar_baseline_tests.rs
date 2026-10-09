@@ -164,3 +164,7 @@ fn legacy_ds_hll_baseline_scalar_child_evaluation_precedes_row_hash_and_tuning()
         "raw fourth child is ignored, not a bound overload"
     );
 }
+
+#[cfg(test)]
+#[path = "original_ds_scalar_domain_probes.rs"]
+mod original_ds_scalar_domain_probes;
