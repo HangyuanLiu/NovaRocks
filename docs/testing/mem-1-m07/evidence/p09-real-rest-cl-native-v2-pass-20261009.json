@@ -1,0 +1,2560 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "plan_task": "P09 real stock REST CL",
+  "outcome": "native real REST functional/provider observation pass; memory owner audit open",
+  "source_revision": "efb4d723211a6f9356cffbd0067a2ce687a615c7",
+  "source_dirty": false,
+  "runner_native_build_identity": "efb4d723211a6f9356cffbd0067a2ce687a615c7",
+  "build_and_input_sha256": {
+    "target/debug/novarocks": "650dbf12a3e5e2e0b30f4f33e63b2c431f4c30b2b03f4849b9acc5ab5fb073f2",
+    "target/debug/novarocks-system-tests": "cd2a9de5e34274a41ed07d967fd499f98b9ad66a6c44d78a3631dd6096627a1c",
+    "docs/testing/mem-1-m07/inputs/real-rest-cl-native-freeze-v1.json": "a38279e3a650f0acd0db47723e5f0dd38857236a8ada5918cbd7f1b4673d38b8",
+    "docs/testing/mem-1-m07/inputs/real-rest-cl-producer-template-v1.json": "6173b8a4dd4b9dd47ea46a30463bba32413e0482bbfb21e43b29cf3c456ee061",
+    "docs/testing/mem-1-m07/scripts/prepare_real_rest_cl.py": "50a317f12417d2d99936c9346024c03d5b3e5a483bca1ce86777a099c4e11dbf",
+    "docs/testing/mem-1-m07/scripts/observe_real_rest_cl.py": "4b334796303846703a139a17a5ff6914a3916e56b2b03ad16fdfe09ed83dbc92",
+    "tools/ci/fixtures/system-scenarios-base.toml": "e959dcbe9214e0a2d2348ac13bab609bf5ed778dd7da316fd92368ba9e83643b"
+  },
+  "driver_duration_seconds": 413.335,
+  "topology": "native1FE+3BE",
+  "process_launch_identities": [
+    {
+      "role": "fe",
+      "pid": 41942,
+      "process_start_token": "macos:1791513181:547406"
+    },
+    {
+      "role": "be-0",
+      "pid": 41945,
+      "process_start_token": "macos:1791513189:846106"
+    },
+    {
+      "role": "be-1",
+      "pid": 41946,
+      "process_start_token": "macos:1791513189:910419"
+    },
+    {
+      "role": "be-2",
+      "pid": 41947,
+      "process_start_token": "macos:1791513189:967250"
+    }
+  ],
+  "private_actual_binding": {
+    "binding": {
+      "compose_project": "nr-isolated-rest-40658-1791512946839762000-1",
+      "fixture_id": "isolated-rest-40658-1791-5404002c",
+      "owner_manifest_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-40658-1791-5404002c/manifest.json",
+      "owner_manifest_sha256": "a5068549295586ad76d8adb35ba1b812c8c1d9cf8c0d22d72a1f062c205265e0",
+      "owner_mode": "task-private",
+      "rest_image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "rest_uri": "http://127.0.0.1:21162",
+      "server_default_warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest",
+      "warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest"
+    },
+    "source": {
+      "canonical_lock_sha256": "9f720cb5dfb932edbef57e34a08f9cbcb717664b70917790283660be482c9181",
+      "iceberg_build_version": "1.11.0-SNAPSHOT",
+      "iceberg_commit": "ccb8bc435062171e64bc8b7e5f56e6aed9c5b934",
+      "iceberg_tag": "apache-iceberg-1.10.1",
+      "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
+      "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "image_source": "apache/iceberg-rest-fixture",
+      "jar_bytes": 211889894,
+      "jar_sha256": "49d01ec8e0995001a92b4c880adfe184d602541ba39d135f105511101da4db7d",
+      "platform": "linux/arm64"
+    },
+    "containers": [
+      {
+        "id": "e987ae1f771d98344c6e2315c9499dfe0e967cea58ab21503dacabe587f8b095",
+        "name": "/nr-isolated-rest-40658-1791512946839762000-1-spark-1",
+        "image_id": "sha256:fd53681a8c2bc0cc9c684c0f688e98d199ac1b654438d1f2ab61c41218c7f153",
+        "image_alias": "sha256:fd53681a8c2bc0cc9c684c0f688e98d199ac1b654438d1f2ab61c41218c7f153",
+        "service": "spark",
+        "state": "running"
+      },
+      {
+        "id": "c0a4715e3e69bef2f3dcf57339cfb783e046a6353df1a8f934e93f05eea4cdf6",
+        "name": "/nr-isolated-rest-40658-1791512946839762000-1-rest-1",
+        "image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+        "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
+        "service": "rest",
+        "state": "running"
+      },
+      {
+        "id": "1f1437e0a2366a60ecf95975ec719cde5c434fedb618e2467f07fd5e5e12d1cb",
+        "name": "/nr-isolated-rest-40658-1791512946839762000-1-minio-1",
+        "image_id": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+        "image_alias": "novarocks/fixture-minio:14cea493d9a3",
+        "service": "minio",
+        "state": "running"
+      },
+      {
+        "id": "e6e968871deed8176c67adc4648c8900764820bb589613e975a51650aa30af49",
+        "name": "/nr-isolated-rest-40658-1791512946839762000-1-mc-1",
+        "image_id": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+        "image_alias": "novarocks/fixture-minio-mc:a7fe349ef4bd",
+        "service": "mc",
+        "state": "exited"
+      },
+      {
+        "id": "8dab5eff036ac6481bf99e424779c69b14938ea6addf69a005cf1f2d1a52c4ab",
+        "name": "/nr-isolated-rest-40658-1791512946839762000-1-mc-init-1",
+        "image_id": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+        "image_alias": "novarocks/fixture-minio-mc:a7fe349ef4bd",
+        "service": "mc-init",
+        "state": "exited"
+      }
+    ],
+    "scope": "Exact task-private project live container/image binding; environment/credentials not retained"
+  },
+  "observer_bound": {
+    "bounds": {
+      "max_decoded_json_bytes": 16777216,
+      "max_header_bytes": 65536,
+      "max_header_fields": 100,
+      "max_observers": 256,
+      "max_request_bytes": 65536,
+      "max_response_bytes": 16777216,
+      "request_absolute_deadline_seconds": 30
+    },
+    "downstream_binding": {
+      "compose_project": "nr-isolated-rest-40658-1791512946839762000-1",
+      "fixture_id": "isolated-rest-40658-1791-5404002c",
+      "owner_manifest_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-40658-1791-5404002c/manifest.json",
+      "owner_manifest_sha256": "a5068549295586ad76d8adb35ba1b812c8c1d9cf8c0d22d72a1f062c205265e0",
+      "owner_mode": "task-private",
+      "rest_image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "rest_uri": "http://127.0.0.1:21162",
+      "server_default_warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest",
+      "warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest"
+    },
+    "observer_freeze_sha256": "9283b8bf0018f464c9f0992c4e38e9020cf508ccc451667ecb4e22ed36fe8997",
+    "observer_sha256": "4b334796303846703a139a17a5ff6914a3916e56b2b03ad16fdfe09ed83dbc92",
+    "observer_uri": "http://127.0.0.1:56797",
+    "pid": 41941,
+    "schema_version": 1,
+    "scope": "test-only observer process; exclude from FE allocator samples",
+    "source": {
+      "canonical_lock_sha256": "9f720cb5dfb932edbef57e34a08f9cbcb717664b70917790283660be482c9181",
+      "iceberg_build_version": "1.11.0-SNAPSHOT",
+      "iceberg_commit": "ccb8bc435062171e64bc8b7e5f56e6aed9c5b934",
+      "iceberg_tag": "apache-iceberg-1.10.1",
+      "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
+      "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "image_source": "apache/iceberg-rest-fixture",
+      "jar_bytes": 211889894,
+      "jar_sha256": "49d01ec8e0995001a92b4c880adfe184d602541ba39d135f105511101da4db7d",
+      "platform": "linux/arm64"
+    },
+    "started_unix_ns": 1791513181540290000,
+    "state": "OBSERVER_BOUND"
+  },
+  "preparation": {
+    "http_requests": 65700,
+    "elapsed_seconds": 231.436537,
+    "details": {
+      "actual_metadata_facts_sha256": "ca9d74b79e7f2fcd0c7853351adf832ab4ebc0993d7155abbfb4b73fbd79dcb8",
+      "actual_namespaces": 32,
+      "actual_tables_loaded": 16384,
+      "actual_views_loaded": 16384,
+      "all_metadata_independently_loaded": true,
+      "capabilities": {
+        "capability_proof": "actual preflight create/load/page/delete required",
+        "endpoints_present": true,
+        "endpoints_sha256": "64be1ec1700ac42aff634942f7fc5126da92f1724eed2d35f38007b1f3d4de78"
+      },
+      "identifiers_sha256": "b14bb2e12b5a577f5bb0d134c9b99676972f659f80de6700b7b0da4a442601a3",
+      "mutations_stopped_before_independent_verification": true,
+      "normal": {
+        "concurrency": [
+          1,
+          8,
+          16
+        ],
+        "namespace_pattern": "cl_ns_%04d",
+        "namespaces": 32,
+        "page_size": 256,
+        "table_pattern": "cl_table_%06d",
+        "tables_per_namespace": 512,
+        "view_pattern": "cl_view_%06d",
+        "views_per_namespace": 512
+      },
+      "preflight_receipt_sha256": "2b2423ca76ef87dd8c1cbe9a388038d7867ded2fb6a9a6d5ec602755fc39eb0b"
+    },
+    "source": {
+      "canonical_lock_sha256": "9f720cb5dfb932edbef57e34a08f9cbcb717664b70917790283660be482c9181",
+      "iceberg_build_version": "1.11.0-SNAPSHOT",
+      "iceberg_commit": "ccb8bc435062171e64bc8b7e5f56e6aed9c5b934",
+      "iceberg_tag": "apache-iceberg-1.10.1",
+      "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
+      "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "image_source": "apache/iceberg-rest-fixture",
+      "jar_bytes": 211889894,
+      "jar_sha256": "49d01ec8e0995001a92b4c880adfe184d602541ba39d135f105511101da4db7d",
+      "platform": "linux/arm64"
+    },
+    "binding": {
+      "compose_project": "nr-isolated-rest-40658-1791512946839762000-1",
+      "fixture_id": "isolated-rest-40658-1791-5404002c",
+      "owner_manifest_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-40658-1791-5404002c/manifest.json",
+      "owner_manifest_sha256": "a5068549295586ad76d8adb35ba1b812c8c1d9cf8c0d22d72a1f062c205265e0",
+      "owner_mode": "task-private",
+      "rest_image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "rest_uri": "http://127.0.0.1:21162",
+      "server_default_warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest",
+      "warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest"
+    }
+  },
+  "native_phases": [
+    {
+      "phase": "catalog_admission",
+      "samples": 427,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 16514,
+          "emitted_body_bytes": 15555395,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 16384,
+          "mutations": 0,
+          "name_bytes": 246080,
+          "names": 16416,
+          "observer_connections_peak": 2,
+          "pages": 129,
+          "requests": 16514,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 15555395,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 16514
+        },
+        "generation": 2,
+        "lifetime_failures": 0,
+        "phase": "catalog_admission",
+        "routes": {
+          "list_namespaces": 1,
+          "list_tables": 128,
+          "load_tables": 16384,
+          "other": 1
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 16514
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "catalog": "cl_normal"
+      },
+      "allocated_before": 17149536,
+      "sampled_allocated_peak": 82953368,
+      "allocated_after": 16603848,
+      "active_before": 24936448,
+      "sampled_active_peak": 97894400,
+      "active_after": 56393728,
+      "resident_before": 32276480,
+      "sampled_resident_peak": 106053632,
+      "resident_after": 104546304
+    },
+    {
+      "phase": "lake_discovery",
+      "samples": 422,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 16514,
+          "emitted_body_bytes": 15555395,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 16384,
+          "mutations": 0,
+          "name_bytes": 246080,
+          "names": 16416,
+          "observer_connections_peak": 2,
+          "pages": 129,
+          "requests": 16514,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 15555395,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 16514
+        },
+        "generation": 3,
+        "lifetime_failures": 0,
+        "phase": "lake_discovery",
+        "routes": {
+          "list_namespaces": 1,
+          "list_tables": 128,
+          "load_tables": 16384,
+          "other": 1
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 16514
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "catalog": "cl_discovery"
+      },
+      "allocated_before": 16638200,
+      "sampled_allocated_peak": 82234472,
+      "allocated_after": 16123224,
+      "active_before": 56475648,
+      "sampled_active_peak": 98992128,
+      "active_after": 60473344,
+      "resident_before": 104628224,
+      "sampled_resident_peak": 107806720,
+      "resident_after": 106889216
+    },
+    {
+      "phase": "information_schema_1",
+      "samples": 23,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 67,
+          "emitted_body_bytes": 891702,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 246080,
+          "names": 16416,
+          "observer_connections_peak": 1,
+          "pages": 65,
+          "requests": 67,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 891702,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 67
+        },
+        "generation": 4,
+        "lifetime_failures": 0,
+        "phase": "information_schema_1",
+        "routes": {
+          "list_namespaces": 1,
+          "list_tables": 64,
+          "load_views": 1,
+          "other": 1
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 65,
+          "404": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "clients": 1,
+        "rows_per_client": 16384
+      },
+      "allocated_before": 16156496,
+      "sampled_allocated_peak": 134267200,
+      "allocated_after": 17090024,
+      "active_before": 60555264,
+      "sampled_active_peak": 174899200,
+      "active_after": 64700416,
+      "resident_before": 106971136,
+      "sampled_resident_peak": 194904064,
+      "resident_after": 169934848
+    },
+    {
+      "phase": "information_schema_8",
+      "samples": 35,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 8,
+          "admission_refusals": 0,
+          "completed": 536,
+          "emitted_body_bytes": 7133616,
+          "failures": 0,
+          "listing_active_peak": 8,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 1968640,
+          "names": 131328,
+          "observer_connections_peak": 9,
+          "pages": 520,
+          "requests": 536,
+          "successful_mutations": 0,
+          "upstream_active_peak": 8,
+          "upstream_body_bytes": 7133616,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 536
+        },
+        "generation": 5,
+        "lifetime_failures": 0,
+        "phase": "information_schema_8",
+        "routes": {
+          "list_namespaces": 8,
+          "list_tables": 512,
+          "load_views": 8,
+          "other": 8
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 520,
+          "404": 16
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "clients": 8,
+        "rows_per_client": 16384
+      },
+      "allocated_before": 17110840,
+      "sampled_allocated_peak": 911366120,
+      "allocated_after": 21048080,
+      "active_before": 64700416,
+      "sampled_active_peak": 964722688,
+      "active_after": 80330752,
+      "resident_before": 169934848,
+      "sampled_resident_peak": 1093009408,
+      "resident_after": 926089216
+    },
+    {
+      "phase": "information_schema_16",
+      "samples": 61,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 9,
+          "admission_refusals": 0,
+          "completed": 1072,
+          "emitted_body_bytes": 14267232,
+          "failures": 0,
+          "listing_active_peak": 8,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 3937280,
+          "names": 262656,
+          "observer_connections_peak": 11,
+          "pages": 1040,
+          "requests": 1072,
+          "successful_mutations": 0,
+          "upstream_active_peak": 8,
+          "upstream_body_bytes": 14267232,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 1072
+        },
+        "generation": 6,
+        "lifetime_failures": 0,
+        "phase": "information_schema_16",
+        "routes": {
+          "list_namespaces": 16,
+          "list_tables": 1024,
+          "load_views": 16,
+          "other": 16
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 1040,
+          "404": 32
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "clients": 16,
+        "rows_per_client": 16384
+      },
+      "allocated_before": 21066768,
+      "sampled_allocated_peak": 1748091776,
+      "allocated_after": 22824576,
+      "active_before": 80330752,
+      "sampled_active_peak": 1814069248,
+      "active_after": 90980352,
+      "resident_before": 925974528,
+      "sampled_resident_peak": 2160574464,
+      "resident_after": 1300168704
+    },
+    {
+      "phase": "show_views_0000",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 7,
+        "lifetime_failures": 0,
+        "phase": "show_views_0000",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 0,
+        "rows": 512
+      },
+      "allocated_before": 22451712,
+      "sampled_allocated_peak": 22929832,
+      "allocated_after": 22929848,
+      "active_before": 90882048,
+      "sampled_active_peak": 90996736,
+      "active_after": 90587136,
+      "resident_before": 1284259840,
+      "sampled_resident_peak": 1285226496,
+      "resident_after": 1284456448
+    },
+    {
+      "phase": "show_views_0001",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 8,
+        "lifetime_failures": 0,
+        "phase": "show_views_0001",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 1,
+        "rows": 512
+      },
+      "allocated_before": 22968120,
+      "sampled_allocated_peak": 23636368,
+      "allocated_after": 22922072,
+      "active_before": 90537984,
+      "sampled_active_peak": 91471872,
+      "active_after": 90357760,
+      "resident_before": 1284440064,
+      "sampled_resident_peak": 1285324800,
+      "resident_after": 1285324800
+    },
+    {
+      "phase": "show_views_0002",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 9,
+        "lifetime_failures": 0,
+        "phase": "show_views_0002",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 2,
+        "rows": 512
+      },
+      "allocated_before": 22989336,
+      "sampled_allocated_peak": 23599216,
+      "allocated_after": 22836008,
+      "active_before": 90390528,
+      "sampled_active_peak": 91226112,
+      "active_after": 90210304,
+      "resident_before": 1282555904,
+      "sampled_resident_peak": 1283358720,
+      "resident_after": 1279918080
+    },
+    {
+      "phase": "show_views_0003",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 10,
+        "lifetime_failures": 0,
+        "phase": "show_views_0003",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 3,
+        "rows": 512
+      },
+      "allocated_before": 22835544,
+      "sampled_allocated_peak": 23321520,
+      "allocated_after": 22124424,
+      "active_before": 90062848,
+      "sampled_active_peak": 90652672,
+      "active_after": 89178112,
+      "resident_before": 1279344640,
+      "sampled_resident_peak": 1280393216,
+      "resident_after": 1255407616
+    },
+    {
+      "phase": "show_views_0004",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 11,
+        "lifetime_failures": 0,
+        "phase": "show_views_0004",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 4,
+        "rows": 512
+      },
+      "allocated_before": 22126520,
+      "sampled_allocated_peak": 22753144,
+      "allocated_after": 22076120,
+      "active_before": 89178112,
+      "sampled_active_peak": 90046464,
+      "active_after": 89161728,
+      "resident_before": 1255391232,
+      "sampled_resident_peak": 1256194048,
+      "resident_after": 1255407616
+    },
+    {
+      "phase": "show_views_0005",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 12,
+        "lifetime_failures": 0,
+        "phase": "show_views_0005",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 5,
+        "rows": 512
+      },
+      "allocated_before": 22090328,
+      "sampled_allocated_peak": 22757832,
+      "allocated_after": 22145736,
+      "active_before": 89178112,
+      "sampled_active_peak": 90112000,
+      "active_after": 89260032,
+      "resident_before": 1255391232,
+      "sampled_resident_peak": 1256275968,
+      "resident_after": 1255489536
+    },
+    {
+      "phase": "show_views_0006",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 13,
+        "lifetime_failures": 0,
+        "phase": "show_views_0006",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 6,
+        "rows": 512
+      },
+      "allocated_before": 21990216,
+      "sampled_allocated_peak": 22608752,
+      "allocated_after": 21803688,
+      "active_before": 89210880,
+      "sampled_active_peak": 90062848,
+      "active_after": 88932352,
+      "resident_before": 1255473152,
+      "sampled_resident_peak": 1256275968,
+      "resident_after": 1255440384
+    },
+    {
+      "phase": "show_views_0007",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 14,
+        "lifetime_failures": 0,
+        "phase": "show_views_0007",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 7,
+        "rows": 512
+      },
+      "allocated_before": 21865112,
+      "sampled_allocated_peak": 22490704,
+      "allocated_after": 21852216,
+      "active_before": 88948736,
+      "sampled_active_peak": 89800704,
+      "active_after": 88866816,
+      "resident_before": 1255342080,
+      "sampled_resident_peak": 1256144896,
+      "resident_after": 1255358464
+    },
+    {
+      "phase": "show_views_0008",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 15,
+        "lifetime_failures": 0,
+        "phase": "show_views_0008",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 8,
+        "rows": 512
+      },
+      "allocated_before": 21883848,
+      "sampled_allocated_peak": 22519792,
+      "allocated_after": 22313664,
+      "active_before": 88866816,
+      "sampled_active_peak": 89800704,
+      "active_after": 89866240,
+      "resident_before": 1255342080,
+      "sampled_resident_peak": 1256226816,
+      "resident_after": 1255505920
+    },
+    {
+      "phase": "show_views_0009",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 16,
+        "lifetime_failures": 0,
+        "phase": "show_views_0009",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 9,
+        "rows": 512
+      },
+      "allocated_before": 22189088,
+      "sampled_allocated_peak": 22690144,
+      "allocated_after": 21810752,
+      "active_before": 89718784,
+      "sampled_active_peak": 90324992,
+      "active_after": 89604096,
+      "resident_before": 1255489536,
+      "sampled_resident_peak": 1256177664,
+      "resident_after": 1254096896
+    },
+    {
+      "phase": "show_views_0010",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 17,
+        "lifetime_failures": 0,
+        "phase": "show_views_0010",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 10,
+        "rows": 512
+      },
+      "allocated_before": 21576432,
+      "sampled_allocated_peak": 22631232,
+      "allocated_after": 21456056,
+      "active_before": 89391104,
+      "sampled_active_peak": 90521600,
+      "active_after": 89227264,
+      "resident_before": 1245560832,
+      "sampled_resident_peak": 1246560256,
+      "resident_after": 1245462528
+    },
+    {
+      "phase": "show_views_0011",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 18,
+        "lifetime_failures": 0,
+        "phase": "show_views_0011",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 11,
+        "rows": 512
+      },
+      "allocated_before": 21507032,
+      "sampled_allocated_peak": 21507064,
+      "allocated_after": 21603264,
+      "active_before": 89145344,
+      "sampled_active_peak": 89145344,
+      "active_after": 88932352,
+      "resident_before": 1245446144,
+      "sampled_resident_peak": 1245446144,
+      "resident_after": 1235419136
+    },
+    {
+      "phase": "show_views_0012",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 19,
+        "lifetime_failures": 0,
+        "phase": "show_views_0012",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 12,
+        "rows": 512
+      },
+      "allocated_before": 21665680,
+      "sampled_allocated_peak": 22115816,
+      "allocated_after": 21712592,
+      "active_before": 89079808,
+      "sampled_active_peak": 89653248,
+      "active_after": 89079808,
+      "resident_before": 1230995456,
+      "sampled_resident_peak": 1231683584,
+      "resident_after": 1231011840
+    },
+    {
+      "phase": "show_views_0013",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 20,
+        "lifetime_failures": 0,
+        "phase": "show_views_0013",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 13,
+        "rows": 512
+      },
+      "allocated_before": 21731184,
+      "sampled_allocated_peak": 22175328,
+      "allocated_after": 21662264,
+      "active_before": 88997888,
+      "sampled_active_peak": 89931776,
+      "active_after": 89128960,
+      "resident_before": 1230995456,
+      "sampled_resident_peak": 1231880192,
+      "resident_after": 1217888256
+    },
+    {
+      "phase": "show_views_0014",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 21,
+        "lifetime_failures": 0,
+        "phase": "show_views_0014",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 14,
+        "rows": 512
+      },
+      "allocated_before": 21497128,
+      "sampled_allocated_peak": 22044008,
+      "allocated_after": 21614840,
+      "active_before": 89063424,
+      "sampled_active_peak": 89833472,
+      "active_after": 89063424,
+      "resident_before": 1218002944,
+      "sampled_resident_peak": 1218723840,
+      "resident_after": 1217937408
+    },
+    {
+      "phase": "show_views_0015",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 22,
+        "lifetime_failures": 0,
+        "phase": "show_views_0015",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 15,
+        "rows": 512
+      },
+      "allocated_before": 21634232,
+      "sampled_allocated_peak": 22309152,
+      "allocated_after": 21556512,
+      "active_before": 89014272,
+      "sampled_active_peak": 90079232,
+      "active_after": 89079808,
+      "resident_before": 1217839104,
+      "sampled_resident_peak": 1218805760,
+      "resident_after": 1218019328
+    },
+    {
+      "phase": "show_views_0016",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 23,
+        "lifetime_failures": 0,
+        "phase": "show_views_0016",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 16,
+        "rows": 512
+      },
+      "allocated_before": 21596720,
+      "sampled_allocated_peak": 22324536,
+      "allocated_after": 21583704,
+      "active_before": 89079808,
+      "sampled_active_peak": 89948160,
+      "active_after": 89096192,
+      "resident_before": 1218002944,
+      "sampled_resident_peak": 1218805760,
+      "resident_after": 1218019328
+    },
+    {
+      "phase": "show_views_0017",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 24,
+        "lifetime_failures": 0,
+        "phase": "show_views_0017",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 17,
+        "rows": 512
+      },
+      "allocated_before": 21446792,
+      "sampled_allocated_peak": 22420336,
+      "allocated_after": 21409088,
+      "active_before": 88932352,
+      "sampled_active_peak": 90259456,
+      "active_after": 88834048,
+      "resident_before": 1217921024,
+      "sampled_resident_peak": 1219198976,
+      "resident_after": 1217937408
+    },
+    {
+      "phase": "show_views_0018",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 25,
+        "lifetime_failures": 0,
+        "phase": "show_views_0018",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 18,
+        "rows": 512
+      },
+      "allocated_before": 21222304,
+      "sampled_allocated_peak": 21676152,
+      "allocated_after": 21401416,
+      "active_before": 88686592,
+      "sampled_active_peak": 89505792,
+      "active_after": 88899584,
+      "resident_before": 1217839104,
+      "sampled_resident_peak": 1218609152,
+      "resident_after": 1217937408
+    },
+    {
+      "phase": "show_views_0019",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 26,
+        "lifetime_failures": 0,
+        "phase": "show_views_0019",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 19,
+        "rows": 512
+      },
+      "allocated_before": 21420256,
+      "sampled_allocated_peak": 22043744,
+      "allocated_after": 21370720,
+      "active_before": 88899584,
+      "sampled_active_peak": 89833472,
+      "active_after": 88883200,
+      "resident_before": 1217921024,
+      "sampled_resident_peak": 1218805760,
+      "resident_after": 1217937408
+    },
+    {
+      "phase": "show_views_0020",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 27,
+        "lifetime_failures": 0,
+        "phase": "show_views_0020",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 20,
+        "rows": 512
+      },
+      "allocated_before": 21389088,
+      "sampled_allocated_peak": 21389104,
+      "allocated_after": 21248040,
+      "active_before": 88866816,
+      "sampled_active_peak": 88965120,
+      "active_after": 88965120,
+      "resident_before": 1217921024,
+      "sampled_resident_peak": 1217921024,
+      "resident_after": 1216741376
+    },
+    {
+      "phase": "show_views_0021",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 28,
+        "lifetime_failures": 0,
+        "phase": "show_views_0021",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 21,
+        "rows": 512
+      },
+      "allocated_before": 21314752,
+      "sampled_allocated_peak": 21318448,
+      "allocated_after": 21312096,
+      "active_before": 88965120,
+      "sampled_active_peak": 89030656,
+      "active_after": 89030656,
+      "resident_before": 1216724992,
+      "sampled_resident_peak": 1216741376,
+      "resident_after": 1216741376
+    },
+    {
+      "phase": "show_views_0022",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 29,
+        "lifetime_failures": 0,
+        "phase": "show_views_0022",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 22,
+        "rows": 512
+      },
+      "allocated_before": 21343008,
+      "sampled_allocated_peak": 22011384,
+      "allocated_after": 21460432,
+      "active_before": 89030656,
+      "sampled_active_peak": 89964544,
+      "active_after": 89178112,
+      "resident_before": 1216724992,
+      "sampled_resident_peak": 1217609728,
+      "resident_after": 1216823296
+    },
+    {
+      "phase": "show_views_0023",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 30,
+        "lifetime_failures": 0,
+        "phase": "show_views_0023",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 23,
+        "rows": 512
+      },
+      "allocated_before": 21473936,
+      "sampled_allocated_peak": 22252312,
+      "allocated_after": 21380368,
+      "active_before": 89063424,
+      "sampled_active_peak": 89964544,
+      "active_after": 88981504,
+      "resident_before": 1216806912,
+      "sampled_resident_peak": 1217806336,
+      "resident_after": 1216741376
+    },
+    {
+      "phase": "show_views_0024",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 31,
+        "lifetime_failures": 0,
+        "phase": "show_views_0024",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 24,
+        "rows": 512
+      },
+      "allocated_before": 21416592,
+      "sampled_allocated_peak": 22043272,
+      "allocated_after": 21320392,
+      "active_before": 88981504,
+      "sampled_active_peak": 89915392,
+      "active_after": 88834048,
+      "resident_before": 1216724992,
+      "sampled_resident_peak": 1217609728,
+      "resident_after": 1216741376
+    },
+    {
+      "phase": "show_views_0025",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 32,
+        "lifetime_failures": 0,
+        "phase": "show_views_0025",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 25,
+        "rows": 512
+      },
+      "allocated_before": 21170888,
+      "sampled_allocated_peak": 21657632,
+      "allocated_after": 21134592,
+      "active_before": 88883200,
+      "sampled_active_peak": 89669632,
+      "active_after": 88850432,
+      "resident_before": 1216806912,
+      "sampled_resident_peak": 1217527808,
+      "resident_after": 1216741376
+    },
+    {
+      "phase": "show_views_0026",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 33,
+        "lifetime_failures": 0,
+        "phase": "show_views_0026",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 26,
+        "rows": 512
+      },
+      "allocated_before": 21189728,
+      "sampled_allocated_peak": 21917688,
+      "allocated_after": 21303360,
+      "active_before": 88981504,
+      "sampled_active_peak": 89833472,
+      "active_after": 89014272,
+      "resident_before": 1216675840,
+      "sampled_resident_peak": 1216675840,
+      "resident_after": 1211170816
+    },
+    {
+      "phase": "show_views_0027",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 34,
+        "lifetime_failures": 0,
+        "phase": "show_views_0027",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 27,
+        "rows": 512
+      },
+      "allocated_before": 21200832,
+      "sampled_allocated_peak": 21865416,
+      "allocated_after": 21134552,
+      "active_before": 89014272,
+      "sampled_active_peak": 89899008,
+      "active_after": 88948736,
+      "resident_before": 1211154432,
+      "sampled_resident_peak": 1212006400,
+      "resident_after": 1211088896
+    },
+    {
+      "phase": "show_views_0028",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 35,
+        "lifetime_failures": 0,
+        "phase": "show_views_0028",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 28,
+        "rows": 512
+      },
+      "allocated_before": 21176424,
+      "sampled_allocated_peak": 21813080,
+      "allocated_after": 21342992,
+      "active_before": 88948736,
+      "sampled_active_peak": 89882624,
+      "active_after": 88965120,
+      "resident_before": 1211072512,
+      "sampled_resident_peak": 1212006400,
+      "resident_after": 1211088896
+    },
+    {
+      "phase": "show_views_0029",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 36,
+        "lifetime_failures": 0,
+        "phase": "show_views_0029",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 29,
+        "rows": 512
+      },
+      "allocated_before": 21088336,
+      "sampled_allocated_peak": 21684200,
+      "allocated_after": 21267000,
+      "active_before": 88817664,
+      "sampled_active_peak": 89702400,
+      "active_after": 88981504,
+      "resident_before": 1211072512,
+      "sampled_resident_peak": 1211875328,
+      "resident_after": 1211088896
+    },
+    {
+      "phase": "show_views_0030",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 37,
+        "lifetime_failures": 0,
+        "phase": "show_views_0030",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 30,
+        "rows": 512
+      },
+      "allocated_before": 21298976,
+      "sampled_allocated_peak": 21466840,
+      "allocated_after": 21456168,
+      "active_before": 88981504,
+      "sampled_active_peak": 89079808,
+      "active_after": 89079808,
+      "resident_before": 1211072512,
+      "sampled_resident_peak": 1211088896,
+      "resident_after": 1211088896
+    },
+    {
+      "phase": "show_views_0031",
+      "samples": 3,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 2,
+          "emitted_body_bytes": 27217,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 0,
+          "mutations": 0,
+          "name_bytes": 7168,
+          "names": 512,
+          "observer_connections_peak": 1,
+          "pages": 2,
+          "requests": 2,
+          "successful_mutations": 0,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 27217,
+          "upstream_mutations_sent": 0,
+          "upstream_requests_sent": 2
+        },
+        "generation": 38,
+        "lifetime_failures": 0,
+        "phase": "show_views_0031",
+        "routes": {
+          "list_views": 2
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 2
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "namespace": 31,
+        "rows": 512
+      },
+      "allocated_before": 21471688,
+      "sampled_allocated_peak": 22165128,
+      "allocated_after": 21140360,
+      "active_before": 89161728,
+      "sampled_active_peak": 90062848,
+      "active_after": 88883200,
+      "resident_before": 1211154432,
+      "sampled_resident_peak": 1212006400,
+      "resident_after": 1211203584
+    },
+    {
+      "phase": "drop_success",
+      "samples": 92,
+      "actual_provider": {
+        "active_connections": 0,
+        "active_requests": 0,
+        "active_upstream_listings": 0,
+        "active_upstream_requests": 0,
+        "counters": {
+          "active_peak": 1,
+          "admission_refusals": 0,
+          "completed": 3591,
+          "emitted_body_bytes": 971426,
+          "failures": 0,
+          "listing_active_peak": 1,
+          "metadata_loads": 1024,
+          "mutations": 1025,
+          "name_bytes": 14848,
+          "names": 1024,
+          "observer_connections_peak": 2,
+          "pages": 4,
+          "requests": 3591,
+          "successful_mutations": 1025,
+          "upstream_active_peak": 1,
+          "upstream_body_bytes": 971426,
+          "upstream_mutations_sent": 1025,
+          "upstream_requests_sent": 3591
+        },
+        "generation": 39,
+        "lifetime_failures": 0,
+        "phase": "drop_success",
+        "routes": {
+          "list_tables": 2,
+          "list_views": 2,
+          "load_tables": 1024,
+          "other": 2563
+        },
+        "scope": "actual observer traffic; FE PID and acceptance must be proven externally",
+        "statuses": {
+          "200": 3591
+        },
+        "valid_observation": true
+      },
+      "sql": {
+        "dropped_namespace": "cl_ns_0000"
+      },
+      "allocated_before": 21163352,
+      "sampled_allocated_peak": 23938984,
+      "allocated_after": 20926656,
+      "active_before": 88883200,
+      "sampled_active_peak": 91783168,
+      "active_after": 89964544,
+      "resident_before": 1211203584,
+      "sampled_resident_peak": 1212874752,
+      "resident_after": 1137606656
+    }
+  ],
+  "independent_after_drop": {
+    "acceptance_scope": "external REST verification only; namespace-list absence and unchanged surviving metadata; no native DROP execution, object HTTP refusal type or provider CL acceptance",
+    "binding": {
+      "compose_project": "nr-isolated-rest-40658-1791512946839762000-1",
+      "fixture_id": "isolated-rest-40658-1791-5404002c",
+      "owner_manifest_path": "/Users/harbor/.codex/worktrees/b946/NovaRocks/docker/iceberg-rest/runtime/isolated-rest-40658-1791-5404002c/manifest.json",
+      "owner_manifest_sha256": "a5068549295586ad76d8adb35ba1b812c8c1d9cf8c0d22d72a1f062c205265e0",
+      "owner_mode": "task-private",
+      "rest_image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "rest_uri": "http://127.0.0.1:21162",
+      "server_default_warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest",
+      "warehouse": "s3://warehouse/isolated-rest-40658-1791-5404002c/rest"
+    },
+    "bounds": {
+      "bulk_deadline_seconds": 7200,
+      "max_request_bytes": 65536,
+      "max_response_bytes": 16777216,
+      "page_size": 256,
+      "preflight_deadline_seconds": 300,
+      "request_timeout_seconds": 30
+    },
+    "details": {
+      "actual_metadata_facts_sha256": "707adad9485155895f3a020c660cc16b9212dd7d1411287391acaea324cda3f9",
+      "actual_namespaces": 31,
+      "actual_tables_loaded": 15872,
+      "actual_views_loaded": 15872,
+      "all_surviving_metadata_independently_loaded_and_unchanged": true,
+      "capabilities": {
+        "capability_proof": "actual preflight create/load/page/delete required",
+        "endpoints_present": true,
+        "endpoints_sha256": "64be1ec1700ac42aff634942f7fc5126da92f1724eed2d35f38007b1f3d4de78"
+      },
+      "identifiers_sha256": "35886b9ed8df2493334b8a143f2a9c58f89cbb5e073919766b8454d1384d7abf",
+      "native_drop_execution_proved": false,
+      "normal": {
+        "concurrency": [
+          1,
+          8,
+          16
+        ],
+        "namespace_pattern": "cl_ns_%04d",
+        "namespaces": 32,
+        "page_size": 256,
+        "table_pattern": "cl_table_%06d",
+        "tables_per_namespace": 512,
+        "view_pattern": "cl_view_%06d",
+        "views_per_namespace": 512
+      },
+      "object_http_refusal_types_proved": false,
+      "prepared_http_audit_sha256": "3453d3360c644804ec98dfda2b586e189444aa55bfe9d55f1b8af867585b5d51",
+      "prepared_metadata_oracle_sha256": "a32964fb6256ffa454cd79f55830c9db7bb3c34e9d837965e520f46659e0d62e",
+      "ready_receipt_sha256": "1b986e095b506365812c3bf8272adace76a73421bacccf4b2ec5547515cf8950",
+      "target_identifier_absence_basis": "normal catalog namespace authority; exact listing absence",
+      "target_namespace": "cl_ns_0000",
+      "target_namespace_list_absent": true,
+      "target_prepared_identifiers_sha256": "ffd422c1d2e5ccfb771de861d7ace5e75d13791f947514f6864196f9f1b79a49",
+      "verification_deadline_seconds": 7200
+    },
+    "elapsed_seconds": 39.541424,
+    "freeze_sha256": "f234ee5c89a165d5aa543b317c2f62e126b4e7a34eb6dc08e6fd208fe03ba754",
+    "http_audit_sha256": "7f761cc3fcd2616f41bbf198a7184060b7ee5aa75d2015b06468d62ca14447c6",
+    "http_requests": 31871,
+    "http_response_bytes": 29418090,
+    "listing_pages": 126,
+    "metadata_oracle_sha256": "ec95a62a016942c4149f074f3b6f0931b3cadbbdcf660dac424f41bc97507a59",
+    "mutations_attempted": 0,
+    "original_input": {
+      "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v3.json",
+      "sha256": "e279724dc4ab2ce34dfdef5f3a939ad3f0f05ed076c36c5c60a7b7d7c6c1a3d3"
+    },
+    "phase": "verify-after-drop",
+    "producer_sha256": "50a317f12417d2d99936c9346024c03d5b3e5a483bca1ce86777a099c4e11dbf",
+    "schema_version": 1,
+    "source": {
+      "canonical_lock_sha256": "9f720cb5dfb932edbef57e34a08f9cbcb717664b70917790283660be482c9181",
+      "iceberg_build_version": "1.11.0-SNAPSHOT",
+      "iceberg_commit": "ccb8bc435062171e64bc8b7e5f56e6aed9c5b934",
+      "iceberg_tag": "apache-iceberg-1.10.1",
+      "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
+      "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+      "image_source": "apache/iceberg-rest-fixture",
+      "jar_bytes": 211889894,
+      "jar_sha256": "49d01ec8e0995001a92b4c880adfe184d602541ba39d135f105511101da4db7d",
+      "platform": "linux/arm64"
+    },
+    "state": "VERIFICATION_PASS",
+    "task": "MEM-1-M07"
+  },
+  "cleanup": {
+    "pids_gone": [
+      41942,
+      41945,
+      41946,
+      41947,
+      41941
+    ],
+    "native_launch_identities": [
+      {
+        "role": "fe",
+        "pid": 41942,
+        "process_start_token": "macos:1791513181:547406"
+      },
+      {
+        "role": "be-0",
+        "pid": 41945,
+        "process_start_token": "macos:1791513189:846106"
+      },
+      {
+        "role": "be-1",
+        "pid": 41946,
+        "process_start_token": "macos:1791513189:910419"
+      },
+      {
+        "role": "be-2",
+        "pid": 41947,
+        "process_start_token": "macos:1791513189:967250"
+      }
+    ],
+    "observer_pid": 41941,
+    "observer_state": "OBSERVER_STOPPED",
+    "observer_lifetime_failures": 0,
+    "observer_actual_active_connections": 0,
+    "exact_private_compose_project": "nr-isolated-rest-40658-1791512946839762000-1",
+    "containers_remaining": [],
+    "volumes_remaining": [],
+    "owner_manifest_retained": false,
+    "scope": "Exact native/observer process and private fixture cleanup only; shared fixtures untouched"
+  },
+  "raw_sha256": {
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/driver-status.json": "a1c2faebb0adf3f55c7ef3559c5e146afbdc531e75e54556ce20ded130d49226",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/driver-input.json": "53322b1342d5a32d0e0cfdae9cdac49bdebbc8c5ba8f93cb14c61190592fea46",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/driver-private-runtime-binding.json": "e92ca7ef982e9e6c44bdb4ada090069f2be314de0c12c8bdeaeb3294202158b3",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/driver-cleanup.json": "e6ac31be694f5991c8dbcf44d8bf313a390da77462e7178cda47f34fdc07e955",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/driver.log": "b0237a49b6e52082bd3001ba7e5421c366ebfcc998dee92a0a499e534bbc59f9",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-022.json": "45e5e9c3f373e4cd2e61dadda74e5d46414cbeff46652f3d8c2857bdc6645faf",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-034.json": "c3daf5f16d2957b6eeb009e93452ed8147669ca9aee9764013fdd4e3fd76414f",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-018.json": "62371bac48f1ca444ac4f574bce07220711c4218cfbcdd80927b0677f063c3e2",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-038.json": "45f6db83fbac0736eb3c4503a168170940d6e17138bfe8e15b2e2217e258510c",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-014.json": "6138e876eb956fd92e392fcef8f27d3e3e75880523ccd82f41402a95807331ff",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-002.json": "d991ec7c29015d9393f75a44db70bdcce9bbd4fc628114ce6407c0f86821315c",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-003.json": "9923301edb00c632da6d2d7493437802b4fa7494f8413bf876e7f2cea1feba24",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-015.json": "97de94796ec7485bd4acc42de48e6f3eb10d26f26686d71096544b5efd25359b",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-019.json": "3c63fb5a7327d39be3d3aae628ff18577297c1df76d710d338ebccb2d5f5e8bd",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-035.json": "af83df00abd1e73eb24a39fd6a2abe047bf33fd4611325af249b7892b65e73f1",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-023.json": "411b554ef59e2b9873b84cd5f2c0c57aa44d543d7bb0075f099e944707bb0d79",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-028.json": "74965391b2a9b341670609e410aca2d55fd29711fe958be39697f4c2c894624e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-012.json": "b1d35a1576e946e923ff0bc9c770808f76fb96371e81dc06fea5baad567f3bd4",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-004.json": "540d161ab12fb8784ecf3c6293d3a8818d7f30f3fe1c4f03a824b95e48617c25",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-024.json": "cc59e3e873c7ae6b188070d4bc68722c42aa24b20e57772b313cfd42ef87ba43",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-032.json": "88a16ae6d3952c7f764830aa147cc94de04710083d61a59fa70cc0a9a72c0b07",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-008.json": "c56bc73733d5e3c359f810a87eda675406374b6ef3fbee53fd0eb38f109c9ae2",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-009.json": "2a042f0da09a19854d25f829cd658490bbbb0d5283d42164c4b549838ae7982c",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-033.json": "03cc6d439949c6c1942520a3358715a49e2eaea8725ce71ace8f5a1e573618f8",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-025.json": "ebe4bdd743b942538c667f19e86725f0648f19374bb2773cb8582033cbdfb3a0",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-005.json": "bbc6cf4cc570711d2cf4a73271231719d66f6914b63b1fd3e6b51b14993371bb",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-013.json": "ce80301d2c334b98827d30d40493e9df419d65b362361e34f30afb542f18967e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/scenario-evidence.json": "bc98250be6a6b236aba7d6c8723491bc24a7d1216842749aca17860b064ea2c7",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-029.json": "d64ae395340e2226d4dcca736279f75cf4e8f29ece9f4092747172001c4f3100",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-006.json": "a1e60b0e0bec205ff88634472153416658fb6b4b7e98f3184ac4433b4e042155",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-010.json": "a4c16abd46b8c344032c00b46d4c0ccadf7dd9db40d1d4f46d53ac1d499027c3",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-listing-measurements.json": "92aa47a9ad118448db1d332e7dc47ab173e8cd5083668c6ab2cdfa6fd9483099",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-030.json": "f2525e30e02301f64a1c6092e847797943b7220cfdd74cabc2257ef3f8cfe239",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-026.json": "36eff7da3f062f0d51d199b6d0723a1e67be060cbddaf30832915c6e4faab93c",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-027.json": "ddba2f898e76ac8bfcd791e8f66e9262d8995b43e907b428b0215a064c689619",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-031.json": "269dcb597d307c8e37eeac90929327cb072e27091c2adfe7764f61f7176abc74",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-011.json": "511647bba20b92dd6fe2947b6683e1f042d0a674fc00337fca810949fee03bfa",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-007.json": "7e387600129f5635194caef3ef76709842134d359afdad4285fd378e97f48b98",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-036.json": "a2f5ef0891b250db06bfb8bc9b81baea42af510e2839ea3c3b310cfbd1ac06bf",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-020.json": "89c4d9aab92c253d996d9ef84ed6ba195caa60fce7c232442a42c54dd2da5927",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-016.json": "6ae897b5a34f89bf9dbead85c0464b8fb34899432ea7f967314025afe627b2cf",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-017.json": "8bb6ef7c99e7a2700461ee831762f8b65d1af0200fdd66a3c8695a476b1c219b",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-001.json": "33c3c43fb5aa24063990fa2a7ff17ab0601e6bdd8399dd69130f6e38573f26e5",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-021.json": "3d8dcd447569562aa2fb7272ba3434cb53a6c0589cecd31814cc6cc197bad608",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/listing-phase-037.json": "4a0adffb1e9a44d1461dc882bb2d089ede4e24d391f9ef365faf300045b14482",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0003-immediate.json": "e030633ecc1dc8c12382928942ab7276ceca50608d56b5d53bf0bbef4dfb0e90",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0016-immediate.json": "f0ec0f8d9d1acbc65ac851e3af98d99d86f42e3ee4563a5ec69f49a1b6330277",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-information_schema_8-immediate.json": "c0ae7a36218ee38670ffe387183f4efb9fa10586d79199e100c550bdab47b582",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0027-idle.json": "c6cf736c72f797e1d414539b4bb13ab09d04ee2c3e4740a859d57b6fb37e6247",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0011-immediate.json": "5017ac82eb9fdf8f3e33dca3771259e0fb19c5f10ae3ee02e07d72ba480cd7e8",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0004-immediate.json": "bae8ec7a5a8b847c8afda2606aaacdb91ab9be4ce349fa547bc170135f4a24bd",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0006-idle.json": "950427526bc42f68f5dfcaeccbf14383851ec5d7b9c35a5778446690ac91a50e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0019-immediate.json": "9eb3d1126ad6c0163b1f90ffed9fb19c458467cb3d6822e2e2a7dcd5837d5ced",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0012-idle.json": "89597b1ee0a580939fa79bce08c0891862673fca282ecbf958c340a850fa24a2",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0018-immediate.json": "616fba5c70b07119f5d41f3c07c99df045497bef5de7b44db3085b5311907779",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0019-idle.json": "403c291ec0e8d1b42c2992c075722e506326c7c5f58d9303f7191afc6e797639",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-lake_discovery-idle.json": "f23029d094b990cc482d093957c55f6e810cc02b64292c0ae53deebfb06c8a05",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0005-immediate.json": "9fef0182f8a67be9c96897d5176c545f4e64f1522472857626ed5657b166b0a5",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0010-immediate.json": "1f812347f239a624316eaef81f26a56c0976c5bf3b7a94e3b58b5f87e8a984d1",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0000-idle.json": "819e72da568d63a3d15f9ab19d5b330485e3375c8c2176762c47d2fa187c5954",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0014-idle.json": "26fe5fdcce435c0f9c0a772bde03159fb89a0f60c42df35d539ad8a2f1fc7ae6",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-information_schema_1-immediate.json": "47ed7440ff066f0ff7fb26ae93e6108e668aee404e979c230a61b758139332c7",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0021-idle.json": "de7259dc2e8f12fc99894c99bfdde409e772131b8f4274ffb25886273071ae3f",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0017-immediate.json": "ab2b29fdb04927ac5cf6c696ac232fce01119dfaee05a73741d05603f97839b9",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0002-immediate.json": "d9c29f444c2e7bb1422dcabe95f39ba0571745f41850d2fe83f25893a3585421",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/observer-freeze-bound.json": "9283b8bf0018f464c9f0992c4e38e9020cf508ccc451667ecb4e22ed36fe8997",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0008-immediate.json": "749d3399235057d4e4a793701b0ebebe069f239c20cc867aeb70c9ffb6ea4d1e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0015-immediate.json": "077a023c02a98c6cbc40225b85f5b579c95855bc94d56f75ca5b6718f41325af",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0000-immediate.json": "7e13d0e93f8a0cdfbcfcb2af2295796fe8e29d33973bc457a9caf130ac0ac1cd",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0026-idle.json": "c49b53e18286482467832949b4cbed80d6b4537596a165ff57d5e521382aa2ba",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0013-idle.json": "df9e512a72b89772d521692375fc9e9e95209b3b61a008c1c88145fd04189519",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0007-immediate.json": "c787c158bbabe570a06975f3e12ee0c6671ebfc36b4811cf1328fc01ca6ae0ca",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0012-immediate.json": "f373f6222318ec3adfbaeca7c667e389366c09ff5497d6acb0b11c74d80e9cd5",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0007-idle.json": "4df11c013dba7d3eae31b373dc9a6d40137ac12e939c112988d4e7fc9f9f37d4",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0013-immediate.json": "5c5cd3ce9a093c17c970f25b21f91eda09556622fe582b4ec93efffa61517274",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0006-immediate.json": "711c277155e9bb370f5ba66200c1d3b48b39940fcdd5b83e48e595d2526d120e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0018-idle.json": "be6e11bffe63328cb52cbd5605f713ddd96b6597d7268986144ba63a3201029d",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-information_schema_1-idle.json": "7e769cf2cd7c3d7df4d1e1f3e74f8aa3d98f1fa1a18adb312586d98df76486d2",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-drop_success-idle.json": "c54141e30dfcb6a99c5f85f6ddae8caebc2a4b257b55512079b3ec7465b5543b",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-information_schema_16-idle.json": "53cabd7ed52840d58352bcf84f0cdaae0bf00fcb5dc5e7096c1a37255cf7f089",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0015-idle.json": "cb9cee82f99a2b46f07768006efd56f0cf5b1c250010d5a6a81fb8dfb0b594b6",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0001-immediate.json": "a5c31366d393c15048ccff3fce8eac406f3b6b1444323da165a7cd768018ef97",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0014-immediate.json": "96d17f35db67dc295bb87386e344f03b2eecb9a2b62419c17457f05151637ac8",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0001-idle.json": "0d47a377c4c4cb863c8e441c665f7a8d573a4f29da5ee50dbee31bb5fe6e9cc3",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0020-idle.json": "6b98798284876f651b6da602bc483969a7529652d33b649cbc137176afbbc22b",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0009-immediate.json": "d0ea42759fd8eb6aa00a5df180da8cc26cf6e718aec09bfa1883a383477e3074",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0009-idle.json": "fbab55068f94308f409c7248e4588814cc616b6affe90b28a35c9c7f895e7003",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0020-immediate.json": "b935a462ecbbabf3d723f584786468f919950ddedfe1dba625e6c94bd0416d30",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/producer-freeze-bound.json": "f234ee5c89a165d5aa543b317c2f62e126b4e7a34eb6dc08e6fd208fe03ba754",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0028-idle.json": "5388704fb16565c3ad56654073198349930773b25f157b58ac2ddf5625b3706f",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0028-immediate.json": "9844db116b1d5554e07ccc22627c1e84c4a1096886373a27af15f82f554ed251",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0004-idle.json": "fa004e42f1824e0b7594987ab5db002479039c7413693e9032849cde1635bcaf",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0027-immediate.json": "9915a26b73d9af6738e54424ed2194c79fea664604377d44fdade069fb9e0be5",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0010-idle.json": "3e2b76199b2f7e3f00ad7831d326c93647d42b06a403daf6e0f44cc4cc1b69c0",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0031-idle.json": "af2299e4c01acffc5b3059922c025c55048559b5e33f8ada2653789389a726a6",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0025-idle.json": "602d6759b41ee41cf031a2766f8a03b31f23b16f65728127740f904fb7a91060",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-lake_discovery-immediate.json": "735258951a5187fda935a1caa754f2aae62a6a62599d7f5e88822bc66d377f1f",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0026-immediate.json": "e4a48c1057492f13b1901d324368f99925692850fa91be6d975b429683a4f013",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/producer-bulk.log": "c547b3e23a81532a0e56a97c0f07206dca9260b7c9ff29a744f969da44faeb31",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0029-immediate.json": "a514f6616100d33ac880bbf494b27988498dcf129a7ce07ae28798607ca9b9fc",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0023-idle.json": "e5d1e2dedcf0dff797aa1c132980c890f12185f3068c5ee3fe2eb341d83dce4b",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/actual-native-catalog.sql": "248497b0e1dbf884b6f3637a4ba9858484efdd369d90d759c2438a03379c60d8",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0021-immediate.json": "d886c845183b63e3017fe277a5fbe6c3da974878332eea582e638c10e060a742",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0002-idle.json": "f6d2ffdafac38ab8ef665cd907c72b90b8a10d561e3b1e022b9910cc3dddbf01",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0016-idle.json": "60da7c5ffd36899bc4c08c0add3a2bfd2733adfa0d25ad462b6c6a332349d538",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-information_schema_16-immediate.json": "88f013414baa260d75ace5d5770780565fae16f99af0dfeded6a5ea9342e74b2",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0008-idle.json": "e7a2c1c1f6388675fc7e89e7534886fbb17f5f5740dc65a8c5cbc36c20b488e0",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0029-idle.json": "8071aa8b61cce682a29ad8e9e54b6e7726835f09ec5c65a5e4e1a6aca1f28ba4",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/observer-stopped.json": "bb91562ccf78541b978dbe45f4bc34ff0f9548b0f7274721b30d4ea36cd9097c",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0023-immediate.json": "bb9398f7962fe5999704cb11be1d5eda907ae180419a947da1e760a1ff7d945f",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0011-idle.json": "1e615b4707e2fa6af69d205fbeb400d6c65523196017ff5d277cf68fd27389d5",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-information_schema_8-idle.json": "ed42346732ae2b9b8b61a3e661e982c404fdde076ccb64c74da4cf646ea48560",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/producer-verify-after-drop.log": "20751fd441934d1515eb79ae50e238658ff832ebbf784fd36693be73821168be",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0005-idle.json": "dc9ac5781351823ac078b5ca291c380d5a82883b45b725b74bd0c9922078ae6e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0024-idle.json": "66e169cbc0cacf10edb38c2a2a648df0aa90908b1a76dcd0da5921b770a1283b",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/observer-process.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/producer-preflight.log": "61b9eb04a485ef3f0845080f25298a5dd61c6b9d9568e21a152465ad9800bb52",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0030-idle.json": "8e4490c74c47afe4513c6289b07c9a293d9b89c9f7f488a5585eadb278e35f91",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0031-immediate.json": "cedc58ede61c43b60c773ae77a3a27afa2cdd06e5b5e32ca90842fb2566298ea",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0024-immediate.json": "59a5dfa7fdd758d35de41253d2d4d8b1277d91ec4cc115419feebdbde7ce7552",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0025-immediate.json": "5b728259b2ac90d98c7a229ede16208ee602b15fbae2584d07994073af875929",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0030-immediate.json": "7cf6981e6416611389256dc6dc16c2daf5f3b2589a02a27fda5e063da7998c18",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-catalog_admission-immediate.json": "48c8b7da183b00ab8e47ff071f1e4c35328236116836f753c02749ce10710247",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0022-idle.json": "b458a60638ae4529bc2084f8bdc2a812ed1a5dbf268459d4dfe1d8f197ca0fc6",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0022-immediate.json": "8e3a06372f9789de80dd3b66bcb8a83549bf130547af22e8a7430dd9dbdb4c47",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-catalog_admission-idle.json": "841125fae02a0a60719fd7c722d25c716b31522eec47bf064bd11f14b49d0b72",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0017-idle.json": "056bcf9fb483a83ce6ee9973586ef09f86c2a85d0d247df56d9831ff39ff33c9",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-drop_success-immediate.json": "7d4057fce3c8d60792af19b2103be58ad857db442d80e5258d6f033f46a3fa0e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/native-show_views_0003-idle.json": "e84524f4b61eb64f7427298f7c9dd7456bb28628cf3cf61bf96f16c47330adf4",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/bulk/http-audit.jsonl": "3453d3360c644804ec98dfda2b586e189444aa55bfe9d55f1b8af867585b5d51",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/bulk/metadata-oracle.jsonl": "a32964fb6256ffa454cd79f55830c9db7bb3c34e9d837965e520f46659e0d62e",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/bulk/READY.json": "1b986e095b506365812c3bf8272adace76a73421bacccf4b2ec5547515cf8950",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/verify-after-drop/VERIFICATION_PASS.json": "779cf65068d50aef7f37d3c5ff8c5abe422d33c00dcc6e062ca3372535f8a769",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/verify-after-drop/http-audit.jsonl": "7f761cc3fcd2616f41bbf198a7184060b7ee5aa75d2015b06468d62ca14447c6",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/verify-after-drop/metadata-oracle.jsonl": "ec95a62a016942c4149f074f3b6f0931b3cadbbdcf660dac424f41bc97507a59",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/observer/observer-audit.jsonl": "13c46e3b0cab4e8355fb9c4c663954bdf43bd7e2fa4719a723718274e21c4924",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/observer/OBSERVER_BOUND.json": "c67f311aca8fa7e602b094caee1b66e7070adc065f6fd2075c4070cd329cfd02",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/preflight/http-audit.jsonl": "8b1417bda2461640236730021e9a6a45fea6e3057d0a4cff0f84be86d8bd757d",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/preflight/PREFLIGHT_PASS.json": "2b2423ca76ef87dd8c1cbe9a388038d7867ded2fb6a9a6d5ec602755fc39eb0b",
+    "logs/mem-1-m07/p09-real-rest-cl-native-v2-20261009/catalog-mem-1-m07-real-rest-listing/real-rest-preparation/preflight/metadata-oracle.jsonl": "7ede940346035c14b5eb0af43550c8c1184fbfbd7a39d497b52a64f23b3a6d2c"
+  },
+  "scope": "Actual stock private REST source/image and independent external oracle. Native FE target process allocator sampled100ms; observer/producer/fixture excluded. Actual HTTP pages/names/concurrency/socket accepted bytes do not prove SDK permits, decoded byte hardbound or FE consumed bytes. No byte pass gate was added. Controlled fault/cancellation matrix remains separate. This pass does not close HMS/Paimon largeCL, CM/CP/P00b/P10, the two pending design choices or MEM-1-M07. Same dev profile as v1; functional/provider observation only. Formal release CL/CM/CP remains OPEN under plan section4.3. No causal peak-reduction claim.",
+  "memory_followup": "Borrowed-row system_catalog source removed its precopy all-row Vec/String. Actual16client sampled FE allocated peak1748091776B/after22824576B remains high; VALUES AST/planner ownership audit OPEN. Sampling does not attribute allocations to an owner or prove a physical last-alias exit.",
+  "dev_build": {
+    "profile": "dev",
+    "source_revision": "efb4d723211a6f9356cffbd0067a2ce687a615c7",
+    "log": "logs/mem-1-m07/p07-system-catalog-borrowed-dev-build-20261009.log",
+    "sha256": "a725c6102ba02fc5e2eac16fa9c74f6e0093da63742d2d760554d44c4f237ceb"
+  },
+  "scenario_evidence_duration_seconds": 168.74
+}
