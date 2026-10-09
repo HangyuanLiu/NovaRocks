@@ -754,6 +754,7 @@ async fn run_logical_execution(
             active
         }
         Ok(Err(failure)) => {
+            session.retire_preparation();
             let error = failure.into_failure().error().clone();
             // Initialization failure may cancel the root while the actor starts
             // converging. Publish the native verdict first so that derived
@@ -770,6 +771,7 @@ async fn run_logical_execution(
             return first_supervision_error(actor_result, retire_result);
         }
         Err(()) => {
+            session.retire_preparation();
             let error = native_future_panicked("Native attempt activation panicked");
             // As above, the direct activation verdict precedes any derived
             // cancellation emitted while the installed actor converges.
@@ -794,6 +796,7 @@ async fn run_logical_execution(
             let running = match actor.activate(initial.ready()).await {
                 Ok(running) => running,
                 Err(error) => {
+                    session.retire_preparation();
                     let error = actor_error(error);
                     let _ = requester.request(CancellationReason::Requested);
                     let convergence = converge_active(
@@ -846,6 +849,7 @@ async fn run_logical_execution(
             return first_supervision_error(actor_result, retire_result);
         }
         (Some(_), None) => {
+            session.retire_preparation();
             let error = QueryExecutionError::new(
                 QueryExecutionErrorKind::InvalidRequest,
                 "Native activated a row execution without its root result runtime",
@@ -883,6 +887,7 @@ async fn run_logical_execution(
             );
         }
         (None, Some(_)) => {
+            session.retire_preparation();
             let error = QueryExecutionError::new(
                 QueryExecutionErrorKind::InvalidRequest,
                 "Native attached a root result runtime to a completion-only execution",
@@ -924,6 +929,7 @@ async fn run_logical_execution(
     let running = match actor.activate(initial.ready()).await {
         Ok(running) => running,
         Err(error) => {
+            session.retire_preparation();
             let error = actor_error(error);
             let _ = requester.request(CancellationReason::Requested);
             let convergence = converge_active(
@@ -957,6 +963,7 @@ async fn run_logical_execution(
         &requester,
     )
     .await;
+    session.retire_preparation();
     let (actor_result, convergence) = match terminal {
         Ok(NativeAttemptTerminal::Completed) => {
             // The logical conclusion is the client-visible terminal boundary.
@@ -3312,6 +3319,325 @@ mod tests {
     async fn terminal_failure_retires_preparation_before_held_convergence_but_preserves_reply_aliases()
      {
         terminal_preparation_exit_fixture(true).await;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InitialTerminalPhase {
+        ActivateFailure,
+        ActivatePanic,
+        CompletionSuccess,
+        CompletionFailure,
+        CompletionPanic,
+    }
+
+    #[derive(Debug)]
+    struct InitialTerminalPreparationPort {
+        state: Arc<PreparationExitState>,
+        backend: BackendProcessId,
+        frontend: FrontendProcessId,
+        phase: InitialTerminalPhase,
+    }
+    impl NativeAttemptPreparationPort for InitialTerminalPreparationPort {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            let state = Arc::clone(&self.state);
+            let backend = self.backend;
+            let frontend = self.frontend;
+            let phase = self.phase;
+            Box::pin(async move {
+                let dormant = InitialTerminalDormant {
+                    inner: SuccessfulCompletionDormantOwner {
+                        backend,
+                        expected_frontend: frontend,
+                    },
+                    // The actual attempt guard is independent of the factory alias.
+                    guard: state
+                        .window
+                        .as_ref()
+                        .expect("original admitted window")
+                        .clone(),
+                    signals: Arc::clone(&state.signals),
+                    phase,
+                };
+                let scheduling = no_scan_scheduling(&request);
+                let result = request.bind(scheduling, dormant).map_err(Into::into);
+                drop(state);
+                result
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct InitialTerminalDormant {
+        inner: SuccessfulCompletionDormantOwner,
+        guard: TestWindow,
+        signals: Arc<PreparationExitSignals>,
+        phase: InitialTerminalPhase,
+    }
+    impl DormantNativeAttemptOwner for InitialTerminalDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            self.inner.eligible_backends()
+        }
+        fn activate<'a>(
+            &'a mut self,
+            schedule: &'a AttemptSchedule,
+            admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            match self.phase {
+                InitialTerminalPhase::ActivateFailure => Box::pin(async {
+                    Err(NativeAttemptActivationFailure::new(
+                        NativeAttemptPreparationFailure::new(
+                            AttemptFailureClass::ExecutionFailure,
+                            QueryExecutionError::new(
+                                QueryExecutionErrorKind::Failed,
+                                "initial terminal fixture activation failure",
+                            ),
+                        ),
+                    ))
+                }),
+                InitialTerminalPhase::ActivatePanic => {
+                    Box::pin(async { panic!("initial terminal fixture activation panic") })
+                }
+                phase => {
+                    let activation = self.inner.activate(schedule, admissions, cancellation);
+                    let guard = self.guard.clone();
+                    let signals = Arc::clone(&self.signals);
+                    Box::pin(async move {
+                        let activated = activation.await?;
+                        let (inner, runtime) = activated.into_parts();
+                        debug_assert!(runtime.is_none());
+                        Ok(ActivatedNativeAttempt::completion(InitialTerminalActive {
+                            inner,
+                            _guard: guard,
+                            signals,
+                            phase,
+                        }))
+                    })
+                }
+            }
+        }
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            let signals = Arc::clone(&self.signals);
+            Box::pin(async move {
+                signals.convergence_entered.store(true, Ordering::SeqCst);
+                signals.release_convergence.notified().await;
+                self.inner.converge(cancellation).await;
+                signals.convergence_completed.store(true, Ordering::SeqCst);
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct InitialTerminalActive {
+        inner: Box<dyn ActiveNativeAttemptOwner>,
+        _guard: TestWindow,
+        signals: Arc<PreparationExitSignals>,
+        phase: InitialTerminalPhase,
+    }
+    impl ActiveNativeAttemptOwner for InitialTerminalActive {
+        fn run<'a>(
+            &'a mut self,
+            drive: &'a NativeAttemptDrive,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            match self.phase {
+                // Delegate the existing exact Establish/admission fixture rather
+                // than returning an unqualified synthetic Completed verdict.
+                InitialTerminalPhase::CompletionSuccess => self.inner.run(drive, cancellation),
+                InitialTerminalPhase::CompletionFailure => Box::pin(async {
+                    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
+                        AttemptFailureClass::ExecutionFailure,
+                        QueryExecutionError::new(
+                            QueryExecutionErrorKind::Failed,
+                            "initial terminal fixture run failure",
+                        ),
+                    ))
+                }),
+                InitialTerminalPhase::CompletionPanic => {
+                    Box::pin(async { panic!("initial terminal fixture run panic") })
+                }
+                _ => unreachable!("activation failure has no active owner"),
+            }
+        }
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            let signals = Arc::clone(&self.signals);
+            Box::pin(async move {
+                signals.convergence_entered.store(true, Ordering::SeqCst);
+                signals.release_convergence.notified().await;
+                let result = self.inner.converge(cancellation).await;
+                signals.convergence_completed.store(true, Ordering::SeqCst);
+                result
+            })
+        }
+    }
+
+    async fn initial_terminal_preparation_fixture(phase: InitialTerminalPhase) {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let capacity = scope
+            .result_capacity()
+            .expect("original scope result capacity");
+        let window = capacity
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .expect("original Internal window admission");
+        let signals = Arc::new(PreparationExitSignals::default());
+        let frontend = FrontendProcessId::new_v7();
+        let attempts = InitialTerminalPreparationPort {
+            state: Arc::new(PreparationExitState {
+                window: Some(TestWindow(window.retain_alias())),
+                signals: Arc::clone(&signals),
+            }),
+            backend: BackendProcessId::new_v7(),
+            frontend,
+            phase,
+        };
+        drop(window);
+        let original_internal_positions = capacity.snapshot().held_positions[2];
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x78),
+            frontend,
+            supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
+        );
+        // Capture failure observations without asserting while a real owner waits.
+        let observations: Result<(bool, bool, usize), &'static str> = async {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.start(completion_request(attempts), root.owner),
+            )
+            .await
+            .map_err(|_| "initial terminal reply timed out")?;
+            match phase {
+                InitialTerminalPhase::CompletionSuccess => {
+                    let mut handle = reply.map_err(|_| "exact Establish completion failed")?;
+                    if !matches!(
+                        handle.take_output(),
+                        Some(crate::api::ExecutionOutput::Completion)
+                    ) {
+                        return Err("success did not preserve original Completion output");
+                    }
+                    drop(handle);
+                }
+                phase => {
+                    let error = match reply {
+                        Err(error) => error,
+                        Ok(handle) => {
+                            drop(handle);
+                            return Err("terminal failure returned success");
+                        }
+                    };
+                    let expected = match phase {
+                        InitialTerminalPhase::ActivateFailure => {
+                            "initial terminal fixture activation failure"
+                        }
+                        InitialTerminalPhase::ActivatePanic => "Native attempt activation panicked",
+                        InitialTerminalPhase::CompletionFailure => {
+                            "initial terminal fixture run failure"
+                        }
+                        InitialTerminalPhase::CompletionPanic => "Native attempt run panicked",
+                        _ => unreachable!(),
+                    };
+                    if error.message() != expected {
+                        return Err("original terminal failure source/order changed");
+                    }
+                }
+            }
+            wait_preparation_exit_fact(&signals.convergence_entered).await?;
+            Ok((
+                signals.factory_exited.load(Ordering::SeqCst),
+                !signals.convergence_completed.load(Ordering::SeqCst),
+                capacity.snapshot().held_positions[2],
+            ))
+        }
+        .await;
+        // Release and observe the same original convergence before shutdown can
+        // legitimately end its optional remote tracking. Then settle actual scope.
+        signals.release_convergence.notify_one();
+        let convergence_exit = wait_preparation_exit_fact(&signals.convergence_completed).await;
+        root.business.release();
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        acknowledge_all_control(&control);
+        let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
+        assert!(
+            convergence_exit.is_ok(),
+            "original convergence did not exit: {phase:?}"
+        );
+        let joined_with_expected_outcome = match (&shutdown, phase) {
+            (
+                Ok(()),
+                InitialTerminalPhase::ActivateFailure
+                | InitialTerminalPhase::CompletionSuccess
+                | InitialTerminalPhase::CompletionFailure,
+            ) => true,
+            (
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
+                InitialTerminalPhase::ActivatePanic,
+            ) => error.message() == "Native attempt activation panicked",
+            (
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
+                InitialTerminalPhase::CompletionPanic,
+            ) => error.message() == "Native attempt run panicked",
+            _ => false,
+        };
+        assert!(
+            joined_with_expected_outcome,
+            "original supervisor owner did not join with its expected outcome: {phase:?} {shutdown:?}"
+        );
+        assert!(settled.is_ok(), "original scope did not settle: {phase:?}");
+        let (factory_exited, convergence_held, held_positions) =
+            observations.expect("bounded terminal facts");
+        assert_eq!(original_internal_positions, 1);
+        assert!(
+            factory_exited,
+            "terminal caller retained preparation state: {phase:?}"
+        );
+        assert!(
+            convergence_held,
+            "original convergence released before observation: {phase:?}"
+        );
+        // The real Dormant/Active guard must remain live even after the unused
+        // factory drops. Zero here would be a false release, not a desired result.
+        assert_eq!(
+            held_positions, 1,
+            "original attempt guard lost its window: {phase:?}"
+        );
+        assert_eq!(capacity.snapshot().held_positions[2], 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_activation_failure_retires_only_unused_preparation_before_convergence() {
+        initial_terminal_preparation_fixture(InitialTerminalPhase::ActivateFailure).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_activation_panic_retires_only_unused_preparation_before_convergence() {
+        initial_terminal_preparation_fixture(InitialTerminalPhase::ActivatePanic).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_success_retires_only_unused_preparation_before_convergence() {
+        initial_terminal_preparation_fixture(InitialTerminalPhase::CompletionSuccess).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_failure_retires_only_unused_preparation_before_convergence() {
+        initial_terminal_preparation_fixture(InitialTerminalPhase::CompletionFailure).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_panic_retires_only_unused_preparation_before_convergence() {
+        initial_terminal_preparation_fixture(InitialTerminalPhase::CompletionPanic).await;
     }
 
     #[tokio::test]
