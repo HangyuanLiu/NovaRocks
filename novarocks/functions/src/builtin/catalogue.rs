@@ -999,12 +999,34 @@ fn scalar_result_nullable(
         Some(FunctionArgument::Lambda { result_type, .. }) => result_type.nullable,
         None => false,
     };
+    let first_value = match request.arguments.first() {
+        Some(FunctionArgument::Value { value_type, .. }) => Some(value_type),
+        _ => None,
+    };
+    scalar_result_nullable_from_types(
+        name,
+        request.logical_argument_count,
+        first_value,
+        value_nullable,
+        work,
+    )
+}
+
+/// The original nullability author over already-authored type facts. Neither
+/// adapter constructs constant facts or evaluates data to supply these loans.
+fn scalar_result_nullable_from_types(
+    name: &str,
+    logical_argument_count: usize,
+    first_value: Option<&FunctionValueType>,
+    value_nullable: impl Fn(usize) -> bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, FunctionBindingError> {
     Ok(match name {
         // POSITIVE uses the math output conversion, which turns non-finite
         // Float32/Float64 values into SQL NULL. Only admitted signed integers
         // and decimals prove a finite Float64 result for every non-NULL value.
-        "positive" => match request.arguments.first() {
-            Some(FunctionArgument::Value { value_type, .. })
+        "positive" => match first_value {
+            Some(value_type)
                 if value_type.logical_type == ValueLogicalType::Physical
                     && matches!(
                         value_type.data_type,
@@ -1039,20 +1061,12 @@ fn scalar_result_nullable(
         | "bool_and_state_union" => false,
         // These four decide their own result from the branches they choose
         // between, so their nullability really is their arguments'.
-        "coalesce" | "ifnull" | "nvl" => nullable_arguments(
-            0..request.logical_argument_count,
-            true,
-            &value_nullable,
-            work,
-        )?,
-        "if" => nullable_arguments(
-            1..request.logical_argument_count,
-            false,
-            &value_nullable,
-            work,
-        )?,
+        "coalesce" | "ifnull" | "nvl" => {
+            nullable_arguments(0..logical_argument_count, true, &value_nullable, work)?
+        }
+        "if" => nullable_arguments(1..logical_argument_count, false, &value_nullable, work)?,
         "case" => nullable_arguments(
-            (1..request.logical_argument_count).step_by(2),
+            (1..logical_argument_count).step_by(2),
             false,
             &value_nullable,
             work,
@@ -1060,12 +1074,9 @@ fn scalar_result_nullable(
         // A function that is total -- one that answers for every value of
         // its declared argument types -- passes its arguments' nullability
         // through. Everything else is nullable.
-        name if TOTAL_SCALAR_FUNCTIONS.contains(&name) => nullable_arguments(
-            0..request.logical_argument_count,
-            false,
-            &value_nullable,
-            work,
-        )?,
+        name if TOTAL_SCALAR_FUNCTIONS.contains(&name) => {
+            nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
+        }
         _ => true,
     })
 }
@@ -1131,6 +1142,88 @@ fn builtin_fixed_result_domain(function_id: &FunctionId) -> Option<ValueLogicalT
 }
 
 impl BuiltinScalarResolver {
+    /// Validate the complete already-selected type profile through the same
+    /// original fixed-overload signature and nullability authors. This does
+    /// not resolve a new function binding, build a request, inspect constants,
+    /// prepare a kernel, or certify emitted source-role facts.
+    pub(super) fn check_instantiated_type_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        binding_control::scope(control, |work| {
+            work.step()?;
+            if selected.aggregate.is_some()
+                || selected.argument_types.len() != logical_argument_count
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            let index = self.overload_index_observed(&selected.overload, work)?;
+            let mut types = Vec::with_capacity(logical_argument_count);
+            for argument in &selected.argument_types {
+                work.step()?;
+                let FunctionArgumentType::Value(value_type) = argument else {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                };
+                types.push(value_type.clone());
+            }
+            work.flush()?;
+            let resolved = resolver::resolve_scalar_value_signature_at_overload(
+                &self.canonical_name,
+                index,
+                &types,
+                work.control(),
+            )
+            .map_err(binding_resolution_error)?;
+            if resolved.argument_types.len() != types.len() {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            for (actual, required) in types.iter().zip(&resolved.argument_types) {
+                if !binding_control::exact_type(actual, required, work)? {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+            }
+            let value_nullable = |index: usize| types.get(index).is_some_and(|ty| ty.nullable);
+            let nullable = scalar_result_nullable_from_types(
+                &self.canonical_name,
+                logical_argument_count,
+                types.first(),
+                value_nullable,
+                work,
+            )?;
+            let mut expected = resolved.return_type;
+            expected.nullable = nullable;
+            let FunctionResultType::Scalar(actual) = &selected.result_type else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            if !binding_control::exact_type(actual, &expected, work)? {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            Ok(())
+        })
+    }
+
+    fn overload_index_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, FunctionBindingError> {
+        let mut index = None;
+        for (ordinal, candidate) in self.overloads.iter().enumerate() {
+            work.step()?;
+            if candidate == overload {
+                index = Some(ordinal);
+                break;
+            }
+        }
+        index.ok_or_else(|| {
+            FunctionBindingError::InvalidBinding(
+                "selected scalar overload is not declared by this function".into(),
+            )
+        })
+    }
+
     /// Instantiate exactly one declared overload through the original scalar
     /// signature author. Validation and late selection share this same body.
     fn selection_at_overload_observed(
@@ -1140,19 +1233,7 @@ impl BuiltinScalarResolver {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         request_types_with_constants(request, work)?;
-        let mut index = None;
-        for (ordinal, candidate) in self.overloads.iter().enumerate() {
-            work.step()?;
-            if candidate == overload {
-                index = Some(ordinal);
-                break;
-            }
-        }
-        let index = index.ok_or_else(|| {
-            FunctionBindingError::InvalidBinding(
-                "selected scalar overload is not declared by this function".into(),
-            )
-        })?;
+        let index = self.overload_index_observed(overload, work)?;
         let argument_types = binding_control::scalar_types(request, work)?;
         work.flush()?;
         let resolved = resolver::resolve_scalar_value_signature_at_overload(

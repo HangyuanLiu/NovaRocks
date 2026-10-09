@@ -1649,3 +1649,9 @@ mod e08s1_string_batch_static_tests;
 
 #[cfg(test)]
 mod e08s1_string_batch_differential_tests;
+
+#[cfg(test)]
+mod e08s1_time_original_profile_tests;
+
+#[cfg(test)]
+mod e08s1_time_static_profile_tests;

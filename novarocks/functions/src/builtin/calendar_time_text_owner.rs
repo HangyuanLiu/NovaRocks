@@ -170,6 +170,19 @@ impl PureFunctionMetadataOwner for TemporalOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_selected_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.resolver
+            .check_instantiated_type_profile_observed(selected, logical_argument_count, control)
+            .map_err(|error| match error {
+                FunctionBindingError::Control(cause) => FunctionBindingError::Control(cause),
+                _ => FunctionBindingError::UnavailableImplementation(selected.overload.clone()),
+            })
+    }
 }
 impl FunctionEffectOwner for TemporalOwner {
     type Error = FunctionBindingError;
