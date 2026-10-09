@@ -365,3 +365,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - clean2d6f1960c实际原生1FE+3BE首跑5.367s/exit1，正常baseline成功；actor此前三条reset/broken-pipe导致begin_capture拒绝，claimed/emitted/target_attempts全部0。没有注入非法reply，不把它称FE负例PASS。actor所有positions/credit0、listeners3实际join、四个精确PID已独立确认不存在；whole actor join verdict仍失败。收据p09-native-root-reply-native-v1-failed-20261009.json绑定raw hashes与原cause。原runtime role logs被explicit shutdown提前删除，缺失不可重建。
 - 本增量仅给downstream H2 handshake/accept、upstream TCP/H2加准确context，固定原position内一个AtomicU64记录实际读取bytes；任何reset/error判据均不放宽，bytes0也不当无输入proof。失败scene在explicit shutdown前retain，shutdown自身有failure亦保留runtime，供下一次实际定位。9actor/149harness/117runner全部PASS，既有ignored3/2不变；收据p09-root-reply-stage-diagnostic-focused-20261009.json。
 - 将用新cleanHEAD与新immutable v2 artifact保持原三scene/caps/clocks/SQL运行。真实FE非法RootReply及M07最终验收仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09 P09：第二次RootReply首跑阶段定位与公开帧诊断
+
+- clean dae0a3e74原生v2仍FAILED/5.335s，claimed/emitted/attempts0；三条downstream H2 accept分别read87/96/96B、children1 reset，另有独立root output capacity closed。四个精确PID已确认不存在，所有actor positions/credit0且实际join，但whole failure保留。失败runtime日志这次实际保留，收据p09-native-root-reply-native-v2-failed-20261009.json包含raw hashes。
+- actual BE启动确有Data readiness connect_with_connector后drop channel、无application RPC的源码；仅byte数/children1不足以将这些错误认定正常。本增量增加固定public preface/header/parser，记录帧类别/完整边界/ever application frame、connection-local accepted RPC与typedIO kind，request/response copy分阶段；不保存AUTH/headerblock/body，不放宽reset、timeout、未知stream或独立capacity错误。
+- 新逐cut/parser反例及相关actor10PASS/0.01s，harness150/0/3ignored/2.42s（最后context-only补充另做focused10PASS）。E0425初始counter误放listener scope已在运行前修正并保留失败日志。收据p09-root-reply-frame-diagnostic-focused-20261009.json；用下一cleanHEAD v3进一步测量，尚无negative/native PASS或新关闭豁免。

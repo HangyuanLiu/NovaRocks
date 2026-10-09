@@ -1,0 +1,1199 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "purpose": "Stage-instrumented actual FE malformed RootReply run failed before injection",
+  "source_revision": "dae0a3e74d216e0aa813a1a081c3a09e603b8f56",
+  "source_dirty": false,
+  "topology": "1FE+3BE",
+  "server_sha256": "7554d342033cc721ed5b062b46bb1f3ea986a8a185d47f3be9daa74f4d7b3241",
+  "runner_sha256": "312333fd0008d6dab58ee70ec8f9742ce69a41fa9601cff1fbc5d3aa7d6f6ec8",
+  "freeze_inputs": [
+    {
+      "path": "docs/testing/mem-1-m07/inputs/native-root-reply-kind-freeze-v1.json",
+      "sha256": "e63a1f13f0056253ef453692efd6c38067a912dc79a2e512e19b6f65a17873f3"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/native-root-reply-prefix-only-freeze-v1.json",
+      "sha256": "70df917b110e051ce747f1bf1c1f2a1703bf17ceb68579323a2577a73166c86b"
+    },
+    {
+      "path": "docs/testing/mem-1-m07/inputs/native-root-reply-profile-freeze-v1.json",
+      "sha256": "08c272a3818e4e32ecd4b3aeabdf149d681f7b631a33898abfefc8d33de5a074"
+    }
+  ],
+  "exit_code": 1,
+  "duration_seconds": 5.335,
+  "scenario": "result-delivery/native-root-reply-profile-refusal",
+  "native_observations": {
+    "actor_after_shutdown": {
+      "active_connections": 0,
+      "active_listeners": 0,
+      "active_streams": 0,
+      "claimed": 0,
+      "connection_positions": 0,
+      "emitted_messages": 0,
+      "failure_overflow": false,
+      "failures": [
+        "root connection: root downstream H2 accept (read_bytes=87, children=1): connection reset",
+        "root connection: root downstream H2 accept (read_bytes=96, children=1): connection reset",
+        "root connection: root downstream H2 accept (read_bytes=96, children=1): connection reset",
+        "root connection: root output capacity closed"
+      ],
+      "first_failure": {
+        "bytes": 88,
+        "class": "connection-or-stream",
+        "sha256": "83b200593e1aca02580a55d61a7116c070604222268c35298a8a3448184ea079"
+      },
+      "first_overflow": null,
+      "frozen_request": null,
+      "frozen_root_task": null,
+      "joined_children": 20,
+      "joined_connections": 10,
+      "joined_listeners": 3,
+      "last_overflow": null,
+      "mutated": null,
+      "non_target_peer_cancels": 0,
+      "not_ready_forwarded": 0,
+      "not_ready_observed": 0,
+      "not_ready_replies": [],
+      "original": null,
+      "overflow_failures": 0,
+      "owned_buffer_bytes": 0,
+      "peak_owned_buffer_bytes": 32768,
+      "shutdown_joined": true,
+      "stream_positions": 0,
+      "target_attempt_requests": [],
+      "target_attempts": 0,
+      "target_consumed_positive_requests": 0,
+      "target_requests": 0,
+      "target_slots": 0
+    },
+    "actor_before_shutdown": {
+      "active_connections": 6,
+      "active_listeners": 3,
+      "active_streams": 0,
+      "claimed": 0,
+      "connection_positions": 6,
+      "emitted_messages": 0,
+      "failure_overflow": false,
+      "failures": [
+        "root connection: root downstream H2 accept (read_bytes=87, children=1): connection reset",
+        "root connection: root downstream H2 accept (read_bytes=96, children=1): connection reset",
+        "root connection: root downstream H2 accept (read_bytes=96, children=1): connection reset",
+        "root connection: root output capacity closed"
+      ],
+      "first_failure": {
+        "bytes": 88,
+        "class": "connection-or-stream",
+        "sha256": "83b200593e1aca02580a55d61a7116c070604222268c35298a8a3448184ea079"
+      },
+      "first_overflow": null,
+      "frozen_request": null,
+      "frozen_root_task": null,
+      "joined_children": 14,
+      "joined_connections": 4,
+      "joined_listeners": 0,
+      "last_overflow": null,
+      "mutated": null,
+      "non_target_peer_cancels": 0,
+      "not_ready_forwarded": 0,
+      "not_ready_observed": 0,
+      "not_ready_replies": [],
+      "original": null,
+      "overflow_failures": 0,
+      "owned_buffer_bytes": 0,
+      "peak_owned_buffer_bytes": 32768,
+      "shutdown_joined": false,
+      "stream_positions": 0,
+      "target_attempt_requests": [],
+      "target_attempts": 0,
+      "target_consumed_positive_requests": 0,
+      "target_requests": 0,
+      "target_slots": 0
+    },
+    "effective_capture_grace": {
+      "capture_millis": 5000,
+      "queue_residence_millis": 15000,
+      "source": "server-serde-default"
+    },
+    "effective_launch": {
+      "schema_version": 1,
+      "semantics": {
+        "child_environment": {
+          "backends": [
+            [
+              {
+                "classification": "non-formal-unsealed",
+                "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                "present": true
+              }
+            ],
+            [
+              {
+                "classification": "non-formal-unsealed",
+                "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                "present": true
+              }
+            ],
+            [
+              {
+                "classification": "non-formal-unsealed",
+                "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+                "present": true
+              }
+            ]
+          ],
+          "frontend": [
+            {
+              "classification": "non-formal-unsealed",
+              "name": "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
+              "present": true
+            }
+          ]
+        },
+        "cluster_size": 3,
+        "expected_eligible_backend_count": 3,
+        "fixed_environment": {
+          "NO_PROXY": "127.0.0.1,localhost"
+        },
+        "launch_profile": "fault-scenario",
+        "native_proxy": {
+          "backends": [
+            {
+              "backend_index": 0,
+              "retained_byte_limit": 1048576
+            },
+            {
+              "backend_index": 1,
+              "retained_byte_limit": 1048576
+            },
+            {
+              "backend_index": 2,
+              "retained_byte_limit": 1048576
+            }
+          ],
+          "root_reply_message_fault": {
+            "actor": {
+              "accounting": "actor-owned-Vec-capacity-only-not-production-physical-envelope",
+              "bounds": {
+                "forward_timeout_millis": 20000,
+                "handshake_timeout_millis": 2000,
+                "maximum_active_streams": 256,
+                "maximum_capture_millis": 5000,
+                "maximum_connections": 32,
+                "maximum_owned_buffer_bytes": 16777216
+              },
+              "capture_deadline": "single-absolute-never-reset",
+              "client_hpack_table_bytes": 4096,
+              "failure_bytes": 4096,
+              "failure_digest_positions": 3,
+              "failure_digest_sha256_bytes": 64,
+              "failures": 32,
+              "h2_connection_window_bytes": 1048576,
+              "h2_frame_bytes": 16384,
+              "h2_header_bytes": 16384,
+              "h2_reset_positions": 32,
+              "h2_send_buffer_bytes": 65536,
+              "h2_stream_window_bytes": 262144,
+              "h2_streams_per_connection": 128,
+              "maximum_data_listeners": 3,
+              "maximum_target_attempts": 32,
+              "mode": "authenticated-plaintext-root-reply-message-v1",
+              "not_ready_transparency": true,
+              "one_shot_per_actor_group": true,
+              "overflow_policy": "fixed-first-cause-first-overflow-last-overflow-wholefailure",
+              "request_bytes": 4096,
+              "response_bytes": 1052672,
+              "server_hpack": "locked-h2-public-default",
+              "target_attempt_evidence_positions": 32,
+              "target_slots": 1
+            },
+            "backend_indices": [
+              0,
+              1,
+              2
+            ],
+            "control_tcp_budget": "original_backend_retained_byte_limit_separate_from_actor",
+            "controller": "shared-one-target-slot-global-connection-stream-owned-buffer-bounds"
+          }
+        },
+        "roles": [
+          {
+            "attachments": [],
+            "backend_index": null,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "catalog_source": {
+                  "type": "table",
+                  "value": {
+                    "mode": {
+                      "type": "string",
+                      "value": "dynamic-state-store"
+                    }
+                  }
+                },
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "heartbeat_interval_ms": {
+                      "type": "integer",
+                      "value": 500
+                    },
+                    "heartbeat_timeout_retries": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "fe"
+                    }
+                  }
+                },
+                "debug": {
+                  "type": "table",
+                  "value": {
+                    "cleanup_fault_dir": {
+                      "type": "string",
+                      "value": "$RUNTIME/connector-cleanup-faults"
+                    }
+                  }
+                },
+                "mv_management": {
+                  "type": "table",
+                  "value": {
+                    "audit_log": {
+                      "type": "string",
+                      "value": "mv-management-audit.log"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "mysql_port": {
+                      "type": "string",
+                      "value": "$FE_MYSQL"
+                    },
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                },
+                "state_store": {
+                  "type": "table",
+                  "value": {
+                    "cluster_id": {
+                      "type": "string",
+                      "value": "novarocks-system-scenarios"
+                    },
+                    "path": {
+                      "type": "string",
+                      "value": "$RUNTIME/frontend-state.sqlite"
+                    },
+                    "provider": {
+                      "type": "string",
+                      "value": "sqlite"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "fe"
+          },
+          {
+            "attachments": [],
+            "backend_index": 0,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_control_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_CONTROL_GRPC"
+                    },
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "advertise_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_GRPC"
+                    },
+                    "frontend_endpoint": {
+                      "type": "string",
+                      "value": "$FE_GRPC_ENDPOINT"
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "be"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "control_grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_CONTROL_GRPC"
+                    },
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "be"
+          },
+          {
+            "attachments": [],
+            "backend_index": 1,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_control_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_CONTROL_GRPC"
+                    },
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "advertise_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_GRPC"
+                    },
+                    "frontend_endpoint": {
+                      "type": "string",
+                      "value": "$FE_GRPC_ENDPOINT"
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "be"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "control_grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_CONTROL_GRPC"
+                    },
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "be"
+          },
+          {
+            "attachments": [],
+            "backend_index": 2,
+            "effective_config": {
+              "type": "table",
+              "value": {
+                "cluster": {
+                  "type": "table",
+                  "value": {
+                    "advertise_control_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_CONTROL_GRPC"
+                    },
+                    "advertise_host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "advertise_port": {
+                      "type": "string",
+                      "value": "$BE_ADVERTISE_GRPC"
+                    },
+                    "frontend_endpoint": {
+                      "type": "string",
+                      "value": "$FE_GRPC_ENDPOINT"
+                    },
+                    "role": {
+                      "type": "string",
+                      "value": "be"
+                    }
+                  }
+                },
+                "native_trust": {
+                  "type": "table",
+                  "value": {
+                    "deployment_id": {
+                      "type": "string",
+                      "value": "novarocks-system-tests"
+                    },
+                    "shared_secret": {
+                      "type": "string",
+                      "value": "${ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}"
+                    },
+                    "transport": {
+                      "type": "table",
+                      "value": {
+                        "mode": {
+                          "type": "string",
+                          "value": "disabled"
+                        }
+                      }
+                    }
+                  }
+                },
+                "runtime": {
+                  "type": "table",
+                  "value": {
+                    "data_runtime_max_blocking_threads": {
+                      "type": "integer",
+                      "value": 64
+                    },
+                    "data_runtime_worker_threads": {
+                      "type": "integer",
+                      "value": 2
+                    },
+                    "exchange_io_threads": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "pipeline_exec_thread_pool_thread_num": {
+                      "type": "integer",
+                      "value": 1
+                    },
+                    "query_blocking_worker_threads": {
+                      "type": "integer",
+                      "value": 1
+                    }
+                  }
+                },
+                "server": {
+                  "type": "table",
+                  "value": {
+                    "control_grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_CONTROL_GRPC"
+                    },
+                    "grpc_port": {
+                      "type": "string",
+                      "value": "$ROLE_GRPC"
+                    },
+                    "host": {
+                      "type": "string",
+                      "value": "127.0.0.1"
+                    },
+                    "http_port": {
+                      "type": "string",
+                      "value": "$ROLE_HTTP"
+                    }
+                  }
+                },
+                "standalone_server": {
+                  "type": "table",
+                  "value": {
+                    "user": {
+                      "type": "string",
+                      "value": "root"
+                    }
+                  }
+                }
+              }
+            },
+            "role": "be"
+          }
+        ]
+      }
+    },
+    "failure_summaries": {
+      "client_join": null,
+      "owner_cleanup": null,
+      "primary": {
+        "bytes": 54,
+        "class": "scene-contract",
+        "format_failed": false,
+        "length_overflow": false,
+        "sha256": "a6b155906cc82de648ebf59e8c1411afa94840af348fe1499e9dd86ff15fde93"
+      }
+    },
+    "freeze": {
+      "capture_millis": 5000,
+      "contract_reason": "unsupported root-result profile",
+      "expected_native_body_sha256": "3796c6fb19ce8ad0d4c3ad37cef1abf50dfdecd525aa796acfa1a2ca8bda6164",
+      "expected_row_sha256": "21a177fd757b7adf5f9c208c4a449ae1d498f365e6aeb5d51a46f1a26474dacd",
+      "forward_millis": 20000,
+      "health_row_sha256": "6dab454b19ecc06d337eb421a7ecc69aaa272a74fdf3a6bf7b81900ca94758b1",
+      "maximum_target_attempts": 32,
+      "metadata_oracle": "complete-same-SQL-successful-native-baseline-plus-fixed-encoder-fields",
+      "mutation": "ProfileTwo",
+      "mysql_error_code": 1105,
+      "mysql_packet_cap": 4096,
+      "mysql_sqlstate": "HY000",
+      "root_meta_proof": "known-semantic-profile-purpose-schema-not-exact-protobuf-bytes",
+      "scenario": "result-delivery/native-root-reply-profile-refusal",
+      "schema_version": 1,
+      "sql": "SELECT REPEAT('x',64) AS payload",
+      "status": "draft-unexecuted",
+      "topology": "1FE+3BE"
+    },
+    "metadata_baseline": {
+      "columns": 1,
+      "elapsed_micros": 36858,
+      "error": null,
+      "first_payload_chunk_micros": 34229,
+      "first_row_micros": 34232,
+      "metadata_sha256": "7cf75cd0ad9991c92a570a0ed320ce61be599c5c6c03237501e60dbe86c6f45c",
+      "packets": 5,
+      "row_payload_bytes": 65,
+      "row_sha256": "21a177fd757b7adf5f9c208c4a449ae1d498f365e6aeb5d51a46f1a26474dacd",
+      "rows": 1,
+      "schema": [
+        {
+          "mysql_type": 253,
+          "name": "payload"
+        }
+      ],
+      "wire_bytes": 125,
+      "wire_prefix_sha256": "4f5a4c65b22b57079a59bb1c392ac50ce2d2efa854ba02eea92cf450a76ccf1a"
+    },
+    "outcome": {
+      "actor_join_ok": false,
+      "client_join_ok": true,
+      "cluster_shutdown_ok": false,
+      "contract_and_recovery_ok": false,
+      "failure_owner_cleanup_ok": true
+    },
+    "root_zero_before-baseline": [
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ],
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    ],
+    "root_zero_before-capture": [
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ],
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    ],
+    "root_zero_failure-cleanup": [
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ],
+      [
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        },
+        {
+          "channels": 0,
+          "data_positions": 0,
+          "deliveries": 0,
+          "ends_acknowledged": 0,
+          "ends_published": 0,
+          "metadata_bytes": 0,
+          "metadata_holders": 0,
+          "payload_bytes": 0,
+          "producers_exited": 0,
+          "producers_running": 0,
+          "retained_reservations": 0,
+          "sealed": 0,
+          "segments": 0,
+          "terminal_task_records": 0
+        }
+      ]
+    ],
+    "scenario": "result-delivery/native-root-reply-profile-refusal",
+    "schema_version": 1
+  },
+  "process_exit": [
+    {
+      "role": "fe",
+      "pid": 65087,
+      "process_start_token": "macos:1791516662:514089",
+      "pid_absent": true
+    },
+    {
+      "role": "be-0",
+      "pid": 65088,
+      "process_start_token": "macos:1791516665:341299",
+      "pid_absent": true
+    },
+    {
+      "role": "be-1",
+      "pid": 65089,
+      "process_start_token": "macos:1791516665:402659",
+      "pid_absent": true
+    },
+    {
+      "role": "be-2",
+      "pid": 65090,
+      "process_start_token": "macos:1791516665:465591",
+      "pid_absent": true
+    }
+  ],
+  "limitations": [
+    "No malformed reply was captured or emitted; no actual FE refusal claim",
+    "Normal baseline succeeded but connection reset/broken pipe blocked begin_capture",
+    "Actor owners actually joined and exact four role PIDs are absent; whole actor join verdict remains failed",
+    "Failed runtime role logs were retained before explicit shutdown; read-byte and H2 accept evidence alone does not prove no RPC framing"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/driver-status.json",
+      "sha256": "f4d43c003b1761f8df004aba1c282c6da927b89f06cc9c184b70f07ac2bc996f",
+      "bytes": 917
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/driver.log",
+      "sha256": "b77039c67702dce3b83364c8d2a6a1af55a479022ac851af24539dceaf2d53b0",
+      "bytes": 6131
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/native-root-reply-observations.json",
+      "sha256": "e3911355585137f8e03140996bd3817807d734ceeaf9e5752604e8e1a964a12d",
+      "bytes": 31694
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/owner-barrier-root-reply-before-baseline.json",
+      "sha256": "16674c241e59dea6f6e394fc40f8d1f0ca2c3eb7d3dd32b0de41e37e04d3ad0d",
+      "bytes": 7396
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/owner-barrier-root-reply-before-capture.json",
+      "sha256": "151da1d6c7e491bb8070ecdf1f792c5459119b97dd298c7c66b929cc2c8e800e",
+      "bytes": 11036
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/owner-barrier-root-reply-failure-cleanup.json",
+      "sha256": "32faf22d120ef753b9e2bc56a9e31f3784c791aa3bec786eac8e8b0496e71108",
+      "bytes": 7397
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/be_0.log",
+      "sha256": "a74e131694cffca2997ca37187d713e28e1139d6dee5cb759d024c39080346cb",
+      "bytes": 99
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/be_0.toml",
+      "sha256": "50b0d8d8025d480cda1a23c8214c26596d8f85e000fea4420a4a7b32a5f9da78",
+      "bytes": 613
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/be_1.log",
+      "sha256": "2f559b862fbfc9538699b7215af7d4d6975f794b75e5776c0714007ba4b8ba66",
+      "bytes": 1363
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/be_1.toml",
+      "sha256": "cb5ea1119b1957c0b81e9463debb31617f8632cffa8415bfa035d0f8f8e971a5",
+      "bytes": 613
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/be_2.log",
+      "sha256": "97aff0f0a7ee70c229b34e84a8ee058c9c890e1fdafbd1768a756ca219954d3d",
+      "bytes": 99
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/be_2.toml",
+      "sha256": "caf38d823e0134172efbb11d907c0a5970a1e733c29b83a93ab49a7f7906bba9",
+      "bytes": 613
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/fe.log",
+      "sha256": "273537e19f5cedee202ea3503a37f3d93d9e4c02a7f447238e59c6cc8293947a",
+      "bytes": 120
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/fe.toml",
+      "sha256": "41aee996d30a9bfeea3d95e8ae60098c38314fb94e59a0ded2f3ec986f9c95ab",
+      "bytes": 1210
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/frontend-state.sqlite",
+      "sha256": "342b8945f6bd15b78d2b902d79d55b55dc82e9fef91882903840e95340bde932",
+      "bytes": 32768
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/runtime/65085_1791516662505177000/frontend-state.sqlite.owner.lock",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p09-native-root-reply-native-v2-20261009/result-delivery-native-root-reply-profile-refusal/scenario-evidence.json",
+      "sha256": "22aeae0335ad34ae6140e85c5360fa5de1a2171ecf5b8b6c10c8a1b75b32f0b1",
+      "bytes": 23470
+    }
+  ]
+}

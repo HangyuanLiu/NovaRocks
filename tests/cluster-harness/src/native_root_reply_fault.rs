@@ -724,11 +724,81 @@ async fn capture_expiry(core: Arc<Core>) {
     }
 }
 
-// A fixed-size counter observes the actual downstream bytes consumed by H2.
-// It stores no payload and remains under the existing connection position.
+// Only public connection framing is observed. No header block, JWT or body
+// payload is retained. The fixed parser stays under its connection position.
+#[derive(Debug, Default)]
+struct IngressFrames {
+    read_bytes: u64,
+    preface_bytes: usize,
+    preface_valid: bool,
+    header: [u8; 9],
+    header_bytes: usize,
+    payload_remaining: usize,
+    frames: u64,
+    settings: u64,
+    window_updates: u64,
+    pings: u64,
+    goaways: u64,
+    application_or_unknown_frame: bool,
+}
+impl IngressFrames {
+    fn new() -> Self {
+        Self {
+            preface_valid: true,
+            ..Self::default()
+        }
+    }
+    fn observe(&mut self, mut bytes: &[u8]) {
+        const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        self.read_bytes = self.read_bytes.saturating_add(bytes.len() as u64);
+        if self.preface_bytes < PREFACE.len() {
+            let take = bytes.len().min(PREFACE.len() - self.preface_bytes);
+            self.preface_valid &=
+                bytes[..take] == PREFACE[self.preface_bytes..self.preface_bytes + take];
+            self.preface_bytes += take;
+            bytes = &bytes[take..];
+        }
+        while !bytes.is_empty() {
+            if self.payload_remaining != 0 {
+                let take = bytes.len().min(self.payload_remaining);
+                self.payload_remaining -= take;
+                bytes = &bytes[take..];
+                continue;
+            }
+            let take = bytes.len().min(9 - self.header_bytes);
+            self.header[self.header_bytes..self.header_bytes + take]
+                .copy_from_slice(&bytes[..take]);
+            self.header_bytes += take;
+            bytes = &bytes[take..];
+            if self.header_bytes != 9 {
+                continue;
+            }
+            let length = ((self.header[0] as usize) << 16)
+                | ((self.header[1] as usize) << 8)
+                | self.header[2] as usize;
+            let stream =
+                u32::from_be_bytes(self.header[5..9].try_into().expect("fixed frame header"))
+                    & 0x7fff_ffff;
+            self.frames = self.frames.saturating_add(1);
+            if stream != 0 || length > FRAME_BYTES {
+                self.application_or_unknown_frame = true;
+            }
+            match self.header[3] {
+                4 => self.settings = self.settings.saturating_add(1),
+                8 => self.window_updates = self.window_updates.saturating_add(1),
+                6 => self.pings = self.pings.saturating_add(1),
+                7 => self.goaways = self.goaways.saturating_add(1),
+                _ => self.application_or_unknown_frame = true,
+            }
+            self.payload_remaining = length;
+            self.header_bytes = 0;
+            self.header = [0; 9];
+        }
+    }
+}
 struct ObservedIngress {
     stream: tokio::net::TcpStream,
-    read_bytes: Arc<AtomicU64>,
+    frames: Arc<Mutex<IngressFrames>>,
 }
 impl tokio::io::AsyncRead for ObservedIngress {
     fn poll_read(
@@ -739,13 +809,11 @@ impl tokio::io::AsyncRead for ObservedIngress {
         let this = self.get_mut();
         let before = buf.filled().len();
         let result = std::pin::Pin::new(&mut this.stream).poll_read(cx, buf);
-        let received = buf.filled().len().saturating_sub(before) as u64;
-        if received != 0 {
-            let _ = this
-                .read_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                    Some(value.saturating_add(received))
-                });
+        if buf.filled().len() != before {
+            this.frames
+                .lock()
+                .expect("root ingress facts lock")
+                .observe(&buf.filled()[before..]);
         }
         result
     }
@@ -789,10 +857,10 @@ async fn serve_connection(
     }
     let handshake_deadline =
         tokio::time::Instant::now() + Duration::from_millis(core.bounds.handshake_timeout_millis);
-    let downstream_read_bytes = Arc::new(AtomicU64::new(0));
+    let downstream_frames = Arc::new(Mutex::new(IngressFrames::new()));
     let observed_stream = ObservedIngress {
         stream,
-        read_bytes: downstream_read_bytes.clone(),
+        frames: downstream_frames.clone(),
     };
     let connect = async {
         let mut server_builder = server::Builder::new();
@@ -811,8 +879,8 @@ async fn serve_connection(
             .await
             .with_context(|| {
                 format!(
-                    "root downstream H2 handshake (read_bytes={})",
-                    downstream_read_bytes.load(Ordering::Acquire)
+                    "root downstream H2 handshake (frames={:?})",
+                    downstream_frames.lock().expect("root ingress facts lock")
                 )
             })?;
         let socket = tokio::net::TcpStream::connect(upstream)
@@ -848,6 +916,7 @@ async fn serve_connection(
         driver.await.context("root upstream H2 driver")?;
         Ok::<_, anyhow::Error>(ChildExit::Upstream)
     });
+    let mut accepted_rpcs = 0u64;
     let outcome = async {
         loop {
             tokio::select! {
@@ -864,9 +933,15 @@ async fn serve_connection(
                 }
                 accepted = downstream.accept() => {
                     let Some((request,mut response)) = accepted.transpose()
-                        .with_context(|| format!("root downstream H2 accept (read_bytes={}, children={})",
-                            downstream_read_bytes.load(Ordering::Acquire), children.len()))?
+                        .map_err(|error| {
+                            let context = format!("root downstream H2 accept (accepted_rpcs={}, children={}, frames={:?}, io={}, io_kind={:?}, raw_os_error={:?}, reset={}, remote={}, reason={:?})",
+                                accepted_rpcs, children.len(), downstream_frames.lock().expect("root ingress facts lock"),
+                                error.is_io(), error.get_io().map(std::io::Error::kind), error.get_io().and_then(std::io::Error::raw_os_error),
+                                error.is_reset(), error.is_remote(), error.reason());
+                            anyhow::Error::new(error).context(context)
+                        })?
                         else {break Ok(())};
+                    accepted_rpcs = accepted_rpcs.saturating_add(1);
                     let Ok(position) = core.stream_positions.clone().try_acquire_owned() else {
                         response.send_reset(h2::Reason::REFUSED_STREAM);
                         core.failure("root actor stream positions exhausted"); continue;
@@ -1121,14 +1196,18 @@ async fn forward_stream(
                     upstream_send.send_data(Bytes::new(), true)?;
                     Ok::<_, anyhow::Error>(())
                 } else {
-                    copy_body(inbound, upstream_send, core.clone()).await
+                    copy_body(inbound, upstream_send, core.clone())
+                        .await
+                        .context("root upstream request copy")
                 }
             };
             tokio::try_join!(request_forward, async {
                 let upstream_response = upstream_response.await?;
                 let (parts, body) = upstream_response.into_parts();
                 let output = response.send_response(Response::from_parts(parts, ()), false)?;
-                copy_body(body, output, core.clone()).await
+                copy_body(body, output, core.clone())
+                    .await
+                    .context("root downstream response copy")
             })?;
             Ok(())
         }
@@ -1526,6 +1605,40 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use std::num::NonZeroU64;
+
+    #[test]
+    fn ingress_diagnostics_keep_public_frame_facts_across_every_chunk_cut() {
+        let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        wire.extend_from_slice(&[0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 128]);
+        wire.extend_from_slice(&[0, 0, 4, 8, 0, 0, 0, 0, 0, 0, 1, 0, 0]);
+        for cut in 0..=wire.len() {
+            let mut facts = IngressFrames::new();
+            facts.observe(&wire[..cut]);
+            facts.observe(&wire[cut..]);
+            assert!(facts.preface_valid);
+            assert_eq!(
+                (
+                    facts.preface_bytes,
+                    facts.header_bytes,
+                    facts.payload_remaining
+                ),
+                (24, 0, 0)
+            );
+            assert_eq!(
+                (facts.frames, facts.settings, facts.window_updates),
+                (2, 1, 1)
+            );
+            assert!(!facts.application_or_unknown_frame);
+            facts.observe(&[0, 0, 0, 1, 4, 0, 0, 0, 1]);
+            assert!(facts.application_or_unknown_frame);
+        }
+        let mut partial = IngressFrames::new();
+        partial.observe(&wire[..wire.len() - 1]);
+        assert_eq!(partial.payload_remaining, 1);
+        let mut bad = IngressFrames::new();
+        bad.observe(&[b'x'; 24]);
+        assert!(!bad.preface_valid);
+    }
 
     fn core() -> Arc<Core> {
         let bounds = RootReplyFaultBounds::default();
