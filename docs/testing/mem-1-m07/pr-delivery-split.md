@@ -29,6 +29,14 @@ Native lane 前置准入、外部列表边界及已经提交的测试和证据�
 原始日志保存在 Git 外；证据文件中的 hash / local path 是溯源信息，不能当作远端可下载产物。
 最终同 SHA 的 workspace / SQL / system 全量报告留给收尾，不把历史全量运行写为本批次通过。
 
+本批次合入 main 后的 [本地整合检查](evidence/pr1-main-integration-checks-20261009.json)
+绑定 `95da8886c` 的实现：Rust 1.92 workspace 全目标编译通过；统计 21 / 维护 39、
+MySQL 默认 16 / 精确 feature 20、Native 终止仲裁 8 / Worker 2 项通过，
+另有 fixture 16 / 验证器 17 项 Python 测试及依赖边界检查通过。
+MySQL 默认与 feature 测试有重叠，不能相加作为独立覆盖。
+仓库保留 main 的 Rust 1.98.1 与 Arrow 58.4；该锁定工具链的验证仍待完成，
+1.92 的整合检查不能代替它，也不构成最终全量或本版本 Native 验收。
+
 ## 第二个 PR：继续实现、测试与收尾
 
 从第一个 PR 的已发布 HEAD 创建独立分支；第一个 PR 发布后不再混入新的测试开发。
