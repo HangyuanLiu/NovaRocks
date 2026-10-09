@@ -1849,3 +1849,6 @@ mod pure_differential_percentile_approx_raw_tests;
 #[cfg(test)]
 #[path = "pure_differential_bitmap_agg_tests.rs"]
 mod bitmap_agg_tests;
+
+#[path = "pure_differential_array_struct_subfield_tests.rs"]
+mod array_struct_subfield_tests;

@@ -1570,6 +1570,11 @@ mod join_probe_filter_actual_sql_tests;
 mod bitmap_agg_actual_sql_source_tests;
 
 #[cfg(test)]
+mod legacy_struct_subfield_baseline_tests;
+#[cfg(test)]
+mod array_struct_subfield_actual_sql_source_tests;
+
+#[cfg(test)]
 mod original_float_arithmetic_baseline_tests;
 #[cfg(test)]
 mod float_arithmetic_required_oracle_tests;
