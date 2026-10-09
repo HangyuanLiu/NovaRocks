@@ -18,13 +18,13 @@
 
 mod contract_lowering;
 mod lowered_draft;
-pub(crate) use lowered_draft::{
-    AggregateRuntimeDemand, CheckedAggregateLogicalSourceEntry, LoweredSqlPhysicalDraft,
+pub use lowered_draft::{
+    AggregateRuntimeDemand, CheckedSqlResultDeclaration, ResultDeclarationError,
+    SqlAuthoredPhysicalPlan, SqlCallDependencyLoan, SqlCallDependencyProvenance,
+    SqlCallDependencySite, SqlCanonicalDependencyLoan, SqlExpressionCallKind,
     SqlSourceJournalError,
 };
-pub use lowered_draft::{
-    CheckedSqlResultDeclaration, ResultDeclarationError, SqlAuthoredPhysicalPlan,
-};
+pub(crate) use lowered_draft::{CheckedAggregateLogicalSourceEntry, LoweredSqlPhysicalDraft};
 mod expression_occurrences;
 mod package_semantics;
 mod physical_aggregate_occurrences;

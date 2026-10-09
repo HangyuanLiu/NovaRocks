@@ -30,8 +30,13 @@ use novarocks_type_contract::{
 
 use crate::binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArguments};
 
+mod dependency_loan;
 mod result_declaration;
 use crate::compiler::SqlPhysicalEmissionMode;
+pub use dependency_loan::{
+    SqlCallDependencyLoan, SqlCallDependencyProvenance, SqlCallDependencySite,
+    SqlCanonicalDependencyLoan,
+};
 use result_declaration::PublishedSqlResultDeclaration;
 pub use result_declaration::{
     CheckedSqlResultDeclaration, ResultDeclarationError, SqlResultDeclaration,
@@ -776,7 +781,7 @@ pub(super) fn validate_table_source_entry_observed(
 }
 
 #[derive(Debug)]
-pub(crate) enum SqlSourceJournalError {
+pub enum SqlSourceJournalError {
     Control(CompileControlError),
     MissingEntry,
     MissingLogicalSource,
@@ -841,7 +846,7 @@ pub(super) enum AggregateSourceTarget {
     Writer(ValueId),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AggregateRuntimeDemand {
+pub enum AggregateRuntimeDemand {
     Update,
     ExpressionState(ExprId),
     WriterState(ValueId),
@@ -926,7 +931,7 @@ impl CanonicalCallOperationalRequest {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SqlExpressionCallKind {
+pub enum SqlExpressionCallKind {
     Scalar,
     Window,
     ValueConversion,
@@ -1011,6 +1016,25 @@ impl LoweredSqlPhysicalDraft {
     pub(crate) fn add_annotation(&mut self, annotation: PlanAnnotation) {
         self.builder.add_annotation(annotation);
     }
+    /// Run the sole publication once, then loan its complete admitted source.
+    /// An absent observer preserves the original meter and publication exactly.
+    pub(crate) fn finish_with_dependency_observer_observed(
+        self,
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<SqlAuthoredPhysicalPlan, PlanConstructionError> {
+        let source = self.finish_observed(control)?;
+        if let Some(observer) = control.fold_dependency_observer() {
+            observer
+                .observe_published_source_observed(&source, control)
+                .map_err(|cause| {
+                    PlanConstructionError::Constants(
+                        novarocks_physical_plan::ConstantReferenceError::Control(cause),
+                    )
+                })?;
+        }
+        Ok(source)
+    }
+
     pub(crate) fn finish_observed(
         self,
         control: &dyn PureCompileControl,

@@ -36,7 +36,10 @@ pub use crate::functions::{
 pub use crate::optimizer::options::SessionOptimizerSettings;
 mod emission_mode;
 pub use crate::planner::distributed::build::{
-    CheckedSqlResultDeclaration, ResultDeclarationError, SqlAuthoredPhysicalPlan,
+    AggregateRuntimeDemand, CheckedSqlResultDeclaration, ResultDeclarationError,
+    SqlAuthoredPhysicalPlan, SqlCallDependencyLoan, SqlCallDependencyProvenance,
+    SqlCallDependencySite, SqlCanonicalDependencyLoan, SqlExpressionCallKind,
+    SqlSourceJournalError,
 };
 pub use crate::planner::distributed::build::{
     FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,

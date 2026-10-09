@@ -2346,7 +2346,7 @@ fn complete(
     control: &super::SqlCompileControl,
 ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
     let source = draft
-        .finish_observed(control)
+        .finish_with_dependency_observer_observed(control)
         .map_err(completion_plan_construction_error)?;
     complete_source(
         version,

@@ -62,6 +62,18 @@ pub trait SqlFoldDependencyObserver: Send + Sync {
         input: SqlFoldDependencyInput<'_>,
         outcome: SqlFoldEvaluationOutcome<'_>,
     );
+
+    /// Borrow the complete source only after its original publication succeeds.
+    /// This loans no kernel coverage, resource grant, or statement-success proof.
+    /// The host admits its receipt work; only original compile control may refuse.
+    /// Existing observers add no work or checkpoints by default.
+    fn observe_published_source_observed(
+        &self,
+        _source: &super::SqlAuthoredPhysicalPlan,
+        _control: &dyn PureCompileControl,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
 }
 
 /// Short-lived calculator/observer loan. Neither enters IR or published plans.

@@ -346,3 +346,6 @@ fn numeric_unary_writer_dml_actual_narrow_statistics_preserve_exact_selected_con
         }
     }
 }
+
+#[path = "sql_call_dependency_writer_loan_tests.rs"]
+mod sql_call_dependency_writer_loan_tests;

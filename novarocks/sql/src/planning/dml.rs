@@ -774,7 +774,7 @@ impl DmlWriteCompletion {
         .map_err(final_lowering_error)?;
         self.query_statistics.annotate_final_plan(&mut draft);
         draft
-            .finish_observed(control)
+            .finish_with_dependency_observer_observed(control)
             .map_err(final_plan_construction_error)
     }
 }
@@ -865,7 +865,7 @@ fn complete_connector_write_plan(
     .map_err(final_lowering_error)?;
     query_statistics.annotate_final_plan(&mut draft);
     draft
-        .finish_observed(control)
+        .finish_with_dependency_observer_observed(control)
         .map_err(final_plan_construction_error)
 }
 
@@ -953,7 +953,7 @@ impl DmlReadCompletion {
         .map_err(final_lowering_error)?;
         self.query_statistics.annotate_final_plan(&mut draft);
         draft
-            .finish_observed(control)
+            .finish_with_dependency_observer_observed(control)
             .map_err(final_plan_construction_error)
     }
 }
@@ -1261,7 +1261,7 @@ impl DmlChangeStreamCompletion {
         .map_err(final_lowering_error)?;
         self.query_statistics.annotate_final_plan(&mut draft);
         let physical_plan = draft
-            .finish_observed(control)
+            .finish_with_dependency_observer_observed(control)
             .map_err(final_plan_construction_error)?;
         let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
         Ok(DmlFinalChangeStreamPlan {
@@ -1631,7 +1631,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     .map_err(final_lowering_error)?;
     query_statistics.annotate_final_plan(&mut draft);
     let physical_plan = draft
-        .finish_observed(control)
+        .finish_with_dependency_observer_observed(control)
         .map_err(final_plan_construction_error)?;
     let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
     Ok(DmlFinalChangeStreamPlan {
@@ -2412,7 +2412,7 @@ pub fn build_final_statistics_connector_plan(
     )
     .map_err(final_lowering_error)?;
     draft
-        .finish_observed(control)
+        .finish_with_dependency_observer_observed(control)
         .map_err(final_plan_construction_error)
 }
 

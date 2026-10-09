@@ -658,3 +658,6 @@ fn sql_fold_dependency_original_unconstrained_binding_is_not_selected_result_con
     );
     assert!(matches!(receipt.outcome, Some(Outcome::Produced(_))));
 }
+
+#[path = "sql_call_dependency_loan_tests.rs"]
+mod sql_call_dependency_loan_tests;

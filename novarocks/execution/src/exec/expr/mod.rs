@@ -1403,3 +1403,6 @@ mod map_entries_copy_edge_tests;
 
 #[cfg(test)]
 mod sql_fold_dependency_observation_tests;
+
+#[cfg(test)]
+mod sql_published_source_observation_tests;
