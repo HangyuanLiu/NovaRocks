@@ -612,9 +612,9 @@ fn build_node(
             build_union_all(program, id, node_id, inputs, ctx, error)
         }
         ProgramNodeKind::Aggregate { input, .. } => {
-            // A Complete aggregate owns each of its groups exactly once, so
-            // its instance input is gathered to one driver first. A Partial
-            // aggregate merges per driver; its later phase completes it.
+            // Preserve the original driver-local Partial -> exchange -> Final
+            // chronology. Grouped states hash actual emitted key slots; a
+            // group-less state uses the original Single exchange.
             let factory = CompiledAggregateProcessorFactory::try_new(
                 Arc::clone(program),
                 id,
@@ -623,23 +623,30 @@ fn build_node(
             let complete = factory.completes_groups();
             let mut build = build_node(program, *input, ctx, error)?;
             if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
+                let partition_slots = factory.local_group_partition_slots();
                 let (partial, final_stage) = factory.into_local_update_stages()?;
-                // Preserve the original per-driver update, serialized state,
-                // local Single exchange, then one merge/final owner.
                 build.pipeline.factories.push(Box::new(partial));
-                build = gather_to_one(build, ctx, node_id);
+                build = if partition_slots.is_empty() {
+                    gather_to_one(build, ctx, node_id)
+                } else {
+                    let partitions = build.pipeline.dop as usize;
+                    shuffle_compiled_group_input_slots(
+                        build,
+                        ctx,
+                        node_id,
+                        partition_slots,
+                        partitions,
+                    )
+                };
                 build.pipeline.factories.push(Box::new(final_stage));
             } else {
                 if complete {
                     build = gather_to_one(build, ctx, node_id);
+                } else {
+                    build.stream = StreamDesc::any(build.pipeline.dop);
                 }
                 build.pipeline.factories.push(Box::new(factory));
             }
-            build.stream = if complete {
-                StreamDesc::single()
-            } else {
-                StreamDesc::any(build.pipeline.dop)
-            };
             Ok(build)
         }
         ProgramNodeKind::Analytic { input, .. } => {

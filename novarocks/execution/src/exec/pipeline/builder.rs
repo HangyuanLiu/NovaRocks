@@ -548,11 +548,56 @@ fn shuffle_by_hash(
 }
 
 fn shuffle_by_hash_on_input_slots(
-    mut build: PipelineBuildResult,
+    build: PipelineBuildResult,
     ctx: &mut PipelineBuildContext,
     owner_node_id: i32,
     partition_slot_ids: Vec<novarocks_types::SlotId>,
     distribution_keys: Vec<crate::exec::expr::ExprId>,
+    partition_count: usize,
+) -> PipelineBuildResult {
+    shuffle_input_slots_with_distribution(
+        build,
+        ctx,
+        owner_node_id,
+        partition_slot_ids,
+        Distribution::Hash {
+            keys: distribution_keys,
+            partitions: partition_count.max(1),
+            hash_version: 0,
+        },
+        partition_count,
+    )
+}
+
+// The same original exchange body reads exact slots, without expression lookup.
+fn shuffle_compiled_group_input_slots(
+    build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    owner_node_id: i32,
+    slots: Vec<novarocks_types::SlotId>,
+    partition_count: usize,
+) -> PipelineBuildResult {
+    let distribution = Distribution::HashInputSlots {
+        slots: slots.clone(),
+        partitions: partition_count.max(1),
+        hash_version: 0,
+    };
+    shuffle_input_slots_with_distribution(
+        build,
+        ctx,
+        owner_node_id,
+        slots,
+        distribution,
+        partition_count,
+    )
+}
+
+fn shuffle_input_slots_with_distribution(
+    mut build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    owner_node_id: i32,
+    partition_slot_ids: Vec<novarocks_types::SlotId>,
+    distribution: Distribution,
     partition_count: usize,
 ) -> PipelineBuildResult {
     let partition_count = partition_count.max(1);
@@ -594,11 +639,7 @@ fn shuffle_by_hash_on_input_slots(
         extra_pipelines,
         stream: StreamDesc {
             dop: partition_count as i32,
-            distribution: Distribution::Hash {
-                keys: distribution_keys,
-                partitions: partition_count,
-                hash_version: 0,
-            },
+            distribution,
         },
     }
 }

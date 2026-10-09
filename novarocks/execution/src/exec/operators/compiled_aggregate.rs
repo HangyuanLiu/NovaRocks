@@ -306,8 +306,7 @@ impl CompiledAggregateProcessorFactory {
     /// Exactly the original local two-stage condition except for upstream
     /// DOP, which the pipeline builder observes after building the input.
     pub(crate) fn requires_local_update_stages(&self) -> bool {
-        self.groups == 0
-            && self.completes_groups()
+        self.completes_groups()
             && self.calls.iter().all(|call| {
                 call.contract.phase() == novarocks_functions::AggregateKernelPhase::Single
             })
@@ -322,7 +321,14 @@ impl CompiledAggregateProcessorFactory {
         }
         let mut partial_calls = Vec::with_capacity(self.calls.len());
         let mut final_calls = Vec::with_capacity(self.calls.len());
-        let mut fields = Vec::with_capacity(self.calls.len());
+        let mut fields = self
+            .output
+            .arrow_schema_ref()
+            .fields()
+            .iter()
+            .take(self.groups)
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
         for (ordinal, original) in self.calls.iter().enumerate() {
             let stages = original.handle.local_stages().ok_or_else(|| {
                 format!("compiled aggregate call {ordinal} has no prepared local lifecycle")
@@ -345,14 +351,14 @@ impl CompiledAggregateProcessorFactory {
                 contract: Arc::clone(handle.contract()),
                 handle,
                 merge: true,
-                first_root: ordinal,
+                first_root: self.groups + ordinal,
                 roots: 1,
             });
             fields.push(
                 original
                     .contract
                     .intermediate_type()
-                    .try_to_field(self.output.slots()[ordinal].name())
+                    .try_to_field(self.output.slots()[self.groups + ordinal].name())
                     .map_err(|error| error.to_string())?,
             );
         }
@@ -366,9 +372,9 @@ impl CompiledAggregateProcessorFactory {
             name: format!("{} LOCAL_PARTIAL", self.name),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
-            groups: 0,
+            groups: self.groups,
             calls: partial_calls,
-            key_types: Vec::new(),
+            key_types: self.key_types.clone(),
             output: intermediate,
             grouping: CompiledAggregateGrouping::Partial,
             direct_input: None,
@@ -378,15 +384,19 @@ impl CompiledAggregateProcessorFactory {
             name: format!("{} LOCAL_FINAL", self.name),
             program: self.program,
             sites: Vec::new(),
-            groups: 0,
+            groups: self.groups,
             calls: final_calls,
-            key_types: Vec::new(),
+            key_types: self.key_types,
             output: self.output,
             grouping: CompiledAggregateGrouping::Complete,
             direct_input: Some(Arc::clone(&partial.output)),
             error: self.error,
         };
         Ok((partial, final_stage))
+    }
+    /// The actual output key slots also prefix the prepared partial schema.
+    pub(crate) fn local_group_partition_slots(&self) -> Vec<novarocks_types::SlotId> {
+        self.output.slot_ids()[..self.groups].to_vec()
     }
     /// Whether every group of this aggregate must be owned by one driver.
     pub(crate) fn completes_groups(&self) -> bool {

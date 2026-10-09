@@ -619,8 +619,8 @@ fn prepare_call(
         work.control(),
     )?;
     work.flush()?;
-    if matches!(&node.kind, NodeKind::Aggregate { group_by, calls, .. }
-        if group_by.is_empty() && !calls.is_empty()
+    if matches!(&node.kind, NodeKind::Aggregate { calls, .. }
+        if !calls.is_empty()
             && calls.iter().all(|call| call.binding.phase == AggregatePhase::Single))
     {
         token

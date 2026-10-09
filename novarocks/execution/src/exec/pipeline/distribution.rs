@@ -39,6 +39,12 @@ pub enum Distribution {
         partitions: usize,
         hash_version: u32,
     },
+    /// Compiled local stages route already emitted keys by actual output slots.
+    HashInputSlots {
+        slots: Vec<novarocks_types::SlotId>,
+        partitions: usize,
+        hash_version: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

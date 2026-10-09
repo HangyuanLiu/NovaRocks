@@ -349,3 +349,7 @@ fn legacy_ds_hll_baseline_float_bits_are_not_ndv_canonicalization() {
 #[cfg(test)]
 #[path = "ds_hll_local_phase_before_tests.rs"]
 mod ds_hll_local_phase_before_tests;
+
+#[cfg(test)]
+#[path = "ds_hll_grouped_original_before_tests.rs"]
+mod ds_hll_grouped_original_before_tests;
