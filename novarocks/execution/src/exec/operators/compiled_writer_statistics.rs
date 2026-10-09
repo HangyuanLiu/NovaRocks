@@ -343,7 +343,8 @@ impl CompiledWriterPartialProcessor {
                 &[],
                 &self.control,
             )?;
-            let mut frame = column.prepare_update_batch(&mapping, input, &self.control)?;
+            let mut frame =
+                column.prepare_update_batch_evaluation(&mapping, input, &self.control)?;
             frame.run(&self.control)?;
         }
         Ok(())
@@ -356,7 +357,7 @@ impl CompiledWriterPartialProcessor {
         let states = self.states.as_ref().expect("states were created");
         let mut columns = Vec::with_capacity(states.len());
         for column in states {
-            columns.push(column.emit(&[0], 1, &self.control)?);
+            columns.push(column.emit_evaluation(&[0], 1, &self.control)?);
         }
         let batch =
             RecordBatch::try_new(self.output.arrow_schema_ref(), columns).map_err(|error| {
@@ -923,7 +924,7 @@ impl CompiledWriterFinalAggregate {
                 EvaluatedArgument::Column(&values),
                 &self.control,
             )?;
-            let mut frame = column.prepare_merge_batch(&groups, input, &self.control)?;
+            let mut frame = column.prepare_merge_batch_evaluation(&groups, input, &self.control)?;
             frame.run(&self.control)?;
         }
         Ok(())
@@ -950,7 +951,7 @@ impl CompiledWriterFinalAggregate {
         }
         let mut columns = vec![Arc::new(Int32Array::from(targets)) as ArrayRef];
         for column in states {
-            columns.push(column.emit(&indices, count, &self.control)?);
+            columns.push(column.emit_evaluation(&indices, count, &self.control)?);
         }
         let batch =
             RecordBatch::try_new(self.output.arrow_schema_ref(), columns).map_err(|error| {

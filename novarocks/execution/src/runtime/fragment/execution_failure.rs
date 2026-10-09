@@ -81,6 +81,7 @@ pub enum ExecutionFailureCause {
     /// infer a resource, deadline, transport or invariant category from text.
     Pipeline(String),
     Kernel(KernelFailure),
+    InvocationData(novarocks_functions::InvocationData),
     RequiredRow(RequiredExpressionRowError),
 }
 
@@ -116,6 +117,7 @@ impl ExecutionFailure {
         match &self.cause {
             ExecutionFailureCause::Pipeline(message) => message,
             ExecutionFailureCause::RequiredRow(error) => error.error().message(),
+            ExecutionFailureCause::InvocationData(error) => error.message(),
             ExecutionFailureCause::Kernel(error) => match error {
                 KernelFailure::Cancelled => "kernel evaluation was cancelled",
                 KernelFailure::DeadlineExceeded => "kernel evaluation deadline was exceeded",
@@ -162,6 +164,17 @@ impl From<KernelFailure> for ExecutionFailure {
         }
     }
 }
+impl From<novarocks_functions::EvaluationFailure> for ExecutionFailure {
+    fn from(error: novarocks_functions::EvaluationFailure) -> Self {
+        match error {
+            novarocks_functions::EvaluationFailure::Kernel(cause) => cause.into(),
+            novarocks_functions::EvaluationFailure::InvocationData(cause) => Self {
+                cause: ExecutionFailureCause::InvocationData(cause),
+                context: None,
+            },
+        }
+    }
+}
 impl From<RequiredExpressionRowError> for ExecutionFailure {
     fn from(error: RequiredExpressionRowError) -> Self {
         Self {
@@ -183,6 +196,7 @@ impl fmt::Display for ExecutionFailure {
             ExecutionFailureCause::Pipeline(message) => f.write_str(message),
             ExecutionFailureCause::Kernel(error) => error.fmt(f),
             ExecutionFailureCause::RequiredRow(error) => error.fmt(f),
+            ExecutionFailureCause::InvocationData(error) => error.fmt(f),
         }
     }
 }
@@ -192,6 +206,7 @@ impl Error for ExecutionFailure {
             ExecutionFailureCause::Pipeline(_) => None,
             ExecutionFailureCause::Kernel(error) => Some(error),
             ExecutionFailureCause::RequiredRow(error) => Some(error),
+            ExecutionFailureCause::InvocationData(error) => Some(error),
         }
     }
 }

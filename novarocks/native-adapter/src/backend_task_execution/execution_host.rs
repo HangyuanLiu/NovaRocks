@@ -1901,7 +1901,8 @@ fn failure_cause_category(
             | KernelFailure::DeadlineExceeded
             | KernelFailure::Operational(_),
         )
-        | ExecutionFailureCause::RequiredRow(_) => TaskFailureCategory::Execution,
+        | ExecutionFailureCause::RequiredRow(_)
+        | ExecutionFailureCause::InvocationData(_) => TaskFailureCategory::Execution,
         ExecutionFailureCause::Pipeline(_) => opaque_category,
     }
 }

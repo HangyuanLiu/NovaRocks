@@ -67,6 +67,8 @@ mod aggregate_extrema_dispatch;
 mod aggregate_extrema_owner;
 mod aggregate_extrema_utf8;
 pub mod aggregate_hll_core;
+mod aggregate_hll_kernel;
+mod aggregate_hll_owner;
 mod aggregate_n;
 pub mod aggregate_n_core;
 mod aggregate_n_owner;

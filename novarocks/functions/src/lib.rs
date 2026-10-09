@@ -34,6 +34,7 @@ mod aggregate_call;
 mod aggregate_erasure;
 pub mod aggregate_format;
 mod aggregate_host_allocator;
+mod aggregate_invocation_backing;
 mod aggregate_kernel;
 pub mod aggregate_scalar;
 pub mod aggregate_scalar_fingerprint;
@@ -59,6 +60,7 @@ pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
+mod evaluation_failure;
 pub mod exact_percentile_core;
 #[cfg(test)]
 mod exact_installed_owner_selection_tests;
@@ -98,6 +100,7 @@ pub use cast::*;
 pub use comparison::*;
 pub use effect_refinement::*;
 pub use evaluation::*;
+pub use evaluation_failure::*;
 pub use higher_order_call::*;
 pub use higher_order_kernel::*;
 pub use kernel_control::*;
@@ -119,9 +122,9 @@ pub use novarocks_type_contract::{
 pub use pure_catalogue::*;
 pub use scalar_kernel::*;
 pub use specialization::FunctionSpecializationFailure;
-pub use temporal_call::{TemporalSourceChannel, PreparedTemporalSource, TemporalCallContract};
 pub use table_call::*;
 pub use table_kernel::*;
+pub use temporal_call::{PreparedTemporalSource, TemporalCallContract, TemporalSourceChannel};
 pub use window_call::*;
 pub use window_kernel::*;
 

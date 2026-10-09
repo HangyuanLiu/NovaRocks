@@ -4998,3 +4998,36 @@ fn observed_all<T>(
 #[cfg(test)]
 #[path = "constant_binding_tests.rs"]
 pub(super) mod constant_binding_tests;
+
+#[cfg(test)]
+pub(super) fn ndv_invocation_data_test_catalog() -> EngineFunctionCatalog {
+    let original = build_builtin_engine_function_catalog().unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    for declaration in builtin_aggregate_declarations()
+        .into_iter()
+        .filter(|item| matches!(item.name, "ndv" | "approx_count_distinct"))
+    {
+        let raw = original
+            .definition(declaration.name, FunctionKind::Aggregate)
+            .unwrap()
+            .binding_declaration()
+            .unwrap();
+        let binding = FunctionBindingDeclaration::try_new(
+            raw.function_id().clone(),
+            raw.kind(),
+            raw.overloads().iter().cloned().map(|mut overload| {
+                overload.effects = Some(super::aggregate_hll_owner::effects());
+                overload
+            }),
+        )
+        .unwrap();
+        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+        builder
+            .register(
+                super::aggregate_hll_owner::definition(declaration.name, binding, resolver)
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    builder.seal().unwrap()
+}

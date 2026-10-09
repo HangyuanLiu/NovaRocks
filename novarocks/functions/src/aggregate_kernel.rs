@@ -31,13 +31,71 @@ use arrow_array::ArrayRef;
 use novarocks_type_contract::{CallEffects, CompilePhase, FunctionValueType, PureCompileControl};
 use std::{alloc::Layout, fmt, sync::Arc};
 
+/// A borrowed receipt from the actual host emission, never an update-row domain.
+/// Capacity is an output-shape fact, not an allocation grant.
+#[derive(Clone, Copy)]
+pub struct AggregateEmissionContext<'host> {
+    contract: &'host Arc<AggregateCallContract>,
+    indices: &'host [usize],
+    row_capacity: usize,
+    allocator: Option<&'host Arc<dyn crate::AggregateStateAllocator>>,
+}
+impl<'host> AggregateEmissionContext<'host> {
+    pub(crate) fn from_host(
+        contract: &'host Arc<AggregateCallContract>,
+        indices: &'host [usize],
+        row_capacity: usize,
+        allocator: Option<&'host Arc<dyn crate::AggregateStateAllocator>>,
+    ) -> Self {
+        Self {
+            contract,
+            indices,
+            row_capacity,
+            allocator,
+        }
+    }
+    pub fn contract(&self) -> &'host Arc<AggregateCallContract> {
+        self.contract
+    }
+    pub fn state_indices(&self) -> &'host [usize] {
+        self.indices
+    }
+    pub fn row_capacity(&self) -> usize {
+        self.row_capacity
+    }
+    /// Emission visits every supplied state in this exact output order.
+    pub fn selection(&self) -> Selection<'static> {
+        Selection::all(self.indices.len())
+    }
+    pub fn allocator(&self) -> Option<&'host Arc<dyn crate::AggregateStateAllocator>> {
+        self.allocator
+    }
+    pub fn phase(&self) -> crate::AggregateInvocationPhase {
+        if self.contract.phase().produces_final_result() {
+            crate::AggregateInvocationPhase::Final
+        } else {
+            crate::AggregateInvocationPhase::Intermediate
+        }
+    }
+}
+impl fmt::Debug for AggregateEmissionContext<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AggregateEmissionContext")
+            .field("contract", self.contract)
+            .field("indices", &self.indices)
+            .field("row_capacity", &self.row_capacity)
+            .field("has_allocator", &self.allocator.is_some())
+            .finish()
+    }
+}
+
 /// Typed, immutable, exact preparation. The host monomorphizes batch dispatch;
 /// this is not a per-row dynamic ABI or a private aggregate state arena.
 ///
 /// State construction and every mutation/emission run inside host-installed
 /// memory scopes with prior allocation/temporary-peak authorization. Retained
 /// bounds below are facts for that owner, not grants or a second wallet.
-/// Lifecycle data failures are non-maskable Operational failures; control,
+/// Whole invocation Data is non-maskable and retains its complete diagnostic; control,
 /// resource and internal failures keep their distinct outer categories.
 pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     type State: Send + 'static;
@@ -112,6 +170,105 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     where
         Self::State: 'state,
         I: ExactSizeIterator<Item = &'state Self::State>;
+    /// Exact owner declaration: old Kernel-only adapters cannot consume Data.
+    fn has_invocation_data(&self) -> bool {
+        false
+    }
+    /// Only owners whose emission consumes the real host receipt opt in.
+    fn requires_emission_context(&self) -> bool {
+        false
+    }
+    fn prepare_update_evaluation<'batch>(
+        &'batch self,
+        input: SelectedAggregateUpdateInput<'batch, 'batch>,
+        _mapping: &[usize],
+        _allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self::PreparedUpdateBatch<'batch>, crate::EvaluationFailure> {
+        self.prepare_update(input, control).map_err(Into::into)
+    }
+    fn update_row_evaluation<'batch>(
+        &self,
+        state: &mut Self::State,
+        prepared: &Self::PreparedUpdateBatch<'batch>,
+        selected_ordinal: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), crate::EvaluationFailure> {
+        self.update_row(state, prepared, selected_ordinal, control)
+            .map_err(Into::into)
+    }
+    fn prepare_merge_evaluation<'batch>(
+        &'batch self,
+        input: SelectedAggregateMergeInput<'batch, 'batch>,
+        _mapping: &[usize],
+        _allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self::PreparedMergeBatch<'batch>, crate::EvaluationFailure> {
+        self.prepare_merge(input, control).map_err(Into::into)
+    }
+    fn merge_row_evaluation<'batch>(
+        &self,
+        state: &mut Self::State,
+        prepared: &Self::PreparedMergeBatch<'batch>,
+        selected_ordinal: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), crate::EvaluationFailure> {
+        self.merge_row(state, prepared, selected_ordinal, control)
+            .map_err(Into::into)
+    }
+    fn build_intermediate_evaluation<'state, I>(
+        &self,
+        states: I,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, crate::EvaluationFailure>
+    where
+        Self::State: 'state,
+        I: ExactSizeIterator<Item = &'state Self::State>,
+    {
+        self.build_intermediate(states, control).map_err(Into::into)
+    }
+    fn build_final_evaluation<'state, I>(
+        &self,
+        states: I,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, crate::EvaluationFailure>
+    where
+        Self::State: 'state,
+        I: ExactSizeIterator<Item = &'state Self::State>,
+    {
+        self.build_final(states, control).map_err(Into::into)
+    }
+    /// Default behavior preserves the original builder and checkpoint sequence.
+    fn build_intermediate_evaluation_with_context<'state, I>(
+        &self,
+        states: I,
+        _context: &AggregateEmissionContext<'_>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, crate::EvaluationFailure>
+    where
+        Self::State: 'state,
+        I: ExactSizeIterator<Item = &'state Self::State>,
+    {
+        self.build_intermediate_evaluation(states, control)
+    }
+    fn build_final_evaluation_with_context<'state, I>(
+        &self,
+        states: I,
+        _context: &AggregateEmissionContext<'_>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, crate::EvaluationFailure>
+    where
+        Self::State: 'state,
+        I: ExactSizeIterator<Item = &'state Self::State>,
+    {
+        self.build_final_evaluation(states, control)
+    }
+    fn prepared_update_retained_bytes(&self, _prepared: &Self::PreparedUpdateBatch<'_>) -> usize {
+        0
+    }
+    fn prepared_merge_retained_bytes(&self, _prepared: &Self::PreparedMergeBatch<'_>) -> usize {
+        0
+    }
     /// O(1) additional owned heap, including retained growth on error exits.
     /// The host accounts inline State in its arena separately.
     fn retained_bytes(&self, state: &Self::State) -> usize;
@@ -385,16 +542,28 @@ impl<'batch, K: PreparedAggregateKernel> AggregateUpdateInvocation<'batch, K> {
         input: SelectedAggregateUpdateInput<'batch, 'batch>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
+        if kernel.has_invocation_data() {
+            return Err(invalid("aggregate requires its invocation Data protocol"));
+        }
+        kernel_only_result(Self::try_new_evaluation(kernel, input, &[], None, control))
+    }
+    pub fn try_new_evaluation(
+        kernel: &'batch K,
+        input: SelectedAggregateUpdateInput<'batch, 'batch>,
+        mapping: &[usize],
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, crate::EvaluationFailure> {
         control.checkpoint(0)?;
         if !std::ptr::eq(input.contract(), kernel.contract().as_ref()) {
-            return Err(invalid(
-                "aggregate update input differs from exact prepared contract",
-            ));
+            return Err(
+                invalid("aggregate update input differs from exact prepared contract").into(),
+            );
         }
         let prepared = if input.selection().is_empty() {
             None
         } else {
-            Some(kernel.prepare_update(input, control)?)
+            Some(kernel.prepare_update_evaluation(input, mapping, allocator, control)?)
         };
         control.checkpoint(0)?;
         Ok(Self {
@@ -403,6 +572,11 @@ impl<'batch, K: PreparedAggregateKernel> AggregateUpdateInvocation<'batch, K> {
             prepared,
             next: 0,
             failed: false,
+        })
+    }
+    pub fn retained_preparation_bytes(&self) -> usize {
+        self.prepared.as_ref().map_or(0, |prepared| {
+            self.kernel.prepared_update_retained_bytes(prepared)
         })
     }
     pub fn next_selected_ordinal(&self) -> Option<usize> {
@@ -417,16 +591,26 @@ impl<'batch, K: PreparedAggregateKernel> AggregateUpdateInvocation<'batch, K> {
         state: &mut K::State,
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), KernelFailure> {
+        if self.kernel.has_invocation_data() {
+            return Err(invalid("aggregate requires its invocation Data protocol"));
+        }
+        kernel_only_result(self.update_next_evaluation(state, control))
+    }
+    pub fn update_next_evaluation(
+        &mut self,
+        state: &mut K::State,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), crate::EvaluationFailure> {
         if self.failed {
-            return Err(KernelFailure::InstanceFailed);
+            return Err(KernelFailure::InstanceFailed.into());
         }
         let Some(ordinal) = self.next_selected_ordinal() else {
-            return Err(invalid("aggregate update has no remaining selected row"));
+            return Err(invalid("aggregate update has no remaining selected row").into());
         };
         let result = (|| {
             control.checkpoint(0)?;
             validate_state_retained(self.kernel, state)?;
-            let result = self.kernel.update_row(
+            let result = self.kernel.update_row_evaluation(
                 state,
                 self.prepared.as_ref().expect("nonempty checked invocation"),
                 ordinal,
@@ -434,7 +618,9 @@ impl<'batch, K: PreparedAggregateKernel> AggregateUpdateInvocation<'batch, K> {
             );
             // Observe retained growth even on error exits. Control/resources
             // remain the primary failure; no post-check grants allocation.
-            finish_lifecycle(result, validate_state_retained(self.kernel, state))
+            crate::evaluation_failure::finish_evaluation_lifecycle(result, || {
+                validate_state_retained(self.kernel, state)
+            })
         })();
         match result {
             Ok(()) => {
@@ -462,16 +648,28 @@ impl<'batch, K: PreparedAggregateKernel> AggregateMergeInvocation<'batch, K> {
         input: SelectedAggregateMergeInput<'batch, 'batch>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
+        if kernel.has_invocation_data() {
+            return Err(invalid("aggregate requires its invocation Data protocol"));
+        }
+        kernel_only_result(Self::try_new_evaluation(kernel, input, &[], None, control))
+    }
+    pub fn try_new_evaluation(
+        kernel: &'batch K,
+        input: SelectedAggregateMergeInput<'batch, 'batch>,
+        mapping: &[usize],
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, crate::EvaluationFailure> {
         control.checkpoint(0)?;
         if !std::ptr::eq(input.contract(), kernel.contract().as_ref()) {
-            return Err(invalid(
-                "aggregate merge input differs from exact prepared contract",
-            ));
+            return Err(
+                invalid("aggregate merge input differs from exact prepared contract").into(),
+            );
         }
         let prepared = if input.selection().is_empty() {
             None
         } else {
-            Some(kernel.prepare_merge(input, control)?)
+            Some(kernel.prepare_merge_evaluation(input, mapping, allocator, control)?)
         };
         control.checkpoint(0)?;
         Ok(Self {
@@ -480,6 +678,11 @@ impl<'batch, K: PreparedAggregateKernel> AggregateMergeInvocation<'batch, K> {
             prepared,
             next: 0,
             failed: false,
+        })
+    }
+    pub fn retained_preparation_bytes(&self) -> usize {
+        self.prepared.as_ref().map_or(0, |prepared| {
+            self.kernel.prepared_merge_retained_bytes(prepared)
         })
     }
     pub fn next_selected_ordinal(&self) -> Option<usize> {
@@ -494,22 +697,34 @@ impl<'batch, K: PreparedAggregateKernel> AggregateMergeInvocation<'batch, K> {
         state: &mut K::State,
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), KernelFailure> {
+        if self.kernel.has_invocation_data() {
+            return Err(invalid("aggregate requires its invocation Data protocol"));
+        }
+        kernel_only_result(self.merge_next_evaluation(state, control))
+    }
+    pub fn merge_next_evaluation(
+        &mut self,
+        state: &mut K::State,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), crate::EvaluationFailure> {
         if self.failed {
-            return Err(KernelFailure::InstanceFailed);
+            return Err(KernelFailure::InstanceFailed.into());
         }
         let Some(ordinal) = self.next_selected_ordinal() else {
-            return Err(invalid("aggregate merge has no remaining selected row"));
+            return Err(invalid("aggregate merge has no remaining selected row").into());
         };
         let result = (|| {
             control.checkpoint(0)?;
             validate_state_retained(self.kernel, state)?;
-            let result = self.kernel.merge_row(
+            let result = self.kernel.merge_row_evaluation(
                 state,
                 self.prepared.as_ref().expect("nonempty checked invocation"),
                 ordinal,
                 control,
             );
-            finish_lifecycle(result, validate_state_retained(self.kernel, state))
+            crate::evaluation_failure::finish_evaluation_lifecycle(result, || {
+                validate_state_retained(self.kernel, state)
+            })
         })();
         match result {
             Ok(()) => {
@@ -521,6 +736,20 @@ impl<'batch, K: PreparedAggregateKernel> AggregateMergeInvocation<'batch, K> {
                 Err(error)
             }
         }
+    }
+}
+
+/// Only a declaration-proven Kernel-only caller uses this projection. A Data
+/// result here violates the owner's declaration; real Data owners cannot enter.
+pub(crate) fn kernel_only_result<T>(
+    result: Result<T, crate::EvaluationFailure>,
+) -> Result<T, KernelFailure> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(crate::EvaluationFailure::Kernel(cause)) => Err(cause),
+        Err(crate::EvaluationFailure::InvocationData(_)) => Err(internal(
+            "aggregate contradicted its Kernel-only failure declaration",
+        )),
     }
 }
 
@@ -580,17 +809,62 @@ where
     K::State: 'state,
     I: ExactSizeIterator<Item = &'state K::State> + Clone,
 {
-    let observed = crate::kernel_control::KernelControlObservation::new(control);
-    let result = emit_aggregate_observed(kernel, states, row_capacity, &observed);
-    observed.finish(result)
+    if kernel.has_invocation_data() {
+        return Err(invalid("aggregate requires its invocation Data protocol"));
+    }
+    kernel_only_result(emit_aggregate_evaluation(
+        kernel,
+        states,
+        row_capacity,
+        control,
+    ))
 }
 
-fn emit_aggregate_observed<'state, K, I>(
+pub fn emit_aggregate_evaluation<'state, K, I>(
     kernel: &K,
     states: I,
     row_capacity: usize,
     control: &dyn KernelEvaluationControl,
-) -> Result<ArrayRef, KernelFailure>
+) -> Result<ArrayRef, crate::EvaluationFailure>
+where
+    K: PreparedAggregateKernel,
+    K::State: 'state,
+    I: ExactSizeIterator<Item = &'state K::State> + Clone,
+{
+    emit_aggregate_evaluation_in(kernel, states, row_capacity, None, control)
+}
+
+pub(crate) fn emit_aggregate_evaluation_in<'state, K, I>(
+    kernel: &K,
+    states: I,
+    row_capacity: usize,
+    context: Option<&AggregateEmissionContext<'_>>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, crate::EvaluationFailure>
+where
+    K: PreparedAggregateKernel,
+    K::State: 'state,
+    I: ExactSizeIterator<Item = &'state K::State> + Clone,
+{
+    let observed = crate::kernel_control::KernelControlObservation::new(control);
+    let result =
+        emit_aggregate_evaluation_observed(kernel, states, row_capacity, context, &observed);
+    match result {
+        Err(data @ crate::EvaluationFailure::InvocationData(_)) => Err(data),
+        Ok(value) => observed.finish(Ok(value)).map_err(Into::into),
+        Err(crate::EvaluationFailure::Kernel(cause)) => {
+            observed.finish(Err(cause)).map_err(Into::into)
+        }
+    }
+}
+
+fn emit_aggregate_evaluation_observed<'state, K, I>(
+    kernel: &K,
+    states: I,
+    row_capacity: usize,
+    context: Option<&AggregateEmissionContext<'_>>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, crate::EvaluationFailure>
 where
     K: PreparedAggregateKernel,
     K::State: 'state,
@@ -599,27 +873,41 @@ where
     control.checkpoint(0)?;
     let rows = states.len();
     if rows > row_capacity {
-        return Err(KernelFailure::ResourceExhausted);
+        return Err(KernelFailure::ResourceExhausted.into());
+    }
+    if kernel.requires_emission_context() && context.is_none() {
+        return Err(invalid("aggregate emission requires its actual host context").into());
     }
     validate_emission_states(kernel, states.clone(), control)?;
-    let result = if kernel.contract().phase().produces_final_result() {
-        kernel.build_final(states.clone(), control)
-    } else {
-        kernel.build_intermediate(states.clone(), control)
+    let final_result = kernel.contract().phase().produces_final_result();
+    let result = match (final_result, context) {
+        (true, Some(context)) => {
+            kernel.build_final_evaluation_with_context(states.clone(), context, control)
+        }
+        (false, Some(context)) => {
+            kernel.build_intermediate_evaluation_with_context(states.clone(), context, control)
+        }
+        (true, None) => kernel.build_final_evaluation(states.clone(), control),
+        (false, None) => kernel.build_intermediate_evaluation(states.clone(), control),
     };
     // Interrupted output is terminal. The host still owns reconciliation and
     // destruction; another observed state traversal cannot complete this call.
     if matches!(
         &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
+        Err(crate::EvaluationFailure::InvocationData(_)
+            | crate::EvaluationFailure::Kernel(
+                KernelFailure::Cancelled
+                    | KernelFailure::DeadlineExceeded
+                    | KernelFailure::ResourceExhausted
+            ))
     ) {
         return result;
     }
     // &State may contain interior mutable storage. Both successful and failed
     // emissions are checked, without changing a primary control/resource error.
-    let output = finish_lifecycle(result, validate_emission_states(kernel, states, control))?;
+    let output = crate::evaluation_failure::finish_evaluation_lifecycle(result, || {
+        validate_emission_states(kernel, states, control)
+    })?;
     let value_type = if kernel.contract().phase().produces_final_result() {
         kernel.contract().final_type()
     } else {

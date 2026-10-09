@@ -600,7 +600,7 @@ impl CompiledAggregateProcessor {
                     arguments[0],
                     &self.control,
                 )?;
-                column.prepare_merge_batch(&mapping, input, &self.control)?
+                column.prepare_merge_batch_evaluation(&mapping, input, &self.control)?
             } else {
                 let input = SelectedAggregateUpdateInput::try_new(
                     call.contract.as_ref(),
@@ -609,7 +609,7 @@ impl CompiledAggregateProcessor {
                     &arguments[call.contract.call().logical_argument_count()..],
                     &self.control,
                 )?;
-                column.prepare_update_batch(&mapping, input, &self.control)?
+                column.prepare_update_batch_evaluation(&mapping, input, &self.control)?
             };
             frame.run(&self.control)?;
         }
@@ -653,7 +653,7 @@ impl CompiledAggregateProcessor {
         let indices = (0..groups).collect::<Vec<_>>();
         let states = self.states.as_ref().expect("states were created");
         for column in states {
-            columns.push(column.emit(&indices, groups, &self.control)?);
+            columns.push(column.emit_evaluation(&indices, groups, &self.control)?);
         }
         let batch = RecordBatch::try_new(fields, columns)
             .map_err(|error| failure("compiled aggregate output", error))?;

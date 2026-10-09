@@ -18,14 +18,16 @@
 //! Framework-owned typed aggregate erasure with host-borrowed state storage.
 //! Handles are immutable; slots and batch frames are execution-owned objects.
 
-use crate::aggregate_kernel::{finish_lifecycle, state_retained_bound};
+use crate::EvaluationFailure;
+use crate::aggregate_kernel::{kernel_only_result, state_retained_bound};
+use crate::evaluation_failure::finish_evaluation_lifecycle;
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
-    AggregateCallContract, AggregateMergeInvocation, AggregateStateMemoryPolicy,
-    AggregateUpdateInvocation, KernelEvaluationControl, KernelFailure, PreparedAggregateKernel,
-    SelectedAggregateMergeInput, SelectedAggregateUpdateInput,
-    create_aggregate_state_with_allocator, emit_aggregate,
+    AggregateCallContract, AggregateEmissionContext, AggregateMergeInvocation,
+    AggregateStateMemoryPolicy, AggregateUpdateInvocation, KernelEvaluationControl, KernelFailure,
+    PreparedAggregateKernel, SelectedAggregateMergeInput, SelectedAggregateUpdateInput,
+    create_aggregate_state_with_allocator,
 };
 use arrow_array::ArrayRef;
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
@@ -53,6 +55,8 @@ impl PreparedAggregateHandle {
             contract: kernel.contract().clone(),
             layout: Layout::new::<K::State>(),
             policy: kernel.memory_policy(),
+            invocation_data: kernel.has_invocation_data(),
+            emission_context: kernel.requires_emission_context(),
             kernel,
         });
         control
@@ -139,6 +143,9 @@ impl PreparedAggregateHandle {
         input: SelectedAggregateUpdateInput<'frame, 'frame>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<AggregateBatchInvocation<'frame>, KernelFailure> {
+        if self.inner.has_invocation_data() {
+            return Err(invalid("aggregate requires its invocation Data protocol"));
+        }
         control.checkpoint(0)?;
         if mapping.len() != input.selection().len() {
             return Err(invalid(
@@ -146,9 +153,28 @@ impl PreparedAggregateHandle {
             ));
         }
         self.validate_mapping(states, mapping, control)?;
+        kernel_only_result(
+            self.inner
+                .prepare_update(states, mapping, input, None, control),
+        )
+        .map(|inner| AggregateBatchInvocation { inner })
+    }
+    pub fn prepare_update_batch_evaluation<'frame, 'storage: 'frame>(
+        &'frame self,
+        states: &'frame mut [AggregateStateSlot<'storage>],
+        mapping: &'frame [usize],
+        input: SelectedAggregateUpdateInput<'frame, 'frame>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<AggregateEvaluationBatchInvocation<'frame>, EvaluationFailure> {
+        control.checkpoint(0)?;
+        if mapping.len() != input.selection().len() {
+            return Err(invalid("aggregate update mapping differs from selected row count").into());
+        }
+        self.validate_mapping(states, mapping, control)?;
         self.inner
-            .prepare_update(states, mapping, input, control)
-            .map(|inner| AggregateBatchInvocation { inner })
+            .prepare_update(states, mapping, input, allocator, control)
+            .map(|inner| AggregateEvaluationBatchInvocation { inner })
     }
     pub fn prepare_merge_batch<'frame, 'storage: 'frame>(
         &'frame self,
@@ -157,6 +183,9 @@ impl PreparedAggregateHandle {
         input: SelectedAggregateMergeInput<'frame, 'frame>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<AggregateBatchInvocation<'frame>, KernelFailure> {
+        if self.inner.has_invocation_data() {
+            return Err(invalid("aggregate requires its invocation Data protocol"));
+        }
         control.checkpoint(0)?;
         if mapping.len() != input.selection().len() {
             return Err(invalid(
@@ -164,9 +193,28 @@ impl PreparedAggregateHandle {
             ));
         }
         self.validate_mapping(states, mapping, control)?;
+        kernel_only_result(
+            self.inner
+                .prepare_merge(states, mapping, input, None, control),
+        )
+        .map(|inner| AggregateBatchInvocation { inner })
+    }
+    pub fn prepare_merge_batch_evaluation<'frame, 'storage: 'frame>(
+        &'frame self,
+        states: &'frame mut [AggregateStateSlot<'storage>],
+        mapping: &'frame [usize],
+        input: SelectedAggregateMergeInput<'frame, 'frame>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<AggregateEvaluationBatchInvocation<'frame>, EvaluationFailure> {
+        control.checkpoint(0)?;
+        if mapping.len() != input.selection().len() {
+            return Err(invalid("aggregate merge mapping differs from selected row count").into());
+        }
+        self.validate_mapping(states, mapping, control)?;
         self.inner
-            .prepare_merge(states, mapping, input, control)
-            .map(|inner| AggregateBatchInvocation { inner })
+            .prepare_merge(states, mapping, input, allocator, control)
+            .map(|inner| AggregateEvaluationBatchInvocation { inner })
     }
     /// State indices preserve host output order and may repeat shared borrows.
     /// Global group/output responsibility remains the host's plan obligation.
@@ -177,8 +225,38 @@ impl PreparedAggregateHandle {
         row_capacity: usize,
         control: &dyn KernelEvaluationControl,
     ) -> Result<ArrayRef, KernelFailure> {
+        if self.inner.has_invocation_data() {
+            return Err(invalid("aggregate requires its invocation Data protocol"));
+        }
         self.validate_mapping(states, indices, control)?;
-        self.inner.emit(states, indices, row_capacity, control)
+        kernel_only_result(
+            self.inner
+                .emit(states, indices, row_capacity, None, control),
+        )
+    }
+    pub fn emit_evaluation(
+        &self,
+        states: &[AggregateStateSlot<'_>],
+        indices: &[usize],
+        row_capacity: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, EvaluationFailure> {
+        self.validate_mapping(states, indices, control)?;
+        self.inner
+            .emit(states, indices, row_capacity, None, control)
+    }
+    /// Forward only the allocator that actually owns this host's state column.
+    pub fn emit_evaluation_with_allocator(
+        &self,
+        states: &[AggregateStateSlot<'_>],
+        indices: &[usize],
+        row_capacity: usize,
+        allocator: Option<&Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, EvaluationFailure> {
+        self.validate_mapping(states, indices, control)?;
+        self.inner
+            .emit(states, indices, row_capacity, allocator, control)
     }
 }
 
@@ -237,7 +315,26 @@ pub struct AggregateBatchInvocation<'frame> {
 }
 impl AggregateBatchInvocation<'_> {
     pub fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), KernelFailure> {
+        kernel_only_result(self.inner.run(control))
+    }
+    pub fn retained_preparation_bytes(&self) -> usize {
+        self.inner.retained_preparation_bytes()
+    }
+    pub fn rows_processed(&self) -> usize {
+        self.inner.rows_processed()
+    }
+}
+
+/// Same erased row loop, with the lossless whole invocation failure channel.
+pub struct AggregateEvaluationBatchInvocation<'frame> {
+    inner: Box<dyn BatchExecution + 'frame>,
+}
+impl AggregateEvaluationBatchInvocation<'_> {
+    pub fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure> {
         self.inner.run(control)
+    }
+    pub fn retained_preparation_bytes(&self) -> usize {
+        self.inner.retained_preparation_bytes()
     }
     pub fn rows_processed(&self) -> usize {
         self.inner.rows_processed()
@@ -245,13 +342,15 @@ impl AggregateBatchInvocation<'_> {
 }
 
 trait BatchExecution {
-    fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), KernelFailure>;
+    fn retained_preparation_bytes(&self) -> usize;
+    fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure>;
     fn rows_processed(&self) -> usize;
 }
 trait ErasedAggregateOps: Send + Sync + fmt::Debug {
     fn contract(&self) -> &Arc<AggregateCallContract>;
     fn layout(&self) -> Layout;
     fn policy(&self) -> AggregateStateMemoryPolicy;
+    fn has_invocation_data(&self) -> bool;
     unsafe fn initialize(
         &self,
         pointer: NonNull<u8>,
@@ -265,22 +364,25 @@ trait ErasedAggregateOps: Send + Sync + fmt::Debug {
         states: &'frame mut [AggregateStateSlot<'storage>],
         mapping: &'frame [usize],
         input: SelectedAggregateUpdateInput<'frame, 'frame>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, KernelFailure>;
+    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure>;
     fn prepare_merge<'frame, 'storage: 'frame>(
         &'frame self,
         states: &'frame mut [AggregateStateSlot<'storage>],
         mapping: &'frame [usize],
         input: SelectedAggregateMergeInput<'frame, 'frame>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, KernelFailure>;
+    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure>;
     fn emit(
         &self,
         states: &[AggregateStateSlot<'_>],
         indices: &[usize],
         row_capacity: usize,
+        allocator: Option<&Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<ArrayRef, KernelFailure>;
+    ) -> Result<ArrayRef, EvaluationFailure>;
 }
 #[derive(Debug)]
 struct TypedOps<K: PreparedAggregateKernel> {
@@ -288,10 +390,14 @@ struct TypedOps<K: PreparedAggregateKernel> {
     contract: Arc<AggregateCallContract>,
     layout: Layout,
     policy: AggregateStateMemoryPolicy,
+    invocation_data: bool,
+    emission_context: bool,
 }
 impl<K: PreparedAggregateKernel> TypedOps<K> {
     fn validate_metadata(&self) -> Result<(), KernelFailure> {
-        if self.kernel.memory_policy() != self.policy
+        if self.kernel.has_invocation_data() != self.invocation_data
+            || self.kernel.requires_emission_context() != self.emission_context
+            || self.kernel.memory_policy() != self.policy
             || !Arc::ptr_eq(self.kernel.contract(), &self.contract)
         {
             Err(internal(
@@ -335,6 +441,9 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
     fn policy(&self) -> AggregateStateMemoryPolicy {
         self.policy
     }
+    fn has_invocation_data(&self) -> bool {
+        self.invocation_data
+    }
     unsafe fn initialize(
         &self,
         pointer: NonNull<u8>,
@@ -369,10 +478,17 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         states: &'frame mut [AggregateStateSlot<'storage>],
         mapping: &'frame [usize],
         input: SelectedAggregateUpdateInput<'frame, 'frame>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, KernelFailure> {
+    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure> {
         self.validate_metadata()?;
-        let invocation = AggregateUpdateInvocation::try_new(self.kernel.as_ref(), input, control)?;
+        let invocation = AggregateUpdateInvocation::try_new_evaluation(
+            self.kernel.as_ref(),
+            input,
+            mapping,
+            allocator,
+            control,
+        )?;
         Ok(Box::new(UpdateFrame {
             adapter: self,
             states,
@@ -387,10 +503,17 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         states: &'frame mut [AggregateStateSlot<'storage>],
         mapping: &'frame [usize],
         input: SelectedAggregateMergeInput<'frame, 'frame>,
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, KernelFailure> {
+    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure> {
         self.validate_metadata()?;
-        let invocation = AggregateMergeInvocation::try_new(self.kernel.as_ref(), input, control)?;
+        let invocation = AggregateMergeInvocation::try_new_evaluation(
+            self.kernel.as_ref(),
+            input,
+            mapping,
+            allocator,
+            control,
+        )?;
         Ok(Box::new(MergeFrame {
             adapter: self,
             states,
@@ -405,8 +528,9 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         states: &[AggregateStateSlot<'_>],
         indices: &[usize],
         row_capacity: usize,
+        allocator: Option<&Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<ArrayRef, KernelFailure> {
+    ) -> Result<ArrayRef, EvaluationFailure> {
         self.validate_metadata()?;
         let observed = crate::kernel_control::KernelControlObservation::new(control);
         let control = &observed as &dyn KernelEvaluationControl;
@@ -418,14 +542,25 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             next: 0,
             _kernel: PhantomData,
         };
-        let result = emit_aggregate(self.kernel.as_ref(), typed.clone(), row_capacity, control);
+        let context =
+            AggregateEmissionContext::from_host(&self.contract, indices, row_capacity, allocator);
+        let result = crate::aggregate_kernel::emit_aggregate_evaluation_in(
+            self.kernel.as_ref(),
+            typed.clone(),
+            row_capacity,
+            Some(&context),
+            control,
+        );
         if matches!(
             &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
+            Err(EvaluationFailure::InvocationData(_)
+                | EvaluationFailure::Kernel(
+                    KernelFailure::Cancelled
+                        | KernelFailure::DeadlineExceeded
+                        | KernelFailure::ResourceExhausted
+                ))
         ) {
-            return observed.finish(result);
+            return finish_observation(&observed, result);
         }
         let post = (|| {
             self.validate_metadata()?;
@@ -436,7 +571,18 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             }
             work.finish()
         })();
-        observed.finish(finish_lifecycle(result, post))
+        finish_observation(&observed, finish_evaluation_lifecycle(result, || post))
+    }
+}
+
+fn finish_observation<T>(
+    observed: &crate::kernel_control::KernelControlObservation<'_>,
+    result: Result<T, EvaluationFailure>,
+) -> Result<T, EvaluationFailure> {
+    match result {
+        Err(data @ EvaluationFailure::InvocationData(_)) => Err(data),
+        Ok(value) => observed.finish(Ok(value)).map_err(Into::into),
+        Err(EvaluationFailure::Kernel(cause)) => observed.finish(Err(cause)).map_err(Into::into),
     }
 }
 
@@ -449,9 +595,9 @@ struct UpdateFrame<'frame, 'storage, K: PreparedAggregateKernel> {
     finished: bool,
 }
 impl<K: PreparedAggregateKernel> BatchExecution for UpdateFrame<'_, '_, K> {
-    fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), KernelFailure> {
+    fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure> {
         if self.finished {
-            return Err(KernelFailure::InstanceFailed);
+            return Err(KernelFailure::InstanceFailed.into());
         }
         // Consumed on both success and failure: the exact batch is never replayed.
         self.finished = true;
@@ -466,13 +612,16 @@ impl<K: PreparedAggregateKernel> BatchExecution for UpdateFrame<'_, '_, K> {
                 // so repeated group mappings create no aliased mutable references.
                 let state = unsafe { slot.pointer.cast::<K::State>().as_mut() };
                 self.adapter.validate_retained(state)?;
-                let result = self.invocation.update_next(state, control);
-                finish_lifecycle(result, self.adapter.validate_retained(state))?;
+                let result = self.invocation.update_next_evaluation(state, control);
+                finish_evaluation_lifecycle(result, || self.adapter.validate_retained(state))?;
                 self.processed += 1;
             }
-            control.checkpoint(0)
+            control.checkpoint(0).map_err(Into::into)
         })();
-        finish_lifecycle(result, self.adapter.validate_metadata())
+        finish_evaluation_lifecycle(result, || self.adapter.validate_metadata())
+    }
+    fn retained_preparation_bytes(&self) -> usize {
+        self.invocation.retained_preparation_bytes()
     }
     fn rows_processed(&self) -> usize {
         self.processed
@@ -487,9 +636,9 @@ struct MergeFrame<'frame, 'storage, K: PreparedAggregateKernel> {
     finished: bool,
 }
 impl<K: PreparedAggregateKernel> BatchExecution for MergeFrame<'_, '_, K> {
-    fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), KernelFailure> {
+    fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure> {
         if self.finished {
-            return Err(KernelFailure::InstanceFailed);
+            return Err(KernelFailure::InstanceFailed.into());
         }
         self.finished = true;
         let result = (|| {
@@ -502,13 +651,16 @@ impl<K: PreparedAggregateKernel> BatchExecution for MergeFrame<'_, '_, K> {
                 // borrow prove State type, alignment, initialization and exclusivity.
                 let state = unsafe { slot.pointer.cast::<K::State>().as_mut() };
                 self.adapter.validate_retained(state)?;
-                let result = self.invocation.merge_next(state, control);
-                finish_lifecycle(result, self.adapter.validate_retained(state))?;
+                let result = self.invocation.merge_next_evaluation(state, control);
+                finish_evaluation_lifecycle(result, || self.adapter.validate_retained(state))?;
                 self.processed += 1;
             }
-            control.checkpoint(0)
+            control.checkpoint(0).map_err(Into::into)
         })();
-        finish_lifecycle(result, self.adapter.validate_metadata())
+        finish_evaluation_lifecycle(result, || self.adapter.validate_metadata())
+    }
+    fn retained_preparation_bytes(&self) -> usize {
+        self.invocation.retained_preparation_bytes()
     }
     fn rows_processed(&self) -> usize {
         self.processed

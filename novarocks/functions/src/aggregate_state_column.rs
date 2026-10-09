@@ -237,6 +237,54 @@ impl AggregateStateColumn {
         self.handle
             .emit(&self.states, indices, row_capacity, control)
     }
+    /// One update frame over these states; `mapping[i]` is the group of the
+    /// input's selected row `i`.
+    pub fn prepare_update_batch_evaluation<'frame>(
+        &'frame mut self,
+        mapping: &'frame [usize],
+        input: SelectedAggregateUpdateInput<'frame, 'frame>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<crate::AggregateEvaluationBatchInvocation<'frame>, crate::EvaluationFailure> {
+        self.handle.prepare_update_batch_evaluation(
+            &mut self.states,
+            mapping,
+            input,
+            Some(Arc::clone(&self.allocator)),
+            control,
+        )
+    }
+
+    /// One merge frame over these states.
+    pub fn prepare_merge_batch_evaluation<'frame>(
+        &'frame mut self,
+        mapping: &'frame [usize],
+        input: SelectedAggregateMergeInput<'frame, 'frame>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<crate::AggregateEvaluationBatchInvocation<'frame>, crate::EvaluationFailure> {
+        self.handle.prepare_merge_batch_evaluation(
+            &mut self.states,
+            mapping,
+            input,
+            Some(Arc::clone(&self.allocator)),
+            control,
+        )
+    }
+
+    /// Emit the states at `indices`, in that order.
+    pub fn emit_evaluation(
+        &self,
+        indices: &[usize],
+        row_capacity: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, crate::EvaluationFailure> {
+        self.handle.emit_evaluation_with_allocator(
+            &self.states,
+            indices,
+            row_capacity,
+            Some(&self.allocator),
+            control,
+        )
+    }
 }
 
 struct UnpublishedBlock {

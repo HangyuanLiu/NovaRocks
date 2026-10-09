@@ -438,10 +438,12 @@ fn guard_legacy(run: impl FnOnce() -> Result<ArrayRef, String>) -> Result<ArrayR
 }
 
 enum GuardedPureResult {
-    Finished(Result<ArrayRef, KernelFailure>),
+    Finished(Result<ArrayRef, novarocks_functions::EvaluationFailure>),
     Panicked(String),
 }
-fn guard_pure(run: impl FnOnce() -> Result<ArrayRef, KernelFailure>) -> GuardedPureResult {
+fn guard_pure(
+    run: impl FnOnce() -> Result<ArrayRef, novarocks_functions::EvaluationFailure>,
+) -> GuardedPureResult {
     match catch_unwind(AssertUnwindSafe(run)) {
         Ok(result) => GuardedPureResult::Finished(result),
         Err(panic) => GuardedPureResult::Panicked(panic_message(&panic)),
@@ -516,7 +518,7 @@ fn compare_shape(
                 }
             }
         }
-        (Err(legacy), Err(KernelFailure::Operational(diagnostic))) => {
+        (Err(legacy), Err(novarocks_functions::EvaluationFailure::Kernel(KernelFailure::Operational(diagnostic)))) => {
             if legacy.starts_with(super::LEGACY_PANIC_PREFIX) {
                 details.push(format!("{shape}: {legacy}"));
             } else if spec.error_messages == ErrorMessageCheck::LegacyContainsPure
@@ -529,6 +531,11 @@ fn compare_shape(
             } else {
                 summary.matched_failures += 1;
             }
+        }
+        (Err(legacy), Err(novarocks_functions::EvaluationFailure::InvocationData(data))) => {
+            if legacy.starts_with(super::LEGACY_PANIC_PREFIX) || legacy != data.message() {
+                details.push(format!("{shape}: whole invocation Data differs: legacy `{legacy}`, pure `{data}`"));
+            } else { summary.matched_failures += 1; }
         }
         (Err(legacy), Err(other)) => details.push(format!(
             "{shape}: legacy failed with `{legacy}`, pure outer failure `{other}` is not a data failure"
@@ -848,7 +855,7 @@ impl PureAggregate {
         column: &mut AggregateStateColumn,
         selection: Selection<'_>,
         mapping: &[usize],
-    ) -> Result<(), KernelFailure> {
+    ) -> Result<(), novarocks_functions::EvaluationFailure> {
         let contract = Arc::clone(handle.contract());
         let arguments = spec
             .arguments
@@ -863,11 +870,15 @@ impl PureAggregate {
             &HarnessControl,
         )?;
         column
-            .prepare_update_batch(mapping, input, &HarnessControl)?
+            .prepare_update_batch_evaluation(mapping, input, &HarnessControl)?
             .run(&HarnessControl)
     }
 
-    fn single(&self, spec: &AggregateDiffSpec, layout: &Layout) -> Result<ArrayRef, KernelFailure> {
+    fn single(
+        &self,
+        spec: &AggregateDiffSpec,
+        layout: &Layout,
+    ) -> Result<ArrayRef, novarocks_functions::EvaluationFailure> {
         let mut column = Self::column(&self.single, layout.groups)?;
         Self::update(
             &self.single,
@@ -876,7 +887,7 @@ impl PureAggregate {
             Selection::all(layout.rows),
             &layout.group_ids,
         )?;
-        column.emit(
+        column.emit_evaluation(
             &(0..layout.groups).collect::<Vec<_>>(),
             layout.groups,
             &HarnessControl,
@@ -887,7 +898,7 @@ impl PureAggregate {
         &self,
         spec: &AggregateDiffSpec,
         layout: &Layout,
-    ) -> Result<ArrayRef, KernelFailure> {
+    ) -> Result<ArrayRef, novarocks_functions::EvaluationFailure> {
         let mut partials = Vec::with_capacity(layout.partitions.len());
         for partition in &layout.partitions {
             if partition.globals.is_empty() {
@@ -906,7 +917,7 @@ impl PureAggregate {
             let locals = (0..partition.globals.len()).collect::<Vec<_>>();
             partials.push((
                 partition,
-                column.emit(&locals, locals.len(), &HarnessControl)?,
+                column.emit_evaluation(&locals, locals.len(), &HarnessControl)?,
             ));
         }
         let mut column = Self::column(&self.last, layout.groups)?;
@@ -919,10 +930,10 @@ impl PureAggregate {
                 &HarnessControl,
             )?;
             column
-                .prepare_merge_batch(&partition.globals, input, &HarnessControl)?
+                .prepare_merge_batch_evaluation(&partition.globals, input, &HarnessControl)?
                 .run(&HarnessControl)?;
         }
-        column.emit(
+        column.emit_evaluation(
             &(0..layout.groups).collect::<Vec<_>>(),
             layout.groups,
             &HarnessControl,
@@ -1139,9 +1150,9 @@ mod panic_comparison_tests {
         let (summary, details) = compare(
             AggregateDiffSpec::new("min_n").expected_panic_payload(PAYLOAD),
             legacy_panic(),
-            GuardedPureResult::Finished(Err(KernelFailure::Operational(KernelDiagnostic::new(
-                PAYLOAD,
-            )))),
+            GuardedPureResult::Finished(Err(novarocks_functions::EvaluationFailure::Kernel(
+                KernelFailure::Operational(KernelDiagnostic::new(PAYLOAD)),
+            ))),
         );
         assert_eq!(summary.matched_panics, 0);
         assert_eq!(summary.matched_failures, 0);

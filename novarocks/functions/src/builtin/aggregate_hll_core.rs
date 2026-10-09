@@ -192,74 +192,135 @@ fn merge_as_opaque_payload<A: HllRegisterAllocator>(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HllMergeFailure {
+    Empty,
+    ExplicitMalformed,
+    SparseMalformed,
+    DecodeExplicitHash,
+    DecodeSparseCount,
+    DecodeSparseIndex,
+}
+impl HllMergeFailure {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "hll_raw merge payload is empty",
+            Self::ExplicitMalformed => "hll_raw EXPLICIT payload is malformed",
+            Self::SparseMalformed => "hll_raw SPARSE payload is malformed",
+            Self::DecodeExplicitHash => "hll_raw decode EXPLICIT hash failed",
+            Self::DecodeSparseCount => "hll_raw decode SPARSE count failed",
+            Self::DecodeSparseIndex => "hll_raw decode SPARSE index failed",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HllPayloadRecipe {
+    Empty,
+    Explicit(usize),
+    Sparse(usize),
+    Full,
+    Opaque,
+}
+/// Original header validation and non-standard opaque fallback decision. It
+/// does not read registers, hash bytes, or pre-interpret sparse index entries.
+pub fn hll_payload_recipe(bytes: &[u8]) -> Result<HllPayloadRecipe, HllMergeFailure> {
+    if bytes.is_empty() {
+        return Err(HllMergeFailure::Empty);
+    }
+    match bytes[0] {
+        HLL_DATA_EMPTY => Ok(HllPayloadRecipe::Empty),
+        HLL_DATA_EXPLICIT => {
+            if bytes.len() < 2 {
+                return Err(HllMergeFailure::ExplicitMalformed);
+            }
+            let count = bytes[1] as usize;
+            let expected = 2 + count * 8;
+            Ok(if bytes.len() != expected {
+                HllPayloadRecipe::Opaque
+            } else {
+                HllPayloadRecipe::Explicit(count)
+            })
+        }
+        HLL_DATA_SPARSE => {
+            if bytes.len() < 5 {
+                return Err(HllMergeFailure::SparseMalformed);
+            }
+            let count = u32::from_le_bytes(
+                bytes[1..5]
+                    .try_into()
+                    .map_err(|_| HllMergeFailure::DecodeSparseCount)?,
+            ) as usize;
+            let expected = 5 + count * 3;
+            Ok(if bytes.len() != expected {
+                HllPayloadRecipe::Opaque
+            } else {
+                HllPayloadRecipe::Sparse(count)
+            })
+        }
+        HLL_DATA_FULL => Ok(if bytes.len() != 1 + HLL_REGISTERS_COUNT {
+            HllPayloadRecipe::Opaque
+        } else {
+            HllPayloadRecipe::Full
+        }),
+        _ => Ok(HllPayloadRecipe::Opaque),
+    }
+}
 pub fn merge_hll_bytes<A: HllRegisterAllocator>(
     state: &mut HllRawState<A>,
     bytes: &[u8],
     work: &mut HllWork<'_, '_>,
 ) -> Result<(), HllError> {
-    if bytes.is_empty() {
-        return Err("hll_raw merge payload is empty".to_string().into());
-    }
-    match bytes[0] {
-        HLL_DATA_EMPTY => Ok(()),
-        HLL_DATA_EXPLICIT => {
-            if bytes.len() < 2 {
-                return Err("hll_raw EXPLICIT payload is malformed".to_string().into());
-            }
-            let count = bytes[1] as usize;
-            let expected = 2 + count * 8;
-            if bytes.len() != expected {
-                // Keep query running for non-standard HLL payloads (for example ds_hll states)
-                // by folding unknown bytes into a deterministic hash bucket.
-                merge_as_opaque_payload(state, bytes, work)?;
-                return Ok(());
-            }
+    merge_hll_bytes_with_failure(
+        state,
+        bytes,
+        work,
+        |failure| HllError::Legacy(failure.message().to_string()),
+        |failure| failure,
+    )
+}
+pub fn merge_hll_bytes_with_failure<A: HllRegisterAllocator, E>(
+    state: &mut HllRawState<A>,
+    bytes: &[u8],
+    work: &mut HllWork<'_, '_>,
+    mut payload_failure: impl FnMut(HllMergeFailure) -> E,
+    mut kernel_failure: impl FnMut(HllError) -> E,
+) -> Result<(), E> {
+    match hll_payload_recipe(bytes).map_err(&mut payload_failure)? {
+        HllPayloadRecipe::Empty => Ok(()),
+        HllPayloadRecipe::Explicit(count) => {
             let mut pos = 2usize;
             for _ in 0..count {
                 let hash = u64::from_le_bytes(
                     bytes[pos..pos + 8]
                         .try_into()
-                        .map_err(|_| "hll_raw decode EXPLICIT hash failed".to_string())?,
+                        .map_err(|_| payload_failure(HllMergeFailure::DecodeExplicitHash))?,
                 );
                 pos += 8;
-                update_state_register_from_hash(state, hash, work)?;
-                work.step()?;
+                update_state_register_from_hash(state, hash, work).map_err(&mut kernel_failure)?;
+                work.step().map_err(&mut kernel_failure)?;
             }
             Ok(())
         }
-        HLL_DATA_SPARSE => {
-            if bytes.len() < 5 {
-                return Err("hll_raw SPARSE payload is malformed".to_string().into());
-            }
-            let count = u32::from_le_bytes(
-                bytes[1..5]
-                    .try_into()
-                    .map_err(|_| "hll_raw decode SPARSE count failed".to_string())?,
-            ) as usize;
-            let expected = 5 + count * 3;
-            if bytes.len() != expected {
-                merge_as_opaque_payload(state, bytes, work)?;
-                return Ok(());
-            }
+        HllPayloadRecipe::Sparse(count) => {
             let mut pos = 5usize;
             let mut has_non_zero = false;
             for _ in 0..count {
                 let idx = u16::from_le_bytes(
                     bytes[pos..pos + 2]
                         .try_into()
-                        .map_err(|_| "hll_raw decode SPARSE index failed".to_string())?,
+                        .map_err(|_| payload_failure(HllMergeFailure::DecodeSparseIndex))?,
                 ) as usize;
                 pos += 2;
                 if idx >= HLL_REGISTERS_COUNT {
-                    merge_as_opaque_payload(state, bytes, work)?;
+                    merge_as_opaque_payload(state, bytes, work).map_err(&mut kernel_failure)?;
                     return Ok(());
                 }
                 let value = bytes[pos];
                 pos += 1;
-                work.step()?;
+                work.step().map_err(&mut kernel_failure)?;
                 if value > 0 {
                     has_non_zero = true;
-                    let registers = ensure_registers(state, work)?;
+                    let registers = ensure_registers(state, work).map_err(&mut kernel_failure)?;
                     if registers[idx] < value {
                         registers[idx] = value;
                     }
@@ -270,18 +331,13 @@ pub fn merge_hll_bytes<A: HllRegisterAllocator>(
             }
             Ok(())
         }
-        HLL_DATA_FULL => {
-            let expected = 1 + HLL_REGISTERS_COUNT;
-            if bytes.len() != expected {
-                merge_as_opaque_payload(state, bytes, work)?;
-                return Ok(());
-            }
+        HllPayloadRecipe::Full => {
             let mut has_non_zero = false;
             for (idx, value) in bytes[1..].iter().enumerate() {
-                work.step()?;
+                work.step().map_err(&mut kernel_failure)?;
                 if *value > 0 {
                     has_non_zero = true;
-                    let registers = ensure_registers(state, work)?;
+                    let registers = ensure_registers(state, work).map_err(&mut kernel_failure)?;
                     if registers[idx] < *value {
                         registers[idx] = *value;
                     }
@@ -292,9 +348,8 @@ pub fn merge_hll_bytes<A: HllRegisterAllocator>(
             }
             Ok(())
         }
-        _ => {
-            merge_as_opaque_payload(state, bytes, work)?;
-            Ok(())
+        HllPayloadRecipe::Opaque => {
+            merge_as_opaque_payload(state, bytes, work).map_err(&mut kernel_failure)
         }
     }
 }
@@ -388,16 +443,100 @@ pub fn estimate_cardinality_from_registers_observed(
     Ok(estimate.max(0.0).round() as i64)
 }
 
+/// Closed dispatch extracted from the original reader. This is not a binding rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HllHashCarrier {
+    Boolean,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Date32,
+    Timestamp(TimeUnit),
+    Decimal128,
+    Utf8,
+    LargeUtf8,
+    Binary,
+    LargeBinary,
+    FixedSizeBinary,
+    Unsupported,
+}
+pub fn hll_hash_carrier(data_type: &DataType) -> HllHashCarrier {
+    match data_type {
+        DataType::Boolean => HllHashCarrier::Boolean,
+        DataType::Int8 => HllHashCarrier::Int8,
+        DataType::Int16 => HllHashCarrier::Int16,
+        DataType::Int32 => HllHashCarrier::Int32,
+        DataType::Int64 => HllHashCarrier::Int64,
+        DataType::Float32 => HllHashCarrier::Float32,
+        DataType::Float64 => HllHashCarrier::Float64,
+        DataType::Date32 => HllHashCarrier::Date32,
+        DataType::Utf8 => HllHashCarrier::Utf8,
+        DataType::LargeUtf8 => HllHashCarrier::LargeUtf8,
+        DataType::Binary => HllHashCarrier::Binary,
+        DataType::LargeBinary => HllHashCarrier::LargeBinary,
+        DataType::Timestamp(unit, _) => HllHashCarrier::Timestamp(*unit),
+        DataType::Decimal128(_, _) => HllHashCarrier::Decimal128,
+        DataType::FixedSizeBinary(_) => HllHashCarrier::FixedSizeBinary,
+        _ => HllHashCarrier::Unsupported,
+    }
+}
+/// The actual carrier is borrowed until formatting; equal prepared metadata is
+/// not a substitute for its Debug bytes (nested Field metadata is a HashMap).
+#[derive(Clone, Copy, Debug)]
+pub enum HllInputFailure<'a> {
+    Bounds { row: usize, len: usize },
+    Downcast(&'static str),
+    Unsupported(&'a DataType),
+}
+impl std::fmt::Display for HllInputFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bounds { row, len } => write!(f, "hll_raw row {row} out of bounds for len {len}"),
+            Self::Downcast(name) => write!(f, "failed to downcast to {name}"),
+            Self::Unsupported(data_type) => {
+                write!(f, "hll_raw does not support input type {:?}", data_type)
+            }
+        }
+    }
+}
+/// Original bounds-before-physical-NULL decision, shared by preparation and
+/// the value reader. NullArray's physical is_null behavior remains unchanged.
+pub fn hll_value_is_present(array: &ArrayRef, row: usize) -> Result<bool, HllInputFailure<'_>> {
+    if row >= array.len() {
+        return Err(HllInputFailure::Bounds {
+            row,
+            len: array.len(),
+        });
+    }
+    Ok(!array.is_null(row))
+}
 pub fn hash_array_value_for_hll_observed(
     array: &ArrayRef,
     row: usize,
     work: &mut HllWork<'_, '_>,
 ) -> Result<Option<u64>, HllError> {
-    let mut hash = |bytes: &[u8]| hash_bytes_for_hll_observed(bytes, work);
-    if row >= array.len() {
-        return Err(format!("hll_raw row {row} out of bounds for len {}", array.len()).into());
-    }
-    if array.is_null(row) {
+    hash_array_value_for_hll_with_failure(
+        array,
+        row,
+        work,
+        |failure| HllError::Legacy(failure.to_string()),
+        |failure| failure,
+    )
+}
+
+pub fn hash_array_value_for_hll_with_failure<E>(
+    array: &ArrayRef,
+    row: usize,
+    work: &mut HllWork<'_, '_>,
+    mut input_failure: impl FnMut(HllInputFailure<'_>) -> E,
+    mut hash_failure: impl FnMut(HllError) -> E,
+) -> Result<Option<u64>, E> {
+    let mut hash =
+        |bytes: &[u8]| hash_bytes_for_hll_observed(bytes, work).map_err(&mut hash_failure);
+    if !hll_value_is_present(array, row).map_err(&mut input_failure)? {
         return Ok(None);
     }
 
@@ -406,44 +545,44 @@ pub fn hash_array_value_for_hll_observed(
             let arr = array
                 .as_any()
                 .downcast_ref::<$array_ty>()
-                .ok_or_else(|| format!("failed to downcast to {}", $name))?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast($name)))?;
             Ok(Some(hash(&arr.value(row).to_le_bytes())?))
         }};
     }
 
-    match array.data_type() {
-        DataType::Boolean => {
+    match hll_hash_carrier(array.data_type()) {
+        HllHashCarrier::Boolean => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("BooleanArray")))?;
             let value = if arr.value(row) { 1u8 } else { 0u8 };
             Ok(Some(hash(&[value])?))
         }
-        DataType::Int8 => hash_primitive_value!(Int8Array, "Int8Array"),
-        DataType::Int16 => hash_primitive_value!(Int16Array, "Int16Array"),
-        DataType::Int32 => hash_primitive_value!(Int32Array, "Int32Array"),
-        DataType::Int64 => hash_primitive_value!(Int64Array, "Int64Array"),
-        DataType::Float32 => {
+        HllHashCarrier::Int8 => hash_primitive_value!(Int8Array, "Int8Array"),
+        HllHashCarrier::Int16 => hash_primitive_value!(Int16Array, "Int16Array"),
+        HllHashCarrier::Int32 => hash_primitive_value!(Int32Array, "Int32Array"),
+        HllHashCarrier::Int64 => hash_primitive_value!(Int64Array, "Int64Array"),
+        HllHashCarrier::Float32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("Float32Array")))?;
             Ok(Some(hash(
                 &canonical_f32_bits_for_hll(arr.value(row)).to_le_bytes(),
             )?))
         }
-        DataType::Float64 => {
+        HllHashCarrier::Float64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("Float64Array")))?;
             Ok(Some(hash(
                 &canonical_f64_bits_for_hll(arr.value(row)).to_le_bytes(),
             )?))
         }
-        DataType::Date32 => hash_primitive_value!(Date32Array, "Date32Array"),
-        DataType::Timestamp(unit, _) => match unit {
+        HllHashCarrier::Date32 => hash_primitive_value!(Date32Array, "Date32Array"),
+        HllHashCarrier::Timestamp(unit) => match unit {
             TimeUnit::Second => hash_primitive_value!(TimestampSecondArray, "TimestampSecondArray"),
             TimeUnit::Millisecond => {
                 hash_primitive_value!(TimestampMillisecondArray, "TimestampMillisecondArray")
@@ -455,43 +594,45 @@ pub fn hash_array_value_for_hll_observed(
                 hash_primitive_value!(TimestampNanosecondArray, "TimestampNanosecondArray")
             }
         },
-        DataType::Decimal128(_, _) => hash_primitive_value!(Decimal128Array, "Decimal128Array"),
-        DataType::Utf8 => {
+        HllHashCarrier::Decimal128 => hash_primitive_value!(Decimal128Array, "Decimal128Array"),
+        HllHashCarrier::Utf8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("StringArray")))?;
             Ok(Some(hash(arr.value(row).as_bytes())?))
         }
-        DataType::LargeUtf8 => {
+        HllHashCarrier::LargeUtf8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("LargeStringArray")))?;
             Ok(Some(hash(arr.value(row).as_bytes())?))
         }
-        DataType::Binary => {
+        HllHashCarrier::Binary => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("BinaryArray")))?;
             Ok(Some(hash(arr.value(row))?))
         }
-        DataType::FixedSizeBinary(_) => {
+        HllHashCarrier::FixedSizeBinary => {
             let arr = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("FixedSizeBinaryArray")))?;
             Ok(Some(hash(arr.value(row))?))
         }
-        DataType::LargeBinary => {
+        HllHashCarrier::LargeBinary => {
             let arr = array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+                .ok_or_else(|| input_failure(HllInputFailure::Downcast("LargeBinaryArray")))?;
             Ok(Some(hash(arr.value(row))?))
         }
-        other => Err(format!("hll_raw does not support input type {:?}", other).into()),
+        HllHashCarrier::Unsupported => Err(input_failure(HllInputFailure::Unsupported(
+            array.data_type(),
+        ))),
     }
 }
 
