@@ -31,6 +31,25 @@ impl fmt::Display for UnsupportedCarrier<'_> {
         write!(f, "hll_hash expects scalar input, got {:?}", self.0)
     }
 }
+/// One original NULL/hash/encoder leaf. Source owners project their original
+/// scalar bytes before this call; this function chooses no type/coercion policy.
+pub fn encode_scalar_bytes_observed<E>(
+    bytes: Option<&[u8]>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Vec<u8>, E> {
+    use crate::hll::{MURMUR_SEED, encode_hll_empty, encode_hll_single, murmur_hash64a_observed};
+    let Some(bytes) = bytes else {
+        return Ok(encode_hll_empty());
+    };
+    let hash = murmur_hash64a_observed(bytes, MURMUR_SEED, observe)?;
+    Ok(encode_hll_single(hash))
+}
+pub fn encode_scalar_bytes(bytes: Option<&[u8]>) -> Vec<u8> {
+    match encode_scalar_bytes_observed::<std::convert::Infallible>(bytes, &mut || Ok(())) {
+        Ok(bytes) => bytes,
+        Err(impossible) => match impossible {},
+    }
+}
 pub enum Input<'a> {
     Boolean(&'a BooleanArray),
     Int8(&'a Int8Array),
@@ -115,14 +134,12 @@ impl<'a> Input<'a> {
         row: usize,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Vec<u8>, E> {
-        use crate::hll::{MURMUR_SEED, encode_hll_empty, encode_hll_single, murmur_hash64a_observed};
         macro_rules! hash {
             ($a:expr,$bytes:expr) => {{
                 if $a.is_null(row) {
-                    return Ok(encode_hll_empty());
+                    return encode_scalar_bytes_observed(None, observe);
                 }
-                let hash = murmur_hash64a_observed($bytes.as_ref(), MURMUR_SEED, observe)?;
-                Ok(encode_hll_single(hash))
+                encode_scalar_bytes_observed(Some($bytes.as_ref()), observe)
             }};
         }
         match self {

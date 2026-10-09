@@ -510,37 +510,16 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
                     );
                 }
             }
-            use novarocks_types::value::hll::{
-                MURMUR_SEED, encode_hll_empty, encode_hll_single, murmur_hash64a,
-            };
+            use novarocks_functions::hll_hash_core::encode_scalar_bytes;
             let arg = expr_to_literal(args[0])?;
-            // Mirror the runtime `eval_hll_hash` byte conversion exactly:
-            //   - NULL  → encode_hll_empty()
-            //   - Int   → Int64 little-endian (analyzer types integer literals as Int64)
-            //   - Float → Float64 little-endian
-            //   - String → raw UTF-8 bytes
-            //   - Bool  → single byte 0/1
+            // Preserve this INSERT author's original byte projection. SELECT
+            // analyzer coercion is a distinct source contract, not a default here.
             let bytes = match arg {
-                Literal::Null => encode_hll_empty(),
-                Literal::Int(v) => {
-                    let buf = v.to_le_bytes();
-                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
-                Literal::Float(v) => {
-                    let buf = v.to_le_bytes();
-                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
-                Literal::String(s) => {
-                    let hash = murmur_hash64a(s.as_bytes(), MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
-                Literal::Bool(b) => {
-                    let buf = [if b { 1u8 } else { 0u8 }];
-                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
+                Literal::Null => encode_scalar_bytes(None),
+                Literal::Int(v) => encode_scalar_bytes(Some(&v.to_le_bytes())),
+                Literal::Float(v) => encode_scalar_bytes(Some(&v.to_le_bytes())),
+                Literal::String(s) => encode_scalar_bytes(Some(s.as_bytes())),
+                Literal::Bool(b) => encode_scalar_bytes(Some(&[if b { 1u8 } else { 0u8 }])),
                 other => return Err(format!("hll_hash unsupported literal: {other:?}")),
             };
             Ok(Literal::String(bytes_to_latin1_string(&bytes)))
