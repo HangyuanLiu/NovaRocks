@@ -769,12 +769,7 @@ fn runtime_original_seven_causes_keep_success_null_and_ordinary_error_tails_with
 // fail. Kernel-backed carriers keep their own row operation.
 #[test]
 fn same_carrier_without_a_kernel_prepares_an_identity_with_no_row_operation() {
-    for carrier in [
-        DataType::Utf8,
-        DataType::Binary,
-        DataType::Date32,
-        DataType::Decimal128(10, 2),
-    ] {
+    for carrier in [DataType::Utf8, DataType::Binary, DataType::Date32] {
         let identity = PreparedCastRecipe::try_new(
             CastOperation::Carrier,
             &ty(carrier.clone(), false),

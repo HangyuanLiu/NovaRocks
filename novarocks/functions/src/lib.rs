@@ -2681,3 +2681,6 @@ pub mod field_shared;
 
 mod native_bitnot;
 pub use native_bitnot::*;
+
+/// Original Decimal128 CAST computation shared by legacy and selected shells.
+pub mod decimal128_rescale;

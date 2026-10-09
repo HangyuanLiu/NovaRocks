@@ -386,7 +386,7 @@ impl ContractLoweringVisitor<'_> {
                         expr,
                         target,
                         allow_throw_exception,
-                        ..
+                        decimal_overflow_policy,
                     } => {
                         // The same statement owner authored this occurrence's reference.
                         // Read its frozen boolean, never an ambient setting or default.
@@ -398,9 +398,10 @@ impl ContractLoweringVisitor<'_> {
                         let input = &self.construction_expression(fragment, *expr)?.ty;
                         let mut revised = old.ty.clone();
                         revised.nullable |= input.nullable
-                            || novarocks_functions::carrier_cast_can_produce_null(
+                            || novarocks_functions::carrier_cast_can_produce_null_with_policy(
                                 &input.data_type,
                                 target,
+                                *decimal_overflow_policy,
                                 self.root_allow_throw_exception,
                             );
                         revised

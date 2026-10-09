@@ -274,6 +274,9 @@ fn compare_legacy_rows(
             CastRowResult::Unsigned(_) => {
                 panic!("signed numeric cast returned an unsigned integer")
             }
+            CastRowResult::Decimal128(_) => {
+                panic!("signed numeric cast returned a decimal")
+            }
         }
     }
     (legacy, rows)

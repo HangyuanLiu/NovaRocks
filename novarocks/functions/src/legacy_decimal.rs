@@ -20,13 +20,17 @@ use arrow_buffer::i256;
 
 /// Compute 10^exp in i128 with overflow checking.
 pub fn pow10_i128(exp: usize) -> Result<i128, String> {
+    checked_pow10_i128(exp).ok_or_else(|| "decimal overflow".to_string())
+}
+
+/// Original checked multiplication without an intermediate diagnostic allocation.
+/// Legacy Option consumers and Result consumers share this single value author.
+pub fn checked_pow10_i128(exp: usize) -> Option<i128> {
     let mut out: i128 = 1;
     for _ in 0..exp {
-        out = out
-            .checked_mul(10)
-            .ok_or_else(|| "decimal overflow".to_string())?;
+        out = out.checked_mul(10)?;
     }
-    Ok(out)
+    Some(out)
 }
 
 /// Compute 10^exp in i256 with overflow checking.

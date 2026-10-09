@@ -227,6 +227,20 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
     }
 }
 
+/// Exact successful-NULL fact with the original frozen Decimal overflow policy.
+/// Other cast domains retain their original existing author unchanged.
+pub fn carrier_cast_can_produce_null_with_policy(
+    source: &DataType,
+    target: &DataType,
+    policy: DecimalOverflowPolicy,
+    allow: bool,
+) -> bool {
+    if matches!(source, DataType::Decimal128(..)) && matches!(target, DataType::Decimal128(..)) {
+        return crate::decimal128_rescale::can_produce_null(policy, allow);
+    }
+    carrier_cast_can_produce_null(source, target, allow)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
     Date32,
@@ -308,6 +322,7 @@ pub enum CastRowResult {
     Unsigned(u64),
     Float32(f32),
     Float64(f64),
+    Decimal128(i128),
     Timestamp(i64),
     Text(String),
     RowError(RowDataError),
@@ -331,6 +346,10 @@ impl DecimalTextSource {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    DecimalRescale {
+        precision: u8,
+        scale: i8,
+    },
     TimeCalendar,
     TimeText {
         mode: crate::time_text_cast::TimeTextParseMode,
@@ -395,6 +414,30 @@ impl PreparedCastRecipe {
         let outcome = (|| {
             for ty in [source, result] {
                 validate_type_observed(ty, &mut work).map_err(CastPrepareError::Kernel)?;
+            }
+            // Decimal128's original same-metadata path enforces actual precision.
+            // It is not an identity, even when only nullability differs.
+            if operation == CastOperation::Carrier
+                && source.logical_type == ValueLogicalType::Physical
+                && result.logical_type == ValueLogicalType::Physical
+                && matches!(source.data_type, DataType::Decimal128(..))
+                && let DataType::Decimal128(precision, scale) = result.data_type
+            {
+                if (source.nullable
+                    || crate::decimal128_rescale::can_produce_null(policy, allow_throw_exception))
+                    && !result.nullable
+                {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                work.step()?;
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::DecimalRescale { precision, scale },
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
             }
             // A Physical carrier with no primitive conversion kernel is still
             // exactly castable to itself: the value passes unchanged and only
@@ -738,6 +781,17 @@ impl PreparedCastRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
+            CastBody::DecimalRescale { scale, .. } => {
+                let DataType::Decimal128(_, source_scale) = self.source.data_type else {
+                    unreachable!("prepared exact Decimal128 source")
+                };
+                crate::decimal128_rescale::may_raise(
+                    source_scale,
+                    scale,
+                    self.decimal_overflow_policy,
+                    self.allow_throw_exception,
+                )
+            }
             // Raw Date32 admits invalid days and original unchecked arithmetic.
             // Preserve its data error and overflow panic rather than promising never-fails.
             CastBody::DateFloat { .. } => true,
@@ -800,6 +854,63 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
+            if let CastBody::DecimalRescale { precision, scale } = self.body {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| array.as_any().is::<Decimal128Array>(),
+                )?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid(
+                            "non-null Decimal128 cast argument contains a selected NULL",
+                        ))
+                    };
+                }
+                work.flush()?;
+                let selected = argument.array().slice(row, 1);
+                work.flush()?;
+                let mut observe = |event| match event {
+                    crate::decimal128_rescale::DecimalRescaleObservation::Step => work.step(),
+                    crate::decimal128_rescale::DecimalRescaleObservation::OpaqueBoundary => {
+                        work.flush()
+                    }
+                };
+                let output = match crate::decimal128_rescale::evaluate_observed(
+                    &selected,
+                    precision,
+                    scale,
+                    self.decimal_overflow_policy,
+                    self.allow_throw_exception,
+                    &mut observe,
+                ) {
+                    Ok(output) => output,
+                    Err(crate::decimal128_rescale::DecimalRescaleError::Host(cause)) => {
+                        return Err(cause);
+                    }
+                    Err(crate::decimal128_rescale::DecimalRescaleError::Data(message)) => {
+                        return Ok(CastRowResult::RowError(RowDataError::new(
+                            ordinal, &message,
+                        )));
+                    }
+                };
+                work.flush()?;
+                let output = output
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        internal("Decimal128 rescale core returned a foreign frozen carrier")
+                    })?;
+                return Ok(if output.is_null(0) {
+                    CastRowResult::Null
+                } else {
+                    CastRowResult::Decimal128(output.value(0))
+                });
+            }
             if self.body == CastBody::TimeCalendar {
                 let row = self.checked_row_with_shape(
                     argument,
@@ -1686,3 +1797,7 @@ mod decimal_float_tests;
 #[cfg(test)]
 #[path = "cast_decimal_float32_tests.rs"]
 mod decimal_float32_tests;
+
+#[cfg(test)]
+#[path = "cast_decimal128_rescale_tests.rs"]
+mod decimal128_rescale_tests;

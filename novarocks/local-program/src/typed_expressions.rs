@@ -173,9 +173,10 @@ impl ProgramTypedExpressions {
                             // Successful NULLs share the primitive cast semantic author;
                             // this does not require a dead definition to be runtime-installed.
                             if *operation == novarocks_functions::CastOperation::Carrier
-                                && novarocks_functions::carrier_cast_can_produce_null(
+                                && novarocks_functions::carrier_cast_can_produce_null_with_policy(
                                     &source.data_type,
                                     &value.data_type,
+                                    *decimal_overflow_policy,
                                     *allow_throw_exception,
                                 )
                                 && !value.nullable

@@ -1363,7 +1363,9 @@ fn evaluate_cast<'a>(
     selection: Selection<'a>,
     work: &mut Work<'_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
-    use arrow::array::{Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array};
+    use arrow::array::{
+        Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    };
     use novarocks_functions::CastRowResult as R;
     let ty = &recipe.result_type().data_type;
     // An unzoned primitive rendering fits within 64 bytes, including the
@@ -1389,8 +1391,11 @@ fn evaluate_cast<'a>(
     selection
         .len()
         .checked_mul(
-            std::mem::size_of::<Option<i64>>()
-                + std::mem::size_of::<RowDataError>()
+            if matches!(ty, DataType::Decimal128(..)) {
+                std::mem::size_of::<Option<i128>>()
+            } else {
+                std::mem::size_of::<Option<i64>>()
+            } + std::mem::size_of::<RowDataError>()
                 + novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES,
         )
         .and_then(|n| n.checked_add(bitmap))
@@ -1413,6 +1418,7 @@ fn evaluate_cast<'a>(
         U64(Vec<Option<u64>>),
         F32(Vec<Option<f32>>),
         F64(Vec<Option<f64>>),
+        Decimal128(Vec<Option<i128>>),
     }
     let mut output = match ty {
         DataType::Boolean => Output::Boolean(Vec::new()),
@@ -1432,6 +1438,7 @@ fn evaluate_cast<'a>(
         DataType::UInt64 => Output::U64(Vec::new()),
         DataType::Float32 => Output::F32(Vec::new()),
         DataType::Float64 => Output::F64(Vec::new()),
+        DataType::Decimal128(..) => Output::Decimal128(Vec::new()),
         _ => return Err(internal("cast recipe has a foreign frozen result carrier")),
     };
     match &mut output {
@@ -1450,6 +1457,7 @@ fn evaluate_cast<'a>(
         Output::U64(v) => v.try_reserve_exact(selection.len()),
         Output::F32(v) => v.try_reserve_exact(selection.len()),
         Output::F64(v) => v.try_reserve_exact(selection.len()),
+        Output::Decimal128(v) => v.try_reserve_exact(selection.len()),
     }
     .map_err(|_| KernelFailure::ResourceExhausted)?;
     let mut errors = Vec::new();
@@ -1527,6 +1535,7 @@ fn evaluate_cast<'a>(
             (Output::U64(v), R::Unsigned(n)) => v.push(Some(n)),
             (Output::F32(v), R::Float32(n)) => v.push(Some(n)),
             (Output::F64(v), R::Float64(n)) => v.push(Some(n)),
+            (Output::Decimal128(v), R::Decimal128(n)) => v.push(Some(n)),
             (Output::I8(v), R::Null) => v.push(None),
             (Output::Boolean(v), R::Null) => v.push(None),
             (Output::I16(v), R::Null) => v.push(None),
@@ -1541,6 +1550,7 @@ fn evaluate_cast<'a>(
             (Output::U64(v), R::Null) => v.push(None),
             (Output::F32(v), R::Null) => v.push(None),
             (Output::F64(v), R::Null) => v.push(None),
+            (Output::Decimal128(v), R::Null) => v.push(None),
             _ => {
                 return Err(internal(
                     "cast body returned a foreign result representation",
@@ -1585,6 +1595,22 @@ fn evaluate_cast<'a>(
         Output::U64(v) => Arc::new(arrow::array::UInt64Array::from(v)),
         Output::F32(v) => Arc::new(Float32Array::from(v)),
         Output::F64(v) => Arc::new(Float64Array::from(v)),
+        Output::Decimal128(v) => {
+            let DataType::Decimal128(precision, scale) = *ty else {
+                return Err(internal(
+                    "Decimal128 cast output metadata differs from its frozen result",
+                ));
+            };
+            Arc::new(
+                Decimal128Array::from(v)
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|_| {
+                        internal(
+                            "Decimal128 cast output differs from its frozen precision and scale",
+                        )
+                    })?,
+            )
+        }
     };
     work.flush()?;
     SelectedValues::try_new_observed(selection, ty, array, errors.into_boxed_slice(), || {

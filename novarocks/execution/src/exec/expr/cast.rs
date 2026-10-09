@@ -47,11 +47,7 @@ use novarocks_types::value::variant::{
 };
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
 fn pow10_i128(scale: u32) -> Option<i128> {
-    let mut out: i128 = 1;
-    for _ in 0..scale {
-        out = out.checked_mul(10)?;
-    }
-    Some(out)
+    novarocks_functions::legacy_decimal::checked_pow10_i128(scale as usize)
 }
 
 fn decimal128_to_i64_literal(value: i128, scale: i8) -> Option<i64> {
@@ -2075,13 +2071,7 @@ fn retag_decimal_array(
     precision: u8,
     scale: i8,
 ) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal128(precision, scale))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(make_array(data))
+    novarocks_functions::decimal128_rescale::retag_legacy(array, precision, scale)
 }
 
 fn retag_decimal256_array(
@@ -2188,58 +2178,12 @@ fn cast_decimal_to_decimal_relaxed(
     target_precision: u8,
     target_scale: i8,
 ) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-    let precision_limit = 10_u128
-        .checked_pow(u32::from(target_precision))
-        .filter(|_| (1..=38).contains(&target_precision))
-        .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
-    let mut values = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        let mut value = arr.value(row);
-        if source_scale < target_scale {
-            let factor = pow10_i128((target_scale - source_scale) as u32)
-                .ok_or_else(|| "decimal scale overflow while casting DECIMAL".to_string())?;
-            let Some(scaled) = value.checked_mul(factor) else {
-                values.push(None);
-                continue;
-            };
-            value = scaled;
-        } else if source_scale > target_scale {
-            let factor = pow10_i128((source_scale - target_scale) as u32)
-                .ok_or_else(|| "decimal scale overflow while casting DECIMAL".to_string())?;
-            let quotient = value / factor;
-            let remainder = value % factor;
-            let needs_round = remainder.abs().saturating_mul(2) >= factor;
-            value = if needs_round {
-                let carry = if value < 0 { -1 } else { 1 };
-                let Some(rounded) = quotient.checked_add(carry) else {
-                    values.push(None);
-                    continue;
-                };
-                rounded
-            } else {
-                quotient
-            };
-        }
-        if value.unsigned_abs() >= precision_limit {
-            values.push(None);
-            continue;
-        }
-        values.push(Some(value));
-    }
-
-    // Build with max precision first, then retag to FE-declared precision/scale.
-    let wide = Decimal128Array::from(values)
-        .with_precision_and_scale(38, target_scale)
-        .map_err(|e| e.to_string())?;
-    retag_decimal_array(&wide, target_precision, target_scale)
+    novarocks_functions::decimal128_rescale::relaxed_legacy(
+        child_array,
+        source_scale,
+        target_precision,
+        target_scale,
+    )
 }
 
 fn cast_decimal256_to_decimal256_relaxed(
@@ -2776,69 +2720,17 @@ fn is_decimal_type(data_type: &DataType) -> bool {
 }
 
 fn checked_numeric_cast_has_overflow(source: &ArrayRef, casted: &ArrayRef) -> Result<bool, String> {
-    if source.len() != casted.len() {
-        return Err("checked decimal CAST length mismatch".to_string());
-    }
-    for row in 0..source.len() {
-        if source.is_null(row) || !casted.is_null(row) {
-            continue;
-        }
-        // Non-finite input is invalid input, distinct from overflow of a finite number.
-        let finite = match source.data_type() {
-            DataType::Float32 => source
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "checked CAST Float32 downcast failed".to_string())?
-                .value(row)
-                .is_finite(),
-            DataType::Float64 => source
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "checked CAST Float64 downcast failed".to_string())?
-                .value(row)
-                .is_finite(),
-            _ => true,
-        };
-        if finite {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    novarocks_functions::decimal128_rescale::checked_numeric_cast_has_overflow_legacy(
+        source, casted,
+    )
 }
 
 /// Enforce a declared decimal target even on same-scale/retag conversion paths.
 /// Limits are frozen metadata and computed once, before iterating values.
 fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, String> {
     match array.data_type() {
-        DataType::Decimal128(precision, scale) => {
-            let (precision, scale) = (*precision, *scale);
-            let limit = 10_u128
-                .checked_pow(u32::from(precision))
-                .filter(|_| (1..=38).contains(&precision))
-                .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
-            let source = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "checked CAST Decimal128 downcast failed".to_string())?;
-            if (0..source.len())
-                .all(|row| source.is_null(row) || source.value(row).unsigned_abs() < limit)
-            {
-                return Ok(array);
-            }
-            let values = (0..source.len())
-                .map(|row| {
-                    if source.is_null(row) || source.value(row).unsigned_abs() >= limit {
-                        None
-                    } else {
-                        Some(source.value(row))
-                    }
-                })
-                .collect::<Vec<_>>();
-            Ok(Arc::new(
-                Decimal128Array::from(values)
-                    .with_precision_and_scale(precision, scale)
-                    .map_err(|error| error.to_string())?,
-            ))
+        DataType::Decimal128(..) => {
+            novarocks_functions::decimal128_rescale::enforce_precision_legacy(array)
         }
         DataType::Decimal256(precision, scale) => {
             let (precision, scale) = (*precision, *scale);
@@ -2894,6 +2786,17 @@ pub fn eval(
     }
 
     let child_array = arena.eval(child, chunk)?;
+    if let (DataType::Decimal128(..), DataType::Decimal128(precision, scale)) =
+        (child_array.data_type(), &target_type)
+    {
+        return novarocks_functions::decimal128_rescale::evaluate_legacy(
+            &child_array,
+            *precision,
+            *scale,
+            decimal_overflow_policy,
+            arena.allow_throw_exception(),
+        );
+    }
     if is_checked_decimal_numeric_cast(child_array.data_type(), &target_type) {
         let casted = if child_array.data_type() == &target_type {
             child_array.clone()

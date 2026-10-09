@@ -93,11 +93,22 @@ fn compare(p: u8, s: i8, target: DataType, raw: Vec<Option<i128>>) {
         let out = instance(&constant)
             .evaluate(&cb, Selection::try_sparse(5, &[1, 4]).unwrap(), &Control)
             .unwrap();
-        assert!(out.errors().is_empty());
-        assert_eq!(
-            values(out.values()),
-            values(&actual(input(p, s, vec![Some(1); 2]), target.clone(), policy, allow).unwrap())
-        );
+        match actual(input(p, s, vec![Some(1); 2]), target.clone(), policy, allow) {
+            Ok(expected) => {
+                assert!(out.errors().is_empty());
+                assert_eq!(values(out.values()), values(&expected));
+            }
+            Err(message) => {
+                assert_eq!(values(out.values()), vec![None, None]);
+                assert_eq!(
+                    out.errors()
+                        .iter()
+                        .map(|error| (error.selected_ordinal(), error.message().to_owned()))
+                        .collect::<Vec<_>>(),
+                    vec![(0, message.clone()), (1, message)]
+                );
+            }
+        }
     }
 }
 #[test]
@@ -133,4 +144,72 @@ fn decimal128_rescale_actual_compiler_identical_metadata_full_carrier_precision_
             Some(-10),
         ],
     );
+}
+
+#[test]
+fn decimal128_rescale_actual_compiler_full_rescale_rounding_overflow_scale_and_null_profiles() {
+    for (p, s, tp, ts) in [
+        (38, 0, 38, 1),
+        (10, 4, 10, 2),
+        (18, -2, 20, 0),
+        (18, 2, 20, -2),
+        (38, 0, 38, -38),
+        (38, 38, 38, -38),
+        (1, -38, 38, 38),
+    ] {
+        compare(
+            p,
+            s,
+            DataType::Decimal128(tp, ts),
+            vec![
+                Some(i128::MIN),
+                Some(i128::MAX),
+                None,
+                Some(3185),
+                Some(-3185),
+                Some(1),
+            ],
+        );
+    }
+}
+#[test]
+fn decimal128_rescale_actual_compiler_every_seven_callback_causes_stop_and_latch_without_replay() {
+    for (p, s, tp, ts, policy, allow) in [
+        (7, 2, 9, 3, DecimalOverflowPolicy::OutputNull, false),
+        (1, 0, 1, 0, DecimalOverflowPolicy::ReportError, true),
+        (38, 38, 38, -38, DecimalOverflowPolicy::OutputNull, false),
+    ] {
+        let source = input(p, s, vec![Some(1), Some(i128::MAX), None, Some(-1)]);
+        let program = compiled(
+            FunctionValueType::new(source.data_type().clone(), true),
+            FunctionValueType::new(DataType::Decimal128(tp, ts), true),
+            Source::Column,
+            Wrap::Bare,
+            policy,
+            allow,
+        );
+        let data = batch(&program, source);
+        let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
+        instance(&program)
+            .evaluate(&data, Selection::all(4), &recorder)
+            .unwrap();
+        let trace = recorder.trace.lock().unwrap().clone();
+        assert!(trace.iter().all(|n| *n <= 256));
+        for stop in 1..=trace.len() {
+            for cause in causes() {
+                let mut frame = instance(&program);
+                let control = CallbackControl::new(cause.clone(), stop);
+                assert!(
+                    matches!(frame.evaluate(&data,Selection::all(4),&control),Err(actual) if actual==cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..stop]);
+                let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
+                assert!(matches!(
+                    frame.evaluate(&data, Selection::all(4), &after),
+                    Err(KernelFailure::InstanceFailed)
+                ));
+                assert!(after.trace.lock().unwrap().is_empty());
+            }
+        }
+    }
 }
