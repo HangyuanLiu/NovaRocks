@@ -451,3 +451,6 @@ fn analytic_input_stage_original_empty_gather_panic_remains() {
 
 #[path = "analytic_copy_operation_port_tests.rs"]
 mod copy_operation_ports;
+
+#[path = "analytic_stage_metadata_escape_tests.rs"]
+mod metadata_escape_tests;

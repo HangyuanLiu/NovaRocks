@@ -45,19 +45,38 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
+#[path = "runtime_kernel_memory.rs"]
+pub(super) mod runtime_kernel_memory;
+
 /// Kernel control backed by the fragment's runtime error state: a recorded
 /// failure or cancellation refuses the next checkpoint, and waits are
 /// interruptible by the same state.
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
+    query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
 }
 impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
         Self {
             error,
+            query_memory: None,
             allocator: None,
         }
+    }
+    /// Borrow the already-validated task capability at original operator binding.
+    /// Arc/account clones establish no funding domain or allocation authorization.
+    pub(crate) fn bind_runtime_memory(&mut self, state: &RuntimeState) {
+        self.query_memory = state.query_memory().cloned();
+    }
+    pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
+        self.query_memory.as_ref()
+    }
+    pub(super) fn request_kernel_memory(
+        &self,
+        request: runtime_kernel_memory::KernelMemoryRequest,
+    ) -> runtime_kernel_memory::KernelMemoryAdmission {
+        runtime_kernel_memory::request(self.query_memory(), request)
     }
     pub(crate) fn bind_mem_tracker(
         &mut self,
@@ -259,6 +278,10 @@ struct CompiledProjectProcessor {
     finished: bool,
 }
 impl Operator for CompiledProjectProcessor {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.control.bind_mem_tracker(tracker);
     }
@@ -420,6 +443,10 @@ struct CompiledFilterProcessor {
     finished: bool,
 }
 impl Operator for CompiledFilterProcessor {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.control.bind_mem_tracker(tracker);
     }

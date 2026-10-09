@@ -263,13 +263,19 @@ impl CompiledWindowProcessorFactory {
     }
 }
 
-impl OperatorFactory for CompiledWindowProcessorFactory {
-    fn name(&self) -> &str {
-        &self.name
+impl CompiledWindowProcessorFactory {
+    #[cfg(test)]
+    pub(crate) fn bind_runtime_memory_for_test(
+        &self,
+        state: &RuntimeState,
+    ) -> ExecutionResult<Option<crate::runtime::query_memory::QueryMemoryBinding>> {
+        let mut processor = self.create_processor();
+        processor.prepare()?;
+        processor.bind_runtime_state(state)?;
+        Ok(processor.control.query_memory().cloned())
     }
-
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledWindowProcessor {
+    fn create_processor(&self) -> CompiledWindowProcessor {
+        CompiledWindowProcessor {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
@@ -291,7 +297,17 @@ impl OperatorFactory for CompiledWindowProcessorFactory {
             original_function_major: self.original_function_major,
             invocation_input: None,
             partition_ordinal: 0,
-        })
+        }
+    }
+}
+
+impl OperatorFactory for CompiledWindowProcessorFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+        Box::new(self.create_processor())
     }
 }
 
@@ -1053,6 +1069,10 @@ fn validate_complete_output(
 }
 
 impl Operator for CompiledWindowProcessor {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        Ok(())
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.control.bind_mem_tracker(tracker);
     }
