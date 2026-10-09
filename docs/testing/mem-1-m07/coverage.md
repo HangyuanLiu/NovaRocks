@@ -604,3 +604,11 @@ outer十case累计488.338s包含source/build哈希与独立prep，不替代/续�
 原协议10项＋新actor11项定向 **21 PASS / 0 FAIL / 0 ignored，0.33s**；actual command terminal exit0。non-test runner check PASS（1m46s）、fmt/diff-check PASS。独立审查指出的v1重入误成功、端口错绑、expiry测试弃server join结果均已在v2修正，旧ignoredv1 bytes保留。收据 `evidence/p09-held-response-actor-components-20261009.json` pin源码/原草稿/独立review/实际日志/旧freeze与manifest/lock。
 
 真实duplex H2及本地Bytes::from_owner是host组件，不冒充BE alias/authenticated Native。held reply不完整decode；withheld是drop前lastsample，reset_requested仅方法调用，不能推BE收到RST。Drop仅abort不产join证明；新Native scene必须全部分支持同outer+runtime并actual settle、保存原primary和cleanup原因。独立原FE身份/launchclock、新可执行freeze、同context正BE send holder/seal后两次lateACK1维持accepted0、释放后context收敛/原MySQL恢复/四role退出仍OPEN；fullClosing64/backinglastalias/其余P08/P00b/P09/P10/final不闭合。无产品cap/deadline/依赖/旧input改动或publish。
+
+### P08 fixed SDK listing startup agreement component PASS (2026-10-09)
+
+原 Server config load 和 FE/BE composition 入口统一检查实际 owner 的冻结 V1 参数：各 catalog8位置、REST connect5s/read30s、OpenDAL List16MiB及原SPI六维listing bound。只读getter投影实际被使用的常量，无新增TOML/env tuning或第二admission owner。独立V1 literal拒默认漂移；整毫秒/u128→u64/page乘积checked，原ConnectorError保实际类型与InvalidRequest。请求更紧bound不改，不猜read30s≤caller10s、List16MiB≤owned page或SDK位置×FS字节的跨域关系。
+
+参数/溢出/实际error downcast **5 PASS**、app_config **65 PASS**、composition **8 PASS**，均0FAIL/0ignored/actual terminal0；Server非test lib+binarycheck、fmt/diff-checkPASS。后加一个cfg(test)错误类型回归，先前65/8的生产源未改。收据 `evidence/p08-sdk-listing-startup-components-20261009.json` pin实际源码、原draft、独立review与logs/profile；仅加server dev serde_json依赖，Cargo.lock只加既有workspace package边，无生产新依赖。
+
+加载门早于role启动，composition首句不冒充早于调用者已有runtime/scan资源。JSON/参数检查不证明List运行行为、SDK实际future退出、第三方内部硬字节界、Native大CL/CM。P08完整checked进程包络需P00b系数，运行期增容/全Hostdrain/里程碑C0及最终同SHA仍OPEN；其余P09/P00b/P10、人类语义和HMS IRU-7例外不变，无push/PR/归档。

@@ -794,6 +794,7 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 /// read by more than the startup path, and a value that can never be honoured
 /// should be refused where it is written, not where it is first used.
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
+    crate::sdk_listing_profile::validate_current()?;
     config.application.state_store_policy.resolve()?;
     Ok(())
 }

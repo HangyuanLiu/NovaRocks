@@ -4303,6 +4303,7 @@ dependencies = [
  "novarocks-worker",
  "novarocks-workload-control",
  "serde",
+ "serde_json",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

@@ -439,6 +439,7 @@ pub fn compose_backend_server_config(
     runtime: tokio::runtime::Handle,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<BackendServerConfig> {
+    crate::sdk_listing_profile::validate_current()?;
     config
         .server
         .validate_for_role(novarocks_types::ClusterRole::Be)
@@ -609,6 +610,7 @@ pub fn compose_frontend_role_config(
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendRoleConfig> {
+    crate::sdk_listing_profile::validate_current()?;
     let runtime_config = &config.runtime;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;

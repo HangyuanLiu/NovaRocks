@@ -144,3 +144,7 @@ clean `1fb1319df` 的原 x S−1/S/S+1、wide q17 S+1缺尾、tiny1..6，十个�
 ### 2026-10-09：P09 同原 response 持有 actor 组件 PASS
 
 原protocol10项和新held-response11项共21 PASS；non-test runner check、fmt/diff-check PASS。原handle保留/actualjoin、取消cleanup重入sticky失败、过期/早退出/panic、实际BE端口绑定均有定向组件覆盖。见[收据](evidence/p09-held-response-actor-components-20261009.json)。host H2 queued owner不是BE alias，Native新scene/source/clock/freeze、真实正holder/seal/lateACK/recovery与四role退出仍OPEN；其它完整M07门不关闭。
+
+### 2026-10-09：P08 SDK 参数联合启动校验组件 PASS
+
+原config load/FE/BE composition检查实际owner冻结V1参数与checked算术，无新增配置旋钮或跨域预算公式。参数5/app_config65/composition8项PASS，Server非test lib+binarycheck、fmt/diff-checkPASS；见[收据](evidence/p08-sdk-listing-startup-components-20261009.json)。参数/JSON一致性不能代替SDK实际退出、List运行行为或Native/CM；完整进程包络、P00b、P08里程碑C0及其它M07门仍OPEN。

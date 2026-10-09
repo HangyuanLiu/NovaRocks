@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "5fc658c18a3ca9847fca0ef7db9eca04a0758007",
+  "status": "P08_FIXED_SDK_LISTING_STARTUP_AGREEMENT_COMPONENT_PASS_NATIVE_OPEN",
+  "source_files": [
+    {
+      "path": "novarocks-server/src/sdk_listing_profile.rs",
+      "bytes": 11775,
+      "sha256": "aec2238df1add442516cdac8658deea47c1058c854812265373b4d0be5dfd0a4"
+    },
+    {
+      "path": "novarocks-server/src/app_config.rs",
+      "bytes": 175810,
+      "sha256": "1ca0cc4ba8f74ac39688c8416b0965d6b7d68c327d2a30084475bda604291751"
+    },
+    {
+      "path": "novarocks-server/src/composition.rs",
+      "bytes": 65693,
+      "sha256": "cbc55d4269d2fa3481258d07998279d268d804f72650848ec42741e100e7b986"
+    },
+    {
+      "path": "novarocks-server/src/lib.rs",
+      "bytes": 1280,
+      "sha256": "8e254c8a426c86714c4764497e3b16e39c6c4c09aea83ccafab166885c845167"
+    },
+    {
+      "path": "novarocks-server/Cargo.toml",
+      "bytes": 3301,
+      "sha256": "308bcfb0d3cb4c205498fa14f9b3eb8ffeb5cc87c3fc84cb5d2f097c4425960c"
+    },
+    {
+      "path": "Cargo.lock",
+      "bytes": 190820,
+      "sha256": "329758dab8450639028e5ca6d150f400de0c56930d16154afad0a356823f6e10"
+    },
+    {
+      "path": "novarocks/connector/iceberg/src/catalog_runtime.rs",
+      "bytes": 13293,
+      "sha256": "66d8d0213a4aa8d6aaaca2f7717875d187229067a27e41318ea532cd9fff20eb"
+    },
+    {
+      "path": "novarocks/connector/paimon/src/lib.rs",
+      "bytes": 1400,
+      "sha256": "0b7d7a812d487f016404160747508bea2852134dee1ad01fec24c4cbbb5cfcdf"
+    },
+    {
+      "path": "novarocks/fs/src/lib.rs",
+      "bytes": 5260,
+      "sha256": "78a93200bff5a252859dbe929e723b5353d5852023ce5bcb54ecc1d72fc07c4f"
+    }
+  ],
+  "draft_and_review_provenance": [
+    {
+      "path": "logs/mem-1-m07/p08-sdk-listing-startup-check-draft-v1/sdk-listing-startup-check.v2.draft.patch",
+      "bytes": 14285,
+      "sha256": "b5b143ab42f582821af08c689a71ee9de81e99f906af7d516792be601423bcb0"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-sdk-listing-startup-check-draft-v1/audit.md",
+      "bytes": 6400,
+      "sha256": "63f639ecc59914b57392ec2f9759dc15067acd5daf7483fd8f916c12aa9fa8ae"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-sdk-listing-startup-independent-review-v1/review.md",
+      "bytes": 5527,
+      "sha256": "7c6e2e746b99d6cbe9cbe1dc0fd281e1a9f78e7d92f95dded74fffc93d775aef"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-sdk-listing-startup-independent-review-v1/review-pins.json",
+      "bytes": 2517,
+      "sha256": "12948ba953ad89634d5101eebbf510db7c6e202c8f1c8e35d2c1b80a05ea67a2"
+    }
+  ],
+  "frozen_profile": {
+    "path": "docs/testing/mem-1-m07/profile-v1.json",
+    "bytes": 9391,
+    "sha256": "96eb57f1f0241aa22819fe83b10bb65b3a9ece0c69891e8eaf3d9cc895e270d9"
+  },
+  "verification": [
+    {
+      "path": "logs/mem-1-m07/p08-sdk-listing-startup-tests-v2-20261009.log",
+      "bytes": 185059,
+      "sha256": "15ee7cb3eee2706531aec45e66fdde819a514ae1e843a352bb3db10f18ff15ae",
+      "filter": "sdk_listing_profile",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 67790,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p08-sdk-listing-app-config-tests-20261009.log",
+      "bytes": 189589,
+      "sha256": "8aa4c6348070f1c17e96579dadac19675d40a2e71a76b220086499a18026301a",
+      "filter": "app_config::tests",
+      "passed": 65,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": null,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p08-sdk-listing-composition-tests-20261009.log",
+      "bytes": 184753,
+      "sha256": "89681bac35942dc2f81ec4d3e121c77e0477c29a79a906d9e89b0b19ce1ad163",
+      "filter": "composition::tests",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": null,
+      "actual_terminal_exit_code": 0
+    }
+  ],
+  "non_test_server_lib_and_binary_check": {
+    "path": "logs/mem-1-m07/p08-sdk-listing-server-check-v2-20261009.log",
+    "bytes": 184321,
+    "sha256": "f9e3a4d70d20c3bcf8404bbdf18bb302c2d0a11741feece24461f73530d46fc3",
+    "actual_session": 12182,
+    "actual_terminal_exit_code": 0
+  },
+  "format_check": {
+    "path": "logs/mem-1-m07/p08-sdk-listing-fmt-check-v2-20261009.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actual_session": 73778,
+    "actual_terminal_exit_code": 0
+  },
+  "behavior": [
+    "The original config load and both role composition entries validate actual owner parameters against frozen V1.",
+    "Read-only projections return actual Iceberg/Paimon admission counts, REST timeout constants and OpenDAL List response limit.",
+    "The validator checks nonzero exact milliseconds, checked u128-to-u64 conversion, checked page geometry and original listing bound validation.",
+    "Independent literals prevent a drifted fixed V1 value from silently becoming its own startup default.",
+    "The original ConnectorError object and InvalidRequest classification survive startup validation wrapping.",
+    "Request-specific tighter listing bounds and existing request deadline/stop semantics are unchanged."
+  ],
+  "component_boundary": [
+    "There are no new TOML/environment tuning knobs, production dependencies or cross-provider admission owners.",
+    "serde_json is added only as a server dev dependency; the lockfile records that already existing workspace package edge.",
+    "No relation is invented between REST read timeout and caller deadline, or between FS response bytes and owned page bytes.",
+    "Load validation precedes role startup; composition validation precedes its own work, not resources its caller may already have constructed.",
+    "JSON agreement and parameter tests do not prove List-only I/O, nonretryability, SDK future exit, trusted-buffer memory limits or Native listing behavior.",
+    "App config and composition tests preceded the final test-only ConnectorError downcast regression; production startup code was unchanged."
+  ],
+  "remaining_open": [
+    "Complete startup owner/transport envelope after P00b coefficient freeze, runtime concurrency transaction and full Host drain.",
+    "Native large HMS/Paimon listing, actual eight SDK positions, cancellation/exit/recovery and owner settlement.",
+    "Full Closing64, held send alias late ACK, backing last-alias and other P09 pressure gates.",
+    "P00b, CM, release CP, Linux handoff, P08 milestone C0, P10 and final same-SHA validation."
+  ],
+  "hms_non_readonly_correctness": "EXCLUDED_BY_USER_IRU7_SCOPE",
+  "publish_authorized": false,
+  "goal_complete": false
+}

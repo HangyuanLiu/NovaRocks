@@ -26,6 +26,12 @@ mod cache;
 mod catalog_properties;
 mod error;
 mod list_body_limit;
+
+/// Read the fixed per-response byte limit used only for OpenDAL List.
+/// Other reads and trusted SDK internal allocations retain their own policy.
+pub const fn frozen_object_store_list_body_limit_bytes() -> usize {
+    list_body_limit::OBJECT_STORE_LIST_BODY_LIMIT_BYTES
+}
 mod object_store_credentials;
 mod object_store_settings;
 mod physical_reader;
