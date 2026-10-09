@@ -116,6 +116,7 @@ pub(crate) fn decode_fragment_submission(
         instance.fragment_instance_id,
         exchange_wait,
     )
+    .with_backend_process_id(instance.backend_process_id)
     .with_typed_scan_runtime(typed_scan_runtime)
     .with_function_catalog(function_catalog);
     let mut ledger = NativeRuntimeFilterDecodeLedger::decode(
@@ -300,6 +301,7 @@ mod tests {
     fn instance(query: UniqueId, finst: UniqueId) -> NativeFragmentInstanceInput {
         NativeFragmentInstanceInput {
             query_id: QueryId::new(query.high(), query.low()),
+            backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             fragment_instance_id: FragmentInstanceId::new(finst),
             backend_num: BackendNum::try_new(3).expect("backend num"),
             query_options: QueryOptions {
