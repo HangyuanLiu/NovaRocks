@@ -6,8 +6,8 @@
   "review_status": "draft",
   "frozen_before_execution": false,
   "source_revision": null,
-  "helper_sha256": "ddcc92f163ec10e8778716c1a8c1f9704ccbf641302e9cb95e9a4f54b66d3a86",
-  "scala_template_sha256": "2c0bb5084d2829fb495bab7552a229f11221d91ba9acf3fd623812a86ed997d4",
+  "helper_sha256": "68680324046fac51becbee6b389c719be44f39a26e7de1f7d576547c01553c23",
+  "scala_template_sha256": "265c62c47b6b62a487e2bd9163ad6fb6b6f1d2deb60034a4fa3a58365e658933",
   "source": {
     "docker_binary": "/Applications/Docker.app/Contents/Resources/bin/docker",
     "fixture_store": "/Users/harbor/.cache/novarocks/fixture-inputs",
@@ -61,13 +61,13 @@
       ]
     },
     "hms_failure_retries": 0,
-    "hms_connect_retries": 0,
     "table_partition_spec": {
       "spec-id": 0,
       "fields": []
     },
     "table_spec_count": 1,
-    "oracle_list_all_tables": true
+    "oracle_list_all_tables": true,
+    "hms_connect_attempts": 1
   },
   "pins": [
     {

@@ -12,7 +12,7 @@
 
 模板仍为 `review_status=draft`、`frozen_before_execution=false`，直接使用会在 owner 创建前拒绝。`source_revision=null` 是唯一未绑定的源码身份字段：主 agent 先审阅、应用并提交 promotion，然后从模板生成 ignored 的独立不可变执行副本，将它绑定到实际干净已提交的 HEAD；不要向 tracked 模板写入包含其自身的尚未生成 commit。
 
-模板的 helper SHA256 是推广后源文件的真实 hash `ddcc92f163ec10e8778716c1a8c1f9704ccbf641302e9cb95e9a4f54b66d3a86`；Scala 模板 SHA256 `2c0bb5084d2829fb495bab7552a229f11221d91ba9acf3fd623812a86ed997d4` 不变。execution copy 必须复核 helper、Scala、17 个源文件 pins、实际 BOM/canonical lock、实际 stock HMS/writer image、JAR 长度/SHA1 和本机绝对路径，最后才设置 `review_status=reviewed`、`frozen_before_execution=true`。模板的 `source.docker_binary` / `fixture_store` 是既有本机锁定输入路径，不是环境猜测；换主机时必须明确审阅并绑定实际输入。schema 使用 exact keys，没有额外 `helper_path` 字段；source 路径由本说明和实际 CLI 文件固定，helper 自身核对 `__file__` hash。
+模板的 helper SHA256 是推广后源文件的真实 hash `68680324046fac51becbee6b389c719be44f39a26e7de1f7d576547c01553c23`；Scala 模板 SHA256 `265c62c47b6b62a487e2bd9163ad6fb6b6f1d2deb60034a4fa3a58365e658933`。execution copy 必须复核 helper、Scala、17 个源文件 pins、实际 BOM/canonical lock、实际 stock HMS/writer image、JAR 长度/SHA1 和本机绝对路径，最后才设置 `review_status=reviewed`、`frozen_before_execution=true`。模板的 `source.docker_binary` / `fixture_store` 是既有本机锁定输入路径，不是环境猜测；换主机时必须明确审阅并绑定实际输入。schema 使用 exact keys，没有额外 `helper_path` 字段；source 路径由本说明和实际 CLI 文件固定，helper 自身核对 `__file__` hash。
 
 CLI（仅示例，不表示已执行 provider）：
 
@@ -47,3 +47,9 @@ python3 docs/testing/mem-1-m07/scripts/test_prepare_real_hms_capability.py
 原 helper SHA256 `c6a23e85402eed40c0538da8c1fc4f075de0127b569d0a3dedb4b8a1c66df6c8`，原 freeze SHA256 `170f11b6f27b0b47fffd74e98c3041526122e0018a1ea0b190b0dec124f0b248`，原 host-only test SHA256 `5340b5cac1600e3aa3614363f4f19fe00f0edc5a4e1b8cd55a46313748bbb41b`；原文件字节保留。
 
 helper 仅改 Apache header 的句间空格/空行、docstring 去除 draft 标签、REPO 从 ignored 路径的 `parents[2]` 改为 scripts 路径的 `parents[4]`。host-only test 仅增加相同 Apache header/shebang，loader 改成实际同目录文件名；测试断言不变。freeze 仅更新 helper hash、将旧 efb 源码身份替换为显式未绑定 null；其他字段逐字段相同。Scala/API/限额/cleanup/BaseException 语义不变。本说明是新的实际路径文档，历史 v1–v5 notes 不覆盖。
+
+## 首次真实运行纠正：一次连接而非零次
+
+clean 5fe6f4dfd首次预检只产生RuntimeMetaException failure marker，create没有成功mutation记录；完整private cleanup成功，失败收据保留于evidence/p09-hms-capability-preflight-v1-failed-20261009.json。实际stock Spark image内hive-metastore-2.3.9.jar SHA256为224b4a59344ff8136a68c0033801390f20d4d01c30ea5fd5dd9c4592f9c8a9ef。javap ctor/open证明METASTORETHRIFTCONNECTIONRETRIES是总连接轮数，原0在初始attempt0时直接退出连接loop。
+
+当前input明确hms_connect_attempts=1，映射Hive属性hive.metastore.connect.retries=1并typed readback为1；failure retries仍0。只允许一个初始connection round，没有额外retry。仓库helper原先误读第三方字段，纠正该测试工具不更改产品或原CL输入；所有其他scope/bounds/pins/image/JAR/API相同。旧immutable execution freeze不覆盖，后续运行绑定新的clean HEAD、新UUID private root与新immutable freeze，不重试上次未知创建。上文v5 promotion段落是历史机械推广边界；当前helper/Scala hashes反映此纠正。

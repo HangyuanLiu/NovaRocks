@@ -329,3 +329,11 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - v5 helper推广到scripts/prepare_real_hms_capability.py，实际repo寻址parents[4]；三项真实Python child边界测试PASS/0.035s：正常capture无多余kill、128B超界保留partial及whole-failure sticky、Popen后KeyboardInterrupt保留第一cause及未知detached owner。BaseException/退出/清理语义和1200s+240s总时钟均未改。17个source pins核对PASS。
 - tracked freeze保持draft/unfrozen/source_revision null，实际执行另建ignored immutable reviewed copy绑定clean已提交HEAD/hash/BOM/images。收据p09-hms-capability-host-focused-20261009.json。仅host capture与输入模板证据；真实HMS 1table+1view能力预检尚未执行，不冒充原32×512table+512view大CL/Native mixed分类或READY。无push/PR/归档。
+
+
+### 2026-10-09 P09：真实HMS预检首跑失败及初始连接字段纠正
+
+- clean5fe6f4dfd首跑实际stockSpark create exit1，唯一failure marker RuntimeMetaException/message hash与Failed to connect to Hive Metastore字面一致，无成功mutation记录。所有host children实际reap/原groupgone；实际HMS/writer IDs均消失，private HMS/catalog/object-store records消失，cleanup complete/errors空/shared未改。失败收据p09-hms-capability-preflight-v1-failed-20261009.json保留原freeze/hash/actualidentity，不冒充PASS。
+- 无网络的锁定Spark镜像javap确认实际Hive2.3.9总连接轮数：初始attempt0>=retries0直接跳出，原helper误读成extra retries。当前helper/freezeinput改hms_connect_attempts1→Hive property1并readback1，failure retries0，允许首次connection而无额外retry；不改产品、scope/CL/caps/deadlines或旧freeze。需要新cleanHEAD、新UUID/newfreeze重新运行；并非重试unknowncreate。
+
+- 纠正后host-only四测试PASS/0.037s（包括reviewed freeze通过及initial attempts0提前拒绝）；第一次schema key漏改所致定向ERROR日志保留，已在provider新运行前修正，未放宽exact schema。

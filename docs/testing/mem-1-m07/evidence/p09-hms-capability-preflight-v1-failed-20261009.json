@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "scope": "private stock HMS capability preflight first failure",
+  "source_revision": "5fe6f4dfd3f6f770f45d49f0a11fd1641412802a",
+  "status": "FAILED",
+  "native_started": false,
+  "bulk_ready": false,
+  "failure": {
+    "container_id": "23350e4286745d4d15621105fc6073e4ada01bec6d921a6e7c6611d2186fd450",
+    "container_name": "nr-m07-hms-cap-2029bd7d50464d1ca805e61f9d51803d-create",
+    "exit_code": 1,
+    "output_bytes": 605,
+    "output_sha256": "668551830dbdc9e96bb7dfcf1f176972d3d438d94d6b09b9e1aa679d0ffc6844",
+    "phase": "create",
+    "program_sha256": "9de2b641ec69d6f1be8a01d72ddec64878c788be4b2a498aabd117e8fd05d3de",
+    "record_sha256": [
+      "13fe098648aa484518b7fb949e53e997072190a16cc17ec11ca2bb803d934fb7"
+    ],
+    "records": [
+      {
+        "kind": "failure",
+        "phase": "create",
+        "value": {
+          "exception_class": "org.apache.iceberg.hive.RuntimeMetaException",
+          "message_sha256": "0aa50baa61787b40d36d00d774c4ce9046920b9925401b6090674d5c5bec0eac"
+        }
+      }
+    ],
+    "unconfirmed_mutations": [
+      "create_namespace",
+      "create_table",
+      "create_view"
+    ],
+    "writer_exited": true
+  },
+  "diagnosis": {
+    "image_id": "sha256:fd53681a8c2bc0cc9c684c0f688e98d199ac1b654438d1f2ab61c41218c7f153",
+    "actual_hive_jar": "/opt/spark/jars/hive-metastore-2.3.9.jar",
+    "actual_hive_jar_sha256": "224b4a59344ff8136a68c0033801390f20d4d01c30ea5fd5dd9c4592f9c8a9ef",
+    "observed_wrapper_reason": "Failed to connect to Hive Metastore",
+    "observed_reason_sha256": "0aa50baa61787b40d36d00d774c4ce9046920b9925401b6090674d5c5bec0eac",
+    "bytecode": "HiveMetaStoreClient ctor loads METASTORETHRIFTCONNECTIONRETRIES into retries; open initializes attempt=0, exits if attempt>=retries before first URI connect. Frozen zero allows zero initial attempts. One permits one initial connection round; extra retries remain zero."
+  },
+  "cleanup": {
+    "complete": true,
+    "errors": [],
+    "retention_barriers": [],
+    "all_owned_host_groups_gone": true,
+    "all_command_pids_absent": true,
+    "actual_hms_and_writer_ids_absent": [
+      "ef18369e0499ccc64de9a6ad3052c30b4a289f3a0caf0f1f7928466d0bfe676a",
+      "23350e4286745d4d15621105fc6073e4ada01bec6d921a6e7c6611d2186fd450"
+    ],
+    "actual_private_owner_records_absent": [
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v1-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/hms/cat-ff2bcfd3257a/manifest.json",
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v1-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/cat-ff2bcfd3257a/record.json",
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v1-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/os-eec671f90159/record.json"
+    ]
+  },
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v1-20261009/status.json",
+      "sha256": "ecbe2649fe4f9c3279045d781cea2c3a981252e85877b31f73a7967320317c26",
+      "bytes": 15833
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v1-20261009/create-receipt.json",
+      "sha256": "18ddbc3f76807e6e3df81ef14ae9409221ded11a8ab7af075fcb9c41f4733cbd",
+      "bytes": 762
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v1-20261009/bound-input.json",
+      "sha256": "f03b925b46ec55e1c066d243354e3ebb6f52efe01212967d3ff7536aa65a0676",
+      "bytes": 5240
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-execution-freeze-v1-20261009.json",
+      "sha256": "b53176510dfe316a0268c7cf74ccb16106fea038f37163f92c2fd2c324ee2d9f",
+      "bytes": 4954
+    },
+    {
+      "path": "logs/mem-1-m07/p09-stock-spark-hive-client-bytecode-20261009.log",
+      "sha256": "f302e074beefab34155621219be76393aee089c9b2058379cd774e182d33fa54",
+      "bytes": 292638
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-capture-boundary-connect-attempt-20261009.log",
+      "sha256": "275fe2291aeea9dc8cfb193b21973630db037a31d1124a186dc9a886343a63e9",
+      "bytes": 2721
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-capture-boundary-connect-attempt-v2-20261009.log",
+      "sha256": "919544438af833403cb501e31d6cdedca36bdce17175e6285e2af99ec25f8760",
+      "bytes": 722
+    }
+  ],
+  "correction_focused_tests": {
+    "command": "python3 docs/testing/mem-1-m07/scripts/test_prepare_real_hms_capability.py -v",
+    "passed": 4,
+    "failed": 0,
+    "duration_seconds": 0.037,
+    "prior_failed_check": "input exact_keys still named hms_connect_retries; corrected schema key before provider rerun",
+    "scope": "Host-only; includes actual legal reviewed freeze validation and refusal of zero initial connection attempts before owner launch"
+  }
+}

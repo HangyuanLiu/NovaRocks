@@ -48,6 +48,16 @@ class CaptureBoundary(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.killpg(facts['owned_group_id'],0)
 
+    def test_disabled_initial_connection_is_rejected_before_owner_launch(self):
+        import json
+        freeze_path = Path(__file__).parents[1] / 'inputs/real-hms-capability-preflight-freeze-v1.json'
+        freeze = json.loads(freeze_path.read_text())
+        freeze.update(review_status='reviewed', frozen_before_execution=True)
+        helper.validate_freeze(freeze)
+        freeze['input']['hms_connect_attempts'] = 0
+        with self.assertRaisesRegex(helper.Refusal, 'capability input differs'):
+            helper.validate_freeze(freeze)
+
     def test_normal_direct_capture_exits_without_kill(self):
         (code,output,facts),children=self.capture("print('bounded')")
         self.assertEqual(code,0)

@@ -225,7 +225,7 @@ def validate_freeze(freeze):
     }, "numeric bounds differ from reviewed capability draft")
     exact_keys(freeze["input"], ("namespace_prefix", "catalog_name", "table_name", "view_name",
         "view_sql", "view_dialect", "table_format_version", "view_format_version",
-        "view_version_id", "schema", "hms_failure_retries", "hms_connect_retries",
+        "view_version_id", "schema", "hms_failure_retries", "hms_connect_attempts",
         "table_partition_spec", "table_spec_count", "oracle_list_all_tables"))
     need(freeze["input"] == {
         "namespace_prefix": "m07_cap_", "catalog_name": "m07_hms_preflight",
@@ -233,7 +233,7 @@ def validate_freeze(freeze):
         "view_dialect": "spark", "table_format_version": 2, "view_format_version": 1,
         "view_version_id": 1, "schema": {"type": "struct", "schema-id": 0,
             "fields": [{"id": 1, "name": "id", "required": True, "type": "long"}]},
-        "hms_failure_retries": 0, "hms_connect_retries": 0,
+        "hms_failure_retries": 0, "hms_connect_attempts": 1,
         "table_partition_spec": {"spec-id": 0, "fields": []}, "table_spec_count": 1,
         "oracle_list_all_tables": True,
     }, "capability input differs")
@@ -578,10 +578,13 @@ object M07HmsCapability {
   }
   def run(): Unit = {
     val conf = new org.apache.hadoop.conf.Configuration(spark.sparkContext.hadoopConfiguration)
-    conf.set("hive.metastore.failure.retries", "0"); conf.set("hive.metastore.connect.retries", "0")
+    conf.set("hive.metastore.failure.retries", "0")
+    // Hive 2.3.9 counts total connection rounds: zero disables the initial
+    // connection. Exactly one round permits the first attempt and no retry.
+    conf.set("hive.metastore.connect.retries", "1")
     val hiveConf = new org.apache.hadoop.hive.conf.HiveConf(conf, classOf[HiveCatalog])
     require(hiveConf.getIntVar(org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTORETHRIFTFAILURERETRIES) == 0, "HMS failure retry setting ignored")
-    require(hiveConf.getIntVar(org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTORETHRIFTCONNECTIONRETRIES) == 0, "HMS connection retry setting ignored")
+    require(hiveConf.getIntVar(org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTORETHRIFTCONNECTIONRETRIES) == 1, "HMS initial connection attempt setting ignored")
     cat.setConf(conf)
     val properties = new java.util.HashMap[String,String]()
     Seq("uri", "warehouse", "io-impl", "s3.endpoint", "s3.path-style-access", "s3.access-key-id", "s3.secret-access-key", "s3.region").foreach { key =>
