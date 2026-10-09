@@ -209,6 +209,10 @@ impl AutomaticMaintenanceContext {
                 self.cancellation.clone(),
             ),
         }
+        .map(|context| {
+            context
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
+        })
     }
 
     pub fn ensure_active(&self) -> Result<(), String> {

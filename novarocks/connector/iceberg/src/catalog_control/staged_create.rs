@@ -132,7 +132,7 @@ pub(crate) fn prepare_rest_staged_table(
     partitioning: &[ConnectorPartitionTransform],
     properties: &[(Arc<str>, Arc<str>)],
 ) -> Result<RestStagedTableCreate, RestStagedPrepareFailure> {
-    // The generation-level twin of `admit_create(CreateTableAsSelect)`. Both
+    // The generation-level twin of the operation-shaped CTAS admission. Both
     // gates decide the same thing from the same generation, and both must
     // decide it before anything is attempted.
     let owner = Arc::clone(runtime.novarocks_catalog());
@@ -140,9 +140,14 @@ pub(crate) fn prepare_rest_staged_table(
     // a namespace round trip -- and a catalog that cannot stage a create should
     // not pay for any of it, nor have its real reason masked by whichever of
     // those steps happens to fail first.
-    if let Err(reason) =
-        owner.admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
-    {
+    if let Err(reason) = owner.admit(
+        &crate::catalog::admission::CatalogAdmissionRequest::statement(
+            crate::catalog::admission::CatalogOperation::CreateTable(
+                crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+            ),
+            crate::catalog::CatalogTableName::new(namespace_name, table_name),
+        ),
+    ) {
         return Err(RestStagedPrepareFailure::Unsupported(
             reason.message().to_string(),
         ));
@@ -884,11 +889,18 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         // publish a CTAS target atomically has to say so here: past this point
         // the caller starts its source, and a refusal would arrive after work
         // that can no longer be taken back.
-        if let Err(unsupported) = self
-            .runtime
-            .novarocks_catalog()
-            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
-        {
+        if let Err(unsupported) = self.runtime.novarocks_catalog().admit(
+            &crate::catalog::admission::CatalogAdmissionRequest::new(
+                crate::catalog::admission::CatalogOperation::CreateTable(
+                    crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+                ),
+                crate::catalog::CatalogTableName::new(
+                    Arc::clone(&request.table.namespace),
+                    Arc::clone(&request.table.table),
+                ),
+                request.context.initiation(),
+            ),
+        ) {
             return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
                 failure: novarocks_spi::connector::ConnectorMutationFailure::new(
                     novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
@@ -2229,7 +2241,14 @@ mod tests {
         );
         runtime
             .novarocks_catalog()
-            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
+            .admit(
+                &crate::catalog::admission::CatalogAdmissionRequest::statement(
+                    crate::catalog::admission::CatalogOperation::CreateTable(
+                        crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+                    ),
+                    crate::catalog::CatalogTableName::new("db", "t"),
+                ),
+            )
             .expect_err("admission refuses CTAS without an enumerable staging root");
         let failure = match prepare_rest_staged_table(
             &runtime,
@@ -2310,12 +2329,26 @@ mod tests {
         let runtime = Arc::new(hadoop_runtime());
         let unsupported = runtime
             .novarocks_catalog()
-            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
+            .admit(
+                &crate::catalog::admission::CatalogAdmissionRequest::statement(
+                    crate::catalog::admission::CatalogOperation::CreateTable(
+                        crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+                    ),
+                    crate::catalog::CatalogTableName::new("db", "t"),
+                ),
+            )
             .expect_err("Hadoop cannot publish a CTAS target atomically");
         assert!(unsupported.message().contains("staged-create"));
         runtime
             .novarocks_catalog()
-            .admit_create(crate::catalog::CatalogCreateIntent::EmptyTable)
+            .admit(
+                &crate::catalog::admission::CatalogAdmissionRequest::statement(
+                    crate::catalog::admission::CatalogOperation::CreateTable(
+                        crate::catalog::CatalogCreateIntent::EmptyTable,
+                    ),
+                    crate::catalog::CatalogTableName::new("db", "t"),
+                ),
+            )
             .expect("an empty-table create is atomic on this catalog");
     }
 

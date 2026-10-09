@@ -52,6 +52,9 @@ fn background_connector_request_context() -> Result<ConnectorRequestContext, Str
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
+    .map(|context| {
+        context.with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
+    })
     .map_err(|error| error.to_string())
 }
 

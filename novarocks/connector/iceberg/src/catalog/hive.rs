@@ -24,6 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::ConnectorError;
 
+use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
@@ -35,7 +36,7 @@ use super::{
 
 /// A Hive Metastore Iceberg catalog.
 ///
-/// HMS has no standard staged-create protocol, so CTAS and create-or-replace
+/// HMS is a permanently read-only compatibility entry. It has no staged-create protocol, so CTAS and create-or-replace
 /// are refused here — before a source runs, a writer dispatches, or a staging
 /// object exists. There is no visible-empty-table fallback: creating the target
 /// first and filling it afterwards would make a half-built table readable,
@@ -49,6 +50,22 @@ pub(super) struct NovaRocksHiveCatalog {
 }
 
 impl NovaRocksHiveCatalog {
+    fn read_only(operation: CatalogOperation) -> CatalogUnsupported {
+        CatalogUnsupported::new(format!(
+            "Hive Metastore catalog is a read-only compatibility entry: {} is not supported; use an Iceberg REST or Hadoop catalog to write",
+            operation.name()
+        ))
+    }
+
+    fn refuse_operation(
+        &self,
+        operation: CatalogOperation,
+        target: impl Into<CatalogAdmissionTarget>,
+    ) -> CatalogUnsupported {
+        self.admit_operation(&operation, &target.into())
+            .expect_err("HMS mutation must be refused before side effects")
+    }
+
     /// Wrap a client the generation already built.
     pub(super) fn adopt(client: Arc<dyn crate::iceberg::Catalog>) -> Self {
         Self {
@@ -67,14 +84,13 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         Arc::clone(self.delegate.client())
     }
 
-    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported> {
-        match intent {
-            CatalogCreateIntent::EmptyTable => Ok(()),
-            CatalogCreateIntent::CreateTableAsSelect => Err(CatalogUnsupported::new(
-                "Hive Metastore Iceberg catalog has no standard staged-create protocol, so \
-                     CREATE TABLE AS SELECT cannot publish its target atomically",
-            )),
-        }
+    fn admit_operation(
+        &self,
+        operation: &CatalogOperation,
+        target: &CatalogAdmissionTarget,
+    ) -> Result<(), CatalogUnsupported> {
+        operation.validate_target(target)?;
+        Err(Self::read_only(*operation))
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
@@ -131,32 +147,36 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
 
     async fn create_namespace(
         &self,
-        namespace: CatalogNamespaceName,
+        _namespace: CatalogNamespaceName,
     ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.delegate.create_namespace(namespace).await
+        CatalogOutcome::Unsupported(
+            self.refuse_operation(CatalogOperation::CreateNamespace, _namespace),
+        )
     }
 
     async fn drop_namespace(
         &self,
-        namespace: CatalogNamespaceName,
+        _namespace: CatalogNamespaceName,
     ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.delegate.drop_namespace(namespace).await
+        CatalogOutcome::Unsupported(
+            self.refuse_operation(CatalogOperation::DropNamespace, _namespace),
+        )
     }
 
-    async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
-        self.delegate.drop_table(table).await
+    async fn drop_table(
+        &self,
+        _table: CatalogTableName,
+    ) -> CatalogOutcome<CatalogDropTableReceipt> {
+        CatalogOutcome::Unsupported(self.refuse_operation(CatalogOperation::DropTable, _table))
     }
 
     async fn anchor_written_metadata(
         &self,
-        table: CatalogTableName,
+        _table: CatalogTableName,
         _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
-        // This catalog owns its own metadata pointer, so a committed write is
-        // already reachable through it.
-        CatalogOutcome::committed(
-            table,
-            novarocks_spi::connector::ExternalMutationEffect::NoOp,
+        CatalogOutcome::Unsupported(
+            self.refuse_operation(CatalogOperation::BootstrapSnapshot, _table),
         )
     }
 
@@ -165,8 +185,9 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         _namespace: CatalogNamespaceName,
         _creation: crate::iceberg::TableCreation,
     ) -> super::StagedCreateStart {
-        super::StagedCreateStart::Unsupported(CatalogUnsupported::new(
-            "Hive Metastore Iceberg catalog has no staged-create protocol",
+        super::StagedCreateStart::Unsupported(self.refuse_operation(
+            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
+            CatalogTableName::new(Arc::clone(&_namespace.namespace), _creation.name),
         ))
     }
 
@@ -175,8 +196,9 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         _commit: crate::iceberg::TableCommit,
         _request_file_io: crate::iceberg::io::FileIO,
     ) -> super::StagedCommitResult {
-        super::StagedCommitResult::Unsupported(CatalogUnsupported::new(
-            "Hive Metastore Iceberg catalog has no staged-create protocol",
+        super::StagedCommitResult::Unsupported(self.refuse_operation(
+            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
+            CatalogTableName::from_identifier(_commit.identifier()),
         ))
     }
 
@@ -184,18 +206,23 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         &self,
         _request: ConditionalCreateRequest,
     ) -> CatalogOutcome<ConditionalCreateAttempt> {
-        CatalogOutcome::unsupported(
-            "Hive Metastore Iceberg catalog publishes a create through the metastore, not through a conditional metadata write",
-        )
+        CatalogOutcome::Unsupported(self.refuse_operation(
+            CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            CatalogTableName::new(
+                Arc::clone(&_request.namespace.namespace),
+                _request.creation.name,
+            ),
+        ))
     }
 
     async fn publish_conditional_create(
         &self,
         _attempt: ConditionalCreateAttempt,
     ) -> CatalogOutcome<ConditionalCreateReceipt> {
-        CatalogOutcome::unsupported(
-            "Hive Metastore Iceberg catalog publishes a create through the metastore, not through a conditional metadata write",
-        )
+        CatalogOutcome::Unsupported(self.refuse_operation(
+            CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            _attempt.target,
+        ))
     }
 
     async fn adjudicate_conditional_create(
@@ -208,31 +235,29 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         ))
     }
 
-    async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
-        super::start_update_table_transaction(&self.delegate, request)
+    async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {
+        CatalogTransactionStart::Unsupported(
+            self.refuse_operation(CatalogOperation::Append, _request.target),
+        )
     }
 
     async fn new_create_table_transaction(
         &self,
         request: CreateTableTransactionRequest,
     ) -> CatalogTransactionStart {
-        match request.intent {
-            CatalogCreateIntent::EmptyTable => {
-                super::start_create_table_transaction(&self.delegate, request)
-            }
-            CatalogCreateIntent::CreateTableAsSelect => match self.admit_create(request.intent) {
-                Ok(()) => super::start_create_table_transaction(&self.delegate, request),
-                Err(reason) => CatalogTransactionStart::Unsupported(reason),
-            },
-        }
+        CatalogTransactionStart::Unsupported(self.refuse_operation(
+            CatalogOperation::CreateTable(request.intent),
+            request.target,
+        ))
     }
 
     async fn new_create_or_replace_table_transaction(
         &self,
         _request: CreateTableTransactionRequest,
     ) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(CatalogUnsupported::new(
-            "Hive Metastore Iceberg catalog cannot replace a table atomically",
+        CatalogTransactionStart::Unsupported(self.refuse_operation(
+            CatalogOperation::CreateTable(_request.intent),
+            _request.target,
         ))
     }
 }

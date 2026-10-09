@@ -24,6 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
+use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::CatalogOutcome;
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
@@ -101,16 +102,19 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         Some(Arc::clone(&self.client))
     }
 
-    fn admit_create(
+    fn admit_operation(
         &self,
-        intent: CatalogCreateIntent,
+        operation: &CatalogOperation,
+        target: &CatalogAdmissionTarget,
     ) -> Result<(), super::error::CatalogUnsupported> {
-        match intent {
-            CatalogCreateIntent::EmptyTable => Ok(()),
-            CatalogCreateIntent::CreateTableAsSelect => self
-                .admit_staged_create(intent)
+        operation.validate_target(target)?;
+        match operation {
+            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect)
+            | CatalogOperation::CreateDocuments => self
+                .admit_staged_create(CatalogCreateIntent::CreateTableAsSelect)
                 .map(|_| ())
                 .map_err(super::error::CatalogUnsupported::new),
+            _ => Ok(()),
         }
     }
 
@@ -224,6 +228,12 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         namespace: CatalogNamespaceName,
     ) -> CatalogOutcome<CatalogNamespaceName> {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateNamespace,
+            &namespace.clone().into(),
+        ) {
+            return CatalogOutcome::Unsupported(reason);
+        }
         self.delegate.create_namespace(namespace).await
     }
 
@@ -231,10 +241,20 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         namespace: CatalogNamespaceName,
     ) -> CatalogOutcome<CatalogNamespaceName> {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::DropNamespace, &namespace.clone().into())
+        {
+            return CatalogOutcome::Unsupported(reason);
+        }
         self.delegate.drop_namespace(namespace).await
     }
 
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::DropTable, &table.clone().into())
+        {
+            return CatalogOutcome::Unsupported(reason);
+        }
         self.delegate.drop_table(table).await
     }
 
@@ -243,6 +263,11 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         table: CatalogTableName,
         _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::BootstrapSnapshot, &table.clone().into())
+        {
+            return CatalogOutcome::Unsupported(reason);
+        }
         // This catalog owns its own metadata pointer, so a committed write is
         // already reachable through it.
         CatalogOutcome::committed(
@@ -256,6 +281,14 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         namespace: CatalogNamespaceName,
         creation: crate::iceberg::TableCreation,
     ) -> super::StagedCreateStart {
+        let target = CatalogTableName::new(Arc::clone(&namespace.namespace), creation.name.clone());
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
+            &target.into(),
+        ) {
+            return super::StagedCreateStart::Unsupported(reason);
+        }
+
         let creation = with_explicit_format_version(creation);
         let ident = match super::delegate::namespace_ident(&namespace) {
             Ok(ident) => ident,
@@ -325,6 +358,14 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         commit: crate::iceberg::TableCommit,
         request_file_io: crate::iceberg::io::FileIO,
     ) -> super::StagedCommitResult {
+        let target = CatalogTableName::from_identifier(commit.identifier());
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
+            &target.into(),
+        ) {
+            return super::StagedCommitResult::Unsupported(reason);
+        }
+
         let result = match self.access_delegation {
             RestAccessDelegationMode::Static => self.client.commit_staged_table_typed(commit).await,
             // The vended generation has no catalog-global StorageFactory. The
@@ -382,6 +423,11 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     }
 
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
+        if let Err(reason) =
+            self.admit_operation(&CatalogOperation::Append, &request.target.clone().into())
+        {
+            return CatalogTransactionStart::Unsupported(reason);
+        }
         super::start_update_table_transaction(&self.delegate, request)
     }
 
@@ -389,6 +435,12 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         request: CreateTableTransactionRequest,
     ) -> CatalogTransactionStart {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::CreateTable(request.intent),
+            &request.target.clone().into(),
+        ) {
+            return CatalogTransactionStart::Unsupported(reason);
+        }
         if self.access_delegation == RestAccessDelegationMode::Vended {
             // The generic transaction API cannot retain the response-local
             // lease seed. Do not issue its static REST request and silently
@@ -407,10 +459,13 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 super::start_create_table_transaction(&self.delegate, request)
             }
             CatalogCreateIntent::CreateTableAsSelect => {
-                // Same decision as `admit_create`, so a caller that asked first
+                // Same operation rule as admission, so a caller that asked first
                 // and a caller that went straight to the constructor get the
                 // same answer.
-                match self.admit_create(request.intent) {
+                match self.admit_operation(
+                    &CatalogOperation::CreateTable(request.intent),
+                    &request.target.clone().into(),
+                ) {
                     Ok(()) => super::start_create_table_transaction(&self.delegate, request),
                     Err(reason) => CatalogTransactionStart::Unsupported(reason),
                 }
@@ -427,7 +482,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 "REST Iceberg vended credentials require a query-attempt lease consumer",
             ));
         }
-        match self.admit_create(CatalogCreateIntent::CreateTableAsSelect) {
+        match self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
+            &request.target.clone().into(),
+        ) {
             Ok(()) => super::start_create_table_transaction(&self.delegate, request),
             Err(reason) => CatalogTransactionStart::Unsupported(reason),
         }

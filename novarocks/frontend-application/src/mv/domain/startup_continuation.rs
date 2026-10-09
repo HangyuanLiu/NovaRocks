@@ -236,6 +236,7 @@ fn readmit(
             None,
             novarocks_spi::connector::ConnectorStopOwner::new().view(),
         )?
+        .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
         .after_external_effect(),
     )
 }
