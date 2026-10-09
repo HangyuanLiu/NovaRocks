@@ -37,6 +37,7 @@ url.workspace = true
 arrow-arith = "58.2.0"
 arrow-ord = "58.2.0"
 regex.workspace = true
+roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 allocator-api2 = "0.2"

@@ -4027,6 +4027,7 @@ dependencies = [
  "openssl",
  "rand 0.8.5",
  "regex",
+ "roaring 0.10.12",
  "ryu",
  "serde",
  "serde_json",

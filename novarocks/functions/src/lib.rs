@@ -47,6 +47,8 @@ pub mod approx_percentile_aggregate_core;
 mod arithmetic;
 mod binding;
 pub mod bit_array;
+pub mod bitmap_value;
+pub mod bitmap_to_string_core;
 pub mod bit_numeric;
 pub mod builtin;
 pub mod calendar_julian;
