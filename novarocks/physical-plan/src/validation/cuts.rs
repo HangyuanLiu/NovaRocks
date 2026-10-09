@@ -60,8 +60,8 @@ pub fn derive_fragment_cuts(plan: &PhysicalPlan) -> Option<BTreeMap<FragmentId, 
         .collect()
 }
 
-pub(crate) struct FragmentCutDerivation {
-    pub(crate) provenance: PlanSourceProvenance,
+pub(crate) struct FragmentCutDerivation<'a> {
+    pub(crate) provenance: PlanSourceProvenance<'a>,
     pub(crate) inbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) outbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) change_stream_writers: BTreeMap<EdgeId, crate::ChangeStreamWriterCut>,
@@ -98,8 +98,8 @@ pub(crate) struct RuntimeFilterBuildExpansion<'a> {
     pub(crate) work_budget: &'a mut SemanticTraceWorkBudget,
 }
 
-impl FragmentCutDerivation {
-    pub(crate) fn new(plan: &PhysicalPlan, limits: &PlanLimits) -> Option<Self> {
+impl<'a> FragmentCutDerivation<'a> {
+    pub(crate) fn new(plan: &'a PhysicalPlan, limits: &PlanLimits) -> Option<Self> {
         let provenance = source_provenance_index(plan)?;
         let mut inbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
         let mut outbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
@@ -462,25 +462,11 @@ pub(crate) fn change_stream_writer_cut(
     route: &crate::ChangeStreamRoute,
     edge: &Edge,
 ) -> Option<crate::ChangeStreamWriterCut> {
-    if route.input_mapping.len() != edge.destination.receive_mapping.len() {
-        return None;
-    }
-    let fields = route
-        .input_mapping
-        .iter()
-        .zip(edge.destination.receive_mapping.iter())
-        .map(|((token, route_source), (mapped_source, destination))| {
-            (route_source == mapped_source).then_some(crate::ChangeStreamWriterCutField {
-                token: *token,
-                source: *route_source,
-                destination: *destination,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
+    let proof = super::io_cuts::change_stream_writer_cut_ref(route, edge)?;
     Some(crate::ChangeStreamWriterCut {
-        route_id: route.route_id,
-        write_target_ordinal: route.write_target_ordinal,
-        fields: fields.into_boxed_slice(),
+        route_id: proof.route_id,
+        write_target_ordinal: proof.write_target_ordinal,
+        fields: proof.fields().collect(),
     })
 }
 
@@ -488,39 +474,20 @@ pub(crate) fn writer_result_cut(
     plan: &PhysicalPlan,
     edge: &Edge,
 ) -> Option<crate::WriterResultCut> {
-    if edge.kind != crate::EdgeKind::Stream {
-        return None;
-    }
-    let source = plan.fragments().get(&edge.source.fragment)?;
-    let root = source.nodes().get(&source.root())?;
-    let NodeKind::TableWriter { target } = &root.kind else {
-        return None;
-    };
-    if !matches!(source.sink(), FragmentSink::Stream { edge: sink_edge } if *sink_edge == edge.id)
-        || target.output_schema.fields.len() != edge.destination.receive_mapping.len()
-        || root.output.columns.as_ref() != edge.source.projection.as_ref()
-    {
-        return None;
-    }
-    let fields = target
-        .output_schema
-        .fields
-        .iter()
-        .zip(&edge.destination.receive_mapping)
-        .map(|(field, (mapped_source, destination))| {
-            (field.value == *mapped_source).then_some(crate::WriterResultCutField {
-                source: field.value,
-                destination: *destination,
-                name: field.name.clone(),
+    let proof = super::io_cuts::writer_result_cut_ref(plan, edge)?;
+    Some(crate::WriterResultCut {
+        write_target_ordinal: proof.write_target_ordinal,
+        schema_revision: proof.schema_revision,
+        fields: proof
+            .fields()
+            .map(|field| crate::WriterResultCutField {
+                source: field.source,
+                destination: field.destination,
+                name: field.name.into(),
                 ty: field.ty.clone(),
                 role: field.role,
             })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(crate::WriterResultCut {
-        write_target_ordinal: target.write_target_ordinal,
-        schema_revision: target.output_schema.revision,
-        fields: fields.into_boxed_slice(),
+            .collect(),
     })
 }
 
@@ -1144,7 +1111,10 @@ pub(crate) fn validate_fragment_cuts_into(
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
         FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
-        FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => Vec::new(),
+        FragmentSink::Result
+        | FragmentSink::RootResult(_)
+        | FragmentSink::SealedArtifact(_)
+        | FragmentSink::Noop => Vec::new(),
     };
     let sink_edge_ids = sink_edges.iter().copied().collect::<BTreeSet<_>>();
     if sink_edge_ids.len() != sink_edges.len() {

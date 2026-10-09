@@ -26,5 +26,10 @@ use crate::query_execution::completion::PreparedLogicalRead;
 /// Query Application runtime. The SQL session transfers the complete prepared
 /// carrier and the unique governed owner without learning Native adapter parts.
 pub(crate) trait LogicalReadLauncher: Send + Sync + 'static {
-    fn start(&self, read: PreparedLogicalRead, owner: WorkOwner) -> QueryExecutionFuture;
+    fn start(
+        &self,
+        read: PreparedLogicalRead,
+        owner: WorkOwner,
+        result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+    ) -> QueryExecutionFuture;
 }

@@ -33,14 +33,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use novarocks_execution_contract::{MaxWait, ResultByteLimit};
 use novarocks_types::identity::{
     AttemptId, FrontendProcessId, LocalQuerySequence, QueryExecutionId, QueryIdAttribution,
     QueryProcessNamespace,
 };
-use novarocks_workload_control::{
-    CancellationReason, LocalResourceAuthority, Stage, WorkError, WorkOwner,
-};
+use novarocks_workload_control::{CancellationReason, Stage, WorkError, WorkOwner};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -60,7 +57,7 @@ use super::{
     LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
     LogicalExecutionRuntimeShutdownError, NativeAttemptDrive, RecoveryDecision, RecoveryInput,
     RecoveryMode, ResultPumpFailure, assert_shutdown_complete, build_attempt_schedule,
-    evaluate_recovery, run_root_result_pump,
+    evaluate_recovery,
 };
 
 static NEXT_PROCESS_QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -87,8 +84,6 @@ pub struct LogicalExecutionRowsConfig {
     delivery_capacity: NonZeroUsize,
     max_attempts: NonZeroU32,
     replacement_reservation_valid_for: Duration,
-    fetch_max_wait: MaxWait,
-    fetch_byte_limit: ResultByteLimit,
 }
 
 impl LogicalExecutionRowsConfig {
@@ -96,15 +91,11 @@ impl LogicalExecutionRowsConfig {
         delivery_capacity: NonZeroUsize,
         max_attempts: NonZeroU32,
         replacement_reservation_valid_for: Duration,
-        fetch_max_wait: MaxWait,
-        fetch_byte_limit: ResultByteLimit,
     ) -> Self {
         Self {
             delivery_capacity,
             max_attempts,
             replacement_reservation_valid_for,
-            fetch_max_wait,
-            fetch_byte_limit,
         }
     }
 }
@@ -214,7 +205,6 @@ impl LogicalExecutionSupervisor {
     pub fn new(
         runtime: Handle,
         native: Arc<dyn LogicalExecutionNativePort>,
-        resources: LocalResourceAuthority,
         namespace: QueryProcessNamespace,
         frontend_process_id: FrontendProcessId,
         config: LogicalExecutionSupervisorConfig,
@@ -233,7 +223,6 @@ impl LogicalExecutionSupervisor {
         let join = runtime.spawn(run_supervisor(
             registry_handle,
             native,
-            resources,
             namespace,
             frontend_process_id,
             config,
@@ -445,7 +434,6 @@ impl ProcessQueryIdAllocator {
 async fn run_supervisor(
     registry: LogicalExecutionRuntimeRegistryHandle,
     native: Arc<dyn LogicalExecutionNativePort>,
-    resources: LocalResourceAuthority,
     namespace: QueryProcessNamespace,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
@@ -471,7 +459,6 @@ async fn run_supervisor(
                 logical_tasks.spawn(run_logical_execution(
                     command,
                     Arc::clone(&native),
-                    resources.clone(),
                     Arc::clone(&query_ids),
                     frontend_process_id,
                     config,
@@ -526,7 +513,6 @@ async fn run_supervisor(
 async fn run_logical_execution(
     command: StartCommand,
     native: Arc<dyn LogicalExecutionNativePort>,
-    resources: LocalResourceAuthority,
     query_ids: Arc<ProcessQueryIdAllocator>,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
@@ -658,6 +644,21 @@ async fn run_logical_execution(
             return fail_uninstalled_start(pending_owner, reply, registry_error(error));
         }
     };
+    let row_carrier = if result_schema.is_some() {
+        match description.row_carrier() {
+            Ok(carrier) => Some(carrier),
+            Err(error) => {
+                drop(stage);
+                return fail_uninstalled_start(
+                    pending_owner,
+                    reply,
+                    QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, error),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let max_establish_authorizations = config.max_establish_authorizations_per_context;
     let actor_config = match (&result_schema, description.recovery()) {
         (None, RecoveryMode::NoRecovery) => LogicalExecutionActorConfig::no_recovery_completion(
@@ -681,6 +682,7 @@ async fn run_logical_execution(
                 stage,
                 schema.clone(),
                 config.rows.delivery_capacity,
+                row_carrier.expect("row output carrier was validated"),
             )
         }
         (Some(schema), RecoveryMode::RestartAttemptBeforeVisibility) => {
@@ -702,6 +704,7 @@ async fn run_logical_execution(
                         config.rows.replacement_reservation_valid_for,
                         schema.clone(),
                         config.rows.delivery_capacity,
+                        row_carrier.expect("row output carrier was validated"),
                     )
                 }
                 Err(error) => Err(error),
@@ -787,7 +790,7 @@ async fn run_logical_execution(
     };
     let (mut active, rows_runtime) = active.into_parts();
     match (&result_schema, rows_runtime) {
-        (Some(schema), Some(rows_runtime)) => {
+        (Some(_), Some(rows_runtime)) => {
             let running = match actor.activate(initial.ready()).await {
                 Ok(running) => running,
                 Err(error) => {
@@ -823,7 +826,6 @@ async fn run_logical_execution(
                 &actor,
                 &mut session,
                 Arc::clone(&description),
-                resources,
                 scope,
                 frontend_process_id,
                 config,
@@ -838,7 +840,6 @@ async fn run_logical_execution(
                     running,
                     runtime: rows_runtime,
                 },
-                schema.clone(),
             )
             .await;
             let retire_result = retire_logical(&registry, registration).await;
@@ -1149,28 +1150,20 @@ async fn drive_rows_attempt_until_pump_decision(
     running: super::RunningAttemptPermit,
     root: novarocks_execution_contract::TaskIdentity,
     scope: novarocks_workload_control::WorkScope,
-    resources: LocalResourceAuthority,
-    schema: ResultSchema,
     runtime: NativeRowsAttemptRuntime,
-    max_wait: MaxWait,
-    fetch_byte_limit: ResultByteLimit,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
 ) -> (Result<super::LogicalConclusion, ResultPumpFailure>,) {
     let (terminal_sender, terminal_source) = super::native_attempt_terminal_channel();
     let mut terminal_sender = Some(terminal_sender);
     let native_run = catch_future_panic(active.run(drive, cancellation));
-    let pump = run_root_result_pump(
+    let pump = super::run_root_relay(
         running,
         root,
         scope,
-        resources,
-        schema,
         runtime.binding,
         runtime.statuses,
         terminal_source,
-        max_wait,
-        fetch_byte_limit,
     );
     tokio::pin!(native_run);
     tokio::pin!(pump);
@@ -1205,7 +1198,6 @@ async fn supervise_rows(
     actor: &super::LogicalExecutionActor,
     session: &mut LogicalNativeSession,
     description: Arc<crate::preparation::FrozenExecutionDescription>,
-    resources: LocalResourceAuthority,
     scope: novarocks_workload_control::WorkScope,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
@@ -1215,7 +1207,6 @@ async fn supervise_rows(
     requester: &novarocks_workload_control::WorkCancellationRequester,
     active_plan: super::ActiveLogicalPlan,
     mut attempt: RowsAttempt,
-    schema: ResultSchema,
 ) -> Result<(), QueryExecutionError> {
     let mut residuals = JoinSet::new();
     // One recovery window covers every replacement preparation. A failed
@@ -1238,11 +1229,7 @@ async fn supervise_rows(
             attempt.running,
             attempt.schedule.root(),
             scope.clone(),
-            resources.clone(),
-            schema.clone(),
             attempt.runtime,
-            config.rows.fetch_max_wait,
-            config.rows.fetch_byte_limit,
             shutdown,
             requester,
         )
@@ -2084,7 +2071,6 @@ fn native_future_panicked(message: &'static str) -> QueryExecutionError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -2148,8 +2134,6 @@ mod tests {
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroU32::new(2).unwrap(),
                 Duration::from_secs(30),
-                MaxWait::new(Duration::from_millis(10)).unwrap(),
-                ResultByteLimit::new(1 << 12).unwrap(),
             ),
         )
     }
@@ -2266,19 +2250,6 @@ mod tests {
         root.business.release();
     }
 
-    fn supervisor_resources() -> LocalResourceAuthority {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 12,
-                per_scope_bytes: (1 << 20) - (1 << 12),
-            },
-        )
-        .unwrap();
-        control.resources()
-    }
-
     #[tokio::test]
     async fn uninstalled_failure_settles_its_known_cancel_control() {
         let (control, root) = governance();
@@ -2327,19 +2298,42 @@ mod tests {
     }
 
     fn rows_request(
+        control: &WorkloadControl,
+        scope: &novarocks_workload_control::WorkScope,
         recovery: RecoveryMode,
         replacements: Option<Arc<dyn super::super::ReplacementQualificationEffectPort>>,
-        attempts: impl NativeAttemptPreparationPort,
+        mut attempts: impl TestRowsPreparationPort,
     ) -> QueryExecutionRequest {
         let plan = crate::completed_plan_fixture::completed_values_plan_blocking(fixture_version());
+        use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
+        let render =
+            novarocks_sql::compiler::client_render_schema(plan.candidate().plan(), 0).unwrap();
+        let candidate = crate::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan.candidate()
+                .plan()
+                .as_ref()
+                .clone()
+                .with_root_output(RootOutputContract::new(
+                    RootProfileId::V1,
+                    FrozenRootOutput::ClientRows(render),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(scope, novarocks_workload_control::ResultWindowClass::Client)
+            .unwrap();
+        attempts.bind_window(window.retain_alias());
         let output = OutputContract::from_completed_plan(
             crate::api::QueryExecutionKind::Read,
-            plan.candidate().plan(),
+            candidate.plan(),
         )
         .unwrap();
         let description = FrozenExecutionDescription::for_completed_plan(
             crate::api::QueryExecutionKind::Read,
-            plan.candidate().clone(),
+            candidate,
             Vec::new(),
             output,
             super::super::ExecutionEffect::None,
@@ -2357,17 +2351,111 @@ mod tests {
         )
     }
 
-    fn rows_decode_runtime() -> super::super::RootResultDecodeRuntime {
-        static OWNER: OnceLock<super::super::RootResultDecodeRuntimeOwner> = OnceLock::new();
-        OWNER
-            .get_or_init(|| {
-                super::super::RootResultDecodeRuntimeOwner::try_new(
-                    NonZeroUsize::new(1).unwrap(),
-                    NonZeroUsize::new(4).unwrap(),
-                )
-                .unwrap()
+    #[derive(Clone)]
+    struct TestWindow(novarocks_workload_control::ResultWindowAlias);
+    impl std::fmt::Debug for TestWindow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TestWindow")
+                .field("scope", &self.0.scope_id())
+                .finish()
+        }
+    }
+
+    trait TestRowsPreparationPort: NativeAttemptPreparationPort {
+        fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias);
+    }
+
+    struct TestRootReadPort {
+        sent: AtomicBool,
+        payload: Option<&'static [u8]>,
+    }
+    impl crate::api::BoundedRootReadPort for TestRootReadPort {
+        fn read(
+            &self,
+            request: novarocks_execution_contract::root_result::RootResultRead,
+            guard: novarocks_workload_control::ResultWindowAlias,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::api::RetainedRootReply,
+                            super::super::RootResultFetchFailure,
+                        >,
+                    > + Send,
+            >,
+        > {
+            use novarocks_execution_contract::root_result::{
+                RootReadOutcome, RootResultData, RootResultReply,
+            };
+            let payload = if !self.sent.swap(true, Ordering::SeqCst) {
+                self.payload
+            } else {
+                None
+            };
+            Box::pin(async move {
+                let Some(payload) = payload else {
+                    return std::future::pending().await;
+                };
+                let reply = RootResultReply {
+                    root_task: request.root_task(),
+                    profile: request.profile(),
+                    kind: request.kind(),
+                    accepted_consumed: request.consumed(),
+                    outcome: RootReadOutcome::Data(
+                        RootResultData::try_new(
+                            request.kind(),
+                            std::num::NonZeroU64::MIN,
+                            bytes::Bytes::from_static(payload),
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                };
+                crate::api::RetainedRootReply::try_new(reply, guard, 64 * 1024).map_err(|error| {
+                    super::super::RootResultFetchFailure::new(
+                        AttemptFailureClass::ContractViolation,
+                        work_error(error),
+                    )
+                })
             })
-            .runtime()
+        }
+        fn seal(
+            &self,
+            _: novarocks_execution_contract::root_lifetime::RootReadSealed,
+        ) -> Result<(), QueryExecutionError> {
+            Ok(())
+        }
+    }
+
+    fn test_root_binding(
+        root: novarocks_execution_contract::TaskIdentity,
+        window: novarocks_workload_control::ResultWindowAlias,
+        payload: Option<&'static [u8]>,
+    ) -> super::super::RootRelayBinding {
+        use novarocks_result_contract::{
+            ClientRowProfile, RootOutputKind, RootProfileId, RootProfileV1,
+        };
+        super::super::RootRelayBinding {
+            port: Arc::new(TestRootReadPort {
+                sent: AtomicBool::new(false),
+                payload,
+            }),
+            frontier: super::super::RootRelayFrontier::new(
+                root,
+                RootProfileId::V1,
+                RootOutputKind::ClientRows,
+                Some(
+                    ClientRowProfile::try_new(
+                        RootProfileV1::SEGMENT_BYTES,
+                        RootProfileV1::ROW_PAYLOAD_BYTES,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
+            window,
+            max_wait: Duration::from_millis(10),
+        }
     }
 
     fn running_status(root: novarocks_execution_contract::TaskIdentity) -> TaskStatus {
@@ -2429,6 +2517,9 @@ mod tests {
             },
         )
         .unwrap();
+        control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .unwrap();
         control.mark_ready().unwrap();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -2571,7 +2662,6 @@ mod tests {
         let (supervisor, _client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             failing_native().0,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x4f),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -2597,7 +2687,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x45),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -2629,7 +2718,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x46),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -2688,8 +2776,15 @@ mod tests {
 
     #[derive(Debug)]
     struct RowsAttemptPreparationPort {
+        relay_window: Option<TestWindow>,
         backend: BackendProcessId,
         converged: Arc<AtomicBool>,
+    }
+
+    impl TestRowsPreparationPort for RowsAttemptPreparationPort {
+        fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+            self.relay_window = Some(TestWindow(window));
+        }
     }
 
     impl NativeAttemptPreparationPort for RowsAttemptPreparationPort {
@@ -2698,6 +2793,11 @@ mod tests {
             request: NativeAttemptPreparationRequest,
         ) -> NativeAttemptPreparationFuture {
             let owner = RowsDormantOwner {
+                relay_window: self
+                    .relay_window
+                    .as_ref()
+                    .expect("fixture window was admitted")
+                    .clone(),
                 backend: self.backend,
                 converged: Arc::clone(&self.converged),
             };
@@ -2710,6 +2810,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RowsDormantOwner {
+        relay_window: TestWindow,
         backend: BackendProcessId,
         converged: Arc<AtomicBool>,
     }
@@ -2727,6 +2828,7 @@ mod tests {
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
             let converged = Arc::clone(&self.converged);
+            let window = self.relay_window.clone();
             Box::pin(async move {
                 let (status_sender, statuses) =
                     super::super::accepted_root_status_projection_with_control_port(
@@ -2739,17 +2841,8 @@ mod tests {
                         super::super::AcceptedAttemptFailure::None,
                     )
                     .unwrap();
-                let binding =
-                    super::super::RootResultPumpBinding::new(rows_decode_runtime(), |_| async {
-                        std::future::pending::<
-                            Result<
-                                super::super::RootResultFetchOutcome,
-                                super::super::RootResultFetchFailure,
-                            >,
-                        >()
-                        .await
-                    });
-                Ok(ActivatedNativeAttempt::rows(
+                let binding = test_root_binding(root, window.0, None);
+                Ok(ActivatedNativeAttempt::relayed_rows(
                     RowsActiveOwner {
                         converged,
                         _status_sender: status_sender,
@@ -2816,13 +2909,13 @@ mod tests {
         let scope = root.owner.scope();
         let converged = Arc::new(AtomicBool::new(false));
         let attempts = RowsAttemptPreparationPort {
+            relay_window: None,
             backend: BackendProcessId::new_v7(),
             converged: Arc::clone(&converged),
         };
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x52),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -2831,7 +2924,7 @@ mod tests {
         let mut handle = tokio::time::timeout(
             Duration::from_secs(1),
             client.start(
-                rows_request(RecoveryMode::NoRecovery, None, attempts),
+                rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts),
                 root.owner,
             ),
         )
@@ -3010,6 +3103,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecoveringRowsPreparationPort {
+        relay_window: Option<TestWindow>,
         backend: BackendProcessId,
         prepares: Arc<AtomicU64>,
         runs: Arc<AtomicU64>,
@@ -3020,6 +3114,12 @@ mod tests {
         failures_before_success: u64,
     }
 
+    impl TestRowsPreparationPort for RecoveringRowsPreparationPort {
+        fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+            self.relay_window = Some(TestWindow(window));
+        }
+    }
+
     impl NativeAttemptPreparationPort for RecoveringRowsPreparationPort {
         fn prepare(
             &mut self,
@@ -3027,6 +3127,11 @@ mod tests {
         ) -> NativeAttemptPreparationFuture {
             let ordinal = self.prepares.fetch_add(1, Ordering::SeqCst) + 1;
             let owner = RecoveringRowsDormantOwner {
+                relay_window: self
+                    .relay_window
+                    .as_ref()
+                    .expect("fixture window was admitted")
+                    .clone(),
                 backend: self.backend,
                 ordinal,
                 runs: Arc::clone(&self.runs),
@@ -3045,6 +3150,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecoveringRowsDormantOwner {
+        relay_window: TestWindow,
         backend: BackendProcessId,
         ordinal: u64,
         runs: Arc<AtomicU64>,
@@ -3075,6 +3181,7 @@ mod tests {
             let block_initial_convergence = self.block_initial_convergence;
             let replacement_missing_rows = self.replacement_missing_rows;
             let failures_before_success = self.failures_before_success;
+            let window = self.relay_window.clone();
             Box::pin(async move {
                 if replacement_missing_rows && ordinal > 1 {
                     return Ok(ActivatedNativeAttempt::completion(PanickingActiveOwner {
@@ -3094,61 +3201,15 @@ mod tests {
                     )
                     .unwrap();
                 let fetches = Arc::new(AtomicU64::new(0));
-                let binding =
-                    super::super::RootResultPumpBinding::new(rows_decode_runtime(), move |_| {
-                        let fetch = fetches.fetch_add(1, Ordering::SeqCst);
-                        async move {
-                            if ordinal > 1 && fetch == 0 {
-                                let packet = super::super::PreflightedRootResultPacket::new(
-                                    novarocks_execution_contract::ResultPacketSequence::new(0),
-                                    64,
-                                    super::super::RootResultDecodeBounds::new(4_096, 4_096)
-                                        .unwrap(),
-                                    || {
-                                        arrow::record_batch::RecordBatch::try_new(
-                                            Arc::new(arrow::datatypes::Schema::new(vec![
-                                                arrow::datatypes::Field::new(
-                                                    "a",
-                                                    arrow::datatypes::DataType::Int64,
-                                                    false,
-                                                ),
-                                                arrow::datatypes::Field::new(
-                                                    "b",
-                                                    arrow::datatypes::DataType::Utf8,
-                                                    true,
-                                                ),
-                                            ])),
-                                            vec![
-                                                Arc::new(arrow::array::Int64Array::from(vec![
-                                                    2_i64,
-                                                ])),
-                                                Arc::new(arrow::array::StringArray::from(vec![
-                                                    Some("replacement"),
-                                                ])),
-                                            ],
-                                        )
-                                        .map_err(|error| {
-                                            QueryExecutionError::new(
-                                                QueryExecutionErrorKind::Failed,
-                                                error.to_string(),
-                                            )
-                                        })
-                                    },
-                                )
-                                .unwrap();
-                                Ok(super::super::RootResultFetchOutcome::Ready(packet))
-                            } else {
-                                std::future::pending::<
-                                    Result<
-                                        super::super::RootResultFetchOutcome,
-                                        super::super::RootResultFetchFailure,
-                                    >,
-                                >()
-                                .await
-                            }
-                        }
-                    });
-                Ok(ActivatedNativeAttempt::rows(
+                let binding = test_root_binding(
+                    root,
+                    window.0,
+                    Some(&[
+                        14, 0, 0, 0, 1, b'2', 11, b'r', b'e', b'p', b'l', b'a', b'c', b'e', b'm',
+                        b'e', b'n', b't',
+                    ]),
+                );
+                Ok(ActivatedNativeAttempt::relayed_rows(
                     RecoveringRowsActiveOwner {
                         ordinal,
                         failures_before_success,
@@ -3252,6 +3313,12 @@ mod tests {
         entered: Arc<AtomicU64>,
     }
 
+    impl TestRowsPreparationPort for HeldReplacementPreparationPort {
+        fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+            self.inner.bind_window(window);
+        }
+    }
+
     impl NativeAttemptPreparationPort for HeldReplacementPreparationPort {
         fn prepare(
             &mut self,
@@ -3290,6 +3357,7 @@ mod tests {
         let gate = Arc::new(tokio::sync::Notify::new());
         let attempts = HeldReplacementPreparationPort {
             inner: RecoveringRowsPreparationPort {
+                relay_window: None,
                 backend: BackendProcessId::new_v7(),
                 prepares: Arc::clone(&prepares),
                 runs: Arc::clone(&runs),
@@ -3314,7 +3382,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x59),
             FrontendProcessId::new_v7(),
             config,
@@ -3322,6 +3389,8 @@ mod tests {
         let mut handle = client
             .start(
                 rows_request(
+                    &control,
+                    &scope,
                     RecoveryMode::RestartAttemptBeforeVisibility,
                     Some(Arc::new(ImmediateReplacementPort::default())),
                     attempts,
@@ -3344,7 +3413,7 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         if release {
             gate.notify_one();
-            let crate::api::ResultDelivery::Batch(delivery) =
+            let crate::api::ResultDelivery::Segment(delivery) =
                 tokio::time::timeout(Duration::from_secs(1), stream.next())
                     .await
                     .expect("replacement released within the budget must deliver")
@@ -3353,14 +3422,7 @@ mod tests {
             else {
                 panic!("replacement must deliver its actual result batch");
             };
-            let bytes = delivery.decoded_bytes();
-            delivery
-                .reserve_protocol(&control.resources(), bytes)
-                .unwrap()
-                .begin_protocol_write(bytes)
-                .unwrap()
-                .complete()
-                .unwrap();
+            delivery.complete();
             assert_eq!(runs.load(Ordering::SeqCst), 2);
         }
         if cancel || release {
@@ -3446,6 +3508,7 @@ mod tests {
         let gate = Arc::new(tokio::sync::Notify::new());
         let attempts = HeldReplacementPreparationPort {
             inner: RecoveringRowsPreparationPort {
+                relay_window: None,
                 backend: BackendProcessId::new_v7(),
                 prepares: Arc::clone(&prepares),
                 runs: Arc::clone(&runs),
@@ -3466,7 +3529,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x5a),
             FrontendProcessId::new_v7(),
             config,
@@ -3474,6 +3536,8 @@ mod tests {
         let mut handle = client
             .start(
                 rows_request(
+                    &control,
+                    &scope,
                     RecoveryMode::RestartAttemptBeforeVisibility,
                     Some(Arc::new(ImmediateReplacementPort::default())),
                     attempts,
@@ -3562,6 +3626,7 @@ mod tests {
         let convergences = Arc::new(AtomicU64::new(0));
         let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
         let attempts = RecoveringRowsPreparationPort {
+            relay_window: None,
             backend: BackendProcessId::new_v7(),
             prepares: Arc::clone(&prepares),
             runs: Arc::clone(&runs),
@@ -3577,7 +3642,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x54),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -3585,6 +3649,8 @@ mod tests {
         let mut handle = client
             .start(
                 rows_request(
+                    &control,
+                    &scope,
                     RecoveryMode::RestartAttemptBeforeVisibility,
                     Some(replacements),
                     attempts,
@@ -3610,7 +3676,7 @@ mod tests {
             .begin_schema()
             .expect("replacement Rows execution must retain the frozen schema")
             .complete();
-        let crate::api::ResultDelivery::Batch(delivery) =
+        let crate::api::ResultDelivery::Segment(delivery) =
             tokio::time::timeout(Duration::from_secs(1), stream.next())
                 .await
                 .expect("replacement must deliver while old convergence is blocked")
@@ -3619,14 +3685,7 @@ mod tests {
         else {
             panic!("replacement must deliver a result batch");
         };
-        let bytes = delivery.decoded_bytes();
-        delivery
-            .reserve_protocol(&control.resources(), bytes)
-            .unwrap()
-            .begin_protocol_write(bytes)
-            .unwrap()
-            .complete()
-            .unwrap();
+        delivery.complete();
         assert_eq!(convergences.load(Ordering::SeqCst), 0);
         allow_initial_convergence.notify_one();
         handle.request_cancel().unwrap();
@@ -3651,6 +3710,7 @@ mod tests {
         let convergences = Arc::new(AtomicU64::new(0));
         let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
         let attempts = RecoveringRowsPreparationPort {
+            relay_window: None,
             backend: BackendProcessId::new_v7(),
             prepares,
             runs: Arc::clone(&runs),
@@ -3665,7 +3725,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x55),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -3673,6 +3732,8 @@ mod tests {
         let mut handle = client
             .start(
                 rows_request(
+                    &control,
+                    &scope,
                     RecoveryMode::RestartAttemptBeforeVisibility,
                     Some(Arc::new(ImmediateReplacementPort::default())),
                     attempts,
@@ -3692,7 +3753,7 @@ mod tests {
         .await
         .expect("successor activation must not wait for the lost residual attempt");
         stream.begin_schema().unwrap().complete();
-        let crate::api::ResultDelivery::Batch(delivery) =
+        let crate::api::ResultDelivery::Segment(delivery) =
             tokio::time::timeout(Duration::from_secs(1), stream.next())
                 .await
                 .expect("successor result must remain available")
@@ -3701,14 +3762,7 @@ mod tests {
         else {
             panic!("successor must deliver a result batch");
         };
-        let bytes = delivery.decoded_bytes();
-        delivery
-            .reserve_protocol(&control.resources(), bytes)
-            .unwrap()
-            .begin_protocol_write(bytes)
-            .unwrap()
-            .complete()
-            .unwrap();
+        delivery.complete();
 
         handle.request_cancel().unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -3745,6 +3799,7 @@ mod tests {
         let runs = Arc::new(AtomicU64::new(0));
         let convergences = Arc::new(AtomicU64::new(0));
         let attempts = RecoveringRowsPreparationPort {
+            relay_window: None,
             backend: BackendProcessId::new_v7(),
             prepares: Arc::clone(&prepares),
             runs,
@@ -3759,7 +3814,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x55),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -3767,6 +3821,8 @@ mod tests {
         let mut handle = client
             .start(
                 rows_request(
+                    &control,
+                    &scope,
                     RecoveryMode::RestartAttemptBeforeVisibility,
                     Some(Arc::new(ImmediateReplacementPort::default())),
                     attempts,
@@ -3801,9 +3857,16 @@ mod tests {
 
     #[derive(Debug)]
     struct VisibleFailurePreparationPort {
+        relay_window: Option<TestWindow>,
         backend: BackendProcessId,
         prepares: Arc<AtomicU64>,
         fail: Arc<tokio::sync::Notify>,
+    }
+
+    impl TestRowsPreparationPort for VisibleFailurePreparationPort {
+        fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+            self.relay_window = Some(TestWindow(window));
+        }
     }
 
     impl NativeAttemptPreparationPort for VisibleFailurePreparationPort {
@@ -3813,6 +3876,11 @@ mod tests {
         ) -> NativeAttemptPreparationFuture {
             self.prepares.fetch_add(1, Ordering::SeqCst);
             let owner = VisibleFailureDormantOwner {
+                relay_window: self
+                    .relay_window
+                    .as_ref()
+                    .expect("fixture window was admitted")
+                    .clone(),
                 backend: self.backend,
                 fail: Arc::clone(&self.fail),
             };
@@ -3825,6 +3893,7 @@ mod tests {
 
     #[derive(Debug)]
     struct VisibleFailureDormantOwner {
+        relay_window: TestWindow,
         backend: BackendProcessId,
         fail: Arc<tokio::sync::Notify>,
     }
@@ -3842,6 +3911,7 @@ mod tests {
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
             let fail = Arc::clone(&self.fail);
+            let window = self.relay_window.clone();
             Box::pin(async move {
                 let (status_sender, statuses) =
                     super::super::accepted_root_status_projection_with_control_port(
@@ -3855,61 +3925,14 @@ mod tests {
                     )
                     .unwrap();
                 let fetches = Arc::new(AtomicU64::new(0));
-                let binding =
-                    super::super::RootResultPumpBinding::new(rows_decode_runtime(), move |_| {
-                        let fetch = fetches.fetch_add(1, Ordering::SeqCst);
-                        async move {
-                            if fetch == 0 {
-                                let packet = super::super::PreflightedRootResultPacket::new(
-                                    novarocks_execution_contract::ResultPacketSequence::new(0),
-                                    64,
-                                    super::super::RootResultDecodeBounds::new(4_096, 4_096)
-                                        .unwrap(),
-                                    || {
-                                        arrow::record_batch::RecordBatch::try_new(
-                                            Arc::new(arrow::datatypes::Schema::new(vec![
-                                                arrow::datatypes::Field::new(
-                                                    "a",
-                                                    arrow::datatypes::DataType::Int64,
-                                                    false,
-                                                ),
-                                                arrow::datatypes::Field::new(
-                                                    "b",
-                                                    arrow::datatypes::DataType::Utf8,
-                                                    true,
-                                                ),
-                                            ])),
-                                            vec![
-                                                Arc::new(arrow::array::Int64Array::from(vec![
-                                                    1_i64,
-                                                ])),
-                                                Arc::new(arrow::array::StringArray::from(vec![
-                                                    Some("visible"),
-                                                ])),
-                                            ],
-                                        )
-                                        .map_err(|error| {
-                                            QueryExecutionError::new(
-                                                QueryExecutionErrorKind::Failed,
-                                                error.to_string(),
-                                            )
-                                        })
-                                    },
-                                )
-                                .unwrap();
-                                Ok(super::super::RootResultFetchOutcome::Ready(packet))
-                            } else {
-                                std::future::pending::<
-                                    Result<
-                                        super::super::RootResultFetchOutcome,
-                                        super::super::RootResultFetchFailure,
-                                    >,
-                                >()
-                                .await
-                            }
-                        }
-                    });
-                Ok(ActivatedNativeAttempt::rows(
+                let binding = test_root_binding(
+                    root,
+                    window.0,
+                    Some(&[
+                        10, 0, 0, 0, 1, b'1', 7, b'v', b'i', b's', b'i', b'b', b'l', b'e',
+                    ]),
+                );
+                Ok(ActivatedNativeAttempt::relayed_rows(
                     VisibleFailureActiveOwner {
                         fail,
                         _status_sender: status_sender,
@@ -3970,6 +3993,7 @@ mod tests {
         let prepares = Arc::new(AtomicU64::new(0));
         let fail = Arc::new(tokio::sync::Notify::new());
         let attempts = VisibleFailurePreparationPort {
+            relay_window: None,
             backend: BackendProcessId::new_v7(),
             prepares: Arc::clone(&prepares),
             fail: Arc::clone(&fail),
@@ -3979,7 +4003,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x56),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -3987,6 +4010,8 @@ mod tests {
         let mut handle = client
             .start(
                 rows_request(
+                    &control,
+                    &scope,
                     RecoveryMode::RestartAttemptBeforeVisibility,
                     Some(Arc::new(ImmediateReplacementPort::default())),
                     attempts,
@@ -4002,18 +4027,11 @@ mod tests {
             .begin_schema()
             .expect("Rows execution must begin with its frozen result schema")
             .complete();
-        let crate::api::ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap()
+        let crate::api::ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap()
         else {
             panic!("the first delivery must be a result batch");
         };
-        let bytes = delivery.decoded_bytes();
-        delivery
-            .reserve_protocol(&control.resources(), bytes)
-            .unwrap()
-            .begin_protocol_write(bytes)
-            .unwrap()
-            .complete()
-            .unwrap();
+        delivery.complete();
         fail.notify_one();
         let Err(error) = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
@@ -4038,6 +4056,12 @@ mod tests {
         backend: BackendProcessId,
         phase: AttemptPanicPhase,
         convergence_calls: Arc<AtomicU64>,
+    }
+
+    impl TestRowsPreparationPort for PanickingAttemptPreparationPort {
+        fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+            drop(window);
+        }
     }
 
     impl NativeAttemptPreparationPort for PanickingAttemptPreparationPort {
@@ -4158,7 +4182,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(namespace),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4214,7 +4237,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            control.resources(),
             QueryProcessNamespace::new(0x53),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4222,7 +4244,7 @@ mod tests {
 
         let error = match client
             .start(
-                rows_request(RecoveryMode::NoRecovery, None, attempts),
+                rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts),
                 root.owner,
             )
             .await
@@ -4258,7 +4280,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x50),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4495,7 +4516,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x50),
             frontend,
             supervisor_config(),
@@ -4598,7 +4618,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(BindingNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x4a),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4763,7 +4782,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
-            supervisor_resources(),
             QueryProcessNamespace::new(0x51),
             frontend,
             supervisor_config(),
@@ -4840,7 +4858,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(PanickingOpenNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x49),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4926,7 +4943,6 @@ mod tests {
             Arc::new(PendingOpenNativePort {
                 entered: Arc::clone(&entered),
             }),
-            control.resources(),
             QueryProcessNamespace::new(0x4a),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -4969,7 +4985,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(DelayedShutdownNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x47),
             FrontendProcessId::new_v7(),
             supervisor_config(),
@@ -5015,7 +5030,6 @@ mod tests {
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             Arc::new(PanickingOpenNativePort),
-            supervisor_resources(),
             QueryProcessNamespace::new(0x4f),
             FrontendProcessId::new_v7(),
             supervisor_config(),

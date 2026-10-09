@@ -72,6 +72,11 @@ pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut Validati
 
 pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut ValidationContext) {
     let path = format!("fragments[{}].sink", fragment.id().get());
+    if let FragmentSink::RootResult(contract) = fragment.sink()
+        && let Err(error) = contract.validate_purpose()
+    {
+        errors.push(ValidationError::new(&path, error.to_string()));
+    }
     let root_output = fragment
         .nodes()
         .get(&fragment.root())
@@ -203,7 +208,7 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
             }
         }
         FragmentSink::SealedArtifact(spec) => validate_artifact_sink(fragment, spec, errors),
-        FragmentSink::Result => {
+        FragmentSink::Result | FragmentSink::RootResult(_) => {
             if root_multiplicity != Some(RowMultiplicity::SingleCopy) {
                 errors.push(ValidationError::new(
                     &path,
@@ -588,7 +593,10 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
                 }
                 &[]
             }
-            FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => &[],
+            FragmentSink::Result
+            | FragmentSink::RootResult(_)
+            | FragmentSink::SealedArtifact(_)
+            | FragmentSink::Noop => &[],
         };
         for edge_id in edges {
             if !referenced.insert(*edge_id) {
@@ -705,7 +713,10 @@ pub(crate) fn edge_kind_matches_sink(sink: &FragmentSink, kind: crate::EdgeKind)
         FragmentSink::Stream { .. } => kind == crate::EdgeKind::Stream,
         FragmentSink::Multicast { .. } => kind == crate::EdgeKind::CteMulticast,
         FragmentSink::Router { .. } => kind == crate::EdgeKind::ChangeStreamRouter,
-        FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => false,
+        FragmentSink::Result
+        | FragmentSink::RootResult(_)
+        | FragmentSink::SealedArtifact(_)
+        | FragmentSink::Noop => false,
     }
 }
 
@@ -903,7 +914,12 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
     let result_sinks = plan
         .fragments()
         .values()
-        .filter(|fragment| matches!(fragment.sink(), FragmentSink::Result))
+        .filter(|fragment| {
+            matches!(
+                fragment.sink(),
+                FragmentSink::Result | FragmentSink::RootResult(_)
+            )
+        })
         .collect::<Vec<_>>();
     match (plan.result_port(), result_sinks.as_slice()) {
         (None, []) => {}
@@ -943,6 +959,59 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
                     "result node is not defined",
                 )),
             }
+            if let FragmentSink::RootResult(contract) = fragment.sink()
+                && let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
+                    contract.output()
+            {
+                if schema.columns().len() != result.fields.len() {
+                    errors.push(ValidationError::new(
+                        "result_port.render_schema",
+                        "render schema width differs from ordered result occurrences",
+                    ));
+                }
+                for (ordinal, (column, field)) in
+                    schema.columns().iter().zip(&result.fields).enumerate()
+                {
+                    let name = field.alias.as_deref().unwrap_or(&field.name);
+                    if column.source_ordinal as usize != ordinal
+                        || column.name != name
+                        || !novarocks_type_contract::result_render_type::render_field_matches_storage(
+                            &column.field, &field.ty.data_type, field.ty.nullable)
+                    {
+                        errors.push(ValidationError::new(
+                            "result_port.render_schema",
+                            format!("render occurrence differs at ordinal {ordinal}"),
+                        ));
+                    }
+                }
+            }
+            if let FragmentSink::RootResult(contract) = fragment.sink()
+                && let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) =
+                    contract.output()
+            {
+                match result.fields.as_ref() {
+                    [field] if result.scalar_schema.as_ref().is_some_and(|frozen| frozen.field() == schema.field()) && field.domain.matches_scalar(&schema.field().value_type) && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                        schema.field(), &field.ty.data_type, field.ty.nullable
+                    ) => {}
+                    _ => errors.push(ValidationError::new(
+                        "result_port.scalar_schema", "scalar schema differs from the sole ordered root occurrence"
+                    )),
+                }
+            }
+            if let Some(schema) = &result.scalar_schema {
+                let consistent = match result.fields.as_ref() {
+                    [field] => field.domain.matches_scalar(&schema.field().value_type)
+                        && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                            schema.field(), &field.ty.data_type, field.ty.nullable),
+                    _ => false,
+                };
+                if !consistent {
+                    errors.push(ValidationError::new(
+                        "result_port.scalar_schema",
+                        "compiler scalar identity differs from the final result carrier",
+                    ));
+                }
+            }
             if result.fields.len() != result.output.columns.len() {
                 errors.push(ValidationError::new(
                     "result_port.fields",
@@ -956,6 +1025,12 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
                     errors.push(ValidationError::new(
                         "result_port.fields",
                         format!("result value differs at ordinal {ordinal}"),
+                    ));
+                }
+                if !field.domain.matches_storage(&field.ty.data_type) {
+                    errors.push(ValidationError::new(
+                        "result_port.fields",
+                        format!("result logical domain differs from storage at ordinal {ordinal}"),
                     ));
                 }
                 if field.name.is_empty() {

@@ -25,6 +25,13 @@ mod access;
 mod cache;
 mod catalog_properties;
 mod error;
+mod list_body_limit;
+
+/// Read the fixed per-response byte limit used only for OpenDAL List.
+/// Other reads and trusted SDK internal allocations retain their own policy.
+pub const fn frozen_object_store_list_body_limit_bytes() -> usize {
+    list_body_limit::OBJECT_STORE_LIST_BODY_LIMIT_BYTES
+}
 mod object_store_credentials;
 mod object_store_settings;
 mod physical_reader;
@@ -38,10 +45,11 @@ mod storage_authority;
 
 pub use access::{
     BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
-    FsListEntry, FsListStream, FsLocation, FsScheme, ObjectStoreAccessContext, ObjectStoreConfig,
-    ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreProviderPool,
-    ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial,
-    ResolvedFsPath, is_object_store_location_parse_only, parse_object_store_path_parse_only,
+    FsListEntry, FsListStream, FsListingBound, FsLocation, FsScheme, ObjectStoreAccessContext,
+    ObjectStoreConfig, ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig,
+    ObjectStoreProviderPool, ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions,
+    ObjectStoreSecretMaterial, ResolvedFsPath, is_object_store_location_parse_only,
+    map_object_store_listing_error, parse_object_store_path_parse_only,
 };
 pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,

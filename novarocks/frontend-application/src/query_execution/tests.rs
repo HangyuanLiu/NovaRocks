@@ -103,12 +103,25 @@ fn profile_outcome_preserves_fragment_profiles() {
         })
         .expect("Profile intent accepts fragment profiles");
 
-    let (result, profiles) = outcome
+    let (output_rows, profiles) = outcome
         .into_profile()
         .expect("profile outcome variant")
         .into_parts();
-    assert_eq!(result.row_count(), 1);
+    assert_eq!(output_rows, 1);
     assert_eq!(profiles.into_profiles(), vec![profile]);
+}
+
+#[test]
+fn profile_outcome_retains_only_exact_count_and_diagnostics() {
+    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
+        .profile(
+            u64::MAX,
+            crate::query_execution::outcome::FragmentProfileSet::new(Vec::new()),
+        )
+        .unwrap();
+    let (rows, profiles) = outcome.into_profile().unwrap().into_parts();
+    assert_eq!(rows, u64::MAX);
+    assert!(profiles.into_profiles().is_empty());
 }
 
 #[test]

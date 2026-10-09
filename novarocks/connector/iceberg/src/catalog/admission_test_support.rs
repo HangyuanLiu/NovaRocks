@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::error::{CatalogOutcome, CatalogUnsupported};
@@ -47,6 +47,9 @@ impl NovaRocksCatalog for AdmittedCatalog {
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
         self.inner.vendored_client()
     }
+    fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
+        self.inner.listing_admission()
+    }
     fn admit_operation(
         &self,
         operation: &CatalogOperation,
@@ -54,8 +57,11 @@ impl NovaRocksCatalog for AdmittedCatalog {
     ) -> Result<(), CatalogUnsupported> {
         operation.validate_target(target)
     }
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
-        self.inner.list_namespaces().await
+    async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.inner.list_namespaces(bound).await
     }
 
     async fn namespace_exists(
@@ -68,8 +74,9 @@ impl NovaRocksCatalog for AdmittedCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.inner.list_tables(namespace).await
+        self.inner.list_tables(namespace, bound).await
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -90,8 +97,9 @@ impl NovaRocksCatalog for AdmittedCatalog {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.inner.list_views(namespace).await
+        self.inner.list_views(namespace, bound).await
     }
 
     async fn load_view(

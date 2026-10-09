@@ -60,6 +60,7 @@ members = [
   "crates/hyper",
   "crates/physical-plan",
   "crates/proto-models",
+  "crates/result-contract",
   "crates/serde",
   "crates/sql",
   "crates/tonic",
@@ -82,6 +83,7 @@ EOF
   write_package "$fixture_root" hyper hyper
   write_package "$fixture_root" physical-plan novarocks-physical-plan
   write_package "$fixture_root" proto-models novarocks-proto-models
+  write_package "$fixture_root" result-contract novarocks-result-contract
   write_package "$fixture_root" serde serde
   write_package "$fixture_root" sql novarocks-sql
   write_package "$fixture_root" tonic tonic
@@ -93,10 +95,14 @@ EOF
     'novarocks-connector-contract = { path = "../connector-contract" }'
   append_dependency "$fixture_root" physical-plan \
     'novarocks-type-contract = { path = "../type-contract" }'
+  append_dependency "$fixture_root" physical-plan \
+    'novarocks-result-contract = { path = "../result-contract" }'
   append_dependency "$fixture_root" connector-contract \
     "bytes = \"=${BYTES_VERSION}\""
   append_dependency "$fixture_root" type-contract \
     "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
+  append_dependency "$fixture_root" type-contract \
+    'novarocks-result-contract = { path = "../result-contract" }'
 
   # Another workspace member enables a feature on a shared dependency. Cargo
   # metadata's workspace resolve graph sees serde, while physical-plan's own
@@ -310,6 +316,14 @@ append_dependency "$transitive_root" type-contract \
 assert_rejected "$transitive_root" \
   "resolved normal dependency closure contains forbidden application/execution owner" \
   "novarocks-execution"
+
+result_runtime_root="$(new_mutation result-runtime)"
+append_dependency "$result_runtime_root" result-contract \
+  'tonic = { path = "../tonic" }'
+assert_rejected "$result_runtime_root" \
+  "novarocks-result-contract declares normal dependencies outside its exact owner allow-list" \
+  "resolved normal dependency closure contains forbidden wire/RPC capability" \
+  "tonic"
 
 # The foundational type vocabulary cannot depend upward on Connector identity.
 reverse_contract_root="$(new_mutation reverse-contract-direction)"

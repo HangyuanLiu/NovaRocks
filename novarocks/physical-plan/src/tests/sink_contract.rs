@@ -207,7 +207,7 @@ fn route(
 }
 
 #[derive(Clone, Copy)]
-enum RouterWriterShape {
+pub(super) enum RouterWriterShape {
     Valid,
     OrdinalDrift,
     TokenDrift,
@@ -216,7 +216,9 @@ enum RouterWriterShape {
     UnionAuxiliarySwap,
 }
 
-fn finish_router_writer_plan(shape: RouterWriterShape) -> Result<PhysicalPlan, ValidationErrors> {
+pub(super) fn finish_router_writer_plan(
+    shape: RouterWriterShape,
+) -> Result<PhysicalPlan, ValidationErrors> {
     finish_router_writer_fixture(shape).1
 }
 

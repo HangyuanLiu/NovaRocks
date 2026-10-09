@@ -82,7 +82,8 @@ pub fn hydrate_dictionary_columns_except(
             DataType::Dictionary(_, value_type) if !keep_encoded(slot.slot_id(), column_type) => {
                 changed = true;
                 let value_type = value_type.as_ref().clone();
-                let flat_field = field.as_ref().clone().with_data_type(value_type.clone());
+                let flat_slot =
+                    slot.with_type_and_nullable(value_type.clone(), field.is_nullable())?;
                 let flat = cast(column.as_ref(), &value_type).map_err(|e| {
                     format!(
                         "hydrate dictionary chunk column {} to value type {:?} failed: {e}",
@@ -90,7 +91,7 @@ pub fn hydrate_dictionary_columns_except(
                     )
                 })?;
                 columns.push(flat);
-                slots.push(slot.with_field(flat_field)?);
+                slots.push(flat_slot);
             }
             _ => {
                 columns.push(Arc::clone(column));
@@ -103,10 +104,20 @@ pub fn hydrate_dictionary_columns_except(
         return Ok(chunk.clone());
     }
 
-    let chunk_schema = Arc::new(ChunkSchema::try_new_with_schema_metadata(
-        slots,
-        chunk.schema().metadata().clone(),
-    )?);
+    let actual_schema = chunk.schema();
+    let chunk_schema = Arc::new(
+        if let Some(source) = chunk
+            .chunk_schema()
+            .schema_metadata_origin()
+            .filter(|origin| origin.backing_bytes_for(&actual_schema).is_some())
+        {
+            ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+        } else {
+            // Preserve the existing unknown-origin path without issuing provenance
+            // merely because its metadata values equal a declared schema.
+            ChunkSchema::try_new_with_schema_metadata(slots, actual_schema.metadata().clone())?
+        },
+    );
     let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
         .map_err(|e| format!("build hydrated chunk record batch failed: {e}"))?;
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
@@ -165,6 +176,87 @@ mod tests {
             LogicalType::Json,
         ))
         .expect("logical field schema")
+    }
+
+    #[test]
+    fn hydration_derives_exact_known_field_and_schema_metadata_owners() {
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let limits = MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        };
+        let field =
+            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "JSON".into())], limits)
+                .unwrap()
+                .into_field("payload".into(), DataType::Utf8, true);
+        let slot = ChunkSlotSchema::try_new_with_metadata_origins(
+            SlotId::new(1),
+            Arc::clone(field.field()),
+            FieldMetadataOrigins::try_new(vec![field], 1).unwrap(),
+            None,
+            Some(7),
+        )
+        .unwrap();
+        let top =
+            ArrowMetadataOwner::try_new(vec![("schema".into(), "source".into())], limits).unwrap();
+        let source = Chunk::try_new_with_columns(
+            Arc::new(ChunkSchema::try_new_with_owned_schema_metadata(vec![slot], top).unwrap()),
+            vec![dict_utf8_with_nulls_and_empty()],
+        )
+        .unwrap();
+        let source_slot = &source.chunk_schema().slots()[0];
+        let flat = hydrate_dictionary_columns(&source).unwrap();
+        let flat_slot = &flat.chunk_schema().slots()[0];
+        assert!(!Arc::ptr_eq(source_slot.field_ref(), flat_slot.field_ref()));
+        assert_eq!(source_slot.field().metadata(), flat_slot.field().metadata());
+        assert_eq!(source_slot.unique_id(), flat_slot.unique_id());
+        assert_eq!(source_slot.field_schema(), flat_slot.field_schema());
+        assert!(
+            flat_slot
+                .metadata_origins()
+                .unwrap()
+                .metadata_bytes_for(flat_slot.field_ref())
+                .is_some()
+        );
+        assert!(
+            flat_slot
+                .metadata_origins()
+                .unwrap()
+                .metadata_bytes_for(source_slot.field_ref())
+                .is_none()
+        );
+        assert_eq!(flat.schema().metadata(), source.schema().metadata());
+        assert!(
+            flat.chunk_schema()
+                .schema_metadata_origin()
+                .unwrap()
+                .backing_bytes_for(&flat.schema())
+                .is_some()
+        );
+        assert!(
+            source
+                .chunk_schema()
+                .schema_metadata_origin()
+                .unwrap()
+                .backing_bytes_for(&flat.schema())
+                .is_none()
+        );
+        // The same metadata values in an independently allocated schema are
+        // not evidence for its map backing, including deleted-bucket spare.
+        let mut unknown = std::collections::HashMap::with_capacity(8192);
+        unknown.insert("schema".into(), "source".into());
+        let foreign = Arc::new(Schema::new_with_metadata(
+            source.schema().fields().clone(),
+            unknown,
+        ));
+        let batch = RecordBatch::try_new(foreign, source.columns().to_vec()).unwrap();
+        let foreign_chunk =
+            Chunk::try_new_with_chunk_schema(batch, source.chunk_schema_ref()).unwrap();
+        let flat = hydrate_dictionary_columns(&foreign_chunk).unwrap();
+        assert!(flat.chunk_schema().schema_metadata_origin().is_none());
+        assert!(flat.chunk_schema().field_metadata_origins().is_some());
     }
 
     #[test]

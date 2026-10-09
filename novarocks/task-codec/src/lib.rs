@@ -2049,6 +2049,95 @@ mod tests {
     }
 
     #[test]
+    fn closed_destination_projection_keeps_the_original_update_envelope_and_receipt() {
+        use super::operation::{
+            decode_control_operation_batch, decode_ordinary_operation_batch,
+            encode_control_operation_batch,
+        };
+        let process = backend();
+        let (_, envelope) = envelope(OperationKind::UpdateTask);
+        let target = identity(2, 3, process);
+        let destination = identity(4, 5, backend());
+        let domain = novarocks::TaskDomainUpdate {
+            domain: Some(
+                novarocks::task_domain_update::Domain::CloseExchangeDestination(
+                    novarocks::CloseExchangeDestinationDomain {
+                        version: 17,
+                        edge_id: 9,
+                        destination_task: Some(encode_task_identity(destination)),
+                    },
+                ),
+            ),
+        };
+        let update = novarocks::TaskOperation {
+            envelope: Some(envelope.clone()),
+            operation: Some(novarocks::task_operation::Operation::UpdateTask(
+                novarocks::UpdateTaskRequest {
+                    identity: Some(encode_task_identity(target)),
+                    domains: vec![domain],
+                },
+            )),
+        };
+        assert!(
+            decode_ordinary_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![update.clone()]
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("ordinary")
+            )
+            .is_err()
+        );
+        let control =
+            encode_control_operation_batch(vec![update.clone()], TransportBudget::DEFAULT).unwrap();
+        assert_eq!(control.operations[0].envelope.as_ref(), Some(&envelope));
+        let decoded = decode_control_operation_batch(
+            &control,
+            TransportBudget::DEFAULT,
+            FieldPath::root("control"),
+        )
+        .unwrap();
+        assert_eq!(decoded[0].envelope().kind(), OperationKind::UpdateTask);
+        assert_eq!(
+            decoded[0].envelope().operation_id().to_bytes().as_slice(),
+            envelope.operation_id.as_ref().unwrap().value.as_slice()
+        );
+        let DecodedOperation::UpdateTask(decoded) = &decoded[0] else {
+            panic!("expected original UpdateTask");
+        };
+        assert_eq!(decoded.request().identity(), target);
+        assert!(matches!(
+            &decoded.domains()[0],
+            super::domain::DecodedTaskDomain::CloseExchangeDestination { .. }
+        ));
+        let mut mixed = update;
+        let Some(novarocks::task_operation::Operation::UpdateTask(request)) = &mut mixed.operation
+        else {
+            unreachable!();
+        };
+        request.domains.push(novarocks::TaskDomainUpdate {
+            domain: Some(novarocks::task_domain_update::Domain::OpenExchangeEdges(
+                novarocks::OpenExchangeEdgesDomain {
+                    version: 1,
+                    edge_ids: vec![9],
+                },
+            )),
+        });
+        assert!(
+            encode_control_operation_batch(vec![mixed.clone()], TransportBudget::DEFAULT).is_err()
+        );
+        assert!(
+            decode_ordinary_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![mixed]
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("ordinary")
+            )
+            .is_ok()
+        );
+    }
+    #[test]
     fn small_control_method_preserves_cancel_and_rejects_create() {
         use super::operation::{
             decode_control_operation_batch, decode_ordinary_operation_batch,
@@ -2808,3 +2897,5 @@ mod tests {
         assert_eq!(cause, Some(AbortCause::LeaseExpired));
     }
 }
+
+pub mod root_result;

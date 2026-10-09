@@ -457,7 +457,7 @@ impl ExecutionExchangeRegistry {
                 Some(expected_chunk_schema),
                 &chunk.batch,
                 &wire_meta,
-                true,
+                DecodeCarrierContract::Exchange,
             )?;
             let mut retagged = chunk_from_exchange_batch(batch, chunk_schema).map_err(|e| {
                 format!(
@@ -1456,6 +1456,60 @@ fn chunk_from_exchange_batch(
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeCarrierContract {
+    Exchange,
+    RootResult,
+}
+
+// Root output metadata must be checked while the original wire fields are
+// still present: retagging a nested Arrow carrier replaces its child fields.
+fn validate_root_result_wire_domains(
+    source: &arrow::datatypes::Field,
+    expected: &arrow::datatypes::Field,
+) -> Result<(), String> {
+    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+    fn marker(field: &arrow::datatypes::Field) -> Result<Option<LogicalType>, String> {
+        let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
+            return Ok(None);
+        };
+        for domain in [
+            LogicalType::Json,
+            LogicalType::Hll,
+            LogicalType::Bitmap,
+            LogicalType::Object,
+            LogicalType::Percentile,
+        ] {
+            if value.trim().eq_ignore_ascii_case(domain.metadata_value()) {
+                return Ok(Some(domain));
+            }
+        }
+        Err("root result wire field contains an unknown logical domain marker".into())
+    }
+    let actual = marker(source)?;
+    let declared = marker(expected)?;
+    if actual.is_some() && actual != declared {
+        return Err("root result wire logical domain differs from declared output domain".into());
+    }
+    // Carrier shape and primitive details are checked separately by the exact
+    // type contract. Walk every field-bearing nested carrier before that check.
+    match (source.data_type(), expected.data_type()) {
+        (DataType::List(source), DataType::List(expected))
+        | (DataType::LargeList(source), DataType::LargeList(expected))
+        | (DataType::FixedSizeList(source, _), DataType::FixedSizeList(expected, _))
+        | (DataType::Map(source, _), DataType::Map(expected, _)) => {
+            validate_root_result_wire_domains(source, expected)?;
+        }
+        (DataType::Struct(source), DataType::Struct(expected)) => {
+            for (source, expected) in source.iter().zip(expected) {
+                validate_root_result_wire_domains(source, expected)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Descriptor-authoritative decode: the receiver's registered chunk schema is
 /// the exact Arrow type contract. Decoded columns may be rebuilt to the
 /// receiver's field metadata and slot namespace, but type drift fails here.
@@ -1463,7 +1517,7 @@ fn materialize_chunk_for_wire_meta(
     expected_chunk_schema: Option<&ChunkSchemaRef>,
     batch: &RecordBatch,
     wire_meta: &ExchangeWireMeta,
-    prefer_wire_slot_ids: bool,
+    carrier_contract: DecodeCarrierContract,
 ) -> Result<(RecordBatch, ChunkSchemaRef), String> {
     if wire_meta.slot_ids_by_index.len() != batch.num_columns() {
         return Err(format!(
@@ -1491,7 +1545,7 @@ fn materialize_chunk_for_wire_meta(
     // Check whether wire slot IDs match the expected schema. Some callers
     // deliberately use an independent expected-slot namespace, so they force
     // position-based mapping even when numeric slot IDs overlap.
-    let wire_ids_match = prefer_wire_slot_ids
+    let wire_ids_match = carrier_contract == DecodeCarrierContract::Exchange
         && wire_meta
             .slot_ids_by_index
             .iter()
@@ -1503,7 +1557,6 @@ fn materialize_chunk_for_wire_meta(
     };
 
     let mut slots = Vec::with_capacity(batch.num_columns());
-    let mut out_fields = Vec::with_capacity(batch.num_columns());
     let mut columns = Vec::with_capacity(batch.num_columns());
     let mut any_materialized = false;
     for (idx, slot_id) in wire_meta.slot_ids_by_index.iter().enumerate() {
@@ -1526,14 +1579,31 @@ fn materialize_chunk_for_wire_meta(
             })?
         };
         let field = batch_schema.field(idx);
+        if carrier_contract == DecodeCarrierContract::RootResult {
+            validate_root_result_wire_domains(field, expected_slot.field())?;
+        }
         let mut out_column = batch.column(idx).clone();
         let mut out_field = field.as_ref().clone();
 
         let expected_arrow_type = expected_slot.data_type();
         if field.data_type() != expected_arrow_type {
             let root = format!("slot {}", expected_slot.slot_id());
-            check_exchange_data_type(expected_arrow_type, field.data_type(), &root)?;
-            if !is_exchange_dictionary_carrier_for_expected(expected_arrow_type, field.data_type())
+            // The root Result sink explicitly supports both string dictionary
+            // carriers for its frozen Utf8 value semantics. Exchange keeps its
+            // existing exact offset contract and independent slot namespace.
+            let root_dictionary = carrier_contract == DecodeCarrierContract::RootResult
+                && expected_arrow_type == &DataType::Utf8
+                && matches!(field.data_type(), DataType::Dictionary(key, value)
+                    if key.as_ref() == &DataType::Int32
+                        && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8));
+            if !root_dictionary {
+                check_exchange_data_type(expected_arrow_type, field.data_type(), &root)?;
+            }
+            if !root_dictionary
+                && !is_exchange_dictionary_carrier_for_expected(
+                    expected_arrow_type,
+                    field.data_type(),
+                )
             {
                 match crate::exec::chunk::type_compatibility::retag_column(
                     batch.column(idx),
@@ -1589,13 +1659,30 @@ fn materialize_chunk_for_wire_meta(
         } else {
             expected_slot.slot_id()
         };
-        slots.push(expected_slot.with_field_and_slot_id(output_slot_id, out_field.clone())?);
-        out_fields.push(Arc::new(out_field));
+        if expected_slot.metadata_origins().is_some() {
+            // Native descriptors own the receiver's metadata. Validate the
+            // received logical domains before replacing wire-only fields,
+            // then derive only from those exact immutable descriptor owners.
+            // No receipt is issued for a decoded IPC HashMap or equal Field.
+            validate_root_result_wire_domains(field, expected_slot.field())?;
+            let slot = expected_slot
+                .reconcile_to_carrier(out_column.data_type(), out_nullable)?
+                .with_slot_id(output_slot_id)?;
+            out_column =
+                crate::exec::chunk::type_compatibility::retag_column(&out_column, slot.data_type())
+                    .map_err(|error| {
+                        format!("exchange descriptor metadata publication failed: {error:?}")
+                    })?;
+            slots.push(slot);
+            any_materialized = true;
+        } else {
+            slots.push(expected_slot.with_field_and_slot_id(output_slot_id, out_field.clone())?);
+        }
         columns.push(out_column);
     }
     let chunk_schema = Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?);
     let new_batch = if any_materialized {
-        RecordBatch::try_new(Arc::new(Schema::new(out_fields)), columns)
+        RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
             .map_err(|e| format!("exchange materialize batch to descriptor failed: {e}"))?
     } else {
         batch.clone()
@@ -1717,8 +1804,12 @@ pub fn decode_root_result_chunks(
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
         let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
-        let (batch, chunk_schema) =
-            materialize_chunk_for_wire_meta(expected_chunk_schema, &batch, &wire_meta, false)?;
+        let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
+            expected_chunk_schema,
+            &batch,
+            &wire_meta,
+            DecodeCarrierContract::RootResult,
+        )?;
         chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
     }
     Ok(chunks)
@@ -1808,7 +1899,7 @@ impl ExecutionExchangeRegistry {
                 expected_chunk_schema.as_ref(),
                 &batch,
                 &wire_meta,
-                true,
+                DecodeCarrierContract::Exchange,
             )?;
             chunks.push(chunk_from_exchange_batch(batch, chunk_schema)?);
         }
@@ -2398,6 +2489,150 @@ mod tests {
     }
 
     #[test]
+    fn m07_root_ipc_refuses_nested_domain_conflicts_before_retagging() {
+        use arrow::array::new_null_array;
+        use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+        fn marked(field: Field, marker: Option<&str>) -> Field {
+            match marker {
+                Some(value) => {
+                    field.with_metadata(HashMap::from([(NR_LOGICAL_TYPE_KEY.into(), value.into())]))
+                }
+                None => field,
+            }
+        }
+        fn nested(kind: usize, marker: Option<&str>) -> Field {
+            let leaf = || Arc::new(marked(Field::new("value", DataType::Binary, true), marker));
+            let data_type = match kind {
+                0 => DataType::Struct(vec![leaf()].into()),
+                1 => DataType::List(leaf()),
+                4 => DataType::LargeList(leaf()),
+                2 | 3 => {
+                    let value = if kind == 2 {
+                        leaf()
+                    } else {
+                        Arc::new(Field::new("value", DataType::Binary, true))
+                    };
+                    let entries = Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![Arc::new(Field::new("key", DataType::Int32, false)), value].into(),
+                        ),
+                        false,
+                    );
+                    DataType::Map(
+                        Arc::new(if kind == 3 {
+                            marked(entries, marker)
+                        } else {
+                            entries
+                        }),
+                        false,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            Field::new("root", data_type, true)
+        }
+        fn schema(field: Field, slot: u32) -> ChunkSchemaRef {
+            Arc::new(
+                crate::exec::chunk::ChunkSchema::try_new(vec![
+                    crate::exec::chunk::ChunkSlotSchema::new_with_field(
+                        SlotId::new(slot),
+                        field,
+                        None,
+                        None,
+                    ),
+                ])
+                .unwrap(),
+            )
+        }
+        for kind in 0..5 {
+            let declared = nested(
+                kind,
+                if kind == 3 {
+                    None
+                } else {
+                    Some(LogicalType::Bitmap.metadata_value())
+                },
+            );
+            let expected = schema(declared.clone(), 74);
+            for marker in [Some("hll"), Some("unknown-domain"), None, Some("bitmap")] {
+                let source = nested(kind, marker);
+                let chunk = Chunk::try_new_with_columns(
+                    schema(source.clone(), 73),
+                    vec![new_null_array(source.data_type(), 1)],
+                )
+                .unwrap();
+                let bytes = encode_chunks(&[chunk], true).unwrap();
+                let decoded = decode_root_result_chunks(&bytes, Some(&expected));
+                if matches!(marker, Some("hll" | "unknown-domain"))
+                    || (kind == 3 && marker.is_some())
+                {
+                    assert!(
+                        decoded.unwrap_err().contains("logical domain"),
+                        "kind={kind} marker={marker:?}"
+                    );
+                } else {
+                    let decoded = decoded.unwrap();
+                    assert_eq!(decoded[0].len(), 1);
+                    assert_eq!(decoded[0].columns()[0].data_type(), declared.data_type());
+                    assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(74)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn m07_root_ipc_preserves_large_string_dictionary_without_changing_exchange_admission() {
+        use arrow::array::{DictionaryArray, Int32Array, LargeStringArray};
+        use arrow::datatypes::Int32Type;
+        let array = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(1), None, Some(0)]),
+                Arc::new(LargeStringArray::from(vec!["{}", "[]"])),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let field = Field::new("wire", array.data_type().clone(), true);
+        let chunk = Chunk::try_new_with_columns(
+            Arc::new(
+                crate::exec::chunk::ChunkSchema::try_new(vec![
+                    crate::exec::chunk::ChunkSlotSchema::new_with_field(
+                        SlotId::new(72),
+                        field,
+                        None,
+                        None,
+                    ),
+                ])
+                .unwrap(),
+            ),
+            vec![array],
+        )
+        .unwrap();
+        let bytes = encode_chunks(&[chunk], true).unwrap();
+        let expected = logical_status_schema(SlotId::new(73));
+        let decoded = decode_root_result_chunks(&bytes, Some(&expected)).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].len(), 3);
+        assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(73)]);
+        assert_eq!(
+            decoded[0].columns()[0].data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8))
+        );
+        assert_eq!(
+            decoded[0].batch.schema().field(0).data_type(),
+            decoded[0].columns()[0].data_type()
+        );
+        let key = ExchangeKey {
+            finst_id_hi: 1703,
+            finst_id_lo: 1704,
+            node_id: 78,
+        };
+        register_expected_chunk_schema(key, 1, logical_status_schema(SlotId::new(72))).unwrap();
+        let error = decode_chunks_for_sender(key, 9, 1, &bytes).unwrap_err();
+        assert!(error.contains("schema type mismatch"));
+    }
+
+    #[test]
     fn decode_chunks_for_sender_preserves_dictionary_carrier_with_logical_expected_schema() {
         let key = ExchangeKey {
             finst_id_hi: 1701,
@@ -2755,6 +2990,86 @@ mod tests {
         assert_eq!(decoded[0].batch.schema().field(0).name(), "file");
         assert_eq!(decoded[0].batch.schema().field(1).name(), "row_id");
         assert_eq!(decoded[0].batch.schema().field(2).name(), "value");
+    }
+
+    #[test]
+    fn native_exchange_publication_retains_descriptor_metadata_ownership() {
+        use crate::exec::chunk::{RootArrayStorageLimits, borrowed_root_chunk_storage};
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let owner = ArrowMetadataOwner::try_new(
+            Vec::new(),
+            MetadataOwnerLimits {
+                entries: 0,
+                construction_bytes: 0,
+            },
+        )
+        .unwrap()
+        .into_field("value".into(), DataType::Int64, false);
+        let expected = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    SlotId::new(73),
+                    Arc::clone(owner.field()),
+                    FieldMetadataOrigins::try_new(vec![owner], 1).unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "wire_value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
+        )
+        .unwrap();
+        let unknown = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            source.schema().as_ref(),
+            &[SlotId::new(5)],
+        )
+        .unwrap();
+        let original = Chunk::new_with_chunk_schema(source, unknown);
+        let limits = RootArrayStorageLimits {
+            bytes: 96 * 1024 * 1024,
+            nodes: 65536,
+            depth: 64,
+        };
+        assert!(borrowed_root_chunk_storage(&original, limits).is_err());
+        let payload = encode_chunks(&[original], true).unwrap();
+        let key = ExchangeKey {
+            finst_id_hi: 91_735,
+            finst_id_lo: 91_736,
+            node_id: 73,
+        };
+        let registry = ExecutionExchangeRegistry::default();
+        registry
+            .register_expected_chunk_schema(key, 1, Arc::clone(&expected))
+            .unwrap();
+        let decoded = registry
+            .decode_chunks_for_sender(key, ExchangeSenderIdentity::local(3, 1), &payload)
+            .unwrap();
+        assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(73)]);
+        assert_eq!(
+            decoded[0]
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+        assert!(borrowed_root_chunk_storage(&decoded[0], limits).is_ok());
+        assert!(Arc::ptr_eq(
+            decoded[0].chunk_schema().slots()[0].field_ref(),
+            expected.slots()[0].field_ref()
+        ));
     }
 
     #[test]

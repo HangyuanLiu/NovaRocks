@@ -64,6 +64,8 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
 
 [features]
+mem-1-m07-root-observation = ["novarocks-frontend-application/mem-1-m07-root-observation"]
+mem-1-m07-exact-mysql-write = ["novarocks-frontend-application/mem-1-m07-exact-mysql-write"]
 default = ["jemalloc"]
 # jemalloc is the only supported production allocator. Building without this
 # feature keeps the system allocator for same-revision baselines and for tools
@@ -73,6 +75,7 @@ mv-first-refresh-staging-test-support = []
 native-compatibility-test-fixture = ["novarocks-version/native-compatibility-test-fixture"]
 
 [dev-dependencies]
+serde_json.workspace = true
 # `server_binary_smoke` spawns the real `novarocks` binary and drives it over
 # MySQL; `state_store_app_config` asserts config/composition by direct call.
 # Domain behaviour belongs to its owner crate, the SQL suites or the system

@@ -208,6 +208,22 @@ impl RootWriteResultRelationSchema {
         )
         .map_err(|error| format!("root write result chunk schema: {error}"))?;
         debug_assert_eq!(slot_ids.len(), ROOT_WRITE_RESULT_COLUMN_COUNT);
+        Self::try_new_with_chunk_schema(contract, chunk_schema)
+    }
+
+    /// Bind an already constructed relation without replacing its immutable
+    /// schema or field metadata owners. Equality validates the contract only;
+    /// the supplied ChunkSchema remains the sole provenance source.
+    pub fn try_new_with_chunk_schema(
+        contract: RootWriteResultSchema,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Result<Self, String> {
+        contract
+            .validate_exact_arrow_schema(chunk_schema.arrow_schema_ref().as_ref())
+            .map_err(|error| error.to_string())?;
+        if contract.slot_ids().map(SlotId::new).as_slice() != chunk_schema.slot_ids() {
+            return Err("root write result slot order differs from supplied chunk schema".into());
+        }
         Ok(Self {
             contract,
             chunk_schema,

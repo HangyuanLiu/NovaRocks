@@ -64,6 +64,28 @@ remove the generated runtime directory.
 
 ## In CI
 
+`result-delivery/many-small-rows-cross-segment` 验证 200000 小行跨 Native
+1 MiB 段时的准确顺序与字节；`result-delivery/large-row-cross-u24` 验证一个
+17825860 字节大行跨 MySQL U24 packet（17 个合法 1 MiB 字符串字段）。输入在
+`docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v4.json` 冻结，客户端
+明确声明 frozen profile 的 64 MiB logical packet allowance，独立
+Python literal oracle 生成期待摘要。原始 actor 以 64 KiB scratch 流式校验
+packet sequence、列数、行数、length-encoded 字段及数据摘要，不积累整行。
+每项还要求真实 BE Task 创建，并保留前后两次连续零值的 FE window/governance
+和 BE reservation/ingress 快照。这里只证明 wire 正确性与公开资源收敛；closing
+满池、精确 alias 退出、全部 W=2 容量矩阵和 transport 测量仍是独立验收。
+
+`result-delivery/producer-exit-context-retention` 在严格校验 metadata 后暂停
+客户端读行。客户端在 connect 前申请 4 KiB receive buffer，并记录 OS 实际值；
+不修改 server profile。一个合法 1 MiB 字符串形成 S+8 Native 行字节，要求
+连续两次观测同一个仍由 context 持有的 root：两个 Data position、End 已发布、
+producer guard 已退出且 task 已为退休记录、最终 End 尚未 ACK。恢复后核对
+独立冻结 schema/packet/行字节摘要并等待公开 owner 收敛。输入为
+`inputs/root-context-retention-freeze-v1.json`。新增 BE ownership 指标只在
+1024 个 context/root 扫描位置内作非阻塞 census；锁忙或覆盖不完整时明确
+不可用并省略 ownership family。它不包含移出 context 的固定 backing 或其它
+Arc 尾部，归零不证明 allocator dealloc，也不代替 ACK-only/ClosingRow 满池门。
+
 `tools/ci/local-full-ci.sh` runs this registry as its own stable stage,
 between the server binary smoke and the SQL suites. The stage discovers
 default scenarios through `--list-default` and runs each one with a single `--only`

@@ -73,21 +73,78 @@ pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 /// the same decision.
 pub(crate) use novarocks_functions::FunctionVolatility;
 
-/// Semantic result domains declared by the closed built-in function identity.
-/// Utf8 itself never establishes JSON provenance; external or shadowing functions
-/// retain their own declared physical domain.
+/// Semantic result domains declared by exact installed built-in bindings.
+/// A physical carrier alone never establishes JSON or opaque provenance.
+/// Literal-dependent Variant calls retain their selected ordinary result domain.
 pub(crate) fn scalar_output_logical_type(
     binding: &ResolvedFunctionBinding,
 ) -> Option<novarocks_types::schema::SqlType> {
+    use novarocks_types::schema::SqlType;
+
     if binding.kind != FunctionKind::Scalar {
         return None;
     }
-    match binding.function_id.as_str() {
-        "builtin.scalar/parse_json/v1"
-        | "builtin.scalar/json_object/v1"
-        | "builtin.scalar/json_array/v1"
-        | "builtin.scalar/to_json/v1"
-        | "builtin.scalar/json_query/v1" => Some(novarocks_types::schema::SqlType::Json),
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        return None;
+    };
+    match (binding.function_id.as_str(), &result.data_type) {
+        (
+            "builtin.scalar/parse_json/v1"
+            | "builtin.scalar/json_object/v1"
+            | "builtin.scalar/json_query/v1",
+            DataType::Utf8,
+        ) => Some(SqlType::Json),
+        (
+            "builtin.scalar/to_bitmap/v1"
+            | "builtin.scalar/bitmap_empty/v1"
+            | "builtin.scalar/bitmap_from_string/v1"
+            | "builtin.scalar/bitmap_from_binary/v1"
+            | "builtin.scalar/bitmap_and/v1"
+            | "builtin.scalar/bitmap_or/v1"
+            | "builtin.scalar/bitmap_xor/v1"
+            | "builtin.scalar/bitmap_andnot/v1"
+            | "builtin.scalar/bitmap_intersect/v1"
+            | "builtin.scalar/sub_bitmap/v1"
+            | "builtin.scalar/bitmap_subset_limit/v1"
+            | "builtin.scalar/bitmap_subset_in_range/v1",
+            DataType::Binary,
+        ) => Some(SqlType::Bitmap),
+        ("builtin.scalar/hll_hash/v1", DataType::Binary) => Some(SqlType::Hll),
+        (
+            "builtin.scalar/percentile_hash/v1" | "builtin.scalar/percentile_empty/v1",
+            DataType::Binary,
+        ) => Some(SqlType::Percentile),
+        (
+            "builtin.scalar/variant_get/v1" | "builtin.scalar/try_variant_get/v1",
+            DataType::LargeBinary,
+        ) => Some(SqlType::Variant),
+        _ => None,
+    }
+}
+
+/// Aggregate output identity is separate from its intermediate state carrier.
+/// Count results and externally serialized states retain their declared types.
+pub(crate) fn aggregate_output_logical_type(
+    binding: &ResolvedFunctionBinding,
+) -> Option<novarocks_types::schema::SqlType> {
+    use novarocks_types::schema::SqlType;
+
+    if binding.kind != FunctionKind::Aggregate {
+        return None;
+    }
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        return None;
+    };
+    match (binding.function_id.as_str(), &result.data_type) {
+        (
+            "builtin.aggregate/bitmap_agg/v1" | "builtin.aggregate/bitmap_union/v1",
+            DataType::Binary,
+        ) => Some(SqlType::Bitmap),
+        (
+            "builtin.aggregate/hll_union/v1" | "builtin.aggregate/hll_raw_agg/v1",
+            DataType::Binary,
+        ) => Some(SqlType::Hll),
+        ("builtin.aggregate/percentile_union/v1", DataType::Binary) => Some(SqlType::Percentile),
         _ => None,
     }
 }
@@ -2422,6 +2479,286 @@ mod tests {
             panic!("scalar binding must have a scalar result")
         };
         result
+    }
+
+    #[test]
+    fn m07_closed_scalar_output_domains_follow_actual_selected_bindings() {
+        use novarocks_types::schema::SqlType;
+
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let cases = [
+            ("to_bitmap", vec![DataType::Int64], SqlType::Bitmap),
+            ("bitmap_empty", vec![], SqlType::Bitmap),
+            ("bitmap_from_string", vec![DataType::Utf8], SqlType::Bitmap),
+            (
+                "bitmap_from_binary",
+                vec![DataType::Binary],
+                SqlType::Bitmap,
+            ),
+            (
+                "bitmap_and",
+                vec![DataType::Binary, DataType::Binary],
+                SqlType::Bitmap,
+            ),
+            (
+                "bitmap_or",
+                vec![DataType::Binary, DataType::Binary],
+                SqlType::Bitmap,
+            ),
+            (
+                "bitmap_xor",
+                vec![DataType::Binary, DataType::Binary],
+                SqlType::Bitmap,
+            ),
+            (
+                "bitmap_andnot",
+                vec![DataType::Binary, DataType::Binary],
+                SqlType::Bitmap,
+            ),
+            (
+                "bitmap_intersect",
+                vec![DataType::Binary, DataType::Binary],
+                SqlType::Bitmap,
+            ),
+            (
+                "sub_bitmap",
+                vec![DataType::Binary, DataType::Int64, DataType::Int64],
+                SqlType::Bitmap,
+            ),
+            (
+                "bitmap_subset_limit",
+                vec![DataType::Binary, DataType::Int64, DataType::Int64],
+                SqlType::Bitmap,
+            ),
+            (
+                "bitmap_subset_in_range",
+                vec![DataType::Binary, DataType::Int64, DataType::Int64],
+                SqlType::Bitmap,
+            ),
+            ("hll_hash", vec![DataType::Utf8], SqlType::Hll),
+            (
+                "percentile_hash",
+                vec![DataType::Float64],
+                SqlType::Percentile,
+            ),
+            ("percentile_empty", vec![], SqlType::Percentile),
+        ];
+        for (name, types, expected) in cases {
+            let arguments = types
+                .into_iter()
+                .map(|ty| value_argument(ty, true, None))
+                .collect::<Vec<_>>();
+            let binding = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(
+                scalar_result(&binding).data_type,
+                DataType::Binary,
+                "{name}"
+            );
+            assert_eq!(
+                scalar_output_logical_type(&binding),
+                Some(expected),
+                "{name}"
+            );
+            assert_eq!(aggregate_output_logical_type(&binding), None, "{name}");
+        }
+        for (name, types) in [
+            ("parse_json", vec![DataType::Utf8]),
+            ("json_object", vec![DataType::Utf8]),
+            ("json_query", vec![DataType::Utf8, DataType::Utf8]),
+        ] {
+            let arguments = types
+                .into_iter()
+                .map(|ty| value_argument(ty, false, None))
+                .collect::<Vec<_>>();
+            let binding = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(scalar_result(&binding).data_type, DataType::Utf8, "{name}");
+            assert_eq!(
+                scalar_output_logical_type(&binding),
+                Some(SqlType::Json),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn m07_variant_output_domain_respects_literal_selected_result() {
+        use novarocks_functions::FunctionLiteral;
+        use novarocks_types::schema::SqlType;
+
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for name in ["variant_get", "try_variant_get"] {
+            let mut arguments = vec![
+                value_argument(DataType::LargeBinary, true, None),
+                value_argument(
+                    DataType::Utf8,
+                    false,
+                    Some(FunctionLiteral::Utf8("$.value".into())),
+                ),
+            ];
+            let binding = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(scalar_result(&binding).data_type, DataType::LargeBinary);
+            assert_eq!(scalar_output_logical_type(&binding), Some(SqlType::Variant));
+            let mut changed = binding.clone();
+            changed.selected.result_type =
+                FunctionResultType::Scalar(FunctionValueType::new(DataType::Binary, true));
+            assert_eq!(scalar_output_logical_type(&changed), None);
+            arguments.push(value_argument(
+                DataType::Utf8,
+                false,
+                Some(FunctionLiteral::Utf8("BIGINT".into())),
+            ));
+            let binding = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(scalar_result(&binding).data_type, DataType::Int64);
+            assert_eq!(scalar_output_logical_type(&binding), None);
+        }
+    }
+
+    #[test]
+    fn m07_closed_aggregate_output_domains_exclude_state_and_count_lookalikes() {
+        use novarocks_types::schema::SqlType;
+
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for (name, argument, domain) in [
+            ("bitmap_agg", DataType::Int64, Some(SqlType::Bitmap)),
+            ("bitmap_union", DataType::Binary, Some(SqlType::Bitmap)),
+            ("hll_union", DataType::Binary, Some(SqlType::Hll)),
+            ("hll_raw_agg", DataType::Binary, Some(SqlType::Hll)),
+            (
+                "percentile_union",
+                DataType::Binary,
+                Some(SqlType::Percentile),
+            ),
+            ("bitmap_union_count", DataType::Binary, None),
+            ("hll_union_agg", DataType::Binary, None),
+            ("ds_hll_count_distinct_union", DataType::Binary, None),
+            ("any_value", DataType::Binary, None),
+        ] {
+            let arguments = [value_argument(argument, true, None)];
+            let binding = catalog
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Aggregate,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{name} must bind exactly: {error}"));
+            if domain.is_some() {
+                assert_eq!(
+                    aggregate_result_type(&binding).data_type,
+                    DataType::Binary,
+                    "{name}"
+                );
+            }
+            assert_eq!(aggregate_output_logical_type(&binding), domain, "{name}");
+            assert_eq!(scalar_output_logical_type(&binding), None, "{name}");
+        }
+        for (name, argument) in [
+            ("bitmap_to_binary", DataType::Binary),
+            ("ds_hll_count_distinct_state", DataType::Int64),
+        ] {
+            let arguments = [value_argument(argument, true, None)];
+            let binding = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(scalar_result(&binding).data_type, DataType::Binary);
+            assert_eq!(scalar_output_logical_type(&binding), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn m07_output_domains_reject_changed_identity_kind_or_selected_carrier() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for (name, arguments) in [
+            (
+                "parse_json",
+                vec![value_argument(DataType::Utf8, true, None)],
+            ),
+            ("bitmap_empty", vec![]),
+            ("hll_hash", vec![value_argument(DataType::Utf8, true, None)]),
+            ("percentile_empty", vec![]),
+        ] {
+            let binding = resolve_exact_scalar(&catalog, name, &arguments);
+            for carrier in [
+                DataType::Boolean,
+                DataType::Utf8,
+                DataType::Binary,
+                DataType::LargeUtf8,
+                DataType::LargeBinary,
+            ]
+            .into_iter()
+            .filter(|carrier| *carrier != scalar_result(&binding).data_type)
+            {
+                let mut changed = binding.clone();
+                changed.selected.result_type =
+                    FunctionResultType::Scalar(FunctionValueType::new(carrier, true));
+                assert_eq!(scalar_output_logical_type(&changed), None, "{name}");
+            }
+            let mut changed = binding.clone();
+            changed.kind = FunctionKind::Aggregate;
+            assert_eq!(scalar_output_logical_type(&changed), None);
+            changed = binding.clone();
+            changed.function_id =
+                FunctionId::try_new(format!("external.scalar/{name}/v1")).unwrap();
+            assert_eq!(scalar_output_logical_type(&changed), None);
+            changed = binding;
+            changed.selected.result_type = FunctionResultType::Relation(
+                vec![FunctionValueType::new(DataType::Binary, true)].into_boxed_slice(),
+            );
+            assert_eq!(scalar_output_logical_type(&changed), None);
+        }
+        let arguments = [value_argument(DataType::Binary, true, None)];
+        let binding = catalog
+            .resolve_bound_user(
+                "percentile_union",
+                FunctionKind::Aggregate,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                },
+            )
+            .unwrap();
+        for carrier in [DataType::Utf8, DataType::LargeBinary, DataType::Int64] {
+            let mut changed = binding.clone();
+            changed.selected.result_type =
+                FunctionResultType::Scalar(FunctionValueType::new(carrier, true));
+            assert_eq!(aggregate_output_logical_type(&changed), None);
+        }
+        let mut changed = binding.clone();
+        changed.kind = FunctionKind::Scalar;
+        assert_eq!(aggregate_output_logical_type(&changed), None);
+        changed = binding.clone();
+        changed.function_id =
+            FunctionId::try_new("external.aggregate/percentile_union/v1").unwrap();
+        assert_eq!(aggregate_output_logical_type(&changed), None);
+        changed = binding;
+        changed.selected.result_type = FunctionResultType::Relation(Box::new([]));
+        assert_eq!(aggregate_output_logical_type(&changed), None);
+    }
+
+    #[test]
+    fn m07_unadmitted_kernel_identities_cannot_establish_output_domains() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let mut binding = resolve_exact_scalar(&catalog, "bitmap_empty", &[]);
+        for id in [
+            "builtin.scalar/hll_empty/v1",
+            "builtin.scalar/hll_serialize/v1",
+            "builtin.scalar/hll_deserialize/v1",
+            "builtin.scalar/hll_hash1/v1",
+            "builtin.scalar/array_to_bitmap/v1",
+        ] {
+            binding.function_id = FunctionId::try_new(id).unwrap();
+            assert_eq!(scalar_output_logical_type(&binding), None, "{id}");
+        }
+        let arguments = [value_argument(DataType::Utf8, false, None)];
+        let mut binding = resolve_exact_scalar(&catalog, "parse_json", &arguments);
+        for name in ["json_array", "to_json"] {
+            binding.function_id = FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap();
+            assert_eq!(scalar_output_logical_type(&binding), None);
+            assert_eq!(
+                builtin_disposition(name),
+                Some(BuiltinDisposition::Unavailable)
+            );
+        }
     }
 
     #[test]

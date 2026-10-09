@@ -41,6 +41,10 @@ struct ProxyState {
     modes: Mutex<[ProxyMode; 2]>,
     connection_generation: AtomicU64,
     active_connections: AtomicU64,
+    budget: Arc<ProxyBufferBudget>,
+}
+
+struct ProxyBufferBudget {
     retained_bytes: AtomicU64,
     peak_retained_bytes: AtomicU64,
     max_retained_bytes: u64,
@@ -51,11 +55,18 @@ struct ProxyState {
 pub struct NativeFaultProxyControl {
     address: SocketAddr,
     state: Arc<ProxyState>,
+    paired_state: Option<Arc<ProxyState>>,
 }
 
 impl NativeFaultProxyControl {
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub(crate) fn paired_with(mut self, other: Self) -> Self {
+        assert!(Arc::ptr_eq(&self.state.budget, &other.state.budget));
+        self.paired_state = Some(other.state);
+        self
     }
 
     /// Pause/resume is serialized with nonblocking socket I/O. Drop rejects
@@ -66,6 +77,9 @@ impl NativeFaultProxyControl {
             ProxyDirection::UpstreamToClient => 1,
         };
         self.state.modes.lock().expect("proxy mode lock")[index] = mode;
+        if let Some(state) = &self.paired_state {
+            state.modes.lock().expect("proxy mode lock")[index] = mode;
+        }
     }
 
     /// Invalidate existing connections while preserving the listening port
@@ -74,23 +88,37 @@ impl NativeFaultProxyControl {
         self.state
             .connection_generation
             .fetch_add(1, Ordering::AcqRel);
+        if let Some(state) = &self.paired_state {
+            state.connection_generation.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
-    /// Allocated forwarding-buffer capacity, excluding kernel socket buffers.
+    /// Shared per-BE forwarding capacity across both listeners, excluding kernel buffers.
     pub fn retained_bytes(&self) -> u64 {
-        self.state.retained_bytes.load(Ordering::Acquire)
+        self.state.budget.retained_bytes.load(Ordering::Acquire)
     }
 
     pub fn peak_retained_bytes(&self) -> u64 {
-        self.state.peak_retained_bytes.load(Ordering::Acquire)
+        self.state
+            .budget
+            .peak_retained_bytes
+            .load(Ordering::Acquire)
     }
 
     pub fn active_connections(&self) -> u64 {
         self.state.active_connections.load(Ordering::Acquire)
+            + self
+                .paired_state
+                .as_ref()
+                .map_or(0, |state| state.active_connections.load(Ordering::Acquire))
     }
 
     pub fn is_stopped(&self) -> bool {
         self.state.stopped.load(Ordering::Acquire)
+            && self
+                .paired_state
+                .as_ref()
+                .is_none_or(|state| state.stopped.load(Ordering::Acquire))
     }
 }
 
@@ -111,6 +139,36 @@ impl NativeFaultProxy {
         if max_retained_bytes == 0 {
             bail!("native fault proxy retained-byte limit must be positive");
         }
+        Self::start_with_budget(
+            upstream,
+            Arc::new(ProxyBufferBudget {
+                retained_bytes: AtomicU64::new(0),
+                peak_retained_bytes: AtomicU64::new(0),
+                max_retained_bytes,
+            }),
+        )
+    }
+
+    /// Two listeners with independent fault modes and one original per-BE buffer budget.
+    pub(crate) fn start_pair(
+        data: SocketAddr,
+        control: SocketAddr,
+        max_retained_bytes: u64,
+    ) -> Result<(Self, Self)> {
+        if max_retained_bytes == 0 {
+            bail!("native fault proxy retained-byte limit must be positive");
+        }
+        let budget = Arc::new(ProxyBufferBudget {
+            retained_bytes: AtomicU64::new(0),
+            peak_retained_bytes: AtomicU64::new(0),
+            max_retained_bytes,
+        });
+        let data = Self::start_with_budget(data, Arc::clone(&budget))?;
+        let control = Self::start_with_budget(control, budget)?;
+        Ok((data, control))
+    }
+
+    fn start_with_budget(upstream: SocketAddr, budget: Arc<ProxyBufferBudget>) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").context("bind native fault proxy")?;
         listener
             .set_nonblocking(true)
@@ -121,9 +179,7 @@ impl NativeFaultProxy {
             modes: Mutex::new([ProxyMode::Forward; 2]),
             connection_generation: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
-            retained_bytes: AtomicU64::new(0),
-            peak_retained_bytes: AtomicU64::new(0),
-            max_retained_bytes,
+            budget,
         });
         let thread_state = Arc::clone(&state);
         let accept_thread = thread::Builder::new()
@@ -145,6 +201,7 @@ impl NativeFaultProxy {
         NativeFaultProxyControl {
             address: self.address,
             state: Arc::clone(&self.state),
+            paired_state: None,
         }
     }
 
@@ -153,7 +210,7 @@ impl NativeFaultProxy {
     }
 
     pub fn retained_bytes(&self) -> u64 {
-        self.state.retained_bytes.load(Ordering::Acquire)
+        self.state.budget.retained_bytes.load(Ordering::Acquire)
     }
 
     pub fn stop(&mut self) {
@@ -234,30 +291,31 @@ impl Drop for ActiveConnection {
 }
 
 struct BufferCredit {
-    state: Arc<ProxyState>,
+    budget: Arc<ProxyBufferBudget>,
     bytes: u64,
 }
 
 impl BufferCredit {
     fn acquire(state: &Arc<ProxyState>) -> Option<Self> {
-        let mut current = state.retained_bytes.load(Ordering::Acquire);
+        let budget = &state.budget;
+        let mut current = budget.retained_bytes.load(Ordering::Acquire);
         loop {
-            let bytes = (state.max_retained_bytes - current).min(16 * 1024);
+            let bytes = (budget.max_retained_bytes - current).min(16 * 1024);
             if bytes == 0 {
                 return None;
             }
-            match state.retained_bytes.compare_exchange_weak(
+            match budget.retained_bytes.compare_exchange_weak(
                 current,
                 current + bytes,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    state
+                    budget
                         .peak_retained_bytes
                         .fetch_max(current + bytes, Ordering::AcqRel);
                     return Some(Self {
-                        state: Arc::clone(state),
+                        budget: Arc::clone(budget),
                         bytes,
                     });
                 }
@@ -269,7 +327,7 @@ impl BufferCredit {
 
 impl Drop for BufferCredit {
     fn drop(&mut self) {
-        self.state
+        self.budget
             .retained_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
     }
@@ -402,6 +460,87 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn paired_listeners_share_the_original_budget_and_keep_independent_fault_modes() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut data, mut control) = NativeFaultProxy::start_pair(
+            upstream.local_addr().unwrap(),
+            control_upstream.local_addr().unwrap(),
+            1024,
+        )
+        .unwrap();
+        assert_ne!(data.address(), control.address());
+        let data_control = data.control();
+        let control_control = control.control();
+        let combined = data_control.clone().paired_with(control_control.clone());
+        let data_credit = BufferCredit::acquire(&data.state).unwrap();
+        assert_eq!(data_credit.bytes, 1024);
+        assert!(BufferCredit::acquire(&control.state).is_none());
+        assert_eq!(combined.retained_bytes(), 1024);
+        assert_eq!(combined.peak_retained_bytes(), 1024);
+        drop(data_credit);
+        let control_credit = BufferCredit::acquire(&control.state).unwrap();
+        assert!(BufferCredit::acquire(&data.state).is_none());
+        drop(control_credit);
+        data_control.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Paused);
+        assert_eq!(control.state.modes.lock().unwrap()[0], ProxyMode::Forward);
+        combined.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Drop);
+        assert_eq!(data.state.modes.lock().unwrap()[1], ProxyMode::Drop);
+        assert_eq!(control.state.modes.lock().unwrap()[1], ProxyMode::Drop);
+        combined.disconnect_all();
+        assert_eq!(data.state.connection_generation.load(Ordering::Acquire), 1);
+        assert_eq!(
+            control.state.connection_generation.load(Ordering::Acquire),
+            1
+        );
+        data.stop();
+        assert!(!combined.is_stopped());
+        control.stop();
+        assert!(combined.is_stopped());
+        assert_eq!(combined.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn paused_data_listener_does_not_pause_the_real_control_upstream() {
+        let data_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut data, mut control) = NativeFaultProxy::start_pair(
+            data_listener.local_addr().unwrap(),
+            control_listener.local_addr().unwrap(),
+            1024,
+        )
+        .unwrap();
+        let echo = thread::spawn(move || {
+            let (mut stream, _) = control_listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut message = [0; 4];
+            stream.read_exact(&mut message).unwrap();
+            assert_eq!(&message, b"ctrl");
+            stream.write_all(b"ack!").unwrap();
+        });
+        data.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Paused);
+        let mut data_client = TcpStream::connect(data.address()).unwrap();
+        data_client.write_all(b"data").unwrap();
+        let mut control_client = TcpStream::connect(control.address()).unwrap();
+        control_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        control_client.write_all(b"ctrl").unwrap();
+        let mut reply = [0; 4];
+        control_client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ack!");
+        drop(control_client);
+        drop(data_client);
+        echo.join().unwrap();
+        data.stop();
+        control.stop();
+        assert_eq!(control.retained_bytes(), 0);
+        assert!(control.control().peak_retained_bytes() <= 1024);
     }
 
     #[test]

@@ -29,8 +29,9 @@ use std::time::{Duration, Instant};
 use super::application;
 use super::model::StatisticsJobTarget;
 use novarocks_statistics_application::{
-    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobCreate,
-    StatisticsJobId, StatisticsJobRuntime, StatisticsJobService, StatisticsTarget,
+    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobAdmission,
+    StatisticsJobCreate, StatisticsJobId, StatisticsJobRuntime, StatisticsJobService,
+    StatisticsTarget,
 };
 use novarocks_workload_control::{PendingQueryRoot, RootAdmissionHandle, WorkClass, WorkRequest};
 
@@ -191,7 +192,7 @@ impl FrontendStatisticsApplicationPort {
                     .root_scope
                     .begin_statistics_job()
                     .map_err(application::StatisticsApplicationError::new)?;
-                let (owner, permit) = admit_statistics_job_root(root, &context).await?;
+                let admission = admit_statistics_job_root(root, &context).await?;
                 let columns = match columns {
                     application::StatisticsColumnIntent::AllColumns => StatisticsColumns::All,
                     application::StatisticsColumnIntent::Explicit(columns) => {
@@ -213,8 +214,7 @@ impl FrontendStatisticsApplicationPort {
                             columns,
                             submitted_at_ms,
                         },
-                        owner,
-                        permit,
+                        admission,
                     )
                     .await
                     .map_err(|error| {
@@ -470,15 +470,13 @@ async fn await_statistics_conclusion_with_clock(
 async fn admit_statistics_job_root(
     root: PendingQueryRoot,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<
-    (
-        novarocks_workload_control::WorkOwner,
-        novarocks_workload_control::QueryConcurrencyPermit,
-    ),
-    application::StatisticsApplicationError,
-> {
+) -> Result<StatisticsJobAdmission, application::StatisticsApplicationError> {
     use novarocks_workload_control::CancellationReason;
-    let admission = match root.owner.scope().admit_query() {
+    let admission = match root
+        .owner
+        .scope()
+        .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
+    {
         Ok(admission) => admission,
         Err(error) => {
             root.owner.complete();
@@ -503,7 +501,7 @@ async fn admit_statistics_job_root(
         }
     };
     match permit {
-        Ok(permit) => {
+        Ok((permit, window)) => {
             if let Err(error) =
                 novarocks_spi::connector::ConnectorOperationControl::check_active(context)
             {
@@ -512,13 +510,15 @@ async fn admit_statistics_job_root(
                 } else {
                     CancellationReason::DeadlineExceeded
                 });
+                drop(window);
                 drop(permit);
                 root.owner.complete_after_terminal_cancel_settled();
                 return Err(application::StatisticsApplicationError::new(
                     error.to_string(),
                 ));
             }
-            Ok((root.owner, permit))
+            StatisticsJobAdmission::try_new(root.owner, permit, window)
+                .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))
         }
         Err(error) => {
             root.owner.complete_after_terminal_cancel_settled();
@@ -554,10 +554,11 @@ mod admission_and_conclusion_tests {
     use std::sync::mpsc;
 
     use novarocks_statistics_application::{
-        StatisticsAttemptError, StatisticsFailure, StatisticsJobConclusion, StatisticsJobState,
-        StatisticsPublicationFact, StatisticsPublicationOutcome,
+        StatisticsAttemptContext, StatisticsAttemptError, StatisticsFailure,
+        StatisticsJobConclusion, StatisticsJobState, StatisticsPublicationFact,
+        StatisticsPublicationOutcome,
     };
-    use novarocks_workload_control::{ResourceConfig, WorkScope, WorkloadConfig, WorkloadControl};
+    use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     use super::*;
 
@@ -574,6 +575,9 @@ mod admission_and_conclusion_tests {
             },
         )
         .expect("control");
+        control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .expect("result capacity");
         control.mark_ready().expect("ready");
         control
     }
@@ -665,7 +669,7 @@ mod admission_and_conclusion_tests {
         fn prepare(
             &self,
             _job: &StatisticsJob,
-            scope: &WorkScope,
+            scope: &StatisticsAttemptContext,
         ) -> Result<(), StatisticsAttemptError> {
             self.started
                 .lock()
@@ -680,7 +684,7 @@ mod admission_and_conclusion_tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("test releases the actual executor");
             self.exited.store(true, Ordering::SeqCst);
-            scope.check().map_err(|error| {
+            scope.stage_scope().check().map_err(|error| {
                 StatisticsAttemptError::Cancelled(StatisticsFailure {
                     message: Arc::from(error.to_string()),
                 })
@@ -697,7 +701,7 @@ mod admission_and_conclusion_tests {
         fn collect(
             &self,
             _job: &StatisticsJob,
-            _scope: &WorkScope,
+            _scope: &StatisticsAttemptContext,
         ) -> Result<(), StatisticsAttemptError> {
             Ok(())
         }
@@ -705,7 +709,7 @@ mod admission_and_conclusion_tests {
         fn publish(
             &self,
             _job: &StatisticsJob,
-            _scope: &WorkScope,
+            _scope: &StatisticsAttemptContext,
         ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
             Ok(StatisticsPublicationOutcome {
                 fact: StatisticsPublicationFact::KnownCommitted,
@@ -767,7 +771,15 @@ mod admission_and_conclusion_tests {
         let root = control
             .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
             .expect("job root");
-        let permit = root.owner.scope().admit_query().unwrap().await.unwrap();
+        let (permit, window) = root
+            .owner
+            .scope()
+            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
+            .expect("atomic job admission")
+            .await
+            .expect("admitted job root");
+        let admission = StatisticsJobAdmission::try_new(root.owner, permit, window)
+            .expect("same-root Internal admission");
         let submitted = runtime
             .submit_admitted(
                 StatisticsJobCreate {
@@ -780,8 +792,7 @@ mod admission_and_conclusion_tests {
                     columns: StatisticsColumns::All,
                     submitted_at_ms: 1,
                 },
-                root.owner,
-                permit,
+                admission,
             )
             .await
             .expect("submit");

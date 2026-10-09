@@ -300,10 +300,7 @@ pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
 fn format_headers_redacted(headers: &HeaderMap, _disable_redaction: bool) -> String {
     format!(
         "{:?}",
-        headers
-            .keys()
-            .map(|name| name.as_str())
-            .collect::<Vec<_>>()
+        headers.keys().map(|name| name.as_str()).collect::<Vec<_>>()
     )
 }
 
@@ -449,9 +446,12 @@ mod tests {
         let canary = "storage-secret-canary";
         let error = serde_json::from_slice::<crate::types::LoadTableResult>(canary.as_bytes())
             .map_err(|source| {
-                Error::new(ErrorKind::Unexpected, "Failed to parse response from rest catalog server")
-                    .with_context("response_body", "[REDACTED]")
-                    .with_source(source)
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to parse response from rest catalog server",
+                )
+                .with_context("response_body", "[REDACTED]")
+                .with_source(source)
             })
             .expect_err("invalid response must fail");
         assert!(!format!("{error:?}").contains(canary));

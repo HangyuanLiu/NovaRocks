@@ -26,9 +26,10 @@ use crate::cancellation::{
 };
 use crate::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
-    BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit,
-    RootAdmissionHandle, WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner,
-    WorkRequest, WorkScope, WorkSuccessSealer,
+    BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit, ResultClosingCut,
+    ResultWindowAlias, ResultWindowClass, ResultWindowGrant, RootAdmissionHandle,
+    WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,
+    WorkSuccessSealer,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -241,6 +242,7 @@ pub enum GovernedStatementFinishOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GovernedStatementVisibilitySealOutcome {
     Sealed,
+    Failed,
     Cancelled(CancellationReason),
     Stale,
 }
@@ -427,6 +429,50 @@ impl QueryControlService {
         timeout_ms: Option<u64>,
         statement_text: Option<Arc<str>>,
     ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_queued(
+            session,
+            admission,
+            deadline,
+            timeout_ms,
+            statement_text,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::begin_queued_governed_query_statement`], but the warehouse
+    /// dequeue also takes one complete result window of `class` together with
+    /// the computation permit, before any dispatch. The owner retains the
+    /// window through the protocol's terminal outcome and its last alias.
+    pub async fn begin_queued_governed_query_statement_with_result(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        class: ResultWindowClass,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_queued(
+            session,
+            admission,
+            deadline,
+            timeout_ms,
+            statement_text,
+            Some(class),
+        )
+        .await
+    }
+
+    async fn begin_queued(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        window: Option<ResultWindowClass>,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
         let mut request = WorkRequest::new(WorkClass::Query);
         request.deadline = deadline;
         let root = admission
@@ -451,7 +497,20 @@ impl QueryControlService {
             }
         };
         let scope = root.owner.scope();
-        let query_admission = match scope.admit_query() {
+        let admitted = match window {
+            None => scope.admit_query().map(|admission| {
+                Box::pin(async move { admission.await.map(|permit| (permit, None)) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+            }),
+            Some(class) => scope.admit_query_with_result(class).map(|admission| {
+                Box::pin(async move {
+                    admission
+                        .await
+                        .map(|(permit, window)| (permit, Some(window)))
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+            }),
+        };
+        let query_admission = match admitted {
             Ok(admission) => admission,
             Err(error) => {
                 root.owner.complete_after_terminal_cancel_settled();
@@ -459,8 +518,8 @@ impl QueryControlService {
                 return Err(GovernedQueryStatementBeginError::Admission(error));
             }
         };
-        let permit = match query_admission.await {
-            Ok(permit) => permit,
+        let (permit, result_window) = match query_admission.await {
+            Ok(admitted) => admitted,
             Err(error) => {
                 if matches!(error, WorkError::Cancelled(_)) {
                     root.owner.complete_after_terminal_cancel_settled();
@@ -479,6 +538,8 @@ impl QueryControlService {
             execution_owner: Some(root.owner),
             business: None,
             query_concurrency: Some(permit),
+            result_window,
+            accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
             finished: false,
@@ -502,11 +563,61 @@ impl QueryControlService {
         timeout_ms: Option<u64>,
         statement_text: Option<Arc<str>>,
     ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_nonqueued(
+            session,
+            admission,
+            class,
+            deadline,
+            timeout_ms,
+            statement_text,
+            None,
+        )
+    }
+
+    /// Acquire the complete result position together with nonqueued business
+    /// admission, before registering or starting the statement's producer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_governed_statement_with_result(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        class: WorkClass,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        window: ResultWindowClass,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_nonqueued(
+            session,
+            admission,
+            class,
+            deadline,
+            timeout_ms,
+            statement_text,
+            Some(window),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_nonqueued(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        class: WorkClass,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        window: Option<ResultWindowClass>,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
         let mut request = WorkRequest::new(class);
         request.deadline = deadline;
-        let root = admission
-            .try_begin_root(request)
-            .map_err(GovernedQueryStatementBeginError::Admission)?;
+        let (root, result_window) = match window {
+            None => admission.try_begin_root(request).map(|root| (root, None)),
+            Some(window) => admission
+                .try_begin_root_with_result(request, window)
+                .map(|(root, window)| (root, Some(window))),
+        }
+        .map_err(GovernedQueryStatementBeginError::Admission)?;
         let cancellation = match GovernedStatementCancellation::new(&root.owner) {
             Ok(cancellation) => cancellation,
             Err(error) => {
@@ -534,6 +645,8 @@ impl QueryControlService {
             execution_owner: Some(root.owner),
             business: Some(root.business),
             query_concurrency: None,
+            result_window,
+            accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
             finished: false,
@@ -650,6 +763,10 @@ pub struct GovernedQueryStatementOwner {
     execution_owner: Option<WorkOwner>,
     business: Option<BusinessPermit>,
     query_concurrency: Option<QueryConcurrencyPermit>,
+    /// The complete result window taken with the permit, when the statement
+    /// declared one. Its position follows the last alias, not this owner.
+    result_window: Option<ResultWindowGrant>,
+    accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
     success_visibility_sealed: bool,
     finished: bool,
@@ -670,6 +787,20 @@ impl GovernedQueryStatementOwner {
 
     pub const fn timeout_ms(&self) -> Option<u64> {
         self.timeout_ms
+    }
+
+    /// An alias of the statement's result window for one relay or delivery
+    /// owner; `None` when the statement took no window at admission.
+    pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
+        self.result_window
+            .as_ref()
+            .map(ResultWindowGrant::retain_alias)
+    }
+
+    pub(crate) fn release_transferred_result_window(&mut self) {
+        // Fetch and transport aliases retain their own short-tail position.
+        // The protocol has already moved its owned bytes into closing capacity.
+        self.result_window.take();
     }
 
     /// Transfer the unique root owner into `QueryExecutionClient::start`.
@@ -706,11 +837,57 @@ impl GovernedQueryStatementOwner {
         self.business.take();
     }
 
+    /// Accept a cancellation delivery cut after publication/fetch dispatch has
+    /// stopped. Only the computation permit is returned here. The statement
+    /// generation, business responsibility and external effects stay owned
+    /// through the protocol's independent closing/actual exit boundary.
+    pub fn accept_cancel_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        if self.finished || self.success_visibility_sealed || self.cancellation().reason().is_none()
+        {
+            return Err(WorkError::Conflict);
+        }
+        if self.accepted_delivery_cut.is_some() {
+            return Ok(false);
+        }
+        self.accepted_delivery_cut = Some(ResultClosingCut::AcceptedCancellation);
+        Ok(self.query_concurrency.take().is_some())
+    }
+
+    /// The originating failure owner uses this only after its failure cut has
+    /// stopped new delivery work. It does not invent client cancellation or
+    /// settle business/external effects, even after success visibility sealed.
+    pub fn accept_failed_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        if self.finished {
+            return Err(WorkError::Released);
+        }
+        if self.accepted_delivery_cut.is_some() {
+            return Ok(false);
+        }
+        self.accepted_delivery_cut = Some(ResultClosingCut::OriginatingFailure);
+        Ok(self.query_concurrency.take().is_some())
+    }
+    pub(crate) fn accepted_delivery_cut(&self) -> Option<ResultClosingCut> {
+        self.accepted_delivery_cut
+    }
+
     /// Atomically wins the terminal success boundary against every later
     /// cancellation request while retaining business and statement ownership.
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
         if self.finished {
             return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        match self.accepted_delivery_cut {
+            Some(ResultClosingCut::OriginatingFailure) => {
+                return GovernedStatementVisibilitySealOutcome::Failed;
+            }
+            Some(ResultClosingCut::AcceptedCancellation) => {
+                return GovernedStatementVisibilitySealOutcome::Cancelled(
+                    self.cancellation()
+                        .reason()
+                        .expect("accepted cancellation cut retains its reason"),
+                );
+            }
+            None => {}
         }
         if self.success_visibility_sealed {
             return GovernedStatementVisibilitySealOutcome::Sealed;
@@ -734,17 +911,7 @@ impl GovernedQueryStatementOwner {
     /// external-effect owner exists, so the known cancellation control reaches
     /// its terminal boundary with the local read start failure.
     pub fn finish_unstarted_read_after_cancellation(mut self) -> GovernedStatementFinishOutcome {
-        if self.finished {
-            return GovernedStatementFinishOutcome::Stale;
-        }
-        self.finished = true;
-        self.complete_local_owner_after_terminal();
-        self.release_terminal_concurrency();
-        let outcome = self
-            .service
-            .port
-            .finish_governed_statement(self.registration.token());
-        outcome
+        self.finish_inner()
     }
 
     pub fn fail(mut self, reason: CancellationReason) -> GovernedStatementFinishOutcome {
@@ -782,6 +949,9 @@ impl GovernedQueryStatementOwner {
     }
 
     fn finish_inner(&mut self) -> GovernedStatementFinishOutcome {
+        if self.accepted_delivery_cut == Some(ResultClosingCut::OriginatingFailure) {
+            return self.protocol_fail_inner();
+        }
         if self.finished {
             return GovernedStatementFinishOutcome::Stale;
         }

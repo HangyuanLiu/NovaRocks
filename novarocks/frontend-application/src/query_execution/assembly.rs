@@ -20,17 +20,147 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+#[cfg(test)]
 use arrow::array::{ArrayRef, RecordBatchOptions};
-use arrow::datatypes::{DataType, Field, Schema};
+#[cfg(test)]
+use arrow::datatypes::{DataType, Schema};
+#[cfg(test)]
 use arrow::record_batch::RecordBatch;
 
 use crate::query_execution::artifact::FragmentId;
+#[cfg(test)]
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::schedule::SchedulingPlan;
+#[cfg(test)]
 use novarocks_execution::exec::chunk::Chunk;
 use tracing::debug;
 
+#[cfg(test)]
+fn validate_source_domain(
+    field: &arrow::datatypes::Field,
+    expected: Option<novarocks_types::logical::LogicalType>,
+) -> Result<(), String> {
+    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+    let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
+        return Ok(());
+    };
+    let value = value.trim();
+    for domain in [
+        LogicalType::Json,
+        LogicalType::Hll,
+        LogicalType::Bitmap,
+        LogicalType::Object,
+        LogicalType::Percentile,
+    ] {
+        if value.eq_ignore_ascii_case(domain.metadata_value()) {
+            if Some(domain) != expected {
+                return Err(
+                    "typed root result source logical domain differs from output domain".into(),
+                );
+            }
+            return Ok(());
+        }
+    }
+    Err("typed root result source contains an unknown logical domain marker".into())
+}
+
+// Check borrowed facts before metadata retagging can replace their identity.
+// Missing source markers may acquire the declared fact; existing facts may not
+// be reinterpreted. Physical compatibility remains the separate existing check.
+#[cfg(test)]
+fn validate_source_field_tree(
+    source: &arrow::datatypes::Field,
+    expected: &arrow::datatypes::Field,
+) -> Result<(), String> {
+    validate_source_domain(source, declared_nested_domain(expected)?)?;
+    validate_source_type_domains(source.data_type(), expected.data_type())
+}
+
+#[cfg(test)]
+fn declared_nested_domain(
+    field: &arrow::datatypes::Field,
+) -> Result<Option<novarocks_types::logical::LogicalType>, String> {
+    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+    let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
+        return Ok(None);
+    };
+    [
+        LogicalType::Json,
+        LogicalType::Hll,
+        LogicalType::Bitmap,
+        LogicalType::Object,
+        LogicalType::Percentile,
+    ]
+    .into_iter()
+    .find(|domain| value.trim().eq_ignore_ascii_case(domain.metadata_value()))
+    .map(Some)
+    .ok_or_else(|| {
+        "typed root result declared field contains an unknown logical domain marker".into()
+    })
+}
+
+#[cfg(test)]
+fn validate_source_type_domains(source: &DataType, expected: &DataType) -> Result<(), String> {
+    match (source, expected) {
+        (DataType::Struct(source), DataType::Struct(expected)) => {
+            for (source, expected) in source.iter().zip(expected.iter()) {
+                validate_source_field_tree(source, expected)?;
+            }
+        }
+        (DataType::List(source), DataType::List(expected))
+        | (DataType::LargeList(source), DataType::LargeList(expected))
+        | (DataType::Map(source, _), DataType::Map(expected, _)) => {
+            // Map entries are a real Field, independently of its key/value
+            // children, and therefore also require strict marker validation.
+            validate_source_field_tree(source, expected)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_source_cache_tree(
+    source: &novarocks_execution::exec::chunk::ChunkFieldSchema,
+    expected_domain: Option<novarocks_types::logical::LogicalType>,
+    expected_type: &DataType,
+) -> Result<(), String> {
+    if source.logical_type().is_some() && source.logical_type() != expected_domain {
+        return Err(
+            "typed root result cached source logical domain differs from output domain".into(),
+        );
+    }
+    let expected_children: &[arrow::datatypes::FieldRef] = match expected_type {
+        DataType::Struct(fields) => fields.as_ref(),
+        DataType::List(item) | DataType::LargeList(item) => std::slice::from_ref(item),
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) => fields.as_ref(),
+            _ => return Err("typed root result declared map entries are not a struct".into()),
+        },
+        _ => &[],
+    };
+    // An absent source cache is a missing fact, not permission to erase
+    // populated children whose shape disagrees with the declared fields.
+    if source.children().is_empty() {
+        return Ok(());
+    }
+    if source.children().len() != expected_children.len() {
+        return Err(
+            "typed root result cached source child count differs from output fields".into(),
+        );
+    }
+    for (source, expected) in source.children().iter().zip(expected_children) {
+        validate_source_cache_tree(
+            source,
+            declared_nested_domain(expected)?,
+            expected.data_type(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
     output_columns: &[PlanOutputColumn],
@@ -41,6 +171,7 @@ pub(crate) fn align_fetch_chunks_to_output_columns(
         .collect()
 }
 
+#[cfg(test)]
 fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
     output_columns: &[PlanOutputColumn],
@@ -64,12 +195,34 @@ fn align_fetch_chunk_to_output_columns(
     let mut fields = Vec::with_capacity(output_columns.len());
     let mut arrays = Vec::with_capacity(output_columns.len());
     for (idx, output) in output_columns.iter().enumerate() {
+        output.validate_domain()?;
+        let slot = &chunk.chunk_schema().slots()[idx];
+        let expected = output.logical_marker();
+        validate_source_domain(chunk.batch.schema().field(idx), expected)?;
+        validate_source_domain(slot.field(), expected)?;
+        validate_source_type_domains(
+            chunk.batch.schema().field(idx).data_type(),
+            &output.data_type,
+        )?;
+        validate_source_type_domains(slot.field().data_type(), &output.data_type)?;
+        validate_source_type_domains(chunk.batch.column(idx).data_type(), &output.data_type)?;
+        validate_source_cache_tree(slot.field_schema(), expected, &output.data_type)?;
         let array =
             align_typed_root_array(idx, chunk.batch.column(idx).clone(), &output.data_type)?;
-        if let Err(mismatch) = novarocks_execution::exec::chunk::type_compatibility::check_exact(
-            &output.data_type,
-            array.data_type(),
-        ) {
+        let dictionary_carrier =
+            result_string_dictionary_carrier(&output.data_type, array.data_type());
+        if matches!(output.data_type, DataType::Utf8 | DataType::LargeUtf8)
+            && matches!(array.data_type(), DataType::Dictionary(_, _))
+            && !dictionary_carrier
+        {
+            return Err("typed root result string dictionary carrier is unsupported".into());
+        }
+        if !dictionary_carrier
+            && let Err(mismatch) = novarocks_execution::exec::chunk::type_compatibility::check_exact(
+                &output.data_type,
+                array.data_type(),
+            )
+        {
             return Err(format!(
                 "typed root result column {idx} type mismatch: output={:?} chunk={:?} ({:?})",
                 output.data_type,
@@ -77,11 +230,17 @@ fn align_fetch_chunk_to_output_columns(
                 mismatch.kind
             ));
         }
-        fields.push(Field::new(
-            output.name.clone(),
-            array.data_type().clone(),
-            output.nullable || array.null_count() > 0,
-        ));
+        let canonical = output.canonical_field(output.nullable || array.null_count() > 0)?;
+        let canonical = if dictionary_carrier {
+            canonical.with_data_type(array.data_type().clone())
+        } else {
+            canonical
+        };
+        fields.push(if slot.field() == &canonical {
+            Arc::clone(slot.field_ref())
+        } else {
+            Arc::new(canonical)
+        });
         arrays.push(array);
     }
 
@@ -91,31 +250,72 @@ fn align_fetch_chunk_to_output_columns(
         &RecordBatchOptions::new().with_row_count(Some(row_count)),
     )
     .map_err(|e| format!("align typed root result batch failed: {e}"))?;
-    let chunk_schema = chunk
+    // The incoming cache describes the wire fields. Rebuild it from the
+    // exact result domain, while retaining the already-decoded slot namespace.
+    let slots = chunk
         .chunk_schema()
-        .with_fields_in_order(
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
-                .collect(),
-        )
-        .map(Arc::new)?;
+        .slots()
+        .iter()
+        .zip(batch.schema().fields())
+        .map(|(slot, field)| {
+            if Arc::ptr_eq(slot.field_ref(), field)
+                && let Some(origins) = slot.metadata_origins()
+            {
+                novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_with_metadata_origins(
+                    slot.slot_id(),
+                    Arc::clone(field),
+                    origins.clone(),
+                    None,
+                    slot.unique_id(),
+                )
+            } else {
+                novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_with_field_ref(
+                    slot.slot_id(),
+                    Arc::clone(field),
+                    None,
+                    slot.unique_id(),
+                )
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let chunk_schema = Arc::new(novarocks_execution::exec::chunk::ChunkSchema::try_new(
+        slots,
+    )?);
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
+#[cfg(test)]
 fn align_typed_root_array(
     idx: usize,
     array: ArrayRef,
     output_type: &DataType,
 ) -> Result<ArrayRef, String> {
+    if result_string_dictionary_carrier(output_type, array.data_type()) {
+        return Ok(array);
+    }
     if novarocks_execution::exec::chunk::type_compatibility::check_exact(
         output_type,
         array.data_type(),
     )
     .is_ok()
     {
+        if array.data_type() != output_type
+            && matches!(
+                output_type,
+                DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::Map(_, _)
+                    | DataType::Struct(_)
+            )
+        {
+            // All original Field/cache domains were validated before this
+            // metadata-only completion. Existing buffers remain unchanged.
+            return novarocks_execution::exec::chunk::type_compatibility::retag_column(
+                &array,
+                output_type,
+            )
+            .map_err(|_| "typed root result nested metadata completion failed".into());
+        }
         return Ok(array);
     }
     if !same_unit_timestamp_metadata_mismatch(output_type, array.data_type()) {
@@ -131,6 +331,24 @@ fn align_typed_root_array(
     })
 }
 
+/// ResultBufferSink::accepts_encoded_column explicitly retains Int32 string
+/// dictionaries (Utf8 or LargeUtf8). This is a result-boundary carrier rule;
+/// it neither broadens generic type compatibility nor hydrates the column.
+#[cfg(test)]
+fn result_string_dictionary_carrier(expected: &DataType, actual: &DataType) -> bool {
+    match (expected, actual) {
+        (DataType::Utf8, DataType::Dictionary(key, value)) => {
+            key.as_ref() == &DataType::Int32
+                && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
+        }
+        (DataType::LargeUtf8, DataType::Dictionary(key, value)) => {
+            key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::LargeUtf8
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
 fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType) -> bool {
     matches!(
         (expected, actual),
@@ -557,6 +775,7 @@ mod tests {
 
     use arrow::array::{Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    #[cfg(test)]
     use arrow::record_batch::RecordBatch;
     use novarocks_spi::connector::ConnectorWriteRouteId;
 
@@ -680,6 +899,7 @@ mod tests {
                 name: "col1".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
             }],
         )
         .unwrap();
@@ -706,6 +926,7 @@ mod tests {
                     name: "price".to_string(),
                     data_type: DataType::Decimal128(20, 2),
                     nullable: false,
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 }],
             )
             .expect_err("decimal precision drift must fail")
@@ -761,5 +982,113 @@ mod tests {
             .expect_err("router group drift must fail before patching");
         assert!(error.contains("expected group=8"), "{error}");
         assert_eq!(fragment, before, "router patch must be atomic");
+    }
+
+    #[test]
+    fn m07_result_alignment_rejects_known_unknown_and_cache_only_domain_conflicts() {
+        use arrow::array::BinaryArray;
+        use novarocks_execution::exec::chunk::{ChunkFieldSchema, ChunkSlotSchema};
+        use novarocks_physical_plan::ResultValueDomain as D;
+        use novarocks_types::logical::{
+            LogicalType as L, NR_LOGICAL_TYPE_KEY, field_with_logical_type,
+        };
+        let source = |batch_marker: Option<&str>, slot_marker: Option<&str>, cached: Option<L>| {
+            let field = |marker: Option<&str>| {
+                let field = Field::new("wire", DataType::Binary, false);
+                match marker {
+                    Some(marker) => {
+                        field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into())
+                    }
+                    None => field,
+                }
+            };
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field(batch_marker)])),
+                vec![Arc::new(BinaryArray::from(vec![
+                    b"actual-nonempty".as_slice(),
+                ]))],
+            )
+            .unwrap();
+            let cache_field = match cached {
+                Some(marker) => field_with_logical_type(field(None), marker),
+                None => field(None),
+            };
+            let cache = ChunkFieldSchema::from_field(&cache_field).unwrap();
+            let slot = ChunkSlotSchema::try_new_with_field(
+                SlotId::new(9),
+                field(slot_marker),
+                Some(cache),
+                None,
+            )
+            .unwrap();
+            let mut chunk = Chunk::try_new_with_chunk_schema(
+                batch.clone(),
+                Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()),
+            )
+            .unwrap();
+            // Chunk construction normally reconciles the batch to its slots.
+            // Keep the three actual public facts independent here so each
+            // alignment guard has its own failure oracle.
+            chunk.batch = batch;
+            chunk
+        };
+        let output = |domain| PlanOutputColumn {
+            name: "declared".into(),
+            data_type: DataType::Binary,
+            nullable: false,
+            domain,
+        };
+        // Known semantic identity is checked independently in both actual
+        // Fields and the cached schema; clearing or renaming is not permission.
+        for domain in [D::Hll, D::Object, D::Percentile, D::Plain] {
+            for (batch, slot, cached) in [
+                (Some("bitmap"), None, None),
+                (None, Some("bitmap"), None),
+                (None, None, Some(L::Bitmap)),
+            ] {
+                let error = align_fetch_chunks_to_output_columns(
+                    vec![source(batch, slot, cached)],
+                    &[output(domain)],
+                )
+                .unwrap_err();
+                assert!(error.contains("logical domain differs"), "{error}");
+            }
+        }
+        for domain in [D::Bitmap, D::Plain] {
+            for (batch, slot) in [
+                (Some("unknown"), None),
+                (None, Some("unknown")),
+                (Some(""), None),
+            ] {
+                let error = align_fetch_chunks_to_output_columns(
+                    vec![source(batch, slot, None)],
+                    &[output(domain)],
+                )
+                .unwrap_err();
+                assert!(error.contains("unknown logical domain"), "{error}");
+            }
+        }
+        let aligned = align_fetch_chunks_to_output_columns(
+            vec![source(None, None, None)],
+            &[output(D::Bitmap)],
+        )
+        .unwrap();
+        assert_eq!(
+            aligned[0].chunk_schema().slots()[0]
+                .field_schema()
+                .logical_type(),
+            Some(L::Bitmap)
+        );
+        let aligned = align_fetch_chunks_to_output_columns(
+            vec![source(Some(" BiTmAp "), Some("bitmap"), Some(L::Bitmap))],
+            &[output(D::Bitmap)],
+        )
+        .unwrap();
+        assert_eq!(
+            aligned[0].chunk_schema().slots()[0]
+                .field_schema()
+                .logical_type(),
+            Some(L::Bitmap)
+        );
     }
 }

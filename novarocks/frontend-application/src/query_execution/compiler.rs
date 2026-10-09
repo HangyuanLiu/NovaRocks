@@ -973,6 +973,8 @@ fn test_request_context_with_role(
                     BackendProcessDescriptor::try_new(
                         BackendProcessId::new_v7(),
                         RuntimeEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
+                        RuntimeEndpoint::new("control-0.test.invalid", 19061)
+                            .expect("valid control endpoint"),
                         "test-deployment",
                         "test-build",
                         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
@@ -1508,6 +1510,13 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let version = plan.version();
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .and_then(|candidate| {
+                candidate.freeze_root_output(
+                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                    ),
+                )
+            })
             .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,

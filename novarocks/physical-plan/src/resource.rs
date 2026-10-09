@@ -89,8 +89,8 @@ impl CutResourcePreflight {
         add_distribution_usage(distribution, &mut self.usage);
     }
 
-    pub(crate) fn add_source(&mut self, source: &ArtifactSourceBinding, path: &str) {
-        add_artifact_source_usage(source, path, &mut self.usage);
+    pub(crate) fn add_source(&mut self, source: crate::SourceBindingRef<'_>, _path: &str) {
+        add_read_reference_usage(source.source, &mut self.usage);
     }
 
     pub(crate) fn add_artifact(
@@ -433,6 +433,10 @@ pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut Validati
         ]);
     }
     if let Some(result) = plan.result_port() {
+        if let Some(schema) = &result.scalar_schema {
+            usage.add_item_counts([schema.type_nodes()]);
+            usage.add_byte_counts([schema.backing_bytes()]);
+        }
         usage.add_item_counts([result.output.columns.len(), result.fields.len()]);
         for (index, field) in result.fields.iter().enumerate() {
             if usage.exhausted() {
@@ -1203,6 +1207,17 @@ fn add_sink_usage(
         FragmentSink::SealedArtifact(spec) => {
             add_artifact_sink_usage(spec, path, usage, errors);
         }
+        FragmentSink::RootResult(contract) => match contract.output() {
+            novarocks_result_contract::FrozenRootOutput::ClientRows(schema) => {
+                usage.add_items(schema.columns().len());
+                usage.add_bytes(schema.backing_bytes());
+            }
+            novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) => {
+                usage.add_items(schema.type_nodes());
+                usage.add_bytes(schema.backing_bytes());
+            }
+            _ => {}
+        },
         FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Noop => {}
     }
 }

@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
@@ -71,6 +71,10 @@ impl NovaRocksHiveCatalog {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHiveCatalog {
+    fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
+        Arc::clone(&self.delegate.listing)
+    }
+
     fn implementation_name(&self) -> &'static str {
         "hive"
     }
@@ -88,8 +92,120 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         Err(Self::read_only(*operation))
     }
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_namespaces().await
+    async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.delegate.list_namespaces(bound).await
+    }
+
+    async fn list_namespaces_for_read(
+        &self,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "external catalog listing requires an admitted request context",
+            )
+        })?;
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        {
+            let target = None;
+            self.delegate
+                .listing
+                .run_hms(
+                    context,
+                    super::hms_listing_observer::HmsListingOperation::Namespaces,
+                    target,
+                    |invocation| async move {
+                        self.delegate
+                            .list_namespaces_observed(bound, &invocation)
+                            .await
+                    },
+                )
+                .await
+        }
+        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+        {
+            self.delegate
+                .listing
+                .run(context, self.list_namespaces(bound))
+                .await
+        }
+    }
+
+    async fn list_tables_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "external catalog listing requires an admitted request context",
+            )
+        })?;
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        {
+            use sha2::Digest;
+            let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
+            self.delegate
+                .listing
+                .run_hms(
+                    context,
+                    super::hms_listing_observer::HmsListingOperation::Tables,
+                    target,
+                    |invocation| async move {
+                        self.delegate
+                            .list_tables_observed(&namespace, bound, &invocation)
+                            .await
+                    },
+                )
+                .await
+        }
+        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+        {
+            self.delegate
+                .listing
+                .run(context, self.list_tables(namespace, bound))
+                .await
+        }
+    }
+
+    async fn list_views_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        {
+            use sha2::Digest;
+            let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
+            self.delegate
+                .listing
+                .run_hms(
+                    &context,
+                    super::hms_listing_observer::HmsListingOperation::Views,
+                    target,
+                    |invocation| async move {
+                        self.delegate
+                            .list_views_observed(&namespace, bound, &invocation)
+                            .await
+                    },
+                )
+                .await
+        }
+        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+        {
+            self.delegate
+                .listing
+                .run(&context, self.list_views(namespace, bound))
+                .await
+        }
     }
 
     async fn namespace_exists(
@@ -102,8 +218,9 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_tables(&namespace).await
+        self.delegate.list_tables(&namespace, bound).await
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -129,8 +246,9 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_views(&namespace).await
+        self.delegate.list_views(&namespace, bound).await
     }
 
     async fn load_view(

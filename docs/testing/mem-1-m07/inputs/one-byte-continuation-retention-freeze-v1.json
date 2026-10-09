@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "topology": "1FE+3BE",
+  "scope": "Native S+1 single row produces exact one-byte continuation; held context census and full normal MySQL oracle, excluding prefix-only refusal and physical last-alias exit.",
+  "sql": "SELECT REPEAT('x', 1048569) AS payload FROM generate_series(1, 1)",
+  "segment_bytes": 1048576,
+  "native_row_bytes": 1048577,
+  "client_receive_buffer_bytes": 4096,
+  "max_applied_receive_buffer_bytes": 65536,
+  "mysql_client_max_packet_bytes": 67108864,
+  "query_observation_ms": 20000,
+  "metadata_wait_ms": 5000,
+  "held_phase_ms": 5000,
+  "phase_sample_interval_ms": 100,
+  "phase_max_samples": 51,
+  "expected_columns": 1,
+  "expected_rows": 1,
+  "expected_row_payload_bytes": 1048573,
+  "expected_packets": 5,
+  "expected_schema": [
+    {
+      "name": "payload",
+      "mysql_type": 253
+    }
+  ],
+  "expected_row_sha256": "20928da92f8b9c02438d16e3f2cb70910c0826822f970ab5da39044a07b52dea"
+}

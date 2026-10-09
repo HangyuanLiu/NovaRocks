@@ -28,9 +28,12 @@ pub struct ConnectorViewRequest {
     pub context: ConnectorRequestContext,
 }
 
+/// Enumerate one namespace's views. The provider refuses a listing that would
+/// exceed `bound`; it never truncates one.
 #[derive(Clone)]
 pub struct ConnectorListViewsRequest {
     pub namespace: ConnectorNamespaceIdentity,
+    pub bound: super::ConnectorListingBound,
     pub context: ConnectorRequestContext,
 }
 

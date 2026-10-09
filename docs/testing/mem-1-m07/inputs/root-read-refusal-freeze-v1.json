@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "topology": "1FE+3BE",
+  "scope": "Authenticated RootResult request profile/kind/sequence refusal, foreign-process baseline, subsequent native query and public owner convergence only; does not prove malformed replies or installed-root ACK/retirement/closing. Freeze before execution. This scenario is explicitly limited to authenticated plaintext/IP; no DNS/TLS teardown upper bound is inferred.",
+  "path": "/novarocks.NovaRocksGrpc/FetchRootResult",
+  "cases": [
+    {
+      "name": "valid-v1-foreign-process",
+      "profile_id": 1,
+      "kind": "client_rows_true",
+      "wanted_sequence": 1,
+      "grpc_status": 9
+    },
+    {
+      "name": "absent-profile",
+      "profile_id": 0,
+      "kind": "client_rows_true",
+      "wanted_sequence": 1,
+      "grpc_status": 3
+    },
+    {
+      "name": "unsupported-v2-profile",
+      "profile_id": 2,
+      "kind": "client_rows_true",
+      "wanted_sequence": 1,
+      "grpc_status": 3
+    },
+    {
+      "name": "absent-kind",
+      "profile_id": 1,
+      "kind": "absent",
+      "wanted_sequence": 1,
+      "grpc_status": 3
+    },
+    {
+      "name": "false-client-rows-kind",
+      "profile_id": 1,
+      "kind": "client_rows_false",
+      "wanted_sequence": 1,
+      "grpc_status": 3
+    },
+    {
+      "name": "unknown-internal-domain",
+      "profile_id": 1,
+      "kind": "unknown_domain_999",
+      "wanted_sequence": 1,
+      "grpc_status": 3
+    },
+    {
+      "name": "zero-wanted-sequence",
+      "profile_id": 1,
+      "kind": "client_rows_true",
+      "wanted_sequence": 0,
+      "grpc_status": 3
+    }
+  ],
+  "health": {
+    "sql": "SELECT SUM(generate_series) AS total FROM generate_series(1, 100)",
+    "expected_row_sha256": "6dab454b19ecc06d337eb421a7ecc69aaa272a74fdf3a6bf7b81900ca94758b1"
+  }
+}

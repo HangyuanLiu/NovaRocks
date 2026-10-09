@@ -115,6 +115,50 @@ jq '
 assert_rejected "$proto_missing_spi" \
   "novarocks-proto-codec internal normal dependencies must be exactly"
 
+proto_missing_result_contract="$tmpdir/proto-missing-result-contract.json"
+jq '
+  (.packages[] | select(.name == "novarocks-proto-codec") | .dependencies) |= map(
+    select(.name != "novarocks-result-contract")
+  )
+' "$base_metadata" >"$proto_missing_result_contract"
+assert_rejected "$proto_missing_result_contract" \
+  "missing: novarocks-result-contract"
+
+task_codec_missing_result_contract="$tmpdir/task-codec-missing-result-contract.json"
+jq '
+  (.packages[] | select(.name == "novarocks-task-codec") | .dependencies) |= map(
+    select(.name != "novarocks-result-contract")
+  )
+' "$base_metadata" >"$task_codec_missing_result_contract"
+assert_rejected "$task_codec_missing_result_contract" \
+  "missing: novarocks-result-contract"
+
+execution_contract_missing_result_contract="$tmpdir/execution-contract-missing-result-contract.json"
+jq '
+  (.packages[] | select(.name == "novarocks-execution-contract") | .dependencies) |= map(
+    select(.name != "novarocks-result-contract")
+  )
+' "$base_metadata" >"$execution_contract_missing_result_contract"
+assert_rejected "$execution_contract_missing_result_contract" \
+  "novarocks-execution-contract internal normal dependencies must be exactly"
+
+result_contract_direct="$tmpdir/result-contract-direct.json"
+jq '
+  (.packages[] | select(.name == "novarocks-result-contract") | .dependencies) += [{
+    name: "bytes", kind: null, optional: true
+  }]
+' "$base_metadata" >"$result_contract_direct"
+assert_rejected "$result_contract_direct" \
+  "novarocks-result-contract must not declare normal dependencies: bytes"
+
+for forbidden in novarocks-proto-models novarocks-execution tonic; do
+  result_contract_closure="$tmpdir/result-contract-${forbidden}.json"
+  add_normal_resolve_edge novarocks-result-contract "$forbidden" "$result_contract_closure"
+  assert_rejected "$result_contract_closure" \
+    "novarocks-result-contract normal dependency closure must be empty:"
+  grep -Fq "$forbidden" "$result_contract_closure.stderr"
+done
+
 task_codec_execution="$tmpdir/task-codec-execution.json"
 jq '
   (.packages[] | select(.name == "novarocks-task-codec") | .dependencies) += [{

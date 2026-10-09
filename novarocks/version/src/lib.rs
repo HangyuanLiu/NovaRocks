@@ -35,6 +35,9 @@ const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 6 adds signed Native caller role and exact process identity claims.
+/// Epoch-5 receivers reject these closed JWT fields, so the two cannot share
+/// an island. Diagnostic subjects do not provide process identity.
 /// Epoch 5 preserves terminal Task control authority when a root result is
 /// revoked and its result plane explicitly awaits that control observation.
 /// Epoch 4 adds Accepted/Installed task creation and the normal context
@@ -45,11 +48,11 @@ const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 5;
+pub const NATIVE_COMPAT_EPOCH: u64 = 6;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 6;
+pub const NATIVE_COMPAT_EPOCH: u64 = 7;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");
@@ -346,6 +349,12 @@ pub const fn native_build_identity() -> &'static str {
     NATIVE_BUILD_IDENTITY
 }
 
+/// Actual build-time Git commit, independently of an explicit native build identity.
+/// Empty for builds without an available Git checkout.
+pub const fn build_git_commit() -> &'static str {
+    env!("NOVAROCKS_GIT_COMMIT_FULL")
+}
+
 /// Short version string reported via heartbeat, e.g. "novarocks-1b9f054a".
 /// Matches StarRocks BE convention of "version-commit".
 pub fn short_version() -> &'static str {
@@ -635,10 +644,26 @@ mod tests {
     #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 6);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 7);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 5);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 6);
     }
+    #[test]
+    fn signed_process_claims_do_not_share_the_subject_only_epoch() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"same-descriptor",
+                carriers(),
+                [0x31; 32],
+                [0x41; 32],
+                1,
+                epoch,
+            )
+            .unwrap()
+        };
+        assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(5).id());
+    }
+
     #[test]
     fn terminal_control_authority_cuts_off_opaque_result_error_epoch() {
         let at = |epoch| {

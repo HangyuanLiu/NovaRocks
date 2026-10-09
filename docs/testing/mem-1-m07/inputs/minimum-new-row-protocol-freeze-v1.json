@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "topology": "1FE+3BE",
+  "scope": "Read actual installed Data1(S) completing row1 and exact Data2 [1,0,0,0,0] starting/completing empty String row2, without consuming ACK; validate production cursor and actual End3 rows2 before normal MySQL oracle. All original caps, deadlines and profile unchanged.",
+  "retention_input_sha256": "3ff9ec431822edad6c4ae134b8ad454c1863f7249e6975644fffaaf90532f927",
+  "phase_ms": 5000,
+  "request_frame_bytes": 4096,
+  "response_data_bytes": 1052672,
+  "data1_sha256": "73bcee5333b6179d0ae451558bd9e2463ce3bbe903e907bf7ff6fe52e9d243d2",
+  "data2_sha256": "957b88b12730e646e0f33d3618b77dfa579e8231e3c59c7104be7165611c8027",
+  "data1_bytes": 1048576,
+  "data2_bytes": 5,
+  "end_sequence": 3,
+  "output_rows": 2,
+  "operations": [
+    "ack0",
+    "ack0",
+    "fetch1",
+    "fetch2",
+    "fetch-end3"
+  ],
+  "cases": [
+    "result-delivery/minimum-new-row-normal-wire"
+  ],
+  "max_identity_candidates": 8,
+  "max_wait_millis": 100,
+  "correction_of": {
+    "path": "docs/testing/mem-1-m07/inputs/one-byte-continuation-protocol-freeze-v1.json",
+    "sha256": "f0b30e249490dee2404633793a65134c98f03f9402ee36ad3119ecdc5845d188",
+    "reason": "Independent minimum legal new-row body coverage. Existing OneByte input and receipts remain unchanged; this new input must be frozen before execution."
+  }
+}

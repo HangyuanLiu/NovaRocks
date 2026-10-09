@@ -1371,6 +1371,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
                 "abort_query_context",
                 "release_query_context",
                 "quiesce_query_context",
+                "close_exchange_destinations",
             ][..],
         ),
         (

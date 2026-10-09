@@ -17,7 +17,7 @@
 
 //! Iceberg-backed materialized-view backend.
 
-use crate::mv::domain::lifecycle::{ListMvsRequest, MvListRow};
+use crate::mv::domain::lifecycle::ListMvsRequest;
 use crate::mv::domain::model::MvStorageEngine;
 
 pub struct IcebergMvBackend {
@@ -31,8 +31,11 @@ impl IcebergMvBackend {
 }
 
 impl IcebergMvBackend {
-    pub fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
-        crate::mv::domain::analysis_adapter::list_mv_rows_with_ports(
+    pub fn list_mvs(
+        &self,
+        req: ListMvsRequest,
+    ) -> Result<novarocks_query_application::api::QueryResult, String> {
+        crate::mv::domain::analysis_adapter::list_mv_result_with_ports(
             self.ports.readiness().as_ref(),
             // The entrance is what decides whether this process may write a
             // target; readiness only decides whether it may read it. A

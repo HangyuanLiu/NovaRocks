@@ -45,6 +45,7 @@ PURE_OWNERS = frozenset({
     "novarocks-connector-contract",
     "novarocks-execution-contract",
     "novarocks-functions",
+    "novarocks-result-contract",
     "novarocks-type-contract",
     "novarocks-types",
 })
@@ -78,6 +79,8 @@ def verify_package(package, workspace_ids):
     if internal:
         if package["id"] not in workspace_ids or package["source"] is not None:
             violations.append(f"{name} is not the workspace-owned pure package")
+        if name == "novarocks-result-contract" and package["dependencies"]:
+            violations.append(f"{name} must remain dependency-free")
         # A feature/target variant of a repository-owned contract requires a new
         # audit. Optional dependencies cannot hide outside the selected tree.
         if package.get("features"):

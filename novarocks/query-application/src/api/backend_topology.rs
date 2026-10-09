@@ -428,10 +428,13 @@ mod tests {
     }
 
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
+        let process_id = BackendProcessId::new_v7();
         BackendProcessDescriptor::try_new(
-            BackendProcessId::new_v7(),
+            process_id,
             RuntimeEndpoint::new(endpoint.ip().to_string(), i32::from(endpoint.port()))
                 .expect("valid endpoint"),
+            RuntimeEndpoint::new(format!("control-{process_id}.test.invalid"), 19061)
+                .expect("valid control endpoint"),
             "test-deployment",
             "test-build",
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),

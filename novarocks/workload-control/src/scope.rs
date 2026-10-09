@@ -201,7 +201,10 @@ pub(crate) struct Node {
     pub resource_waiters: usize,
     pub reserved_bytes: u64,
     pub used_bytes: u64,
-    pub result_credit: crate::ResultCreditSnapshot,
+    pub result_windows: crate::ResultCapacitySnapshot,
+    /// The result window class a queued query admission must take together
+    /// with its computation permit; `None` when it is not queued or takes none.
+    pub pending_query_window: Option<crate::ResultWindowClass>,
     pub control_pending: ControlIntents,
     pub cancellation_signalled: bool,
     pub terminal_cancel_settled: bool,
@@ -236,7 +239,8 @@ impl Node {
             resource_waiters: 0,
             reserved_bytes: 0,
             used_bytes: 0,
-            result_credit: crate::ResultCreditSnapshot::default(),
+            result_windows: crate::ResultCapacitySnapshot::default(),
+            pending_query_window: None,
             control_pending: ControlIntents::empty(),
             cancellation_signalled: false,
             terminal_cancel_settled: false,
@@ -268,10 +272,7 @@ pub(crate) struct State {
     pub preparation: usize,
     pub execution: usize,
     pub requests: BTreeMap<u64, PendingAdmission>,
-    pub resource_waiters: ResourceWaiters,
-    pub next_result_fetch_waiter_id: u64,
-    pub next_decode_waiter_id: u64,
-    pub next_protocol_waiter_id: u64,
+    pub resource_waiters: BTreeSet<(WorkId, ResourceClass)>,
     pub preparation_queue: FairQueue,
     pub execution_queue: FairQueue,
     pub query_queue: FairQueue,
@@ -290,7 +291,8 @@ pub(crate) struct State {
     pub control_reserved: u64,
     pub control_used: u64,
     pub peak_held_bytes: u64,
-    pub result_credit: crate::ResultCreditSnapshot,
+    pub result_capacity: Option<crate::ResultCapacityConfig>,
+    pub result_windows: crate::ResultCapacitySnapshot,
     pub peak_waiting: usize,
     pub peak_waiting_records: usize,
     pub peak_waiting_bytes: u64,
@@ -319,10 +321,7 @@ impl State {
             && self.preparation == 0
             && self.execution == 0
             && self.requests.is_empty()
-            && self.resource_waiters.generic.is_empty()
-            && self.resource_waiters.result_fetch.is_empty()
-            && self.resource_waiters.decode.is_empty()
-            && self.resource_waiters.protocol.is_empty()
+            && self.resource_waiters.is_empty()
             && self.waiting_bytes == 0
             && self.old_attempts == 0
             && self.unknown_creates == 0
@@ -334,7 +333,6 @@ impl State {
             && self.data_used == 0
             && self.control_reserved == 0
             && self.control_used == 0
-            && self.result_credit.held_bytes() == 0
     }
 
     pub(crate) fn next_id(&mut self) -> Result<u64, WorkError> {
@@ -343,30 +341,6 @@ impl State {
             .checked_add(1)
             .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(self.next_id)
-    }
-
-    pub(crate) fn next_protocol_waiter_id(&mut self) -> Result<u64, WorkError> {
-        self.next_protocol_waiter_id = self
-            .next_protocol_waiter_id
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(self.next_protocol_waiter_id)
-    }
-
-    pub(crate) fn next_decode_waiter_id(&mut self) -> Result<u64, WorkError> {
-        self.next_decode_waiter_id = self
-            .next_decode_waiter_id
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(self.next_decode_waiter_id)
-    }
-
-    pub(crate) fn next_result_fetch_waiter_id(&mut self) -> Result<u64, WorkError> {
-        self.next_result_fetch_waiter_id = self
-            .next_result_fetch_waiter_id
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(self.next_result_fetch_waiter_id)
     }
 
     pub(crate) fn collect(&mut self, mut id: WorkId) {
@@ -402,30 +376,9 @@ impl State {
     }
 }
 
-pub(crate) struct ResultWaiter {
-    pub scope: WorkId,
-    pub bytes: u64,
-}
-
-#[derive(Default)]
-pub(crate) struct ResourceWaiters {
-    pub generic: BTreeSet<(WorkId, ResourceClass)>,
-    pub result_fetch: BTreeMap<u64, ResultWaiter>,
-    pub result_fetch_by_scope: BTreeMap<WorkId, u64>,
-    pub decode: BTreeMap<u64, ResultWaiter>,
-    pub decode_by_scope: BTreeMap<WorkId, u64>,
-    pub protocol: BTreeMap<u64, ResultWaiter>,
-}
-
-impl ResourceWaiters {
-    pub(crate) fn len(&self) -> usize {
-        self.generic.len() + self.result_fetch.len() + self.decode.len() + self.protocol.len()
-    }
-}
-
 pub(crate) struct Inner {
     pub config: WorkloadConfig,
-    pub resource_config: ResourceConfig,
+    pub resource_config: Option<Arc<ResourceConfig>>,
     pub state: Mutex<State>,
     pub changed: Notify,
 }
@@ -444,9 +397,8 @@ impl Inner {
         result
     }
 
-    /// Mutate accounting facts that cannot make a capacity waiter runnable.
-    /// Result packet state transitions use this path while capacity is held or
-    /// reduced, avoiding a process-wide waiter wakeup for every packet step.
+    /// Mutate reservation and allocation facts without waking capacity waiters.
+    /// Capacity release separately notifies waiters after the actual holder exits.
     pub(crate) fn update_facts_silent<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.state.lock().unwrap();
         let result = f(&mut state);
@@ -513,6 +465,13 @@ pub struct WorkloadControlParts {
     pub root_admission: RootAdmissionHandle,
     pub observation: WorkloadObservationHandle,
     pub resources: LocalResourceAuthority,
+}
+
+/// Process-composition capabilities for a role with no allocation budget.
+pub struct CountedWorkloadControlParts {
+    pub owner: WorkloadControl,
+    pub root_admission: RootAdmissionHandle,
+    pub observation: WorkloadObservationHandle,
 }
 
 /// Proof that the unique workload owner closed admission and observed a fully
@@ -582,9 +541,22 @@ impl WorkloadShutdownFailure {
 }
 
 fn try_begin_root(inner: &Arc<Inner>, request: WorkRequest) -> Result<RootWork, WorkError> {
+    try_begin_root_window(inner, request, None).map(|(root, _)| root)
+}
+
+fn try_begin_root_window(
+    inner: &Arc<Inner>,
+    request: WorkRequest,
+    window: Option<crate::ResultWindowClass>,
+) -> Result<(RootWork, Option<crate::ResultWindowGrant>), WorkError> {
     inner.update(|state| {
         let class = request.class;
         let result = (|| {
+            if window == Some(crate::ResultWindowClass::Closing)
+                || (window.is_some() && class.uses_warehouse_concurrency())
+            {
+                return Err(WorkError::Conflict);
+            }
             if state.closed {
                 return Err(WorkError::Closed);
             }
@@ -614,12 +586,28 @@ fn try_begin_root(inner: &Arc<Inner>, request: WorkRequest) -> Result<RootWork, 
                 inner: Arc::clone(inner),
                 id,
             };
-            Ok(RootWork {
-                owner: WorkOwner {
-                    scope: Some(scope.clone()),
+            let grant = match window {
+                None => None,
+                Some(class) => match crate::result_window::reserve_window(state, &scope, class) {
+                    Ok(grant) => Some(grant),
+                    Err(error) => {
+                        // No owner or permit has escaped this transaction.
+                        state.nodes.remove(&id);
+                        state.roots -= 1;
+                        state.businesses -= 1;
+                        return Err(error);
+                    }
                 },
-                business: BusinessPermit { scope: Some(scope) },
-            })
+            };
+            Ok((
+                RootWork {
+                    owner: WorkOwner {
+                        scope: Some(scope.clone()),
+                    },
+                    business: BusinessPermit { scope: Some(scope) },
+                },
+                grant,
+            ))
         })();
         if result.is_err() {
             state.root_lifecycle.rejected_admissions.increment(class);
@@ -677,6 +665,21 @@ impl RootAdmissionHandle {
         try_begin_root(&self.inner, request)
     }
 
+    /// Admit nonqueued work and its complete result position in one authority
+    /// transaction. Refusal publishes neither a root nor a business permit.
+    pub fn try_begin_root_with_result(
+        &self,
+        request: WorkRequest,
+        class: crate::ResultWindowClass,
+    ) -> Result<(RootWork, crate::ResultWindowGrant), WorkError> {
+        try_begin_root_window(&self.inner, request, Some(class)).map(|(root, window)| {
+            (
+                root,
+                window.expect("requested result position is returned atomically"),
+            )
+        })
+    }
+
     /// Register a logical query before it receives warehouse concurrency.
     /// The caller installs protocol cancellation from the returned owner, then
     /// awaits `WorkScope::admit_query` without creating a second root.
@@ -700,16 +703,15 @@ impl RootAdmissionHandle {
 }
 
 impl WorkloadControl {
-    /// Transitional owner-only constructor retained until the Frontend host
-    /// atomically switches to [`Self::try_new_split`]. Do not inject this owner
-    /// into product-lived services.
+    /// Construct a workload owner with an explicit allocation budget.
+    /// Inject narrow capabilities into product-lived services.
     pub fn try_new(config: WorkloadConfig, resources: ResourceConfig) -> Result<Self, WorkError> {
         config.validate()?;
         resources.validate()?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
-                resource_config: resources,
+                resource_config: Some(Arc::new(resources)),
                 state: Mutex::new(State::default()),
                 changed: Notify::new(),
             }),
@@ -726,7 +728,28 @@ impl WorkloadControl {
         Ok(WorkloadControlParts {
             root_admission: owner.root_admission(),
             observation: owner.observation(),
-            resources: owner.resources(),
+            resources: owner.resources()?,
+            owner,
+        })
+    }
+
+    /// Construct responsibility, admission and lifecycle control without a
+    /// generic allocation authority. Result windows are installed separately.
+    pub fn try_new_counted(
+        config: WorkloadConfig,
+    ) -> Result<CountedWorkloadControlParts, WorkError> {
+        config.validate()?;
+        let owner = Self {
+            inner: Arc::new(Inner {
+                config,
+                resource_config: None,
+                state: Mutex::new(State::default()),
+                changed: Notify::new(),
+            }),
+        };
+        Ok(CountedWorkloadControlParts {
+            root_admission: owner.root_admission(),
+            observation: owner.observation(),
             owner,
         })
     }
@@ -832,10 +855,18 @@ impl WorkloadControl {
         })
     }
 
-    pub fn resources(&self) -> LocalResourceAuthority {
-        LocalResourceAuthority {
+    /// Obtain the explicitly installed allocation authority. Count-only role
+    /// composition has no allocation budget and cannot mint this capability.
+    pub fn resources(&self) -> Result<LocalResourceAuthority, WorkError> {
+        let config = self
+            .inner
+            .resource_config
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        Ok(LocalResourceAuthority {
             inner: Arc::clone(&self.inner),
-        }
+            config: Arc::clone(config),
+        })
     }
 
     /// Adopt an orphan without manufacturing a stop or release fact.
@@ -1344,6 +1375,13 @@ pub struct QueryConcurrencyPermit {
 }
 
 impl QueryConcurrencyPermit {
+    /// Verify both the host and exact admitted root before a runtime handoff.
+    pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|held| held.id == scope.id && Arc::ptr_eq(&held.inner, &scope.inner))
+    }
+
     pub fn release(self) {
         drop(self);
     }

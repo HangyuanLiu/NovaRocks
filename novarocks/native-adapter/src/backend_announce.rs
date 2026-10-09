@@ -68,8 +68,10 @@ impl BackendAnnounceSupervisor {
         let join = std::thread::Builder::new()
             .name("backend-announce".to_string())
             .spawn(move || {
-                let client =
-                    NativeRpcClient::new_native_endpoint(thread_runtime, thread_frontend_endpoint);
+                let client = NativeRpcClient::new_membership_endpoint(
+                    thread_runtime,
+                    thread_frontend_endpoint,
+                );
                 let initial_backoff = initial_backoff.max(Duration::from_millis(1));
                 let max_backoff = max_backoff.max(initial_backoff);
                 let mut retry_delay = initial_backoff;
@@ -118,7 +120,7 @@ impl BackendAnnounceSupervisor {
 
     /// Reports the drain the process has already entered before waking the loop.
     pub fn announce_drain(&self) {
-        let client = NativeRpcClient::new_native_endpoint(
+        let client = NativeRpcClient::new_membership_endpoint(
             self.data_runtime.clone(),
             self.frontend_endpoint.clone(),
         );

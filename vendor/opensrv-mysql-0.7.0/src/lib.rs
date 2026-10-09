@@ -24,7 +24,6 @@
 
 extern crate mysql_common as myc;
 
-use std::collections::HashMap;
 use std::io;
 use std::io::Write;
 use std::iter;
@@ -37,12 +36,23 @@ use tokio_rustls::rustls::ServerConfig;
 
 pub use crate::myc::constants::{CapabilityFlags, ColumnFlags, ColumnType, StatusFlags};
 #[cfg(feature = "tls")]
-pub use crate::tls::{plain_run_with_options, secure_run_with_options};
+pub use crate::tls::{
+    plain_run_with_limits, plain_run_with_options, secure_run_with_limits, secure_run_with_options,
+};
 
 mod commands;
 mod errorcodes;
+mod input;
+mod limits;
+pub use input::ProtocolInputUsage;
 mod packet_reader;
 mod packet_writer;
+mod streaming;
+pub use limits::ProtocolLimits;
+pub use streaming::{
+    ClosingMysqlWriter, ClosingResponseLease, FramingCursor, FrozenMetadata,
+    OwnedStreamingMysqlWriter, ResidentTailPart, StreamingResponseLease, WritePhase,
+};
 mod params;
 mod resultset;
 #[cfg(feature = "tls")]
@@ -111,6 +121,16 @@ pub trait AsyncMysqlShim<W: Send> {
     ///
     /// Must implement `From<io::Error>` so that transport-level errors can be lifted.
     type Error: From<io::Error>;
+
+    /// Observe bounded input allocation coverage. This does not imply release.
+    fn on_protocol_input_usage(&mut self, _usage: ProtocolInputUsage) {}
+
+    /// Whether protocol-local query shortcuts may bypass the query callback.
+    /// A consumer with statement-class admission must disable them for any
+    /// connection class whose admission needs to inspect the whole query.
+    fn permits_query_shortcuts(&self) -> bool {
+        true
+    }
 
     /// Server version
     fn version(&self) -> String {
@@ -217,9 +237,39 @@ pub struct IntermediaryOptions {
 
 #[derive(Default)]
 struct StatementData {
-    long_data: HashMap<u16, Vec<u8>>,
+    long_data: input::LongData,
     bound_types: Vec<(myc::constants::ColumnType, bool)>,
     params: u16,
+}
+
+impl StatementData {
+    fn append_long_data(&mut self, param: u16, data: &[u8], limit: usize) -> io::Result<()> {
+        if param >= self.params {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "long data parameter is out of range",
+            ));
+        }
+        let total = self
+            .long_data
+            .values()
+            .try_fold(data.len(), |n, bytes| n.checked_add(bytes.len()))
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "prepared long data exceeds limit",
+                )
+            })?;
+        self.long_data.ensure_slots(self.params as usize)?;
+        let bytes = self.long_data.get_or_insert(param)?;
+        bytes.try_reserve_exact(data.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "long data allocation failed")
+        })?;
+        bytes.extend_from_slice(data);
+        let _ = total;
+        Ok(())
+    }
 }
 
 const AUTH_PLUGIN_DATA_PART_1_LENGTH: usize = 8;
@@ -250,35 +300,143 @@ where
     /// Create a new server over two one-way channels and process client commands until the client
     /// disconnects or an error occurs, with config options.
     pub async fn run_with_options(
+        shim: B,
+        input_stream: R,
+        output_stream: W,
+        opts: &IntermediaryOptions,
+    ) -> Result<(), B::Error> {
+        Self::run_with_limits(
+            shim,
+            input_stream,
+            output_stream,
+            opts,
+            ProtocolLimits::default(),
+        )
+        .await
+    }
+
+    pub async fn run_with_limits(
+        shim: B,
+        input_stream: R,
+        output_stream: W,
+        opts: &IntermediaryOptions,
+        limits: ProtocolLimits,
+    ) -> Result<(), B::Error> {
+        Self::run_with_optional_input_deadlines(
+            shim,
+            input_stream,
+            output_stream,
+            opts,
+            limits,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Authentication includes greeting, plugin switches, admission and the
+    /// final flush under one caller-supplied absolute deadline. A command's
+    /// deadline starts at its first byte and is not renewed by drip input or
+    /// a continuation packet. An idle authenticated connection may stay idle.
+    pub async fn run_with_input_deadlines(
+        shim: B,
+        input_stream: R,
+        output_stream: W,
+        opts: &IntermediaryOptions,
+        limits: ProtocolLimits,
+        auth_deadline: tokio::time::Instant,
+        command_timeout: std::time::Duration,
+        write_timeout: std::time::Duration,
+    ) -> Result<(), B::Error> {
+        if command_timeout.is_zero() || write_timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MySQL input and write timeouts must be positive",
+            )
+            .into());
+        }
+        Self::run_with_optional_input_deadlines(
+            shim,
+            input_stream,
+            output_stream,
+            opts,
+            limits,
+            Some(auth_deadline),
+            Some(command_timeout),
+            Some(write_timeout),
+        )
+        .await
+    }
+
+    async fn run_with_optional_input_deadlines(
         mut shim: B,
         input_stream: R,
         mut output_stream: W,
         opts: &IntermediaryOptions,
+        limits: ProtocolLimits,
+        auth_deadline: Option<tokio::time::Instant>,
+        command_timeout: Option<std::time::Duration>,
+        write_timeout: Option<std::time::Duration>,
     ) -> Result<(), B::Error> {
-        let process_use_statement_on_query = opts.process_use_statement_on_query;
-        let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
-        let (_, (handshake, seq, client_capabilities, input_stream)) =
-            AsyncMysqlIntermediary::init_before_ssl(
-                &mut shim,
-                input_stream,
-                &mut output_stream,
-                #[cfg(feature = "tls")]
-                &None,
+        let limits = limits.validate()?;
+        if auth_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MySQL authentication deadline expired",
             )
-            .await?;
+            .into());
+        }
+        let initialize = async {
+            let process_use_statement_on_query = opts.process_use_statement_on_query;
+            let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
+            let (_, (handshake, seq, client_capabilities, input_stream)) =
+                AsyncMysqlIntermediary::init_before_ssl_with_limits(
+                    &mut shim,
+                    input_stream,
+                    &mut output_stream,
+                    limits,
+                    #[cfg(feature = "tls")]
+                    &None,
+                )
+                .await?;
 
-        let reader = PacketReader::new(input_stream);
-        let writer = PacketWriter::new(output_stream);
+            let reader = input_stream;
+            let writer = PacketWriter::with_limits(output_stream, limits);
 
-        let mut mi = AsyncMysqlIntermediary {
-            client_capabilities,
-            process_use_statement_on_query,
-            reject_connection_on_dbname_absence,
-            shim,
-            reader,
-            writer,
+            let mut mi = AsyncMysqlIntermediary {
+                client_capabilities,
+                process_use_statement_on_query,
+                reject_connection_on_dbname_absence,
+                shim,
+                reader,
+                writer,
+            };
+            mi.init_after_ssl(handshake, seq).await?;
+            Ok::<_, B::Error>(mi)
         };
-        mi.init_after_ssl(handshake, seq).await?;
+        let mut mi = match auth_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, initialize)
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "MySQL authentication deadline expired",
+                    )
+                })??,
+            None => initialize.await?,
+        };
+        // timeout_at polls a ready operation before its timer. Check the
+        // commit boundary too so queued, already-buffered IO cannot renew time.
+        if auth_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MySQL authentication deadline expired",
+            )
+            .into());
+        }
+        mi.reader.set_message_timeout(command_timeout);
+        mi.writer.set_response_timeout(write_timeout);
         mi.run().await
     }
 
@@ -294,8 +452,33 @@ where
         ),
         B::Error,
     > {
-        let mut reader = PacketReader::new(input_stream);
-        let mut writer = PacketWriter::new(output_stream);
+        Self::init_before_ssl_with_limits(
+            shim,
+            input_stream,
+            output_stream,
+            ProtocolLimits::default(),
+            #[cfg(feature = "tls")]
+            tls_conf,
+        )
+        .await
+    }
+
+    pub async fn init_before_ssl_with_limits(
+        shim: &mut B,
+        input_stream: R,
+        output_stream: &mut W,
+        limits: ProtocolLimits,
+        #[cfg(feature = "tls")] tls_conf: &Option<std::sync::Arc<ServerConfig>>,
+    ) -> Result<
+        (
+            bool,
+            (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+        ),
+        B::Error,
+    > {
+        let mut reader = PacketReader::with_limit(input_stream, limits.validate()?.auth_bytes);
+        reader.set_expected_first(Some(1));
+        let mut writer = PacketWriter::with_limits(output_stream, limits);
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
         writer.write_all(&[10])?; // protocol 10
 
@@ -388,7 +571,7 @@ where
             })?
             .1;
 
-        writer.set_seq(seq + 1);
+        writer.set_seq(seq.wrapping_add(1));
 
         #[cfg(not(feature = "tls"))]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
@@ -415,6 +598,7 @@ where
     ) -> Result<(), B::Error> {
         #[cfg(feature = "tls")]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
+            self.reader.set_expected_first(Some(seq.wrapping_add(1)));
             let (_seq, hs) = self.reader.next_async().await?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -451,7 +635,7 @@ where
                 })?
                 .1;
 
-            self.writer.set_seq(seq + 1);
+            self.writer.set_seq(seq.wrapping_add(1));
         }
 
         let scramble = self.shim.salt();
@@ -480,7 +664,7 @@ where
                     && auth_response.is_empty()
                     && handshake.auth_plugin != auth_plugin_expect.as_bytes()
                 {
-                    self.writer.set_seq(seq + 1);
+                    self.writer.set_seq(seq.wrapping_add(1));
                     self.writer.write_all(&[0xfe])?;
                     self.writer.write_all(auth_plugin_expect.as_bytes())?;
                     self.writer.write_all(&[0x00])?;
@@ -491,6 +675,8 @@ where
                     self.writer.flush_all().await?;
 
                     {
+                        self.reader
+                            .set_expected_first(Some(self.writer.next_sequence()));
                         let (rseq, auth_response_data) =
                             self.reader.next_async().await?.ok_or_else(|| {
                                 io::Error::new(
@@ -504,7 +690,7 @@ where
                     }
                 }
 
-                self.writer.set_seq(seq + 1);
+                self.writer.set_seq(seq.wrapping_add(1));
 
                 if !self
                     .shim
@@ -561,17 +747,23 @@ where
     }
 
     async fn run(mut self) -> Result<(), B::Error> {
+        self.reader.set_limit(self.writer.limits().command_bytes);
+        self.reader.set_expected_first(Some(0));
         use crate::commands::Command;
 
-        let mut stmts: HashMap<u32, _> = HashMap::new();
+        let mut stmts = input::PreparedStatements::new(self.writer.limits())?;
+        self.shim.on_protocol_input_usage(stmts.usage()?);
         while let Some((seq, packet)) = self.reader.next_async().await? {
-            self.writer.set_seq(seq + 1);
+            self.writer.reset_response_deadline();
+            self.writer.set_seq(seq.wrapping_add(1));
             let res = commands::parse(&packet);
             match res {
                 Ok(cmd) => {
                     match cmd.1 {
                         Command::Query(q) => {
-                            if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
+                            if self.shim.permits_query_shortcuts()
+                                && (q.starts_with(b"SELECT @@") || q.starts_with(b"select @@"))
+                            {
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     false,
@@ -580,17 +772,19 @@ where
 
                                 let var = &q[b"SELECT @@".len()..];
                                 let var_with_at = &q[b"SELECT ".len()..];
-                                let cols = &[Column {
-                                    table: String::new(),
-                                    column: String::from_utf8_lossy(var_with_at).to_string(),
-                                    coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
-                                    colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
-                                }];
-
                                 match var {
                                     b"max_allowed_packet" => {
+                                        let cols = &[Column {
+                                            table: String::new(),
+                                            column: String::from_utf8_lossy(var_with_at)
+                                                .to_string(),
+                                            coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
+                                            colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                                        }];
+
                                         let mut w = w.start(cols).await?;
-                                        w.write_row(iter::once(67108864u32)).await?;
+                                        let max_allowed_packet = w.max_allowed_packet();
+                                        w.write_row(iter::once(max_allowed_packet)).await?;
                                         w.finish().await?;
                                     }
                                     _ => {
@@ -648,14 +842,8 @@ where
                                 .await?;
                         }
                         Command::Execute { stmt, params } => {
-                            let state = stmts.get_mut(&stmt).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("asked to execute unknown statement {}", stmt),
-                                )
-                            })?;
                             {
-                                let params = params::ParamParser::new(params, state);
+                                let params = stmts.parser(stmt, params)?;
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     true,
@@ -663,28 +851,14 @@ where
                                 );
                                 self.shim.on_execute(stmt, params, w).await?;
                             }
-                            state.long_data.clear();
+                            stmts.clear_long_data(stmt);
                         }
                         Command::SendLongData { stmt, param, data } => {
-                            stmts
-                                .get_mut(&stmt)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!(
-                                            "got long data packet for unknown statement {}",
-                                            stmt
-                                        ),
-                                    )
-                                })?
-                                .long_data
-                                .entry(param)
-                                .or_insert_with(Vec::new)
-                                .extend(data);
+                            stmts.append_long_data(stmt, param, data)?;
                         }
                         Command::Close(stmt) => {
                             self.shim.on_close(stmt).await;
-                            stmts.remove(&stmt);
+                            stmts.remove(stmt);
                             // NOTE: spec dictates no response from server
                         }
                         Command::ListFields(_) => {
@@ -730,6 +904,12 @@ where
                             break;
                         }
                     }
+                    // The callback transferred the write half to independent closing.
+                    // Never read another command or touch the detached socket slot.
+                    if self.writer.is_detached() || self.writer.is_poisoned() {
+                        return Ok(());
+                    }
+                    self.shim.on_protocol_input_usage(stmts.usage()?);
                     self.writer.flush_all().await?;
                 }
                 Err(_) => {

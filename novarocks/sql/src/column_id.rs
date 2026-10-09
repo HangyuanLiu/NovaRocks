@@ -192,9 +192,45 @@ impl ColumnRefFactory {
             .is_some_and(|column| column.json_list_provenance)
     }
 
+    pub(crate) fn borrowed_logical_type(
+        &self,
+        id: ColumnId,
+    ) -> Option<&novarocks_types::schema::SqlType> {
+        let index = id.0.checked_sub(1)? as usize;
+        self.columns.get(index)?.logical_type.as_ref()
+    }
+
     pub(crate) fn logical_type(&self, id: ColumnId) -> Option<novarocks_types::schema::SqlType> {
         let index = id.0.checked_sub(1)? as usize;
         self.columns.get(index)?.logical_type.clone()
+    }
+
+    /// Transfer already-established facts across a planner-proven same-value
+    /// symbol rewrite. This does not derive a domain from a carrier or name.
+    pub(crate) fn transfer_value_provenance(
+        &mut self,
+        source: ColumnId,
+        target: ColumnId,
+    ) -> Result<(), &'static str> {
+        let original = self.get(source);
+        let replacement = self.get(target);
+        if original.data_type != replacement.data_type {
+            return Err("same-value column rewrite changed its declared carrier");
+        }
+        if original.nullable && !replacement.nullable {
+            return Err("same-value column rewrite narrowed its declared nullability");
+        }
+        if replacement.logical_type.is_some() && replacement.logical_type != original.logical_type {
+            return Err("same-value column rewrite contains conflicting logical domains");
+        }
+        if replacement.json_list_provenance && !original.json_list_provenance {
+            return Err("same-value column rewrite contains conflicting JSON list witnesses");
+        }
+        let logical = original.logical_type.clone();
+        let json_list = original.json_list_provenance;
+        self.set_logical_type(target, logical);
+        self.set_json_list_provenance(target, json_list);
+        Ok(())
     }
 
     /// Return a human-readable display name for the column: `"qualifier.name"`

@@ -14,15 +14,21 @@ shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
 
 [server]
 host = "127.0.0.1"
-# Native fragment/exchange gRPC listener. This listener does not expose
+# Native Data gRPC listener. This listener does not expose
 # management HTTP routes.
 grpc_port = 9081
+# Independent Native Control listener; required explicitly for role=be.
+control_grpc_port = 9082
 # BE management HTTP listener for BE-scoped metrics.
 http_port = 8041
 
 [cluster]
 role = "be"
+frontend_endpoint = "127.0.0.1:9080"
 advertise_host = "127.0.0.1"
+# Set these separately when NAT exposes different external ports.
+# advertise_port = 29081
+# advertise_control_port = 29082
 
 [runtime]
 # Per-scan speculative successor bounds. Demand reads use the shared range

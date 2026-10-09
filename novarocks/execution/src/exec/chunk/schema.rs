@@ -19,9 +19,12 @@ use std::sync::Arc;
 
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
 use arrow::array::ArrayRef;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_types::SlotId;
+use novarocks_types::arrow_metadata_owner::{
+    ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedSchema, MetadataOwnerLimits,
+};
 use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -114,13 +117,24 @@ impl ChunkFieldSchema {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ChunkSlotSchema {
     slot_id: SlotId,
-    field: Field,
+    field: FieldRef,
+    metadata_origins: Option<FieldMetadataOrigins>,
     field_schema: ChunkFieldSchema,
     unique_id: Option<i32>,
 }
+
+impl PartialEq for ChunkSlotSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.slot_id == other.slot_id
+            && self.field == other.field
+            && self.field_schema == other.field_schema
+            && self.unique_id == other.unique_id
+    }
+}
+impl Eq for ChunkSlotSchema {}
 
 impl ChunkSlotSchema {
     pub fn new_with_field(
@@ -145,9 +159,147 @@ impl ChunkSlotSchema {
                 Some(schema) => schema,
                 None => ChunkFieldSchema::from_field(&field)?,
             },
-            field,
+            field: Arc::new(field),
+            metadata_origins: None,
             unique_id,
         })
+    }
+
+    /// Share a field without inferring metadata provenance from its values.
+    pub fn try_new_with_field_ref(
+        slot_id: SlotId,
+        field: FieldRef,
+        field_schema: Option<ChunkFieldSchema>,
+        unique_id: Option<i32>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            slot_id,
+            field_schema: match field_schema {
+                Some(schema) => schema,
+                None => ChunkFieldSchema::from_field(&field)?,
+            },
+            field,
+            metadata_origins: None,
+            unique_id,
+        })
+    }
+
+    pub fn try_new_with_metadata_origins(
+        slot_id: SlotId,
+        field: FieldRef,
+        metadata_origins: FieldMetadataOrigins,
+        field_schema: Option<ChunkFieldSchema>,
+        unique_id: Option<i32>,
+    ) -> Result<Self, String> {
+        if metadata_origins.metadata_bytes_for(&field).is_none() {
+            return Err(
+                "chunk slot metadata receipt does not match the exact field owner".to_string(),
+            );
+        }
+        Ok(Self {
+            slot_id,
+            field_schema: match field_schema {
+                Some(schema) => schema,
+                None => ChunkFieldSchema::from_field(&field)?,
+            },
+            field,
+            metadata_origins: Some(metadata_origins),
+            unique_id,
+        })
+    }
+
+    pub fn metadata_origins(&self) -> Option<&FieldMetadataOrigins> {
+        self.metadata_origins.as_ref()
+    }
+
+    pub fn field_ref(&self) -> &FieldRef {
+        &self.field
+    }
+
+    pub fn with_type_and_nullable(
+        &self,
+        data_type: DataType,
+        nullable: bool,
+    ) -> Result<Self, String> {
+        if &data_type == self.field.data_type() && nullable == self.field.is_nullable() {
+            return Ok(self.clone());
+        }
+        if let Some(origins) = &self.metadata_origins {
+            let original = origins
+                .owner_for(&self.field)
+                .ok_or("chunk field metadata origin is missing")?;
+            let replacement = original
+                .derive_field(
+                    data_type,
+                    nullable,
+                    MetadataOwnerLimits {
+                        entries: 65536,
+                        construction_bytes: 96 * 1024 * 1024,
+                    },
+                )
+                .map_err(|_| "chunk field metadata derivation exceeds its source profile")?;
+            let field = Arc::clone(replacement.field());
+            let origins = origins
+                .replacing_root(&self.field, replacement, 65536)
+                .map_err(|_| "chunk field metadata origins exceed the node profile")?;
+            if let Ok(scoped) = origins.for_field_tree(&field, 65536, 64) {
+                Self::try_new_with_metadata_origins(
+                    self.slot_id,
+                    field,
+                    scoped,
+                    Some(self.field_schema.clone()),
+                    self.unique_id,
+                )
+            } else {
+                // A legal generic type replacement can introduce fields whose
+                // metadata backing is unknown. Keep its semantics and exact
+                // Field Arc, but never issue a complete source-origin claim.
+                Self::try_new_with_field_ref(
+                    self.slot_id,
+                    field,
+                    Some(self.field_schema.clone()),
+                    self.unique_id,
+                )
+            }
+        } else {
+            self.with_field(
+                self.field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(data_type)
+                    .with_nullable(nullable),
+            )
+        }
+    }
+
+    pub(crate) fn reconcile_to_carrier(
+        &self,
+        actual: &DataType,
+        nullable: bool,
+    ) -> Result<Self, String> {
+        let Some(origins) = &self.metadata_origins else {
+            let field = reconcile_chunk_field_to_data_type(self.field(), actual, nullable)?;
+            return self.with_type_and_nullable(field.data_type().clone(), field.is_nullable());
+        };
+        // Only known immutable source maps can be copied. The actual carrier's
+        // metadata remains a separate, unproven owner; it is never normalized.
+        let scoped = origins
+            .for_field_tree(&self.field, 65536, 64)
+            .map_err(|_| "chunk field metadata tree is incomplete or exceeds its profile")?;
+        let mut derived = Vec::new();
+        let field = reconcile_owned_field(&self.field, actual, nullable, &scoped, &mut derived)?;
+        if Arc::ptr_eq(&self.field, &field) {
+            return Ok(self.clone());
+        }
+        let origins = FieldMetadataOrigins::try_new(derived, 65536)
+            .map_err(|_| "chunk field metadata derivation exceeds its node profile")?;
+        Self::try_new_with_metadata_origins(
+            self.slot_id,
+            field,
+            origins,
+            Some(self.field_schema.clone()),
+            self.unique_id,
+        )
     }
 
     /// Return a copy of this slot schema with nullable set to the given value.
@@ -155,12 +307,8 @@ impl ChunkSlotSchema {
         if self.field.is_nullable() == nullable {
             return self.clone();
         }
-        Self {
-            slot_id: self.slot_id,
-            field: self.field.clone().with_nullable(nullable),
-            field_schema: self.field_schema.clone(),
-            unique_id: self.unique_id,
-        }
+        self.with_type_and_nullable(self.field.data_type().clone(), nullable)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     pub fn from_field(
@@ -181,12 +329,9 @@ impl ChunkSlotSchema {
     }
 
     pub fn with_slot_id(&self, slot_id: SlotId) -> Result<Self, String> {
-        Self::try_new_with_field(
-            slot_id,
-            self.field.clone(),
-            Some(self.field_schema.clone()),
-            self.unique_id,
-        )
+        let mut slot = self.clone();
+        slot.slot_id = slot_id;
+        Ok(slot)
     }
 
     pub fn with_field_and_slot_id(&self, slot_id: SlotId, field: Field) -> Result<Self, String> {
@@ -227,13 +372,25 @@ impl ChunkSlotSchema {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ChunkSchema {
     slots: Vec<ChunkSlotSchema>,
     arrow_schema: SchemaRef,
     slot_ids: Vec<SlotId>,
     index_by_slot: HashMap<SlotId, usize>,
+    field_metadata_origins: Option<FieldMetadataOrigins>,
+    schema_metadata_origin: Option<MetadataOwnedSchema>,
 }
+
+impl PartialEq for ChunkSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.slots == other.slots
+            && self.arrow_schema == other.arrow_schema
+            && self.slot_ids == other.slot_ids
+            && self.index_by_slot == other.index_by_slot
+    }
+}
+impl Eq for ChunkSchema {}
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
 
@@ -251,16 +408,6 @@ fn check_chunk_data_type(
             m.kind
         )
     })
-}
-
-fn reconcile_chunk_field_to_field(expected: &Field, actual: &Field) -> Result<Arc<Field>, String> {
-    let data_type = reconcile_chunk_data_type(expected.data_type(), actual.data_type())?;
-    let nullable = expected.is_nullable() || actual.is_nullable();
-    if &data_type == expected.data_type() && nullable == expected.is_nullable() {
-        Ok(Arc::new(expected.clone()))
-    } else {
-        Ok(Arc::new(rebuild_chunk_field(expected, data_type, nullable)))
-    }
 }
 
 fn reconcile_chunk_field_to_data_type(
@@ -328,6 +475,81 @@ fn reconcile_nested_chunk_field(
     )))
 }
 
+fn reconcile_owned_field(
+    expected: &FieldRef,
+    actual: &DataType,
+    actual_nullable: bool,
+    origins: &FieldMetadataOrigins,
+    derived: &mut Vec<novarocks_types::arrow_metadata_owner::MetadataOwnedField>,
+) -> Result<FieldRef, String> {
+    let data_type = reconcile_owned_type(expected.data_type(), actual, origins, derived)?;
+    let nullable = expected.is_nullable() || actual_nullable;
+    let owner = origins
+        .owner_for(expected)
+        .ok_or("nested chunk field metadata origin is missing")?;
+    let owner = if &data_type == expected.data_type() && nullable == expected.is_nullable() {
+        owner.clone()
+    } else {
+        owner
+            .derive_field(
+                data_type,
+                nullable,
+                MetadataOwnerLimits {
+                    entries: 65536,
+                    construction_bytes: 96 * 1024 * 1024,
+                },
+            )
+            .map_err(|_| "nested chunk metadata derivation exceeds its source profile")?
+    };
+    if derived.len() >= 65536 {
+        return Err("nested chunk metadata derivation exceeds its node profile".into());
+    }
+    let field = Arc::clone(owner.field());
+    derived.push(owner);
+    Ok(field)
+}
+
+fn reconcile_owned_type(
+    expected: &DataType,
+    actual: &DataType,
+    origins: &FieldMetadataOrigins,
+    derived: &mut Vec<novarocks_types::arrow_metadata_owner::MetadataOwnedField>,
+) -> Result<DataType, String> {
+    // Validate the complete expected tree once per subtree before copying any
+    // metadata. The index walk is bounded and does not inspect unknown tables.
+    check_chunk_data_type(expected, actual, "column")?;
+    if is_dictionary_string_carrier(expected, actual) {
+        return Ok(actual.clone());
+    }
+    match (expected, actual) {
+        (DataType::List(a), DataType::List(b)) => Ok(DataType::List(reconcile_owned_field(
+            a,
+            b.data_type(),
+            b.is_nullable(),
+            origins,
+            derived,
+        )?)),
+        (DataType::LargeList(a), DataType::LargeList(b)) => Ok(DataType::LargeList(
+            reconcile_owned_field(a, b.data_type(), b.is_nullable(), origins, derived)?,
+        )),
+        (DataType::Map(a, ordered), DataType::Map(b, _)) => Ok(DataType::Map(
+            reconcile_owned_field(a, b.data_type(), b.is_nullable(), origins, derived)?,
+            *ordered,
+        )),
+        (DataType::Struct(a), DataType::Struct(b)) => {
+            let fields = a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| {
+                    reconcile_owned_field(a, b.data_type(), b.is_nullable(), origins, derived)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataType::Struct(fields.into()))
+        }
+        _ => Ok(expected.clone()),
+    }
+}
+
 fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool {
     matches!(
         (expected, actual),
@@ -355,29 +577,91 @@ impl ChunkSchema {
                 let (field_schema, unique_id) = layout
                     .slot_metadata_at(index)
                     .ok_or_else(|| format!("local program slot {index} lacks metadata"))?;
-                ChunkSlotSchema::try_new_with_field(
-                    *slot,
-                    field.as_ref().clone(),
-                    Some(crate::exec::expr::static_program::thaw_field_schema(
-                        field_schema,
-                    )),
-                    unique_id,
-                )
+                let metadata = Some(crate::exec::expr::static_program::thaw_field_schema(
+                    field_schema,
+                ));
+                if let Some(origins) = layout.field_metadata_origins() {
+                    ChunkSlotSchema::try_new_with_metadata_origins(
+                        *slot,
+                        Arc::clone(field),
+                        origins
+                            .for_field_tree(field, 65536, 64)
+                            .map_err(|_| "local program field metadata origins are incomplete")?,
+                        metadata,
+                        unique_id,
+                    )
+                } else {
+                    ChunkSlotSchema::try_new_with_field(
+                        *slot,
+                        field.as_ref().clone(),
+                        metadata,
+                        unique_id,
+                    )
+                }
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(Arc::new(Self::try_new_with_schema_metadata(
-            slots,
-            layout.schema().metadata().clone(),
-        )?))
+        let mut schema = Self::try_new_with_schema_metadata(slots, HashMap::new())?;
+        if let Some(origin) = layout.schema_metadata_origin() {
+            // Keep the exact original immutable schema and map. All source
+            // slot field Arcs above already refer to these same fields.
+            if origin.backing_bytes_for(layout.schema()).is_none() {
+                return Err(
+                    "local program schema metadata owner conflicts with its layout".to_string(),
+                );
+            }
+            schema.arrow_schema = Arc::clone(layout.schema());
+            schema.schema_metadata_origin = Some(origin.clone());
+        } else {
+            schema.arrow_schema = Arc::new(Schema::new_with_metadata(
+                schema
+                    .slots
+                    .iter()
+                    .map(|slot| Arc::clone(slot.field_ref()))
+                    .collect::<Vec<_>>(),
+                layout.schema().metadata().clone(),
+            ));
+        }
+        Ok(Arc::new(schema))
     }
 
     pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, String> {
-        Self::try_new_with_schema_metadata(slots, HashMap::new())
+        let metadata = ArrowMetadataOwner::try_new(
+            Vec::new(),
+            MetadataOwnerLimits {
+                entries: 0,
+                construction_bytes: 0,
+            },
+        )
+        .map_err(|_| "empty schema metadata construction failed")?;
+        Self::try_new_with_owned_schema_metadata(slots, metadata)
     }
 
     pub fn try_new_with_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         metadata: HashMap<String, String>,
+    ) -> Result<Self, String> {
+        Self::build(slots, Some(metadata), None, None)
+    }
+
+    pub fn try_new_with_owned_schema_metadata(
+        slots: Vec<ChunkSlotSchema>,
+        metadata: ArrowMetadataOwner,
+    ) -> Result<Self, String> {
+        Self::build(slots, None, Some(metadata), None)
+    }
+
+    pub fn try_new_with_derived_schema_metadata(
+        slots: Vec<ChunkSlotSchema>,
+        source: &MetadataOwnedSchema,
+    ) -> Result<Self, String> {
+        Self::build(slots, None, None, Some(source))
+    }
+
+    fn build(
+        slots: Vec<ChunkSlotSchema>,
+        unknown_metadata: Option<HashMap<String, String>>,
+        owned_metadata: Option<ArrowMetadataOwner>,
+        derived_metadata: Option<&MetadataOwnedSchema>,
     ) -> Result<Self, String> {
         let mut index_by_slot = HashMap::with_capacity(slots.len());
         let mut slot_ids = Vec::with_capacity(slots.len());
@@ -391,25 +675,138 @@ impl ChunkSchema {
                 ));
             }
             slot_ids.push(slot.slot_id());
-            fields.push(Arc::new(slot.field().clone()));
+            fields.push(Arc::clone(slot.field_ref()));
         }
+        let field_metadata_origins = if slots.iter().all(|slot| slot.metadata_origins().is_some()) {
+            let count = slots
+                .iter()
+                .try_fold(0usize, |count, slot| {
+                    count
+                        .checked_add(slot.metadata_origins().unwrap().owners().len())
+                        .filter(|count| *count <= 65536)
+                })
+                .ok_or("chunk schema metadata origin collection exceeds its node profile")?;
+            let mut owners = Vec::with_capacity(count);
+            for slot in &slots {
+                owners.extend_from_slice(slot.metadata_origins().unwrap().owners());
+            }
+            Some(
+                FieldMetadataOrigins::try_new(owners, 65536)
+                    .map_err(|_| "chunk schema metadata origins exceed their node profile")?,
+            )
+        } else {
+            None
+        };
+        let (arrow_schema, schema_metadata_origin) = if let Some(source) = derived_metadata {
+            let origin = source
+                .derive_schema(
+                    fields.into(),
+                    MetadataOwnerLimits {
+                        entries: 65536,
+                        construction_bytes: 96 * 1024 * 1024,
+                    },
+                )
+                .map_err(|_| "chunk schema metadata derivation exceeds its source profile")?;
+            (Arc::clone(origin.schema()), Some(origin))
+        } else if let Some(metadata) = owned_metadata {
+            let origin = metadata.into_schema(fields.into());
+            (Arc::clone(origin.schema()), Some(origin))
+        } else {
+            let metadata =
+                unknown_metadata.ok_or("chunk schema metadata has no construction input")?;
+            (Arc::new(Schema::new_with_metadata(fields, metadata)), None)
+        };
         Ok(Self {
             slots,
-            arrow_schema: Arc::new(arrow::datatypes::Schema::new_with_metadata(
-                fields, metadata,
-            )),
+            arrow_schema,
             slot_ids,
             index_by_slot,
+            field_metadata_origins,
+            schema_metadata_origin,
         })
     }
 
     pub fn empty() -> Self {
-        Self {
-            slots: Vec::new(),
-            arrow_schema: Arc::new(arrow::datatypes::Schema::empty()),
-            slot_ids: Vec::new(),
-            index_by_slot: HashMap::new(),
+        Self::try_new(Vec::new()).expect("empty chunk schema construction is infallible")
+    }
+
+    pub fn field_metadata_origins(&self) -> Option<&FieldMetadataOrigins> {
+        self.field_metadata_origins.as_ref()
+    }
+
+    pub fn schema_metadata_origin(&self) -> Option<&MetadataOwnedSchema> {
+        self.schema_metadata_origin.as_ref()
+    }
+
+    /// Inspect only this immutable ChunkSchema's own scaffolds. Field/schema
+    /// owners and their genuine metadata receipts are inspected separately.
+    pub(super) fn inspect_root_scaffolds(
+        &self,
+        inspection: &mut super::root_schema_backing::RootSchemaInspection,
+    ) -> Result<(), super::root_schema_backing::RootSchemaBackingError> {
+        use super::root_schema_backing::RootSchemaBackingError;
+        use std::alloc::Layout;
+        use std::mem::{align_of, size_of};
+
+        inspection.charge_arc(self)?;
+        for (capacity, width) in [
+            (self.slots.capacity(), size_of::<ChunkSlotSchema>()),
+            (self.slot_ids.capacity(), size_of::<SlotId>()),
+        ] {
+            inspection.charge(
+                capacity
+                    .checked_mul(width)
+                    .ok_or(RootSchemaBackingError::CapacityExceeded)?,
+            )?;
         }
+        // Private build creates this map fresh with capacity for all slots,
+        // inserts each key once, and exposes no mutation/removal API. Its
+        // never-deleted table history is known; no arbitrary map is accepted.
+        if self.index_by_slot.capacity() != 0 {
+            let buckets = self
+                .index_by_slot
+                .capacity()
+                .checked_add(1)
+                .and_then(usize::checked_next_power_of_two)
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?;
+            let payload = buckets
+                .checked_mul(size_of::<(SlotId, usize)>())
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?;
+            let alignment = align_of::<(SlotId, usize)>().max(16);
+            let aligned = payload
+                .checked_add(alignment - 1)
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?
+                & !(alignment - 1);
+            let bytes = aligned
+                .checked_add(buckets)
+                .and_then(|b| b.checked_add(16))
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?;
+            Layout::from_size_align(bytes, alignment)
+                .map_err(|_| RootSchemaBackingError::CapacityExceeded)?;
+            inspection.charge(bytes)?;
+        }
+        fn logical(
+            schema: &ChunkFieldSchema,
+            depth: usize,
+            inspection: &mut super::root_schema_backing::RootSchemaInspection,
+        ) -> Result<(), RootSchemaBackingError> {
+            inspection.enter_auxiliary_node(depth)?;
+            inspection.charge(
+                schema
+                    .children
+                    .capacity()
+                    .checked_mul(size_of::<ChunkFieldSchema>())
+                    .ok_or(RootSchemaBackingError::CapacityExceeded)?,
+            )?;
+            for child in &schema.children {
+                logical(child, depth + 1, inspection)?;
+            }
+            Ok(())
+        }
+        for slot in &self.slots {
+            logical(&slot.field_schema, 0, inspection)?;
+        }
+        Ok(())
     }
 
     pub fn slots(&self) -> &[ChunkSlotSchema] {
@@ -457,6 +854,39 @@ impl ChunkSchema {
             .map(|(field, slot_id)| Self::slot_schema_from_arrow_field(slot_id, field.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         Self::try_new_with_schema_metadata(slots, schema.metadata().clone()).map(Arc::new)
+    }
+
+    /// Retains an exact immutable schema constructed by an owned decoder.
+    /// Structural equality never substitutes for the field/map owner receipts.
+    pub fn try_ref_from_owned_schema_and_slot_ids(
+        source: &MetadataOwnedSchema,
+        origins: &FieldMetadataOrigins,
+        slot_ids: &[SlotId],
+    ) -> Result<ChunkSchemaRef, String> {
+        if source.schema().fields().len() != slot_ids.len() {
+            return Err("owned chunk schema slot id length mismatch".into());
+        }
+        let slots = source
+            .schema()
+            .fields()
+            .iter()
+            .zip(slot_ids)
+            .map(|(field, slot)| {
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    *slot,
+                    Arc::clone(field),
+                    origins
+                        .for_field_tree(field, 65536, 64)
+                        .map_err(|_| "owned chunk field metadata origins are incomplete")?,
+                    None,
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut schema = Self::try_new(slots)?;
+        schema.arrow_schema = Arc::clone(source.schema());
+        schema.schema_metadata_origin = Some(source.clone());
+        Ok(Arc::new(schema))
     }
 
     pub fn slot(&self, slot_id: SlotId) -> Option<&ChunkSlotSchema> {
@@ -550,13 +980,14 @@ pub(super) fn align_chunk_schema_to_batch(
         }
         let root = format!("slot {} ({})", expected.slot_id(), expected.name());
         check_chunk_data_type(expected.data_type(), field.data_type(), &root)?;
-        let reconciled_field = reconcile_chunk_field_to_field(expected.field(), field.as_ref())?;
-        slots.push(
-            expected
-                .with_field_and_slot_id(expected.slot_id(), reconciled_field.as_ref().clone())?,
-        );
+        slots.push(expected.reconcile_to_carrier(field.data_type(), field.is_nullable())?);
     }
-    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+    let schema = if let Some(source) = chunk_schema.schema_metadata_origin() {
+        ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+    } else {
+        ChunkSchema::try_new(slots)?
+    };
+    Ok(Arc::new(schema))
 }
 
 pub(super) fn align_chunk_schema_to_columns(
@@ -578,17 +1009,14 @@ pub(super) fn align_chunk_schema_to_columns(
             .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
         let root = format!("slot {} ({})", expected.slot_id(), expected.name());
         check_chunk_data_type(expected.data_type(), column.data_type(), &root)?;
-        let reconciled_field = reconcile_chunk_field_to_data_type(
-            expected.field(),
-            column.data_type(),
-            column.null_count() > 0,
-        )?;
-        slots.push(
-            expected
-                .with_field_and_slot_id(expected.slot_id(), reconciled_field.as_ref().clone())?,
-        );
+        slots.push(expected.reconcile_to_carrier(column.data_type(), column.null_count() > 0)?);
     }
-    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+    let schema = if let Some(source) = chunk_schema.schema_metadata_origin() {
+        ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+    } else {
+        ChunkSchema::try_new(slots)?
+    };
+    Ok(Arc::new(schema))
 }
 
 #[cfg(test)]
@@ -608,6 +1036,270 @@ mod tests {
     use crate::exec::chunk::Chunk;
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
+
+    fn owned_slot(id: u32) -> ChunkSlotSchema {
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let owner = ArrowMetadataOwner::try_new(
+            vec![("nr_logical_type".to_string(), "JSON".to_string())],
+            MetadataOwnerLimits {
+                entries: 1,
+                construction_bytes: 4096,
+            },
+        )
+        .unwrap()
+        .into_field(format!("v{id}"), DataType::Utf8, false);
+        ChunkSlotSchema::try_new_with_metadata_origins(
+            SlotId::new(id),
+            Arc::clone(owner.field()),
+            FieldMetadataOrigins::try_new(vec![owner], 1).unwrap(),
+            None,
+            Some(id as i32),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn owned_slot_derivation_preserves_identity_only_for_unchanged_field() {
+        let source = owned_slot(7);
+        let unchanged = source
+            .with_type_and_nullable(DataType::Utf8, false)
+            .unwrap();
+        assert!(Arc::ptr_eq(source.field_ref(), unchanged.field_ref()));
+        let renamed_slot = source.with_slot_id(SlotId::new(9)).unwrap();
+        assert!(Arc::ptr_eq(source.field_ref(), renamed_slot.field_ref()));
+        assert!(
+            renamed_slot
+                .metadata_origins()
+                .unwrap()
+                .metadata_bytes_for(source.field_ref())
+                .is_some()
+        );
+        let nullable = source.with_nullable(true);
+        assert!(!Arc::ptr_eq(source.field_ref(), nullable.field_ref()));
+        assert_eq!(source.field().metadata(), nullable.field().metadata());
+        assert!(
+            nullable
+                .metadata_origins()
+                .unwrap()
+                .metadata_bytes_for(nullable.field_ref())
+                .is_some()
+        );
+        assert!(
+            nullable
+                .metadata_origins()
+                .unwrap()
+                .metadata_bytes_for(source.field_ref())
+                .is_none()
+        );
+        let arbitrary = source.with_field(source.field().clone()).unwrap();
+        assert_eq!(source, arbitrary);
+        assert!(arbitrary.metadata_origins().is_none());
+    }
+
+    #[test]
+    fn nested_carrier_alignment_derives_every_changed_source_field_owner() {
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let limits = MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        };
+        let item =
+            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "JSON".into())], limits)
+                .unwrap()
+                .into_field("item".into(), DataType::Utf8, false);
+        let list = ArrowMetadataOwner::try_new(vec![], limits)
+            .unwrap()
+            .into_field(
+                "values".into(),
+                DataType::List(Arc::clone(item.field())),
+                false,
+            );
+        let root = ArrowMetadataOwner::try_new(vec![], limits)
+            .unwrap()
+            .into_field(
+                "root".into(),
+                DataType::Struct(vec![Arc::clone(list.field())].into()),
+                false,
+            );
+        let old_item = Arc::clone(item.field());
+        let old_list = Arc::clone(list.field());
+        let source = ChunkSchema::try_new(vec![
+            ChunkSlotSchema::try_new_with_metadata_origins(
+                SlotId::new(1),
+                Arc::clone(root.field()),
+                FieldMetadataOrigins::try_new(vec![item, list, root], 3).unwrap(),
+                None,
+                None,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let actual_item = Arc::new(Field::new(
+            "item",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        ));
+        let actual_list = Arc::new(Field::new(
+            "values",
+            DataType::List(Arc::clone(&actual_item)),
+            true,
+        ));
+        let actual_type = DataType::Struct(vec![actual_list].into());
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "root",
+                actual_type.clone(),
+                true,
+            )])),
+            vec![arrow::array::new_empty_array(&actual_type)],
+        )
+        .unwrap();
+        let aligned = super::align_chunk_schema_to_batch(&batch, &source).unwrap();
+        let slot = &aligned.slots()[0];
+        let origins = slot.metadata_origins().unwrap();
+        let reachable = origins.for_field_tree(slot.field_ref(), 5, 2).unwrap();
+        assert_eq!(reachable.owners().len(), 3);
+        let DataType::Struct(fields) = slot.data_type() else {
+            panic!("struct")
+        };
+        let DataType::List(item) = fields[0].data_type() else {
+            panic!("list")
+        };
+        assert!(!Arc::ptr_eq(&old_item, item));
+        assert!(!Arc::ptr_eq(&old_list, &fields[0]));
+        assert_eq!(logical_type_of_field(item), Some(LogicalType::Json));
+        assert!(item.is_nullable());
+        assert!(origins.metadata_bytes_for(item).is_some());
+        assert!(origins.metadata_bytes_for(&fields[0]).is_some());
+        assert!(origins.metadata_bytes_for(&actual_item).is_none());
+        assert!(
+            origins
+                .metadata_bytes_for(&batch.schema().fields()[0])
+                .is_none()
+        );
+        assert_eq!(
+            super::align_chunk_schema_to_batch(&batch, &aligned).unwrap(),
+            aligned
+        );
+    }
+
+    #[test]
+    fn retagged_actual_nested_array_shares_only_the_exact_known_target_field() {
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let limits = MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        };
+        let child =
+            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "JSON".into())], limits)
+                .unwrap()
+                .into_field("item".into(), DataType::Utf8, true);
+        let exact_child = Arc::clone(child.field());
+        let root = ArrowMetadataOwner::try_new(vec![], limits)
+            .unwrap()
+            .into_field(
+                "root".into(),
+                DataType::Struct(vec![Arc::clone(&exact_child)].into()),
+                false,
+            );
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    SlotId::new(1),
+                    Arc::clone(root.field()),
+                    FieldMetadataOrigins::try_new(vec![child, root], 2).unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let foreign = Arc::new(Field::new("item", DataType::Utf8, true));
+        let values = Arc::new(StructArray::new(
+            vec![Arc::clone(&foreign)].into(),
+            vec![Arc::new(StringArray::from(vec![Some("{}")]))],
+            None,
+        )) as ArrayRef;
+        let chunk = Chunk::try_new_with_columns(schema, vec![values]).unwrap();
+        let DataType::Struct(actual_fields) = chunk.columns()[0].data_type() else {
+            panic!("struct")
+        };
+        assert!(Arc::ptr_eq(&exact_child, &actual_fields[0]));
+        assert!(!Arc::ptr_eq(&foreign, &actual_fields[0]));
+        let origins = chunk.chunk_schema().field_metadata_origins().unwrap();
+        assert!(origins.metadata_bytes_for(&actual_fields[0]).is_some());
+        assert!(origins.metadata_bytes_for(&foreign).is_none());
+        assert!(Arc::ptr_eq(
+            &chunk.schema(),
+            &chunk.chunk_schema().arrow_schema_ref()
+        ));
+    }
+
+    #[test]
+    fn static_layout_thaw_narrows_each_slot_and_keeps_actual_schema_owner() {
+        use novarocks_local_program::{StaticFieldSchema, StaticLayout};
+        // A whole-layout index on every slot would produce 66,049 entries and
+        // reject this valid 257-field layout when the schema is reconstructed.
+        let source = ChunkSchema::try_new((0..257).map(owned_slot).collect()).unwrap();
+        let layout = StaticLayout::try_new_exact(
+            source.arrow_schema_ref(),
+            Arc::from(source.slot_ids()),
+            source
+                .slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        StaticFieldSchema::new(Some(LogicalType::Json), vec![]),
+                        slot.unique_id(),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+        .with_metadata_origins(
+            source.field_metadata_origins().unwrap().clone(),
+            source.schema_metadata_origin().cloned(),
+        )
+        .unwrap();
+        let restored = ChunkSchema::from_static_layout(&layout).unwrap();
+        assert_eq!(source, *restored);
+        assert!(Arc::ptr_eq(
+            &source.arrow_schema_ref(),
+            &restored.arrow_schema_ref()
+        ));
+        assert_eq!(
+            restored.field_metadata_origins().unwrap().owners().len(),
+            257
+        );
+        for (old, new) in source.slots().iter().zip(restored.slots()) {
+            assert!(Arc::ptr_eq(old.field_ref(), new.field_ref()));
+            assert_eq!(new.metadata_origins().unwrap().owners().len(), 1);
+        }
+        let projected = layout
+            .project_by_slots(&[SlotId::new(19), SlotId::new(3)])
+            .unwrap();
+        let restored = ChunkSchema::from_static_layout(&projected).unwrap();
+        assert_eq!(restored.slot_ids(), &[SlotId::new(19), SlotId::new(3)]);
+        assert!(Arc::ptr_eq(
+            source.slots()[19].field_ref(),
+            restored.slots()[0].field_ref()
+        ));
+        assert_eq!(restored.field_metadata_origins().unwrap().owners().len(), 2);
+        assert!(
+            restored
+                .schema_metadata_origin()
+                .unwrap()
+                .backing_bytes_for(&restored.arrow_schema_ref())
+                .is_some()
+        );
+    }
 
     #[test]
     fn strict_rejects_duplicate_slot_id() {

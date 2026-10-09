@@ -1525,6 +1525,7 @@ mod tests {
             source_endpoint.clone(),
             target_endpoint.clone(),
             BackendRoutePeer::Remote {
+                backend_process_id: novarocks_types::BackendProcessId::new_v7(),
                 participant_id: 2,
                 endpoint: endpoint(9072),
             },
@@ -1539,6 +1540,7 @@ mod tests {
             source_endpoint,
             target_endpoint,
             BackendRoutePeer::Remote {
+                backend_process_id: novarocks_types::BackendProcessId::new_v7(),
                 participant_id: 1,
                 endpoint: endpoint(9071),
             },
@@ -1769,6 +1771,7 @@ mod tests {
             source_endpoint,
             target_endpoint,
             BackendRoutePeer::Remote {
+                backend_process_id: novarocks_types::BackendProcessId::new_v7(),
                 participant_id: 1,
                 endpoint: endpoint(9071),
             },
@@ -1911,6 +1914,7 @@ mod tests {
             source_endpoint,
             target_endpoint,
             BackendRoutePeer::Remote {
+                backend_process_id: novarocks_types::BackendProcessId::new_v7(),
                 participant_id: 1,
                 endpoint: endpoint(9071),
             },

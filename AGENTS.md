@@ -189,7 +189,8 @@ SQL client
 
 - `novarocks/mysql-adapter/src/**`
   MySQL protocol: `listener.rs` (connection serving and drain),
-  `result_encoding.rs` and `row_encoding.rs` (result-set and row encoding),
+  `result_encoding.rs` (metadata projection), `relay_result_writer.rs` and
+  `local_result_writer.rs` (governed bounded result delivery),
   `error_mapping/**`.
 
 ### 4.3 Native Plan Wire and BE-Side Fragment Decode
@@ -859,7 +860,7 @@ suspected case against a clean server before attributing it to the change.
   separation is in `fragment_plan_decode_submission.rs` and Execution
   `exec/node/lowering.rs`. The wire vocabulary lives in `novarocks/plan-codec/src/**`.
 - **MySQL protocol behavior**: inspect `novarocks/mysql-adapter/src/listener.rs`,
-  `result_encoding.rs` and `row_encoding.rs`.
+  `result_encoding.rs`, `relay_result_writer.rs` and `local_result_writer.rs`.
 - **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for
   admission and routing, then the specific flow under
   `novarocks/frontend-application/src/query_execution/dml/**` (`insert.rs`,

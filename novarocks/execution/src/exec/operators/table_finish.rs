@@ -1164,6 +1164,12 @@ fn root_artifact_chunk(
         .map_err(|error| format!("table finish artifact row shape: {error}"))?;
     }
     let root_arrow = root_schema.arrow_schema_ref();
+    // The reused upstream nested arrays name the upstream layout's child
+    // fields. Rebind them to the Root layout's own fields (buffers are shared,
+    // nothing is copied) so the Root output carries only metadata owners its
+    // own layout provides; a bounded root producer refuses any other owner.
+    let input_fields = rebind_list(input_lists, root_arrow.field(4).data_type())?;
+    let properties = rebind_map(maps, root_arrow.field(7).data_type())?;
     let columns = vec![
         Arc::new(Int8Array::from(vec![
             RootRowKind::ArtifactDraft.to_wire();
@@ -1186,6 +1192,44 @@ fn root_artifact_chunk(
         })?;
     }
     Ok(Some(output))
+}
+
+fn rebind_list(list: &arrow::array::ListArray, root: &DataType) -> Result<ArrayRef, String> {
+    let DataType::List(item) = root else {
+        return Err("table finish Root input_fields is not a List".to_string());
+    };
+    arrow::array::ListArray::try_new(
+        Arc::clone(item),
+        list.offsets().clone(),
+        Arc::clone(list.values()),
+        list.nulls().cloned(),
+    )
+    .map(|list| Arc::new(list) as ArrayRef)
+    .map_err(|error| format!("rebind table finish artifact input_fields: {error}"))
+}
+
+fn rebind_map(map: &arrow::array::MapArray, root: &DataType) -> Result<ArrayRef, String> {
+    let DataType::Map(entries, sorted) = root else {
+        return Err("table finish Root properties is not a Map".to_string());
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return Err("table finish Root property entries are not a Struct".to_string());
+    };
+    let rebound = arrow::array::StructArray::try_new(
+        fields.clone(),
+        map.entries().columns().to_vec(),
+        map.entries().nulls().cloned(),
+    )
+    .map_err(|error| format!("rebind table finish artifact entries: {error}"))?;
+    arrow::array::MapArray::try_new(
+        Arc::clone(entries),
+        map.offsets().clone(),
+        rebound,
+        map.nulls().cloned(),
+        *sorted,
+    )
+    .map(|map| Arc::new(map) as ArrayRef)
+    .map_err(|error| format!("rebind table finish artifact properties: {error}"))
 }
 
 impl Operator for TableFinishOperator {
@@ -1628,6 +1672,91 @@ mod tests {
     use crate::exec::operators::table_writer::tests::target;
     use crate::runtime::ExecutionRuntime;
     use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
+
+    #[test]
+    fn root_artifact_rebinds_reused_nested_arrays_to_root_layout_fields() {
+        use arrow::array::{Int32Array, MapArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use novarocks_spi::connector::write_stack::root_write_result_schema;
+        let root = RootWriteResultRelationSchema::fixed();
+        let root_schema = Arc::clone(root.chunk_schema());
+        // An upstream layout with equal types but independently owned fields.
+        let upstream = root_write_result_schema();
+        let DataType::List(item) = upstream.field(4).data_type() else {
+            unreachable!()
+        };
+        let DataType::Map(entries, false) = upstream.field(7).data_type() else {
+            unreachable!()
+        };
+        let DataType::Struct(entry_fields) = entries.data_type() else {
+            unreachable!()
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![RootRowKind::ArtifactDraft.to_wire()])),
+            Arc::new(Int32Array::from(vec![0])),
+            new_null_array(&DataType::Int64, 1),
+            new_null_array(&DataType::Binary, 1),
+            Arc::new(ListArray::new(
+                Arc::clone(item),
+                OffsetBuffer::from_lengths([1]),
+                Arc::new(Int32Array::from(vec![5])),
+                None,
+            )),
+            Arc::new(StringArray::from(vec!["theta"])),
+            Arc::new(BinaryArray::from(vec![b"body".as_slice()])),
+            Arc::new(MapArray::new(
+                Arc::clone(entries),
+                OffsetBuffer::from_lengths([1]),
+                StructArray::new(
+                    entry_fields.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec!["k"])) as ArrayRef,
+                        Arc::new(StringArray::from(vec!["v"])) as ArrayRef,
+                    ],
+                    None,
+                ),
+                None,
+                false,
+            )),
+        ];
+        let upstream_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&upstream, root_schema.slot_ids())
+                .unwrap();
+        let batch = RecordBatch::try_new(upstream_schema.arrow_schema_ref(), columns).unwrap();
+        let chunk = Chunk::try_new_with_chunk_schema(batch, upstream_schema).unwrap();
+        let output = root_artifact_chunk(chunk, &root_schema, None)
+            .unwrap()
+            .expect("one artifact row");
+        let root_arrow = root_schema.arrow_schema_ref();
+        let (DataType::List(expected_item), DataType::List(actual_item)) = (
+            root_arrow.field(4).data_type(),
+            output.batch.column(4).data_type(),
+        ) else {
+            panic!("input_fields is a List");
+        };
+        assert!(Arc::ptr_eq(expected_item, actual_item));
+        assert!(!Arc::ptr_eq(item, actual_item));
+        let (DataType::Map(expected_entries, _), DataType::Map(actual_entries, _)) = (
+            root_arrow.field(7).data_type(),
+            output.batch.column(7).data_type(),
+        ) else {
+            panic!("properties is a Map");
+        };
+        assert!(Arc::ptr_eq(expected_entries, actual_entries));
+        let rebound = output
+            .batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let (DataType::Struct(expected_children), DataType::Struct(actual_children)) =
+            (expected_entries.data_type(), rebound.entries().data_type())
+        else {
+            panic!("entries are a Struct");
+        };
+        assert!(Arc::ptr_eq(&expected_children[0], &actual_children[0]));
+        assert!(Arc::ptr_eq(&expected_children[1], &actual_children[1]));
+    }
 
     /// A row shape the tests can express, including shapes a correct
     /// `TableWriter` would never produce.

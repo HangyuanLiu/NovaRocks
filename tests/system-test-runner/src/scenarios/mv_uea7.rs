@@ -117,6 +117,10 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
         &self.create_catalog_sql
     }
 
+    pub(super) fn rest_fixture(&self) -> &IsolatedIcebergRestFixture {
+        &self.rest
+    }
+
     pub(super) fn rest_uri(&self) -> &str {
         &self.rest.endpoints().rest_uri
     }

@@ -233,7 +233,9 @@ pub fn decode_fragment_sink_assignment(
                 ))
             })
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Vec::new(),
+        plan::data_sink::Kind::Result(_)
+        | plan::data_sink::Kind::RootResult(_)
+        | plan::data_sink::Kind::Noop(_) => Vec::new(),
     };
     let edges = decode_sink_edges(&expected, sink_edge_ids, topology, path.clone())?;
     let mut groups = edges
@@ -259,9 +261,9 @@ pub fn decode_fragment_sink_assignment(
                 sender_id: None,
             })
         }
-        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => {
-            Ok(FragmentSinkAssignment::None)
-        }
+        plan::data_sink::Kind::Result(_)
+        | plan::data_sink::Kind::RootResult(_)
+        | plan::data_sink::Kind::Noop(_) => Ok(FragmentSinkAssignment::None),
     }
 }
 

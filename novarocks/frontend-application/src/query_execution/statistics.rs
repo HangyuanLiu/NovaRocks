@@ -22,6 +22,7 @@
 //! unpivot/result operators. This module retains the frozen expectations and
 //! validates the Root result stream before the provider session may finish.
 
+use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,6 +205,17 @@ impl StatisticsCollectionProgram {
         columns
     }
 
+    pub(crate) fn result_decoder_with_capacity(
+        &self,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<StatisticsRootResultDecoder, String> {
+        let retention =
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(binding)?;
+        let mut decoder = self.result_decoder();
+        decoder.retention = Some(retention);
+        Ok(decoder)
+    }
+
     pub fn result_decoder(&self) -> StatisticsRootResultDecoder {
         StatisticsRootResultDecoder::new(
             self.required
@@ -371,6 +383,13 @@ pub fn prepare_completed_statistics_collection(
     .map_err(contract_violation)?;
     let version = plan.version();
     let candidate = CompletedPhysicalPlanCandidate::for_program(plan)
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+                ),
+            )
+        })
         .map_err(|error| contract_violation(error.to_string()))?;
     let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
         novarocks_query_application::api::QueryExecutionKind::Statistics,
@@ -507,21 +526,39 @@ fn admit_statistics_scan_binding(
 /// for ANALYZE; the provider session validates the compact body and derives
 /// provider metadata while consuming `finish`.
 pub struct StatisticsRootResultDecoder {
+    relay_assembly: RootRecordAssembly,
+    relayed_record_count: u64,
     expected: BTreeSet<StatisticsArtifactIdentity>,
     observed: BTreeMap<StatisticsArtifactIdentity, StatisticsArtifactDraft>,
     body_bytes: usize,
     root_eof: bool,
     execution_succeeded: bool,
+    retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
 
 impl StatisticsRootResultDecoder {
+    #[cfg(test)]
+    pub(crate) fn for_test_with_capacity(
+        expected: impl IntoIterator<Item = StatisticsArtifactIdentity>,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Self {
+        let retention =
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(binding)
+                .unwrap();
+        let mut decoder = Self::new(expected);
+        decoder.retention = Some(retention);
+        decoder
+    }
     fn new(expected: impl IntoIterator<Item = StatisticsArtifactIdentity>) -> Self {
         Self {
+            relayed_record_count: 0,
+            relay_assembly: RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
             expected: expected.into_iter().collect(),
             observed: BTreeMap::new(),
             body_bytes: 0,
             root_eof: false,
             execution_succeeded: false,
+            retention: None,
         }
     }
 
@@ -602,43 +639,109 @@ impl StatisticsRootResultDecoder {
             if fields.null_count() != 0 {
                 return Err("statistics Root input_fields contains a null item".into());
             }
-            let field_ids = fields.values().to_vec();
-            if field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len() {
-                return Err("statistics Root input_fields contains a duplicate field ID".into());
-            }
             let property_offsets = properties.value_offsets();
             let property_count = usize::try_from(property_offsets[row + 1] - property_offsets[row])
                 .map_err(|_| "statistics Root properties offset is invalid".to_string())?;
             if property_count != 0 {
                 return Err("ANALYZE statistics Root properties must be empty".into());
             }
-            let identity = StatisticsArtifactIdentity::try_new(field_ids, blob_types.value(row))
-                .map_err(|error| error.to_string())?;
-            if !self.expected.contains(&identity) {
-                return Err(format!(
-                    "statistics Root emitted unexpected artifact identity {identity:?}"
-                ));
-            }
-            if self.observed.contains_key(&identity) {
-                return Err(format!(
-                    "statistics Root emitted duplicate artifact identity {identity:?}"
-                ));
-            }
-            self.body_bytes =
-                charge_statistics_body_bytes(self.body_bytes, bodies.value(row).len())?;
-            let draft = StatisticsArtifactDraft::try_new(
-                identity.input_fields().to_vec(),
-                identity.blob_type(),
-                bytes::Bytes::copy_from_slice(bodies.value(row)),
-                BTreeMap::new(),
-            )
-            .map_err(|error| error.to_string())?;
-            self.observed.insert(identity, draft);
+            self.apply_artifact(
+                fields.values().to_vec(),
+                blob_types.value(row),
+                bodies.value(row),
+            )?;
         }
         Ok(())
     }
 
+    /// Apply one complete StatisticsArtifactV1 record relayed from the
+    /// Backend, under the same identity, membership and body rules.
+    /// Validate complete local domain consumption before the coordinator
+    /// records End. This count is relation rows, not affected write rows.
+    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), String> {
+        self.relay_assembly.finish()?;
+        if output_rows != self.relayed_record_count {
+            return Err("internal root End differs from decoded record count".into());
+        }
+        Ok(())
+    }
+
+    /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
+    /// record is validated before this call returns and its receipt may finish.
+    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
+        if self.root_eof {
+            return Err("statistics Root emitted a trailing body after EOF".into());
+        }
+        let mut assembly = std::mem::replace(
+            &mut self.relay_assembly,
+            RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
+        );
+        let result = assembly.push(body, |record| {
+            self.apply_record(record)?;
+            self.relayed_record_count = self
+                .relayed_record_count
+                .checked_add(1)
+                .ok_or("internal root record count overflow")?;
+            Ok(())
+        });
+        self.relay_assembly = assembly;
+        result
+    }
+
+    pub fn apply_record(&mut self, record: &[u8]) -> Result<(), String> {
+        if self.root_eof {
+            return Err("statistics Root emitted a trailing record after EOF".into());
+        }
+        if self.observed.len() >= MAX_STATISTICS_ROOT_ROWS {
+            return Err("statistics Root row budget exceeded".into());
+        }
+        let view =
+            novarocks_native_adapter::root_statistics_codec::StatisticsArtifactRecordView::parse(
+                record,
+            )
+            .map_err(|error| format!("statistics Root record: {error}"))?;
+        self.apply_artifact(view.field_ids().collect(), view.blob_type(), view.body())
+    }
+
+    fn apply_artifact(
+        &mut self,
+        field_ids: Vec<i32>,
+        blob_type: &str,
+        body: &[u8],
+    ) -> Result<(), String> {
+        if field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len() {
+            return Err("statistics Root input_fields contains a duplicate field ID".into());
+        }
+        let identity = StatisticsArtifactIdentity::try_new(field_ids, blob_type)
+            .map_err(|error| error.to_string())?;
+        if !self.expected.contains(&identity) {
+            return Err(format!(
+                "statistics Root emitted unexpected artifact identity {identity:?}"
+            ));
+        }
+        if self.observed.contains_key(&identity) {
+            return Err(format!(
+                "statistics Root emitted duplicate artifact identity {identity:?}"
+            ));
+        }
+        self.body_bytes = charge_statistics_body_bytes(self.body_bytes, body.len())?;
+        let draft = StatisticsArtifactDraft::try_new(
+            identity.input_fields().to_vec(),
+            identity.blob_type(),
+            bytes::Bytes::copy_from_slice(body),
+            BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        let draft = match &self.retention {
+            Some(retention) => draft.attach_guard(retention.spi_guard()),
+            None => draft,
+        };
+        self.observed.insert(identity, draft);
+        Ok(())
+    }
+
     pub fn observe_root_eof(&mut self) -> Result<(), String> {
+        self.relay_assembly.finish()?;
         if std::mem::replace(&mut self.root_eof, true) {
             return Err("statistics Root emitted duplicate EOF".into());
         }
@@ -753,6 +856,131 @@ mod tests {
             chunk_schema,
         )
         .expect("chunk")
+    }
+
+    /// The Backend statistics encoder's records for `chunk`, cut into tiny
+    /// bodies and reassembled.
+    fn statistics_records(chunk: &Chunk) -> Vec<Vec<u8>> {
+        use novarocks_native_adapter::root_record_assembly::{
+            RootRecordAssembly, RootRecordDomain,
+        };
+        use novarocks_native_adapter::root_statistics_codec::{
+            StatisticsArtifactEncoder, StatisticsCodecStatus, StatisticsCodecTotals,
+        };
+        let mut encoder = StatisticsArtifactEncoder::try_new(
+            chunk.batch.clone(),
+            StatisticsCodecTotals::default(),
+        )
+        .expect("statistics relation");
+        let mut stream = Vec::new();
+        let mut output = vec![0_u8; 9];
+        loop {
+            let turn = encoder.step(&mut output).expect("encodable artifacts");
+            stream.extend_from_slice(&output[..turn.emitted_bytes]);
+            if turn.status == StatisticsCodecStatus::InputComplete {
+                break;
+            }
+        }
+        let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, 1 << 20);
+        let mut records = Vec::new();
+        for body in stream.chunks(4) {
+            assembly
+                .push(body, |record| {
+                    records.push(record.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assembly.finish().unwrap();
+        records
+    }
+
+    #[test]
+    fn last_artifact_body_clone_retains_window_after_decoder_and_artifacts_exit() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "theta-v1")]);
+        decoder.retention = Some(
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(&binding)
+                .unwrap(),
+        );
+        for record in statistics_records(&chunk(&[(&[1], "theta-v1", b"one", &[])])) {
+            decoder.apply_relay_body(&record).unwrap();
+        }
+        decoder.observe_root_eof().unwrap();
+        decoder.observe_execution_success().unwrap();
+        let artifacts = decoder.finish().unwrap();
+        let body = artifacts[0].body().clone();
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        drop(artifacts);
+        assert_eq!(body.as_ref(), b"one");
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(body);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
+    fn relayed_body_end_refuses_partial_record_and_preserves_all_success_gate() {
+        let record = statistics_records(&chunk(&[(&[1], "theta-v1", b"one", &[])])).remove(0);
+        let expected = StatisticsArtifactIdentity::try_new(vec![1], "theta-v1").unwrap();
+        let mut decoder = StatisticsRootResultDecoder::new([expected.clone()]);
+        decoder.apply_relay_body(&record[..7]).unwrap();
+        assert!(
+            decoder
+                .observe_root_eof()
+                .unwrap_err()
+                .contains("unfinished")
+        );
+        assert!(!decoder.root_eof);
+        decoder.apply_relay_body(&record[7..]).unwrap();
+        assert!(decoder.check_relay_end(2).is_err());
+        assert!(!decoder.root_eof);
+        decoder.check_relay_end(1).unwrap();
+        decoder.observe_root_eof().unwrap();
+        assert!(decoder.finish().unwrap_err().contains("all-success"));
+        let mut decoder = StatisticsRootResultDecoder::new([expected]);
+        decoder.apply_relay_body(&record).unwrap();
+        decoder.observe_root_eof().unwrap();
+        decoder.observe_execution_success().unwrap();
+        assert_eq!(decoder.finish().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn relayed_statistics_records_match_the_arrow_relation() {
+        let rows = chunk(&[
+            (&[1], "apache-datasketches-theta-v1", b"one", &[]),
+            (&[2, 3], "apache-datasketches-theta-v1", b"two", &[]),
+        ]);
+        let expected = || {
+            StatisticsRootResultDecoder::new([
+                StatisticsArtifactIdentity::try_new(vec![1], "apache-datasketches-theta-v1")
+                    .unwrap(),
+                StatisticsArtifactIdentity::try_new(vec![2, 3], "apache-datasketches-theta-v1")
+                    .unwrap(),
+            ])
+        };
+        let mut from_chunk = expected();
+        from_chunk.apply_chunk(&rows).unwrap();
+        from_chunk.observe_root_eof().unwrap();
+        from_chunk.observe_execution_success().unwrap();
+        let mut from_records = expected();
+        for record in statistics_records(&rows) {
+            for body in record.chunks(3) {
+                from_records.apply_relay_body(body).unwrap();
+            }
+        }
+        from_records.observe_root_eof().unwrap();
+        from_records.observe_execution_success().unwrap();
+        assert_eq!(from_records.finish().unwrap(), from_chunk.finish().unwrap());
+        // Duplicates and unexpected identities are refused on the record path too.
+        let mut duplicate = expected();
+        let records = statistics_records(&rows);
+        duplicate.apply_record(&records[0]).unwrap();
+        assert!(duplicate.apply_record(&records[0]).is_err());
+        let mut unexpected = StatisticsRootResultDecoder::new([identity(9, "x")]);
+        assert!(unexpected.apply_record(&records[0]).is_err());
     }
 
     #[test]

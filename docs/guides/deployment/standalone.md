@@ -47,15 +47,23 @@ FE 配置必须包括：
 - 与 BE 相同的 mandatory `[native_trust]` deployment id、shared secret 和 transport mode；
 - BE 会向 FE Native gRPC endpoint 自注册；`[cluster].backends` 不是 deployment 配置。
 
-BE 配置必须包括自身不同的 Native gRPC 与 management HTTP 端口，以及本地
-connector object-store binding。Paimon 查询要求 FE 与 BE 的 binding 指向同一
-warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
+BE 配置必须包括 Data 的 `[server].grpc_port`、显式非零 Control 的
+`[server].control_grpc_port` 与 `[server].http_port`，三个端口必须独立；Control 不从
+Data 端口推导。BE 使用 `[cluster].frontend_endpoint` 向 FE 原有 Native endpoint announce。
+每次 announce 的完整 descriptor 都包含 Data 与 Control endpoint，FE 对准确 Control
+endpoint 的 heartbeat 必须返回完全相同的 descriptor，才允许新查询调度。
+
+Data 与 Control 使用同一个准确 advertised host；可选 `[cluster].advertise_control_port`
+单独指定 Control 外部端口，未配置时等于显式的 Control bind 端口。若本地也使用 NAT，
+两条端口映射必须分别正确。BE 还必须配置本地 connector object-store binding。Paimon 查询要求 FE 与 BE 的 binding
+指向同一 warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
 sizing，其他 role-local 字段各自生效。
 
 两份正常角色配置都可包含 `[runtime.native_ingress]`：FE 只使用
 `worker_threads`、`max_blocking_threads` 调整自己的 Native report listener；BE
 使用同节的普通/控制运行及等待资格、消息界和控制执行器参数。all-in-one 沿用
-这两套 role-local listener，没有单独的入口容量或 FE 整集群 Task 配额。
+正常 role-local listener：FE report 一条，BE Data/Control 两条，没有 all-in-one
+专用的入口容量或 FE 整集群 Task 配额。
 完整键与默认值见 [分布式部署](distributed.md#配置-be-节点)。
 
 `all-in-one` 不共享或绕过 Native trust：Server 仍分别为 FE 与 BE 构造 role-scoped
@@ -78,7 +86,13 @@ NO_PROXY=127.0.0.1,localhost \
 ```
 
 任一 role runner 返回时，supervisor 会请求另一侧 shutdown、等待双方完成清理，并
-保留 primary error。成功启动后，FE 会打印 MySQL readiness marker：
+保留 primary error。BE 两条 advertised endpoint 的启动就绪检查成功后会打印：
+
+```text
+NOVAROCKS_READY role=be grpc_port=9081 control_grpc_port=9082 advertise_host=127.0.0.1 pid=<pid>
+```
+
+FE 另行打印 MySQL readiness marker；具体端口均取自各自配置：
 
 ```text
 NOVAROCKS_READY mysql_port=9030 pid=<pid>
@@ -90,12 +104,29 @@ NOVAROCKS_READY mysql_port=9030 pid=<pid>
 mysql -h 127.0.0.1 -P 9030 -uroot
 ```
 
-## 四个 listener surface
+## 五个 Native／management listener surface
 
 | Role | Native listener | Management listener |
 | --- | --- | --- |
-| FE | `[server].grpc_port`：仅 coordinator-report gRPC | `[server].http_port`：FE-scoped metrics 与现有 gated lifecycle debug |
-| BE | `[server].grpc_port`：仅 fragment/exchange Native gRPC | `[server].http_port`：BE-scoped metrics |
+| FE | `[server].grpc_port`：coordinator-report 与 authenticated announce | `[server].http_port`：FE-scoped metrics 与现有 gated lifecycle debug |
+| BE | `[server].grpc_port`：Data；`[server].control_grpc_port`：Control | `[server].http_port`：BE-scoped metrics |
+
+BE Data 接受 task submission、status/result、普通 split/domain updates、catalog prune 和 peer
+exchange/runtime-filter RPC；Control 接受 `ApplyTaskControlOperations` 与 `Heartbeat`。
+错误域在认证后、读取 body 与调用 handler 前拒绝，不跨 listener 转发；BE→FE
+`AnnounceBackend` 仍使用 FE 原有 Native endpoint。
+
+BE 两条 listener 各有自己的 Tokio runtime，Control 使用 `control_worker_threads`。
+Data 32 与 Control 8 个 acquisition positions 不互借，2 秒握手期限覆盖 TLS/preface/
+初始 SETTINGS；成功应用 peer SETTINGS 且完成实际 SETTINGS/ACK flush 才释放握手
+位置，失败和取消等实际握手 owner 退出。Data 半开连接满位不会占用 Control 资格。
+正常应用 stream 不受已完成握手的 2 秒期限约束。
+
+两份 role 配置都在 bind 前检查文件描述符 soft limit：BE 至少 1024、FE 至少 2048，
+所以这个组合启动方式也需要满足 FE 基线。检查只查询 `getrlimit(RLIMIT_NOFILE)`，不
+修改或预留 FD。BE 的 Native socket stock 518 Data + 20 Control + 2 listeners + 2 refusal
+transients = 542，1024 基线余量为 482；它不证明其他文件或 Connector 已预留容量。
+这些 listener 和资格也不宣称完整 Native owner graph 或 bounded-root/V1 支持。
 
 Native listener 不安装 management HTTP route；management listener 不承载 Native
 gRPC service。metrics 也按 role-local registry 收集，因此同进程的 all-in-one 不会
@@ -121,7 +152,8 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
   --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
-该 fixture 为当前工作区生成一对正常 FE/BE 配置和四个不冲突 listener port；不要
+该 fixture 为当前工作区生成一对正常 FE/BE 配置，以及 FE Native/management、BE
+Data/Control/management 五个不冲突 listener port（MySQL 端口另外配置）；不要
 猜测端口或重用旧的 standalone config 环境变量。
 
 Paimon 本地 fixture 和支持矩阵见 [Paimon 只读 Connector](../connectors/paimon.md)。
@@ -136,11 +168,13 @@ Paimon 本地 fixture 和支持矩阵见 [Paimon 只读 Connector](../connectors
 
 | 现象 | 处理方式 |
 | --- | --- |
-| 启动前报 endpoint overlap | 为 FE MySQL、FE/BE Native gRPC、FE/BE management HTTP 分配不同端口；也检查 wildcard bind。 |
+| 启动前报 endpoint overlap | 为 FE MySQL、FE Native、BE Data、BE Control 与两侧 management HTTP 分配不同端口；也检查 wildcard bind。 |
 | 启动前报 process configuration mismatch | 两份配置的 logging 与 data-runtime sizing 必须相同。 |
 | FE 提示缺少 StaticFile snapshot | 复制 `novarocks-catalogs.toml.example` 到 FE config 同目录，并使 `[catalog_source].static_file_path` 指向它；文件缺失不会降级为空 snapshot。 |
 | FE 提示 DynamicStateStore 缺少 StateStore | 仅在 `[catalog_source].mode = "dynamic-state-store"` 时配置 durable `[state_store]`；不要以 transient/in-memory membership 替代。 |
 | native trust preflight failure | 使 FE/BE 的 `deployment_id`、resolved shared secret 与 transport mode 完全相同；完整 secret rotation 只能 homogeneous restart。 |
+| 缺少 BE Control 配置或 BE 不 Eligible | 显式填写 `[server].control_grpc_port`，核对两条 advertised endpoint 可达；FE Heartbeat 使用 Control，完整 descriptor 必须一致。 |
+| 启动拒绝 Native descriptor baseline | 在进程启动环境使 soft FD limit 至少 2048；Server 不会自动修改限制。 |
 | Native RPC `Unauthenticated` 或 TLS handshake failure | 检查 secret/env、token clock 和双方 TLS profile；不要降级或删除 JWT 来绕过失败。 |
 | 访问 `/metrics` 得到 Native 协议错误或 404 | 改访问对应 role 的 management HTTP port，而不是 Native gRPC port。 |
 | 连接 MySQL 失败 | 等待 `NOVAROCKS_READY`，然后确认 FE 的 `[standalone_server].mysql_port`。 |

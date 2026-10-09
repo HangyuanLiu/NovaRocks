@@ -35,6 +35,102 @@ pub use super::mv_persistence::{
 };
 pub use crate::compiler::SqlMvRelationOccurrenceId;
 
+/// Refuse private result domains before a persistence facade discards their
+/// query-local identities or converts their physical storage into SQL DDL.
+/// Ordinary Binary never establishes an opaque domain. Existing schema
+/// admission owns its limits; this check adds no scalar profile restriction.
+pub(crate) fn validate_persistable_output(
+    resolved: &crate::analysis::ResolvedQuery,
+    factory: &crate::column_id::ColumnRefFactory,
+) -> Result<(), String> {
+    for column in resolved
+        .output_columns
+        .iter()
+        .filter(|column| !column.is_internal)
+    {
+        if let Some(logical) = factory.borrowed_logical_type(column.column_id) {
+            PersistenceOutputInspection::logical(logical)?;
+        }
+        PersistenceOutputInspection::data_type(&column.data_type)?;
+    }
+    Ok(())
+}
+
+struct PersistenceOutputInspection;
+
+impl PersistenceOutputInspection {
+    fn rejected() -> String {
+        "Object and Percentile result domains are unsupported for persisted schemas".into()
+    }
+
+    fn logical(logical: &novarocks_types::schema::SqlType) -> Result<(), String> {
+        use novarocks_types::schema::SqlType;
+        match logical {
+            SqlType::Object | SqlType::Percentile => Err(Self::rejected()),
+            SqlType::Array(item) => Self::logical(item),
+            SqlType::Map(key, value) => {
+                Self::logical(key)?;
+                Self::logical(value)
+            }
+            SqlType::Struct(fields) => {
+                for (_, field) in fields {
+                    Self::logical(field)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn field(field: &arrow::datatypes::Field) -> Result<(), String> {
+        use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
+        if field
+            .metadata()
+            .get(NR_LOGICAL_TYPE_KEY)
+            .is_some_and(|value| {
+                let value = value.trim();
+                value.eq_ignore_ascii_case("object") || value.eq_ignore_ascii_case("percentile")
+            })
+        {
+            return Err(Self::rejected());
+        }
+        Self::data_type(field.data_type())
+    }
+
+    fn data_type(data_type: &arrow::datatypes::DataType) -> Result<(), String> {
+        use arrow::datatypes::DataType;
+        match data_type {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
+            | DataType::Map(field, _) => Self::field(field),
+            DataType::Struct(fields) => {
+                for field in fields {
+                    Self::field(field)?;
+                }
+                Ok(())
+            }
+            DataType::Union(fields, _) => {
+                for (_, field) in fields.iter() {
+                    Self::field(field)?;
+                }
+                Ok(())
+            }
+            DataType::Dictionary(key, value) => {
+                Self::data_type(key)?;
+                Self::data_type(value)
+            }
+            DataType::RunEndEncoded(runs, values) => {
+                Self::field(runs)?;
+                Self::field(values)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
 /// Application materialization may attach only this immutable column label;
 /// the planner vocabulary remains private.
@@ -341,6 +437,135 @@ mod refresh_property_facade_tests {
         let (resolved, _, _) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").expect("analyze query");
         SqlResolvedMvRefreshInput::from_analysis(resolved)
+    }
+
+    #[test]
+    fn m07_mv_persistence_rejects_exact_scalar_and_aggregate_private_domains() {
+        for sql in [
+            "SELECT percentile_empty() AS state FROM fact_east",
+            "SELECT percentile_hash(CAST(amount AS DOUBLE)) AS state FROM fact_east",
+            "SELECT percentile_union(percentile_hash(CAST(amount AS DOUBLE))) AS state FROM fact_east",
+        ] {
+            let query = parse_query(sql);
+            let (resolved, _, factory) =
+                crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales")
+                    .expect("installed producer must analyze");
+            let error = validate_persistable_output(&resolved, &factory)
+                .expect_err("private domain must not become VARBINARY");
+            assert_eq!(
+                error, "Object and Percentile result domains are unsupported for persisted schemas",
+                "{sql}"
+            );
+        }
+        let query =
+            parse_query("SELECT bitmap_to_binary(to_bitmap(id)) AS external FROM fact_east");
+        let (resolved, _, factory) =
+            crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
+        assert_eq!(resolved.output_columns[0].data_type, DataType::Binary);
+        validate_persistable_output(&resolved, &factory)
+            .expect("ordinary external Binary is not an opaque domain");
+    }
+
+    struct PersistenceDomainCatalog(ColumnDef);
+
+    impl PlannerTableProvider for PersistenceDomainCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<ResolvedAnalyzerTable, String> {
+            let planner = TableDef {
+                name: table.to_string(),
+                columns: vec![self.0.clone()],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: ScanSource::Sql(SqlScanSource::new(
+                    crate::compiler::mv_rewrite::test_target_binding(),
+                    SqlTableIdentity {
+                        catalog: catalog.unwrap_or("ice").to_string(),
+                        namespace: database.to_string(),
+                        table: table.to_string(),
+                    },
+                    SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
+                )),
+            };
+            Ok(ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
+        }
+    }
+
+    #[test]
+    fn m07_mv_persistence_checks_complete_declared_domain_and_actual_nested_markers() {
+        use arrow::datatypes::Field;
+        use novarocks_types::logical::{LogicalType, field_with_logical_type};
+        use novarocks_types::schema::SqlType;
+        use std::sync::Arc;
+
+        let list = |field| DataType::List(Arc::new(field));
+        let cases = [
+            (DataType::Binary, Some(SqlType::Object)),
+            (
+                list(Field::new("item", DataType::Binary, true)),
+                Some(SqlType::Array(Box::new(SqlType::Percentile))),
+            ),
+            (
+                list(field_with_logical_type(
+                    Field::new("item", DataType::Binary, true),
+                    LogicalType::Object,
+                )),
+                None,
+            ),
+            (
+                DataType::Struct(
+                    vec![Arc::new(field_with_logical_type(
+                        Field::new("state", DataType::Binary, true),
+                        LogicalType::Percentile,
+                    ))]
+                    .into(),
+                ),
+                None,
+            ),
+        ];
+        let query = parse_query("SELECT state AS renamed FROM source");
+        for (data_type, logical_type) in cases {
+            let catalog = PersistenceDomainCatalog(ColumnDef {
+                name: "state".into(),
+                data_type,
+                nullable: true,
+                write_default: None,
+                logical_type,
+            });
+            let (resolved, _, factory) = crate::analyzer::analyze(&query, &catalog, "sales")
+                .expect("source declaration must analyze");
+            assert_eq!(
+                validate_persistable_output(&resolved, &factory),
+                Err(
+                    "Object and Percentile result domains are unsupported for persisted schemas"
+                        .into()
+                )
+            );
+        }
+        for logical_type in [
+            None,
+            Some(SqlType::Binary),
+            Some(SqlType::Bitmap),
+            Some(SqlType::Hll),
+        ] {
+            let catalog = PersistenceDomainCatalog(ColumnDef {
+                name: "state".into(),
+                data_type: DataType::Binary,
+                nullable: true,
+                write_default: None,
+                logical_type,
+            });
+            let (resolved, _, factory) =
+                crate::analyzer::analyze(&query, &catalog, "sales").unwrap();
+            validate_persistable_output(&resolved, &factory)
+                .expect("existing domains retain their existing persistence policy");
+        }
     }
 
     fn observed_schema() -> SqlMvObservedSchemaFacts {

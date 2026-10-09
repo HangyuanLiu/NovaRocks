@@ -21,30 +21,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
+use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
 use crate::query_execution::service::QueryExecutionService;
-use novarocks_execution_contract::{MaxWait, ResultByteLimit};
 use novarocks_native_adapter::FrontendTaskTransportBudget;
-use novarocks_query_application::api::{QueryExecutionClient, QueryExecutionErrorKind};
+use novarocks_query_application::api::QueryExecutionClient;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, LogicalExecutionRowsConfig, LogicalExecutionSupervisor,
     LogicalExecutionSupervisorConfig, LogicalExecutionSupervisorShutdownError,
-    RootResultDecodeRuntime, RootResultDecodeRuntimeOwner,
 };
 use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_workload_control::{
-    CancellationReason, DeadlineExpiryHandle, LocalResourceAuthority, ResourceConfig,
-    RootAdmissionHandle, WorkloadConfig, WorkloadControl, WorkloadObservationHandle,
-    WorkloadShutdownError,
+    CancellationReason, DeadlineExpiryHandle, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
+    WorkloadObservationHandle, WorkloadShutdownError,
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
-use novarocks_native_trust::NativeTrust;
+use novarocks_native_trust::{NativeProcessIdentity, NativeTrust};
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
@@ -82,8 +80,6 @@ use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_RESULT_DECODE_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
-const DEFAULT_RESULT_DECODE_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 /// Cached planning workers retire after one minute without an admitted job.
 /// This is a reuse window, not a Frontend CPU or query-capacity limit.
 const DEFAULT_QUERY_CPU_IDLE_KEEPALIVE: Duration = Duration::from_secs(60);
@@ -92,14 +88,10 @@ const DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32
 const DEFAULT_RESULT_DELIVERY_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(30);
-const DEFAULT_RESULT_FETCH_MAX_WAIT: Duration = Duration::from_millis(200);
 const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
 const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
-const TEST_WORKLOAD_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const TEST_WORKLOAD_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
-const TEST_WORKLOAD_PER_SCOPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[cfg(test)]
 fn test_native_trust() -> Arc<NativeTrust> {
@@ -134,16 +126,31 @@ pub enum FrontendApplicationErrorKind {
     CoordinatorOpen,
     QueryCpuExecutorOpen,
     QueryBlockingExecutorOpen,
-    ResultDecodeRuntimeOpen,
+    InternalResultCpuOpen,
     WorkloadControlOpen,
     Server,
     Shutdown,
+}
+
+#[cfg(feature = "mem-1-m07-root-observation")]
+struct RootObservationIoSource(std::io::Error);
+#[cfg(feature = "mem-1-m07-root-observation")]
+impl fmt::Debug for RootObservationIoSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OriginalRootObservationIo { source_retained: true }")
+    }
 }
 
 #[derive(Debug)]
 pub struct FrontendApplicationError {
     kind: FrontendApplicationErrorKind,
     message: String,
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    root_observation_io: Option<Box<RootObservationIoSource>>,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    fixture_failures: [Option<
+        Box<novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixtureError>,
+    >; 4],
 }
 
 impl FrontendApplicationError {
@@ -151,12 +158,56 @@ impl FrontendApplicationError {
         Self {
             kind,
             message: error.to_string(),
+            #[cfg(feature = "mem-1-m07-root-observation")]
+            root_observation_io: None,
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            fixture_failures: std::array::from_fn(|_| None),
         }
     }
 
     /// Constructs a role-composition failure for the outer Server owner.
     pub fn server(error: impl fmt::Display) -> Self {
         Self::new(FrontendApplicationErrorKind::Server, error)
+    }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    pub(crate) fn server_fixture(
+        error: novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixtureError,
+    ) -> Self {
+        let mut result = Self::server(&error);
+        result.fixture_failures[0] = Some(Box::new(error));
+        result
+    }
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    pub(crate) fn server_root_observation(error: std::io::Error) -> Self {
+        let mut result = Self::server("root observation stdout IO failed");
+        result.root_observation_io = Some(Box::new(RootObservationIoSource(error)));
+        result
+    }
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-root-observation"
+    ))]
+    pub(crate) fn with_role_cleanup(mut self, cleanup: Self) -> Self {
+        self.message
+            .push_str(&format!("; cleanup failed: {cleanup}"));
+        #[cfg(feature = "mem-1-m07-root-observation")]
+        if let Some(source) = cleanup.root_observation_io {
+            // Only the one startup emission can supply this original IO source.
+            assert!(self.root_observation_io.is_none());
+            self.root_observation_io = Some(source);
+        }
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        for source in cleanup.fixture_failures.into_iter().flatten() {
+            // The fixture has exactly four possible verdict stages: control,
+            // socket cleanup, registry verification and original-owner finish.
+            let slot = self
+                .fixture_failures
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .expect("fixed MySQL fixture verdict stages");
+            *slot = Some(source);
+        }
+        self
     }
 
     /// Retains the first role failure while recording bounded cleanup failure.
@@ -177,7 +228,19 @@ impl fmt::Display for FrontendApplicationError {
     }
 }
 
-impl std::error::Error for FrontendApplicationError {}
+impl std::error::Error for FrontendApplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(feature = "mem-1-m07-root-observation")]
+        if let Some(error) = &self.root_observation_io {
+            return Some(&error.0);
+        }
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        if let Some(error) = self.fixture_failures.iter().flatten().next() {
+            return Some(error.as_ref());
+        }
+        None
+    }
+}
 
 /// Unique owner aggregate for the query-application runtime.
 ///
@@ -193,13 +256,17 @@ struct FrontendExecutionRuntimeOwner {
     deadline_supervisor: FrontendWorkloadDeadlineSupervisor,
     root_admission: RootAdmissionHandle,
     workload_observation: WorkloadObservationHandle,
-    resources: LocalResourceAuthority,
     query_cpu: QueryCpuExecutorOwner,
     query_cpu_executor: QueryCpuExecutor,
     query_blocking: QueryBlockingExecutorOwner,
     query_blocking_executor: QueryBlockingExecutor,
-    decode: RootResultDecodeRuntimeOwner,
-    decode_runtime: RootResultDecodeRuntime,
+    internal_result_cpu: InternalResultCpuOwner,
+    internal_result_cpu_runtime: InternalResultCpu,
+    /// The complete result-window profile, installed before readiness.
+    /// Statements take windows through admission; closing deliveries take
+    /// their separate positions here.
+    #[allow(dead_code, reason = "closing deliveries acquire through this handle")]
+    result_capacity: novarocks_workload_control::ResultCapacityHandle,
     terminal_error: Option<String>,
     shutdown_complete: bool,
 }
@@ -270,26 +337,30 @@ struct FrontendQueryRuntimeConfig {
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
     transport_budget: FrontendTaskTransportBudget,
-    result_fetch_byte_limit: ResultByteLimit,
     abort_capacity: NonZeroUsize,
 }
 
 impl FrontendExecutionRuntimeOwner {
     fn try_new(
         runtime: Handle,
+        frontend_process_id: FrontendProcessId,
         supervisor_config: LogicalExecutionSupervisorConfig,
         workload_config: WorkloadConfig,
-        resource_config: ResourceConfig,
         query_cpu_config: QueryCpuExecutorConfig,
         query_blocking_config: QueryBlockingExecutorConfig,
-        decode_worker_count: NonZeroUsize,
-        decode_queue_capacity: NonZeroUsize,
     ) -> Result<Self, FrontendApplicationError> {
-        let workload =
-            WorkloadControl::try_new_split(workload_config, resource_config).map_err(|error| {
+        let workload = WorkloadControl::try_new_counted(workload_config).map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::WorkloadControlOpen, error)
+        })?;
+        // The frozen result profile must cover computation admission; a
+        // concurrency limit beyond its client positions is refused here.
+        let result_capacity = workload
+            .owner
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .map_err(|error| {
                 FrontendApplicationError::new(
                     FrontendApplicationErrorKind::WorkloadControlOpen,
-                    error,
+                    format!("install result window capacity: {error}"),
                 )
             })?;
         let query_cpu = QueryCpuExecutorOwner::try_new(query_cpu_config).map_err(|error| {
@@ -304,16 +375,13 @@ impl FrontendExecutionRuntimeOwner {
                 )
             })?;
         let query_blocking_executor = query_blocking.executor();
-        let decode =
-            RootResultDecodeRuntimeOwner::try_new(decode_worker_count, decode_queue_capacity)
-                .map_err(|error| {
-                    FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::ResultDecodeRuntimeOpen,
-                        error,
-                    )
-                })?;
-        let decode_runtime = decode.runtime();
-        let frontend_process_id = FrontendProcessId::new_v7();
+        let internal_result_cpu = InternalResultCpuOwner::try_new().map_err(|error| {
+            FrontendApplicationError::new(
+                FrontendApplicationErrorKind::InternalResultCpuOpen,
+                error,
+            )
+        })?;
+        let internal_result_cpu_runtime = internal_result_cpu.runtime();
         let process_bytes = frontend_process_id.to_bytes();
         let namespace = QueryProcessNamespace::new(
             u64::from_be_bytes(process_bytes[..8].try_into().expect("UUID high half"))
@@ -333,7 +401,6 @@ impl FrontendExecutionRuntimeOwner {
         let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
             runtime.clone(),
             Arc::new(FrontendLogicalExecutionNativePort),
-            workload.resources.clone(),
             namespace,
             frontend_process_id,
             supervisor_config,
@@ -350,13 +417,13 @@ impl FrontendExecutionRuntimeOwner {
             deadline_supervisor,
             root_admission: workload.root_admission,
             workload_observation: workload.observation,
-            resources: workload.resources,
             query_cpu,
             query_cpu_executor,
             query_blocking,
             query_blocking_executor,
-            decode,
-            decode_runtime,
+            internal_result_cpu,
+            internal_result_cpu_runtime,
+            result_capacity,
             terminal_error: None,
             shutdown_complete: false,
         })
@@ -434,12 +501,7 @@ impl FrontendExecutionRuntimeOwner {
             return Err(error);
         }
 
-        if let Err(error) = self.decode.shutdown_until(deadline).await {
-            if error.kind() == QueryExecutionErrorKind::DeadlineExceeded {
-                return Err(error.to_string());
-            }
-            self.record_terminal_error(error.to_string());
-        }
+        self.internal_result_cpu.shutdown_until(deadline).await?;
 
         self.shutdown_complete = true;
         self.terminal_error.take().map_or(Ok(()), Err)
@@ -451,7 +513,7 @@ impl FrontendExecutionRuntimeOwner {
         self.supervisor.abandon_for_process_exit();
         self.query_cpu.request_shutdown_for_process_exit();
         self.query_blocking.request_shutdown_for_process_exit();
-        self.decode.request_shutdown_for_process_exit();
+        self.internal_result_cpu.request_shutdown_for_process_exit();
         self.workload.take();
         self.shutdown_complete = true;
     }
@@ -544,10 +606,6 @@ impl FrontendExecutionRuntimeOwner {
         self.workload_observation.clone()
     }
 
-    fn resources(&self) -> LocalResourceAuthority {
-        self.resources.clone()
-    }
-
     fn query_cpu_executor(&self) -> QueryCpuExecutor {
         self.query_cpu_executor.clone()
     }
@@ -556,8 +614,8 @@ impl FrontendExecutionRuntimeOwner {
         self.query_blocking_executor.clone()
     }
 
-    fn decode_runtime(&self) -> RootResultDecodeRuntime {
-        self.decode_runtime.clone()
+    fn internal_result_cpu(&self) -> InternalResultCpu {
+        self.internal_result_cpu_runtime.clone()
     }
 
     fn is_shutdown_complete(&self) -> bool {
@@ -712,9 +770,6 @@ impl Default for FrontendQueryControlTimeouts {
 pub struct FrontendLogicalExecutionRuntimeConfig {
     supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
-    resources: ResourceConfig,
-    decode_worker_count: NonZeroUsize,
-    decode_queue_capacity: NonZeroUsize,
     abort_effect_capacity: NonZeroUsize,
 }
 
@@ -722,17 +777,11 @@ impl FrontendLogicalExecutionRuntimeConfig {
     pub fn new(
         supervisor: LogicalExecutionSupervisorConfig,
         workload: WorkloadConfig,
-        resources: ResourceConfig,
-        decode_worker_count: NonZeroUsize,
-        decode_queue_capacity: NonZeroUsize,
         abort_effect_capacity: NonZeroUsize,
     ) -> Self {
         Self {
             supervisor,
             workload,
-            resources,
-            decode_worker_count,
-            decode_queue_capacity,
             abort_effect_capacity,
         }
     }
@@ -747,20 +796,9 @@ impl FrontendLogicalExecutionRuntimeConfig {
                     DEFAULT_RESULT_DELIVERY_CAPACITY,
                     DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS,
                     DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR,
-                    MaxWait::new(DEFAULT_RESULT_FETCH_MAX_WAIT)
-                        .expect("the test result fetch wait is representable"),
-                    ResultByteLimit::new(16 * 1024 * 1024)
-                        .expect("the test result fetch byte limit is nonzero"),
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: TEST_WORKLOAD_TOTAL_BYTES,
-                control_bytes: TEST_WORKLOAD_CONTROL_BYTES,
-                per_scope_bytes: TEST_WORKLOAD_PER_SCOPE_BYTES,
-            },
-            DEFAULT_RESULT_DECODE_WORKER_COUNT,
-            DEFAULT_RESULT_DECODE_QUEUE_CAPACITY,
             DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY,
         )
     }
@@ -794,17 +832,13 @@ pub struct FrontendExecutionConfig {
     coordination_budgets: CoordinationBudgets,
     transport_budget: FrontendTaskTransportBudget,
     /// Positive root-result payload credit placed on every Native fetch.
-    result_fetch_byte_limit: ResultByteLimit,
     /// Elastic process-wide workers for already-admitted CPU preparation.
     query_cpu_executor_config: QueryCpuExecutorConfig,
     /// Fixed process-wide workers for legacy synchronous query command edges.
     query_blocking_executor_config: QueryBlockingExecutorConfig,
     /// Fixed process-wide worker and waiting bounds for synchronous result decode.
-    result_decode_worker_count: NonZeroUsize,
-    result_decode_queue_capacity: NonZeroUsize,
     logical_execution_supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
-    workload_resources: ResourceConfig,
     logical_abort_effect_capacity: NonZeroUsize,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
@@ -844,8 +878,6 @@ impl FrontendExecutionConfig {
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
             coordination_budgets: CoordinationBudgets::DEFAULT,
             transport_budget: FrontendTaskTransportBudget::DEFAULT,
-            result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
-                .expect("the test result fetch byte limit is nonzero"),
             query_cpu_executor_config: QueryCpuExecutorConfig::with_idle_keepalive(
                 DEFAULT_QUERY_CPU_IDLE_KEEPALIVE,
             ),
@@ -853,11 +885,8 @@ impl FrontendExecutionConfig {
                 DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
                 DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY,
             ),
-            result_decode_worker_count: logical_runtime.decode_worker_count,
-            result_decode_queue_capacity: logical_runtime.decode_queue_capacity,
             logical_execution_supervisor: logical_runtime.supervisor,
             workload: logical_runtime.workload,
-            workload_resources: logical_runtime.resources,
             logical_abort_effect_capacity: logical_runtime.abort_effect_capacity,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
@@ -922,11 +951,6 @@ impl FrontendExecutionConfig {
     ) -> Self {
         self.coordination_budgets = coordination;
         self.transport_budget = transport;
-        self
-    }
-
-    pub fn with_result_fetch_byte_limit(mut self, limit: ResultByteLimit) -> Self {
-        self.result_fetch_byte_limit = limit;
         self
     }
 
@@ -1132,6 +1156,14 @@ impl FrontendApplicationHost {
                 error,
             ));
         }
+        // The role composition root mints one identity for both signed Native
+        // calls and logical execution. Transport subjects remain diagnostic.
+        let frontend_process_id = FrontendProcessId::new_v7();
+        native_trust
+            .bind_process_identity(NativeProcessIdentity::Frontend(frontend_process_id))
+            .map_err(|error| {
+                FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
+            })?;
         let query_runtime = data_runtime.clone();
         let data_runtime = FrontendDataRuntime::new_with_native_trust(
             data_runtime,
@@ -1144,13 +1176,11 @@ impl FrontendApplicationHost {
         })?;
         let execution_runtime_owner = FrontendExecutionRuntimeOwner::try_new(
             query_runtime,
+            frontend_process_id,
             execution.logical_execution_supervisor,
             execution.workload.clone(),
-            execution.workload_resources.clone(),
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
-            execution.result_decode_worker_count,
-            execution.result_decode_queue_capacity,
         )?;
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
@@ -1168,7 +1198,6 @@ impl FrontendApplicationHost {
                 split_initial_wait_cap: execution.connector_split_initial_dynamic_filter_wait_cap,
                 coordination_budgets: execution.coordination_budgets,
                 transport_budget: execution.transport_budget,
-                result_fetch_byte_limit: execution.result_fetch_byte_limit,
                 abort_capacity: execution.logical_abort_effect_capacity,
             },
             execution_runtime_owner,
@@ -1632,23 +1661,14 @@ impl FrontendApplicationHost {
                 config.split_initial_wait_cap,
                 config.coordination_budgets,
                 config.transport_budget.into_codec(),
-                config.result_fetch_byte_limit,
                 self.backend_topology_port(),
                 self.data_runtime.clone(),
                 self.execution_runtime_owner.lifecycle_diagnostics(),
+                self.execution_runtime_owner.internal_result_cpu(),
             )
             .map_err(FrontendApplicationError::server)?,
         );
         Ok(QueryExecutionService::new(coordinator))
-    }
-
-    /// Cloneable query handle for the one process-owned result decode runtime.
-    #[allow(
-        dead_code,
-        reason = "The application host retains this narrow handle for role integration."
-    )]
-    pub(crate) fn result_decode_runtime(&self) -> RootResultDecodeRuntime {
-        self.execution_runtime_owner.decode_runtime()
     }
 
     /// Cloneable submission handle for the process-owned CPU preparation pool.
@@ -1688,7 +1708,6 @@ impl FrontendApplicationHost {
             Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
             topology as novarocks_query_application::api::BackendProcessObservationService,
             self.data_runtime.clone(),
-            self.result_decode_runtime(),
             config.native_compatibility_id,
             config.runtime_filter_worker_count,
             config.task_update_retry_policy,
@@ -1722,14 +1741,6 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.workload_observation()
     }
 
-    #[allow(
-        dead_code,
-        reason = "Product integrations consume this local resource authority."
-    )]
-    pub(crate) fn workload_resources(&self) -> LocalResourceAuthority {
-        self.execution_runtime_owner.resources()
-    }
-
     pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
         Arc::clone(self.topology())
     }
@@ -1755,6 +1766,7 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             native_ingress,
+            self.data_runtime.transport_admission().clone(),
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -1778,6 +1790,7 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             native_ingress,
+            self.data_runtime.transport_admission().clone(),
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -1975,12 +1988,12 @@ mod tests {
     use novarocks_state_store_runtime::{
         StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
     };
-    use novarocks_workload_control::{ResourceConfig, WorkClass, WorkRequest, WorkloadConfig};
+    use novarocks_workload_control::{WorkClass, WorkRequest, WorkloadConfig};
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
         FrontendExecutionConfig, FrontendExecutionRuntimeOwner, LogicalExecutionRowsConfig,
-        LogicalExecutionSupervisorConfig, MaxWait, ResultByteLimit, test_native_trust,
+        LogicalExecutionSupervisorConfig, test_native_trust,
     };
     use novarocks_native_adapter::FrontendNativeTransport;
 
@@ -1995,6 +2008,7 @@ mod tests {
     async fn execution_runtime_shutdown_deadline_retains_the_same_workload_owner_for_retry() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -2003,23 +2017,14 @@ mod tests {
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
                     Duration::from_secs(1),
-                    MaxWait::new(Duration::from_millis(20)).unwrap(),
-                    ResultByteLimit::new(1024).unwrap(),
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),
-            NonZeroUsize::new(1).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
         )
         .expect("execution runtime opens");
         runtime.mark_ready().expect("workload authority ready");
@@ -2046,6 +2051,7 @@ mod tests {
     async fn execution_runtime_supervises_admitted_statement_deadlines() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -2054,23 +2060,14 @@ mod tests {
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
                     Duration::from_secs(1),
-                    MaxWait::new(Duration::from_millis(20)).unwrap(),
-                    ResultByteLimit::new(1024).unwrap(),
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),
-            NonZeroUsize::new(1).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
         )
         .expect("execution runtime opens");
         runtime.mark_ready().expect("workload authority ready");
@@ -2107,6 +2104,7 @@ mod tests {
     async fn execution_runtime_shutdown_consumes_terminal_control_notifications() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -2115,23 +2113,14 @@ mod tests {
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
                     Duration::from_secs(1),
-                    MaxWait::new(Duration::from_millis(20)).unwrap(),
-                    ResultByteLimit::new(1024).unwrap(),
                 ),
             ),
             WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),
-            NonZeroUsize::new(1).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
         )
         .expect("execution runtime opens");
         runtime.mark_ready().expect("workload authority ready");

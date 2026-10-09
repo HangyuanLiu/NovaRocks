@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bounded process executor for synchronous result decoding.
+//! Bounded process executor for synchronous application work.
 //!
 //! The executor knows nothing about Native packets or Arrow. A move-only job
-//! closure may capture both the raw packet and its result credit, keeping that
+//! closure retains its application input and capacity owner, keeping that
 //! ownership together from admission through synchronous execution.
 
 use std::{
@@ -33,14 +33,14 @@ use std::{
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
-type DecodeCall<R> = Box<dyn FnOnce() -> R + Send + 'static>;
+type WorkerCall<R> = Box<dyn FnOnce() -> R + Send + 'static>;
 
-/// One move-only synchronous decode operation.
-pub(crate) struct ResultDecodeJob<R> {
-    call: Option<DecodeCall<R>>,
+/// One move-only synchronous application operation.
+pub(crate) struct BoundedWorkerJob<R> {
+    call: Option<WorkerCall<R>>,
 }
 
-impl<R> ResultDecodeJob<R> {
+impl<R> BoundedWorkerJob<R> {
     pub(crate) fn new(call: impl FnOnce() -> R + Send + 'static) -> Self {
         Self {
             call: Some(Box::new(call)),
@@ -50,25 +50,25 @@ impl<R> ResultDecodeJob<R> {
     fn run(mut self) -> R {
         self.call
             .take()
-            .expect("a result decode job runs at most once")()
+            .expect("a bounded worker job runs at most once")()
     }
 }
 
-impl<R> fmt::Debug for ResultDecodeJob<R> {
+impl<R> fmt::Debug for BoundedWorkerJob<R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ResultDecodeJob")
+            .debug_struct("BoundedWorkerJob")
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResultDecodeExecutorConfig {
+pub(crate) struct BoundedWorkerConfig {
     worker_threads: NonZeroUsize,
     queue_capacity: NonZeroUsize,
 }
 
-impl ResultDecodeExecutorConfig {
+impl BoundedWorkerConfig {
     pub(crate) const fn new(worker_threads: NonZeroUsize, queue_capacity: NonZeroUsize) -> Self {
         Self {
             worker_threads,
@@ -86,78 +86,78 @@ impl ResultDecodeExecutorConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResultDecodeExecutorOpenError {
+pub(crate) struct BoundedWorkerOpenError {
     detail: Arc<str>,
 }
 
-impl fmt::Display for ResultDecodeExecutorOpenError {
+impl fmt::Display for BoundedWorkerOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.detail)
     }
 }
 
-impl std::error::Error for ResultDecodeExecutorOpenError {}
+impl std::error::Error for BoundedWorkerOpenError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResultDecodeWorkerError {
+pub(crate) enum BoundedWorkerError {
     Panicked,
     ExecutorClosed,
 }
 
-impl fmt::Display for ResultDecodeWorkerError {
+impl fmt::Display for BoundedWorkerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Panicked => "result decode worker panicked",
-            Self::ExecutorClosed => "result decode executor closed before completing the job",
+            Self::Panicked => "bounded worker worker panicked",
+            Self::ExecutorClosed => "bounded worker executor closed before completing the job",
         })
     }
 }
 
-impl std::error::Error for ResultDecodeWorkerError {}
+impl std::error::Error for BoundedWorkerError {}
 
 /// A refused submission returns the still-unexecuted move-only job.
-pub(crate) struct ResultDecodeSubmitError<R> {
-    job: ResultDecodeJob<R>,
+pub(crate) struct BoundedWorkerSubmitError<R> {
+    job: BoundedWorkerJob<R>,
 }
 
-impl<R> ResultDecodeSubmitError<R> {
-    pub(crate) fn into_job(self) -> ResultDecodeJob<R> {
+impl<R> BoundedWorkerSubmitError<R> {
+    pub(crate) fn into_job(self) -> BoundedWorkerJob<R> {
         self.job
     }
 }
 
-impl<R> fmt::Debug for ResultDecodeSubmitError<R> {
+impl<R> fmt::Debug for BoundedWorkerSubmitError<R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ResultDecodeSubmitError")
+            .debug_struct("BoundedWorkerSubmitError")
             .finish_non_exhaustive()
     }
 }
 
 /// Completion ownership is independent of job execution. Dropping this value
 /// never cancels a queued or running job.
-pub(crate) struct ResultDecodeReceipt<R> {
-    receiver: oneshot::Receiver<Result<R, ResultDecodeWorkerError>>,
+pub(crate) struct BoundedWorkerReceipt<R> {
+    receiver: oneshot::Receiver<Result<R, BoundedWorkerError>>,
 }
 
-impl<R> ResultDecodeReceipt<R> {
-    pub(crate) async fn complete(self) -> Result<R, ResultDecodeWorkerError> {
+impl<R> BoundedWorkerReceipt<R> {
+    pub(crate) async fn complete(self) -> Result<R, BoundedWorkerError> {
         self.receiver
             .await
-            .unwrap_or(Err(ResultDecodeWorkerError::ExecutorClosed))
+            .unwrap_or(Err(BoundedWorkerError::ExecutorClosed))
     }
 }
 
-impl<R> fmt::Debug for ResultDecodeReceipt<R> {
+impl<R> fmt::Debug for BoundedWorkerReceipt<R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ResultDecodeReceipt")
+            .debug_struct("BoundedWorkerReceipt")
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResultDecodeExecutorSnapshot {
+pub(crate) struct BoundedWorkerSnapshot {
     pub(crate) queued: usize,
     pub(crate) running: usize,
     pub(crate) worker_threads: usize,
@@ -165,8 +165,8 @@ pub(crate) struct ResultDecodeExecutorSnapshot {
 }
 
 struct QueuedJob<R> {
-    job: ResultDecodeJob<R>,
-    completion: oneshot::Sender<Result<R, ResultDecodeWorkerError>>,
+    job: BoundedWorkerJob<R>,
+    completion: oneshot::Sender<Result<R, BoundedWorkerError>>,
     queue_slot: OwnedSemaphorePermit,
 }
 
@@ -186,26 +186,26 @@ struct Shared<R> {
     queue_capacity: usize,
 }
 
-/// Unique process-lifetime owner of the result decode worker threads.
+/// Unique process-lifetime owner of the bounded worker worker threads.
 ///
-/// Query work receives only [`BoundedResultDecodeHandle`]. Keeping the worker
+/// Query work receives only [`BoundedWorkerHandle`]. Keeping the worker
 /// join handles here prevents a query-scoped handle drop from closing or
 /// joining the process executor.
-pub(crate) struct BoundedResultDecodeOwner<R> {
+pub(crate) struct BoundedWorkerOwner<R> {
     shared: Arc<Shared<R>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// Cloneable submission handle for the process-owned result decode executor.
+/// Cloneable submission handle for the process-owned bounded worker executor.
 ///
 /// This handle deliberately has no edge to the owner or its join handles.
 /// Dropping any or all handles therefore never closes the executor or blocks
 /// while worker threads converge.
-pub(crate) struct BoundedResultDecodeHandle<R> {
+pub(crate) struct BoundedWorkerHandle<R> {
     shared: Arc<Shared<R>>,
 }
 
-impl<R> Clone for BoundedResultDecodeHandle<R> {
+impl<R> Clone for BoundedWorkerHandle<R> {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
@@ -213,19 +213,17 @@ impl<R> Clone for BoundedResultDecodeHandle<R> {
     }
 }
 
-impl<R: Send + 'static> fmt::Debug for BoundedResultDecodeHandle<R> {
+impl<R: Send + 'static> fmt::Debug for BoundedWorkerHandle<R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("BoundedResultDecodeHandle")
+            .debug_struct("BoundedWorkerHandle")
             .field("snapshot", &self.snapshot())
             .finish()
     }
 }
 
-impl<R: Send + 'static> BoundedResultDecodeOwner<R> {
-    pub(crate) fn try_new(
-        config: ResultDecodeExecutorConfig,
-    ) -> Result<Self, ResultDecodeExecutorOpenError> {
+impl<R: Send + 'static> BoundedWorkerOwner<R> {
+    pub(crate) fn try_new(config: BoundedWorkerConfig) -> Result<Self, BoundedWorkerOpenError> {
         let worker_threads = config.worker_threads().get();
         let queue_capacity = config.queue_capacity().get();
         let shared = Arc::new(Shared {
@@ -245,7 +243,7 @@ impl<R: Send + 'static> BoundedResultDecodeOwner<R> {
         for index in 0..worker_threads {
             let worker_shared = Arc::clone(&shared);
             match thread::Builder::new()
-                .name(format!("result-decode-{index}"))
+                .name(format!("bounded-worker-{index}"))
                 // Decoding a result walks a nested value as deep as the type
                 // is, and these threads are workers like any other: the
                 // process sizes its runtime workers deliberately, and one
@@ -267,8 +265,8 @@ impl<R: Send + 'static> BoundedResultDecodeOwner<R> {
                     for worker in workers {
                         let _ = worker.join();
                     }
-                    return Err(ResultDecodeExecutorOpenError {
-                        detail: format!("spawn result decode worker failed: {error}").into(),
+                    return Err(BoundedWorkerOpenError {
+                        detail: format!("spawn bounded worker worker failed: {error}").into(),
                     });
                 }
             }
@@ -280,9 +278,9 @@ impl<R: Send + 'static> BoundedResultDecodeOwner<R> {
     }
 }
 
-impl<R> BoundedResultDecodeOwner<R> {
-    pub(crate) fn handle(&self) -> BoundedResultDecodeHandle<R> {
-        BoundedResultDecodeHandle {
+impl<R> BoundedWorkerOwner<R> {
+    pub(crate) fn handle(&self) -> BoundedWorkerHandle<R> {
+        BoundedWorkerHandle {
             shared: Arc::clone(&self.shared),
         }
     }
@@ -297,7 +295,7 @@ impl<R> BoundedResultDecodeOwner<R> {
     /// from a Tokio coordinator worker. Drop only closes admission and hands
     /// the workers to the process reaper; it never joins on the dropping
     /// thread.
-    pub(crate) fn shutdown_and_join(mut self) -> Result<(), ResultDecodeShutdownError> {
+    pub(crate) fn shutdown_and_join(mut self) -> Result<(), BoundedWorkerShutdownError> {
         self.shutdown_and_join_inner()
     }
 
@@ -310,7 +308,7 @@ impl<R> BoundedResultDecodeOwner<R> {
     pub(crate) async fn shutdown_until(
         &mut self,
         deadline: Instant,
-    ) -> Result<(), ResultDecodeShutdownError> {
+    ) -> Result<(), BoundedWorkerShutdownError> {
         close_queue(&self.shared);
         let wait = wait_for_worker_exit(&self.shared);
         if tokio::time::timeout_at(deadline.into(), wait)
@@ -323,17 +321,17 @@ impl<R> BoundedResultDecodeOwner<R> {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .live_workers;
-            return Err(ResultDecodeShutdownError::DeadlineExceeded { live_workers });
+            return Err(BoundedWorkerShutdownError::DeadlineExceeded { live_workers });
         }
         self.join_finished_workers()
     }
 
-    fn shutdown_and_join_inner(&mut self) -> Result<(), ResultDecodeShutdownError> {
+    fn shutdown_and_join_inner(&mut self) -> Result<(), BoundedWorkerShutdownError> {
         close_queue(&self.shared);
         self.join_finished_workers()
     }
 
-    fn join_finished_workers(&mut self) -> Result<(), ResultDecodeShutdownError> {
+    fn join_finished_workers(&mut self) -> Result<(), BoundedWorkerShutdownError> {
         let workers = self
             .workers
             .get_mut()
@@ -347,45 +345,45 @@ impl<R> BoundedResultDecodeOwner<R> {
         if panicked_workers == 0 {
             Ok(())
         } else {
-            Err(ResultDecodeShutdownError::WorkerPanicked { panicked_workers })
+            Err(BoundedWorkerShutdownError::WorkerPanicked { panicked_workers })
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResultDecodeShutdownError {
+pub(crate) enum BoundedWorkerShutdownError {
     DeadlineExceeded { live_workers: usize },
     WorkerPanicked { panicked_workers: usize },
 }
 
-impl fmt::Display for ResultDecodeShutdownError {
+impl fmt::Display for BoundedWorkerShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DeadlineExceeded { live_workers } => write!(
                 formatter,
-                "result decode shutdown deadline exceeded with {live_workers} live worker(s)"
+                "bounded worker shutdown deadline exceeded with {live_workers} live worker(s)"
             ),
             Self::WorkerPanicked { panicked_workers } => write!(
                 formatter,
-                "{panicked_workers} result decode worker(s) panicked during shutdown"
+                "{panicked_workers} bounded worker worker(s) panicked during shutdown"
             ),
         }
     }
 }
 
-impl std::error::Error for ResultDecodeShutdownError {}
+impl std::error::Error for BoundedWorkerShutdownError {}
 
-impl<R: Send + 'static> BoundedResultDecodeHandle<R> {
+impl<R: Send + 'static> BoundedWorkerHandle<R> {
     /// Waits only for bounded queue admission. Once this returns a receipt,
     /// the worker queue owns the job and dropping the caller future or receipt
     /// cannot cancel it.
     pub(crate) async fn submit(
         &self,
-        job: ResultDecodeJob<R>,
-    ) -> Result<ResultDecodeReceipt<R>, ResultDecodeSubmitError<R>> {
+        job: BoundedWorkerJob<R>,
+    ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
         let queue_slot = match Arc::clone(&self.shared.queue_slots).acquire_owned().await {
             Ok(slot) => slot,
-            Err(_) => return Err(ResultDecodeSubmitError { job }),
+            Err(_) => return Err(BoundedWorkerSubmitError { job }),
         };
         let (completion, receiver) = oneshot::channel();
         let queued = QueuedJob {
@@ -399,22 +397,22 @@ impl<R: Send + 'static> BoundedResultDecodeHandle<R> {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if state.closed {
-            return Err(ResultDecodeSubmitError { job: queued.job });
+            return Err(BoundedWorkerSubmitError { job: queued.job });
         }
         debug_assert!(state.jobs.len() < self.shared.queue_capacity);
         state.jobs.push_back(queued);
         drop(state);
         self.shared.ready.notify_one();
-        Ok(ResultDecodeReceipt { receiver })
+        Ok(BoundedWorkerReceipt { receiver })
     }
 
-    pub(crate) fn snapshot(&self) -> ResultDecodeExecutorSnapshot {
+    pub(crate) fn snapshot(&self) -> BoundedWorkerSnapshot {
         let state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        ResultDecodeExecutorSnapshot {
+        BoundedWorkerSnapshot {
             queued: state.jobs.len(),
             running: state.running,
             worker_threads: self.shared.worker_threads,
@@ -468,8 +466,8 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
         // Admission protects the bounded waiting queue only. Once this worker
         // owns the job, its fixed thread is the running bound.
         drop(queue_slot);
-        let outcome = catch_unwind(AssertUnwindSafe(|| job.run()))
-            .map_err(|_| ResultDecodeWorkerError::Panicked);
+        let outcome =
+            catch_unwind(AssertUnwindSafe(|| job.run())).map_err(|_| BoundedWorkerError::Panicked);
         if let Err(undelivered) = completion.send(outcome) {
             // The result is destroyed here, on the worker, before this job is
             // removed from the running set.
@@ -515,7 +513,7 @@ fn close_queue<R>(shared: &Shared<R>) {
     shared.ready.notify_all();
 }
 
-impl<R> Drop for BoundedResultDecodeOwner<R> {
+impl<R> Drop for BoundedWorkerOwner<R> {
     fn drop(&mut self) {
         close_queue(&self.shared);
         let workers = self
@@ -526,22 +524,22 @@ impl<R> Drop for BoundedResultDecodeOwner<R> {
     }
 }
 
-type ResultDecodeWorkerSet = Vec<JoinHandle<()>>;
+type WorkerSet = Vec<JoinHandle<()>>;
 
 /// The fallback path cannot report worker panics, but it must still keep thread
 /// convergence away from arbitrary async/runtime destruction paths. A single
 /// process reaper owns every fallback join. If the reaper itself cannot be
 /// created, dropping the join handles safely detaches the already-closing
 /// workers instead of blocking the owner destructor.
-fn reap_workers(workers: ResultDecodeWorkerSet) {
+fn reap_workers(workers: WorkerSet) {
     if workers.is_empty() {
         return;
     }
-    static REAPER: OnceLock<Option<mpsc::Sender<ResultDecodeWorkerSet>>> = OnceLock::new();
+    static REAPER: OnceLock<Option<mpsc::Sender<WorkerSet>>> = OnceLock::new();
     let reaper = REAPER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<ResultDecodeWorkerSet>();
+        let (sender, receiver) = mpsc::channel::<WorkerSet>();
         thread::Builder::new()
-            .name("result-decode-reaper".to_string())
+            .name("bounded-worker-reaper".to_string())
             .spawn(move || {
                 while let Ok(workers) = receiver.recv() {
                     for worker in workers {
@@ -587,8 +585,8 @@ mod tests {
     fn executor<R: Send + 'static>(
         workers: usize,
         queue: usize,
-    ) -> (BoundedResultDecodeOwner<R>, BoundedResultDecodeHandle<R>) {
-        let owner = BoundedResultDecodeOwner::try_new(ResultDecodeExecutorConfig::new(
+    ) -> (BoundedWorkerOwner<R>, BoundedWorkerHandle<R>) {
+        let owner = BoundedWorkerOwner::try_new(BoundedWorkerConfig::new(
             NonZeroUsize::new(workers).unwrap(),
             NonZeroUsize::new(queue).unwrap(),
         ))
@@ -597,11 +595,7 @@ mod tests {
         (owner, handle)
     }
 
-    async fn wait_for(
-        supervisor: &BoundedResultDecodeHandle<usize>,
-        queued: usize,
-        running: usize,
-    ) {
+    async fn wait_for(supervisor: &BoundedWorkerHandle<usize>, queued: usize, running: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let snapshot = supervisor.snapshot();
@@ -637,7 +631,7 @@ mod tests {
         let (release, released) = mpsc::channel();
         let (started, did_start) = mpsc::channel();
         let receipt = supervisor
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 started.send(()).unwrap();
                 released.recv().unwrap();
                 7
@@ -669,7 +663,7 @@ mod tests {
             let peak = Arc::clone(&peak);
             receipts.push(
                 supervisor
-                    .submit(ResultDecodeJob::new(move || {
+                    .submit(BoundedWorkerJob::new(move || {
                         let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(current, Ordering::SeqCst);
                         let (lock, ready) = &*gate;
@@ -689,7 +683,7 @@ mod tests {
         assert_eq!((snapshot.worker_threads, snapshot.queue_capacity), (2, 2));
         assert!(snapshot.running <= 2);
         assert!(snapshot.queued <= 2);
-        let mut fifth = Box::pin(supervisor.submit(ResultDecodeJob::new(|| 4)));
+        let mut fifth = Box::pin(supervisor.submit(BoundedWorkerJob::new(|| 4)));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut fifth)
                 .await
@@ -724,7 +718,7 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let running_gate = Arc::clone(&gate);
         let running = supervisor
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 let (lock, ready) = &*running_gate;
                 let mut open = lock.lock().unwrap();
                 while !*open {
@@ -735,13 +729,16 @@ mod tests {
             .await
             .unwrap();
         wait_for(&supervisor, 0, 1).await;
-        let queued = supervisor.submit(ResultDecodeJob::new(|| 2)).await.unwrap();
+        let queued = supervisor
+            .submit(BoundedWorkerJob::new(|| 2))
+            .await
+            .unwrap();
         wait_for(&supervisor, 1, 1).await;
         let (dropped, observed_drop) = mpsc::channel();
         let notice = DropNotice {
             dropped: Some(dropped),
         };
-        let mut waiting = Box::pin(supervisor.submit(ResultDecodeJob::new(move || {
+        let mut waiting = Box::pin(supervisor.submit(BoundedWorkerJob::new(move || {
             drop(notice);
             3
         })));
@@ -763,7 +760,7 @@ mod tests {
         assert_eq!(supervisor.snapshot().queued, 0);
         let replacement = tokio::time::timeout(
             Duration::from_secs(1),
-            supervisor.submit(ResultDecodeJob::new(|| 4)),
+            supervisor.submit(BoundedWorkerJob::new(|| 4)),
         )
         .await
         .expect("a cancelled waiter must not leak queue admission")
@@ -778,7 +775,7 @@ mod tests {
         let (started, did_start) = mpsc::channel();
         let (dropped, observed_drop) = mpsc::channel();
         let receipt = supervisor
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 started.send(std::thread::current().id()).unwrap();
                 released.recv().unwrap();
                 DropNotice {
@@ -800,7 +797,7 @@ mod tests {
         let (release, released) = mpsc::channel();
         let (started, did_start) = mpsc::channel();
         let running = handle
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 started.send(()).unwrap();
                 released.recv().unwrap();
                 1
@@ -815,7 +812,7 @@ mod tests {
         let replacement = owner.handle();
         let queued = tokio::time::timeout(
             Duration::from_secs(1),
-            replacement.submit(ResultDecodeJob::new(|| 2)),
+            replacement.submit(BoundedWorkerJob::new(|| 2)),
         )
         .await
         .expect("dropping query handles must leave process admission open")
@@ -833,7 +830,7 @@ mod tests {
         let (owner, handle) = executor::<usize>(1, 1);
         let captured = handle.clone();
         let receipt = handle
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 assert_eq!(captured.snapshot().worker_threads, 1);
                 drop(captured);
                 7
@@ -851,7 +848,7 @@ mod tests {
         let (release, released) = mpsc::channel();
         let (started, observed_start) = mpsc::channel();
         let running = handle
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 started.send(()).unwrap();
                 released.recv().unwrap();
                 1
@@ -859,7 +856,7 @@ mod tests {
             .await
             .unwrap();
         receive(&observed_start).await;
-        let queued = handle.submit(ResultDecodeJob::new(|| 2)).await.unwrap();
+        let queued = handle.submit(BoundedWorkerJob::new(|| 2)).await.unwrap();
         wait_for(&handle, 1, 1).await;
 
         let releaser = std::thread::spawn(move || {
@@ -870,16 +867,16 @@ mod tests {
         drop(owner);
         assert!(
             drop_started.elapsed() < Duration::from_millis(300),
-            "fallback owner Drop synchronously waited for a running decode job"
+            "fallback owner Drop synchronously waited for a running worker job"
         );
         assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
         assert_eq!(
             queued.complete().await,
-            Err(ResultDecodeWorkerError::ExecutorClosed)
+            Err(BoundedWorkerError::ExecutorClosed)
         );
         match tokio::time::timeout(
             Duration::from_secs(1),
-            handle.submit(ResultDecodeJob::new(|| 3)),
+            handle.submit(BoundedWorkerJob::new(|| 3)),
         )
         .await
         .expect("closed intake must reject without waiting")
@@ -892,12 +889,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_deadline_retains_the_same_decode_workers_for_retry() {
+    async fn shutdown_deadline_retains_the_same_workers_for_retry() {
         let (mut owner, handle) = executor::<usize>(1, 1);
         let (release, released) = mpsc::channel();
         let (started, observed_start) = mpsc::channel();
         let running = handle
-            .submit(ResultDecodeJob::new(move || {
+            .submit(BoundedWorkerJob::new(move || {
                 started.send(()).unwrap();
                 released.recv().unwrap();
                 1
@@ -908,10 +905,10 @@ mod tests {
 
         assert_eq!(
             owner.shutdown_until(Instant::now()).await,
-            Err(ResultDecodeShutdownError::DeadlineExceeded { live_workers: 1 })
+            Err(BoundedWorkerShutdownError::DeadlineExceeded { live_workers: 1 })
         );
-        match handle.submit(ResultDecodeJob::new(|| 2)).await {
-            Ok(_) => panic!("decode shutdown must keep intake closed across retry"),
+        match handle.submit(BoundedWorkerJob::new(|| 2)).await {
+            Ok(_) => panic!("worker shutdown must keep intake closed across retry"),
             Err(error) => drop(error.into_job()),
         }
 
@@ -935,7 +932,7 @@ mod tests {
         let (started, observed_start) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let running = runtime
-            .block_on(handle.submit(ResultDecodeJob::new(move || {
+            .block_on(handle.submit(BoundedWorkerJob::new(move || {
                 started.send(()).unwrap();
                 released.recv().unwrap();
                 drop(running_handle);
@@ -944,7 +941,7 @@ mod tests {
             .unwrap();
         observed_start.recv_timeout(Duration::from_secs(1)).unwrap();
         let queued = runtime
-            .block_on(handle.submit(ResultDecodeJob::new(move || {
+            .block_on(handle.submit(BoundedWorkerJob::new(move || {
                 drop(queued_handle);
                 2
             })))
@@ -974,7 +971,7 @@ mod tests {
             .unwrap();
         let (owner, supervisor) = executor::<usize>(1, 1);
         let receipt = runtime
-            .block_on(supervisor.submit(ResultDecodeJob::new(move || {
+            .block_on(supervisor.submit(BoundedWorkerJob::new(move || {
                 started.send(()).unwrap();
                 released.recv().unwrap();
                 resumed.send(()).unwrap();

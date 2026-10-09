@@ -433,7 +433,7 @@ impl TaskExecutionHost for FakeTaskHost {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
-    ) -> Result<PreparedTaskFacts, HostRejection> {
+    ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         self.ledger
             .installs_attempted
             .fetch_add(1, Ordering::SeqCst);
@@ -458,13 +458,14 @@ impl TaskExecutionHost for FakeTaskHost {
         self.ledger
             .receivers_installed
             .fetch_add(1, Ordering::SeqCst);
-        Ok(PreparedTaskFacts::new(
-            if plan.bytes().first() == Some(&STREAM_SINK) {
+        novarocks_worker::PreparedTaskInstallation::new(
+            PreparedTaskFacts::new(if plan.bytes().first() == Some(&STREAM_SINK) {
                 FragmentSinkKind::DataStream
             } else {
                 FragmentSinkKind::Result
-            },
-        ))
+            }),
+            None,
+        )
     }
 
     fn remove_receiver(&self, _descriptor: &TaskDescriptor) {

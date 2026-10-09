@@ -237,12 +237,11 @@ impl AnalyzerScope {
         col: &ColumnDef,
         id: ColumnId,
     ) {
-        self.factory.borrow_mut().set_logical_type(
-            id,
-            col.logical_type
-                .clone()
-                .filter(|logical| matches!(logical, novarocks_types::schema::SqlType::Json)),
-        );
+        // The catalog owns the complete declared domain, including opaque
+        // and nested types. Physical Binary/Utf8 cannot reconstruct it later.
+        self.factory
+            .borrow_mut()
+            .set_logical_type(id, col.logical_type.clone());
         let json_list = matches!(&col.data_type, DataType::List(item)
             if novarocks_types::logical::logical_type_of_field(item) == Some(novarocks_types::logical::LogicalType::Json))
             || matches!(&col.logical_type, Some(novarocks_types::schema::SqlType::Array(item)) if **item == novarocks_types::schema::SqlType::Json);

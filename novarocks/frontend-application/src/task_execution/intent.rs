@@ -128,25 +128,20 @@ impl OperationIntent {
     /// Lifecycle operations and `CancelTask` consume the process transport's
     /// control reserve even though they retain independent dispatcher lanes.
     /// Exact destination closes keep the Task's one-at-a-time Update lane.
+    pub(crate) fn native_method(&self) -> novarocks_proto_codec::native_rpc::NativeRpcMethod {
+        let only_close = match self {
+            Self::UpdateTask(request) => {
+                !request.domains().is_empty()
+                    && request.domains().iter().all(task_domain_requires_control)
+            }
+            _ => false,
+        };
+        novarocks_proto_codec::native_rpc::operation_method(self.shape(), only_close)
+    }
     pub(crate) fn requires_control_progress(&self) -> bool {
-        if let Self::UpdateTask(request) = self {
-            return !request.domains().is_empty()
-                && request.domains().iter().all(task_domain_requires_control);
-        }
-        match self.shape() {
-            OperationShape::AcquireQueryContextAdmissionTicket
-            | OperationShape::EstablishQueryContext
-            | OperationShape::AdvanceQueryContextDomain
-            | OperationShape::RenewQueryExecutionLease
-            | OperationShape::CancelTask
-            | OperationShape::QuiesceQueryContext
-            | OperationShape::AbortQueryContext
-            | OperationShape::ReleaseQueryContext => true,
-            OperationShape::CreateTask
-            | OperationShape::UpdateTask
-            | OperationShape::FetchTaskDynamicFilters
-            | OperationShape::GetFinalTaskInfo => false,
-        }
+        use novarocks_proto_codec::native_rpc::{FrontendNativeLane, NativeTrafficClass};
+        self.native_method().contract().traffic
+            == NativeTrafficClass::Frontend(FrontendNativeLane::LifecycleControl)
     }
 
     /// The backend process this request is addressed to.

@@ -56,20 +56,22 @@ from pathlib import Path
 PACKAGE_NAME = "novarocks-physical-plan"
 TYPE_CONTRACT = "novarocks-type-contract"
 CONNECTOR_CONTRACT = "novarocks-connector-contract"
+RESULT_CONTRACT = "novarocks-result-contract"
 
 # These are allowed direct internal dependencies, not required dependencies.
 # Removing one as the contract gets smaller remains legal.
-DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT})
+DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, RESULT_CONTRACT})
 DIRECT_PACKAGE_ALLOW_LIST = frozenset(
-    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT}
+    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, RESULT_CONTRACT}
 )
 
 # Dependency direction is part of the architecture. The type contract is the
 # lower-level vocabulary; the Connector contract may consume it, but neither
 # contract may acquire physical-plan or application authority.
 INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
-    TYPE_CONTRACT: frozenset({"arrow-schema"}),
+    TYPE_CONTRACT: frozenset({"arrow-schema", RESULT_CONTRACT}),
     CONNECTOR_CONTRACT: frozenset({"bytes", TYPE_CONTRACT}),
+    RESULT_CONTRACT: frozenset(),
 }
 
 # This vocabulary is used only for declared-edge diagnostics. Resolved closure
@@ -81,6 +83,7 @@ RESOLVED_PACKAGE_ALLOW_LIST = frozenset(
         "bytes",
         "novarocks-connector-contract",
         "novarocks-type-contract",
+        RESULT_CONTRACT,
     }
 )
 
@@ -369,6 +372,7 @@ def resolved_package_allow_list(graph):
     packages = [
         graph.workspace_package(TYPE_CONTRACT),
         graph.workspace_package(CONNECTOR_CONTRACT),
+        graph.workspace_package(RESULT_CONTRACT),
     ]
     packages.extend(
         package

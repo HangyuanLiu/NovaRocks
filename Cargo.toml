@@ -22,7 +22,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks-server", "novarocks/catalog-application", "novarocks/connector-contract", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend-application", "novarocks/fs", "novarocks/functions", "novarocks/local-program", "novarocks/memory", "novarocks/mv-application", "novarocks/mysql-adapter", "novarocks/native-adapter", "novarocks/native-trust", "novarocks/parser", "novarocks/physical-plan", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/state-store/runtime", "novarocks/state-store/sqlite", "novarocks/state-store/testkit", "novarocks/statistics-application", "novarocks/table-maintenance", "novarocks/task-codec", "novarocks/type-contract", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "tests/cluster-harness", "tests/datasketches-tck", "tests/sql/runner", "tests/system-test-runner", "tests/test-support", "tools", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest", "tools/memory-attribution-bench"]
+members = ["novarocks-server", "novarocks/catalog-application", "novarocks/connector-contract", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend-application", "novarocks/fs", "novarocks/functions", "novarocks/local-program", "novarocks/memory", "novarocks/mv-application", "novarocks/mysql-adapter", "novarocks/native-adapter", "novarocks/native-trust", "novarocks/parser", "novarocks/physical-plan", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/result-contract", "novarocks/result-render", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/state-store/runtime", "novarocks/state-store/sqlite", "novarocks/state-store/testkit", "novarocks/statistics-application", "novarocks/table-maintenance", "novarocks/task-codec", "novarocks/type-contract", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "tests/cluster-harness", "tests/datasketches-tck", "tests/sql/runner", "tests/system-test-runner", "tests/test-support", "tools", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest", "tools/memory-attribution-bench"]
 # Native development defaults to the server package.
 default-members = ["novarocks-server"]
 # Vendored upstream packages keep their own workspace and lock authority.
@@ -131,6 +131,8 @@ novarocks-plan-codec = { path = "novarocks/plan-codec", version = "0.1.0" }
 novarocks-proto-codec = { path = "novarocks/proto-codec", version = "0.1.0" }
 novarocks-proto-models = { path = "novarocks/proto-models", version = "0.1.0" }
 novarocks-query-application = { path = "novarocks/query-application", version = "0.1.0" }
+novarocks-result-contract = { path = "novarocks/result-contract", version = "0.1.0" }
+novarocks-result-render = { path = "novarocks/result-render", version = "0.1.0" }
 novarocks-secret = { path = "novarocks/secret", version = "0.1.0" }
 novarocks-server = { path = "novarocks-server", version = "0.1.0" }
 novarocks-spi = { path = "novarocks/spi", version = "0.1.0" }
@@ -180,6 +182,9 @@ codegen-units = 256
 # and OverwriteCommit (Plan Tasks 9 / 10) until upstream ships native RowDelta
 # and OverwriteFiles actions. See vendor/iceberg-0.9.0/PATCH.md for the diff.
 [patch.crates-io]
+# Only the entries below are allowed; none of them exists to meter allocations
+# inside a third-party crate. Design: ADR-0168
+# (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 iceberg = { path = "vendor/iceberg-0.9.0" }
 # Vendored to add Iceberg view REST endpoints (create/load/commit/drop/
 # exists/list) that upstream 0.9.0 does not implement. See

@@ -43,6 +43,55 @@ pub struct MvReadinessPort {
     handle: tokio::runtime::Handle,
 }
 
+pub(crate) struct MvLocalProjectionInventory {
+    inventory: novarocks_mv_application::readiness::MvBoundedProjectionInventory,
+    handle: tokio::runtime::Handle,
+}
+
+impl MvLocalProjectionInventory {
+    pub(crate) fn order_by_namespace_and_name(&mut self) {
+        self.inventory.order_by_namespace_and_name();
+    }
+
+    fn block_on<T>(
+        handle: &tokio::runtime::Handle,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| handle.block_on(future)),
+            Err(_) => handle.block_on(future),
+        }
+    }
+
+    pub(crate) fn next_ready(&mut self) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        Self::block_on(&self.handle, self.inventory.next_ready())
+    }
+
+    pub(crate) fn next_listable(
+        &mut self,
+    ) -> Result<Option<novarocks_mv_application::readiness::ListedMvProjection>, MvRepositoryError>
+    {
+        Self::block_on(&self.handle, self.inventory.next_listable())
+    }
+}
+
+fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjectionInventoryBound {
+    use novarocks_mv_application::repository::MvProjectionInventoryBound;
+    let bound = MvProjectionInventoryBound {
+        entries: novarocks_query_application::api::LocalResultBound::V1.rows,
+        snapshot_bytes: 16 * 1024 * 1024,
+        raw_page_bytes: 1024 * 1024,
+        single_name_bytes: 65_536,
+        continuation_token_bytes: 4096,
+        decode: novarocks_mv_application::persistence::validation::PersistenceDecodeBudget {
+            max_document_bytes: 1024 * 1024,
+            max_working_set_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        },
+    };
+    bound
+}
+
 /// Read-only inventory for query-local MV candidate discovery.
 ///
 /// A query freezes and validates every returned lake publication before it can
@@ -179,6 +228,19 @@ impl MvReadinessPort {
         )
     }
 
+    /// Local-source profile: one finite locator snapshot and one decoded
+    /// page. Planning/background callers keep their own inventory contract.
+    pub(crate) fn local_projection_inventory(
+        &self,
+    ) -> Result<MvLocalProjectionInventory, MvRepositoryError> {
+        let bound = local_inventory_bound();
+        let inventory = self.block_on(self.service.bounded_projection_inventory(bound))?;
+        Ok(MvLocalProjectionInventory {
+            inventory,
+            handle: self.handle.clone(),
+        })
+    }
+
     /// Enumerate only projections whose current-process readiness permits
     /// consumption.  A catalog/package observation failure therefore removes
     /// exactly that target from SHOW, rewrite, scheduler and maintenance
@@ -187,15 +249,6 @@ impl MvReadinessPort {
         &self,
     ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
         self.block_on(self.service.list_ready_projections())
-    }
-
-    /// Everything the inventory shows, including the targets this process may
-    /// only read.
-    pub(crate) fn list_listable_projections(
-        &self,
-    ) -> Result<Vec<novarocks_mv_application::readiness::ListedMvProjection>, MvRepositoryError>
-    {
-        self.block_on(self.service.list_listable_projections())
     }
 
     /// Dependency reads are tied to a ready downstream projection.  Callers
@@ -208,6 +261,22 @@ impl MvReadinessPort {
         self.block_on(
             self.service
                 .list_ready_dependencies_by_downstream(projection),
+        )
+    }
+
+    pub(crate) fn list_local_dependencies_by_downstream(
+        &self,
+        projection: &LoadedMvProjection,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        use novarocks_mv_application::repository::MvDependencyReadBound;
+        let bound = MvDependencyReadBound {
+            inventory: local_inventory_bound(),
+            entries: 4096,
+            collection_bytes: 4 * 1024 * 1024,
+        };
+        self.block_on(
+            self.service
+                .list_ready_dependencies_by_downstream_bounded(projection, bound),
         )
     }
 

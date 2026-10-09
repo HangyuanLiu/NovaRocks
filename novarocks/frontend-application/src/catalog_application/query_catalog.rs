@@ -39,6 +39,7 @@ use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 mod registry;
 mod schema_cache;
 mod service;
+mod variant_identity;
 
 use registry::{Catalog, CatalogRegistry};
 use schema_cache::SchemaCache;
@@ -261,6 +262,12 @@ pub fn connector_table_materialization_from_metadata(
     let mut row_lineage_metadata_columns = Vec::new();
     for (ordinal, field) in metadata.schema.fields().iter().enumerate() {
         let fact = metadata.planning_facts.column_facts().get(ordinal);
+        let variant_identity = variant_identity::project_column(
+            &metadata.definition_facts,
+            ordinal,
+            field,
+            fact.map(|fact| fact.semantic_kind()).unwrap_or_default(),
+        )?;
         let logical_type = match fact.map(|fact| fact.semantic_kind()) {
             Some(ConnectorTableColumnSemanticKind::Bitmap) => {
                 Some(novarocks_types::schema::SqlType::Bitmap)
@@ -268,7 +275,7 @@ pub fn connector_table_materialization_from_metadata(
             Some(ConnectorTableColumnSemanticKind::Hll) => {
                 Some(novarocks_types::schema::SqlType::Hll)
             }
-            _ => None,
+            _ => variant_identity,
         };
         let column = novarocks_types::schema::ColumnDef {
             name: field.name().to_string(),

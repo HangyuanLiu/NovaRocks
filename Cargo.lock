@@ -3639,14 +3639,23 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
+ "bytes",
+ "h2",
  "hmac",
+ "http",
  "libc",
  "mysql",
+ "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-native-trust",
+ "novarocks-proto-codec",
+ "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-secret",
+ "novarocks-task-codec",
  "novarocks-test-support",
  "novarocks-types",
+ "prost 0.13.5",
  "rcgen",
  "reqwest",
  "serde",
@@ -3687,7 +3696,9 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
+ "faststr",
  "futures",
+ "hive_metastore",
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
@@ -3823,6 +3834,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-local-program",
  "novarocks-memory",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-type-contract",
@@ -3853,6 +3865,7 @@ name = "novarocks-execution-contract"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "novarocks-result-contract",
  "novarocks-types",
  "uuid",
 ]
@@ -3868,6 +3881,7 @@ dependencies = [
 name = "novarocks-frontend-application"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2",
  "anyhow",
  "apache-avro",
  "arrow",
@@ -3877,6 +3891,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hashbrown 0.14.5",
  "hex",
  "novarocks-catalog-application",
  "novarocks-connector-starrocks",
@@ -3896,6 +3911,8 @@ dependencies = [
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-query-application",
+ "novarocks-result-contract",
+ "novarocks-result-render",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
@@ -3938,6 +3955,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "futures",
+ "http",
  "libc",
  "novarocks-secret",
  "novarocks-spi",
@@ -3974,6 +3992,7 @@ dependencies = [
  "novarocks-connector-contract",
  "novarocks-execution-contract",
  "novarocks-functions",
+ "novarocks-result-contract",
  "novarocks-type-contract",
  "novarocks-types",
  "serde_json",
@@ -4041,16 +4060,19 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
- "chrono",
  "libc",
  "mysql_common 0.32.4",
+ "novarocks-execution-contract",
  "novarocks-parser",
  "novarocks-query-application",
+ "novarocks-result-contract",
+ "novarocks-result-render",
  "novarocks-sql",
  "novarocks-types",
  "novarocks-user-error",
  "novarocks-workload-control",
  "opensrv-mysql",
+ "sha2",
  "tokio",
  "tracing",
 ]
@@ -4067,6 +4089,7 @@ dependencies = [
  "h2",
  "hyper",
  "hyper-util",
+ "libc",
  "novarocks-connector-contract",
  "novarocks-execution",
  "novarocks-execution-contract",
@@ -4079,6 +4102,8 @@ dependencies = [
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
+ "novarocks-result-render",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
@@ -4141,6 +4166,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-schema",
  "novarocks-connector-contract",
+ "novarocks-result-contract",
  "novarocks-type-contract",
 ]
 
@@ -4156,6 +4182,7 @@ dependencies = [
  "novarocks-physical-plan",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-type-contract",
  "novarocks-types",
@@ -4171,6 +4198,7 @@ dependencies = [
  "bytes",
  "novarocks-execution-contract",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-types",
  "once_cell",
@@ -4202,6 +4230,8 @@ dependencies = [
  "novarocks-execution-contract",
  "novarocks-parser",
  "novarocks-physical-plan",
+ "novarocks-result-contract",
+ "novarocks-result-render",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
@@ -4211,6 +4241,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "novarocks-result-contract"
+version = "0.1.0"
+
+[[package]]
+name = "novarocks-result-render"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "chrono",
+ "novarocks-result-contract",
+ "novarocks-type-contract",
+ "novarocks-types",
 ]
 
 [[package]]
@@ -4258,6 +4303,7 @@ dependencies = [
  "novarocks-worker",
  "novarocks-workload-control",
  "serde",
+ "serde_json",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -4299,6 +4345,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-parser",
  "novarocks-physical-plan",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-type-contract",
  "novarocks-types",
@@ -4456,11 +4503,15 @@ dependencies = [
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
  "novarocks-execution",
+ "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-native-trust",
+ "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-secret",
+ "novarocks-task-codec",
  "novarocks-types",
  "novarocks-version",
  "prost 0.13.5",
@@ -4468,6 +4519,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tonic",
 ]
@@ -4483,6 +4535,7 @@ dependencies = [
  "novarocks-state-store-api",
  "novarocks-state-store-runtime",
  "novarocks-state-store-testkit",
+ "novarocks-workload-control",
  "serde",
  "serde_json",
  "tokio",
@@ -4493,9 +4546,11 @@ dependencies = [
 name = "novarocks-task-codec"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "novarocks-execution-contract",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-types",
  "prost 0.13.5",
@@ -4530,6 +4585,7 @@ name = "novarocks-type-contract"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "novarocks-result-contract",
 ]
 
 [[package]]
@@ -4576,6 +4632,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-memory",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-types",
  "sha2",

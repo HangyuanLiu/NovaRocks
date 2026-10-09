@@ -705,6 +705,7 @@ pub(crate) struct SqlAnalysisOutput {
     reason = "Optimizer metadata remains part of the compiler terminal until the lifecycle handoff consumes it."
 )]
 pub(crate) struct SqlOptimizedOutput {
+    pub(crate) root_semantics: root_output::RootOutputSemantics,
     pub(crate) optimized_tree: crate::optimizer::OptimizedOperatorNode,
     pub(crate) function_catalog: Arc<dyn SqlFunctionCatalog>,
     pub(crate) statistics: SqlStatisticsPlan,
@@ -783,13 +784,14 @@ pub fn analyze_mv_refresh_input(
     )?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
         .map_err(|error| error.to_string())?;
-    let (resolved, _, _) = crate::analyzer::analyze_with_function_catalog(
+    let (resolved, _, factory) = crate::analyzer::analyze_with_function_catalog(
         &query,
         catalog.planner_table_provider(),
         &current_database,
         functions,
     )
     .map_err(|error| error.to_string())?;
+    crate::planning::mv::validate_persistable_output(&resolved, &factory)?;
     Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
 }
 
@@ -1219,6 +1221,12 @@ impl SqlCompiler {
         } = request.analyzed;
         let control = request.control;
         control.check()?;
+        let root_semantics = root_output::RootOutputSemantics::capture(
+            &crate::planner::plan_output_columns(&logical_plan)
+                .map_err(SqlCompileError::Compilation)?,
+            &factory,
+        )
+        .map_err(SqlCompileError::Compilation)?;
         let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
         let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical_plan,
@@ -1273,7 +1281,11 @@ impl SqlCompiler {
         .map_err(SqlCompileError::Compilation)?;
         control.check()?;
 
+        root_semantics
+            .domains(&optimized_tree.output_columns)
+            .map_err(SqlCompileError::Compilation)?;
         Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
+            root_semantics,
             optimized_tree,
             function_catalog,
             statistics,
@@ -2615,5 +2627,9 @@ mod completion;
 mod completion_catalog;
 mod completion_driver;
 mod completion_predicate;
+pub(crate) mod root_output;
+mod root_render_type;
+mod root_scalar_type;
 pub use completion::*;
+pub use root_render_type::client_render_schema;
 pub(crate) mod mv_rewrite;

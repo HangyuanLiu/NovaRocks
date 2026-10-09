@@ -30,6 +30,7 @@ import "catalog.proto";
 import "connector_read.proto";
 import "filter.proto";
 import "plan.proto";
+import "result.proto";
 
 // FE<->BE control + data-plane RPC surface. One service, all cluster-internal
 // traffic. Server: novarocks/native-adapter/src/native_server.rs. Clients: the
@@ -83,6 +84,10 @@ service NovaRocksGrpc {
       returns (GetFinalTaskInfoResponse);
   // Root result poll, fenced against an exact task and backend process.
   rpc FetchTaskResult(FetchTaskResultRequest) returns (FetchResultResponse);
+  // M07 context-owned bounded root read on the ResultData lane. One RPC per
+  // root stream in flight; served by the Backend's root reader, never by a
+  // decoded Arrow packet path.
+  rpc FetchRootResult(FetchRootResultRequest) returns (FetchRootResultResponse);
 }
 
 // Immutable identity for one physical execution attempt of a logical query.
@@ -110,6 +115,93 @@ enum BackendReportedState {
   BACKEND_REPORTED_STATE_DRAINING = 2;
 }
 
+message NativeResultSupportGeometry {
+  uint64 frontend_client_compute_positions = 1;
+  uint64 frontend_short_tail_positions = 2;
+  uint64 frontend_client_window_positions = 3;
+  uint64 frontend_closing_positions = 4;
+  uint64 frontend_ordinary_connections = 5;
+  uint64 frontend_control_connections = 6;
+  uint64 frontend_local_positions = 7;
+  uint64 frontend_internal_positions = 8;
+  uint64 frontend_supported_cancel_burst = 9;
+  uint64 frontend_sustained_cancels_per_second = 10;
+  uint64 transport_authenticated_live_frontends_per_backend = 11;
+  uint64 transport_worst_case_roots_per_frontend_per_backend = 12;
+  uint64 transport_connections_per_frontend_backend_result = 13;
+  uint64 transport_connections_per_frontend_backend_observation = 14;
+  uint64 transport_connections_per_frontend_backend_submission = 15;
+  uint64 transport_connections_per_frontend_backend_lifecycle_control = 16;
+  uint64 transport_streams_per_connection = 17;
+  uint64 transport_tonic_pending_per_connection = 18;
+  uint64 transport_h2_frame_bytes = 19;
+  uint64 transport_h2_header_bytes = 20;
+  uint64 transport_h2_send_buffer_bytes = 21;
+  bool transport_h2_adaptive_window = 22;
+  uint64 transport_connect_deadline_ms = 23;
+  uint64 transport_fetch_deadline_ms = 24;
+  uint64 transport_short_tail_exit_deadline_ms = 25;
+  uint64 transport_handshake_deadline_ms = 26;
+  uint64 transport_maximum_live_backends = 27;
+  uint64 transport_h2_connection_receive_window_bytes = 28;
+  uint64 transport_h2_stream_receive_window_bytes = 29;
+  uint64 transport_h2_pending_resets = 30;
+  uint64 transport_connection_all_independent_backings_bytes = 31;
+  uint64 transport_stream_bookkeeping_bytes = 32;
+  uint64 transport_idle_decoder_bytes = 33;
+  uint64 transport_header_raw_and_expanded_bytes = 34;
+  uint64 transport_nonroot_producer_positions = 35;
+  uint64 transport_nonroot_encode_positions = 36;
+  uint64 transport_nonroot_decode_positions = 37;
+  uint64 transport_nonroot_producer_expanded_bytes = 38;
+  uint64 transport_nonroot_wire_actual_backing_bytes = 39;
+  uint64 transport_nonroot_decoded_expanded_bytes = 40;
+  uint64 transport_nonroot_wire_logical_bytes = 41;
+  bool transport_nonroot_compression = 42;
+  uint64 transport_frontend_native_additional_bytes = 43;
+  uint64 transport_data_handshake_positions = 44;
+  uint64 transport_control_handshake_positions = 45;
+  uint64 transport_exchange_connections_per_peer = 46;
+  uint64 transport_runtime_filter_connections_per_peer = 47;
+  uint64 transport_exchange_inflight_per_peer = 48;
+  uint64 transport_exchange_short_tails_per_peer = 49;
+  uint64 transport_runtime_filter_inflight_per_peer = 50;
+  uint64 transport_runtime_filter_short_tails_per_peer = 51;
+  uint64 root_joint_retained_bytes_per_root = 52;
+  uint64 root_joint_retained_bytes_per_process = 53;
+  uint64 root_maximum_root_drivers = 54;
+  uint64 root_shared_input_positions = 55;
+  uint64 root_shared_encoding_cursors = 56;
+  uint64 root_original_input_backing_capacity_bytes = 57;
+  uint64 root_additional_hydrate_backing_capacity_bytes = 58;
+  uint64 root_scratch_capacity_bytes = 59;
+  uint64 root_small_row_staging_bytes = 60;
+  uint64 root_active_segment_positions = 61;
+  uint64 root_queued_segment_positions = 62;
+  uint64 root_terminal_positions = 63;
+  uint64 root_segment_backing_capacity_bytes = 64;
+  uint64 root_live_send_holders = 65;
+  uint64 root_independent_payload_copies_per_send = 66;
+  uint64 root_fixed_schema_cursor_driver_capacity_bytes = 67;
+  uint64 root_actual_exit_deadline_ms = 68;
+  uint64 root_retired_segment_tail_positions = 69;
+  uint64 frontend_window_all_objects_bytes = 70;
+  uint64 frontend_closing_all_objects_bytes = 71;
+  uint64 frontend_minimum_open_file_limit = 72;
+  uint64 backend_minimum_open_file_limit = 73;
+  uint64 transport_connecting_positions_per_lane = 74;
+  uint64 transport_closing_positions_per_lane = 75;
+  uint64 transport_exchange_connecting_positions_per_peer = 76;
+  uint64 transport_exchange_closing_positions_per_peer = 77;
+  uint64 transport_runtime_filter_connecting_positions_per_peer = 78;
+  uint64 transport_runtime_filter_closing_positions_per_peer = 79;
+}
+message BoundedRootSupport {
+  QueryControlEndpoint control_endpoint = 1;
+  uint32 profile_id = 2;
+  NativeResultSupportGeometry geometry = 3;
+}
+
 message BackendProcessDescriptor {
   BackendProcessId process_id = 1;
   QueryControlEndpoint endpoint = 2;
@@ -118,6 +210,10 @@ message BackendProcessDescriptor {
   NativeCompatibilityId native_compatibility_id = 5;
   // Exact immutable per-Context preparation capacity; missing or zero is invalid.
   uint64 preparing_positions = 6;
+  // Absence declares no bounded-root capability; it never implies a default.
+  BoundedRootSupport bounded_root_support = 7;
+  // Mandatory independent lifecycle/control endpoint, even without root support.
+  QueryControlEndpoint control_endpoint = 8;
 }
 
 message AnnounceBackendRequest {
@@ -970,6 +1066,12 @@ message ApplyTaskOperationsRequest {
 
 // Only bounded control mutations may use the small Native method.
 // Each item keeps its own operation identity and relative wait budget.
+// Narrow projection of the original UpdateTask operation. The operation
+// envelope and task update sequencing remain unchanged.
+message CloseExchangeDestinationsRequest {
+  TaskIdentity identity = 1;
+  repeated CloseExchangeDestinationDomain destinations = 2; // 1..=256
+}
 message TaskControlOperation {
   TaskOperationEnvelope envelope = 1;
   oneof control {
@@ -978,6 +1080,7 @@ message TaskControlOperation {
     AbortQueryContextRequest abort_query_context = 4;
     ReleaseQueryContextRequest release_query_context = 5;
     QuiesceQueryContextRequest quiesce_query_context = 6;
+    CloseExchangeDestinationsRequest close_exchange_destinations = 7;
   }
 }
 
@@ -1474,4 +1577,29 @@ message FetchTaskResultRequest {
   // caps this below the process-wide gRPC decode limit so the response
   // envelope cannot make a legal payload exceed that transport limit.
   uint64 max_result_bytes = 4;
+}
+
+// M07 context-owned root read. One RPC in flight; absent wanted_sequence is
+// ACK-only. consumed_sequence is independent of wanted_sequence.
+message FetchRootResultRequest {
+  TaskIdentity root_task = 1;
+  uint32 profile_id = 2;
+  novarocks.result.RootOutputKind output_kind = 3;
+  optional uint64 wanted_sequence = 4;
+  uint64 consumed_sequence = 5;
+  uint64 max_wait_millis = 6;
+}
+message FetchRootResultResponse {
+  TaskIdentity root_task = 1;
+  uint32 profile_id = 2;
+  novarocks.result.RootOutputKind output_kind = 3;
+  uint64 accepted_consumed_sequence = 4;
+  oneof outcome {
+    bool ack_only = 5;
+    bool not_ready = 6;
+    bool retired = 7;
+    bool await_terminal_control = 8;
+    novarocks.result.RootData data = 9;
+    novarocks.result.RootEnd end = 10;
+  }
 }

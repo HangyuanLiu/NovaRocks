@@ -216,7 +216,9 @@ fn static_sink_targets(kind: &plan::data_sink::Kind) -> Box<[StaticSinkTarget]> 
         target_exchange_node_id,
     };
     match kind {
-        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Box::default(),
+        plan::data_sink::Kind::Result(_)
+        | plan::data_sink::Kind::RootResult(_)
+        | plan::data_sink::Kind::Noop(_) => Box::default(),
         plan::data_sink::Kind::DataStream(stream) => {
             Box::new([target(stream.target_fragment_id, stream.dest_node_id)])
         }

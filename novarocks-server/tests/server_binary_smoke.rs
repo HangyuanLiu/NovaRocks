@@ -74,11 +74,13 @@ struct ConfigPair {
     fe_grpc_port: u16,
     be_http_port: u16,
     be_grpc_port: u16,
+    be_control_grpc_port: u16,
     fe_mysql: Option<ReservedTcpPort>,
     fe_http: Option<ReservedTcpPort>,
     fe_grpc: Option<ReservedTcpPort>,
     be_http: Option<ReservedTcpPort>,
     be_grpc: Option<ReservedTcpPort>,
+    be_control_grpc: Option<ReservedTcpPort>,
     lifecycle_fault_dir: PathBuf,
 }
 
@@ -90,11 +92,13 @@ impl ConfigPair {
         let fe_grpc = reserve_port();
         let be_http = reserve_port();
         let be_grpc = reserve_port();
+        let be_control_grpc = reserve_port();
         let fe_mysql_port = fe_mysql.port();
         let fe_http_port = fe_http.port();
         let fe_grpc_port = fe_grpc.port();
         let be_http_port = be_http.port();
         let be_grpc_port = be_grpc.port();
+        let be_control_grpc_port = be_control_grpc.port();
         let state_store = runtime.path().join("frontend-state.sqlite");
         let log_dir = runtime.path().join("logs");
         let lifecycle_fault_dir = runtime.path().join("query-lifecycle-faults");
@@ -152,6 +156,7 @@ shared_secret = "0123456789abcdef0123456789abcdef"
 host = "127.0.0.1"
 http_port = {be_http_port}
 grpc_port = {be_grpc_port}
+control_grpc_port = {be_control_grpc_port}
 
 [cluster]
 role = "be"
@@ -169,11 +174,13 @@ frontend_endpoint = "127.0.0.1:{fe_grpc_port}"
             fe_grpc_port,
             be_http_port,
             be_grpc_port,
+            be_control_grpc_port,
             fe_mysql: Some(fe_mysql),
             fe_http: Some(fe_http),
             fe_grpc: Some(fe_grpc),
             be_http: Some(be_http),
             be_grpc: Some(be_grpc),
+            be_control_grpc: Some(be_control_grpc),
             lifecycle_fault_dir,
         }
     }
@@ -181,6 +188,7 @@ frontend_endpoint = "127.0.0.1:{fe_grpc_port}"
     fn release_be(&mut self) {
         drop(self.be_http.take());
         drop(self.be_grpc.take());
+        drop(self.be_control_grpc.take());
     }
 
     fn release_fe(&mut self) {
@@ -338,6 +346,7 @@ fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool)
 
     assert_native_rejects_management(pair.fe_grpc_port, "/metrics");
     assert_native_rejects_management(pair.be_grpc_port, "/metrics");
+    assert_native_rejects_management(pair.be_control_grpc_port, "/metrics");
     assert_native_rejects_management(pair.fe_grpc_port, LIFECYCLE_DEBUG_PATH);
 
     let fe_metrics = scrape_metrics(pair.fe_http_port);
@@ -447,6 +456,7 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
         pair.fe_grpc_port,
         pair.be_http_port,
         pair.be_grpc_port,
+        pair.be_control_grpc_port,
     ] {
         let rebound = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
             panic!("port {port} must be reusable after parity smoke: {error}")
@@ -563,6 +573,7 @@ shared_secret = "0123456789abcdef0123456789abcdef"
 host = "127.0.0.1"
 http_port = {}
 grpc_port = {conflict_port}
+control_grpc_port = {}
 
 [cluster]
 role = "be"
@@ -570,6 +581,7 @@ frontend_endpoint = "127.0.0.1:{}"
 "#,
             log_dir.display(),
             pair.be_http_port,
+            pair.be_control_grpc_port,
             pair.fe_grpc_port,
         ),
     );
@@ -638,4 +650,80 @@ path = "{}"
     let rebound = TcpListener::bind(("127.0.0.1", conflict_port))
         .expect("preflight must not start conflicting native listener");
     drop(rebound);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn insufficient_native_fd_baseline_refuses_before_role_startup_side_effects() {
+    use std::os::unix::process::CommandExt;
+
+    let _lock = lock_server_binary_smoke();
+    let mut pair = ConfigPair::new();
+    pair.release_all();
+    let mut parent_limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit writes one valid rlimit on success.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, parent_limits.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: the successful call initialized both members.
+    let parent_limits = unsafe { parent_limits.assume_init() };
+    for (role, config, threshold) in [
+        ("be", pair.be_config.path(), 1024_u64),
+        ("fe", pair.fe_config.path(), 2048_u64),
+    ] {
+        let child_limits = libc::rlimit {
+            rlim_cur: (threshold - 1).min(parent_limits.rlim_cur),
+            rlim_max: parent_limits.rlim_max,
+        };
+        let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+        command
+            .args(["standalone", "--role", role, "--config"])
+            .arg(config);
+        // SAFETY: the child-only callback performs a single async-signal-safe
+        // syscall. It neither allocates nor reads process-shared locks/state.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &child_limits) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let output = command
+            .output()
+            .expect("run child with a deliberately short FD baseline");
+        assert!(!output.status.success());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("Native descriptor baseline"),
+            "{diagnostic}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("NOVAROCKS_READY"));
+        assert!(!pair.runtime.path().join("logs").exists());
+        assert!(!pair.runtime.path().join("frontend-state.sqlite").exists());
+        for port in [
+            pair.fe_grpc_port,
+            pair.fe_http_port,
+            pair.fe_mysql_port,
+            pair.be_grpc_port,
+            pair.be_control_grpc_port,
+            pair.be_http_port,
+        ] {
+            let _listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        }
+    }
+    let mut after = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: same successful initialization contract as the first query.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, after.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: getrlimit succeeded.
+    let after = unsafe { after.assume_init() };
+    assert_eq!(
+        (after.rlim_cur, after.rlim_max),
+        (parent_limits.rlim_cur, parent_limits.rlim_max)
+    );
 }

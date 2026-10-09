@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "topology": "1FE+3BE",
+  "scope": "Installed-root exact identity from fresh exact TaskCreateApplied identities in one execution, up to eight candidates on the occupied BE. ACK0 routing must identify exactly one typed installed root; other candidates must be exact unknown-context-root refusals. Zero ACK twice preserves logical root and normal wire. Separate protocol-interference case offers/replays actual Data1/Data2+End3, ACKs actually observed End twice, proves Retired and context-held logical retirement then KILL/resume/save factual wire. Does not claim normal wire after interference or last-alias/allocator exit.",
+  "retention_input_sha256": "3f8813c8c8205ba724ad8c3dc6eeecae4562681244e46d12910de360a1c45752",
+  "phase_ms": 5000,
+  "request_frame_bytes": 4096,
+  "response_data_bytes": 1052672,
+  "data1_sha256": "e1778a1a63f0deff423d34c267bbc2be60c018adde82cf23dfcc9926582d0b42",
+  "data2_sha256": "4cf0c1012276f46af31e44d2fbb03ae7af56f03c9996eb9452b99b3e6273698e",
+  "data1_bytes": 1048576,
+  "data2_bytes": 8,
+  "end_sequence": 3,
+  "output_rows": 1,
+  "operations": [
+    "ack0",
+    "ack0",
+    "fetch1",
+    "fetch2-end3",
+    "replay1",
+    "ack3",
+    "ack3",
+    "retired1"
+  ],
+  "cases": [
+    "result-delivery/installed-root-zero-ack-normal-wire",
+    "result-delivery/installed-root-replay-final-ack-interference"
+  ],
+  "max_identity_candidates": 8,
+  "max_wait_millis": 100,
+  "correction_of": {
+    "path": "docs/testing/mem-1-m07/inputs/installed-root-protocol-freeze-v1.json",
+    "sha256": "aed1b7c70236be9fca6c870d6bca4963b4b637e7ab9c56d1b254c96d0b0f9564",
+    "reason": "Pre-native integration audit found max_wait_millis=0 violates the frozen positive RootRead wait contract. Freeze a valid 100ms request wait; all row inputs, operation chain, caps and absolute deadlines remain unchanged. V1 native was never executed."
+  }
+}

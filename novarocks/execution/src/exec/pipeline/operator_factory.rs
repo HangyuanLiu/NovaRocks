@@ -33,6 +33,13 @@ use super::operator::Operator;
 pub trait OperatorFactory: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Freeze the actual built pipeline geometry before any driver is
+    /// instantiated. Host-owned bounded sinks use this to count completion
+    /// after sort/gather collapse without guessing the configured DOP.
+    fn bind_pipeline_dop(&self, _dop: i32) -> Result<(), String> {
+        Ok(())
+    }
+
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator>;
 
     #[cfg(test)]

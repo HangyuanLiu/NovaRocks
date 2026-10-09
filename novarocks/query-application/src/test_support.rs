@@ -22,7 +22,6 @@
 //! application crate. Production adapters cannot use this module because the
 //! production dependency does not enable `test-support`.
 
-use arrow::record_batch::RecordBatch;
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, QueryContextRef, ResultPacketSequence,
 };
@@ -49,8 +48,8 @@ use crate::coordination::{
 };
 
 use crate::api::result::{
-    BatchDelivery, DecodedResultBatch, EndDelivery, QueryResultTransport, ResultDelivery,
-    ResultDeliveryDisposition, ResultDeliveryReceipt,
+    EndDelivery, QueryResultTransport, ResultDelivery, ResultDeliveryDisposition,
+    ResultDeliveryReceipt,
 };
 
 /// Test-only observation of one move-only protocol delivery.
@@ -88,6 +87,8 @@ pub struct ResultStreamTestProducer {
     failure: watch::Sender<Option<QueryExecutionError>>,
     workload: WorkloadControl,
     root: Option<RootWork>,
+    window: Option<novarocks_workload_control::ResultWindowGrant>,
+    capacity: Option<novarocks_workload_control::ResultCapacityHandle>,
 }
 
 impl ResultStreamTestProducer {
@@ -105,22 +106,76 @@ impl ResultStreamTestProducer {
         ),
         QueryExecutionError,
     > {
+        Self::open_with_carrier(
+            execution_id,
+            fields,
+            delivery_capacity,
+            resource_config,
+            crate::api::ResultRowCarrier::relayed(
+                novarocks_result_contract::RootOutputKind::ClientRows,
+                Some(
+                    novarocks_result_contract::ClientRowProfile::try_new(
+                        novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
+                        novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
+                    )
+                    .expect("frozen client profile"),
+                ),
+            )?,
+        )
+    }
+
+    pub fn open_with_carrier(
+        execution_id: QueryExecutionId,
+        fields: Vec<ResultField>,
+        delivery_capacity: usize,
+        resource_config: ResourceConfig,
+        carrier: crate::api::ResultRowCarrier,
+    ) -> Result<
+        (
+            Self,
+            ExecutionHandle,
+            LocalResourceAuthority,
+            TestResultDeliveryReceipt,
+        ),
+        QueryExecutionError,
+    > {
         let workload = WorkloadControl::try_new(WorkloadConfig::default(), resource_config)
             .expect("test result workload config must be valid");
+        let capacity = Some({
+            workload
+                .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+                .expect("test result capacity")
+        });
         workload
             .mark_ready()
             .expect("test result workload becomes ready");
         let root = workload
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .expect("test result root work is admitted");
+        let window = capacity.as_ref().map(|capacity| {
+            let class = match carrier {
+                crate::api::ResultRowCarrier::Relayed {
+                    kind: novarocks_result_contract::RootOutputKind::ClientRows,
+                    ..
+                } => novarocks_workload_control::ResultWindowClass::Client,
+                _ => novarocks_workload_control::ResultWindowClass::Internal,
+            };
+            capacity
+                .try_acquire(&root.owner.scope(), class)
+                .expect("test root window")
+        });
         let schema = ResultSchema::new(fields);
-        let (transport, schema_receipt, failure, stream) =
-            QueryResultStream::try_channel(execution_id.query_id(), schema, delivery_capacity)?;
+        let (transport, schema_receipt, failure, stream) = QueryResultStream::try_channel(
+            execution_id.query_id(),
+            schema,
+            carrier,
+            delivery_capacity,
+        )?;
         let handle = ExecutionHandle::new(
             root.owner.cancellation_requester(),
             ExecutionOutput::Rows(stream),
         );
-        let resources = workload.resources();
+        let resources = workload.resources().unwrap();
         Ok((
             Self {
                 execution_id,
@@ -128,6 +183,8 @@ impl ResultStreamTestProducer {
                 failure,
                 workload,
                 root: Some(root),
+                window,
+                capacity,
             },
             handle,
             resources,
@@ -135,35 +192,113 @@ impl ResultStreamTestProducer {
         ))
     }
 
-    pub async fn enqueue_batch(
+    pub fn result_capacity(&self) -> novarocks_workload_control::ResultCapacityHandle {
+        self.capacity
+            .as_ref()
+            .expect("test relayed capacity")
+            .clone()
+    }
+
+    /// Encoded ClientRows fixture transferred through the real V1 validator.
+    pub async fn enqueue_client_body(
         &self,
         sequence: u64,
-        batch: RecordBatch,
+        body: Vec<u8>,
+        rows: u64,
     ) -> Result<TestResultDeliveryReceipt, QueryExecutionError> {
-        let decoded = DecodedResultBatch::try_new(batch)?;
-        let bytes = decoded.governance_charge_bytes();
-        let root = self.root.as_ref().expect("test result root remains active");
-        let authority = self.workload.resources();
-        let credit = authority
-            .reserve_result_credit(&root.owner.scope(), bytes)
-            .expect("test result fetch credit is representable")
-            .begin_fetch()
-            .expect("test result fetch begins")
-            .retain_raw(bytes)
-            .expect("test result raw payload is retained")
-            .reserve_decode(&authority, bytes)
-            .expect("test result decode capacity is reserved")
-            .queue_decoded(bytes)
-            .expect("test result decoded payload is queued");
-        let (delivery, receipt) = BatchDelivery::try_new(
+        use novarocks_execution_contract::TaskIdentity;
+        use novarocks_execution_contract::root_result::{
+            RootReadOutcome, RootResultData, RootResultReply,
+        };
+        use novarocks_result_contract::{
+            ClientRowProfile, ClientRowStreamCursor, RootOutputKind, RootProfileId, RootProfileV1,
+        };
+        use novarocks_types::{BackendProcessId, StageId, TaskId};
+        let data = RootResultData::try_new(
+            RootOutputKind::ClientRows,
+            std::num::NonZeroU64::new(sequence.checked_add(1).ok_or_else(|| {
+                crate::api::QueryExecutionError::new(
+                    crate::api::QueryExecutionErrorKind::InvalidRequest,
+                    "fixture sequence overflow",
+                )
+            })?)
+            .unwrap(),
+            bytes::Bytes::from(body),
+            None,
+        )
+        .map_err(|error| {
+            crate::api::QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+        self.enqueue_segment(
+            sequence,
+            RootResultReply {
+                root_task: TaskIdentity::new(
+                    self.execution_id,
+                    StageId::new(1).unwrap(),
+                    TaskId::new(1).unwrap(),
+                    BackendProcessId::new_v7(),
+                ),
+                profile: RootProfileId::V1,
+                kind: RootOutputKind::ClientRows,
+                accepted_consumed: sequence,
+                outcome: RootReadOutcome::Data(data),
+            },
+            Some((
+                ClientRowProfile::try_new(
+                    RootProfileV1::SEGMENT_BYTES,
+                    RootProfileV1::ROW_PAYLOAD_BYTES,
+                )
+                .unwrap(),
+                ClientRowStreamCursor::default(),
+            )),
+            rows,
+        )
+        .await
+    }
+
+    /// Test-only transfer through the real move-only segment/receipt boundary.
+    pub async fn enqueue_segment(
+        &self,
+        sequence: u64,
+        reply: novarocks_execution_contract::root_result::RootResultReply,
+        client_rows: Option<(
+            novarocks_result_contract::ClientRowProfile,
+            novarocks_result_contract::ClientRowStreamCursor,
+        )>,
+        rows: u64,
+    ) -> Result<TestResultDeliveryReceipt, QueryExecutionError> {
+        let window = self
+            .window
+            .as_ref()
+            .expect("relayed test stream has a window");
+        let backing = match &reply.outcome {
+            novarocks_execution_contract::root_result::RootReadOutcome::Data(data) => {
+                data.body().len() as u64 + 4096
+            }
+            _ => 4096,
+        };
+        let retained =
+            crate::api::RetainedRootReply::try_new(reply, window.retain_alias(), backing).map_err(
+                |error| {
+                    QueryExecutionError::new(
+                        crate::api::QueryExecutionErrorKind::InvalidRequest,
+                        error.to_string(),
+                    )
+                },
+            )?;
+        let (delivery, receipt) = crate::api::RootSegmentDelivery::try_new(
             self.execution_id,
             ResultPacketSequence::new(sequence),
-            decoded,
-            credit,
+            retained,
+            client_rows,
+            rows,
         )?;
         let permit = self.transport.reserve_owned().await?;
         self.transport
-            .enqueue(permit, ResultDelivery::Batch(delivery));
+            .enqueue(permit, ResultDelivery::Segment(delivery));
         Ok(TestResultDeliveryReceipt(receipt))
     }
 

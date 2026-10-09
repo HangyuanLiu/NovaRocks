@@ -30,6 +30,7 @@ use novarocks_types::SlotId;
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
     Result,
+    RootResult(Arc<novarocks_result_contract::RootOutputContract>),
     Noop,
     DataStream(DataStreamSinkProgram),
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
@@ -39,7 +40,7 @@ pub enum FragmentSinkProgram {
 impl FragmentSinkProgram {
     pub fn validate(&self) -> Result<(), ExecPlanBuildError> {
         match self {
-            Self::Result | Self::Noop => Ok(()),
+            Self::Result | Self::RootResult(_) | Self::Noop => Ok(()),
             Self::DataStream(program) => program.validate(),
             Self::MultiCastDataStream(program) => program.validate(),
             Self::SplitDataStream(program) => program.validate(),
@@ -52,6 +53,7 @@ impl FragmentSinkProgram {
         self.validate().map_err(|error| error.to_string())?;
         match self {
             Self::Result => Ok(StaticSinkProgram::Result),
+            Self::RootResult(contract) => Ok(StaticSinkProgram::RootResult(contract)),
             Self::Noop => Ok(StaticSinkProgram::Noop),
             Self::DataStream(program) => {
                 let DataStreamSinkProgram {

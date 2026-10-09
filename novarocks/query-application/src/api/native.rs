@@ -41,7 +41,7 @@ use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
     AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptFailureClass, AttemptSchedule,
     NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort,
-    ReplacementWorkerAdmissionEvidence, RootResultPumpBinding,
+    ReplacementWorkerAdmissionEvidence,
 };
 use crate::preparation::FrozenExecutionDescription;
 
@@ -467,9 +467,10 @@ impl ActivatedNativeAttempt {
         }
     }
 
-    pub fn rows(
+    /// Rows relayed as Backend-encoded root items, without decode.
+    pub fn relayed_rows(
         owner: impl ActiveNativeAttemptOwner,
-        binding: RootResultPumpBinding,
+        binding: crate::coordination::RootRelayBinding,
         statuses: AcceptedRootStatusSource,
     ) -> Self {
         Self {
@@ -492,7 +493,7 @@ impl ActivatedNativeAttempt {
 /// attempt. Native retains transport and Task status internals; the query
 /// supervisor receives only the closed pump inputs it owns.
 pub(crate) struct NativeRowsAttemptRuntime {
-    pub(crate) binding: RootResultPumpBinding,
+    pub(crate) binding: crate::coordination::RootRelayBinding,
     pub(crate) statuses: AcceptedRootStatusSource,
 }
 

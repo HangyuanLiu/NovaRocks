@@ -27,8 +27,9 @@ use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::process_runtime::{ProcessRuntime, ProjectionOrder, TargetReadiness};
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvRepository, MvRepositoryError,
-    MvRepositoryErrorKind, ReplaceMvProjectionRequest,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionInventoryBound,
+    MvProjectionInventoryEntry, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
+    ReplaceMvProjectionRequest,
 };
 use novarocks_spi::connector::{CatalogHandle, ConnectorRequestContext, LakePublicationId};
 use std::sync::Arc;
@@ -278,6 +279,110 @@ pub enum MvDropReadiness {
 pub struct ListedMvProjection {
     pub loaded: LoadedMvProjection,
     pub manageability: MvListedManageability,
+}
+
+/// A complete bounded locator snapshot, consumed one fresh model at a time.
+/// The service still owns readiness/order and the repository still owns CAS.
+pub struct MvBoundedProjectionInventory {
+    service: MvReadinessService,
+    entries: std::vec::IntoIter<MvProjectionInventoryEntry>,
+    bound: MvProjectionInventoryBound,
+}
+
+impl MvBoundedProjectionInventory {
+    /// Order only thin locators; fresh models still remain one-at-a-time.
+    pub fn order_by_namespace_and_name(&mut self) {
+        self.entries.as_mut_slice().sort_by(|left, right| {
+            left.target
+                .namespace()
+                .cmp(right.target.namespace())
+                .then(left.target.name().cmp(right.target.name()))
+        });
+    }
+
+    pub async fn next_ready(&mut self) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        for entry in self.entries.by_ref() {
+            let order = self.service.runtime.projection_order(entry.target.clone());
+            let cell = order.lock().await;
+            // Provider/decoder failure is never a readiness verdict: propagate
+            // it instead of returning a truncated successful inventory.
+            let Some(loaded) = self
+                .service
+                .repository
+                .find_by_target_bounded(&entry.target, self.bound)
+                .await?
+            else {
+                continue;
+            };
+            let ready = self.service.runtime.with_readiness(&entry.target, |state| {
+                matches!(state, TargetReadiness::Ready)
+            });
+            if ready && cell.installed.as_ref() == Some(&loaded.version) {
+                return Ok(Some(loaded));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn next_listable(&mut self) -> Result<Option<ListedMvProjection>, MvRepositoryError> {
+        for entry in self.entries.by_ref() {
+            let mut bound = self.bound;
+            let manageability = self
+                .service
+                .runtime
+                .with_readiness(&entry.target, |state| {
+                    let reason_bytes = match state {
+                        TargetReadiness::ReadOnly(reason)
+                        | TargetReadiness::Unavailable(reason) => reason.len(),
+                        _ => 0,
+                    };
+                    bound.decode.max_working_set_bytes = bound
+                        .decode
+                        .max_working_set_bytes
+                        .checked_sub(reason_bytes)
+                        .filter(|remaining| *remaining > 0)
+                        .ok_or_else(|| {
+                            MvRepositoryError::new(
+                                MvRepositoryErrorKind::InvalidRequest,
+                                "MV readiness reason exceeds its decoded page bound",
+                            )
+                        })?;
+                    Ok::<_, MvRepositoryError>(match state {
+                        TargetReadiness::Ready => Some(MvListedManageability::Manageable),
+                        TargetReadiness::ReadOnly(reason) => {
+                            Some(MvListedManageability::ReadOnly(reason.clone()))
+                        }
+                        TargetReadiness::Unavailable(reason) => {
+                            Some(MvListedManageability::Unavailable(reason.clone()))
+                        }
+                        TargetReadiness::Unobserved => None,
+                    })
+                })?;
+            let Some(manageability) = manageability else {
+                continue;
+            };
+            let order = self.service.runtime.projection_order(entry.target.clone());
+            let cell = order.lock().await;
+            let Some(loaded) = self
+                .service
+                .repository
+                .find_by_target_bounded(&entry.target, bound)
+                .await?
+            else {
+                continue;
+            };
+            if matches!(manageability, MvListedManageability::Manageable)
+                && cell.installed.as_ref() != Some(&loaded.version)
+            {
+                continue;
+            }
+            return Ok(Some(ListedMvProjection {
+                loaded,
+                manageability,
+            }));
+        }
+        Ok(None)
+    }
 }
 
 /// Whether this process may manage a projection it can show.
@@ -756,54 +861,16 @@ impl MvReadinessService {
         }
         Ok(Some(loaded))
     }
-    /// Every projection this process can show, with whether it may also
-    /// manage it.
-    ///
-    /// A target closed behind a restart barrier or owned by another
-    /// deployment is still a sound query candidate, so leaving it out of the
-    /// inventory would tell an operator their MV is gone when it is being
-    /// read. What they need instead is to see it and to see why it cannot be
-    /// refreshed.
-    pub async fn list_listable_projections(
+    pub async fn bounded_projection_inventory(
         &self,
-    ) -> Result<Vec<ListedMvProjection>, MvRepositoryError> {
-        let mut result = Vec::new();
-        for projection in self.repository.list_projections().await? {
-            let target = projection.projection.facts.target();
-            let manageability = match self.runtime.readiness(target) {
-                TargetReadiness::Ready => MvListedManageability::Manageable,
-                TargetReadiness::ReadOnly(reason) => MvListedManageability::ReadOnly(reason),
-                // A quarantined projection is in doubt, not gone. Hiding it
-                // tells an operator their view disappeared, when what happened
-                // is that this process stopped trusting its own copy and has
-                // to say why.
-                TargetReadiness::Unavailable(reason) => MvListedManageability::Unavailable(reason),
-                // Nothing here has observed this target at all, so this
-                // process has nothing to report about it.
-                TargetReadiness::Unobserved => continue,
-            };
-            let order = self.runtime.projection_order(target.clone());
-            let cell = order.lock().await;
-            let Some(loaded) = self.repository.find_by_target(target).await? else {
-                continue;
-            };
-            // `installed` marks the version management was opened on, and a
-            // read-only target deliberately has none -- that is what read-only
-            // means here. So the version check belongs to the manageable case
-            // only; requiring it of a read-only target would hide exactly the
-            // rows this listing exists to show.
-            if matches!(manageability, MvListedManageability::Manageable)
-                && cell.installed.as_ref() != Some(&loaded.version)
-            {
-                continue;
-            }
-            drop(cell);
-            result.push(ListedMvProjection {
-                loaded,
-                manageability,
-            });
-        }
-        Ok(result)
+        bound: MvProjectionInventoryBound,
+    ) -> Result<MvBoundedProjectionInventory, MvRepositoryError> {
+        let entries = self.repository.list_projection_inventory(bound).await?;
+        Ok(MvBoundedProjectionInventory {
+            service: self.clone(),
+            entries: entries.into_iter(),
+            bound,
+        })
     }
 
     pub async fn list_ready_projections(
@@ -837,6 +904,34 @@ impl MvReadinessService {
             .list_dependencies_by_downstream(projection.projection.mv_id)
             .await
     }
+    /// Local display keeps the current ready version and bounded index read
+    /// under the target's observation order, without cloning a second model.
+    pub async fn list_ready_dependencies_by_downstream_bounded(
+        &self,
+        projection: &LoadedMvProjection,
+        bound: crate::repository::MvDependencyReadBound,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        let target = projection.projection.facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        let ready = self
+            .runtime
+            .with_readiness(target, |state| matches!(state, TargetReadiness::Ready));
+        if !ready || cell.installed.as_ref() != Some(&projection.version) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "MV target requires a successful fresh Current observation",
+            ));
+        }
+        self.repository
+            .list_dependencies_by_downstream_bounded(
+                projection.projection.mv_id,
+                &projection.version,
+                bound,
+            )
+            .await
+    }
+
     pub async fn ensure_no_ready_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectIdentity,

@@ -65,6 +65,10 @@ impl AdmissionCatalogSpy {
 
 #[async_trait]
 impl NovaRocksCatalog for AdmissionCatalogSpy {
+    fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
+        Arc::new(Default::default())
+    }
+
     fn implementation_name(&self) -> &'static str {
         self.inner.implementation_name()
     }
@@ -88,7 +92,10 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         panic!("unsupported document admission requested the catalog client");
     }
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
+    async fn list_namespaces(
+        &self,
+        _bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }
 
@@ -102,6 +109,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     async fn list_tables(
         &self,
         _namespace: CatalogNamespaceName,
+        _bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }
@@ -133,6 +141,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     async fn list_views(
         &self,
         _namespace: CatalogNamespaceName,
+        _bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }

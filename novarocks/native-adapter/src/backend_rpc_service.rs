@@ -415,6 +415,18 @@ impl NovaRocksGrpc for BackendRpcService {
             .await?;
         Ok(tonic::Response::new(response))
     }
+
+    async fn fetch_root_result(
+        &self,
+        _request: tonic::Request<proto::FetchRootResultRequest>,
+    ) -> Result<tonic::Response<proto::FetchRootResultResponse>, tonic::Status> {
+        // The bounded root reader serves this method ahead of the generated
+        // service, keeping each response body's owner until it exits.
+        Err(tonic::Status::new(
+            tonic::Code::Unimplemented,
+            "FetchRootResult is served by the bounded root reader route",
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -304,8 +304,8 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     source_location,
                     &binding,
                     self.runtime.resources().catalog_runtime(),
-                )
-                .map_err(map_provider_error)?;
+                    self.runtime.novarocks_catalog().listing_admission(),
+                )?;
                 let mapping_digest = manifest
                     .canonical_name_mapping
                     .as_deref()
@@ -470,6 +470,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                         .for_request(request_context.clone()),
                     &expected_manifest,
                     runtime.resources().catalog_runtime(),
+                    runtime.novarocks_catalog().listing_admission(),
                 )
                 .map_err(|error| format!("ADD FILES frozen manifest changed: {error}"))?;
                 validate_no_duplicate_data_files(&runtime, current, &expected_manifest, None)
@@ -1384,7 +1385,7 @@ fn failure(
     ConnectorMutationFailure::new(kind, message)
 }
 
-fn map_provider_error(message: impl ToString) -> ConnectorError {
+pub(super) fn map_provider_error(message: impl ToString) -> ConnectorError {
     let message = message.to_string();
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("not found") || lower.contains("unknown table") {

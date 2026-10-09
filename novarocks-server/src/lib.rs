@@ -32,6 +32,7 @@ mod paimon_access;
 pub mod provider_manifest;
 pub mod roles;
 pub mod scan_io;
+mod sdk_listing_profile;
 pub mod state_store_config;
 mod state_store_limits;
 pub mod supervisor;

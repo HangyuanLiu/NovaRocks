@@ -22,23 +22,37 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
+use std::time::Duration;
+
+#[cfg(test)]
+#[path = "native_control_listener_tests.rs"]
+mod control_listener_tests;
+
+#[cfg(test)]
+#[path = "native_incoming_seal_tests.rs"]
+mod incoming_seal_tests;
 
 use axum::Router;
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::IntoResponse;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
+use novarocks_proto_codec::native_rpc::{NativeEndpointDomain, NativeRpcMethod};
 use tokio::net::TcpListener as TokioTcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tower::ServiceExt;
 
 use crate::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+use crate::native_incoming_key_capacity::NativeIncomingKey;
 use crate::native_ingress::NativeIngressService;
+use crate::native_transport_admission::{
+    NativeHandshakePermit, NativeIncomingConnectionBinding, NativeTransportAdmission,
+    TransportClass, TransportRole,
+};
 
 /// How long a stopping listener lets its already-accepted connections finish.
 ///
@@ -99,6 +113,16 @@ impl Default for NativeIngressConfig {
     }
 }
 
+/// The admission class a listener serves. Each class has its own physical
+/// connection and handshake positions; one class never borrows the other's.
+#[derive(Clone)]
+pub(crate) struct ListenerAdmission {
+    pub(crate) admission: NativeTransportAdmission,
+    pub(crate) class: TransportClass,
+    /// The Backend data listener's bounded root reader, if it serves roots.
+    pub(crate) root_results: Option<Arc<crate::root_result_reader::NativeRootResultReader>>,
+}
+
 /// Instance-owned native gRPC listener lifecycle.
 ///
 /// The role provides its generated service and owns every domain handler. This
@@ -117,7 +141,7 @@ impl NativeRpcServerHandle {
         clippy::too_many_arguments,
         reason = "role identity and its authentication metric remain explicit composition inputs"
     )]
-    pub fn start<S, F, H>(
+    pub fn start_frontend_membership<S, F, H>(
         host: &str,
         port: u16,
         service: S,
@@ -128,12 +152,137 @@ impl NativeRpcServerHandle {
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
         ingress_config: NativeIngressConfig,
+        admission: NativeTransportAdmission,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
         F: Fn() + Send + Sync + 'static,
         H: Fn() + Send + Sync + 'static,
     {
+        Self::start_inner(
+            host,
+            port,
+            service,
+            native_trust,
+            incoming_adapter,
+            role_label,
+            NativeEndpointDomain::FrontendMembership,
+            thread_name,
+            on_authentication_failure,
+            on_transport_handshake_failure,
+            ingress_config,
+            ListenerAdmission {
+                admission,
+                class: TransportClass::Membership,
+                root_results: None,
+            },
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "role identity and its authentication metric remain explicit composition inputs"
+    )]
+    pub(crate) fn start_with_admission<S, F, H>(
+        host: &str,
+        port: u16,
+        service: S,
+        native_trust: Arc<NativeTrust>,
+        incoming_adapter: NativeIncomingAdapter,
+        role_label: &'static str,
+        domain: NativeEndpointDomain,
+        thread_name: &'static str,
+        on_authentication_failure: F,
+        on_transport_handshake_failure: H,
+        ingress_config: NativeIngressConfig,
+        admission: NativeTransportAdmission,
+        class: TransportClass,
+        root_results: Option<Arc<crate::root_result_reader::NativeRootResultReader>>,
+    ) -> Result<Self, String>
+    where
+        S: NovaRocksGrpc + Clone + Send + Sync + 'static,
+        F: Fn() + Send + Sync + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        Self::start_inner(
+            host,
+            port,
+            service,
+            native_trust,
+            incoming_adapter,
+            role_label,
+            domain,
+            thread_name,
+            on_authentication_failure,
+            on_transport_handshake_failure,
+            ingress_config,
+            ListenerAdmission {
+                admission,
+                class,
+                root_results,
+            },
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "role identity and its authentication metric remain explicit composition inputs"
+    )]
+    fn start_inner<S, F, H>(
+        host: &str,
+        port: u16,
+        service: S,
+        native_trust: Arc<NativeTrust>,
+        incoming_adapter: NativeIncomingAdapter,
+        role_label: &'static str,
+        domain: NativeEndpointDomain,
+        thread_name: &'static str,
+        on_authentication_failure: F,
+        on_transport_handshake_failure: H,
+        ingress_config: NativeIngressConfig,
+        admission: ListenerAdmission,
+    ) -> Result<Self, String>
+    where
+        S: NovaRocksGrpc + Clone + Send + Sync + 'static,
+        F: Fn() + Send + Sync + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        {
+            let listener_admission = &admission;
+            let compatible = matches!(
+                (
+                    domain,
+                    listener_admission.class,
+                    listener_admission.admission.role()
+                ),
+                (
+                    NativeEndpointDomain::BackendData,
+                    TransportClass::Data,
+                    TransportRole::Backend
+                ) | (
+                    NativeEndpointDomain::BackendControl,
+                    TransportClass::Control,
+                    TransportRole::Backend
+                ) | (
+                    NativeEndpointDomain::FrontendMembership,
+                    TransportClass::Membership,
+                    TransportRole::Frontend
+                )
+            );
+            if !compatible {
+                return Err("native endpoint domain and transport admission class disagree".into());
+            }
+        }
+        let descriptor_capacity =
+            crate::native_fd_capacity::verify_native_file_descriptor_capacity(domain).map_err(
+                |error| format!("verify native {role_label} descriptor capacity: {error}"),
+            )?;
+        tracing::info!(
+            role = role_label,
+            endpoint_domain = ?domain,
+            descriptor_capacity = ?descriptor_capacity,
+            "native listener descriptor baseline verified"
+        );
         let address = (host, port)
             .to_socket_addrs()
             .map_err(|error| {
@@ -163,7 +312,10 @@ impl NativeRpcServerHandle {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
-                        .worker_threads(ingress_config.worker_threads)
+                        .worker_threads(match domain {
+                            NativeEndpointDomain::BackendControl => ingress_config.control_worker_threads,
+                            _ => ingress_config.worker_threads,
+                        })
                         .max_blocking_threads(ingress_config.max_blocking_threads)
                         .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
                         .build()
@@ -174,26 +326,26 @@ impl NativeRpcServerHandle {
                         let listener = TokioTcpListener::from_std(listener).map_err(|error| {
                             format!("create Tokio native {role_label} gRPC listener: {error}")
                         })?;
-                        // FE consumes listener runtime sizing only. Its report
-                        // service keeps the native baseline message limits;
-                        // BE method limits belong solely to task ingress.
-                        let (ordinary_request_limit, ordinary_response_limit, control_request_limit, control_response_limit) =
-                            if role_label == "backend" {
-                                (
-                                    ingress_config.ordinary_request_max_bytes,
-                                    ingress_config.ordinary_response_max_bytes,
-                                    ingress_config.control_request_max_bytes,
-                                    ingress_config.control_response_max_bytes,
-                                )
-                            } else {
-                                (GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES)
-                            };
+                        // The explicit endpoint domain owns runtime admission
+                        // and generated-service limits. Labels are diagnostic.
+                        let (request_limit, response_limit) = match domain {
+                            NativeEndpointDomain::BackendData => (
+                                ingress_config.ordinary_request_max_bytes,
+                                ingress_config.ordinary_response_max_bytes,
+                            ),
+                            NativeEndpointDomain::BackendControl => (
+                                ingress_config.control_request_max_bytes,
+                                ingress_config.control_response_max_bytes,
+                            ),
+                            NativeEndpointDomain::FrontendMembership =>
+                                (GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES),
+                        };
                         let ordinary_service = NovaRocksGrpcServer::new(service.clone())
-                            .max_decoding_message_size(ordinary_request_limit)
-                            .max_encoding_message_size(ordinary_response_limit);
+                            .max_decoding_message_size(request_limit)
+                            .max_encoding_message_size(response_limit);
                         let control_service = NovaRocksGrpcServer::new(service)
-                            .max_decoding_message_size(control_request_limit)
-                            .max_encoding_message_size(control_response_limit);
+                            .max_decoding_message_size(request_limit)
+                            .max_encoding_message_size(response_limit);
                         let grpc_path = format!(
                             "/{}/*rest",
                             <NovaRocksGrpcServer<S> as NamedService>::NAME
@@ -202,18 +354,35 @@ impl NativeRpcServerHandle {
                             "/{}/ApplyTaskControlOperations",
                             <NovaRocksGrpcServer<S> as NamedService>::NAME
                         );
+                        let mut router = Router::new()
+                            .route_service(&control_path, AxumGrpcService::new(control_service));
+                        // Bounded root reads bypass the generated service: the
+                        // root reader keeps each response body's owner until
+                        // the body exits.
+                        if let Some(reader) = admission.root_results.clone()
+                        {
+                            router = router.route_service(
+                                novarocks_proto_codec::native_rpc::NativeRpcMethod::FetchRootResult
+                                    .contract()
+                                    .path,
+                                RootResultRoute { reader },
+                            );
+                        }
                         let app = tower::ServiceExt::<axum::http::Request<axum::body::Body>>::map_response(
-                            Router::new()
-                                .route_service(&control_path, AxumGrpcService::new(control_service))
+                            router
                                 .route_service(&grpc_path, AxumGrpcService::new(ordinary_service))
                                 .fallback(grpc_unimplemented_fallback),
-                            |response: axum::http::Response<axum::body::Body>| response.map(boxed),
+                            box_native_response as NativeResponseMapper,
                         );
                         let app = NativeIngressService::new(
                             app,
                             ingress_config,
                             <NovaRocksGrpcServer<S> as NamedService>::NAME,
-                            role_label == "backend",
+                            domain != NativeEndpointDomain::FrontendMembership,
+                            domain,
+                        )
+                        .with_lane_streams(
+                            Some(admission.admission.clone()),
                         );
                         let app = NativeListenerAuthService::new(
                             app,
@@ -227,6 +396,8 @@ impl NativeRpcServerHandle {
                             shutdown_rx,
                             transport_handshake_failure,
                             role_label,
+                            Some(admission),
+                            Some((native_trust.server_admission(), domain)),
                         )
                         .await
                     });
@@ -274,11 +445,17 @@ impl NativeRpcServerHandle {
         }
     }
 
-    pub fn stop(&mut self) -> Result<(), String> {
+    /// Close this listener's admission before waiting for its runtime to exit.
+    /// Multiple independently owned listeners can all begin stopping first.
+    pub fn begin_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);
         }
+    }
+
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.begin_stop();
         if let Some(join_handle) = self.join_handle.take() {
             join_handle
                 .join()
@@ -294,6 +471,245 @@ impl Drop for NativeRpcServerHandle {
     }
 }
 
+type NativeResponseMapper =
+    fn(axum::http::Response<axum::body::Body>) -> axum::http::Response<tonic::body::BoxBody>;
+
+fn box_native_response(
+    response: axum::http::Response<axum::body::Body>,
+) -> axum::http::Response<tonic::body::BoxBody> {
+    response.map(boxed)
+}
+
+/// Apply the frozen public HTTP/2 limits to one Native connection, admitted or
+/// not. These bound the counts and per-item sizes inside Hyper/H2; the bytes
+/// those libraries allocate under them are covered by the transport
+/// measurement gate.
+fn configure_native_server(builder: &mut http2::Builder<TokioExecutor>) {
+    let g = NativeResultSupportGeometry::V1;
+    builder
+        .initial_stream_window_size(g.transport_h2_stream_receive_window_bytes as u32)
+        .initial_connection_window_size(g.transport_h2_connection_receive_window_bytes as u32)
+        .adaptive_window(g.transport_h2_adaptive_window)
+        .max_concurrent_streams(g.transport_streams_per_connection as u32)
+        .max_pending_accept_reset_streams(g.transport_h2_pending_resets as usize)
+        .max_local_error_reset_streams(g.transport_h2_pending_resets as usize)
+        .max_frame_size(g.transport_h2_frame_bytes as u32)
+        .max_header_list_size(g.transport_h2_header_bytes as u32)
+        .max_send_buf_size(g.transport_h2_send_buffer_bytes as usize);
+}
+
+/// Per-connection request-head admission for admitted listeners.
+///
+/// The first request whose method belongs to this endpoint and whose caller
+/// authenticates seals the connection to that caller process and traffic
+/// class, and ends the connection's bootstrap: its handshake position is
+/// returned. A later request with another key, or an authenticated caller
+/// without a process identity, closes the connection. Unknown methods and
+/// authentication failures are left to the routes behind this layer.
+#[derive(Clone)]
+struct NativeIncomingHeadAdmission {
+    binding: NativeIncomingConnectionBinding,
+    admission: NativeServerAdmission,
+    domain: NativeEndpointDomain,
+    handshake: NativeHandshakePermit,
+    close: Arc<Notify>,
+}
+
+impl NativeIncomingHeadAdmission {
+    fn admit(&self, uri: &axum::http::Uri, headers: &axum::http::HeaderMap) -> Result<(), ()> {
+        let Some(method) = NativeRpcMethod::from_path(uri.path()) else {
+            return Ok(());
+        };
+        if !method.is_allowed_at(self.domain) {
+            return Ok(());
+        }
+        let Ok(caller) = self.admission.admit_headers(headers) else {
+            return Ok(());
+        };
+        let sealed = caller
+            .process_identity()
+            .ok_or(())
+            .and_then(|peer| {
+                NativeIncomingKey::new(peer, self.domain, method.contract().traffic).map_err(|_| ())
+            })
+            .and_then(|key| self.binding.seal(key).map_err(|_| ()));
+        match sealed {
+            Ok(()) => {
+                self.handshake.release();
+                Ok(())
+            }
+            Err(()) => {
+                self.close.notify_one();
+                Err(())
+            }
+        }
+    }
+}
+
+struct ConnectionInputs<S> {
+    stream: tokio::net::TcpStream,
+    app: S,
+    incoming: NativeIncomingAdapter,
+    admitted: Option<AdmittedConnection>,
+    served: ServedConnection,
+    drain: watch::Receiver<()>,
+    on_transport_handshake_failure: Arc<dyn Fn() + Send + Sync>,
+}
+
+struct AdmittedConnection {
+    connection: crate::native_transport_admission::NativeConnectionPermit,
+    head: NativeIncomingHeadAdmission,
+    bootstrap_deadline: tokio::time::Instant,
+}
+
+async fn serve_connection<S>(inputs: ConnectionInputs<S>)
+where
+    S: Service<
+            axum::http::Request<axum::body::Body>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let ConnectionInputs {
+        stream,
+        app,
+        incoming,
+        admitted,
+        mut served,
+        mut drain,
+        on_transport_handshake_failure,
+    } = inputs;
+    let deadline = admitted
+        .as_ref()
+        .map(|admitted| admitted.bootstrap_deadline);
+    let accepted = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, incoming.accept(stream)).await {
+            Ok(accepted) => accepted.map_err(|error| format!("{error:?}")),
+            Err(_) => Err("native bootstrap deadline elapsed during TLS".to_owned()),
+        },
+        None => incoming
+            .accept(stream)
+            .await
+            .map_err(|error| format!("{error:?}")),
+    };
+    let stream = match accepted {
+        Ok(stream) => stream,
+        Err(error) => {
+            served.close("transport_handshake", &error);
+            on_transport_handshake_failure();
+            return;
+        }
+    };
+    let (stream, head) = match admitted {
+        Some(AdmittedConnection {
+            connection, head, ..
+        }) => {
+            // The admission position follows the IO: it is returned only after
+            // the socket and its TLS state have been destroyed.
+            let stream = novarocks_native_trust::OwnedNativeIo::with_guard(stream, connection);
+            (stream, Some(head))
+        }
+        // Only private generic listener tests omit admission. Production
+        // composition requires role-matched admission before listener startup.
+        None => (novarocks_native_trust::OwnedNativeIo::new(stream), None),
+    };
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    configure_native_server(&mut builder);
+    let close = head.as_ref().map(|head| Arc::clone(&head.close));
+    let handshake = head.as_ref().map(|head| head.handshake.clone());
+    let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+        let app = app.clone();
+        let admitted = head
+            .as_ref()
+            .map(|head| head.admit(request.uri(), request.headers()));
+        async move {
+            if admitted == Some(Err(())) {
+                return Ok::<_, std::convert::Infallible>(
+                    tonic::Status::new(
+                        tonic::Code::Unavailable,
+                        "native connection is sealed to another caller or lane",
+                    )
+                    .into_http(),
+                );
+            }
+            let response = app
+                .oneshot(request.map(axum::body::Body::new))
+                .await
+                .expect("Native route service is infallible");
+            Ok::<_, std::convert::Infallible>(response)
+        }
+    });
+    let mut connection = std::pin::pin!(builder.serve_connection(TokioIo::new(stream), service));
+    let mut winding_down = false;
+    let outcome = loop {
+        let bootstrap_pending = handshake
+            .as_ref()
+            .is_some_and(NativeHandshakePermit::is_held);
+        tokio::select! {
+            outcome = &mut connection => break Ok(outcome),
+            // A closed channel means the listener is gone, which asks for the
+            // same thing as an explicit signal.
+            _ = drain.changed(), if !winding_down => {
+                winding_down = true;
+                // GOAWAY, then let the streams already in flight finish. This
+                // is what makes a stopping backend answer its caller instead
+                // of vanishing.
+                connection.as_mut().graceful_shutdown();
+            }
+            _ = sleep_until_or_forever(deadline), if bootstrap_pending => {
+                // The guard above was read when this wait began. A request
+                // that authenticated meanwhile ended the bootstrap, and its
+                // connection must keep serving past the deadline.
+                if handshake
+                    .as_ref()
+                    .is_some_and(NativeHandshakePermit::is_held)
+                {
+                    break Err("native bootstrap deadline elapsed before an authenticated request");
+                }
+            }
+            _ = notified_or_forever(close.as_deref()) => {
+                break Err("native connection seal conflict");
+            }
+        }
+    };
+    match outcome {
+        Ok(outcome) => served.close(
+            "http2",
+            &match outcome {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("{error:?}"),
+            },
+        ),
+        Err(reason) => {
+            if reason.starts_with("native bootstrap") {
+                on_transport_handshake_failure();
+            }
+            served.close("admission", reason);
+        }
+    }
+}
+
+async fn sleep_until_or_forever(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn notified_or_forever(close: Option<&Notify>) {
+    match close {
+        Some(close) => close.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Listener composition keeps the admission and signed caller inputs explicit."
+)]
 async fn serve_native_listener<S>(
     listener: TokioTcpListener,
     app: S,
@@ -301,6 +717,8 @@ async fn serve_native_listener<S>(
     mut shutdown_rx: watch::Receiver<bool>,
     on_transport_handshake_failure: Arc<dyn Fn() + Send + Sync>,
     role_label: &'static str,
+    admission: Option<ListenerAdmission>,
+    incoming_admission: Option<(NativeServerAdmission, NativeEndpointDomain)>,
 ) -> Result<(), String>
 where
     S: Service<
@@ -312,6 +730,8 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
+    let bootstrap =
+        Duration::from_millis(NativeResultSupportGeometry::V1.transport_handshake_deadline_ms);
     // Per listener rather than per process: one all-in-one process hosts both
     // role listeners, and a shared counter would report the other one's work.
     let live_connections = Arc::new(AtomicU64::new(0));
@@ -331,13 +751,9 @@ where
             accepted = listener.accept() => {
                 let (stream, peer) = match accepted {
                     Err(error) => {
-                        // One refused connection is not a broken listener. The
-                        // previous behaviour returned here, which dropped this
-                        // thread's runtime and cancelled every other live
-                        // connection on this process -- their peers saw a
-                        // socket close with no GOAWAY. A listener that is
-                        // really gone still surfaces, through the consecutive
-                        // count below, so supervision can act on it.
+                        // One refused connection is not a broken listener. A
+                        // listener that is really gone still surfaces, through
+                        // the consecutive count below, so supervision can act.
                         consecutive_accept_errors += 1;
                         tracing::warn!(
                             role = role_label,
@@ -347,7 +763,8 @@ where
                         );
                         if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
                             return Err(format!(
-                                "accept native gRPC connection failed                                  {consecutive_accept_errors} times in a row: {error}"
+                                "accept native gRPC connection failed \
+                                 {consecutive_accept_errors} times in a row: {error}"
                             ));
                         }
                         // Descriptor exhaustion returns immediately and would
@@ -358,63 +775,54 @@ where
                     Ok(accepted) => accepted,
                 };
                 consecutive_accept_errors = 0;
-                let app = app.clone();
-                let incoming = incoming.clone();
-                let on_transport_handshake_failure = Arc::clone(&on_transport_handshake_failure);
+                let accepted_at = tokio::time::Instant::now();
+                let admitted = match (&admission, &incoming_admission) {
+                    (Some(listener_admission), Some((server_admission, domain))) => {
+                        match listener_admission.admission.try_accept(listener_admission.class) {
+                            Ok(accepted) => Some(AdmittedConnection {
+                                connection: accepted.connection,
+                                head: NativeIncomingHeadAdmission {
+                                    binding: accepted.binding,
+                                    admission: server_admission.clone(),
+                                    domain: *domain,
+                                    handshake: accepted.handshake,
+                                    close: Arc::new(Notify::new()),
+                                },
+                                bootstrap_deadline: accepted_at + bootstrap,
+                            }),
+                            Err(_) => {
+                                // No position: close the socket now. Refusal is
+                                // not a broken listener and leaves no pending work.
+                                tracing::debug!(
+                                    role = role_label,
+                                    %peer,
+                                    "native listener refused a connection without admission positions"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        }
+                    }
+                    (Some(_), None) => {
+                        return Err("admitted native listener lacks incoming admission".to_owned());
+                    }
+                    (None, _) => None,
+                };
                 let served = ServedConnection::open(
                     role_label,
                     peer,
                     &next_connection_id,
                     &live_connections,
                 );
-                let mut drain = drain_rx.clone();
-                tokio::spawn(async move {
-                    let mut served = served;
-                    let stream = match incoming.accept(stream).await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            served.close("transport_handshake", &format!("{error:?}"));
-                            on_transport_handshake_failure();
-                            return;
-                        }
-                    };
-                    let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                        let app = app.clone();
-                        async move {
-                            let response = app
-                                .oneshot(request.map(axum::body::Body::new))
-                                .await
-                                .expect("Native route service is infallible");
-                            Ok::<_, std::convert::Infallible>(response)
-                        }
-                    });
-                    let mut connection = std::pin::pin!(
-                        http2::Builder::new(TokioExecutor::new())
-                            .serve_connection(TokioIo::new(stream), service)
-                    );
-                    let mut winding_down = false;
-                    let outcome = loop {
-                        tokio::select! {
-                            outcome = &mut connection => break outcome,
-                            // A closed channel means the listener is gone, which
-                            // asks for the same thing as an explicit signal.
-                            _ = drain.changed(), if !winding_down => {
-                                winding_down = true;
-                                // GOAWAY, then let the streams already in flight
-                                // finish. This is what makes a stopping backend
-                                // answer its caller instead of vanishing.
-                                connection.as_mut().graceful_shutdown();
-                            }
-                        }
-                    };
-                    served.close(
-                        "http2",
-                        &match outcome {
-                            Ok(()) => "ok".to_string(),
-                            Err(error) => format!("{error:?}"),
-                        },
-                    );
-                });
+                tokio::spawn(serve_connection(ConnectionInputs {
+                    stream,
+                    app: app.clone(),
+                    incoming: incoming.clone(),
+                    admitted,
+                    served,
+                    drain: drain_rx.clone(),
+                    on_transport_handshake_failure: Arc::clone(&on_transport_handshake_failure),
+                }));
             }
         }
     }
@@ -573,28 +981,54 @@ where
     fn call(&mut self, request: axum::http::Request<Body>) -> Self::Future {
         if self.admission.admit_headers(request.headers()).is_err() {
             (self.on_authentication_failure)();
-            return Box::pin(async {
-                Ok(
-                    tonic::Status::unauthenticated("native caller authentication failed")
-                        .into_http(),
-                )
-            });
+            drop(request);
+            let response = tonic::Status::new(
+                tonic::Code::Unauthenticated,
+                "native caller authentication failed",
+            )
+            .into_http();
+            return Box::pin(async move { Ok(response) });
         }
         Box::pin(self.inner.call(request))
     }
 }
 
-async fn grpc_unimplemented_fallback() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [
-            (tonic::Status::GRPC_STATUS, HeaderValue::from_static("12")),
-            (
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            ),
-        ],
-    )
+async fn grpc_unimplemented_fallback(
+    request: axum::http::Request<axum::body::Body>,
+) -> axum::http::Response<axum::body::Body> {
+    drop(request);
+    tonic::Status::new(tonic::Code::Unimplemented, "")
+        .into_http()
+        .map(axum::body::Body::new)
+}
+
+/// Serves `FetchRootResult` from the Backend's bounded root reader.
+#[derive(Clone)]
+struct RootResultRoute {
+    reader: Arc<crate::root_result_reader::NativeRootResultReader>,
+}
+
+impl Service<axum::http::Request<axum::body::Body>> for RootResultRoute {
+    type Response = axum::http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: axum::http::Request<axum::body::Body>) -> Self::Future {
+        let reader = Arc::clone(&self.reader);
+        Box::pin(async move {
+            Ok(
+                crate::root_result_unary::root_result_unary(&reader, request)
+                    .await
+                    .map(boxed),
+            )
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -634,6 +1068,43 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test]
+    async fn authentication_refusal_answers_without_entering_the_route() {
+        use std::sync::atomic::AtomicUsize;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let observed = entered.clone();
+        let inner = tower::service_fn(move |_request: axum::http::Request<axum::body::Body>| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, std::convert::Infallible>(tonic::Status::ok("").into_http()) }
+        });
+        let rejected = failures.clone();
+        let mut service = NativeListenerAuthService::new(
+            inner,
+            crate::backend_test_support::test_backend_native_trust().server_admission(),
+            Arc::new(move || {
+                rejected.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let response = service
+            .call(axum::http::Request::new(axum::body::Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["grpc-status"], "16");
+    }
+
+    #[tokio::test]
+    async fn unknown_route_answers_unimplemented() {
+        let response =
+            grpc_unimplemented_fallback(axum::http::Request::new(axum::body::Body::empty())).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["grpc-status"], "12");
+        assert_eq!(response.headers()["content-type"], "application/grpc");
+    }
 
     /// A service that reports when it has been entered and answers only when
     /// it is released, so a test can hold one request in flight.
@@ -694,6 +1165,8 @@ mod tests {
             shutdown_rx,
             Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
             "test",
+            None,
+            None,
         ));
 
         let stream = tokio::net::TcpStream::connect(address)

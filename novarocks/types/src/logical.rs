@@ -32,7 +32,7 @@ pub enum LogicalType {
 }
 
 impl LogicalType {
-    pub(crate) fn metadata_value(self) -> &'static str {
+    pub fn metadata_value(self) -> &'static str {
         match self {
             Self::Json => "json",
             Self::Hll => "hll",

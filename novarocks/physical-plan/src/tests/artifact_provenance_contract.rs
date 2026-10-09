@@ -17,7 +17,7 @@
 
 use super::*;
 
-fn provenance_cut_fixture() -> (PhysicalPlan, FragmentId) {
+pub(super) fn provenance_cut_fixture() -> (PhysicalPlan, FragmentId) {
     let edge = EdgeId::new(811);
     let source_fragment = FragmentId::new(811);
     let destination_fragment = FragmentId::new(812);

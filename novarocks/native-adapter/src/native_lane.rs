@@ -1,0 +1,566 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Native lanes and the stream positions they hold.
+//!
+//! A lane is one physical transport owner from the frozen method manifest
+//! (spec v6 §5.4.5). Each HTTP/2 stream a lane opens or serves holds one
+//! NovaRocks stream position from before the request is dispatched until the
+//! response body's public exit: end of stream, an error/reset, or the drop of
+//! the NovaRocks body wrapper. Neither a returned unary handler nor a resolved
+//! Tonic response future returns the position (spec v6 §5.4.4).
+//!
+//! Positions are counts. The bytes Hyper, H2 and Tonic keep per stream are
+//! bounded by their public configuration and verified by the transport
+//! measurement gate; see `native_transport_geometry`.
+//!
+//! Design: ADR-0170 (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
+
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
+
+use bytes::Bytes;
+use hyper::body::Frame;
+use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
+use novarocks_proto_codec::native_rpc::{FrontendNativeLane, NativeTrafficClass};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::PollSemaphore;
+use tonic::body::BoxBody;
+use tonic::codegen::{Body as HttpBody, Service, StdError};
+use tonic::transport::Channel;
+
+use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
+
+/// One physical Native transport owner from the frozen method manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum NativeLane {
+    ResultData,
+    Submission,
+    Observation,
+    LifecycleControl,
+    Exchange,
+    RuntimeFilter,
+    Membership,
+}
+
+impl NativeLane {
+    pub const COUNT: usize = 7;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::ResultData,
+        Self::Submission,
+        Self::Observation,
+        Self::LifecycleControl,
+        Self::Exchange,
+        Self::RuntimeFilter,
+        Self::Membership,
+    ];
+
+    /// The lane of a manifest traffic class; retired traffic has none.
+    pub const fn of(traffic: NativeTrafficClass) -> Option<Self> {
+        match traffic {
+            NativeTrafficClass::Frontend(lane) => Some(Self::frontend(lane)),
+            NativeTrafficClass::Exchange => Some(Self::Exchange),
+            NativeTrafficClass::RuntimeFilter => Some(Self::RuntimeFilter),
+            NativeTrafficClass::Membership => Some(Self::Membership),
+            NativeTrafficClass::Retired => None,
+        }
+    }
+
+    pub const fn frontend(lane: FrontendNativeLane) -> Self {
+        match lane {
+            FrontendNativeLane::ResultData => Self::ResultData,
+            FrontendNativeLane::Submission => Self::Submission,
+            FrontendNativeLane::Observation => Self::Observation,
+            FrontendNativeLane::LifecycleControl => Self::LifecycleControl,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::ResultData => 0,
+            Self::Submission => 1,
+            Self::Observation => 2,
+            Self::LifecycleControl => 3,
+            Self::Exchange => 4,
+            Self::RuntimeFilter => 5,
+            Self::Membership => 6,
+        }
+    }
+
+    /// Stable metric label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ResultData => "result_data",
+            Self::Submission => "submission",
+            Self::Observation => "observation",
+            Self::LifecycleControl => "lifecycle_control",
+            Self::Exchange => "exchange",
+            Self::RuntimeFilter => "runtime_filter",
+            Self::Membership => "membership",
+        }
+    }
+
+    /// The connection admission class whose positions this lane's
+    /// connections take. Only lifecycle control uses the Control class.
+    pub const fn class(self) -> TransportClass {
+        match self {
+            Self::LifecycleControl => TransportClass::Control,
+            _ => TransportClass::Data,
+        }
+    }
+}
+
+/// Which side of a stream a position belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum StreamDirection {
+    /// A stream this process serves.
+    Incoming,
+    /// A stream this process opened as a client.
+    Outgoing,
+}
+
+impl StreamDirection {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Incoming => "incoming",
+            Self::Outgoing => "outgoing",
+        }
+    }
+}
+
+/// Which admission position a count describes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum PositionKind {
+    /// A live connection: from admission until its IO wrapper is dropped.
+    Connection,
+    /// A connection still bootstrapping (TLS, H2 preface, first request).
+    Handshake,
+}
+
+impl PositionKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Handshake => "handshake",
+        }
+    }
+}
+
+/// Role-owned publication of admission transitions. Every method is a
+/// notification after the transition has happened; admission never reads
+/// back from it, so metrics cannot change an admission decision.
+pub trait NativeTransportObserver: Send + Sync + 'static {
+    /// Positions of one class and kind currently in use, and their limit.
+    fn positions(&self, _class: TransportClass, _kind: PositionKind, _used: usize, _limit: usize) {}
+    /// One connection was refused for lack of a position.
+    fn refused(&self, _class: TransportClass) {}
+    /// A connection bound to a lane was established (+1) or exited (-1).
+    fn lane_connections(&self, _lane: NativeLane, _delta: i64) {}
+    /// A stream position was taken (+1) or returned (-1).
+    fn lane_streams(&self, _lane: NativeLane, _direction: StreamDirection, _delta: i64) {}
+    /// The fixed number of stream positions of one gate.
+    fn lane_stream_limit(&self, _lane: NativeLane, _direction: StreamDirection, _limit: usize) {}
+}
+
+pub(crate) type SharedObserver = Option<Arc<dyn NativeTransportObserver>>;
+
+/// A fixed number of stream positions for one lane and direction.
+#[derive(Clone)]
+pub struct NativeLaneStreamGate {
+    semaphore: Arc<Semaphore>,
+    lane: NativeLane,
+    direction: StreamDirection,
+    limit: usize,
+    observer: SharedObserver,
+}
+
+impl fmt::Debug for NativeLaneStreamGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeLaneStreamGate")
+            .field("lane", &self.lane)
+            .field("direction", &self.direction)
+            .field("limit", &self.limit)
+            .field("available", &self.available())
+            .finish()
+    }
+}
+
+impl NativeLaneStreamGate {
+    pub(crate) fn new(
+        lane: NativeLane,
+        direction: StreamDirection,
+        limit: usize,
+        observer: SharedObserver,
+    ) -> Self {
+        if let Some(observer) = &observer {
+            observer.lane_stream_limit(lane, direction, limit);
+        }
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+            lane,
+            direction,
+            limit,
+            observer,
+        }
+    }
+
+    pub fn lane(&self) -> NativeLane {
+        self.lane
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn available(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// Take a position now or refuse; a refusal holds nothing.
+    pub fn try_acquire(&self) -> Option<NativeLaneStreamPermit> {
+        Arc::clone(&self.semaphore)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| self.permit(permit))
+    }
+
+    fn permit(&self, permit: OwnedSemaphorePermit) -> NativeLaneStreamPermit {
+        if let Some(observer) = &self.observer {
+            observer.lane_streams(self.lane, self.direction, 1);
+        }
+        NativeLaneStreamPermit {
+            permit: Some(permit),
+            lane: self.lane,
+            direction: self.direction,
+            observer: self.observer.clone(),
+        }
+    }
+}
+
+/// One held stream position. Dropping it is the stream's exit.
+pub struct NativeLaneStreamPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    lane: NativeLane,
+    direction: StreamDirection,
+    observer: SharedObserver,
+}
+
+impl fmt::Debug for NativeLaneStreamPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeLaneStreamPermit")
+            .field("lane", &self.lane)
+            .field("direction", &self.direction)
+            .finish()
+    }
+}
+
+impl Drop for NativeLaneStreamPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        if let Some(observer) = &self.observer {
+            observer.lane_streams(self.lane, self.direction, -1);
+        }
+    }
+}
+
+/// A response body that holds its stream position until its public exit:
+/// the end of stream, an error (including a reset), or this wrapper's drop.
+pub struct NativeLaneStreamBody {
+    inner: BoxBody,
+    permit: Option<NativeLaneStreamPermit>,
+}
+
+impl NativeLaneStreamBody {
+    pub fn new(inner: BoxBody, permit: Option<NativeLaneStreamPermit>) -> Self {
+        Self { inner, permit }
+    }
+
+    /// Box the wrapper as the Tonic body type, so the transport's response
+    /// type does not change.
+    pub fn boxed(inner: BoxBody, permit: Option<NativeLaneStreamPermit>) -> BoxBody {
+        match permit {
+            Some(permit) => tonic::body::boxed(Self::new(inner, Some(permit))),
+            None => inner,
+        }
+    }
+}
+
+impl HttpBody for NativeLaneStreamBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
+            // End of stream or error: the stream has exited.
+            drop(self.permit.take());
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// One outgoing connection owner: a Tonic `Channel` over exactly one admitted
+/// connection, plus the stream positions of that connection.
+///
+/// `poll_ready` takes a position before the request reaches Tonic's queue,
+/// and the response body carries it to its exit. Clones share the positions;
+/// a position reserved by `poll_ready` belongs to that clone only.
+pub struct NativeLaneChannel {
+    channel: Channel,
+    gate: NativeLaneStreamGate,
+    poll: PollSemaphore,
+    reserved: Option<OwnedSemaphorePermit>,
+}
+
+impl fmt::Debug for NativeLaneChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeLaneChannel")
+            .field("gate", &self.gate)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for NativeLaneChannel {
+    fn clone(&self) -> Self {
+        Self {
+            channel: self.channel.clone(),
+            gate: self.gate.clone(),
+            poll: PollSemaphore::new(Arc::clone(&self.gate.semaphore)),
+            reserved: None,
+        }
+    }
+}
+
+impl NativeLaneChannel {
+    /// Bind `channel` to its lane with the frozen per-connection stream
+    /// count. Outgoing transitions publish through `admission`'s observer.
+    pub fn new(
+        channel: Channel,
+        lane: NativeLane,
+        admission: Option<&NativeTransportAdmission>,
+    ) -> Self {
+        Self::with_streams(
+            channel,
+            lane,
+            client_streams_per_connection(),
+            admission.and_then(NativeTransportAdmission::observer),
+        )
+    }
+
+    pub(crate) fn with_streams(
+        channel: Channel,
+        lane: NativeLane,
+        streams: usize,
+        observer: SharedObserver,
+    ) -> Self {
+        let gate = NativeLaneStreamGate::new(lane, StreamDirection::Outgoing, streams, observer);
+        Self {
+            channel,
+            poll: PollSemaphore::new(Arc::clone(&gate.semaphore)),
+            gate,
+            reserved: None,
+        }
+    }
+
+    pub fn lane(&self) -> NativeLane {
+        self.gate.lane
+    }
+
+    pub fn stream_limit(&self) -> usize {
+        self.gate.limit
+    }
+
+    pub fn available_streams(&self) -> usize {
+        self.gate.available()
+    }
+}
+
+impl Service<hyper::http::Request<BoxBody>> for NativeLaneChannel {
+    type Response = hyper::http::Response<BoxBody>;
+    type Error = StdError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.reserved.is_none() {
+            // The semaphore is never closed; a closed gate is a broken owner.
+            let Some(permit) = ready!(self.poll.poll_acquire(cx)) else {
+                return Poll::Ready(Err("native lane stream gate closed".into()));
+            };
+            self.reserved = Some(permit);
+        }
+        Service::poll_ready(&mut self.channel, cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, request: hyper::http::Request<BoxBody>) -> Self::Future {
+        let permit = self.reserved.take().map(|permit| self.gate.permit(permit));
+        let response = Service::call(&mut self.channel, request);
+        Box::pin(async move {
+            // The position also covers the time Tonic holds the request
+            // before its stream opens; a failed call returns it here.
+            let response = response.await.map_err(StdError::from)?;
+            Ok(response.map(|body| NativeLaneStreamBody::boxed(body, permit)))
+        })
+    }
+}
+
+fn client_streams_per_connection() -> usize {
+    usize::try_from(NativeResultSupportGeometry::V1.transport_streams_per_connection)
+        .expect("validated Native geometry fits the target")
+}
+
+/// Public Tonic endpoint settings from the frozen geometry: connect deadline,
+/// fixed receive windows, header list size, the Tonic request queue and the
+/// per-connection request concurrency. Settings Tonic 0.12 does not expose
+/// keep the Hyper/H2 defaults recorded in `native_transport_geometry`.
+pub fn configure_native_endpoint(
+    endpoint: tonic::transport::Endpoint,
+) -> tonic::transport::Endpoint {
+    let g = NativeResultSupportGeometry::V1;
+    endpoint
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .connect_timeout(Duration::from_millis(g.transport_connect_deadline_ms))
+        .http2_adaptive_window(g.transport_h2_adaptive_window)
+        .initial_stream_window_size(Some(
+            u32::try_from(g.transport_h2_stream_receive_window_bytes)
+                .expect("validated Native stream window fits HTTP/2"),
+        ))
+        .initial_connection_window_size(Some(
+            u32::try_from(g.transport_h2_connection_receive_window_bytes)
+                .expect("validated Native connection window fits HTTP/2"),
+        ))
+        .http2_max_header_list_size(
+            u32::try_from(g.transport_h2_header_bytes)
+                .expect("validated Native header list fits HTTP/2"),
+        )
+        .buffer_size(
+            usize::try_from(g.transport_tonic_pending_per_connection)
+                .expect("validated Native pending queue fits the target"),
+        )
+        .concurrency_limit(client_streams_per_connection())
+}
+
+/// The connection count a Frontend keeps per Backend process, endpoint and
+/// lane, from the frozen geometry.
+pub fn frontend_lane_connections(lane: FrontendNativeLane) -> usize {
+    let g = NativeResultSupportGeometry::V1;
+    let count = match lane {
+        FrontendNativeLane::ResultData => g.transport_connections_per_frontend_backend_result,
+        FrontendNativeLane::Submission => g.transport_connections_per_frontend_backend_submission,
+        FrontendNativeLane::Observation => g.transport_connections_per_frontend_backend_observation,
+        FrontendNativeLane::LifecycleControl => {
+            g.transport_connections_per_frontend_backend_lifecycle_control
+        }
+    };
+    usize::try_from(count).expect("validated Native lane connection count fits the target")
+}
+
+/// Which admission a dial attempt takes.
+#[derive(Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one Copy value per connector, captured once; the inline key avoids an allocation per dial"
+)]
+pub(crate) enum NativeDial {
+    /// A Backend dial of `class`, with its exact peer/lane key when it has one.
+    Backend(
+        TransportClass,
+        Option<crate::native_channel_identity::InlineNativeChannelIdentity>,
+    ),
+    /// A Frontend dial of one Backend lane.
+    Frontend(FrontendNativeLane),
+}
+
+/// The transport connector preceded by dial admission. Admission is taken
+/// again on every attempt, including Tonic's internal reconnect; a refused
+/// attempt opens no socket and resolves no name, and the physical position of
+/// an established connection follows its IO until the IO is dropped. The
+/// handshake position covers DNS, TCP and TLS and returns once the IO exists.
+pub(crate) fn admitted_connector_service(
+    connector: novarocks_native_trust::NativeEndpointConnector,
+    admission: Option<NativeTransportAdmission>,
+    dial: NativeDial,
+) -> impl Service<
+    hyper::http::Uri,
+    Response = hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>,
+    Error = std::io::Error,
+    Future = impl Send,
+> + Clone
++ Send
++ 'static {
+    tower::service_fn(move |_| {
+        let connector = connector.clone();
+        let admission = admission.clone();
+        async move {
+            let dial = admission
+                .as_ref()
+                .map(|admission| match dial {
+                    NativeDial::Backend(class, key) => admission.try_dial(class, key),
+                    NativeDial::Frontend(lane) => admission.try_dial_lane(lane),
+                })
+                .transpose()
+                .map_err(|error| {
+                    std::io::Error::new(error.kind(), "native dial admission refused")
+                })?;
+            let io = connector.connect().await.map_err(|failure| {
+                std::io::Error::other(format!("native transport connector failed: {failure}"))
+            })?;
+            let io: novarocks_native_trust::BoxedNativeIo = match dial {
+                Some(dial) => Box::new(novarocks_native_trust::OwnedNativeIo::with_guard(
+                    io,
+                    dial.established()?,
+                )),
+                None => io,
+            };
+            Ok(hyper_util::rt::TokioIo::new(io))
+        }
+    })
+}
+
+/// A Frontend's admitted connector for one Backend lane.
+pub fn frontend_lane_connector(
+    connector: novarocks_native_trust::NativeEndpointConnector,
+    admission: NativeTransportAdmission,
+    lane: FrontendNativeLane,
+) -> impl Service<
+    hyper::http::Uri,
+    Response = hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>,
+    Error = std::io::Error,
+    Future = impl Send,
+> + Clone
++ Send
++ 'static {
+    admitted_connector_service(connector, Some(admission), NativeDial::Frontend(lane))
+}
+
+#[cfg(test)]
+#[path = "native_lane_tests.rs"]
+mod tests;

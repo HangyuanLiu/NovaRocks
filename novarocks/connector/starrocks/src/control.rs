@@ -453,6 +453,7 @@ mod tests {
                 .metadata()
                 .list_tables(ConnectorListTablesRequest {
                     namespace,
+                    bound: novarocks_spi::connector::ConnectorListingBound::V1,
                     context: context(),
                 })
                 .expect("table listing")

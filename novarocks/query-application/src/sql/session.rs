@@ -24,6 +24,7 @@ use novarocks_parser::{
     ast::{self, Fold, Statement},
     printer::print_expr,
 };
+use novarocks_result_contract::ScalarProfileV1;
 use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::naming::DEFAULT_DATABASE;
 
@@ -118,8 +119,45 @@ impl SessionSqlState {
     }
 
     /// Records one SQL expression as a connection-local user variable.
-    pub fn set_user_variable(&mut self, name: &str, value: String) {
-        self.user_variables.insert(name.to_ascii_lowercase(), value);
+    ///
+    /// The session container is bounded: at most
+    /// [`ScalarProfileV1::VARIABLES`] variables whose names and stored
+    /// expressions together stay within [`ScalarProfileV1::SESSION_LIVE_BYTES`].
+    /// A staged copy becomes the live state as a whole, so the same bound
+    /// also caps every staged candidate ([`ScalarProfileV1::SESSION_STAGED_BYTES`]).
+    /// A refused assignment leaves the state unchanged.
+    pub fn set_user_variable(&mut self, name: &str, mut value: String) -> Result<(), String> {
+        let name = name.to_ascii_lowercase();
+        let replaced = self
+            .user_variables
+            .get(&name)
+            .map(|previous| name.len() + previous.len());
+        let count = self.user_variables.len() + usize::from(replaced.is_none());
+        if count > ScalarProfileV1::VARIABLES {
+            return Err(format!(
+                "session holds at most {} user variables",
+                ScalarProfileV1::VARIABLES
+            ));
+        }
+        let limit = ScalarProfileV1::SESSION_LIVE_BYTES.min(ScalarProfileV1::SESSION_STAGED_BYTES);
+        let bytes = self.user_variable_bytes() - replaced.unwrap_or(0) + name.len() + value.len();
+        if bytes > limit {
+            return Err(format!(
+                "user variable {name} would raise session user variables to {bytes} bytes, \
+                 beyond the {limit} byte session limit"
+            ));
+        }
+        value.shrink_to_fit();
+        self.user_variables.insert(name, value);
+        Ok(())
+    }
+
+    /// Bytes of names and stored expressions held by this session.
+    fn user_variable_bytes(&self) -> usize {
+        self.user_variables
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum()
     }
 
     /// Rewrites references to this session's user variables with their stored
@@ -208,7 +246,11 @@ pub fn apply_session_set_assignment(
                     ));
                 }
             };
-            state.set_user_variable(&variable.value, value);
+            state
+                .set_user_variable(&variable.value, value)
+                .map_err(|message| {
+                    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, message)
+                })?;
             Ok(SessionSetAssignmentOutcome::Applied)
         }
         ast::SetTarget::SystemVariable(variable) => {
@@ -784,9 +826,75 @@ mod tests {
     }
 
     #[test]
+    fn user_variables_are_bounded_by_count_and_bytes_without_partial_mutation() {
+        use novarocks_result_contract::ScalarProfileV1;
+
+        let mut state = SessionSqlState::default();
+        for index in 0..ScalarProfileV1::VARIABLES {
+            state
+                .set_user_variable(&format!("v{index}"), "1".to_string())
+                .expect("within the variable count");
+        }
+        let error = state
+            .set_user_variable("one_more", "1".to_string())
+            .expect_err("count limit");
+        assert!(error.contains("at most"), "{error}");
+        assert_eq!(state.user_variables.len(), ScalarProfileV1::VARIABLES);
+        // Replacing an existing variable does not add to the count.
+        state
+            .set_user_variable("V0", "2".to_string())
+            .expect("replacement");
+        assert_eq!(
+            state.user_variables.get("v0").map(String::as_str),
+            Some("2")
+        );
+
+        let mut state = SessionSqlState::default();
+        let half = ScalarProfileV1::SESSION_LIVE_BYTES / 2;
+        state
+            .set_user_variable("a", "x".repeat(half))
+            .expect("first half");
+        let before = state.user_variables.clone();
+        let error = state
+            .set_user_variable("b", "y".repeat(half))
+            .expect_err("byte limit");
+        assert!(error.contains("session limit"), "{error}");
+        assert_eq!(state.user_variables, before);
+        // A smaller replacement of the large value is admitted.
+        state
+            .set_user_variable("a", "x".to_string())
+            .expect("shrinking replacement");
+        state
+            .set_user_variable("b", "y".repeat(half))
+            .expect("room after replacement");
+    }
+
+    #[test]
+    fn an_oversized_user_variable_assignment_is_an_invalid_value() {
+        use novarocks_result_contract::ScalarProfileV1;
+
+        let source = format!(
+            "SET @big = '{}'",
+            "z".repeat(ScalarProfileV1::SESSION_LIVE_BYTES)
+        );
+        let Some(ParsedStatement::Session(ast::SessionStatement::Set(set))) =
+            novarocks_parser::parse(&source).expect("parse set").pop()
+        else {
+            panic!("expected SET");
+        };
+        let mut state = SessionSqlState::default();
+        let error = apply_session_set_assignment(&source, &set.assignments[0], &mut state)
+            .expect_err("oversized value");
+        assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
+        assert!(state.user_variables.is_empty());
+    }
+
+    #[test]
     fn substitutes_user_variables_without_a_frontend_router() {
         let mut state = SessionSqlState::default();
-        state.set_user_variable("@limit", "7".to_string());
+        state
+            .set_user_variable("@limit", "7".to_string())
+            .expect("bounded variable");
         let statement = novarocks_parser::parse("SELECT @limit")
             .expect("parse query")
             .pop()

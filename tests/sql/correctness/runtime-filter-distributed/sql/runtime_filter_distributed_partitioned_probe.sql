@@ -93,7 +93,8 @@ WHERE b.flag = 'Y';
 
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED
--- @explain_contains=HASH_PARTITIONED (k)
+-- @explain_contains=HASH_PARTITIONED (p.k)
+-- @explain_contains=HASH_PARTITIONED (b.k)
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
 -- @expect_runtime_filter_available=available
@@ -157,7 +158,8 @@ WHERE p.id >= 2001 AND b.flag = 'Y';
 SET disable_optimizer_rules = '';
 -- @result_contains=partitioned_null_safe_ok
 -- @explain_contains=HASH JOIN (PARTITIONED
--- @explain_contains=HASH_PARTITIONED (k)
+-- @explain_contains=HASH_PARTITIONED (p.k)
+-- @explain_contains=HASH_PARTITIONED (b.k)
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
 -- @expect_runtime_filter_available=available

@@ -31,15 +31,17 @@ spec.loader.exec_module(guard)
 
 
 class BoundaryTests(unittest.TestCase):
-    def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False):
+    def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False,
+                result_dependency=""):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         (root / "Cargo.toml").write_text(
-            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime"]\n')
+            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result"]\n')
         for directory, name, dependencies in (
                 ("program", "novarocks-local-program", root_dependency),
                 ("types", "novarocks-types", types_dependency),
+                ("result", "novarocks-result-contract", result_dependency),
                 ("runtime", "tokio", "")):
             package = root / directory
             (package / "src").mkdir(parents=True)
@@ -62,6 +64,21 @@ class BoundaryTests(unittest.TestCase):
     def test_pure_contract_and_unrelated_workspace_runtime_are_allowed(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n')
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dependency_free_result_contract_is_allowed(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_result_contract_cannot_acquire_runtime_even_through_a_pure_root(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
+                              result_dependency='tokio = { path = "../runtime" }\n')
+        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
+        self.assertIn("runtime/wire/provider/storage capability: tokio", result.stderr)
+
+    def test_result_contract_cannot_add_an_otherwise_pure_dependency(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
+                              result_dependency='novarocks-types = { path = "../types" }\n')
+        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
 
     def test_transitive_runtime_is_rejected(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n',

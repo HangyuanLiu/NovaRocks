@@ -25,7 +25,7 @@ use std::fmt;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{RuntimeFilterBindingId, RuntimeFilterChannelId};
-use novarocks_types::UniqueId;
+use novarocks_types::{BackendProcessId, UniqueId};
 
 use super::{BackendEnvelopeKind, BackendParticipantIdentity, BackendRouteEdgeId};
 
@@ -42,6 +42,7 @@ pub enum BackendRoutePeer {
     Loopback,
     Remote {
         participant_id: u32,
+        backend_process_id: BackendProcessId,
         endpoint: RuntimeEndpoint,
     },
 }
@@ -148,6 +149,7 @@ impl BackendRoutingEdge {
 pub struct BackendRemoteRoute {
     edge_id: BackendRouteEdgeId,
     participant_id: u32,
+    backend_process_id: BackendProcessId,
     endpoint: RuntimeEndpoint,
     target_role: BackendRouteRole,
 }
@@ -163,6 +165,10 @@ impl BackendRemoteRoute {
     )]
     pub const fn participant_id(&self) -> u32 {
         self.participant_id
+    }
+
+    pub const fn backend_process_id(&self) -> BackendProcessId {
+        self.backend_process_id
     }
 
     pub const fn endpoint(&self) -> &RuntimeEndpoint {
@@ -531,10 +537,12 @@ impl BackendRoutingShard {
                 BackendRoutePeer::Loopback => loopback_route_edge_ids.push(edge.id()),
                 BackendRoutePeer::Remote {
                     participant_id,
+                    backend_process_id,
                     endpoint,
                 } => remote_routes.push(BackendRemoteRoute {
                     edge_id: edge.id(),
                     participant_id: *participant_id,
+                    backend_process_id: *backend_process_id,
                     endpoint: endpoint.clone(),
                     target_role: edge.target().role(),
                 }),
@@ -640,6 +648,7 @@ mod tests {
                     aggregator.clone(),
                     BackendRoutePeer::Remote {
                         participant_id: 2,
+                        backend_process_id: BackendProcessId::new_v7(),
                         endpoint: RuntimeEndpoint::new("be-2", 8060).unwrap(),
                     },
                     [
@@ -655,6 +664,7 @@ mod tests {
                     consumer,
                     BackendRoutePeer::Remote {
                         participant_id: 3,
+                        backend_process_id: BackendProcessId::new_v7(),
                         endpoint: RuntimeEndpoint::new("be-3", 8060).unwrap(),
                     },
                     [
@@ -668,6 +678,91 @@ mod tests {
             [((RuntimeFilterBindingId::new(7), UniqueId::new(5, 6)), 2)],
         )
         .unwrap()
+    }
+
+    fn remote_producer_decision(
+        backend_process_id: BackendProcessId,
+        participant_id: u32,
+    ) -> BackendRouteDecision {
+        let binding = RuntimeFilterBindingId::new(7);
+        let source = BackendRouteEndpoint::new(1, BackendRouteRole::Producer(binding)).unwrap();
+        let target =
+            BackendRouteEndpoint::new(participant_id, BackendRouteRole::Aggregator).unwrap();
+        let edge = BackendRoutingEdge::new(
+            BackendRouteEdgeId::new(11),
+            source,
+            target,
+            BackendRoutePeer::Remote {
+                participant_id,
+                backend_process_id,
+                endpoint: RuntimeEndpoint::new("same-be", 8060).unwrap(),
+            },
+            [BackendEnvelopeKind::Contribution],
+        )
+        .unwrap();
+        let channel = BackendRoutingChannel::new(
+            RuntimeFilterChannelId::new(9),
+            [BackendRouteRole::Producer(binding)],
+            [],
+            [edge],
+            [],
+        )
+        .unwrap();
+        BackendRoutingShard::new(
+            BackendParticipantIdentity::new(UniqueId::new(1, 2), 3),
+            1,
+            [channel],
+        )
+        .unwrap()
+        .route_producer(
+            RuntimeFilterChannelId::new(9),
+            binding,
+            BackendEnvelopeKind::Contribution,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_decision_preserves_frozen_process_independently_of_participant_id() {
+        let process: BackendProcessId = "0194bc12-3456-7000-8000-123456789abc".parse().unwrap();
+        for participant_id in [2, 73] {
+            let decision = remote_producer_decision(process, participant_id);
+            assert!(decision.loopback_route_edge_ids().is_empty());
+            assert_eq!(decision.remote_routes().len(), 1);
+            let route = &decision.remote_routes()[0];
+            assert_eq!(route.backend_process_id(), process);
+            assert_eq!(route.participant_id(), participant_id);
+            assert_eq!(route.edge_id(), BackendRouteEdgeId::new(11));
+            assert_eq!(
+                route.endpoint(),
+                &RuntimeEndpoint::new("same-be", 8060).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_incarnations_at_the_same_endpoint_are_distinct() {
+        let first: BackendProcessId = "0194bc12-3456-7000-8000-123456789abc".parse().unwrap();
+        let replacement: BackendProcessId = "0194bc12-3456-7000-8000-123456789abd".parse().unwrap();
+        let peer = |backend_process_id| BackendRoutePeer::Remote {
+            participant_id: 2,
+            backend_process_id,
+            endpoint: RuntimeEndpoint::new("same-be", 8060).unwrap(),
+        };
+        assert_ne!(peer(first), peer(replacement));
+        let first_decision = remote_producer_decision(first, 2);
+        let replacement_decision = remote_producer_decision(replacement, 2);
+        let first_route = &first_decision.remote_routes()[0];
+        let replacement_route = &replacement_decision.remote_routes()[0];
+        assert_eq!(first_route.endpoint(), replacement_route.endpoint());
+        assert_eq!(
+            first_route.participant_id(),
+            replacement_route.participant_id()
+        );
+        assert_eq!(first_route.backend_process_id(), first);
+        assert_eq!(replacement_route.backend_process_id(), replacement);
+        assert_ne!(first_route, replacement_route);
+        assert_ne!(first_decision, replacement_decision);
     }
 
     #[test]

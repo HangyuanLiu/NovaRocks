@@ -43,19 +43,25 @@ insert into tbl values
 ('abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'ab', 1),
 ('abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'ab', 1),
 ('abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'ab', 1);
+-- Seed an admitted value before the oversized assignment. Its preservation
+-- below proves that ScalarValueV1 refuses the whole replacement record.
+set @arr_str = (select array_agg(k1) from tbl);
 
 -- query 4
 -- @skip_result_check=true
+-- The original 10,000-row input remains unchanged. Its roughly 850 KiB
+-- nested value exceeds the accepted 64 KiB whole-record ScalarValueV1 bound.
+-- @expect_error=scalar value exceeds frozen 64 KiB record bound
 USE ${case_db};
 set @arr_str = (select array_agg(k1) from (select t1.k1 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t);
 
 -- query 5
 USE ${case_db};
-select @arr_str[1];
+select @arr_str[1] AS first_string, array_length(@arr_str) AS retained_length;
 
 -- query 6
 USE ${case_db};
-select element_at(array_agg(array_length(@arr_str)), 5) from (select t1.k3 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t;
+select element_at(array_agg(array_length(@arr_str)), 5) AS fifth_length from (select t1.k3 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t;
 
 -- query 7
 -- @skip_result_check=true

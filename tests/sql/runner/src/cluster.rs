@@ -75,13 +75,83 @@ pub(crate) fn launch_server(
                 child_environment: if launch_profile == LaunchProfile::FaultScenario {
                     novarocks_cluster_harness::statement_lifecycle_observation_environment()?
                 } else {
-                    Default::default()
+                    resolve_fixture_credential_environment()?
                 },
                 config_overlay: resolve_role_scoped_connector_overlay()?,
                 native_trust_fixture: Default::default(),
             },
         )?)),
     }
+}
+
+/// Bind only declared fixture secrets after the runner's final fixture projection.
+/// Performance children clear their ambient environment, so the exact role
+/// config references need explicit bindings rather than an earlier fixture's
+/// literals. Runtime and fault knobs remain excluded.
+fn resolve_fixture_credential_environment()
+-> Result<novarocks_cluster_harness::CrossProcessChildEnvironment> {
+    let mut bindings = novarocks_cluster_harness::CrossProcessChildEnvironment::default();
+    for (config_key, purpose, destination) in [
+        (
+            "NOVAROCKS_FE_CONFIG",
+            "object-store-metadata",
+            &mut bindings.fe,
+        ),
+        ("NOVAROCKS_BE_CONFIG", "object-store-data", &mut bindings.be),
+    ] {
+        let Some(path) = std::env::var_os(config_key) else {
+            continue;
+        };
+        let source = fs::read_to_string(PathBuf::from(path))
+            .with_context(|| format!("read declared {config_key} fixture credentials"))?;
+        *destination =
+            fixture_credential_environment(&source, purpose, |name| std::env::var(name).ok())?;
+    }
+    Ok(bindings)
+}
+
+fn fixture_credential_environment(
+    source: &str,
+    purpose: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let config = source
+        .parse::<toml::Value>()
+        .context("parse fixture role config")?;
+    let mut bindings = std::collections::BTreeMap::new();
+    let credentials = config
+        .get("connector")
+        .and_then(|value| value.get("credentials"))
+        .and_then(toml::Value::as_array);
+    for credential in credentials.into_iter().flatten() {
+        if credential.get("purpose").and_then(toml::Value::as_str) != Some(purpose) {
+            continue;
+        }
+        for key in ["access_key_id", "access_key_secret"] {
+            let Some(value) = credential.get(key).and_then(toml::Value::as_str) else {
+                continue;
+            };
+            if !value.contains("${ENV") {
+                continue;
+            }
+            let reference = value
+                .strip_prefix("${ENV:")
+                .and_then(|v| v.strip_suffix('}'));
+            let Some(name @ ("AWS_S3_ACCESS_KEY_ID" | "AWS_S3_SECRET_ACCESS_KEY")) = reference
+            else {
+                bail!(
+                    "performance fixture credentials require an exact supported secret reference"
+                );
+            };
+            let secret = lookup(name)
+                .filter(|value| !value.is_empty())
+                .with_context(|| {
+                    format!("declared fixture credential requires environment variable {name}")
+                })?;
+            bindings.insert(name.to_string(), secret);
+        }
+    }
+    Ok(bindings)
 }
 
 /// Validate cluster CLI arguments. Returns an error string on failure.
@@ -264,6 +334,57 @@ access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
             connector_overlay_from_config("[cluster]\nrole = 'be'\n")
                 .expect("parse backend config")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn performance_fixture_secrets_follow_final_projection_and_exact_role() {
+        let source = r#"
+[[connector.credentials]]
+purpose = "object-store-metadata"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
+
+[[connector.credentials]]
+purpose = "object-store-data"
+access_key_id = "${ENV:UNCLASSIFIED_DATA_SECRET}"
+
+[runtime]
+knob = "${ENV:UNCLASSIFIED_RUNTIME_KNOB}"
+"#;
+        let bindings =
+            fixture_credential_environment(source, "object-store-metadata", |name| match name {
+                "AWS_S3_ACCESS_KEY_ID" => Some("final-fixture-key".to_string()),
+                "AWS_S3_SECRET_ACCESS_KEY" => Some("final-fixture-secret".to_string()),
+                _ => panic!("unrelated role or runtime input must not be read"),
+            })
+            .expect("bind final fixture identity");
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings["AWS_S3_ACCESS_KEY_ID"], "final-fixture-key");
+        assert_eq!(bindings["AWS_S3_SECRET_ACCESS_KEY"], "final-fixture-secret");
+        assert!(
+            fixture_credential_environment(source, "object-store-data", |_| {
+                panic!("unclassified secret must be refused before lookup")
+            })
+            .is_err()
+        );
+        assert!(fixture_credential_environment(source, "object-store-metadata", |_| None).is_err());
+    }
+
+    #[test]
+    fn performance_fixture_literals_do_not_inherit_ambient_secrets() {
+        let source = r#"
+[[connector.credentials]]
+purpose = "object-store-data"
+access_key_id = "literal-key"
+access_key_secret = "literal-secret"
+"#;
+        assert!(
+            fixture_credential_environment(source, "object-store-data", |_| {
+                panic!("literal credentials must not read ambient values")
+            })
+            .expect("literal config")
+            .is_empty()
         );
     }
 }

@@ -36,6 +36,7 @@ pub mod debug_environment;
 pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
 pub mod exchange_transmitter;
+mod final_result_layout;
 pub mod fragment_aggregate;
 pub mod fragment_decode_context;
 pub mod fragment_error;
@@ -61,7 +62,23 @@ pub mod fragment_validation;
 pub mod fragment_variant_path;
 pub mod fragment_window;
 pub mod management_http;
+mod native_channel_cache;
+mod native_channel_identity;
 pub mod native_client;
+mod native_connection_key_capacity;
+pub mod native_fd_capacity;
+mod native_incoming_key_capacity;
+pub mod native_lane;
+pub mod root_cow_selection_codec;
+mod root_producer_pool;
+pub mod root_record_assembly;
+pub mod root_result_reader;
+pub mod root_result_session;
+pub mod root_result_unary;
+pub mod root_scalar_container_codec;
+pub mod root_scalar_leaf_codec;
+pub mod root_statistics_codec;
+pub mod root_write_commit_codec;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
 pub mod native_control_executor;
@@ -70,6 +87,8 @@ pub mod native_fragment_query;
 mod native_fragment_query_tests;
 pub mod native_ingress;
 pub mod native_server;
+pub mod native_transport_admission;
+pub mod native_transport_geometry;
 #[cfg(test)]
 mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;
@@ -99,9 +118,8 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
 }
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_native_trust::{
@@ -111,7 +129,6 @@ use novarocks_native_trust::{
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
-use tonic::transport::Channel;
 
 /// Largest root-result payload admitted by the Native task wire.
 pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =
@@ -285,7 +302,8 @@ pub struct BackendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
     native_transport: BackendNativeTransport,
-    channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
+    channels: native_channel_cache::NativeChannelCache,
+    transport_admission: Option<native_transport_admission::NativeTransportAdmission>,
 }
 
 impl BackendDataRuntime {
@@ -298,9 +316,32 @@ impl BackendDataRuntime {
             handle,
             native_trust,
             native_transport,
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            channels: native_channel_cache::NativeChannelCache::bounded()
+                .expect("frozen Native channel-cache geometry is finite"),
+            transport_admission: None,
         }
     }
+    /// A BE host gets its own channel generation over the process admission.
+    /// Channels dialed before admission was installed are never reused.
+    pub(crate) fn with_transport_admission(
+        &self,
+        admission: native_transport_admission::NativeTransportAdmission,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            handle: self.handle.clone(),
+            native_trust: Arc::clone(&self.native_trust),
+            native_transport: self.native_transport.clone(),
+            channels: native_channel_cache::NativeChannelCache::bounded()?,
+            transport_admission: Some(admission),
+        })
+    }
+
+    pub(crate) fn transport_admission(
+        &self,
+    ) -> Option<&native_transport_admission::NativeTransportAdmission> {
+        self.transport_admission.as_ref()
+    }
+
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future + Send,
@@ -321,7 +362,7 @@ impl BackendDataRuntime {
     pub fn native_transport(&self) -> &BackendNativeTransport {
         &self.native_transport
     }
-    pub fn channels(&self) -> &Arc<Mutex<HashMap<NativeEndpoint, Channel>>> {
+    pub(crate) fn channels(&self) -> &native_channel_cache::NativeChannelCache {
         &self.channels
     }
 }

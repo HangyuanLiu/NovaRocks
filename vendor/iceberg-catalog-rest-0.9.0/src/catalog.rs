@@ -45,8 +45,8 @@ use crate::client::{
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CommitViewRequest,
     CreateNamespaceRequest, CreateTableRequest, CreateViewRequest, ListNamespaceResponse,
-    ListTablesResponse, ListViewsResponse, LoadCredentialsResult, LoadTableResult,
-    LoadViewResult, NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    ListTablesResponse, ListViewsResponse, LoadCredentialsResult, LoadTableResult, LoadViewResult,
+    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
 };
 
 /// REST catalog URI
@@ -436,7 +436,9 @@ pub struct RestAccessDelegation {
 
 impl RestAccessDelegation {
     fn new(storage_credentials: Option<Vec<crate::types::StorageCredential>>) -> Self {
-        Self { storage_credentials }
+        Self {
+            storage_credentials,
+        }
     }
 
     /// Whether the REST response carried the `storage-credentials` member.
@@ -608,7 +610,10 @@ impl Debug for DeferredStagedTableCreateWithAccessDelegation {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeferredStagedTableCreateWithAccessDelegation")
             .field("materialization", &self.materialization)
-            .field("initialization_update_count", &self.initialization_updates.len())
+            .field(
+                "initialization_update_count",
+                &self.initialization_updates.len(),
+            )
             .field("access_delegation", &self.access_delegation)
             .finish()
     }
@@ -632,7 +637,11 @@ impl StagedTableCreateWithAccessDelegation {
 
     /// Consume this result into all of its provider-private facts.
     pub fn into_parts(self) -> (Table, Vec<TableUpdate>, RestAccessDelegation) {
-        (self.table, self.initialization_updates, self.access_delegation)
+        (
+            self.table,
+            self.initialization_updates,
+            self.access_delegation,
+        )
     }
 }
 
@@ -640,7 +649,10 @@ impl Debug for StagedTableCreateWithAccessDelegation {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StagedTableCreateWithAccessDelegation")
             .field("table", &self.table)
-            .field("initialization_update_count", &self.initialization_updates.len())
+            .field(
+                "initialization_update_count",
+                &self.initialization_updates.len(),
+            )
             .field("access_delegation", &self.access_delegation)
             .finish()
     }
@@ -752,13 +764,90 @@ impl RestCatalog {
                 ErrorKind::Unexpected,
                 "Tried to list tables of a namespace that does not exist",
             )),
-            _ => {
-                Err(deserialize_unexpected_catalog_error(
-                    http_response,
-                    context.client.disable_header_redaction(),
-                )
-                .await)
-            }
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// Fetch one REST list-namespaces page, preserving the opaque continuation.
+    /// The caller owns pagination; this method never fetches a later page.
+    pub async fn list_namespaces_page(
+        &self,
+        parent: Option<&NamespaceIdent>,
+        page_token: Option<&str>,
+        page_size: usize,
+    ) -> Result<ListNamespaceResponse> {
+        if page_size == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "REST list-namespaces page size must be non-zero",
+            ));
+        }
+        let context = self.context().await?;
+        let page_size = page_size.to_string();
+        let mut request = context
+            .client
+            .request(Method::GET, context.config.namespaces_endpoint())
+            .query(&[("pageSize", page_size.as_str())]);
+        if let Some(parent) = parent {
+            request = request.query(&[("parent", parent.to_url_string())]);
+        }
+        if let Some(token) = page_token {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let response = context.client.query_catalog(request.build()?).await?;
+        match response.status() {
+            StatusCode::OK => deserialize_catalog_response::<ListNamespaceResponse>(response).await,
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "The parent parameter of the namespace provided does not exist",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// Fetch one REST list-views page, preserving the opaque continuation.
+    /// The caller owns pagination; this method never fetches a later page.
+    pub async fn list_views_page(
+        &self,
+        namespace: &NamespaceIdent,
+        page_token: Option<&str>,
+        page_size: usize,
+    ) -> Result<ListViewsResponse> {
+        if page_size == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "REST list-views page size must be non-zero",
+            ));
+        }
+        let context = self.context().await?;
+        let page_size = page_size.to_string();
+        let mut request = context
+            .client
+            .request(Method::GET, context.config.views_endpoint(namespace))
+            .query(&[("pageSize", page_size.as_str())]);
+        if let Some(token) = page_token {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let response = context.client.query_catalog(request.build()?).await?;
+        match response.status() {
+            StatusCode::OK => deserialize_catalog_response::<ListViewsResponse>(response).await,
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::NamespaceNotFound,
+                "Tried to list views under a namespace that does not exist",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
         }
     }
 
@@ -961,7 +1050,8 @@ impl RestCatalog {
         let http_response = context.client.query_catalog(request).await?;
         match http_response.status() {
             StatusCode::OK => {
-                let response = deserialize_catalog_response::<LoadCredentialsResult>(http_response).await?;
+                let response =
+                    deserialize_catalog_response::<LoadCredentialsResult>(http_response).await?;
                 Ok(RestAccessDelegation::new(response.storage_credentials))
             }
             _ => Err(deserialize_unexpected_catalog_error(
@@ -1325,16 +1415,16 @@ impl RestCatalog {
         } else {
             request
         }
-            .json(&CreateTableRequest {
-                name: creation.name,
-                location: creation.location,
-                schema: creation.schema,
-                partition_spec: creation.partition_spec,
-                write_order: creation.sort_order,
-                stage_create: Some(stage_create),
-                properties: creation.properties,
-            })
-            .build()?;
+        .json(&CreateTableRequest {
+            name: creation.name,
+            location: creation.location,
+            schema: creation.schema,
+            partition_spec: creation.partition_spec,
+            write_order: creation.sort_order,
+            stage_create: Some(stage_create),
+            properties: creation.properties,
+        })
+        .build()?;
 
         let http_response = context.client.query_catalog(request).await?;
         let response = match http_response.status() {
@@ -3065,10 +3155,7 @@ mod tests {
         );
         let namespace = NamespaceIdent::new("ns1".to_string());
 
-        let first = catalog
-            .list_tables_page(&namespace, None, 1)
-            .await
-            .unwrap();
+        let first = catalog.list_tables_page(&namespace, None, 1).await.unwrap();
         assert_eq!(first.identifiers.len(), 1);
         assert_eq!(first.identifiers[0].name, "table1");
         assert_eq!(first.next_page_token.as_deref(), Some("opaque-token"));
@@ -3084,6 +3171,108 @@ mod tests {
         config_mock.assert_async().await;
         first_page_mock.assert_async().await;
         second_page_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_page_preserves_token_and_size_without_accumulating() {
+        let mut server = Server::new_async().await;
+        let config = create_config_mock(&mut server).await;
+        let first_mock = server
+            .mock("GET", "/v1/namespaces?pageSize=1")
+            .with_status(200)
+            .with_body(r#"{"namespaces":[["ns1"]],"next-page-token":"opaque-token"}"#)
+            .create_async()
+            .await;
+        let second_mock = server
+            .mock("GET", "/v1/namespaces?pageSize=1&pageToken=opaque-token")
+            .with_status(200)
+            .with_body(r#"{"namespaces":[["ns2"]]}"#)
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let first = catalog.list_namespaces_page(None, None, 1).await.unwrap();
+        assert_eq!(first.namespaces.len(), 1);
+        assert_eq!(first.next_page_token.as_deref(), Some("opaque-token"));
+        // The second mock has not been called: the SDK owns no page loop.
+        assert!(!second_mock.matched_async().await);
+        let second = catalog
+            .list_namespaces_page(None, first.next_page_token.as_deref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(second.namespaces.len(), 1);
+        assert_eq!(second.next_page_token, None);
+        config.assert_async().await;
+        first_mock.assert_async().await;
+        second_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_page_preserves_parent_filter() {
+        let mut server = Server::new_async().await;
+        let config = create_config_mock(&mut server).await;
+        let page = server
+            .mock(
+                "GET",
+                "/v1/namespaces?pageSize=1&parent=ns1&pageToken=opaque-token",
+            )
+            .with_status(200)
+            .with_body(r#"{"namespaces":[["ns1","child"]],"next-page-token":"next"}"#)
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+        let parent = NamespaceIdent::new("ns1".to_string());
+        let response = catalog
+            .list_namespaces_page(Some(&parent), Some("opaque-token"), 1)
+            .await
+            .unwrap();
+        assert_eq!(response.namespaces.len(), 1);
+        assert_eq!(response.namespaces[0].as_ref(), &["ns1", "child"]);
+        assert_eq!(response.next_page_token.as_deref(), Some("next"));
+        config.assert_async().await;
+        page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_views_page_preserves_token_and_size_without_accumulating() {
+        let mut server = Server::new_async().await;
+        let config = create_config_mock(&mut server).await;
+        let first_mock = server.mock("GET", "/v1/namespaces/ns1/views?pageSize=1")
+            .with_status(200).with_body(r#"{"identifiers":[{"namespace":["ns1"],"name":"v1"}],"next-page-token":"opaque-token"}"#).create_async().await;
+        let second_mock = server
+            .mock(
+                "GET",
+                "/v1/namespaces/ns1/views?pageSize=1&pageToken=opaque-token",
+            )
+            .with_status(200)
+            .with_body(r#"{"identifiers":[{"namespace":["ns1"],"name":"v2"}]}"#)
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+        let namespace = NamespaceIdent::new("ns1".to_string());
+        let first = catalog.list_views_page(&namespace, None, 1).await.unwrap();
+        assert_eq!(first.identifiers.len(), 1);
+        assert_eq!(first.next_page_token.as_deref(), Some("opaque-token"));
+        // The second mock has not been called: the SDK owns no page loop.
+        assert!(!second_mock.matched_async().await);
+        let second = catalog
+            .list_views_page(&namespace, first.next_page_token.as_deref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(second.identifiers.len(), 1);
+        assert_eq!(second.next_page_token, None);
+        config.assert_async().await;
+        first_mock.assert_async().await;
+        second_mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -3548,12 +3737,12 @@ mod tests {
         let (materialization, delegation) = delegated_response.into_parts();
         assert!(delegation.is_present());
         assert_eq!(delegation.len(), 1);
-        let credential = delegation
-            .credentials()
-            .next()
-            .unwrap();
+        let credential = delegation.credentials().next().unwrap();
         assert_eq!(credential.prefix(), "s3://warehouse/database/");
-        assert_eq!(credential.config_value("s3.access-key-id"), Some("access-canary"));
+        assert_eq!(
+            credential.config_value("s3.access-key-id"),
+            Some("access-canary")
+        );
         assert!(format!("{credential:?}").contains("s3.access-key-id"));
         assert!(!format!("{credential:?}").contains("secret-canary"));
         assert!(!format!("{materialization:?}").contains("secret-canary"));
@@ -3591,7 +3780,10 @@ mod tests {
         let catalog = RestCatalog::new(
             RestCatalogConfig::builder()
                 .uri(server.url())
-                .props(HashMap::from([("token".to_string(), "refresh-token".to_string())]))
+                .props(HashMap::from([(
+                    "token".to_string(),
+                    "refresh-token".to_string(),
+                )]))
                 .build(),
             Some(Arc::new(LocalFsStorageFactory)),
         );
@@ -3604,7 +3796,10 @@ mod tests {
         assert_eq!(delegation.len(), 1);
         let credential = delegation.credentials().next().expect("credential");
         assert_eq!(credential.prefix(), "s3://warehouse/data/");
-        assert_eq!(credential.config_value("s3.access-key-id"), Some("access-canary"));
+        assert_eq!(
+            credential.config_value("s3.access-key-id"),
+            Some("access-canary")
+        );
         assert!(!format!("{credential:?}").contains("secret-canary"));
         assert!(!format!("{delegation:?}").contains("secret-canary"));
 
@@ -4022,7 +4217,8 @@ mod tests {
             .await;
         // No StorageFactory is installed. A successful deferred response
         // proves the method did not select a catalog-global FileIO first.
-        let catalog = RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build(), None);
+        let catalog =
+            RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build(), None);
 
         let staged = catalog
             .stage_create_table_typed_deferred_with_access_delegation(
@@ -4158,10 +4354,14 @@ mod tests {
         // The caller-owned FileIO is the only storage capability. A vended
         // catalog must not need a catalog-global StorageFactory to finalize a
         // successful staged commit response.
-        let catalog = RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build(), None);
+        let catalog =
+            RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build(), None);
 
         let table = catalog
-            .commit_staged_table_typed_with_file_io(typed_staged_commit(), FileIO::new_with_memory())
+            .commit_staged_table_typed_with_file_io(
+                typed_staged_commit(),
+                FileIO::new_with_memory(),
+            )
             .await
             .expect("caller-owned FileIO materializes committed staged response");
         assert_eq!(table.identifier().name, "test1");
@@ -4313,6 +4513,9 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "load_table_response.json"
             ))
+            // The sibling transaction uses its frozen base instead of
+            // reloading metadata while applying an action.
+            .expect(0)
             .create_async()
             .await;
 
@@ -4452,6 +4655,9 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "load_table_response.json"
             ))
+            // The sibling transaction uses its frozen base instead of
+            // reloading metadata while applying an action.
+            .expect(0)
             .create_async()
             .await;
 

@@ -32,7 +32,7 @@ use novarocks_proto_models::{common, novarocks as proto, plan};
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 use prost::Message;
 use std::collections::BTreeSet;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -137,10 +137,14 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let endpoint = context.handle().native_be_endpoint(0)?;
         let mode = context.handle().native_trust_mode();
         let connector = context.handle().native_probe_connector(endpoint, mode)?;
+        let control_endpoint = context.handle().native_be_control_endpoint(0)?;
+        let control_connector = context
+            .handle()
+            .native_probe_connector(control_endpoint, mode)?;
         let trust = context.handle().native_probe_trust()?;
         let authorization = authorization_header(&trust)?;
         let heartbeat: proto::HeartbeatResponse = raw_unary(
-            connector.clone(),
+            control_connector,
             HEARTBEAT_PATH,
             &authorization,
             proto::HeartbeatRequest {
@@ -615,6 +619,10 @@ fn assert_other_island_admission_cut(
     let endpoint = context.handle().native_be_endpoint(2)?;
     let mode = context.handle().native_trust_mode();
     let connector = context.handle().native_probe_connector(endpoint, mode)?;
+    let control_endpoint = context.handle().native_be_control_endpoint(2)?;
+    let control_connector = context
+        .handle()
+        .native_probe_connector(control_endpoint, mode)?;
     let trust = context.handle().native_probe_trust()?;
     let authorization = authorization_header(&trust)?;
     let rows = context.handle().frontend_backend_topology()?;
@@ -625,7 +633,7 @@ fn assert_other_island_admission_cut(
         .context("SHOW BACKENDS omitted OtherIsland admission target")?;
     let backend = target.process_id.parse::<BackendProcessId>()?;
     let heartbeat: proto::HeartbeatResponse = raw_unary(
-        connector.clone(),
+        control_connector,
         HEARTBEAT_PATH,
         &authorization,
         proto::HeartbeatRequest {
@@ -677,7 +685,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     let endpoint = context.handle().native_be_endpoint(2)?;
     let mode = context.handle().native_trust_mode();
     let connector = context.handle().native_probe_connector(endpoint, mode)?;
-    let trust = context.handle().native_probe_trust()?;
+    let trust = context.handle().native_backend_probe_trust()?;
     let authorization = authorization_header(&trust)?;
     let exchange = proto::ExchangeRequest {
         finst_id_hi: 11,
@@ -957,6 +965,135 @@ pub(super) fn raw_unary_response<M: Message, R: Message + Default>(
     raw_unary_response_with_hold(connector, path, authorization, message, None)
 }
 
+/// One explicit fixture-owned physical connection. Cloned clients multiplex
+/// streams on this connection; they never create another peer incarnation.
+pub(super) struct RawUnaryConnection {
+    runtime: Arc<tokio::runtime::Runtime>,
+    sender: Option<client::SendRequest<Bytes>>,
+    driver: Option<tokio::task::JoinHandle<Result<(), h2::Error>>>,
+}
+
+#[derive(Clone)]
+pub(super) struct RawUnaryClient {
+    runtime: Arc<tokio::runtime::Runtime>,
+    sender: client::SendRequest<Bytes>,
+}
+
+impl RawUnaryConnection {
+    pub(super) fn connect(connector: &NativeEndpointConnector) -> Result<Self> {
+        let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+        let (sender, driver) = runtime.block_on(async {
+            let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
+            let (sender, connection) = client::handshake(stream).await?;
+            let driver = tokio::spawn(connection);
+            Ok::<_, anyhow::Error>((sender, driver))
+        })?;
+        Ok(Self {
+            runtime,
+            sender: Some(sender),
+            driver: Some(driver),
+        })
+    }
+
+    pub(super) fn client(&self) -> RawUnaryClient {
+        RawUnaryClient {
+            runtime: Arc::clone(&self.runtime),
+            sender: self.sender.as_ref().expect("live raw H2 fixture").clone(),
+        }
+    }
+
+    /// Cancellation is explicit and joined: dropping a task handle alone would
+    /// detach the IO driver and leave a physical closing generation alive.
+    pub(super) fn close(&mut self) {
+        drop(self.sender.take());
+        if let Some(driver) = self.driver.take() {
+            driver.abort();
+            let _ = self.runtime.block_on(driver);
+        }
+    }
+}
+
+impl Drop for RawUnaryConnection {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl RawUnaryClient {
+    pub(super) fn response_with_hold<M: Message, R: Message + Default>(
+        &self,
+        path: &str,
+        authorization: &str,
+        message: M,
+        hold_token: Option<&str>,
+    ) -> Result<RawUnaryResponse<R>> {
+        let mut payload = Vec::new();
+        message.encode(&mut payload)?;
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        frame.push(0);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let mut sender = self.sender.clone();
+        self.runtime.block_on(async move {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/grpc")
+                .header("te", "trailers")
+                .header(header::AUTHORIZATION, authorization);
+            if let Some(token) = hold_token {
+                request = request.header("x-novarocks-ingress-hold-token", token);
+            }
+            let request = request.body(())?;
+            // Readiness belongs to each sender handle, including concurrent
+            // streams approaching the peer's advertised stream limit.
+            sender = sender.ready().await?;
+            let (response, mut send_stream) = sender.send_request(request, false)?;
+            send_stream.send_data(Bytes::from(frame), true)?;
+            let response = response.await?;
+            ensure!(
+                response.status().as_u16() == 200,
+                "raw RPC returned HTTP {}",
+                response.status()
+            );
+            let header_status = grpc_status(response.headers());
+            let header_message = grpc_message(response.headers());
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk?;
+                bytes.extend_from_slice(&chunk);
+                body.flow_control().release_capacity(chunk.len())?;
+            }
+            let trailers = body.trailers().await?;
+            let status = header_status
+                .or_else(|| trailers.as_ref().and_then(grpc_status))
+                .context("raw RPC omitted grpc-status")?;
+            let message = header_message.or_else(|| trailers.as_ref().and_then(grpc_message));
+            let decoded = if bytes.is_empty() {
+                None
+            } else {
+                ensure!(
+                    bytes.len() >= 5 && bytes[0] == 0,
+                    "raw RPC response lacks uncompressed gRPC frame"
+                );
+                let length = u32::from_be_bytes(bytes[1..5].try_into().expect("frame header width"))
+                    as usize;
+                ensure!(
+                    bytes.len() == length + 5,
+                    "raw RPC response frame length mismatch"
+                );
+                Some(R::decode(&bytes[5..]).context("decode raw gRPC response")?)
+            };
+            Ok(RawUnaryResponse {
+                grpc_status: status,
+                grpc_message: message,
+                message: decoded,
+            })
+        })
+    }
+}
+
 pub(super) fn raw_unary_response_with_hold<M: Message, R: Message + Default>(
     connector: &NativeEndpointConnector,
     path: &str,
@@ -964,73 +1101,12 @@ pub(super) fn raw_unary_response_with_hold<M: Message, R: Message + Default>(
     message: M,
     hold_token: Option<&str>,
 ) -> Result<RawUnaryResponse<R>> {
-    let mut payload = Vec::new();
-    message.encode(&mut payload)?;
-    let mut frame = Vec::with_capacity(payload.len() + 5);
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
-    let connector = connector.clone();
-    let path = path.to_owned();
-    let authorization = authorization.to_owned();
-    let hold_token = hold_token.map(ToOwned::to_owned);
-    tokio::runtime::Runtime::new()?.block_on(async move {
-        let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
-        let (mut sender, connection) = client::handshake(stream).await?;
-        let driver = tokio::spawn(async move { connection.await });
-        let mut request = Request::builder()
-            .method("POST")
-            .uri(path)
-            .header(header::CONTENT_TYPE, "application/grpc")
-            .header("te", "trailers")
-            .header(header::AUTHORIZATION, authorization);
-        if let Some(token) = hold_token {
-            request = request.header("x-novarocks-ingress-hold-token", token);
-        }
-        let request = request.body(())?;
-        let (response, mut send_stream) = sender.send_request(request, false)?;
-        send_stream.send_data(Bytes::from(frame), true)?;
-        let response = response.await?;
-        ensure!(
-            response.status().as_u16() == 200,
-            "raw RPC returned HTTP {}",
-            response.status()
-        );
-        let header_status = grpc_status(response.headers());
-        let header_message = grpc_message(response.headers());
-        let mut body = response.into_body();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = body.data().await {
-            bytes.extend_from_slice(&chunk?);
-        }
-        let trailers = body.trailers().await?;
-        let status = header_status
-            .or_else(|| trailers.as_ref().and_then(grpc_status))
-            .context("raw RPC omitted grpc-status")?;
-        let message = header_message.or_else(|| trailers.as_ref().and_then(grpc_message));
-        driver.abort();
-        let _ = driver.await;
-        let decoded = if bytes.is_empty() {
-            None
-        } else {
-            ensure!(
-                bytes.len() >= 5 && bytes[0] == 0,
-                "raw RPC response lacks uncompressed gRPC frame"
-            );
-            let length =
-                u32::from_be_bytes(bytes[1..5].try_into().expect("frame header width")) as usize;
-            ensure!(
-                bytes.len() == length + 5,
-                "raw RPC response frame length mismatch"
-            );
-            Some(R::decode(&bytes[5..]).context("decode raw gRPC response")?)
-        };
-        Ok(RawUnaryResponse {
-            grpc_status: status,
-            grpc_message: message,
-            message: decoded,
-        })
-    })
+    // Preserve the single-request helper's default: one fresh connection, the
+    // same wire/status decode, and a joined driver before returning to caller.
+    let connection = RawUnaryConnection::connect(connector)?;
+    connection
+        .client()
+        .response_with_hold(path, authorization, message, hold_token)
 }
 
 fn grpc_status(headers: &http::HeaderMap) -> Option<u16> {

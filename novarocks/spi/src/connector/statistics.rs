@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
-    ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorMutationOperationId, ConnectorPayloadRetentionGuard, ConnectorRequestContext,
+    ConnectorTableHandle, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 /// Maximum size of one provider-owned data-version, evidence-revision, plan,
@@ -223,10 +223,11 @@ impl StatisticsColumnSelection {
 }
 
 /// Provider-neutral identity of one artifact expected from ordinary execution.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug)]
 pub struct StatisticsArtifactIdentity {
     input_fields: Vec<i32>,
     blob_type: Arc<str>,
+    retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 impl StatisticsArtifactIdentity {
@@ -264,6 +265,7 @@ impl StatisticsArtifactIdentity {
         Ok(Self {
             input_fields,
             blob_type,
+            retention: None,
         })
     }
 
@@ -276,13 +278,38 @@ impl StatisticsArtifactIdentity {
     }
 }
 
+// Retention is a lifetime fact and has no semantic identity.
+impl PartialEq for StatisticsArtifactIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.input_fields == other.input_fields && self.blob_type == other.blob_type
+    }
+}
+impl Eq for StatisticsArtifactIdentity {}
+impl PartialOrd for StatisticsArtifactIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for StatisticsArtifactIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.input_fields, &self.blob_type).cmp(&(&other.input_fields, &other.blob_type))
+    }
+}
+impl std::hash::Hash for StatisticsArtifactIdentity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.input_fields, state);
+        std::hash::Hash::hash(&self.blob_type, state);
+    }
+}
+
 /// Generic long-form artifact row produced after an ordinary aggregate and
 /// Unpivot. This carrier contains no provider session or catalog authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct StatisticsArtifactDraft {
     identity: StatisticsArtifactIdentity,
     body: Bytes,
     properties: BTreeMap<String, String>,
+    retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 impl StatisticsArtifactDraft {
@@ -292,34 +319,49 @@ impl StatisticsArtifactDraft {
         body: Bytes,
         properties: BTreeMap<String, String>,
     ) -> Result<Self, ConnectorError> {
-        if body.len() > MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "statistics artifact body exceeds the packet limit",
-            ));
-        }
-        let property_bytes = properties.iter().try_fold(0usize, |total, (key, value)| {
-            total
-                .checked_add(key.len())
-                .and_then(|value_total| value_total.checked_add(value.len()))
-        });
-        if property_bytes.is_none_or(|bytes| bytes > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "statistics artifact properties exceed the payload limit",
-            ));
-        }
-        if properties.keys().any(|key| key.is_empty()) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "statistics artifact property name must not be empty",
-            ));
-        }
+        validate_artifact_parts(body.len(), &properties)?;
         Ok(Self {
             identity: StatisticsArtifactIdentity::try_new(input_fields, blob_type)?,
             body,
             properties,
+            retention: None,
         })
+    }
+
+    /// The inputs must already be covered by the caller's admitted holder.
+    /// This factory retains that holder before validation allocates scratch;
+    /// it neither admits an ungoverned graph nor acquires fresh capacity.
+    pub fn try_new_with_guard(
+        input_fields: Vec<i32>,
+        blob_type: impl Into<Arc<str>>,
+        body: Bytes,
+        properties: BTreeMap<String, String>,
+        guard: ConnectorPayloadRetentionGuard,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new(input_fields, blob_type, body, properties)
+            .map(|draft| draft.attach_guard(guard))
+    }
+
+    /// Ownership handoff for an already-covered graph, with no payload copy.
+    /// Callers must hold their admission before constructing the original.
+    pub fn attach_guard(mut self, guard: ConnectorPayloadRetentionGuard) -> Self {
+        let guard = match self.retention.take() {
+            Some(previous) => ConnectorPayloadRetentionGuard::new((previous, guard)),
+            None => guard,
+        };
+        self.body = Bytes::from_owner(RetainedArtifactBody {
+            body: self.body,
+            _guard: guard.clone(),
+        });
+        self.identity.retention = Some(guard.clone());
+        // Keep any previous holder through the body and identity when a
+        // covered graph is handed between owners.
+        self.retention = Some(guard);
+        self
+    }
+
+    pub fn into_guarded_parts(self) -> StatisticsArtifactParts {
+        StatisticsArtifactParts { draft: self }
     }
 
     pub fn identity(&self) -> &StatisticsArtifactIdentity {
@@ -334,8 +376,92 @@ impl StatisticsArtifactDraft {
         &self.properties
     }
 
+    /// Transition-only extraction. Guarded consumers must use
+    /// `into_guarded_parts` so property metadata retains its holder as well.
     pub fn into_parts(self) -> (StatisticsArtifactIdentity, Bytes, BTreeMap<String, String>) {
         (self.identity, self.body, self.properties)
+    }
+}
+
+fn validate_artifact_parts(
+    body_len: usize,
+    properties: &BTreeMap<String, String>,
+) -> Result<(), ConnectorError> {
+    if body_len > MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "statistics artifact body exceeds the packet limit",
+        ));
+    }
+    let property_bytes = properties.iter().try_fold(0usize, |total, (key, value)| {
+        total
+            .checked_add(key.len())
+            .and_then(|value_total| value_total.checked_add(value.len()))
+    });
+    if property_bytes.is_none_or(|bytes| bytes > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "statistics artifact properties exceed the payload limit",
+        ));
+    }
+    if properties.keys().any(|key| key.is_empty()) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "statistics artifact property name must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+impl PartialEq for StatisticsArtifactDraft {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.body == other.body
+            && self.properties == other.properties
+    }
+}
+impl Eq for StatisticsArtifactDraft {}
+
+// Drop the actual backing before its caller-provided capacity holder.
+struct RetainedArtifactBody {
+    body: Bytes,
+    _guard: ConnectorPayloadRetentionGuard,
+}
+impl AsRef<[u8]> for RetainedArtifactBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// Retained decomposition for provider normalization and assembly. Borrowing
+/// metadata does not detach it; cloning this carrier retains the same holder.
+#[derive(Clone, Debug)]
+pub struct StatisticsArtifactParts {
+    draft: StatisticsArtifactDraft,
+}
+impl StatisticsArtifactParts {
+    pub fn identity(&self) -> &StatisticsArtifactIdentity {
+        self.draft.identity()
+    }
+    pub fn body(&self) -> &Bytes {
+        self.draft.body()
+    }
+    pub fn properties(&self) -> &BTreeMap<String, String> {
+        self.draft.properties()
+    }
+
+    /// Mutate metadata while the carrier and its holder remain owned. The
+    /// caller covers new growth with the same pre-admitted capacity.
+    pub fn properties_mut(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.draft.properties
+    }
+
+    /// Revalidate normalized metadata without replacing the retained identity
+    /// or body. Error meanings and ordering match the ordinary constructor.
+    pub fn try_into_draft(self) -> Result<StatisticsArtifactDraft, ConnectorError> {
+        let draft = self.draft;
+        validate_artifact_parts(draft.body.len(), &draft.properties)?;
+        Ok(draft)
     }
 }
 
@@ -1614,5 +1740,140 @@ mod tests {
                 "an exact value on a {relation:?} basis still describes other rows"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn identity_clone_alone_retains_the_admitted_metadata_holder() {
+        let holder = Arc::new(());
+        let weak = Arc::downgrade(&holder);
+        let draft = StatisticsArtifactDraft::try_new_with_guard(
+            vec![1],
+            "theta",
+            Bytes::new(),
+            BTreeMap::new(),
+            ConnectorPayloadRetentionGuard::new(holder),
+        )
+        .unwrap();
+        let identity = draft.identity().clone();
+        drop(draft);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(identity.input_fields(), [1]);
+        drop(identity);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn artifact_body_slice_and_metadata_identity_outlive_draft_with_same_holder() {
+        let holder = Arc::new(());
+        let weak = Arc::downgrade(&holder);
+        let draft = StatisticsArtifactDraft::try_new_with_guard(
+            vec![1],
+            "theta",
+            Bytes::from_static(b"body"),
+            BTreeMap::new(),
+            ConnectorPayloadRetentionGuard::new(holder),
+        )
+        .unwrap();
+        let plain = StatisticsArtifactDraft::try_new(
+            vec![1],
+            "theta",
+            Bytes::from_static(b"body"),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(draft, plain);
+        assert_eq!(
+            draft.identity().cmp(plain.identity()),
+            std::cmp::Ordering::Equal
+        );
+        let hash = |id: &StatisticsArtifactIdentity| {
+            let mut state = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(id, &mut state);
+            std::hash::Hasher::finish(&state)
+        };
+        assert_eq!(hash(draft.identity()), hash(plain.identity()));
+        let body = draft.body().slice(1..3);
+        let identity = draft.identity().clone();
+        let mut parts = draft.into_guarded_parts();
+        parts.properties_mut().insert("ndv".into(), "1".into());
+        let normalized = parts.try_into_draft().unwrap();
+        let metadata = normalized.clone().into_guarded_parts();
+        drop(normalized);
+        drop(identity);
+        drop(body);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(metadata.properties().get("ndv").unwrap(), "1");
+        drop(metadata);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn last_body_slice_releases_backing_before_capacity_holder() {
+        struct Payload {
+            data: Vec<u8>,
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl AsRef<[u8]> for Payload {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.events.lock().unwrap().push("payload");
+            }
+        }
+        struct Holder(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("holder");
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let body = Bytes::from_owner(Payload {
+            data: vec![1, 2, 3],
+            events: events.clone(),
+        });
+        let draft = StatisticsArtifactDraft::try_new_with_guard(
+            vec![1],
+            "theta",
+            body,
+            BTreeMap::new(),
+            ConnectorPayloadRetentionGuard::new(Holder(events.clone())),
+        )
+        .unwrap();
+        let alias = draft.body().slice(1..2);
+        drop(draft);
+        assert!(events.lock().unwrap().is_empty());
+        drop(alias);
+        assert_eq!(*events.lock().unwrap(), ["payload", "holder"]);
+    }
+
+    #[test]
+    fn guarded_normalization_revalidates_metadata_with_original_errors() {
+        let draft = StatisticsArtifactDraft::try_new_with_guard(
+            vec![1],
+            "theta",
+            Bytes::new(),
+            BTreeMap::new(),
+            ConnectorPayloadRetentionGuard::new(()),
+        )
+        .unwrap();
+        let mut parts = draft.into_guarded_parts();
+        parts.properties_mut().insert("".into(), "x".into());
+        let error = parts.try_into_draft().unwrap_err();
+        let plain = StatisticsArtifactDraft::try_new(
+            vec![1],
+            "theta",
+            Bytes::new(),
+            BTreeMap::from([(String::new(), "x".into())]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), plain.kind());
+        assert_eq!(error.to_string(), plain.to_string());
     }
 }

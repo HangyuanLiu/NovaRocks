@@ -43,3 +43,6 @@ novarocks-server/log/
 # own contents, but a failed one deliberately retains artifacts for diagnosis.
 novarocks-server/.server-binary-smoke-runtime/
 /tests/sql/.runtime/
+
+# Verification receipts and scratch probes belong in ignored logs/.
+/docs/testing/mem-1-m07/evidence/

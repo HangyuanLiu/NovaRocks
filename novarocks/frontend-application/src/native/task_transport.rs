@@ -54,13 +54,18 @@ use prometheus::{
     HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry,
 };
 
+#[cfg(test)]
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome, OperationShape,
+    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome,
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextRef, TaskIdentity,
     TaskOperationId, TaskStatusCursor, UpdateQueryContext,
 };
+use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_proto_codec::FieldPath;
+#[cfg(test)]
+use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
+use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_query_application::coordination::{
@@ -679,18 +684,19 @@ struct TaskBackendTarget {
 }
 
 fn freeze_targets(
-    backends: &[(BackendProcessId, RuntimeEndpoint)],
+    backends: &[BackendProcessDescriptor],
     data_runtime: &FrontendDataRuntime,
 ) -> Result<BTreeMap<BackendProcessId, TaskBackendTarget>, String> {
     if backends.is_empty() {
         return Err("the native task transport requires at least one backend".to_owned());
     }
     let mut targets = BTreeMap::new();
-    for (process_id, endpoint) in backends {
+    for descriptor in backends {
+        let process_id = descriptor.process_id();
         let target = TaskBackendTarget {
-            client: Client::new(endpoint.native_endpoint().clone(), data_runtime.clone()),
+            client: Client::for_backend(descriptor.clone(), data_runtime.clone()),
         };
-        if targets.insert(*process_id, target).is_some() {
+        if targets.insert(process_id, target).is_some() {
             return Err(format!("duplicate backend process {process_id}"));
         }
     }
@@ -724,7 +730,7 @@ impl fmt::Debug for NativeTaskOperationSink {
 
 impl NativeTaskOperationSink {
     pub(crate) fn new(
-        backends: &[(BackendProcessId, RuntimeEndpoint)],
+        backends: &[BackendProcessDescriptor],
         transport: TransportBudget,
         attempt: AttemptWireFacts,
         acks: TaskAckIntakeHandle,
@@ -859,7 +865,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
             let encoded = encode_operation(intent, &self.attempt);
             match encoded {
                 Ok(operation) => {
-                    operations.push((is_small_control(intent.shape()), operation));
+                    operations.push((is_small_control(&intent), operation));
                     sent.push(SentOperation {
                         operation_id: intent.operation_id(),
                         kind: intent.kind(),
@@ -968,21 +974,9 @@ fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTransportLane {
     }
 }
 
-const fn is_small_control(shape: OperationShape) -> bool {
-    match shape {
-        OperationShape::RenewQueryExecutionLease
-        | OperationShape::CancelTask
-        | OperationShape::QuiesceQueryContext
-        | OperationShape::AbortQueryContext
-        | OperationShape::ReleaseQueryContext => true,
-        OperationShape::AcquireQueryContextAdmissionTicket
-        | OperationShape::EstablishQueryContext
-        | OperationShape::AdvanceQueryContextDomain
-        | OperationShape::CreateTask
-        | OperationShape::UpdateTask
-        | OperationShape::FetchTaskDynamicFilters
-        | OperationShape::GetFinalTaskInfo => false,
-    }
+fn is_small_control(intent: &OperationIntent) -> bool {
+    intent.native_method()
+        == novarocks_proto_codec::native_rpc::NativeRpcMethod::ApplyTaskControlOperations
 }
 
 enum EncodedMethodRequest {
@@ -1010,7 +1004,8 @@ impl EncodedMethodBatch {
 }
 
 /// Preserve dispatcher order while directing each contiguous run to the
-/// method whose closed input grammar accepts it.
+/// method whose closed input grammar accepts it. A run also shares one
+/// absolute submit deadline: a longer item must not renew a shorter item.
 fn encode_method_batches(
     operations: Vec<(bool, proto::TaskOperation)>,
     budget: TransportBudget,
@@ -1018,19 +1013,22 @@ fn encode_method_batches(
     let mut batches = Vec::new();
     let mut iter = operations.into_iter().peekable();
     while let Some((control, first)) = iter.next() {
+        let wait_millis = first
+            .envelope
+            .as_ref()
+            .map(|envelope| envelope.max_wait_millis);
         let mut run = vec![first];
-        while iter
-            .peek()
-            .is_some_and(|(next_control, _)| *next_control == control)
-        {
+        while iter.peek().is_some_and(|(next_control, operation)| {
+            *next_control == control
+                && operation
+                    .envelope
+                    .as_ref()
+                    .map(|envelope| envelope.max_wait_millis)
+                    == wait_millis
+        }) {
             run.push(iter.next().expect("peeked operation exists").1);
         }
-        let deadline = run
-            .iter()
-            .filter_map(|operation| operation.envelope.as_ref())
-            .map(|envelope| Duration::from_millis(envelope.max_wait_millis))
-            .max()
-            .unwrap_or_default();
+        let deadline = Duration::from_millis(wait_millis.unwrap_or_default());
         let items = run.len();
         let request = if control {
             EncodedMethodRequest::Control(encode_control_operation_batch(run, budget)?)
@@ -1292,7 +1290,7 @@ fn acknowledgement(
 
 /// One `ApplyTaskOperations` round trip, classified by type.
 ///
-/// The deadline is the longest wait the batch itself requested. A batch that
+/// The deadline is the shared absolute submit deadline of this run. A batch that
 /// has not answered by then has a genuinely unknown outcome, which is exactly
 /// what the retry rule exists for.
 async fn send_operations(
@@ -1302,8 +1300,12 @@ async fn send_operations(
     intake: &TaskAckIntakeHandle,
     establishes: &[(TaskOperationId, QueryContextRef)],
 ) -> Result<proto::ApplyTaskOperationsResponse, OperationDispatchResult> {
+    let method = match &request {
+        EncodedMethodRequest::Ordinary(_) => NativeRpcMethod::ApplyTaskOperations,
+        EncodedMethodRequest::Control(_) => NativeRpcMethod::ApplyTaskControlOperations,
+    };
     let (mut grpc, acquired) =
-        tokio::time::timeout_at(expires_at, client.grpc_with_channel_identity())
+        tokio::time::timeout_at(expires_at, client.grpc_with_channel_identity(method))
             .await
             .map_err(|_| OperationDispatchResult::TransportUnknown)?
             .map_err(|error| {
@@ -1316,7 +1318,7 @@ async fn send_operations(
         // Nothing was submitted, so nothing was applied. It is still reported
         // as unknown rather than as a rejection, because a caller may only
         // conclude "not applied" from an answer it received.
-        client.invalidate_channel_if_current(&acquired);
+        client.invalidate_channel_if_current(method, &acquired);
         return Err(OperationDispatchResult::TransportUnknown);
     }
     let call = async {
@@ -1375,7 +1377,7 @@ async fn send_operations(
         // An unknown outcome may have poisoned this stream. An old request
         // cannot evict a replacement channel already installed by another
         // attempt or by membership reconciliation.
-        client.invalidate_channel_if_current(&acquired);
+        client.invalidate_channel_if_current(method, &acquired);
     }
     outcome
 }
@@ -1470,7 +1472,7 @@ impl TaskStatusSubscriber {
     /// This is a migration-only constructor. New ownership must use
     /// [`Self::new_context_aware`].
     pub(crate) fn new(
-        backends: &[(BackendProcessId, RuntimeEndpoint)],
+        backends: &[BackendProcessDescriptor],
         intake: StatusIntakeHandle,
         error_budget: u32,
         data_runtime: FrontendDataRuntime,
@@ -1490,7 +1492,7 @@ impl TaskStatusSubscriber {
 
     /// Builds the single-stream task and query-context observation transport.
     pub(crate) fn new_context_aware(
-        backends: &[(BackendProcessId, RuntimeEndpoint)],
+        backends: &[BackendProcessDescriptor],
         intake: StatusIntakeHandle,
         context_convergence: ContextConvergenceIntakeHandle,
         error_budget: u32,
@@ -2045,7 +2047,7 @@ async fn open_subscription(
     let request = encode_context_aware_subscribe_task_status(context, &cursors, context_cursor)
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
     let mut grpc = client
-        .grpc_with_channel_error()
+        .grpc_with_channel_error(NativeRpcMethod::SubscribeTaskStatus)
         .await
         .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
     grpc.subscribe_task_status(tonic::Request::new(request))
@@ -2089,7 +2091,7 @@ impl Drop for CoveredSubscription {
 
 impl CoveredTaskStatusSubscriber {
     pub(crate) fn new(
-        backends: &[(BackendProcessId, RuntimeEndpoint)],
+        backends: &[BackendProcessDescriptor],
         intake: Arc<ObservationIntake>,
         error_budget: u32,
         data_runtime: FrontendDataRuntime,
@@ -2368,7 +2370,7 @@ async fn open_covered_subscription(
     let request = encode_covered_subscribe_task_status(request)
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
     let mut grpc = client
-        .grpc_with_channel_error()
+        .grpc_with_channel_error(NativeRpcMethod::SubscribeTaskStatus)
         .await
         .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
     grpc.subscribe_task_status(tonic::Request::new(request))
@@ -3131,18 +3133,102 @@ mod tests {
     struct PeerState {
         applied: Vec<proto::ApplyTaskOperationsRequest>,
         control_requests: usize,
+        heartbeat_descriptor: Option<BackendProcessDescriptor>,
+        heartbeats: Vec<proto::HeartbeatRequest>,
         apply_answers: VecDeque<ApplyAnswer>,
         subscribed: Vec<proto::SubscribeTaskStatusRequest>,
         subscribe_answers: VecDeque<SubscribeAnswer>,
         held: Vec<tokio::sync::mpsc::Sender<Result<proto::TaskStatusStreamEvent, Status>>>,
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct TaskWirePeer {
         state: Arc<Mutex<PeerState>>,
+        domain: NativeEndpointDomain,
+    }
+
+    impl Default for TaskWirePeer {
+        fn default() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PeerState::default())),
+                domain: NativeEndpointDomain::BackendData,
+            }
+        }
     }
 
     impl TaskWirePeer {
+        async fn apply_operations(
+            &self,
+            request: Request<proto::ApplyTaskOperationsRequest>,
+        ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
+            let request = request.into_inner();
+            let answer = {
+                let mut state = self.state.lock().expect("peer state");
+                state.applied.push(request.clone());
+                state
+                    .apply_answers
+                    .pop_front()
+                    .unwrap_or(ApplyAnswer::Outcomes(vec![
+                        OperationOutcome::Accepted;
+                        request.operations.len()
+                    ]))
+            };
+            let (outcomes, reversed, truncated) = match answer {
+                ApplyAnswer::Outcomes(outcomes) => (
+                    outcomes
+                        .into_iter()
+                        .map(|outcome| (outcome, None))
+                        .collect(),
+                    false,
+                    false,
+                ),
+                ApplyAnswer::Reversed(outcomes) => (
+                    outcomes
+                        .into_iter()
+                        .map(|outcome| (outcome, None))
+                        .collect(),
+                    true,
+                    false,
+                ),
+                ApplyAnswer::Truncated(outcomes) => (
+                    outcomes
+                        .into_iter()
+                        .map(|outcome| (outcome, None))
+                        .collect(),
+                    false,
+                    true,
+                ),
+                ApplyAnswer::WithAck(items) => (items, false, false),
+                ApplyAnswer::Reject(code) => {
+                    return Err(Status::new(code, "task wire test peer rejection"));
+                }
+            };
+            let mut receipts = request
+                .operations
+                .iter()
+                .zip(outcomes)
+                .map(|(operation, (outcome, ack))| proto::TaskOperationReceipt {
+                    operation_id: operation
+                        .envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.operation_id.clone()),
+                    outcome: encode_operation_outcome(outcome),
+                    safe_detail: String::new(),
+                    safe_field_path: None,
+                    ack,
+                })
+                .collect::<Vec<_>>();
+            if reversed {
+                receipts.reverse();
+            }
+            if truncated {
+                receipts.pop();
+            }
+            Ok(Response::new(proto::ApplyTaskOperationsResponse {
+                receipts,
+            }))
+        }
+
         fn rejected(rpc: &str) -> Status {
             Status::failed_precondition(format!("task wire test peer rejects {rpc}"))
         }
@@ -3215,78 +3301,19 @@ mod tests {
             &self,
             request: Request<proto::ApplyTaskOperationsRequest>,
         ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
-            let request = request.into_inner();
-            let answer = {
-                let mut state = self.state.lock().expect("peer state");
-                state.applied.push(request.clone());
-                state
-                    .apply_answers
-                    .pop_front()
-                    .unwrap_or(ApplyAnswer::Outcomes(vec![
-                        OperationOutcome::Accepted;
-                        request.operations.len()
-                    ]))
-            };
-            let (outcomes, reversed, truncated) = match answer {
-                ApplyAnswer::Outcomes(outcomes) => (
-                    outcomes
-                        .into_iter()
-                        .map(|outcome| (outcome, None))
-                        .collect(),
-                    false,
-                    false,
-                ),
-                ApplyAnswer::Reversed(outcomes) => (
-                    outcomes
-                        .into_iter()
-                        .map(|outcome| (outcome, None))
-                        .collect(),
-                    true,
-                    false,
-                ),
-                ApplyAnswer::Truncated(outcomes) => (
-                    outcomes
-                        .into_iter()
-                        .map(|outcome| (outcome, None))
-                        .collect(),
-                    false,
-                    true,
-                ),
-                ApplyAnswer::WithAck(items) => (items, false, false),
-                ApplyAnswer::Reject(code) => {
-                    return Err(Status::new(code, "task wire test peer rejection"));
-                }
-            };
-            let mut receipts = request
-                .operations
-                .iter()
-                .zip(outcomes)
-                .map(|(operation, (outcome, ack))| proto::TaskOperationReceipt {
-                    operation_id: operation
-                        .envelope
-                        .as_ref()
-                        .and_then(|envelope| envelope.operation_id.clone()),
-                    outcome: encode_operation_outcome(outcome),
-                    safe_detail: String::new(),
-                    safe_field_path: None,
-                    ack,
-                })
-                .collect::<Vec<_>>();
-            if reversed {
-                receipts.reverse();
+            if !NativeRpcMethod::ApplyTaskOperations.is_allowed_at(self.domain) {
+                return Err(Self::rejected("wrong endpoint domain"));
             }
-            if truncated {
-                receipts.pop();
-            }
-            Ok(Response::new(proto::ApplyTaskOperationsResponse {
-                receipts,
-            }))
+            self.apply_operations(request).await
         }
 
         async fn apply_task_control_operations(
             &self,
             request: Request<proto::ApplyTaskControlOperationsRequest>,
         ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
+            if !NativeRpcMethod::ApplyTaskControlOperations.is_allowed_at(self.domain) {
+                return Err(Self::rejected("wrong endpoint domain"));
+            }
             self.state.lock().expect("peer state").control_requests += 1;
             let operations = request
                 .into_inner()
@@ -3294,6 +3321,14 @@ mod tests {
                 .into_iter()
                 .map(|operation| {
                     let body = match operation.control.expect("control body") {
+                        proto::task_control_operation::Control::CloseExchangeDestinations(close) => {
+                            proto::task_operation::Operation::UpdateTask(proto::UpdateTaskRequest {
+                                identity: close.identity,
+                                domains: close.destinations.into_iter().map(|destination| proto::TaskDomainUpdate {
+                                    domain: Some(proto::task_domain_update::Domain::CloseExchangeDestination(destination)),
+                                }).collect(),
+                            })
+                        }
                         proto::task_control_operation::Control::RenewLease(renew) => {
                             proto::task_operation::Operation::UpdateQueryContext(
                                 proto::UpdateQueryContextRequest {
@@ -3324,7 +3359,7 @@ mod tests {
                     }
                 })
                 .collect();
-            self.apply_task_operations(Request::new(proto::ApplyTaskOperationsRequest {
+            self.apply_operations(Request::new(proto::ApplyTaskOperationsRequest {
                 operations,
             }))
             .await
@@ -3334,6 +3369,9 @@ mod tests {
             &self,
             request: Request<proto::SubscribeTaskStatusRequest>,
         ) -> Result<Response<Self::SubscribeTaskStatusStream>, Status> {
+            if !NativeRpcMethod::SubscribeTaskStatus.is_allowed_at(self.domain) {
+                return Err(Self::rejected("wrong endpoint domain"));
+            }
             let answer = {
                 let mut state = self.state.lock().expect("peer state");
                 state.subscribed.push(request.into_inner());
@@ -3383,6 +3421,13 @@ mod tests {
             Err(Self::rejected("FetchTaskResult"))
         }
 
+        async fn fetch_root_result(
+            &self,
+            _request: Request<proto::FetchRootResultRequest>,
+        ) -> Result<Response<proto::FetchRootResultResponse>, Status> {
+            Err(Self::rejected("FetchRootResult"))
+        }
+
         async fn exchange(
             &self,
             _request: Request<tonic::Streaming<proto::ExchangeRequest>>,
@@ -3427,22 +3472,58 @@ mod tests {
 
         async fn heartbeat(
             &self,
-            _request: Request<proto::HeartbeatRequest>,
+            request: Request<proto::HeartbeatRequest>,
         ) -> Result<Response<proto::HeartbeatResponse>, Status> {
-            Err(Self::rejected("Heartbeat"))
+            if !NativeRpcMethod::Heartbeat.is_allowed_at(self.domain) {
+                return Err(Self::rejected("wrong endpoint domain"));
+            }
+            let descriptor = {
+                let mut state = self.state.lock().expect("peer state");
+                state.heartbeats.push(request.into_inner());
+                state
+                    .heartbeat_descriptor
+                    .clone()
+                    .ok_or_else(|| Self::rejected("missing heartbeat fixture"))?
+            };
+            Ok(Response::new(proto::HeartbeatResponse {
+                num_cores: 2,
+                descriptor: Some(
+                    novarocks_proto_codec::membership::BackendProcessDescriptor::from_contract(
+                        descriptor,
+                    )
+                    .as_proto()
+                    .clone(),
+                ),
+                reported_state: proto::BackendReportedState::Running as i32,
+                admission_epoch_capability: Some(
+                    novarocks_task_codec::identity::encode_admission_epoch_capability(
+                        novarocks_execution_contract::AdmissionEpochCapability::try_from_bytes(
+                            [0x61; 16],
+                        )
+                        .unwrap(),
+                    ),
+                ),
+            }))
         }
     }
 
-    /// One live loopback peer and the endpoint that reaches it.
+    /// Two independent sockets for one shared process fixture.
     struct Loopback {
         peer: TaskWirePeer,
         endpoint: RuntimeEndpoint,
-        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        served: tokio::task::JoinHandle<()>,
+        control_endpoint: RuntimeEndpoint,
+        shutdown: [Option<tokio::sync::oneshot::Sender<()>>; 2],
+        served: [tokio::task::JoinHandle<()>; 2],
     }
 
     impl Loopback {
-        async fn start() -> Self {
+        async fn serve(
+            peer: TaskWirePeer,
+        ) -> (
+            RuntimeEndpoint,
+            tokio::sync::oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+        ) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind the loopback task peer");
@@ -3451,34 +3532,77 @@ mod tests {
                 let item = listener.accept().await.map(|(stream, _)| stream);
                 Some((item, listener))
             });
-            let peer = TaskWirePeer::default();
-            let service = peer.clone();
             let (shutdown, stop) = tokio::sync::oneshot::channel();
             let served = tokio::spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(NovaRocksGrpcServer::new(service))
+                    .add_service(NovaRocksGrpcServer::new(peer))
                     .serve_with_incoming_shutdown(incoming, async {
                         let _ = stop.await;
                     })
                     .await
                     .expect("serve the loopback task peer");
             });
+            (
+                RuntimeEndpoint::new("127.0.0.1", i32::from(address.port()))
+                    .expect("valid loopback endpoint"),
+                shutdown,
+                served,
+            )
+        }
+
+        async fn start() -> Self {
+            let peer = TaskWirePeer::default();
+            let (endpoint, data_shutdown, data_served) = Self::serve(peer.clone()).await;
+            let mut control_peer = peer.clone();
+            control_peer.domain = NativeEndpointDomain::BackendControl;
+            let (control_endpoint, control_shutdown, control_served) =
+                Self::serve(control_peer).await;
+            assert_ne!(endpoint, control_endpoint);
             Self {
                 peer,
-                endpoint: RuntimeEndpoint::new("127.0.0.1", i32::from(address.port()))
-                    .expect("a valid loopback endpoint"),
-                shutdown: Some(shutdown),
-                served,
+                endpoint,
+                control_endpoint,
+                shutdown: [Some(data_shutdown), Some(control_shutdown)],
+                served: [data_served, control_served],
             }
         }
+
+        fn descriptor(&self, process: BackendProcessId) -> BackendProcessDescriptor {
+            test_descriptor(
+                process,
+                self.endpoint.clone(),
+                self.control_endpoint.clone(),
+            )
+        }
+    }
+
+    fn test_descriptor(
+        process: BackendProcessId,
+        data: RuntimeEndpoint,
+        control: RuntimeEndpoint,
+    ) -> BackendProcessDescriptor {
+        BackendProcessDescriptor::try_new(
+            process,
+            data,
+            control,
+            "task-wire-test",
+            "task-wire-test",
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            4096,
+        )
+        .expect("independent fixture endpoints")
     }
 
     impl Drop for Loopback {
         fn drop(&mut self) {
-            if let Some(shutdown) = self.shutdown.take() {
-                let _ = shutdown.send(());
+            for shutdown in &mut self.shutdown {
+                if let Some(shutdown) = shutdown.take() {
+                    let _ = shutdown.send(());
+                }
             }
-            self.served.abort();
+            for served in &self.served {
+                served.abort();
+            }
         }
     }
 
@@ -3492,7 +3616,7 @@ mod tests {
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
         let sink = NativeTaskOperationSink::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             TransportBudget::DEFAULT,
             test_attempt_facts(),
             acks.handle(),
@@ -3504,6 +3628,129 @@ mod tests {
             sink,
             acks,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_descriptor_routes_ordinary_and_control_runs_to_independent_sockets() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        assert_ne!(fixture.loopback.endpoint, fixture.loopback.control_endpoint);
+        let operations = [update_intent(1, backend, 1), cancel_intent(1, backend)]
+            .iter()
+            .map(|intent| {
+                (
+                    is_small_control(intent),
+                    encode_operation(intent, &test_attempt_facts()).unwrap(),
+                )
+            })
+            .collect();
+        let runs = encode_method_batches(operations, TransportBudget::DEFAULT).unwrap();
+        assert_eq!(runs.len(), 2);
+        for run in runs {
+            send_operations(
+                &fixture.sink.targets[&backend].client,
+                run.request,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                &fixture.acks.handle(),
+                &[],
+            )
+            .await
+            .expect("the correct socket accepts its method");
+        }
+        assert_eq!(fixture.loopback.peer.applied().len(), 2);
+        assert_eq!(fixture.loopback.peer.control_requests(), 1);
+
+        // Deliberately bypass the frozen client selector to prove each actual
+        // peer rejects the other socket's method, before consuming its grammar.
+        let mut data = super::super::transport::Client::for_endpoint(
+            fixture.loopback.endpoint.native_endpoint().clone(),
+            NativeEndpointDomain::BackendData,
+            backend,
+            fixture.sink.data_runtime.clone(),
+        )
+        .grpc_with_channel_error(NativeRpcMethod::ApplyTaskOperations)
+        .await
+        .unwrap();
+        let error = data
+            .apply_task_control_operations(proto::ApplyTaskControlOperationsRequest {
+                operations: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let mut control = super::super::transport::Client::for_endpoint(
+            fixture.loopback.control_endpoint.native_endpoint().clone(),
+            NativeEndpointDomain::BackendControl,
+            backend,
+            fixture.sink.data_runtime.clone(),
+        )
+        .grpc_with_channel_error(NativeRpcMethod::ApplyTaskControlOperations)
+        .await
+        .unwrap();
+        let error = control
+            .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                operations: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(fixture.loopback.peer.applied().len(), 2);
+        assert_eq!(fixture.loopback.peer.control_requests(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_adapter_uses_the_frozen_control_socket_and_preserves_the_whole_descriptor() {
+        use novarocks_query_application::api::HeartbeatOutcome;
+        let backend = BackendProcessId::new_v7();
+        let loopback = Loopback::start().await;
+        let descriptor = loopback.descriptor(backend);
+        loopback.peer.state.lock().unwrap().heartbeat_descriptor = Some(descriptor.clone());
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let control = loopback.control_endpoint.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            super::super::transport::heartbeat(&runtime, backend, control, Duration::from_secs(5))
+        })
+        .await
+        .unwrap();
+        let HeartbeatOutcome::Ok {
+            descriptor: observed,
+            ..
+        } = outcome
+        else {
+            panic!("control heartbeat must complete");
+        };
+        assert_eq!(observed, descriptor);
+        let state = loopback.peer.state.lock().unwrap();
+        assert_eq!(state.heartbeats.len(), 1);
+        assert_eq!(
+            state.heartbeats[0]
+                .expected_process_id
+                .as_ref()
+                .unwrap()
+                .value,
+            backend.to_bytes()
+        );
+        drop(state);
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let mut data = Client::for_endpoint(
+            loopback.endpoint.native_endpoint().clone(),
+            NativeEndpointDomain::BackendData,
+            backend,
+            runtime,
+        )
+        .grpc_with_channel_error(NativeRpcMethod::ApplyTaskOperations)
+        .await
+        .unwrap();
+        assert_eq!(
+            data.heartbeat(proto::HeartbeatRequest {
+                expected_process_id: None
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(loopback.peer.state.lock().unwrap().heartbeats.len(), 1);
     }
 
     /// Waits for the transport to settle `count` operations.
@@ -3589,7 +3836,7 @@ mod tests {
             .iter()
             .map(|intent| {
                 (
-                    is_small_control(intent.shape()),
+                    is_small_control(&intent),
                     encode_operation(intent, &test_attempt_facts()).expect("encodable intent"),
                 )
             })
@@ -3598,7 +3845,7 @@ mod tests {
             .expect("mixed batch fits transport budget");
         assert_eq!(
             batches.iter().map(|batch| batch.items).collect::<Vec<_>>(),
-            vec![1, 2, 1]
+            vec![1, 1, 1, 1]
         );
         let actual_ids = batches
             .iter()
@@ -3634,6 +3881,10 @@ mod tests {
         ));
         assert!(matches!(
             batches[2].request,
+            EncodedMethodRequest::Control(_)
+        ));
+        assert!(matches!(
+            batches[3].request,
             EncodedMethodRequest::Ordinary(_)
         ));
     }
@@ -3654,7 +3905,7 @@ mod tests {
                     .as_mut()
                     .expect("envelope")
                     .max_wait_millis = if index == 0 { 300_000 } else { 100 };
-                (is_small_control(intent.shape()), operation)
+                (is_small_control(&intent), operation)
             })
             .collect();
         let batches =
@@ -3693,6 +3944,53 @@ mod tests {
             "expired control run must not reach its RPC"
         );
         assert_eq!(fixture.loopback.peer.control_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adjacent_control_items_with_different_waits_keep_each_submit_deadline() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let intents = [
+            update_intent(1, backend, 1),
+            cancel_intent(1, backend),
+            renew_intent(backend),
+        ];
+        let operations = intents
+            .iter()
+            .enumerate()
+            .map(|(index, intent)| {
+                let mut operation = encode_operation(intent, &test_attempt_facts()).unwrap();
+                operation.envelope.as_mut().unwrap().max_wait_millis =
+                    if index == 1 { 100 } else { 300_000 };
+                (is_small_control(intent), operation)
+            })
+            .collect();
+        let batches = encode_method_batches(operations, TransportBudget::DEFAULT).unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.items).collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
+        let submitted_at = tokio::time::Instant::now() - Duration::from_secs(10);
+        let client = &fixture.sink.targets[&backend].client;
+        let mut batches = batches.into_iter();
+        let first = batches.next().unwrap();
+        let deadline = first.expires_at(submitted_at);
+        send_operations(client, first.request, deadline, &fixture.acks.handle(), &[])
+            .await
+            .unwrap();
+        let short = batches.next().unwrap();
+        let deadline = short.expires_at(submitted_at);
+        assert_eq!(
+            send_operations(client, short.request, deadline, &fixture.acks.handle(), &[]).await,
+            Err(OperationDispatchResult::TransportUnknown)
+        );
+        assert_eq!(fixture.loopback.peer.control_requests(), 0);
+        let long = batches.next().unwrap();
+        let deadline = long.expires_at(submitted_at);
+        send_operations(client, long.request, deadline, &fixture.acks.handle(), &[])
+            .await
+            .unwrap();
+        assert_eq!(fixture.loopback.peer.control_requests(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3770,7 +4068,7 @@ mod tests {
         let handle = runtime.handle().clone();
         runtime.shutdown_background();
         let mut sink = NativeTaskOperationSink::new(
-            &[(backend, fixture.loopback.endpoint.clone())],
+            &[fixture.loopback.descriptor(backend)],
             TransportBudget::DEFAULT,
             test_attempt_facts(),
             fixture.acks.handle(),
@@ -4276,7 +4574,7 @@ mod tests {
         let wake = Arc::new(CountingWake::default());
         let intake = StatusIntake::new(16, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
         let subscriber = TaskStatusSubscriber::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             intake.handle(),
             error_budget,
             data_runtime,
@@ -4302,7 +4600,7 @@ mod tests {
         let status_intake = StatusIntake::new(16, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
         let convergence_intake = ContextConvergenceIntake::bounded(convergence_capacity);
         let subscriber = TaskStatusSubscriber::new_context_aware(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             status_intake.handle(),
             convergence_intake.handle(),
             error_budget,
@@ -4404,7 +4702,7 @@ mod tests {
             ObservationIntake::new(16, 32, 32 * 4096, 4096, wake).expect("bounded intake"),
         );
         let subscriber = CoveredTaskStatusSubscriber::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             3,
             FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -4543,7 +4841,7 @@ mod tests {
         );
         let subscriber = Arc::new(
             CoveredTaskStatusSubscriber::new(
-                &[(context.backend_process_id(), loopback.endpoint.clone())],
+                &[loopback.descriptor(context.backend_process_id())],
                 Arc::clone(&intake),
                 2,
                 FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -4724,7 +5022,7 @@ mod tests {
                     .unwrap(),
             );
             let subscriber = CoveredTaskStatusSubscriber::new(
-                &[(backend, loopback.endpoint.clone())],
+                &[loopback.descriptor(backend)],
                 Arc::clone(&intake),
                 2,
                 FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -4864,7 +5162,7 @@ mod tests {
         );
         let subscriber = Arc::new(
             CoveredTaskStatusSubscriber::new(
-                &[(context.backend_process_id(), loopback.endpoint.clone())],
+                &[loopback.descriptor(context.backend_process_id())],
                 Arc::clone(&intake),
                 2,
                 FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -5084,7 +5382,7 @@ mod tests {
                 .unwrap(),
         );
         let subscriber = CoveredTaskStatusSubscriber::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             intake,
             1,
             FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -5146,7 +5444,7 @@ mod tests {
             .expect("one queue frame and one pending frame"),
         );
         let subscriber = CoveredTaskStatusSubscriber::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             2,
             FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -5250,7 +5548,7 @@ mod tests {
             .unwrap(),
         );
         let subscriber = CoveredTaskStatusSubscriber::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             2,
             FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -5330,7 +5628,7 @@ mod tests {
             .unwrap(),
         );
         let subscriber = CoveredTaskStatusSubscriber::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             3,
             FrontendDataRuntime::new(tokio::runtime::Handle::current()),
@@ -5951,7 +6249,7 @@ mod tests {
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let intake = StatusIntake::new(1, Arc::new(CountingWake::default()));
         let subscriber = TaskStatusSubscriber::new(
-            &[(backend, loopback.endpoint.clone())],
+            &[loopback.descriptor(backend)],
             intake.handle(),
             1,
             data_runtime,
@@ -6058,9 +6356,11 @@ mod tests {
             .expect("a test runtime");
         let data_runtime = FrontendDataRuntime::new(runtime.handle().clone());
         let error = TaskStatusSubscriber::new(
-            &[(
+            &[test_descriptor(
                 BackendProcessId::new_v7(),
-                RuntimeEndpoint::new("127.0.0.1", 9000).expect("a valid endpoint"),
+                RuntimeEndpoint::new("127.0.0.1", 9000).expect("a valid data endpoint"),
+                RuntimeEndpoint::new("control.test.invalid", 19061)
+                    .expect("a valid control endpoint"),
             )],
             StatusIntake::new(1, Arc::new(CountingWake::default())).handle(),
             0,

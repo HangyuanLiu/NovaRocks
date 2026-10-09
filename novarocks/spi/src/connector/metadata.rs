@@ -904,8 +904,11 @@ fn planning_facts_bytes(
         )
 }
 
-/// Provider-neutral SQL type facts used only to render a table definition.
+/// Provider-neutral declared type facts for table-definition rendering.
 ///
+/// The query catalog may also retain an exact declared Variant identity after
+/// validating its read carrier. It must not derive query types generally from
+/// these display spellings: a provider may narrow an integer read carrier.
 /// This deliberately does not reuse the catalog-mutation type vocabulary:
 /// display metadata must retain fixed-binary width, while mutation inputs own
 /// defaults, aggregation semantics, and provider admission rules.
@@ -1251,15 +1254,21 @@ pub struct ConnectorTableObjectRebindRequest {
     pub context: ConnectorRequestContext,
 }
 
+/// Enumerate one namespace's tables. The provider refuses a listing that
+/// would exceed `bound`; it never truncates one.
 #[derive(Clone)]
 pub struct ConnectorListTablesRequest {
     pub namespace: ConnectorNamespaceIdentity,
+    pub bound: super::ConnectorListingBound,
     pub context: ConnectorRequestContext,
 }
 
+/// Enumerate one catalog's namespaces. The provider refuses a listing that
+/// would exceed `bound`; it never truncates one.
 #[derive(Clone)]
 pub struct ConnectorListNamespacesRequest {
     pub instance_id: ConnectorInstanceId,
+    pub bound: super::ConnectorListingBound,
     pub context: ConnectorRequestContext,
 }
 

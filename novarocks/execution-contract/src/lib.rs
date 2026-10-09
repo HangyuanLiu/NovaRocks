@@ -29,7 +29,10 @@ pub mod domain;
 pub mod identity;
 pub mod lease;
 pub mod membership;
+pub mod native_result_support;
 pub mod operation;
+pub mod ordered_retained_stream;
+pub mod root_lifetime;
 pub mod status;
 pub mod task_convergence;
 pub mod transition;
@@ -82,3 +85,5 @@ pub use operation::*;
 pub use status::*;
 pub use task_convergence::*;
 pub use transition::*;
+
+pub mod root_result;

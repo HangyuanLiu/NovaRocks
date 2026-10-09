@@ -18,6 +18,10 @@
 pub mod actors;
 mod cli;
 mod config;
+#[cfg(unix)]
+mod exact_mysql_target_binding;
+#[cfg(unix)]
+mod exact_native_admission;
 mod performance;
 mod runner;
 pub mod scenario;
@@ -25,7 +29,11 @@ mod scenarios;
 
 fn main() {
     if let Err(error) = cli::Cli::parse_env().and_then(runner::run) {
-        eprintln!("system scenario runner failed: {error:#}");
+        if let Some(verdict) = runner::exact_mysql_failure_presentation(&error) {
+            eprintln!("system scenario runner failed: {verdict}");
+        } else {
+            eprintln!("system scenario runner failed: {error:#}");
+        }
         std::process::exit(1);
     }
 }

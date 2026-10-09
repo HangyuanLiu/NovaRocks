@@ -1079,20 +1079,34 @@ pub fn decode_ordinary_operation_batch_with_skip(
 }
 
 fn is_small_control(operation: &DecodedOperation) -> bool {
-    match operation {
-        DecodedOperation::AcquireQueryContextAdmissionTicket(_)
-        | DecodedOperation::CreateTask(_)
-        | DecodedOperation::UpdateTask(_) => false,
-        DecodedOperation::UpdateQueryContext(command) => match command {
-            DecodedUpdateQueryContext::Establish(_)
-            | DecodedUpdateQueryContext::AdvanceDomain { .. } => false,
-            DecodedUpdateQueryContext::RenewLease { .. } => true,
-        },
-        DecodedOperation::CancelTask(_)
-        | DecodedOperation::AbortQueryContext(_)
-        | DecodedOperation::QuiesceQueryContext(_)
-        | DecodedOperation::ReleaseQueryContext(_) => true,
-    }
+    use novarocks_execution_contract::operation::OperationShape as S;
+    let (shape, only_close) = match operation {
+        DecodedOperation::AcquireQueryContextAdmissionTicket(_) => {
+            (S::AcquireQueryContextAdmissionTicket, false)
+        }
+        DecodedOperation::CreateTask(_) => (S::CreateTask, false),
+        DecodedOperation::UpdateTask(update) => (
+            S::UpdateTask,
+            !update.domains().is_empty()
+                && update.domains().iter().all(|domain| {
+                    matches!(domain, DecodedTaskDomain::CloseExchangeDestination { .. })
+                }),
+        ),
+        DecodedOperation::UpdateQueryContext(command) => (
+            match command {
+                DecodedUpdateQueryContext::Establish(_) => S::EstablishQueryContext,
+                DecodedUpdateQueryContext::AdvanceDomain { .. } => S::AdvanceQueryContextDomain,
+                DecodedUpdateQueryContext::RenewLease { .. } => S::RenewQueryExecutionLease,
+            },
+            false,
+        ),
+        DecodedOperation::CancelTask(_) => (S::CancelTask, false),
+        DecodedOperation::AbortQueryContext(_) => (S::AbortQueryContext, false),
+        DecodedOperation::QuiesceQueryContext(_) => (S::QuiesceQueryContext, false),
+        DecodedOperation::ReleaseQueryContext(_) => (S::ReleaseQueryContext, false),
+    };
+    novarocks_proto_codec::native_rpc::operation_method(shape, only_close)
+        == novarocks_proto_codec::native_rpc::NativeRpcMethod::ApplyTaskControlOperations
 }
 
 /// Decodes the closed small-control method via the one authoritative typed
@@ -1118,6 +1132,31 @@ pub fn decode_control_operation_batch(
             )
         })?;
         let operation = match command {
+            novarocks::task_control_operation::Control::CloseExchangeDestinations(request) => {
+                if request.destinations.is_empty()
+                    || request.destinations.len() > MAX_DOMAIN_UPDATES
+                {
+                    return Err(invalid(
+                        control_path,
+                        "close projection requires 1..=256 destinations",
+                    ));
+                }
+                novarocks::task_operation::Operation::UpdateTask(novarocks::UpdateTaskRequest {
+                    identity: request.identity.clone(),
+                    domains: request
+                        .destinations
+                        .iter()
+                        .cloned()
+                        .map(|destination| novarocks::TaskDomainUpdate {
+                            domain: Some(
+                                novarocks::task_domain_update::Domain::CloseExchangeDestination(
+                                    destination,
+                                ),
+                            ),
+                        })
+                        .collect(),
+                })
+            }
             novarocks::task_control_operation::Control::RenewLease(request) => {
                 novarocks::task_operation::Operation::UpdateQueryContext(
                     novarocks::UpdateQueryContextRequest {
@@ -2004,9 +2043,35 @@ pub fn encode_control_operation_batch(
             Some(novarocks::task_operation::Operation::QuiesceQueryContext(request)) => {
                 novarocks::task_control_operation::Control::QuiesceQueryContext(request)
             }
+            Some(novarocks::task_operation::Operation::UpdateTask(request)) => {
+                if request.domains.is_empty() || request.domains.len() > MAX_DOMAIN_UPDATES {
+                    return Err(invalid(
+                        path.clone().index(index),
+                        "close projection requires 1..=256 destinations",
+                    ));
+                }
+                let destinations = request
+                    .domains
+                    .into_iter()
+                    .map(|domain| match domain.domain {
+                        Some(novarocks::task_domain_update::Domain::CloseExchangeDestination(
+                            destination,
+                        )) => Ok(destination),
+                        _ => Err(invalid(
+                            path.clone().index(index),
+                            "control UpdateTask may only close frozen destinations",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                novarocks::task_control_operation::Control::CloseExchangeDestinations(
+                    novarocks::CloseExchangeDestinationsRequest {
+                        identity: request.identity,
+                        destinations,
+                    },
+                )
+            }
             Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(_))
             | Some(novarocks::task_operation::Operation::CreateTask(_))
-            | Some(novarocks::task_operation::Operation::UpdateTask(_))
             | None => {
                 return Err(invalid(
                     path.clone().index(index),

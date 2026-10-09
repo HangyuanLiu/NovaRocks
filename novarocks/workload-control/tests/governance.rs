@@ -996,6 +996,7 @@ fn stage_capability_and_resource_authority_are_bound_to_the_exact_scope() {
     assert!(matches!(
         control
             .resources()
+            .unwrap()
             .reserve(&c.owner.scope(), 1, ResourceClass::Data),
         Err(WorkError::ForeignAuthority)
     ));
@@ -1006,7 +1007,7 @@ fn reservation_and_usage_share_one_charge_and_slices_keep_the_original_allocatio
     let control = control();
     let work = root(&control, WorkClass::Query);
     let scope = work.owner.scope();
-    let resources = control.resources();
+    let resources = control.resources().unwrap();
     let mut reservation = resources.reserve(&scope, 100, ResourceClass::Data).unwrap();
     let allocation = reservation.charge(80).unwrap();
     let slice = allocation.clone();
@@ -1042,6 +1043,7 @@ fn commit_wait_releases_execution_but_keeps_output_and_business_responsibility()
     let execution = query.scope().try_acquire(Stage::Execution).unwrap();
     let mut reserve = control
         .resources()
+        .unwrap()
         .reserve(&query.scope(), 64, ResourceClass::Data)
         .unwrap();
     let output = reserve.charge(48).unwrap();
@@ -1054,7 +1056,7 @@ fn commit_wait_releases_execution_but_keeps_output_and_business_responsibility()
     query.complete();
     let snapshot = control.snapshot();
     assert_eq!((snapshot.execution, snapshot.businesses), (0, 1));
-    assert_eq!(control.resources().snapshot().data_used_bytes, 48);
+    assert_eq!(control.resources().unwrap().snapshot().data_used_bytes, 48);
     drop(output);
     assert_eq!(control.snapshot().scopes.len(), 1);
     work.owner.complete();
@@ -1075,6 +1077,7 @@ fn allocation_handoff_is_atomic_and_foreign_processes_cannot_receive_it() {
     let foreign = root(&other_control, WorkClass::Query);
     let mut reservation = control
         .resources()
+        .unwrap()
         .reserve(&a.owner.scope(), 80, ResourceClass::Data)
         .unwrap();
     let allocation = reservation.charge(80).unwrap();
@@ -1086,809 +1089,12 @@ fn allocation_handoff_is_atomic_and_foreign_processes_cannot_receive_it() {
         Err(WorkError::ForeignAuthority)
     );
     allocation.transfer_to(&b.owner.scope()).unwrap();
-    assert_eq!(control.resources().snapshot().held_bytes(), 80);
+    assert_eq!(control.resources().unwrap().snapshot().held_bytes(), 80);
     assert_eq!(control.snapshot().root_responsibilities, 1);
     b.owner.complete();
     b.business.release();
     drop(allocation);
     assert_eq!(control.snapshot().root_responsibilities, 0);
-}
-
-fn result_credit_at(
-    control: &WorkloadControl,
-    scope: &WorkScope,
-    stage: ResultCreditStage,
-) -> ResultCredit {
-    let authority = control.resources();
-    let credit = authority.reserve_result_credit(scope, 64).unwrap();
-    if stage == ResultCreditStage::ReservedBeforeFetch {
-        return credit;
-    }
-    let credit = credit.begin_fetch().unwrap();
-    if stage == ResultCreditStage::InFlightRaw {
-        return credit;
-    }
-    let credit = credit.retain_raw(32).unwrap();
-    if stage == ResultCreditStage::RawRetained {
-        return credit;
-    }
-    let credit = credit.reserve_decode(&authority, 48).unwrap();
-    if stage == ResultCreditStage::DecodeReserved {
-        return credit;
-    }
-    let credit = credit.queue_decoded(40).unwrap();
-    if stage == ResultCreditStage::DecodedQueued {
-        return credit;
-    }
-    let credit = credit.reserve_protocol(&authority, 48).unwrap();
-    if stage == ResultCreditStage::ProtocolReserved {
-        return credit;
-    }
-    credit.begin_protocol_write(32).unwrap()
-}
-
-fn small_decoded_credit(control: &WorkloadControl, scope: &WorkScope) -> ResultCredit {
-    let authority = control.resources();
-    authority
-        .reserve_result_credit(scope, 24)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(20)
-        .unwrap()
-        .reserve_decode(&authority, 24)
-        .unwrap()
-        .queue_decoded(20)
-        .unwrap()
-}
-
-fn small_raw_credit(control: &WorkloadControl, scope: &WorkScope) -> ResultCredit {
-    control
-        .resources()
-        .reserve_result_credit(scope, 24)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(20)
-        .unwrap()
-}
-
-#[test]
-fn result_credit_transitions_share_the_data_ledger_and_hold_slow_output() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let scope = work.owner.scope();
-    let authority = control.resources();
-
-    let credit = authority.reserve_result_credit(&scope, 80).unwrap();
-    let snapshot = authority.snapshot();
-    assert_eq!(
-        (snapshot.data_reserved_bytes, snapshot.data_used_bytes),
-        (80, 0)
-    );
-    assert_eq!(snapshot.result_credit.reserved_before_fetch_bytes, 80);
-    assert_eq!(snapshot.result_credit.held_bytes(), snapshot.held_bytes());
-
-    let credit = credit.begin_fetch().unwrap();
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.in_flight_raw_bytes, 80);
-    assert_eq!(
-        (snapshot.data_reserved_bytes, snapshot.data_used_bytes),
-        (80, 0)
-    );
-
-    let credit = credit.retain_raw(48).unwrap();
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.raw_retained_bytes, 48);
-    assert_eq!(
-        (snapshot.data_reserved_bytes, snapshot.data_used_bytes),
-        (0, 48)
-    );
-
-    let credit = credit.reserve_decode(&authority, 56).unwrap();
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.decode_reserved_bytes, 104);
-    assert_eq!(
-        (snapshot.data_reserved_bytes, snapshot.data_used_bytes),
-        (56, 48)
-    );
-    assert_eq!(snapshot.result_credit.held_bytes(), snapshot.held_bytes());
-
-    let credit = credit.queue_decoded(40).unwrap();
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.decoded_queued_bytes, 40);
-    assert_eq!(
-        (snapshot.data_reserved_bytes, snapshot.data_used_bytes),
-        (0, 40)
-    );
-
-    let credit = credit.reserve_protocol(&authority, 24).unwrap();
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.protocol_reserved_bytes, 64);
-    assert_eq!(
-        (snapshot.data_reserved_bytes, snapshot.data_used_bytes),
-        (24, 40)
-    );
-
-    let credit = credit.begin_protocol_write(16).unwrap();
-    assert_eq!(
-        authority.snapshot().result_credit.protocol_writing_bytes,
-        56
-    );
-    work.owner.complete();
-    work.business.release();
-    assert_eq!(control.snapshot().root_responsibilities, 1);
-    assert_eq!(authority.snapshot().data_used_bytes, 56);
-    credit.consume().unwrap();
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-    assert_eq!(control.snapshot().root_responsibilities, 0);
-}
-
-#[tokio::test]
-async fn protocol_result_credit_waiters_share_a_scope_and_grant_fifo() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let first = small_decoded_credit(&control, &work.owner.scope());
-    let second = small_decoded_credit(&control, &work.owner.scope());
-    let mut blocker = authority
-        .reserve(&blocker_work.owner.scope(), 72, ResourceClass::Data)
-        .unwrap();
-    let mut first = Box::pin(first.reserve_protocol_when_available(&authority, 16));
-    let mut second = Box::pin(second.reserve_protocol_when_available(&authority, 16));
-    assert!(poll(&mut first).is_pending());
-    assert!(poll(&mut second).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 2);
-    blocker.release_unused(16).unwrap();
-    assert!(poll(&mut second).is_pending());
-    let first = first.await.unwrap();
-    assert_eq!(first.stage(), ResultCreditStage::ProtocolReserved);
-    assert_eq!(control.snapshot().resource_waiters, 1);
-    drop(first);
-
-    let second = second.await.unwrap();
-    assert_eq!(second.stage(), ResultCreditStage::ProtocolReserved);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    drop((second, blocker));
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-    drop((work, blocker_work));
-}
-
-#[tokio::test]
-async fn decode_result_credit_waiters_grant_fifo_across_scopes() {
-    let control = control();
-    let first_work = root(&control, WorkClass::Query);
-    let second_work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let first = small_raw_credit(&control, &first_work.owner.scope());
-    let second = small_raw_credit(&control, &second_work.owner.scope());
-    let mut blocker = authority
-        .reserve(&blocker_work.owner.scope(), 72, ResourceClass::Data)
-        .unwrap();
-    let mut first = Box::pin(first.reserve_decode_when_available(&authority, 16));
-    let mut second = Box::pin(second.reserve_decode_when_available(&authority, 16));
-    assert!(poll(&mut first).is_pending());
-    assert!(poll(&mut second).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 2);
-
-    blocker.release_unused(16).unwrap();
-    assert!(poll(&mut second).is_pending());
-    let first = first.await.unwrap();
-    assert_eq!(first.stage(), ResultCreditStage::DecodeReserved);
-    assert_eq!(control.snapshot().resource_waiters, 1);
-    drop(first);
-
-    let second = second.await.unwrap();
-    assert_eq!(second.stage(), ResultCreditStage::DecodeReserved);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    drop((second, blocker));
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn decode_waiter_rejects_sync_bypass_and_duplicate_scope_registration() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let bypass_work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let first = small_raw_credit(&control, &work.owner.scope());
-    let duplicate = small_raw_credit(&control, &work.owner.scope());
-    let bypass = small_raw_credit(&control, &bypass_work.owner.scope());
-    let mut blocker = authority
-        .reserve(&blocker_work.owner.scope(), 52, ResourceClass::Data)
-        .unwrap();
-    let mut first = Box::pin(first.reserve_decode_when_available(&authority, 16));
-    assert!(poll(&mut first).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 1);
-
-    let rejection = match duplicate
-        .reserve_decode_when_available(&authority, 16)
-        .await
-    {
-        Ok(_) => panic!("a scope must not register two decode waiters"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(rejection.error(), &WorkError::AlreadyWaitingForResultDecode);
-    let (_, duplicate) = rejection.into_parts();
-    assert_eq!(duplicate.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(control.snapshot().resource_waiters, 1);
-
-    blocker.release_unused(16).unwrap();
-    let rejection = match bypass.reserve_decode(&authority, 1) {
-        Ok(_) => panic!("a synchronous decode reservation must not bypass the queue"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(
-        rejection.error(),
-        &WorkError::Capacity("decode reservation queue")
-    );
-    let (_, bypass) = rejection.into_parts();
-    assert_eq!(bypass.stage(), ResultCreditStage::RawRetained);
-
-    let first = first.await.unwrap();
-    assert_eq!(first.stage(), ResultCreditStage::DecodeReserved);
-    drop((first, duplicate, bypass, blocker));
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn cancelled_and_dropped_decode_waiters_unregister_and_release_explicitly() {
-    let control = control();
-    let cancelled_work = root(&control, WorkClass::Query);
-    let dropped_work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let cancelled_credit = small_raw_credit(&control, &cancelled_work.owner.scope());
-    let dropped_credit = small_raw_credit(&control, &dropped_work.owner.scope());
-    let blocker = authority
-        .reserve(&blocker_work.owner.scope(), 72, ResourceClass::Data)
-        .unwrap();
-
-    let mut cancelled = Box::pin(cancelled_credit.reserve_decode_when_available(&authority, 16));
-    let mut dropped = Box::pin(dropped_credit.reserve_decode_when_available(&authority, 16));
-    assert!(poll(&mut cancelled).is_pending());
-    assert!(poll(&mut dropped).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 2);
-    drop(dropped);
-    assert_eq!(control.snapshot().resource_waiters, 1);
-    assert_eq!(authority.snapshot().held_bytes(), 92);
-
-    cancelled_work.owner.cancel(CancellationReason::Requested);
-    let rejection = match cancelled.await {
-        Ok(_) => panic!("cancelled decode wait must fail"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(
-        rejection.error(),
-        &WorkError::Cancelled(CancellationReason::Requested)
-    );
-    let (_, cancelled_credit) = rejection.into_parts();
-    assert_eq!(cancelled_credit.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(authority.snapshot().held_bytes(), 92);
-    drop(cancelled_credit);
-    assert_eq!(authority.snapshot().held_bytes(), 72);
-    drop(blocker);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn borrowed_decode_wait_drop_preserves_raw_credit_and_accounting() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let mut raw = small_raw_credit(&control, &work.owner.scope());
-    let blocker = authority
-        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
-        .unwrap();
-
-    let mut waiting = Box::pin(raw.reserve_decode_when_available_in_place(&authority, 16));
-    assert!(poll(&mut waiting).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 1);
-    drop(waiting);
-
-    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(raw.held_bytes(), 20);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.raw_retained_bytes, 20);
-    assert_eq!(snapshot.result_credit.decode_reserved_bytes, 0);
-    assert_eq!(snapshot.held_bytes(), 112);
-    drop((raw, blocker));
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn borrowed_decode_wait_cancellation_preserves_raw_credit_and_accounting() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let mut raw = small_raw_credit(&control, &work.owner.scope());
-    let blocker = authority
-        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
-        .unwrap();
-
-    let mut waiting = Box::pin(raw.reserve_decode_when_available_in_place(&authority, 16));
-    assert!(poll(&mut waiting).is_pending());
-    work.owner.cancel(CancellationReason::Requested);
-    assert_eq!(
-        waiting.await,
-        Err(WorkError::Cancelled(CancellationReason::Requested))
-    );
-
-    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(raw.held_bytes(), 20);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.raw_retained_bytes, 20);
-    assert_eq!(snapshot.result_credit.decode_reserved_bytes, 0);
-    assert_eq!(snapshot.held_bytes(), 112);
-    drop((raw, blocker));
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn borrowed_decode_wait_moves_credit_in_place_after_capacity_is_granted() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let mut raw = small_raw_credit(&control, &work.owner.scope());
-    let mut blocker = authority
-        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
-        .unwrap();
-
-    let mut waiting = Box::pin(raw.reserve_decode_when_available_in_place(&authority, 16));
-    assert!(poll(&mut waiting).is_pending());
-    blocker.release_unused(16).unwrap();
-    waiting.await.unwrap();
-
-    assert_eq!(raw.stage(), ResultCreditStage::DecodeReserved);
-    assert_eq!(raw.held_bytes(), 36);
-    let snapshot = authority.snapshot();
-    assert_eq!(snapshot.result_credit.raw_retained_bytes, 0);
-    assert_eq!(snapshot.result_credit.decode_reserved_bytes, 36);
-    assert_eq!(snapshot.data_reserved_bytes, 92);
-    assert_eq!(snapshot.data_used_bytes, 20);
-    drop((raw, blocker));
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn result_fetch_credit_waiters_grant_fifo_without_direct_bypass() {
-    let control = control();
-    let blocker_work = root(&control, WorkClass::Query);
-    let first_work = root(&control, WorkClass::Query);
-    let second_work = root(&control, WorkClass::Query);
-    let bypass_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let blocker = authority
-        .reserve_result_credit(&blocker_work.owner.scope(), 112)
-        .unwrap();
-    let first_scope = first_work.owner.scope();
-    let second_scope = second_work.owner.scope();
-    let mut first = Box::pin(authority.reserve_result_credit_when_available(&first_scope, 64));
-    let mut second = Box::pin(authority.reserve_result_credit_when_available(&second_scope, 64));
-    assert!(poll(&mut first).is_pending());
-    assert!(poll(&mut second).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 2);
-    assert!(matches!(
-        authority
-            .reserve_result_credit_when_available(&first_scope, 1)
-            .await,
-        Err(WorkError::AlreadyWaitingForResultFetch)
-    ));
-    assert_eq!(control.snapshot().resource_waiters, 2);
-    assert!(matches!(
-        authority.reserve_result_credit(&bypass_work.owner.scope(), 1),
-        Err(WorkError::Capacity("result fetch reservation queue"))
-    ));
-
-    drop(blocker);
-    assert!(poll(&mut second).is_pending());
-    let first = first.await.unwrap();
-    assert_eq!(first.stage(), ResultCreditStage::ReservedBeforeFetch);
-    assert_eq!(control.snapshot().resource_waiters, 1);
-    assert!(poll(&mut second).is_pending());
-    drop(first);
-
-    let second = second.await.unwrap();
-    assert_eq!(second.stage(), ResultCreditStage::ReservedBeforeFetch);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    drop(second);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn dropped_and_cancelled_result_fetch_waiters_unregister_exactly_once() {
-    let control = control();
-    let blocker_work = root(&control, WorkClass::Query);
-    let dropped_work = root(&control, WorkClass::Query);
-    let successor_work = root(&control, WorkClass::Query);
-    let cancelled_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let blocker = authority
-        .reserve_result_credit(&blocker_work.owner.scope(), 112)
-        .unwrap();
-
-    let dropped_scope = dropped_work.owner.scope();
-    let mut dropped = Box::pin(authority.reserve_result_credit_when_available(&dropped_scope, 16));
-    let successor_scope = successor_work.owner.scope();
-    let mut successor =
-        Box::pin(authority.reserve_result_credit_when_available(&successor_scope, 16));
-    assert!(poll(&mut dropped).is_pending());
-    assert!(poll(&mut successor).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 2);
-    drop(dropped);
-    assert_eq!(control.snapshot().resource_waiters, 1);
-    drop(blocker);
-    drop(successor.await.unwrap());
-    assert_eq!(control.snapshot().resource_waiters, 0);
-
-    let blocker = authority
-        .reserve_result_credit(&blocker_work.owner.scope(), 112)
-        .unwrap();
-
-    let cancelled_scope = cancelled_work.owner.scope();
-    let mut cancelled =
-        Box::pin(authority.reserve_result_credit_when_available(&cancelled_scope, 16));
-    assert!(poll(&mut cancelled).is_pending());
-    assert_eq!(control.snapshot().resource_waiters, 1);
-    cancelled_work.owner.cancel(CancellationReason::Requested);
-    assert!(matches!(
-        cancelled.await,
-        Err(WorkError::Cancelled(CancellationReason::Requested))
-    ));
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(authority.snapshot().held_bytes(), 112);
-    drop(blocker);
-}
-
-#[test]
-fn dropping_result_credit_at_every_stage_returns_capacity() {
-    for stage in [
-        ResultCreditStage::ReservedBeforeFetch,
-        ResultCreditStage::InFlightRaw,
-        ResultCreditStage::RawRetained,
-        ResultCreditStage::DecodeReserved,
-        ResultCreditStage::DecodedQueued,
-        ResultCreditStage::ProtocolReserved,
-        ResultCreditStage::ProtocolWriting,
-    ] {
-        let control = control();
-        let work = root(&control, WorkClass::Query);
-        let credit = result_credit_at(&control, &work.owner.scope(), stage);
-        assert_eq!(credit.stage(), stage);
-        assert_ne!(control.resources().snapshot().held_bytes(), 0);
-        drop(credit);
-        assert_eq!(control.resources().snapshot().held_bytes(), 0);
-        work.owner.complete();
-        work.business.release();
-        assert_eq!(control.snapshot().root_responsibilities, 0);
-    }
-}
-
-#[test]
-fn result_credit_limits_foreign_authorities_and_invalid_transitions_fail_closed() {
-    let local = control();
-    let foreign = control();
-    let work = root(&local, WorkClass::Query);
-    let foreign_work = root(&foreign, WorkClass::Query);
-    let authority = local.resources();
-    assert!(matches!(
-        authority.reserve_result_credit(&foreign_work.owner.scope(), 1),
-        Err(WorkError::ForeignAuthority)
-    ));
-    assert!(matches!(
-        authority.reserve_result_credit(&work.owner.scope(), 0),
-        Err(WorkError::Capacity(_))
-    ));
-
-    let credit = authority
-        .reserve_result_credit(&work.owner.scope(), 64)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(32)
-        .unwrap();
-    let rejection = match credit.reserve_decode(&foreign.resources(), 16) {
-        Ok(_) => panic!("foreign authority must be rejected"),
-        Err(rejection) => rejection,
-    };
-    assert!(matches!(rejection.error(), WorkError::ForeignAuthority));
-    let (_, credit) = rejection.into_parts();
-    assert_eq!(authority.snapshot().held_bytes(), 32);
-    drop(credit);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-
-    let credit = authority
-        .reserve_result_credit(&work.owner.scope(), 16)
-        .unwrap();
-    let rejection = match credit.begin_protocol_write(1) {
-        Ok(_) => panic!("invalid protocol transition must be rejected"),
-        Err(rejection) => rejection,
-    };
-    assert!(matches!(
-        rejection.error(),
-        WorkError::InvalidResultCreditTransition {
-            from: ResultCreditStage::ReservedBeforeFetch,
-            requested: ResultCreditStage::ProtocolWriting,
-        }
-    ));
-    let (_, credit) = rejection.into_parts();
-    assert_eq!(authority.snapshot().held_bytes(), 16);
-    drop(credit);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-
-    let credit = authority
-        .reserve_result_credit(&work.owner.scope(), 16)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(8)
-        .unwrap()
-        .reserve_decode(&authority, 8)
-        .unwrap()
-        .queue_decoded(8)
-        .unwrap()
-        .reserve_protocol(&authority, 4)
-        .unwrap();
-    let rejection = match credit.begin_protocol_write(5) {
-        Ok(_) => panic!("protocol bytes beyond the reservation must be rejected"),
-        Err(rejection) => rejection,
-    };
-    assert!(matches!(rejection.error(), WorkError::Capacity(_)));
-    let (_, credit) = rejection.into_parts();
-    assert_eq!(credit.stage(), ResultCreditStage::ProtocolReserved);
-    assert_eq!(authority.snapshot().held_bytes(), 12);
-    drop(credit);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-
-    let credit = authority
-        .reserve_result_credit(&work.owner.scope(), 16)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(8)
-        .unwrap();
-    let rejection = match credit.reserve_decode(&authority, 0) {
-        Ok(_) => panic!("zero-byte decode reservation must be rejected"),
-        Err(rejection) => rejection,
-    };
-    assert!(matches!(rejection.error(), WorkError::Capacity(_)));
-    let (_, credit) = rejection.into_parts();
-    assert_eq!(authority.snapshot().held_bytes(), 8);
-    drop(credit);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-
-    let ordinary = authority
-        .reserve(&work.owner.scope(), 1, ResourceClass::Data)
-        .unwrap();
-    let before = authority.snapshot();
-    assert!(matches!(
-        authority.reserve_result_credit(&work.owner.scope(), u64::MAX),
-        Err(WorkError::ArithmeticOverflow)
-    ));
-    assert_eq!(authority.snapshot(), before);
-    drop(ordinary);
-}
-
-#[test]
-fn result_credit_enforces_process_and_scope_limits_under_competition() {
-    let control = control();
-    let a = root(&control, WorkClass::Query);
-    let b = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let first = authority
-        .reserve_result_credit(&a.owner.scope(), 80)
-        .unwrap();
-    assert!(matches!(
-        authority.reserve_result_credit(&b.owner.scope(), 33),
-        Err(WorkError::Capacity("local allocation bytes"))
-    ));
-    let second = authority
-        .reserve_result_credit(&b.owner.scope(), 32)
-        .unwrap();
-    assert_eq!(authority.snapshot().held_bytes(), 112);
-    drop((first, second));
-
-    let raw = authority
-        .reserve_result_credit(&a.owner.scope(), 80)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(80)
-        .unwrap();
-    let rejection = match raw.reserve_decode(&authority, 33) {
-        Ok(_) => panic!("scope capacity overflow must be rejected"),
-        Err(rejection) => rejection,
-    };
-    assert!(matches!(
-        rejection.error(),
-        WorkError::Capacity("scope allocation bytes")
-    ));
-    let (_, raw) = rejection.into_parts();
-    assert_eq!(authority.snapshot().held_bytes(), 80);
-    drop(raw);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-
-    let start = std::sync::Arc::new(Barrier::new(2));
-    let attempted = std::sync::Arc::new(Barrier::new(2));
-    let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut joins = Vec::new();
-    for scope in [a.owner.scope(), b.owner.scope()] {
-        let authority = authority.clone();
-        let start = start.clone();
-        let attempted = attempted.clone();
-        let winners = winners.clone();
-        joins.push(std::thread::spawn(move || {
-            start.wait();
-            let credit = authority.reserve_result_credit(&scope, 80).ok();
-            if credit.is_some() {
-                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            attempted.wait();
-            drop(credit);
-        }));
-    }
-    for join in joins {
-        join.join().unwrap();
-    }
-    assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn unrepresentable_decode_wait_fails_closed_and_preserves_raw_credit() {
-    let foreign = control();
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let raw = authority
-        .reserve_result_credit(&work.owner.scope(), 80)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(80)
-        .unwrap();
-    let rejection = match raw
-        .reserve_decode_when_available(&foreign.resources(), 16)
-        .await
-    {
-        Ok(_) => panic!("a foreign authority must not reserve decode capacity"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(rejection.error(), &WorkError::ForeignAuthority);
-    let (_, raw) = rejection.into_parts();
-    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(authority.snapshot().held_bytes(), 80);
-    let rejection = match raw.reserve_decode_when_available(&authority, 33).await {
-        Ok(_) => panic!("a permanently unrepresentable decode must fail"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(
-        rejection.error(),
-        &WorkError::Capacity("unrepresentable decode allocation")
-    );
-    let (_, raw) = rejection.into_parts();
-    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(authority.snapshot().held_bytes(), 80);
-    drop(raw);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn decode_wait_registration_is_unique_under_concurrent_polling() {
-    let control = control();
-    let blocker_work = root(&control, WorkClass::Query);
-    let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let first = small_raw_credit(&control, &work.owner.scope());
-    let second = small_raw_credit(&control, &work.owner.scope());
-    let blocker = authority
-        .reserve(&blocker_work.owner.scope(), 72, ResourceClass::Data)
-        .unwrap();
-    let start = Barrier::new(2);
-    let polled = Barrier::new(2);
-    let runtime = tokio::runtime::Handle::current();
-    let outcomes = std::thread::scope(|threads| {
-        [first, second]
-            .into_iter()
-            .map(|credit| {
-                threads.spawn(|| {
-                    let _runtime = runtime.enter();
-                    let mut waiting =
-                        Box::pin(credit.reserve_decode_when_available(&authority, 16));
-                    start.wait();
-                    let outcome = poll(&mut waiting);
-                    polled.wait();
-                    outcome
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect::<Vec<_>>()
-    });
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|outcome| outcome.is_pending())
-            .count(),
-        1
-    );
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|outcome| matches!(
-                outcome,
-                Poll::Ready(Err(rejection))
-                    if rejection.error() == &WorkError::AlreadyWaitingForResultDecode
-            ))
-            .count(),
-        1
-    );
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(control.snapshot().peak_waiting_records, 1);
-    assert_eq!(authority.snapshot().held_bytes(), 92);
-    drop(outcomes);
-    assert_eq!(authority.snapshot().held_bytes(), 72);
-    drop(blocker);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[test]
-fn raw_and_decoded_transition_errors_preserve_the_original_credit() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let inflight = authority
-        .reserve_result_credit(&work.owner.scope(), 16)
-        .unwrap()
-        .begin_fetch()
-        .unwrap();
-    let rejection = match inflight.retain_raw(17) {
-        Ok(_) => panic!("raw bytes beyond the fetch reservation must fail"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(
-        rejection.error(),
-        &WorkError::Capacity("invalid raw result bytes")
-    );
-    let (_, inflight) = rejection.into_parts();
-    assert_eq!(inflight.stage(), ResultCreditStage::InFlightRaw);
-    assert_eq!(authority.snapshot().held_bytes(), 16);
-    drop(inflight);
-
-    let decode_reserved = authority
-        .reserve_result_credit(&work.owner.scope(), 16)
-        .unwrap()
-        .begin_fetch()
-        .unwrap()
-        .retain_raw(8)
-        .unwrap()
-        .reserve_decode(&authority, 8)
-        .unwrap();
-    let rejection = match decode_reserved.queue_decoded(9) {
-        Ok(_) => panic!("decoded bytes beyond the reservation must fail"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(
-        rejection.error(),
-        &WorkError::Capacity("invalid decoded result bytes")
-    );
-    let (_, decode_reserved) = rejection.into_parts();
-    assert_eq!(decode_reserved.stage(), ResultCreditStage::DecodeReserved);
-    assert_eq!(authority.snapshot().held_bytes(), 16);
-    drop(decode_reserved);
-    assert_eq!(authority.snapshot().held_bytes(), 0);
 }
 
 #[tokio::test]
@@ -1899,6 +1105,7 @@ async fn data_saturation_and_cancellation_preserve_control_progress_and_memory()
         .collect::<Vec<_>>();
     let mut reserve = control
         .resources()
+        .unwrap()
         .reserve(&works[0].owner.scope(), 112, ResourceClass::Data)
         .unwrap();
     let data = reserve.charge(112).unwrap();
@@ -1909,15 +1116,17 @@ async fn data_saturation_and_cancellation_preserve_control_progress_and_memory()
     assert!(matches!(
         control
             .resources()
+            .unwrap()
             .reserve(&works[1].owner.scope(), 1, ResourceClass::Data),
         Err(WorkError::Cancelled(_))
     ));
     let mut control_reserve = control
         .resources()
+        .unwrap()
         .reserve(&works[0].owner.scope(), 16, ResourceClass::Control)
         .unwrap();
     let control_bytes = control_reserve.charge(16).unwrap();
-    assert_eq!(control.resources().snapshot().held_bytes(), 128);
+    assert_eq!(control.resources().unwrap().snapshot().held_bytes(), 128);
     let first = control.next_control().unwrap();
     let second = control.next_control().unwrap();
     assert!(control.next_control().is_none());
@@ -1932,7 +1141,7 @@ async fn data_saturation_and_cancellation_preserve_control_progress_and_memory()
     }
     assert_eq!(seen.len(), 4);
     assert!(seen.contains(&retried));
-    assert_eq!(control.resources().snapshot().data_used_bytes, 112);
+    assert_eq!(control.resources().unwrap().snapshot().data_used_bytes, 112);
     drop((data, reserve, control_bytes, control_reserve));
     for work in works {
         work.owner.complete();
@@ -1946,7 +1155,7 @@ async fn allocation_waiter_wakes_on_real_release_and_cancel() {
     let control = control();
     let a = root(&control, WorkClass::Query);
     let b = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let reserve = authority
         .reserve(&a.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -1991,7 +1200,7 @@ fn unknown_create_and_old_attempt_bounds_preserve_last_known_usage() {
     let usage = snapshot.scopes[0].obligations[0].usage.as_ref().unwrap();
     assert_eq!(usage.last_known_bytes, 10_000);
     assert!(usage.current_unknown);
-    assert_eq!(control.resources().snapshot().held_bytes(), 0);
+    assert_eq!(control.resources().unwrap().snapshot().held_bytes(), 0);
     let unknown1 = scope
         .register_obligation(key(2), ObligationKind::UnknownCreate)
         .unwrap();
@@ -2162,6 +1371,7 @@ fn an_empty_reservation_has_no_release_claim_and_cannot_revive_completed_work() 
     let scope = work.owner.scope();
     let mut reserve = control
         .resources()
+        .unwrap()
         .reserve(&scope, 10, ResourceClass::Data)
         .unwrap();
     reserve.release_unused(10).unwrap();
@@ -2315,7 +1525,7 @@ async fn resource_wait_timeout_is_absolute_despite_repeated_capacity_notificatio
     let control = control();
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -2344,109 +1554,6 @@ async fn resource_wait_timeout_is_absolute_despite_repeated_capacity_notificatio
 }
 
 #[tokio::test(start_paused = true)]
-async fn result_fetch_wait_timeout_is_absolute_despite_repeated_notifications() {
-    let control = control();
-    let blocker = root(&control, WorkClass::Query);
-    let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let memory = authority
-        .reserve_result_credit(&blocker.owner.scope(), 112)
-        .unwrap();
-    let scope = work.owner.scope();
-    let mut waiting = Box::pin(authority.reserve_result_credit_when_available(&scope, 16));
-    assert!(poll(&mut waiting).is_pending());
-    for _ in 0..2 {
-        tokio::time::advance(Duration::from_secs(10)).await;
-        let signal = authority
-            .reserve(&blocker.owner.scope(), 1, ResourceClass::Control)
-            .unwrap();
-        drop(signal);
-        assert!(poll(&mut waiting).is_pending());
-    }
-    tokio::time::advance(Duration::from_secs(10)).await;
-    assert!(matches!(waiting.await, Err(WorkError::CapacityWaitTimeout)));
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(scope.check(), Ok(()));
-    assert_eq!(scope.cancellation().unwrap().reason(), None);
-    assert_eq!(authority.snapshot().held_bytes(), 112);
-    drop(memory);
-    drop(
-        authority
-            .reserve_result_credit_when_available(&scope, 16)
-            .await
-            .unwrap(),
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn decode_wait_timeout_is_absolute_and_preserves_raw_credit() {
-    let control = control();
-    let work = root(&control, WorkClass::Query);
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let raw = small_raw_credit(&control, &work.owner.scope());
-    let blocker = authority
-        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
-        .unwrap();
-    let mut waiting = Box::pin(raw.reserve_decode_when_available(&authority, 16));
-    assert!(poll(&mut waiting).is_pending());
-    for _ in 0..2 {
-        tokio::time::advance(Duration::from_secs(10)).await;
-        let signal = authority
-            .reserve(&blocker_work.owner.scope(), 1, ResourceClass::Control)
-            .unwrap();
-        drop(signal);
-        assert!(poll(&mut waiting).is_pending());
-    }
-    tokio::time::advance(Duration::from_secs(10)).await;
-    let rejection = match waiting.await {
-        Ok(_) => panic!("decode wait must honor its absolute capacity timeout"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(rejection.error(), &WorkError::CapacityWaitTimeout);
-    let (_, raw) = rejection.into_parts();
-    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(authority.snapshot().held_bytes(), 112);
-    drop((raw, blocker));
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn decode_wait_uses_the_earlier_inherited_deadline() {
-    let control = control();
-    let work = control
-        .try_begin_root(WorkRequest {
-            class: WorkClass::Query,
-            deadline: Some(Instant::now() + Duration::from_secs(3)),
-        })
-        .unwrap();
-    let blocker_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let raw = small_raw_credit(&control, &work.owner.scope());
-    let blocker = authority
-        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
-        .unwrap();
-    let mut waiting = Box::pin(raw.reserve_decode_when_available(&authority, 16));
-    assert!(poll(&mut waiting).is_pending());
-    tokio::time::advance(Duration::from_secs(3)).await;
-    let rejection = match waiting.await {
-        Ok(_) => panic!("decode wait must inherit the scope deadline"),
-        Err(rejection) => rejection,
-    };
-    assert_eq!(
-        rejection.error(),
-        &WorkError::Cancelled(CancellationReason::DeadlineExceeded)
-    );
-    let (_, raw) = rejection.into_parts();
-    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(authority.snapshot().held_bytes(), 112);
-    drop((raw, blocker));
-    assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test(start_paused = true)]
 async fn resource_wait_uses_the_earlier_inherited_query_deadline() {
     let control = control();
     let blocker = root(&control, WorkClass::Query);
@@ -2464,7 +1571,7 @@ async fn resource_wait_uses_the_earlier_inherited_query_deadline() {
             deadline: Some(Instant::now() + Duration::from_secs(60)),
         })
         .unwrap();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -2486,7 +1593,7 @@ async fn cleanup_capacity_wait_is_bounded_even_when_data_work_is_cancelled() {
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
     work.owner.cancel(CancellationReason::Requested);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 16, ResourceClass::Control)
         .unwrap();
@@ -2516,7 +1623,7 @@ async fn cleanup_capacity_can_become_available_after_inherited_deadline_expires(
         .unwrap();
     let query = child(&work.owner.scope());
     let scope = query.scope();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 16, ResourceClass::Control)
         .unwrap();
@@ -2561,7 +1668,7 @@ async fn cleanup_capacity_uses_its_full_independent_timeout_after_parent_deadlin
         .unwrap();
     let query = child(&work.owner.scope());
     let scope = query.scope();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 16, ResourceClass::Control)
         .unwrap();
@@ -2591,7 +1698,7 @@ async fn resource_wait_registration_is_unique_under_concurrent_polling() {
     let control = control();
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -2650,7 +1757,7 @@ async fn distinct_resource_classes_have_distinct_bounded_registrations() {
     let control = control();
     let blocker = root(&control, WorkClass::Query);
     let work = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let data = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -2706,7 +1813,7 @@ async fn stage_and_resource_waits_share_one_global_entry_limit() {
         .scope()
         .try_acquire(Stage::Execution)
         .unwrap();
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();
@@ -2783,7 +1890,7 @@ async fn stage_and_resource_waits_share_one_global_entry_limit() {
 async fn pending_resource_wait_retains_completed_scope_until_future_drop() {
     let control = control();
     let blocker = root(&control, WorkClass::Query);
-    let authority = control.resources();
+    let authority = control.resources().unwrap();
     let memory = authority
         .reserve(&blocker.owner.scope(), 112, ResourceClass::Data)
         .unwrap();

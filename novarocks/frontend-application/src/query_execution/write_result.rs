@@ -39,6 +39,8 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
+use crate::query_execution::internal_result_cpu::InternalResultRetention;
+use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::array::{
@@ -46,6 +48,7 @@ use arrow::array::{
     StructArray,
 };
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_native_adapter::root_write_commit_codec::WriteCommitRecordView;
 use novarocks_spi::connector::write_stack::{
     PreparedWriteSetLedger, ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
     ROOT_WRITE_RESULT_FRAGMENT_INDEX, ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
@@ -71,6 +74,7 @@ pub(crate) struct DecodedPreparedWriteSet {
     row_count: u64,
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: Vec<WriteStatisticsArtifact>,
+    retention: Option<InternalResultRetention>,
 }
 
 impl DecodedPreparedWriteSet {
@@ -86,6 +90,7 @@ impl DecodedPreparedWriteSet {
             row_count,
             fragments,
             statistics: Vec::new(),
+            retention: None,
         }
     }
 
@@ -99,7 +104,17 @@ impl DecodedPreparedWriteSet {
             row_count,
             fragments,
             statistics,
+            retention: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_capacity(
+        mut self,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Self {
+        self.retention = Some(InternalResultRetention::try_new(binding).unwrap());
+        self
     }
 
     pub(crate) const fn row_count(&self) -> u64 {
@@ -116,8 +131,14 @@ impl DecodedPreparedWriteSet {
         u64,
         Vec<(WriteTargetOrdinal, Vec<u8>)>,
         Vec<WriteStatisticsArtifact>,
+        Option<InternalResultRetention>,
     ) {
-        (self.row_count, self.fragments, self.statistics)
+        (
+            self.row_count,
+            self.fragments,
+            self.statistics,
+            self.retention,
+        )
     }
 }
 
@@ -186,7 +207,22 @@ impl RootWriteDecodeContract {
 }
 
 /// Accumulates the root result relation across fetched batches.
+/// One Root write result row, from either the Arrow relation or a relayed
+/// record. Absent values are the row's nulls.
+struct RootWriteRow<'a> {
+    kind: RootRowKind,
+    target: Option<i32>,
+    count: Option<i64>,
+    fragment: Option<&'a [u8]>,
+    field_values: Option<Vec<Option<i32>>>,
+    blob_type: Option<&'a str>,
+    body: Option<&'a [u8]>,
+    pairs: Option<Vec<(Option<&'a str>, Option<&'a str>)>>,
+}
+
 pub(crate) struct RootWriteResultDecoder {
+    relay_assembly: RootRecordAssembly,
+    relayed_record_count: u64,
     contract: RootWriteDecodeContract,
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
@@ -196,11 +232,17 @@ pub(crate) struct RootWriteResultDecoder {
     body_bytes: usize,
     property_bytes: usize,
     root_eof: bool,
+    retention: Option<InternalResultRetention>,
 }
 
 impl RootWriteResultDecoder {
     pub(crate) fn new(contract: RootWriteDecodeContract) -> Self {
         Self {
+            relayed_record_count: 0,
+            relay_assembly: RootRecordAssembly::new(
+                RootRecordDomain::WriteCommit,
+                32 * 1024 * 1024,
+            ),
             contract,
             rows: WriteRowCountAccumulator::new(),
             ledger: PreparedWriteSetLedger::new(),
@@ -210,7 +252,18 @@ impl RootWriteResultDecoder {
             body_bytes: 0,
             property_bytes: 0,
             root_eof: false,
+            retention: None,
         }
+    }
+
+    pub(crate) fn new_with_capacity(
+        contract: RootWriteDecodeContract,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Self, String> {
+        let retention = InternalResultRetention::try_new(binding)?;
+        let mut decoder = Self::new(contract);
+        decoder.retention = Some(retention);
+        Ok(decoder)
     }
 
     pub(crate) fn apply_chunk(&mut self, chunk: &Chunk) -> Result<(), String> {
@@ -250,70 +303,28 @@ impl RootWriteResultDecoder {
             }
             let kind = RootRowKind::from_wire(kinds.value(row))
                 .map_err(|error| format!("root write result row kind: {error}"))?;
-            let target = (!targets.is_null(row)).then(|| targets.value(row));
-            let count = (!counts.is_null(row)).then(|| counts.value(row));
-            let fragment = (!fragments.is_null(row)).then(|| fragments.value(row));
-            let field_count = (!input_fields.is_null(row)).then(|| input_fields.value_length(row));
-            let blob_type = (!blob_types.is_null(row)).then(|| blob_types.value(row));
-            let body = (!bodies.is_null(row)).then(|| bodies.value(row));
-            let property_count = (!properties.is_null(row)).then(|| properties.value_length(row));
-            self.membership
-                .observe(
-                    kind,
-                    RootWriteResultRowShape {
-                        target,
-                        row_count: count,
-                        fragment_len: fragment.map(<[u8]>::len),
-                        input_fields_len: field_count.map(|value| value as usize),
-                        blob_type_len: blob_type.map(str::len),
-                        body_len: body.map(<[u8]>::len),
-                        properties_len: property_count.map(|value| value as usize),
-                    },
-                )
-                .map_err(|error| format!("write Root row shape: {error}"))?;
-
-            match kind {
-                RootRowKind::Summary => {
-                    let count = count.expect("validated above");
-                    let count = row_count_from_wire(count)
-                        .map_err(|error| format!("write Root row count: {error}"))?;
-                    self.rows
-                        .add(count)
-                        .map_err(|error| format!("write Root row count: {error}"))?;
-                }
-                RootRowKind::PreparedFragment => {
-                    let target = target_ordinal_from_wire(target.expect("validated above"))
-                        .map_err(|error| format!("write Root target ordinal: {error}"))?;
-                    if !self.contract.expected_targets.contains(&target) {
-                        return Err(format!(
-                            "write Root names target {} outside this query's frozen set",
-                            target.get()
-                        ));
-                    }
-                    let fragment = fragment.expect("validated above");
-                    self.ledger
-                        .reserve_fragment(fragment.len())
-                        .map_err(|error| format!("prepared write set budget: {error}"))?;
-                    self.fragments.push((target, fragment.to_vec()));
-                }
-                RootRowKind::ArtifactDraft => {
-                    let target = target_ordinal_from_wire(target.expect("validated above"))
-                        .map_err(|error| format!("write Root artifact target: {error}"))?;
-                    if !self.contract.expected_targets.contains(&target) {
-                        return Err(format!(
-                            "write Root artifact names target {} outside this query's frozen set",
-                            target.get()
-                        ));
-                    }
-                    let fields = input_fields.value(row);
-                    let fields = fields
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .ok_or_else(|| "write Root input_fields item is not Int32".to_string())?;
-                    let field_values = (0..fields.len())
+            let field_values = if input_fields.is_null(row) {
+                None
+            } else {
+                let fields = input_fields.value(row);
+                let fields = fields
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| "write Root input_fields item is not Int32".to_string())?;
+                Some(
+                    (0..fields.len())
                         .map(|index| (!fields.is_null(index)).then(|| fields.value(index)))
-                        .collect::<Vec<_>>();
-                    let entries = properties.value(row);
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let entries = if properties.is_null(row) {
+                None
+            } else {
+                Some(properties.value(row))
+            };
+            let pairs = match &entries {
+                None => None,
+                Some(entries) => {
                     let entries =
                         entries
                             .as_any()
@@ -331,81 +342,226 @@ impl RootWriteResultDecoder {
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| "write Root property values are not Utf8".to_string())?;
-                    let pairs = (0..entries.len())
-                        .map(|index| {
-                            (
-                                (!keys.is_null(index)).then(|| keys.value(index)),
-                                (!values.is_null(index)).then(|| values.value(index)),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    validate_artifact_draft_nested_values(&field_values, &pairs)
-                        .map_err(|error| format!("write Root artifact values: {error}"))?;
-                    let field_ids = field_values
-                        .into_iter()
-                        .map(|field| field.expect("validated non-null field"))
-                        .collect::<Vec<_>>();
-                    let identity = StatisticsArtifactIdentity::try_new(
-                        field_ids.clone(),
-                        blob_type.expect("validated above"),
+                    Some(
+                        (0..entries.len())
+                            .map(|index| {
+                                (
+                                    (!keys.is_null(index)).then(|| keys.value(index)),
+                                    (!values.is_null(index)).then(|| values.value(index)),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
                     )
-                    .map_err(|error| format!("write Root artifact identity: {error}"))?;
-                    let key = (target, identity.clone());
-                    if !self.contract.expected_artifacts.contains(&key) {
-                        return Err(format!(
-                            "write Root emitted an unexpected artifact for target {}: {identity:?}",
-                            target.get()
-                        ));
-                    }
-                    if self.statistics.contains_key(&key) {
-                        return Err(format!(
-                            "write Root emitted a duplicate artifact for target {}: {identity:?}",
-                            target.get()
-                        ));
-                    }
-                    if self.statistics.len() >= MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-                        return Err("write Root statistics artifact budget exceeded".into());
-                    }
-                    let body = body.expect("validated above");
-                    self.body_bytes = charge_total(
-                        self.body_bytes,
-                        body.len(),
-                        MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
-                        "write Root artifact body",
-                    )?;
-                    let mut property_map = BTreeMap::new();
-                    let mut row_property_bytes = 0usize;
-                    for (key, value) in pairs {
-                        let key = key.expect("validated property key");
-                        let value = value.expect("validated property value");
-                        row_property_bytes = row_property_bytes
-                            .checked_add(key.len())
-                            .and_then(|total| total.checked_add(value.len()))
-                            .ok_or_else(|| "write Root property budget overflow".to_string())?;
-                        property_map.insert(key.to_string(), value.to_string());
-                    }
-                    self.property_bytes = charge_total(
-                        self.property_bytes,
-                        row_property_bytes,
-                        MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-                        "write Root artifact properties",
-                    )?;
-                    let draft = StatisticsArtifactDraft::try_new(
-                        field_ids,
-                        identity.blob_type(),
-                        bytes::Bytes::copy_from_slice(body),
-                        property_map,
-                    )
-                    .map_err(|error| format!("write Root artifact draft: {error}"))?;
-                    self.statistics
-                        .insert(key, WriteStatisticsArtifact::new(target, draft));
                 }
+            };
+            self.apply_row(RootWriteRow {
+                kind,
+                target: (!targets.is_null(row)).then(|| targets.value(row)),
+                count: (!counts.is_null(row)).then(|| counts.value(row)),
+                fragment: (!fragments.is_null(row)).then(|| fragments.value(row)),
+                field_values,
+                blob_type: (!blob_types.is_null(row)).then(|| blob_types.value(row)),
+                body: (!bodies.is_null(row)).then(|| bodies.value(row)),
+                pairs,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Validate complete local domain consumption before the coordinator
+    /// records End. This count is relation rows, not affected write rows.
+    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), String> {
+        self.relay_assembly.finish()?;
+        if output_rows != self.relayed_record_count {
+            return Err("internal root End differs from decoded record count".into());
+        }
+        Ok(())
+    }
+
+    /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
+    /// record is validated before this call returns and its receipt may finish.
+    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
+        if self.root_eof {
+            return Err("write Root emitted a trailing body after EOF".into());
+        }
+        let mut assembly = std::mem::replace(
+            &mut self.relay_assembly,
+            RootRecordAssembly::new(RootRecordDomain::WriteCommit, 32 * 1024 * 1024),
+        );
+        let result = assembly.push(body, |record| {
+            self.apply_record(record)?;
+            self.relayed_record_count = self
+                .relayed_record_count
+                .checked_add(1)
+                .ok_or("internal root record count overflow")?;
+            Ok(())
+        });
+        self.relay_assembly = assembly;
+        result
+    }
+
+    /// Apply one complete PreparedWriteCommitV1 record relayed from the
+    /// Backend. The same row rules apply as for the Arrow relation.
+    pub(crate) fn apply_record(&mut self, record: &[u8]) -> Result<(), String> {
+        if self.root_eof {
+            return Err("write Root emitted a trailing record after EOF".into());
+        }
+        let view = WriteCommitRecordView::parse(record)
+            .map_err(|error| format!("write Root record: {error}"))?;
+        let header = view.header();
+        let kind = header.kind();
+        let artifact = kind == RootRowKind::ArtifactDraft;
+        self.apply_row(RootWriteRow {
+            kind,
+            target: (kind != RootRowKind::Summary).then(|| header.target()),
+            count: (kind == RootRowKind::Summary)
+                .then(|| i64::try_from(header.row_count()))
+                .transpose()
+                .map_err(|_| "write Root record row count exceeds i64".to_string())?,
+            fragment: (kind == RootRowKind::PreparedFragment).then(|| view.fragment()),
+            field_values: artifact.then(|| view.field_ids().map(Some).collect()),
+            blob_type: artifact.then(|| view.blob_type()),
+            body: artifact.then(|| view.body()),
+            pairs: artifact.then(|| {
+                view.properties()
+                    .map(|(key, value)| (Some(key), Some(value)))
+                    .collect()
+            }),
+        })
+    }
+
+    fn apply_row(&mut self, row: RootWriteRow<'_>) -> Result<(), String> {
+        let RootWriteRow {
+            kind,
+            target,
+            count,
+            fragment,
+            field_values,
+            blob_type,
+            body,
+            pairs,
+        } = row;
+        self.membership
+            .observe(
+                kind,
+                RootWriteResultRowShape {
+                    target,
+                    row_count: count,
+                    fragment_len: fragment.map(<[u8]>::len),
+                    input_fields_len: field_values.as_ref().map(Vec::len),
+                    blob_type_len: blob_type.map(str::len),
+                    body_len: body.map(<[u8]>::len),
+                    properties_len: pairs.as_ref().map(Vec::len),
+                },
+            )
+            .map_err(|error| format!("write Root row shape: {error}"))?;
+
+        match kind {
+            RootRowKind::Summary => {
+                let count = count.expect("validated above");
+                let count = row_count_from_wire(count)
+                    .map_err(|error| format!("write Root row count: {error}"))?;
+                self.rows
+                    .add(count)
+                    .map_err(|error| format!("write Root row count: {error}"))?;
+            }
+            RootRowKind::PreparedFragment => {
+                let target = target_ordinal_from_wire(target.expect("validated above"))
+                    .map_err(|error| format!("write Root target ordinal: {error}"))?;
+                if !self.contract.expected_targets.contains(&target) {
+                    return Err(format!(
+                        "write Root names target {} outside this query's frozen set",
+                        target.get()
+                    ));
+                }
+                let fragment = fragment.expect("validated above");
+                self.ledger
+                    .reserve_fragment(fragment.len())
+                    .map_err(|error| format!("prepared write set budget: {error}"))?;
+                self.fragments.push((target, fragment.to_vec()));
+            }
+            RootRowKind::ArtifactDraft => {
+                let target = target_ordinal_from_wire(target.expect("validated above"))
+                    .map_err(|error| format!("write Root artifact target: {error}"))?;
+                if !self.contract.expected_targets.contains(&target) {
+                    return Err(format!(
+                        "write Root artifact names target {} outside this query's frozen set",
+                        target.get()
+                    ));
+                }
+                let field_values = field_values.expect("validated above");
+                let pairs = pairs.expect("validated above");
+                validate_artifact_draft_nested_values(&field_values, &pairs)
+                    .map_err(|error| format!("write Root artifact values: {error}"))?;
+                let field_ids = field_values
+                    .into_iter()
+                    .map(|field| field.expect("validated non-null field"))
+                    .collect::<Vec<_>>();
+                let identity = StatisticsArtifactIdentity::try_new(
+                    field_ids.clone(),
+                    blob_type.expect("validated above"),
+                )
+                .map_err(|error| format!("write Root artifact identity: {error}"))?;
+                let key = (target, identity.clone());
+                if !self.contract.expected_artifacts.contains(&key) {
+                    return Err(format!(
+                        "write Root emitted an unexpected artifact for target {}: {identity:?}",
+                        target.get()
+                    ));
+                }
+                if self.statistics.contains_key(&key) {
+                    return Err(format!(
+                        "write Root emitted a duplicate artifact for target {}: {identity:?}",
+                        target.get()
+                    ));
+                }
+                if self.statistics.len() >= MAX_CONNECTOR_STATISTICS_ARTIFACTS {
+                    return Err("write Root statistics artifact budget exceeded".into());
+                }
+                let body = body.expect("validated above");
+                self.body_bytes = charge_total(
+                    self.body_bytes,
+                    body.len(),
+                    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
+                    "write Root artifact body",
+                )?;
+                let mut property_map = BTreeMap::new();
+                let mut row_property_bytes = 0usize;
+                for (key, value) in pairs {
+                    let key = key.expect("validated property key");
+                    let value = value.expect("validated property value");
+                    row_property_bytes = row_property_bytes
+                        .checked_add(key.len())
+                        .and_then(|total| total.checked_add(value.len()))
+                        .ok_or_else(|| "write Root property budget overflow".to_string())?;
+                    property_map.insert(key.to_string(), value.to_string());
+                }
+                self.property_bytes = charge_total(
+                    self.property_bytes,
+                    row_property_bytes,
+                    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+                    "write Root artifact properties",
+                )?;
+                let draft = StatisticsArtifactDraft::try_new(
+                    field_ids,
+                    identity.blob_type(),
+                    bytes::Bytes::copy_from_slice(body),
+                    property_map,
+                )
+                .map_err(|error| format!("write Root artifact draft: {error}"))?;
+                let draft = match &self.retention {
+                    Some(retention) => draft.attach_guard(retention.spi_guard()),
+                    None => draft,
+                };
+                self.statistics
+                    .insert(key, WriteStatisticsArtifact::new(target, draft));
             }
         }
         Ok(())
     }
 
     pub(crate) fn observe_root_eof(&mut self) -> Result<(), String> {
+        self.relay_assembly.finish()?;
         if std::mem::replace(&mut self.root_eof, true) {
             return Err("write Root emitted duplicate EOF".into());
         }
@@ -434,6 +590,7 @@ impl RootWriteResultDecoder {
             row_count: self.rows.get(),
             fragments: self.fragments,
             statistics: self.statistics.into_values().collect(),
+            retention: self.retention,
         })
     }
 }
@@ -651,6 +808,164 @@ mod tests {
             [target],
             [(target, identity)],
         ))
+    }
+
+    /// Encode `rows` exactly as the Backend root producer does.
+    fn records(rows: Vec<Row>) -> Vec<Vec<u8>> {
+        use novarocks_native_adapter::root_record_assembly::{
+            RootRecordAssembly, RootRecordDomain,
+        };
+        use novarocks_native_adapter::root_write_commit_codec::{
+            WriteCommitEncoder, WriteCommitTotals,
+        };
+        let mut encoder =
+            WriteCommitEncoder::try_new(chunk(rows).batch.clone(), WriteCommitTotals::default())
+                .expect("fixed relation");
+        let mut stream = Vec::new();
+        let mut output = vec![0_u8; 7];
+        loop {
+            let turn = encoder.step(&mut output).expect("encodable rows");
+            stream.extend_from_slice(&output[..turn.emitted_bytes]);
+            if turn.status == novarocks_result_render::RenderTurnStatus::InputComplete {
+                break;
+            }
+        }
+        let mut assembly = RootRecordAssembly::new(RootRecordDomain::WriteCommit, 1 << 20);
+        let mut out = Vec::new();
+        for body in stream.chunks(5) {
+            assembly
+                .push(body, |record| {
+                    out.push(record.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assembly.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn prepared_payload_and_last_statistics_body_clone_retain_actual_capacity() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let contract = RootWriteDecodeContract::for_test(
+            [target],
+            [(
+                target,
+                StatisticsArtifactIdentity::try_new(vec![11], "theta-v1").unwrap(),
+            )],
+        );
+        let mut decoder = RootWriteResultDecoder::new_with_capacity(contract, &binding).unwrap();
+        for record in records(vec![
+            fragment(0, 5),
+            artifact(0, 11, "theta-v1", b"sketch"),
+            summary(9),
+        ]) {
+            decoder.apply_relay_body(&record).unwrap();
+        }
+        let prepared = finish(decoder).unwrap();
+        let body = prepared.statistics[0].draft().body().clone();
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(prepared);
+        assert_eq!(body.as_ref(), b"sketch");
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(body);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
+    fn fragment_only_prepared_set_retains_capacity_until_its_payload_exits() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let mut decoder = RootWriteResultDecoder::new_with_capacity(
+            RootWriteDecodeContract::for_test(targets(1), std::iter::empty()),
+            &binding,
+        )
+        .unwrap();
+        for record in records(vec![fragment(0, 5), summary(9)]) {
+            decoder.apply_relay_body(&record).unwrap();
+        }
+        let prepared = finish(decoder).unwrap();
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(prepared);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
+    fn relayed_records_decode_to_the_same_prepared_set_as_the_arrow_relation() {
+        let rows = || {
+            vec![
+                fragment(0, 5),
+                artifact(0, 11, "theta-v1", b"sketch"),
+                fragment(0, 3),
+                summary(9),
+            ]
+        };
+        let mut from_chunk = exact_decoder();
+        from_chunk.apply_chunk(&chunk(rows())).unwrap();
+        let from_chunk = finish(from_chunk).unwrap();
+        let mut from_records = exact_decoder();
+        for record in records(rows()) {
+            for body in record.chunks(3) {
+                from_records.apply_relay_body(body).unwrap();
+            }
+        }
+        let from_records = finish(from_records).unwrap();
+        assert_eq!(from_records.row_count, from_chunk.row_count);
+        assert_eq!(from_records.fragments, from_chunk.fragments);
+        assert_eq!(from_records.statistics, from_chunk.statistics);
+    }
+
+    #[test]
+    fn relayed_body_end_refuses_partial_record_without_publishing_eof() {
+        let record = records(vec![fragment(0, 5)]).remove(0);
+        let mut decoder = new_decoder(1);
+        decoder.apply_relay_body(&record[..7]).unwrap();
+        assert!(
+            decoder
+                .observe_root_eof()
+                .unwrap_err()
+                .contains("unfinished")
+        );
+        assert!(!decoder.root_eof);
+        decoder.apply_relay_body(&record[7..]).unwrap();
+        let tail = records(vec![summary(5)]).remove(0);
+        decoder.apply_relay_body(&tail).unwrap();
+        assert!(decoder.check_relay_end(1).is_err());
+        assert!(!decoder.root_eof);
+        decoder.check_relay_end(2).unwrap();
+        let prepared = finish(decoder).unwrap();
+        assert_eq!(prepared.row_count(), 5);
+    }
+
+    #[test]
+    fn relayed_records_obey_membership_targets_and_artifact_sets() {
+        // A target outside the frozen set is refused.
+        let mut decoder = new_decoder(1);
+        let foreign = records(vec![fragment(3, 1), summary(0)]);
+        assert!(decoder.apply_record(&foreign[0]).is_err());
+        // An unexpected artifact identity is refused.
+        let mut decoder = exact_decoder();
+        let unexpected = records(vec![artifact(0, 12, "theta-v1", b"x")]);
+        assert!(decoder.apply_record(&unexpected[0]).is_err());
+        // A missing SUMMARY fails at finish; records after EOF are refused.
+        let mut decoder = new_decoder(1);
+        let only_fragment = records(vec![fragment(0, 1)]);
+        decoder.apply_record(&only_fragment[0]).unwrap();
+        decoder.observe_root_eof().unwrap();
+        assert!(decoder.apply_record(&only_fragment[0]).is_err());
+        assert!(decoder.finish().is_err());
+        // A truncated record is refused before any fact is applied.
+        let mut decoder = new_decoder(1);
+        let record = &records(vec![fragment(0, 4), summary(1)])[0];
+        assert!(decoder.apply_record(&record[..record.len() - 1]).is_err());
     }
 
     fn permutations(facts: &[CompletionFact]) -> Vec<Vec<CompletionFact>> {

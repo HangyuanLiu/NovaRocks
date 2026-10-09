@@ -25,8 +25,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
+use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
@@ -124,7 +124,7 @@ pub(crate) fn assemble_round(
     backend_process_ids: &BTreeMap<usize, BackendProcessId>,
     admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     preparing_positions: &BTreeMap<BackendProcessId, usize>,
-    backends: &[(BackendProcessId, RuntimeEndpoint)],
+    backends: &[BackendProcessDescriptor],
     submissions: Vec<ValidatedNativeSubmission>,
     establish: AttemptEstablishFacts,
     wake: Arc<dyn StatusIntakeWake>,

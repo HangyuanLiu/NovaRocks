@@ -237,6 +237,8 @@ message RuntimeFilterRouteEndpointView {
 message RuntimeFilterRemotePeer {
   uint32 participant_id = 1;
   string endpoint = 2;
+  // Exactly 16 non-nil UUID-v7 bytes from the frozen backend topology.
+  bytes backend_process_id = 3;
 }
 
 message RuntimeFilterRoutePeer {

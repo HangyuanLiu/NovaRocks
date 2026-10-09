@@ -162,6 +162,9 @@ pub enum SqlType {
     Binary,
     Bitmap,
     Hll,
+    /// Internal opaque value facts. These do not admit public SQL type names.
+    Object,
+    Percentile,
     Boolean,
     Date,
     DateTime,

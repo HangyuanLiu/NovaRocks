@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::{
-    CancellationReason, QueryConcurrencyPermit, WorkError, WorkId, WorkScope,
+    CancellationReason, QueryConcurrencyPermit, ResultWindowClass, ResultWindowGrant, WorkError,
+    WorkId, WorkScope,
+    result_window::{adopt_window, count_window, uncount_window, window_room},
     scope::{State, WorkloadConfig},
 };
 use std::{
@@ -63,6 +65,10 @@ pub(crate) struct PendingAdmission {
     pub wait_deadline: Instant,
     pub state: AdmissionState,
     pub waker: Option<Waker>,
+    /// The complete result window a query takes together with its permit,
+    /// and whether dispatch has counted it.
+    pub window: Option<ResultWindowClass>,
+    pub window_counted: bool,
 }
 
 fn capacity(state: &State, config: &WorkloadConfig, root: WorkId, kind: AdmissionKind) -> bool {
@@ -136,15 +142,20 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
         .collect::<Vec<_>>();
     for (id, error) in rejected {
         let request = &state.requests[&id];
-        let (work, root, kind, granted) = (
+        let (work, root, kind, granted, window) = (
             request.work,
             request.root,
             request.kind,
             matches!(request.state, AdmissionState::Granted),
+            request.window.filter(|_| request.window_counted),
         );
         remove_queue(state, root, id, kind);
         if granted {
             release(state, work, root, kind);
+            if let Some(class) = window {
+                uncount_window(state, root, class);
+                state.requests.get_mut(&id).unwrap().window_counted = false;
+            }
         } else if let AdmissionKind::Stage(stage) = kind {
             state.nodes.get_mut(&work).unwrap().stages.remove(&stage);
         }
@@ -171,9 +182,17 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
                 break;
             }
             let nodes = &state.nodes;
-            let ready = |root: WorkId| {
-                !matches!(kind, AdmissionKind::Stage(Stage::Execution))
-                    || nodes[&root].root_executions < config.executions_per_root
+            let capacity = (&state.result_capacity, &state.result_windows);
+            // A query whose result window class is full stays queued without
+            // taking the permit; others behind it may still proceed.
+            let ready = |root: WorkId| match kind {
+                AdmissionKind::Query => nodes[&root]
+                    .pending_query_window
+                    .is_none_or(|class| window_room(capacity.0, capacity.1, class)),
+                AdmissionKind::Stage(Stage::Execution) => {
+                    nodes[&root].root_executions < config.executions_per_root
+                }
+                AdmissionKind::Stage(Stage::Preparation) => true,
             };
             let next = match kind {
                 AdmissionKind::Query => state.query_queue.pop_runnable(ready),
@@ -187,6 +206,12 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
             };
             let root = state.requests[&id].root;
             grant(state, root, kind);
+            // Permit and complete window are one transaction: room was
+            // checked by `ready` under this same authority lock.
+            if let Some(class) = state.requests[&id].window {
+                count_window(state, root, class).expect("ready checked complete window room");
+                state.requests.get_mut(&id).unwrap().window_counted = true;
+            }
             let request = state.requests.get_mut(&id).unwrap();
             request.state = AdmissionState::Granted;
             if let Some(waker) = request.waker.take() {
@@ -200,14 +225,17 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
 fn take_request(state: &mut State, id: u64, receive: bool) -> PendingAdmission {
     let request = state.requests.remove(&id).unwrap();
     state.waiting_bytes -= request.bytes;
-    state
-        .nodes
-        .get_mut(&request.work)
-        .unwrap()
-        .pending_admissions -= 1;
+    let node = state.nodes.get_mut(&request.work).unwrap();
+    node.pending_admissions -= 1;
+    if request.kind == AdmissionKind::Query {
+        node.pending_query_window = None;
+    }
     match request.state {
         AdmissionState::Granted if !receive => {
-            release(state, request.work, request.root, request.kind)
+            release(state, request.work, request.root, request.kind);
+            if let Some(class) = request.window.filter(|_| request.window_counted) {
+                uncount_window(state, request.root, class);
+            }
         }
         AdmissionState::Waiting => {
             remove_queue(state, request.root, id, request.kind);
@@ -281,6 +309,8 @@ impl WorkScope {
                     wait_deadline,
                     state: AdmissionState::Waiting,
                     waker: None,
+                    window: None,
+                    window_counted: false,
                 },
             );
             state.waiting_bytes = bytes;
@@ -414,6 +444,25 @@ impl WorkScope {
     /// root. The scope must be the root, so scalar children and preparation
     /// steps cannot create a nested queue entry while their parent is running.
     pub fn admit_query(&self) -> Result<QueryAdmission, WorkError> {
+        self.queue_query(None)
+    }
+
+    /// Await the warehouse slot together with one complete result window of
+    /// `class`. Both are taken in the same dequeue transaction, before any
+    /// dispatch; neither is held while waiting for the other.
+    pub fn admit_query_with_result(
+        &self,
+        class: ResultWindowClass,
+    ) -> Result<ResultQueryAdmission, WorkError> {
+        if class == ResultWindowClass::Closing {
+            return Err(WorkError::Conflict);
+        }
+        Ok(ResultQueryAdmission {
+            inner: self.queue_query(Some(class))?,
+        })
+    }
+
+    fn queue_query(&self, window: Option<ResultWindowClass>) -> Result<QueryAdmission, WorkError> {
         let cancellation = self.cancellation()?;
         let wait_deadline = Instant::now()
             .checked_add(self.inner.config.capacity_wait_timeout)
@@ -430,6 +479,12 @@ impl WorkScope {
             if node.query_admitted {
                 return Err(WorkError::AlreadyAdmitted);
             }
+            if node.pending_query_window.is_some() {
+                return Err(WorkError::Conflict);
+            }
+            if window.is_some() && state.result_capacity.is_none() {
+                return Err(WorkError::NotReady);
+            }
             if state.waiting_records() >= self.inner.config.waiting_limit {
                 return Err(WorkError::Capacity("waiting entries"));
             }
@@ -444,11 +499,15 @@ impl WorkScope {
                     wait_deadline,
                     state: AdmissionState::Waiting,
                     waker: None,
+                    window,
+                    window_counted: false,
                 },
             );
             state.peak_waiting = state.peak_waiting.max(state.requests.len());
             state.record_waiting_peak();
-            state.nodes.get_mut(&self.id).unwrap().pending_admissions += 1;
+            let node = state.nodes.get_mut(&self.id).unwrap();
+            node.pending_admissions += 1;
+            node.pending_query_window = window;
             state.query_queue.push(self.id, id);
             Ok(id)
         })?;
@@ -477,7 +536,46 @@ pub struct QueryAdmission {
 impl Future for QueryAdmission {
     type Output = Result<QueryConcurrencyPermit, WorkError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().poll_admitted(cx).map(|result| {
+            result.map(|admitted| {
+                debug_assert!(admitted.window.is_none());
+                admitted.permit
+            })
+        })
+    }
+}
+
+/// A query permit and, for a result admission, its complete window.
+struct AdmittedQuery {
+    permit: QueryConcurrencyPermit,
+    window: Option<ResultWindowGrant>,
+}
+
+/// A pending warehouse query admission that also takes a complete result
+/// window in the same dequeue transaction.
+#[must_use = "A query admission must be awaited or dropped"]
+pub struct ResultQueryAdmission {
+    inner: QueryAdmission,
+}
+
+impl Future for ResultQueryAdmission {
+    type Output = Result<(QueryConcurrencyPermit, ResultWindowGrant), WorkError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().inner.poll_admitted(cx).map(|result| {
+            result.map(|admitted| {
+                let window = admitted
+                    .window
+                    .expect("a result admission counts its window with its permit");
+                (admitted.permit, window)
+            })
+        })
+    }
+}
+
+impl QueryAdmission {
+    fn poll_admitted(&mut self, cx: &mut Context<'_>) -> Poll<Result<AdmittedQuery, WorkError>> {
         let id = self.id.expect("Query admission polled after completion");
         if let Poll::Ready(reason) = self.cancelled.as_mut().poll(cx) {
             self.id = None;
@@ -496,6 +594,7 @@ impl Future for QueryAdmission {
         let inner = Arc::clone(&self.scope.inner);
         let result = inner.update(|state| {
             let request = state.requests.get_mut(&id).unwrap();
+            let window = request.window.filter(|_| request.window_counted);
             let result = match &request.state {
                 AdmissionState::Waiting => {
                     if request
@@ -518,14 +617,26 @@ impl Future for QueryAdmission {
                 Ok(grant)
             });
             take_request(state, id, result.is_ok());
-            Some(result)
+            // A received grant keeps its counted window; the envelope comes
+            // from the same configuration that counted it.
+            Some(result.map(|()| {
+                window.map(|class| {
+                    let config = state
+                        .result_capacity
+                        .expect("a counted window has its capacity profile");
+                    (class, config.all_objects_bytes[class.index()])
+                })
+            }))
         });
         let Some(result) = result else {
             return Poll::Pending;
         };
         self.id = None;
-        Poll::Ready(result.map(|()| QueryConcurrencyPermit {
-            scope: Some(self.scope.clone()),
+        Poll::Ready(result.map(|window| AdmittedQuery {
+            permit: QueryConcurrencyPermit {
+                scope: Some(self.scope.clone()),
+            },
+            window: window.map(|(class, bytes)| adopt_window(&self.scope, class, bytes)),
         }))
     }
 }

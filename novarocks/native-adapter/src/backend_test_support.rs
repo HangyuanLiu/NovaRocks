@@ -36,21 +36,21 @@ use crate::{BackendDataRuntime, BackendNativeTransport};
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_backend_data_runtime() -> BackendDataRuntime {
-    static TEST_RUNTIME: std::sync::LazyLock<(tokio::runtime::Runtime, BackendDataRuntime)> =
+    static TEST_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
         std::sync::LazyLock::new(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
+            tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .worker_threads(1)
                 .build()
-                .expect("build Backend test data runtime");
-            let adapter = BackendDataRuntime::new(
-                runtime.handle().clone(),
-                test_backend_native_trust(),
-                BackendNativeTransport::Plaintext,
-            );
-            (runtime, adapter)
+                .expect("build Backend test data runtime")
         });
-    TEST_RUNTIME.1.clone()
+    // Tests may share executor threads, but each composed role has its own
+    // process-bound trust and channel generation.
+    BackendDataRuntime::new(
+        TEST_RUNTIME.handle().clone(),
+        test_backend_native_trust(),
+        BackendNativeTransport::Plaintext,
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -143,8 +143,8 @@ mod tests {
             BackendNativeTransport::Plaintext,
         );
 
-        assert!(std::sync::Arc::ptr_eq(first.channels(), clone.channels()));
-        assert!(!std::sync::Arc::ptr_eq(first.channels(), second.channels()));
+        assert!(first.channels().same_cache(clone.channels()));
+        assert!(!first.channels().same_cache(second.channels()));
     }
 
     #[test]

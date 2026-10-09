@@ -440,6 +440,10 @@ impl IcebergReadBinding {
 
     /// Bind this provider template to one admitted request. This local view is
     /// carried only by an active reader or writer, never by a table or handle.
+    pub(crate) fn request_context(&self) -> Option<&ConnectorRequestContext> {
+        self.request_context.as_ref()
+    }
+
     pub fn for_request(&self, request_context: ConnectorRequestContext) -> Self {
         Self {
             resources: self.resources.clone(),

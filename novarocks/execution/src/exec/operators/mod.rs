@@ -46,11 +46,13 @@ mod project_processor;
 mod repeat_processor;
 mod result_buffer_sink;
 mod result_sink;
+mod root_result_sink;
 pub(crate) mod runtime_filter;
 pub mod scan;
 mod setop;
 mod sort;
 mod split_data_stream_sink;
+mod statistics_materializer;
 mod table_finish;
 mod table_function_processor;
 pub(crate) mod table_writer;
@@ -86,6 +88,7 @@ pub(crate) use repeat_processor::repeat_output_chunk_schema;
 pub use result_buffer_sink::ResultBufferSinkFactory;
 #[cfg(test)]
 pub(crate) use result_sink::{ResultSinkFactory, ResultSinkHandle};
+pub use root_result_sink::RootResultSinkFactory;
 pub(crate) use setop::{
     ExceptSharedState, IntersectSharedState, SetOpStageController, UnionAllSharedState,
 };
@@ -95,6 +98,7 @@ pub use setop::{
 };
 pub use sort::SortProcessorFactory;
 pub use split_data_stream_sink::SplitDataStreamSinkFactory;
+pub(crate) use statistics_materializer::StatisticsMaterializerFactory;
 pub use table_finish::TableFinishOperatorFactory;
 pub use table_function_processor::TableFunctionProcessorFactory;
 pub use table_writer::TableWriterOperatorFactory;

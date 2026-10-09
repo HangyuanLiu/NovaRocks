@@ -17,6 +17,7 @@
 
 pub mod aggregate;
 pub mod arrow_cast;
+pub mod arrow_metadata_owner;
 pub mod arrow_primitive;
 pub mod cluster_role;
 pub mod coercion;

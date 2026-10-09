@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, StringArray};
+use arrow::array::ArrayRef;
+#[cfg(test)]
+use arrow::array::BooleanArray;
 use arrow::datatypes::DataType;
 use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_parser::{ast, printer};
@@ -82,15 +84,12 @@ pub fn try_query_materialized_views(
     readiness: &MvReadinessPort,
     query: &ast::Query,
 ) -> Result<Option<StatementResult>, String> {
+    if !is_local_materialized_views_query(query) {
+        return Ok(None);
+    }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
+        unreachable!("local materialized-view admission requires SELECT");
     };
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Ok(None);
-    }
-    if !is_information_schema_materialized_views(&select.from[0].relation) {
-        return Ok(None);
-    }
 
     let projection = projection_columns(select)?;
     let mut rows = materialized_view_rows(readiness)?;
@@ -112,13 +111,57 @@ pub fn try_query_materialized_views(
 fn materialized_view_rows(
     readiness: &MvReadinessPort,
 ) -> Result<Vec<MaterializedViewInfoRow>, String> {
-    let projections = readiness
-        .list_ready_projections()
-        .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
-    Ok(projections
-        .iter()
-        .map(|loaded| materialized_view_row(&loaded.projection))
-        .collect())
+    let mut inventory = readiness
+        .local_projection_inventory()
+        .map_err(|e| format!("load materialized view metadata inventory failed: {e}"))?;
+    let bound = novarocks_query_application::api::LocalResultBound::V1;
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    let mut workspace_payload = 0usize;
+    while let Some(loaded) = inventory
+        .next_ready()
+        .map_err(|e| format!("load materialized view metadata failed: {e}"))?
+    {
+        let target = loaded.projection.facts.target();
+        let row_bytes = [target.namespace().len(), target.name().len(), 4, 0]
+            .into_iter()
+            .fold(0usize, |total, n| {
+                total.saturating_add(
+                    novarocks_query_application::api::LocalResultBound::cell_bytes(n),
+                )
+            });
+        bytes = bytes.saturating_add(row_bytes);
+        bound
+            .admit(rows.len().saturating_add(1), bytes)
+            .map_err(|e| format!("information_schema.materialized_views: {e}"))?;
+        let capacity = if rows.len() == rows.capacity() {
+            rows.capacity().saturating_mul(2).max(1).min(bound.rows)
+        } else {
+            rows.capacity()
+        };
+        workspace_payload = workspace_payload
+            .saturating_add(target.namespace().len())
+            .saturating_add(target.name().len())
+            .saturating_add(2 * 64);
+        // Two vector backings cover growth, filtering and stable-sort scratch;
+        // variable text is copied only after the complete workspace check.
+        if capacity
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<MaterializedViewInfoRow>())
+            .saturating_add(workspace_payload)
+            > bound.bytes
+        {
+            return Err(
+                "information_schema.materialized_views exceeds its row workspace bound".into(),
+            );
+        }
+        if capacity != rows.capacity() {
+            rows.try_reserve_exact(capacity - rows.len())
+                .map_err(|_| "information_schema.materialized_views workspace allocation failed")?;
+        }
+        rows.push(materialized_view_row(&loaded.projection));
+    }
+    Ok(rows)
 }
 
 fn materialized_view_row(projection: &StoredMvProjection) -> MaterializedViewInfoRow {
@@ -131,16 +174,26 @@ fn materialized_view_row(projection: &StoredMvProjection) -> MaterializedViewInf
     }
 }
 
+/// Borrow the exact shape used by the immediate producer before any result
+/// window or catalog snapshot is acquired. Other system queries stay distributed.
+pub(crate) fn is_local_materialized_views_query(query: &ast::Query) -> bool {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.from.len() == 1
+        && select.from[0].joins.is_empty()
+        && is_information_schema_materialized_views(&select.from[0].relation)
+}
+
 fn is_information_schema_materialized_views(factor: &ast::TableFactor) -> bool {
     let ast::TableFactor::Table { name, .. } = factor else {
         return false;
     };
-    let parts = object_name_parts(name);
     matches!(
-        parts.as_slice(),
+        name.parts.as_slice(),
         [schema, table]
-            if schema.eq_ignore_ascii_case("information_schema")
-                && table.eq_ignore_ascii_case("materialized_views")
+            if schema.value.eq_ignore_ascii_case("information_schema")
+                && table.value.eq_ignore_ascii_case("materialized_views")
     )
 }
 
@@ -256,6 +309,20 @@ fn build_query_result(
     columns: &[InfoColumn],
     rows: &[MaterializedViewInfoRow],
 ) -> Result<QueryResult, String> {
+    let bound = novarocks_query_application::api::LocalResultBound::V1;
+    if columns.len() > bound.columns {
+        return Err("information_schema.materialized_views exceeds its column bound".into());
+    }
+    let bytes = columns.iter().fold(0usize, |sum, column| {
+        rows.iter().fold(sum, |sum, row| {
+            sum.saturating_add(
+                novarocks_query_application::api::LocalResultBound::cell_bytes(
+                    row_string_value(row, *column).map_or(0, str::len),
+                ),
+            )
+        })
+    });
+    bound.admit(rows.len(), bytes)?;
     let query_columns = columns
         .iter()
         .map(|column| {
@@ -277,39 +344,36 @@ fn build_query_result(
 
 fn build_column_array(column: InfoColumn, rows: &[MaterializedViewInfoRow]) -> ArrayRef {
     match column {
-        InfoColumn::TableSchema => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.table_schema.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        InfoColumn::TableName => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.table_name.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        InfoColumn::IsActive => Arc::new(BooleanArray::from(
-            rows.iter()
-                .map(|row| Some(row.is_active))
-                .collect::<Vec<_>>(),
-        )),
-        InfoColumn::InactiveReason => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.inactive_reason.clone())
-                .collect::<Vec<_>>(),
-        )),
+        InfoColumn::IsActive => {
+            let mut builder = arrow::array::BooleanBuilder::with_capacity(rows.len());
+            for row in rows {
+                builder.append_value(row.is_active);
+            }
+            Arc::new(builder.finish())
+        }
+        _ => {
+            let bytes = rows.iter().fold(0usize, |sum, row| {
+                sum.saturating_add(row_string_value(row, column).map_or(0, str::len))
+            });
+            let mut builder = arrow::array::StringBuilder::with_capacity(rows.len(), bytes);
+            for row in rows {
+                builder.append_option(row_string_value(row, column));
+            }
+            Arc::new(builder.finish())
+        }
     }
 }
 
-fn row_string_value(row: &MaterializedViewInfoRow, column: InfoColumn) -> Option<String> {
+fn row_string_value(row: &MaterializedViewInfoRow, column: InfoColumn) -> Option<&str> {
     match column {
-        InfoColumn::TableSchema => Some(row.table_schema.clone()),
-        InfoColumn::TableName => Some(row.table_name.clone()),
-        InfoColumn::IsActive => Some(row.is_active.to_string()),
-        InfoColumn::InactiveReason => row.inactive_reason.clone(),
+        InfoColumn::TableSchema => Some(&row.table_schema),
+        InfoColumn::TableName => Some(&row.table_name),
+        InfoColumn::IsActive => Some(if row.is_active { "true" } else { "false" }),
+        InfoColumn::InactiveReason => row.inactive_reason.as_deref(),
     }
 }
 
-fn row_sort_value(row: &MaterializedViewInfoRow, column: InfoColumn) -> String {
+fn row_sort_value(row: &MaterializedViewInfoRow, column: InfoColumn) -> &str {
     row_string_value(row, column).unwrap_or_default()
 }
 
@@ -394,5 +458,51 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_source_tests {
+    use super::*;
+
+    #[test]
+    fn row_comparison_lends_existing_names_without_a_per_comparison_clone() {
+        let row = MaterializedViewInfoRow {
+            table_schema: "sales".into(),
+            table_name: "mv".into(),
+            is_active: true,
+            inactive_reason: None,
+        };
+        assert_eq!(
+            row_string_value(&row, InfoColumn::TableName)
+                .unwrap()
+                .as_ptr(),
+            row.table_name.as_ptr()
+        );
+        assert_eq!(
+            row_sort_value(&row, InfoColumn::TableSchema).as_ptr(),
+            row.table_schema.as_ptr()
+        );
+        assert_eq!(row_sort_value(&row, InfoColumn::IsActive), "true");
+        assert_eq!(row_sort_value(&row, InfoColumn::InactiveReason), "");
+    }
+
+    #[test]
+    fn repeated_virtual_columns_are_checked_as_one_whole_result() {
+        let row = MaterializedViewInfoRow {
+            table_schema: "sales".into(),
+            table_name: "x".repeat(4 * 1024 * 1024),
+            is_active: true,
+            inactive_reason: None,
+        };
+        assert!(
+            build_query_result(&[InfoColumn::TableName; 8], std::slice::from_ref(&row)).is_err()
+        );
+        let error = build_query_result(
+            &vec![InfoColumn::IsActive; 4097],
+            std::slice::from_ref(&row),
+        )
+        .unwrap_err();
+        assert!(error.contains("column bound"));
     }
 }

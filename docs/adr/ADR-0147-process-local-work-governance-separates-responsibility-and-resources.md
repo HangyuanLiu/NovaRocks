@@ -11,12 +11,20 @@ provenance:
   - "discussion: 2026-09-11 process-local work governance and host ownership"
 code-anchors:
   - "novarocks/workload-control/src/scope.rs (WorkloadControl, WorkScope, WorkOwner)"
-  - "novarocks/workload-control/src/resource.rs (LocalResourceAuthority, ResultCredit)"
+  - "novarocks/workload-control/src/resource.rs (LocalResourceAuthority, Reservation, AllocationCharge)"
   - "novarocks/workload-control/src/observation.rs (obligations and control progress)"
   - "novarocks/query-application/src/coordination/supervisor.rs (governed logical executions)"
   - "novarocks/frontend-application/src/application.rs (FrontendApplicationHost and shutdown ownership)"
   - "novarocks-server/src/app_config.rs (explicit frontend workload configuration)"
 ---
+
+## MEM-1-M07 实施更新（2026-10-08）
+
+FE 已切到 `WorkloadControl::try_new_counted`：只装配责任、计数准入与生命周期能力，不安装通用 allocation budget，也不向查询、protocol 或 supervisor 注入 LRA。原 statement scope 的固定 result window 在最后 holder 退出时归还，独立 Closing capacity 覆盖写入与尾部。`ResultCredit`、阶段钱包、FIFO 和通用 Arrow delivery 已删除。MySQL raw Arrow writer/行复制与未消费的 description result-credit 字段也已退役；内部 command 的暂存 `QueryResult` 必须由应用包装成原 owner 的 GovernedQuery，协议适配器在发布 metadata 前拒绝未经包装的结果。以下旧结果信用描述保留为原裁决背景，不再代表当前 FE 实现。
+
+需要 allocation budget 的 owner 仍显式提供 `ResourceConfig`；其 `Reservation`/`AllocationCharge` 保留原精确 authority 与最后 alias 退出语义。未安装 allocation budget 的 owner 请求 `resources()` 明确返回 `NotReady`，不会产生默认池。BE process memory control 和现有 retained 保护继续存在。
+
+`[runtime.frontend_workload].control_bytes` 与 `per_scope_bytes` 已退役，配置解析明确拒绝。进程 MemoryAuthority 的保护 floor 独立迁到 `[runtime.memory].control_bytes`，默认仍为 64 MiB，在 work account 建立前预承诺；它不是 FE result window 或第三方内部授权。此更新不宣称 M03b/M04b 后续接线已完成。
 
 ## 问题
 

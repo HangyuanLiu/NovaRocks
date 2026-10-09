@@ -29,6 +29,7 @@ mod aggregate_sequence_contract;
 mod artifact_provenance_contract;
 mod contract_regressions;
 mod exchange_occurrence_contract;
+mod io_cut_view_contract;
 mod ordering_window_assertion_contract;
 mod partition_scan_contract;
 mod runtime_filter_wait_contract;
@@ -531,6 +532,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FragmentId::new(2),
         output: OutputPort {
             node: result_node,
@@ -538,12 +540,14 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         },
         fields: Box::from([
             ResultField {
+                domain: ResultValueDomain::Plain,
                 name: "x".into(),
                 alias: None,
                 value: destination_value,
                 ty: ty(DataType::Int64, false),
             },
             ResultField {
+                domain: ResultValueDomain::Plain,
                 name: "y".into(),
                 alias: None,
                 value: destination_value,

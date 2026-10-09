@@ -113,6 +113,16 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads))
 }
 
+pub(crate) fn lower_final_physical_plan_with_root_semantics(
+    plan: &PhysicalPlanNode,
+    version: PlanVersionId,
+    dop_domain: PipelineDopDomain,
+    reads: Option<FinalizedProviderReadSet>,
+    semantics: crate::compiler::root_output::RootOutputSemantics,
+) -> Result<PlanBuilder, ContractLoweringError> {
+    lower_final_physical_plan_inner_with_domains(plan, version, dop_domain, reads, Some(semantics))
+}
+
 /// Lower one admitted SQL write directly into the final physical-plan
 /// contract. The provider handle is consumed by exact target ordinal here;
 /// neither the logical tree nor the legacy distributed-plan carrier can own or
@@ -201,6 +211,21 @@ fn lower_final_physical_plan_inner(
     dop_domain: PipelineDopDomain,
     reads: Option<FinalizedProviderReadSet>,
 ) -> Result<PlanBuilder, ContractLoweringError> {
+    lower_final_physical_plan_inner_with_domains(plan, version, dop_domain, reads, None)
+}
+
+fn lower_final_physical_plan_inner_with_domains(
+    plan: &PhysicalPlanNode,
+    version: PlanVersionId,
+    dop_domain: PipelineDopDomain,
+    reads: Option<FinalizedProviderReadSet>,
+    semantics: Option<crate::compiler::root_output::RootOutputSemantics>,
+) -> Result<PlanBuilder, ContractLoweringError> {
+    let domains = semantics
+        .as_ref()
+        .map(|facts| facts.domains(&plan.output_columns))
+        .transpose()
+        .map_err(invalid_write)?;
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
     let root = visitor.lower_node(plan)?;
@@ -213,12 +238,24 @@ fn lower_final_physical_plan_inner(
         .iter()
         .map(|value| visitor.value_declared_type(*value))
         .collect::<Result<Vec<_>, _>>()?;
-    let result_fields = result_fields(plan, &root.output, &result_types, &root.display_names)?;
+    let mut result_fields = result_fields(plan, &root.output, &result_types, &root.display_names)?;
+    if let Some(domains) = &domains {
+        if domains.len() != result_fields.len() {
+            return Err(invalid_write("root semantic field count differs".into()));
+        }
+        for (field, domain) in result_fields.iter_mut().zip(domains) {
+            if !domain.matches_storage(&field.ty.data_type) {
+                return Err(invalid_write("root semantic field storage differs".into()));
+            }
+            field.domain = *domain;
+        }
+    }
     let result_output = OutputPort {
         node: root.node,
         columns: root.output.clone(),
     };
     let result_port = ResultPort {
+        scalar_schema: semantics.and_then(|facts| facts.scalar_schema(&result_types)),
         fragment: root.fragment,
         output: result_output,
         fields: result_fields,
@@ -3564,6 +3601,7 @@ impl ContractLoweringVisitor {
             .iter()
             .zip(output.iter())
             .map(|(field, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: field.name().clone().into_boxed_str(),
                 alias: None,
                 value: *value,
@@ -3573,6 +3611,7 @@ impl ContractLoweringVisitor {
             .into_boxed_slice();
         self.complete_fragment(finish_fragment, finish, FragmentSink::Result)?;
         self.finish_draft(ResultPort {
+            scalar_schema: None,
             fragment: finish_fragment,
             output: OutputPort {
                 node: finish,
@@ -7181,6 +7220,16 @@ impl ContractLoweringVisitor {
             });
         }
 
+        // A literal can carry the position's nullability directly. Wrapping
+        // each non-null cell in CASE TRUE ELSE NULL would multiply a large
+        // VALUES relation's expression count without changing its values.
+        // Different data types still take the explicit conversion path below.
+        if source.data_type == target.data_type
+            && let ExprKind::Literal(literal) = &expression.kind
+        {
+            return self.lower_literal_at_type(owner, literal, target.clone());
+        }
+
         let mut lowered = self.lower_expression(owner, expression, &BTreeMap::new())?;
         let mut lowered_type = source;
         if lowered_type.data_type != target.data_type {
@@ -7831,7 +7880,15 @@ impl ContractLoweringVisitor {
         literal: &LiteralValue,
         expression: &TypedExpr,
     ) -> Result<ExprId, ContractLoweringError> {
-        let target = expression_type(expression);
+        self.lower_literal_at_type(owner, literal, expression_type(expression))
+    }
+
+    fn lower_literal_at_type(
+        &mut self,
+        owner: NodeId,
+        literal: &LiteralValue,
+        target: ValueType,
+    ) -> Result<ExprId, ContractLoweringError> {
         let (literal, source) = lower_literal(literal, &target)?;
         // A literal is an exact value; the position it stands in states the
         // type, because everything that reads this expression was typed
@@ -8214,6 +8271,7 @@ fn result_fields(
             // statement that aliased nothing still has one.
             let alias = identity.and_then(|identity| identity.alias.as_deref());
             ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: name.into(),
                 alias: alias.map(Into::into),
                 value: *value,
@@ -11676,7 +11734,44 @@ mod tests {
         for expression in rows.iter().map(|row| row[0]) {
             let expression = fragment.expressions().get(expression).unwrap();
             assert_eq!(expression.ty, ValueType::new(DataType::Float64, true));
-            assert!(matches!(expression.kind, ContractExprKind::Case { .. }));
+        }
+        assert!(matches!(
+            fragment.expressions().get(rows[0][0]).unwrap().kind,
+            ContractExprKind::Case { .. }
+        ));
+        assert!(matches!(
+            fragment.expressions().get(rows[1][0]).unwrap().kind,
+            ContractExprKind::Literal(ContractLiteralValue::Float64Bits(bits))
+                if bits == 1.5_f64.to_bits()
+        ));
+    }
+
+    #[test]
+    fn large_nullable_literal_values_fit_without_redundant_case_expressions() {
+        let columns = (1..=4)
+            .map(|id| column(id, &format!("text_{id}"), DataType::Utf8, true))
+            .collect();
+        let rows = (0..16_384)
+            .map(|row| {
+                (0..4)
+                    .map(|col| TypedExpr {
+                        kind: ExprKind::Literal(if row == 0 && col == 0 {
+                            LiteralValue::Null
+                        } else {
+                            LiteralValue::String(format!("{row}_{col}"))
+                        }),
+                        data_type: DataType::Utf8,
+                        nullable: row == 0 && col == 0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let final_plan = finish_for_test(&values(columns, rows)).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        assert_eq!(fragment.expressions().len(), 65_536);
+        for (_, expression) in fragment.expressions().iter() {
+            assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
+            assert!(matches!(expression.kind, ContractExprKind::Literal(_)));
         }
     }
 

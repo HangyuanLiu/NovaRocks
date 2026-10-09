@@ -60,7 +60,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 5;
+pub const PLAN_CONTRACT_REVISION: u32 = 6;
 
 #[cfg(test)]
 mod tests;

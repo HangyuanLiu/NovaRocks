@@ -321,6 +321,13 @@ pub enum MaintenanceStatementResult {
 /// to the Frontend MV background runtime until CLS-R3.
 // Design: ADR-0083 (docs/adr/ADR-0083-frontend-owns-table-maintenance-execution-port.md)
 pub trait TableMaintenanceEngine: Send + Sync {
+    /// Bind the one already-admitted root before any distributed rewrite
+    /// construction. This capability never enters durable job descriptions.
+    fn for_admitted_execution(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Arc<dyn TableMaintenanceEngine>, String>;
+
     fn capture_admitted_optimize_target(
         &self,
         _target: &MaintenanceTarget,
@@ -903,7 +910,12 @@ impl BackgroundMaintenanceAttempt {
 /// for each call. There is deliberately no Core default, process-global lookup
 /// or application-facade fallback.
 pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
-    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String>;
+    fn begin_automatic_maintenance_attempt(
+        &self,
+        capacity: Option<
+            &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        >,
+    ) -> Result<BackgroundMaintenanceAttempt, String>;
 }
 
 /// Long-lived automatic-maintenance engine.
@@ -930,7 +942,9 @@ impl BackgroundMaintenanceEngine {
     }
 
     fn request_engine(&self) -> Result<RequestScopedMaintenanceEngine, String> {
-        let attempt = self.attempt_factory.begin_automatic_maintenance_attempt()?;
+        let attempt = self
+            .attempt_factory
+            .begin_automatic_maintenance_attempt(None)?;
         Ok(RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             attempt.execution,
@@ -954,6 +968,32 @@ impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
 }
 
 impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
+    fn for_admitted_execution(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )?;
+        let original = self
+            .execution
+            .result_capacity()
+            .ok_or("request maintenance engine has no admitted root binding")?;
+        if !original.window_alias().is_for_scope(capacity.scope())
+            || !original
+                .window_alias()
+                .shares_capacity_with(&capacity.window_alias())
+        {
+            return Err("request maintenance engine cannot change its admitted root".into());
+        }
+        Ok(Arc::new(Self::new(
+            self.kernel.clone(),
+            self.execution.clone(),
+            self.connector_context.clone(),
+        )))
+    }
+
     fn capture_admitted_optimize_target(
         &self,
         target: &MaintenanceTarget,
@@ -1323,6 +1363,14 @@ impl RequestScopedMaintenanceEngine {
         intent: DistributedRewriteIntent,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        let capacity = self
+            .execution
+            .result_capacity()
+            .ok_or("distributed maintenance rewrite has no admitted Internal window")?;
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )?;
         let identity = Self::target_identity(target)?;
         crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
             self.kernel.query_execution(),
@@ -1339,6 +1387,35 @@ impl RequestScopedMaintenanceEngine {
 }
 
 impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
+    fn for_admitted_execution(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )?;
+        let attempt = self
+            .attempt_factory
+            .begin_automatic_maintenance_attempt(Some(capacity))?;
+        let returned = attempt
+            .execution
+            .result_capacity()
+            .ok_or("automatic maintenance factory omitted its admitted root")?;
+        if !returned.window_alias().is_for_scope(capacity.scope())
+            || !returned
+                .window_alias()
+                .shares_capacity_with(&capacity.window_alias())
+        {
+            return Err("automatic maintenance factory replaced its admitted root".into());
+        }
+        Ok(Arc::new(RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            attempt.execution,
+            attempt.connector_context,
+        )))
+    }
+
     fn resolve_target(
         &self,
         name_parts: &[String],
@@ -1766,6 +1843,13 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     let version = plan.version();
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .and_then(|candidate| {
+                candidate.freeze_root_output(
+                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                    ),
+                )
+            })
             .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
@@ -2246,5 +2330,139 @@ mod maintenance_attempt_context_tests {
             MaintenanceJobState::TargetReplaced.as_str(),
             "TARGET_REPLACED"
         );
+    }
+}
+
+#[cfg(test)]
+mod admitted_background_context_tests {
+    use super::*;
+    use novarocks_query_application::api::{
+        BackendTopologyError, BackendTopologyPort, BackendTopologySnapshot,
+        BackendTopologyValidationError,
+    };
+    use novarocks_workload_control::{
+        ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+        WorkloadConfig, WorkloadControl,
+    };
+    use std::time::Duration;
+
+    struct TopologyProbe {
+        allow_snapshot: bool,
+    }
+    impl BackendTopologyPort for TopologyProbe {
+        fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+            assert!(
+                self.allow_snapshot,
+                "capacity refusal must precede topology capture"
+            );
+            Ok(BackendTopologySnapshot::empty(7))
+        }
+        fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+            panic!("unused topology subscription")
+        }
+        fn validate_snapshot(
+            &self,
+            _: &BackendTopologySnapshot,
+        ) -> Result<(), BackendTopologyValidationError> {
+            panic!("unused topology validation")
+        }
+        fn wait_for_eligible_after(
+            &self,
+            _: u64,
+            _: Instant,
+        ) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+            panic!("unused topology wait")
+        }
+        fn record_successful_stage(&self, _: usize, _: usize) {
+            panic!("unused stage report")
+        }
+    }
+    fn control() -> (
+        WorkloadControl,
+        novarocks_workload_control::ResultCapacityHandle,
+    ) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        (control, capacity)
+    }
+
+    #[tokio::test]
+    async fn local_window_refuses_before_automatic_topology_capture() {
+        let (control, _) = control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+        let result = crate::capabilities::background_maintenance_attempt(
+            novarocks_types::ClusterRole::Fe,
+            Arc::new(TopologyProbe {
+                allow_snapshot: false,
+            }),
+            Duration::from_secs(60),
+            &tokio::runtime::Handle::current(),
+            Some(&binding),
+        );
+        assert!(matches!(result, Err(error) if error.contains("Internal")));
+        drop(binding);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[tokio::test]
+    async fn automatic_attempt_keeps_original_root_deadline_cancellation_and_window() {
+        let (control, capacity) = control();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut request = WorkRequest::new(WorkClass::Management);
+        request.deadline = Some(deadline.into());
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(request, ResultWindowClass::Internal)
+            .unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+        let attempt = crate::capabilities::background_maintenance_attempt(
+            novarocks_types::ClusterRole::Fe,
+            Arc::new(TopologyProbe {
+                allow_snapshot: true,
+            }),
+            Duration::from_secs(60),
+            &tokio::runtime::Handle::current(),
+            Some(&binding),
+        )
+        .unwrap();
+        assert_eq!(attempt.execution.deadline(), Some(deadline));
+        assert_eq!(attempt.execution.topology().revision(), 7);
+        let returned = attempt.execution.result_capacity().unwrap();
+        assert!(returned.window_alias().is_for_scope(binding.scope()));
+        assert!(
+            returned
+                .window_alias()
+                .shares_capacity_with(&binding.window_alias())
+        );
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
+        assert!(attempt.execution.cancellation().is_cancelled());
+        drop(binding);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(attempt);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 }

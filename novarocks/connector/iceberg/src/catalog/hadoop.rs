@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use super::admission::{
     CatalogAdmission, CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogInitiation,
@@ -90,8 +90,43 @@ impl NovaRocksHadoopCatalog {
     }
 }
 
+const MAX_BOUNDED_READ_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const OVERSIZED_READ_DIAGNOSTIC: &str = "Hadoop catalog read diagnostic exceeds its bounded limit";
+
+/// Keep control/refusal source kinds and ordinary typed read classification,
+/// copying only an admitted borrowed message. The SDK's source/context display
+/// can retain an arbitrary remote response and must never be rendered here.
+fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
+    use novarocks_spi::connector::ConnectorErrorKind;
+    let (kind, message) = match std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<ConnectorError>())
+    {
+        Some(source)
+            if matches!(
+                source.kind(),
+                ConnectorErrorKind::ResourceExhausted
+                    | ConnectorErrorKind::Cancelled
+                    | ConnectorErrorKind::DeadlineExceeded
+            ) =>
+        {
+            (source.kind(), source.message())
+        }
+        _ => (super::error::read_error_kind(error.kind()), error.message()),
+    };
+    let message = if message.len() <= MAX_BOUNDED_READ_DIAGNOSTIC_BYTES {
+        message
+    } else {
+        OVERSIZED_READ_DIAGNOSTIC
+    };
+    ConnectorError::new(kind, message)
+}
+
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
+    fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
+        Arc::clone(&self.delegate.listing)
+    }
+
     fn implementation_name(&self) -> &'static str {
         "hadoop"
     }
@@ -143,27 +178,44 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         }
     }
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_namespaces().await
+    async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.delegate.list_namespaces(bound).await
     }
 
+    /// The warehouse directory listing is checked against the bound before any
+    /// child is probed, so neither the probes nor the retained names can
+    /// exceed it.
     async fn list_namespaces_for_read(
         &self,
         binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        let namespaces = self
-            .client
-            .list_namespaces_for_read(binding)
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "filesystem catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(&context, async {
+                let namespaces = self
+                    .client
+                    .list_namespaces_for_read(binding, bound)
+                    .await
+                    .map_err(|error| map_bounded_read_error(&error))?;
+                Ok(super::delegate::sorted_unique(
+                    namespaces
+                        .into_iter()
+                        .flat_map(|ident| ident.inner())
+                        .filter(|name| !name.starts_with('.'))
+                        .collect(),
+                ))
+            })
             .await
-            .map_err(|error| super::error::map_read_error(&error))?;
-        let mut names = namespaces
-            .into_iter()
-            .flat_map(|ident| ident.inner())
-            .filter(|name| !name.starts_with('.'))
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
     }
 
     async fn namespace_exists(
@@ -188,28 +240,39 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_tables(&namespace).await
+        self.delegate.list_tables(&namespace, bound).await
     }
 
+    /// The namespace directory listing is checked against the bound before
+    /// any child is probed for a version hint.
     async fn list_tables_for_read(
         &self,
         namespace: CatalogNamespaceName,
         binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        let ident = super::delegate::namespace_ident(&namespace)?;
-        let tables = self
-            .client
-            .list_tables_for_read(&ident, binding)
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "filesystem catalog listing requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(&context, async {
+                let ident = super::delegate::namespace_ident(&namespace)?;
+                let tables = self
+                    .client
+                    .list_tables_for_read(&ident, binding, bound)
+                    .await
+                    .map_err(|error| map_bounded_read_error(&error))?;
+                Ok(super::delegate::sorted_unique(
+                    tables.into_iter().map(|ident| ident.name).collect(),
+                ))
+            })
             .await
-            .map_err(|error| super::error::map_read_error(&error))?;
-        let mut names = tables
-            .into_iter()
-            .map(|ident| ident.name)
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -265,8 +328,9 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_views(&namespace).await
+        self.delegate.list_views(&namespace, bound).await
     }
 
     async fn load_view(
@@ -646,5 +710,103 @@ fn message(failure: &crate::hadoop_catalog::HadoopCreateFailure) -> String {
     match failure.facts.as_ref() {
         Some(facts) => format!("{} [operation_id={}]", failure.message, facts.operation_id),
         None => failure.message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod bounded_read_error_tests {
+    use std::fmt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+    use super::{
+        MAX_BOUNDED_READ_DIAGNOSTIC_BYTES, OVERSIZED_READ_DIAGNOSTIC, map_bounded_read_error,
+    };
+    use crate::iceberg::{Error, ErrorKind};
+
+    #[derive(Debug)]
+    struct PanicDisplay;
+
+    impl fmt::Display for PanicDisplay {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("bounded projection must not render the remote source")
+        }
+    }
+
+    impl std::error::Error for PanicDisplay {}
+
+    #[derive(Debug)]
+    struct LargeRemoteDisplay {
+        response: String,
+        displays: Arc<AtomicUsize>,
+    }
+
+    impl fmt::Display for LargeRemoteDisplay {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.displays.fetch_add(1, Ordering::SeqCst);
+            formatter.write_str(&self.response)
+        }
+    }
+
+    impl std::error::Error for LargeRemoteDisplay {}
+
+    #[test]
+    fn bounded_read_error_never_renders_source_or_context() {
+        let error = Error::new(ErrorKind::DataInvalid, "invalid directory metadata")
+            .with_context("remote-response", "r".repeat(1024 * 1024))
+            .with_source(PanicDisplay);
+        let projected = map_bounded_read_error(&error);
+        assert_eq!(projected.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(projected.message(), "invalid directory metadata");
+
+        let displays = Arc::new(AtomicUsize::new(0));
+        let error = Error::new(ErrorKind::Unexpected, "directory request failed").with_source(
+            LargeRemoteDisplay {
+                response: "response".repeat(1024 * 1024),
+                displays: displays.clone(),
+            },
+        );
+        let projected = map_bounded_read_error(&error);
+        assert_eq!(projected.kind(), ConnectorErrorKind::Unavailable);
+        assert_eq!(projected.message(), "directory request failed");
+        assert_eq!(displays.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_read_error_admits_bytes_before_message_copy() {
+        let exact = "🦀".repeat(MAX_BOUNDED_READ_DIAGNOSTIC_BYTES / 4);
+        let error =
+            Error::new(ErrorKind::FeatureUnsupported, exact.clone()).with_source(PanicDisplay);
+        let projected = map_bounded_read_error(&error);
+        assert_eq!(projected.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(projected.message(), exact);
+        let oversized = Error::new(ErrorKind::TableNotFound, exact + "x").with_source(PanicDisplay);
+        let projected = map_bounded_read_error(&oversized);
+        assert_eq!(projected.kind(), ConnectorErrorKind::NotFound);
+        assert_eq!(projected.message(), OVERSIZED_READ_DIAGNOSTIC);
+    }
+
+    #[test]
+    fn bounded_read_error_preserves_control_kinds_with_bounded_source_message() {
+        for kind in [
+            ConnectorErrorKind::ResourceExhausted,
+            ConnectorErrorKind::Cancelled,
+            ConnectorErrorKind::DeadlineExceeded,
+        ] {
+            let error = Error::new(ErrorKind::Unexpected, "wrapper")
+                .with_source(ConnectorError::new(kind, "typed control reason"));
+            let projected = map_bounded_read_error(&error);
+            assert_eq!(projected.kind(), kind);
+            assert_eq!(projected.message(), "typed control reason");
+
+            let error = Error::new(ErrorKind::Unexpected, "wrapper").with_source(
+                ConnectorError::new(kind, "x".repeat(MAX_BOUNDED_READ_DIAGNOSTIC_BYTES + 1)),
+            );
+            let projected = map_bounded_read_error(&error);
+            assert_eq!(projected.kind(), kind);
+            assert_eq!(projected.message(), OVERSIZED_READ_DIAGNOSTIC);
+        }
     }
 }

@@ -499,6 +499,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     cluster_size: Option<usize>,
 
+    /// Cross-process launch profile: fault-scenario or performance.
+    /// Performance supports release binaries and refuses fault directives.
+    #[arg(long)]
+    cluster_launch_profile: Option<novarocks_cluster_harness::LaunchProfile>,
+
     /// SQL statements applied, in order, to each target case session before its first step.
     #[arg(long = "target-session-sql", value_name = "SQL", action = ArgAction::Append)]
     target_session_sql: Vec<String>,
@@ -4761,6 +4766,27 @@ fn report_preserved_failure_artifacts(result: &Result<Option<PathBuf>>) {
     }
 }
 
+fn select_cluster_launch_profile(
+    requested: Option<novarocks_cluster_harness::LaunchProfile>,
+    lane: TestLane,
+    query_lifecycle_faults: bool,
+    cleanup_faults: bool,
+) -> Result<novarocks_cluster_harness::LaunchProfile> {
+    use novarocks_cluster_harness::LaunchProfile;
+    let has_faults = query_lifecycle_faults || cleanup_faults;
+    let profile = requested.unwrap_or_else(|| {
+        if lane == TestLane::Benchmark && !has_faults {
+            LaunchProfile::Performance
+        } else {
+            LaunchProfile::FaultScenario
+        }
+    });
+    if profile == LaunchProfile::Performance && has_faults {
+        bail!("performance launch profile refuses query-lifecycle or cleanup fault directives");
+    }
+    Ok(profile)
+}
+
 pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32> {
     let base_dir = resolve_repo_root()?;
     let suite_configs = build_suite_configs(&base_dir, lane)?;
@@ -4961,14 +4987,12 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         )?;
     let cleanup_faults_enabled = !cli.dry_run
         && selected_cases_require_cleanup_faults(&cli, &suite_names, &suite_configs, &base_dir)?;
-    let launch_profile = if lane == TestLane::Benchmark
-        && !query_lifecycle_faults_enabled
-        && !cleanup_faults_enabled
-    {
-        novarocks_cluster_harness::LaunchProfile::Performance
-    } else {
-        novarocks_cluster_harness::LaunchProfile::FaultScenario
-    };
+    let launch_profile = select_cluster_launch_profile(
+        cli.cluster_launch_profile,
+        lane,
+        query_lifecycle_faults_enabled,
+        cleanup_faults_enabled,
+    )?;
 
     let launch_cluster_mode = if cli.dry_run {
         ClusterMode::AllInOne
@@ -6578,6 +6602,46 @@ mod tests {
     }
 
     #[test]
+    fn release_cluster_launch_profile_preserves_fault_gates() {
+        use novarocks_cluster_harness::LaunchProfile;
+        let cli = crate::Cli::try_parse_from([
+            "novarocks-sql-test",
+            "--suite",
+            "decimal",
+            "--cluster-launch-profile",
+            "performance",
+        ])
+        .expect("parse release-compatible launch profile");
+        assert_eq!(cli.cluster_launch_profile, Some(LaunchProfile::Performance));
+        assert_eq!(
+            super::select_cluster_launch_profile(
+                cli.cluster_launch_profile,
+                super::TestLane::Correctness,
+                false,
+                false,
+            )
+            .unwrap(),
+            LaunchProfile::Performance
+        );
+        for (query_faults, cleanup_faults) in [(true, false), (false, true), (true, true)] {
+            assert!(
+                super::select_cluster_launch_profile(
+                    cli.cluster_launch_profile,
+                    super::TestLane::Correctness,
+                    query_faults,
+                    cleanup_faults,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            super::select_cluster_launch_profile(None, super::TestLane::Correctness, false, false,)
+                .unwrap(),
+            LaunchProfile::FaultScenario
+        );
+    }
+
+    #[test]
     fn cli_allows_extension_listing_without_a_suite() {
         let cli = crate::Cli::try_parse_from(["novarocks-sql-test", "--list-extensions"])
             .expect("extension listing should not require a suite");
@@ -6991,6 +7055,7 @@ mod tests {
             be: vec![BePorts {
                 http: 18080,
                 grpc: 19070,
+                control_grpc: 19071,
             }],
             fe_http_port: 28080,
             fe_grpc_port: 29070,

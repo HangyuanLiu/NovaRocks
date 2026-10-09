@@ -255,6 +255,7 @@ fn build_join_output_projection(
                 input: Box::new(join_node.node),
                 node_id,
                 is_subordinate: true,
+                validate_final_result_input: false,
                 exprs,
                 expr_slot_ids: layout.order().to_vec(),
                 expr_slot_schemas: Some(expr_slot_schemas),

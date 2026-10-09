@@ -63,13 +63,16 @@ pub(crate) mod error;
 pub(crate) mod factory;
 pub(crate) mod hadoop;
 pub(crate) mod hive;
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub(crate) mod hms_listing_observer;
+pub(crate) mod listing_admission;
 pub(crate) mod rest;
 
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use self::error::{CatalogOutcome, CatalogUnsupported};
 
@@ -396,15 +399,29 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         None
     }
 
-    // ---- A. Reads -------------------------------------------------------
+    /// The one admission domain shared by this catalog generation's listings,
+    /// including maintenance object listings.
+    fn listing_admission(&self) -> Arc<listing_admission::ListingAdmission>;
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError>;
+    // ---- A. Reads -------------------------------------------------------
+    //
+    // Every enumeration is bounded at its source by the caller's
+    // `ConnectorListingBound`: a listing that would exceed it is refused with
+    // `ResourceExhausted`, never truncated. A source that can page does so
+    // with pages no larger than `bound.page_entries`; a source that cannot is
+    // checked as one complete listing.
+
+    async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError>;
 
     async fn list_namespaces_for_read(
         &self,
         _binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.list_namespaces().await
+        self.list_namespaces(bound).await
     }
 
     async fn namespace_exists(
@@ -423,14 +440,16 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError>;
 
     async fn list_tables_for_read(
         &self,
         namespace: CatalogNamespaceName,
         _binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.list_tables(namespace).await
+        self.list_tables(namespace, bound).await
     }
 
     async fn list_tables_page(
@@ -481,9 +500,34 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     /// Enumerate views. See [`NovaRocksCatalog::view_exists`] on why this is
     /// not allowed to answer with an empty vector when it cannot answer.
+    async fn list_views_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.list_views(namespace, bound).await
+    }
+
+    async fn list_tables_page_for_request(
+        &self,
+        namespace: CatalogNamespaceName,
+        page_token: Option<Arc<str>>,
+        page_size: usize,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<CatalogTablePage, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.list_tables_page(namespace, page_token, page_size)
+            .await
+    }
+
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError>;
 
     async fn load_view(

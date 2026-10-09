@@ -152,13 +152,20 @@ impl FrontendCatalogPruneService {
                         continue;
                     }
                 };
+                let process_id = match target.process_id() {
+                    Ok(process_id) => process_id,
+                    Err(error) => {
+                        tracing::warn!(%error, backend = target.backend_idx(), "catalog prune skipped invalid backend process");
+                        continue;
+                    }
+                };
                 let request = request.clone();
                 let data_runtime = self.data_runtime.clone();
                 let timeout = self.config.rpc_timeout;
                 workers.spawn_blocking(move || {
                     (
                         target.backend_idx(),
-                        prune_catalogs(&data_runtime, endpoint, &request, timeout),
+                        prune_catalogs(&data_runtime, endpoint, process_id, &request, timeout),
                     )
                 });
             }

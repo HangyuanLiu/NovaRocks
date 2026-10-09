@@ -62,6 +62,33 @@ pub struct ProviderReadReference {
     pub relation: ConnectorReadRelationPayload,
 }
 
+/// Exact source provenance borrowed from its immutable plan owner.
+/// Comparison has the same source-then-selection ordering as
+/// [`ArtifactSourceBinding`], without copying provider-private payloads.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SourceBindingRef<'a> {
+    pub source: &'a ProviderReadReference,
+    pub selection_digest: &'a [u8; 32],
+}
+
+impl SourceBindingRef<'_> {
+    pub fn to_owned(self) -> ArtifactSourceBinding {
+        ArtifactSourceBinding {
+            source: self.source.clone(),
+            selection_digest: *self.selection_digest,
+        }
+    }
+}
+
+impl<'a> From<&'a ArtifactSourceBinding> for SourceBindingRef<'a> {
+    fn from(binding: &'a ArtifactSourceBinding) -> Self {
+        Self {
+            source: &binding.source,
+            selection_digest: &binding.selection_digest,
+        }
+    }
+}
+
 /// Exact provider column identity associated with the same frozen relation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderColumnReference {
@@ -192,14 +219,15 @@ impl Relation {
     }
 
     pub fn source_binding(&self) -> ArtifactSourceBinding {
-        match self {
-            Self::Data(relation) => ArtifactSourceBinding {
-                source: relation.read.clone(),
-                selection_digest: relation.selection_digest,
-            },
-            Self::Metadata(relation) => ArtifactSourceBinding {
-                source: relation.read.clone(),
-                selection_digest: relation.selection_digest,
+        self.source_binding_ref().to_owned()
+    }
+
+    pub fn source_binding_ref(&self) -> SourceBindingRef<'_> {
+        SourceBindingRef {
+            source: self.read(),
+            selection_digest: match self {
+                Self::Data(relation) => &relation.selection_digest,
+                Self::Metadata(relation) => &relation.selection_digest,
             },
         }
     }

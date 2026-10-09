@@ -52,12 +52,20 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                 format!("invalid gRPC exchange destination port: {error}"),
             )
         })?;
-        let client = NativeRpcClient::new_host_port(
+        let target = frame.destination_task_identity.ok_or_else(|| {
+            failed(
+                FragmentIoErrorKind::InvalidResponse,
+                "exchange destination has no frozen task identity",
+            )
+        })?;
+        let endpoint =
+            novarocks_types::NativeEndpoint::from_host_port(frame.destination.host(), port)
+                .map_err(|error| failed(FragmentIoErrorKind::InvalidResponse, error.to_string()))?;
+        let client = NativeRpcClient::new_backend_endpoint(
             self.runtime.clone(),
-            frame.destination.host().to_string(),
-            port,
-        )
-        .map_err(|error| failed(FragmentIoErrorKind::Unavailable, error))?;
+            endpoint,
+            target.backend_process_id(),
+        );
         let normal_closed = client
             .exchange_unary(
                 frame.destination_fragment_instance_id,
@@ -195,6 +203,32 @@ mod tests {
             sender_count: 2,
         };
         (frame, proof)
+    }
+
+    #[test]
+    fn missing_frozen_destination_process_is_refused_before_tcp_dial() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut frame, _) = frame_and_proof();
+        frame.destination = RuntimeEndpoint::new(
+            "127.0.0.1",
+            i32::from(listener.local_addr().unwrap().port()),
+        )
+        .unwrap();
+        frame.destination_task_identity = None;
+        let transmitter = super::grpc_exchange_transmitter(
+            crate::backend_test_support::test_backend_data_runtime(),
+            std::time::Duration::from_secs(1),
+        );
+        let error = transmitter.transmit(frame).unwrap_err();
+        assert_eq!(
+            error.failure().unwrap().kind(),
+            FragmentIoErrorKind::InvalidResponse
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

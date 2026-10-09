@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "frozen_before_execution": true,
+  "scenario": "catalog/mem-1-m07-real-rest-listing",
+  "original_input": {
+    "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v3.json",
+    "sha256": "e279724dc4ab2ce34dfdef5f3a939ad3f0f05ed076c36c5c60a7b7d7c6c1a3d3"
+  },
+  "normal": {
+    "namespaces": 32,
+    "tables_per_namespace": 512,
+    "views_per_namespace": 512,
+    "page_size": 256,
+    "namespace_pattern": "cl_ns_%04d",
+    "table_pattern": "cl_table_%06d",
+    "view_pattern": "cl_view_%06d",
+    "concurrency": [
+      1,
+      8,
+      16
+    ]
+  },
+  "native_topology": {
+    "frontend_processes": 1,
+    "backend_processes": 3
+  },
+  "deadlines": {
+    "sql_client_timeout_seconds": 120,
+    "observer_control_seconds": 1,
+    "observer_start_seconds": 5,
+    "observer_stop_seconds": 35,
+    "observer_exit_seconds": 5,
+    "native_scenario_seconds": 1800
+  },
+  "phases": [
+    "catalog_admission",
+    "lake_discovery",
+    "information_schema_1",
+    "information_schema_8",
+    "information_schema_16",
+    "show_views_each_of_32_namespaces",
+    "drop_success",
+    "independent_verify_after_drop"
+  ],
+  "oracle": {
+    "tables": 16384,
+    "views": 16384,
+    "drop_namespace": "cl_ns_0000",
+    "drop_mutations": 1025,
+    "remaining_namespaces": 31,
+    "metadata_loads_per_discovery": 16384
+  },
+  "scope": "Stock private REST only. External preflight/bulk preparation precedes FE launch. Independent verification follows FE sampling. Actual observer pages/names/body bytes/concurrent requests are distinct from SDK positions and FE allocator bytes. No deterministic boundary injection, cross-provider acceptance, native deadline extension, or retry.",
+  "deadline_scope": "Native SQL/provider phases and native resource convergence must finish before one fixed1800s deadline (also clamped to context.deadline). External prelaunch preparation and post-native read-only verification each use their separately frozen producer clocks; verification is not included in native phase PASS or FE sampling."
+}

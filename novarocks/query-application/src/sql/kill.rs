@@ -17,7 +17,7 @@
 
 //! Query-application KILL admission and command execution.
 
-use novarocks_parser::ast::{KillKind, KillStatement, LiteralKind};
+use novarocks_parser::ast::{KillKind, KillStatement, LiteralKind, SessionStatement};
 
 use crate::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
@@ -30,6 +30,28 @@ use crate::session_control::{
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
 use super::session_admit::SessionAdmitError;
+
+/// Route only parser-admitted control commands before ordinary root/business
+/// admission. Connection admission and the existing authorization still apply.
+/// All other session statements retain their normal governed entrypoint.
+pub fn execute_control_session_statement(
+    source: &str,
+    statement: &SessionStatement,
+    requester: SessionToken,
+    query_control: &QueryControlService,
+    connection_control: &dyn ClientConnectionControlPort,
+) -> Option<Result<QuerySessionOutput, QueryServiceError>> {
+    let SessionStatement::Kill(statement) = statement else {
+        return None;
+    };
+    Some(execute_kill_statement(
+        source,
+        statement,
+        requester,
+        query_control,
+        connection_control,
+    ))
+}
 
 /// Executes a parser-admitted KILL statement using the exact session and
 /// protocol connection capabilities composed for this query service.
@@ -173,6 +195,109 @@ mod tests {
                 .push((target, reason));
             self.outcome
         }
+    }
+
+    #[test]
+    fn control_route_cancels_existing_work_while_ordinary_capacity_is_full_and_closed() {
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkError,
+            WorkRequest, WorkloadConfig, WorkloadControl,
+        };
+        let control = QueryApplicationControl::service();
+        let requester = register_session(&control, 8, 1, "alice");
+        let target = register_session(&control, 7, 1, "alice");
+        let foreign = register_session(&control, 9, 1, "bob");
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig {
+                root_limit: 1,
+                business_limit: 1,
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let statement = control
+            .begin_governed_statement_with_result(
+                target.token(),
+                &workload.root_admission(),
+                WorkClass::Management,
+                None,
+                None,
+                None,
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        assert!(matches!(
+            workload
+                .root_admission()
+                .try_begin_root(WorkRequest::new(WorkClass::Management)),
+            Err(WorkError::Capacity(_))
+        ));
+        workload.close_admission();
+        let connection_control =
+            FixedConnectionControl::new(ClientConnectionTerminateOutcome::Requested);
+        let kill = SessionStatement::Kill(parsed_kill("KILL QUERY 7"));
+        assert!(
+            execute_control_session_statement(
+                "KILL QUERY 7",
+                &kill,
+                foreign.token(),
+                &control,
+                &connection_control
+            )
+            .unwrap()
+            .is_err()
+        );
+        assert!(statement.cancellation().reason().is_none());
+        assert!(matches!(
+            execute_control_session_statement(
+                "KILL QUERY 7",
+                &kill,
+                requester.token(),
+                &control,
+                &connection_control
+            )
+            .unwrap()
+            .unwrap(),
+            QuerySessionOutput::Ok
+        ));
+        assert!(statement.cancellation().reason().is_some());
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        assert_eq!(workload.snapshot().businesses, 1);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        let ordinary = parse("SET @v = 1").unwrap();
+        let [Statement::Session(session)] = ordinary.as_slice() else {
+            panic!("session statement");
+        };
+        assert!(
+            execute_control_session_statement(
+                "SET @v = 1",
+                session,
+                requester.token(),
+                &control,
+                &connection_control
+            )
+            .is_none()
+        );
+        drop(statement);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[test]

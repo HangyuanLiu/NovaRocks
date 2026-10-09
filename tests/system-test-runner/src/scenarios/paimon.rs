@@ -234,10 +234,20 @@ impl Scenario for PaimonSnapshotAndSchema {
             let _ = advance_thread.join();
             return Err(error.context("external Paimon S2 fixture publication"));
         }
-        ensure!(
-            matches!(held.done.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "S1 query reached terminal before the S2 snapshot was published"
-        );
+        match held.done.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(outcome) => {
+                held.thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("S1 Paimon query actor panicked"))??;
+                let rows =
+                    outcome.context("S1 query failed before the S2 snapshot was published")?;
+                bail!("S1 query completed before the S2 snapshot was published: {rows:?}");
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("S1 Paimon query actor disconnected before S2 publication");
+            }
+        }
         let advanced: Result<()> = (|| {
             advance_done
                 .recv_timeout(context.remaining("finish S2 fixture verification")?)

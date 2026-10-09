@@ -4,11 +4,20 @@ mod backend_membership;
 mod catalog_state;
 mod connector;
 mod distributed_writer;
+#[cfg(unix)]
+pub(crate) mod exact_mysql_native_driver;
+#[cfg(unix)]
+pub(crate) mod exact_mysql_native_oracle;
 mod exchange_normal_close;
 mod frontend_lifecycle;
+pub(crate) mod hms_classification_preflight;
 mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;
+#[cfg(unix)]
+mod independent_root_target;
+mod listing;
+mod listing_real_rest;
 mod memory_attribution;
 mod mv_recovery;
 mod mv_uea7;
@@ -24,6 +33,11 @@ mod preparation_capacity;
 mod query_concurrency;
 mod query_lifecycle;
 mod query_output;
+mod result_delivery;
+mod result_delivery_baseline;
+mod result_delivery_closing;
+mod result_delivery_root_protocol;
+mod result_delivery_root_reply;
 mod runtime_filter;
 mod state_family;
 mod table_maintenance;
@@ -43,7 +57,15 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(query_concurrency::scenarios());
     scenarios.extend(query_output::scenarios());
     scenarios.extend(memory_attribution::scenarios());
+    scenarios.push(Box::new(listing::CatalogListing));
+    scenarios.push(Box::new(listing_real_rest::RealRestListing::default()));
+    scenarios.push(Box::new(listing::CatalogListingCancellation));
+    scenarios.push(Box::new(listing::ObjectStoreListingBoundary));
     scenarios.extend(uea1_performance::scenarios());
+    scenarios.extend(result_delivery_baseline::scenarios());
+    scenarios.extend(result_delivery::scenarios());
+    scenarios.extend(result_delivery_root_reply::scenarios());
+    scenarios.extend(result_delivery_closing::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
     scenarios.extend(uea4_range_reads::scenarios());
     scenarios.extend(uea4_rss_baselines::scenarios());
