@@ -663,7 +663,7 @@ pub(super) fn validate_contract(
 ) -> Result<(), KernelFailure> {
     let [
         FunctionArgumentType::Value(value),
-        FunctionArgumentType::Value(rate),
+        FunctionArgumentType::Value(_rate),
     ] = contract.call().selected().argument_types.as_ref()
     else {
         return Err(invalid(
@@ -675,10 +675,8 @@ pub(super) fn validate_contract(
     };
     let mut expected = value.clone();
     expected.nullable = true;
-    if rate.data_type != DataType::Float64
-        || !expected.exactly_equals_observed::<KernelFailure>(output, || {
-            work.step().map_err(compile_failure)
-        })?
+    if !expected
+        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
         || !FunctionValueType::new(DataType::Binary, true)
             .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
                 work.step().map_err(compile_failure)
