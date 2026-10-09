@@ -1149,3 +1149,11 @@ mod opaque_memory_host_tests;
 #[cfg(test)]
 #[path = "ds_hll_local_phase_factory_tests.rs"]
 mod ds_hll_local_phase_factory_tests;
+
+#[cfg(test)]
+#[path = "copy_root_scratch_host_tests.rs"]
+mod copy_root_scratch_host_tests;
+
+#[cfg(test)]
+#[path = "copy_child_scratch_host_tests.rs"]
+mod copy_child_scratch_host_tests;

@@ -22,6 +22,16 @@
 mod zip;
 pub use zip::preflight_zip;
 
+#[path = "selected_copy/root_scratch_host.rs"]
+mod root_scratch_host;
+pub use root_scratch_host::{
+    TakeRootScratchFacts, preflight_take_child_tables_in, preflight_take_root_scratch_in,
+};
+
+#[path = "selected_copy/child_scratch.rs"]
+mod child_scratch;
+use child_scratch::ChildScratchVec;
+
 use crate::KernelFailure;
 use arrow_array::types::{ByteArrayType, Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow_array::{
@@ -62,7 +72,10 @@ impl std::error::Error for CopyError {
         }
     }
 }
-struct CopyObservation<'a>(&'a mut dyn FnMut(bool) -> Result<(), KernelFailure>);
+struct CopyObservation<'a>(
+    &'a mut dyn FnMut(bool) -> Result<(), KernelFailure>,
+    Option<&'a crate::aggregate_host_allocator::HostAggregateAllocator>,
+);
 impl CopyObservation<'_> {
     fn step(&mut self) -> Result<(), CopyError> {
         (self.0)(false).map_err(CopyError::Control)
@@ -203,7 +216,7 @@ pub fn preflight_broadcast(
     rows: usize,
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe);
+    let mut work = CopyObservation(&mut observe, None);
     work.boundary()?;
     let result = (|| {
         let start = ordinal as usize;
@@ -396,14 +409,14 @@ fn data_children<'a>(
     sources: &[&'a ArrayData],
     index: usize,
     work: &mut CopyObservation<'_>,
-) -> Result<Vec<&'a ArrayData>, CopyError> {
+) -> Result<ChildScratchVec<&'a ArrayData>, CopyError> {
     buffer_extent(sources.len(), std::mem::size_of::<&ArrayData>())?;
-    let mut children = Vec::new();
+    let mut children = ChildScratchVec::new(work.1);
     for data in sources {
         work.step()?;
-        children.push(data.child_data().get(index).ok_or(CopyError::Invalid(
+        children.try_push(data.child_data().get(index).ok_or(CopyError::Invalid(
             "constant mutable-copy source has missing child data",
-        ))?);
+        ))?)?;
     }
     Ok(children)
 }
@@ -427,12 +440,12 @@ fn child_sources<'a>(
     sources: &[&'a dyn Array],
     work: &mut CopyObservation<'_>,
     mut child: impl FnMut(&'a dyn Array) -> Result<&'a dyn Array, CopyError>,
-) -> Result<Vec<&'a dyn Array>, CopyError> {
+) -> Result<ChildScratchVec<&'a dyn Array>, CopyError> {
     buffer_extent(sources.len(), std::mem::size_of::<&dyn Array>())?;
-    let mut children = Vec::new();
+    let mut children = ChildScratchVec::new(work.1);
     for source in sources {
         work.step()?;
-        children.push(child(*source)?);
+        children.try_push(child(*source)?)?;
     }
     Ok(children)
 }
@@ -863,9 +876,32 @@ fn run<R: RunEndIndexType>(
 pub fn preflight_take(
     array: &dyn Array,
     indices: &[Option<u64>],
-    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+    observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe);
+    preflight_take_with_root_scope(array, indices, observe, |_| Ok(()))
+}
+
+// ONE original take-plan construction and recursive extent/child author. The
+// legacy entry has no host or new observation; optional root admission covers
+// only the two exact original root vectors, not recursive scratch or payload.
+fn preflight_take_with_root_scope<S>(
+    array: &dyn Array,
+    indices: &[Option<u64>],
+    observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+    admit_root: impl FnOnce(usize) -> Result<S, CopyError>,
+) -> Result<(), CopyError> {
+    preflight_take_with_child_tables(array, indices, observe, admit_root, None)
+}
+
+fn preflight_take_with_child_tables<S>(
+    array: &dyn Array,
+    indices: &[Option<u64>],
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+    admit_root: impl FnOnce(usize) -> Result<S, CopyError>,
+    child_allocator: Option<&crate::aggregate_host_allocator::HostAggregateAllocator>,
+) -> Result<(), CopyError> {
+    let root_scope = admit_root(indices.len())?;
+    let mut work = CopyObservation(&mut observe, child_allocator);
     let mut ranges = Vec::with_capacity(indices.len());
     let mut nulls = 0;
     for index in indices {
@@ -877,22 +913,27 @@ pub fn preflight_take(
             nulls = add(nulls, 1)?;
         }
     }
-    preflight(
+    let selection = Selection {
+        blocks: vec![Block {
+            source: 0,
+            ranges,
+            repeats: 1,
+        }],
+        nulls,
+        null_ops: usize::from(nulls != 0),
+    };
+    let result = preflight(
         array,
-        &Selection {
-            blocks: vec![Block {
-                source: 0,
-                ranges,
-                repeats: 1,
-            }],
-            nulls,
-            null_ops: usize::from(nulls != 0),
-        },
+        &selection,
         CopyMode::Take {
             index_maximum: usize::MAX,
         },
         &mut work,
-    )
+    );
+    // Destroy the actual root plan before releasing its admitted scratch.
+    drop(selection);
+    drop(root_scope);
+    result
 }
 
 /// Check one contiguous MutableArrayData copy and its trailing NULL padding.
@@ -907,7 +948,7 @@ pub fn preflight_extend(
     capacity: usize,
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe);
+    let mut work = CopyObservation(&mut observe, None);
     work.boundary()?;
     let result = (|| {
         let end = add(start, len)?;
@@ -961,7 +1002,7 @@ pub fn preflight_extend_multi(
     constructor_capacity: usize,
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe);
+    let mut work = CopyObservation(&mut observe, None);
     work.boundary()?;
     let result = (|| {
         let first = *sources.first().ok_or(CopyError::Invalid(
@@ -1150,7 +1191,7 @@ pub fn preflight_guarded_interleave(
     ) {
         return preflight_fixed_interleave(ty, sources, choices, observe);
     }
-    let mut work = CopyObservation(&mut observe);
+    let mut work = CopyObservation(&mut observe, None);
     work.boundary()?;
     let result = (|| {
         guarded_interleave_extent(ty, choices.len())?;
@@ -1191,7 +1232,7 @@ pub fn preflight_fixed_interleave(
     choices: &[(usize, usize)],
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    let mut work = CopyObservation(&mut observe);
+    let mut work = CopyObservation(&mut observe, None);
     work.boundary()?;
     let result = (|| {
         fixed_interleave_extent(ty, choices.len())?;
