@@ -406,6 +406,8 @@ fn metric_request(
 
 #[cfg(test)]
 mod unified_tests {
+    mod held_port_tests;
+
     use std::num::NonZeroU64;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};

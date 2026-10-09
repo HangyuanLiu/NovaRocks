@@ -408,3 +408,6 @@ mod tests {
         assert!(error.contains("REST timeout"), "{error}");
     }
 }
+
+#[cfg(test)]
+mod held_port_tests;
