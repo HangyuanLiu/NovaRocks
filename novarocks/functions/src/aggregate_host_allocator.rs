@@ -63,6 +63,10 @@ impl HostAggregateAllocator {
         // cannot be destroyed for the lifetime of the returned borrow.
         unsafe { self.inner.as_ref() }
     }
+    /// Compare actual immutable host identity. This grants no allocation or scope.
+    pub(crate) fn has_host_authority(&self, host: &Arc<dyn AggregateStateAllocator>) -> bool {
+        Arc::ptr_eq(&self.inner().host, host)
+    }
     pub(crate) const fn metadata_allocation_bytes() -> usize {
         Layout::new::<HostAllocatorInner>().size()
     }

@@ -130,6 +130,13 @@ pub struct OpaqueReservation {
     bytes: usize,
 }
 impl OpaqueReservation {
+    /// Borrow the actual reservation authority without making a zero-byte grant.
+    pub(crate) fn belongs_to_allocator(
+        &self,
+        allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
+    ) -> bool {
+        allocator.has_host_authority(&self.host)
+    }
     pub const fn remaining_bytes(&self) -> usize {
         self.bytes
     }

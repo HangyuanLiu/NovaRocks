@@ -338,3 +338,6 @@ mod percentile_approx_raw_owner;
 mod percentile_approx_raw_selected;
 
 mod aggregate_by_window;
+
+// Private transport/lifecycle probes; no scalar owner or ABI is registered.
+mod scalar_invocation_data;
