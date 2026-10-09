@@ -180,6 +180,11 @@ fn frozen_reads(
                     DataType::Int16 => ConnectorValueType::SmallInt,
                     DataType::Int32 => ConnectorValueType::Integer,
                     DataType::Int64 => ConnectorValueType::BigInt,
+                    // Keep full precision/signed scale and logical class from
+                    // the sole connector assignment projection author.
+                    DataType::Decimal128(..) => connector_type_for_value_type(&field.ty).expect(
+                        "actual Decimal128 source must have its exact connector projection",
+                    ),
                     _ => panic!("closed native nonnull test source has an unexpected carrier"),
                 };
                 let read = relation.read();
@@ -233,7 +238,9 @@ fn frozen_reads(
     }
     reads
 }
-fn programs(source: &SqlAuthoredPhysicalPlan) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
+pub(super) fn programs(
+    source: &SqlAuthoredPhysicalPlan,
+) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
     let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
     let uses = semantics
         .iter()
@@ -299,7 +306,7 @@ fn programs(source: &SqlAuthoredPhysicalPlan) -> BTreeMap<FragmentId, Arc<LocalP
         })
         .collect()
 }
-fn producer_root(
+pub(super) fn producer_root(
     programs: &BTreeMap<FragmentId, Arc<LocalProgram>>,
 ) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
     let mut found = None;
@@ -333,7 +340,11 @@ fn producer_root(
     }
     found.expect("actual SQL source retains its producer projection")
 }
-fn batch(program: &LocalProgram, root: ProgramExpressionRootSite, input: ArrayRef) -> RecordBatch {
+pub(super) fn batch(
+    program: &LocalProgram,
+    root: ProgramExpressionRootSite,
+    input: ArrayRef,
+) -> RecordBatch {
     let ProgramExpressionRootSite::Node { node, .. } = root else {
         unreachable!()
     };

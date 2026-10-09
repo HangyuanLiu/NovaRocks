@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original Decimal128 Arrow and Decimal256 Types Float64 value authors.
+//! Original Decimal128 Arrow and Decimal256 Types floating-point value authors.
 //! These are distinct original formulas. No overflow policy or context is read.
-use arrow_array::{Decimal128Array, Float64Array, types::Float64Type};
+use arrow_array::{
+    Decimal128Array, Float32Array, Float64Array,
+    types::{Float32Type, Float64Type},
+};
 use arrow_buffer::i256;
 use num_traits::ToPrimitive;
 
@@ -45,5 +48,30 @@ pub fn decimal256_to_f64(value: i256, scale: i8) -> f64 {
     } else {
         let factor = 10f64.powi(scale as i32);
         unscaled_f64 / factor
+    }
+}
+
+/// Original Arrow Decimal128 Float32 closure, sharing its original f64 division.
+pub fn decimal128_to_f32(value: i128, scale: i8) -> f32 {
+    decimal128_to_f64(value, scale) as f32
+}
+
+/// Original Arrow primitive unary computes even hidden NULL backing values.
+pub fn decimal128_array_to_f32(array: &Decimal128Array, scale: i8) -> Float32Array {
+    array.unary::<_, Float32Type>(|value| decimal128_to_f32(value, scale))
+}
+
+/// Original Types and Execution Decimal256 narrowing preserves infinities.
+pub fn decimal256_to_f32(value: i256, scale: i8) -> f32 {
+    decimal256_to_f64(value, scale) as f32
+}
+
+/// Original Execution Float32 sanitizer's selected non-NULL value projection.
+/// Types/Project Decimal casters deliberately do not consume this projection.
+pub fn finite_f32_value(value: f32) -> Option<f32> {
+    if !value.is_finite() {
+        None
+    } else {
+        Some(value)
     }
 }

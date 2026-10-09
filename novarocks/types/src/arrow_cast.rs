@@ -1016,6 +1016,13 @@ pub fn cast_scalar_with_special_rules(
         }
         (DataType::Decimal128(_, s), DataType::Utf8) => cast_decimal_to_utf8_array(array, *s),
         (DataType::Decimal256(_, s), DataType::Utf8) => cast_decimal256_to_utf8_array(array, *s),
+        (DataType::Decimal128(_, s), DataType::Float32) => {
+            use arrow_array::cast::AsArray;
+            let arr = array.as_primitive::<arrow_array::types::Decimal128Type>();
+            Ok(Arc::new(
+                novarocks_functions::decimal_float_cast::decimal128_array_to_f32(arr, *s),
+            ))
+        }
         (DataType::Decimal256(_, s), DataType::Float32) => cast_decimal256_to_float32(array, *s),
         (DataType::Decimal128(_, s), DataType::Float64) => {
             // Retain the original pinned Arrow primitive unary operation, including
@@ -1660,7 +1667,9 @@ fn cast_decimal256_to_float32(child_array: &ArrayRef, scale: i8) -> Result<Array
         } else {
             // Convert to f64 first for precision, then narrow to f32.
             // f64->f32 narrowing preserves +inf/-inf for out-of-range values.
-            values.push(Some(decimal256_to_f64(arr.value(row), scale) as f32));
+            values.push(Some(
+                novarocks_functions::decimal_float_cast::decimal256_to_f32(arr.value(row), scale),
+            ));
         }
     }
     Ok(Arc::new(Float32Array::from(values)) as ArrayRef)

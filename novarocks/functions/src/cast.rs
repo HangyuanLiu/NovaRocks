@@ -159,6 +159,11 @@ impl UnsignedWidth {
 /// Successful-NULL obligations of exact primitive carrier casts. This is a
 /// static semantic fact, not an installed runtime capability whitelist.
 pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
+    if target == &DataType::Float32
+        && matches!(source, DataType::Decimal128(_, scale) if *scale < 0)
+    {
+        return true;
+    }
     if source == &DataType::Binary && target == &DataType::Utf8 {
         return true;
     }
@@ -327,6 +332,7 @@ enum CastBody {
     DecimalFloat {
         source: DecimalTextSource,
         scale: i8,
+        target: Target,
     },
     TemporalCarrier {
         source: Source,
@@ -447,7 +453,7 @@ impl PreparedCastRecipe {
                     });
                 }
             }
-            if result.data_type == DataType::Float64
+            if matches!(result.data_type, DataType::Float32 | DataType::Float64)
                 && matches!(
                     source.data_type,
                     DataType::Decimal128(..) | DataType::Decimal256(..)
@@ -460,7 +466,14 @@ impl PreparedCastRecipe {
                 };
                 work.step()?;
                 if let Some((decimal, scale)) = decimal {
-                    if source.nullable && !result.nullable {
+                    if !result.nullable
+                        && (source.nullable
+                            || carrier_cast_can_produce_null(
+                                &source.data_type,
+                                &result.data_type,
+                                allow_throw_exception,
+                            ))
+                    {
                         return Err(CastPrepareError::TypeMismatch);
                     }
                     return Ok(Self {
@@ -470,6 +483,11 @@ impl PreparedCastRecipe {
                         body: CastBody::DecimalFloat {
                             source: decimal,
                             scale,
+                            target: if result.data_type == DataType::Float32 {
+                                Target::F32
+                            } else {
+                                Target::F64
+                            },
                         },
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
@@ -670,7 +688,7 @@ impl PreparedCastRecipe {
             } => false,
             // The original Decimal256 -scale expression panics for i8::MIN
             // in checked builds. Retain failure awareness without converting it.
-            CastBody::DecimalFloat { source, scale } => {
+            CastBody::DecimalFloat { source, scale, .. } => {
                 source == DecimalTextSource::Decimal256 && scale == i8::MIN
             }
             CastBody::TemporalCarrier { .. } => {
@@ -819,7 +837,12 @@ impl PreparedCastRecipe {
                 work.flush()?;
                 return Ok(CastRowResult::Text(text));
             }
-            if let CastBody::DecimalFloat { source, scale } = self.body {
+            if let CastBody::DecimalFloat {
+                source,
+                scale,
+                target,
+            } = self.body
+            {
                 let row = self.checked_row_with_shape(
                     argument,
                     ordinal,
@@ -835,28 +858,70 @@ impl PreparedCastRecipe {
                     };
                 }
                 work.flush()?;
-                let value = match source {
-                    DecimalTextSource::Decimal128 => crate::decimal_float_cast::decimal128_to_f64(
-                        argument
-                            .array()
-                            .as_any()
-                            .downcast_ref::<Decimal128Array>()
-                            .ok_or_else(|| internal("checked decimal float has a foreign carrier"))?
-                            .value(row),
-                        scale,
-                    ),
-                    DecimalTextSource::Decimal256 => crate::decimal_float_cast::decimal256_to_f64(
-                        argument
-                            .array()
-                            .as_any()
-                            .downcast_ref::<Decimal256Array>()
-                            .ok_or_else(|| internal("checked decimal float has a foreign carrier"))?
-                            .value(row),
-                        scale,
-                    ),
+                let value = match target {
+                    Target::F64 => CastRowResult::Float64(match source {
+                        DecimalTextSource::Decimal128 => {
+                            crate::decimal_float_cast::decimal128_to_f64(
+                                argument
+                                    .array()
+                                    .as_any()
+                                    .downcast_ref::<Decimal128Array>()
+                                    .ok_or_else(|| {
+                                        internal("checked decimal float has a foreign carrier")
+                                    })?
+                                    .value(row),
+                                scale,
+                            )
+                        }
+                        DecimalTextSource::Decimal256 => {
+                            crate::decimal_float_cast::decimal256_to_f64(
+                                argument
+                                    .array()
+                                    .as_any()
+                                    .downcast_ref::<Decimal256Array>()
+                                    .ok_or_else(|| {
+                                        internal("checked decimal float has a foreign carrier")
+                                    })?
+                                    .value(row),
+                                scale,
+                            )
+                        }
+                    }),
+                    Target::F32 => match source {
+                        DecimalTextSource::Decimal128 => {
+                            let narrowed = crate::decimal_float_cast::decimal128_to_f32(
+                                argument
+                                    .array()
+                                    .as_any()
+                                    .downcast_ref::<Decimal128Array>()
+                                    .ok_or_else(|| {
+                                        internal("checked decimal float has a foreign carrier")
+                                    })?
+                                    .value(row),
+                                scale,
+                            );
+                            crate::decimal_float_cast::finite_f32_value(narrowed)
+                                .map(CastRowResult::Float32)
+                                .unwrap_or(CastRowResult::Null)
+                        }
+                        DecimalTextSource::Decimal256 => {
+                            CastRowResult::Float32(crate::decimal_float_cast::decimal256_to_f32(
+                                argument
+                                    .array()
+                                    .as_any()
+                                    .downcast_ref::<Decimal256Array>()
+                                    .ok_or_else(|| {
+                                        internal("checked decimal float has a foreign carrier")
+                                    })?
+                                    .value(row),
+                                scale,
+                            ))
+                        }
+                    },
+                    _ => return Err(internal("decimal float has a foreign frozen target")),
                 };
                 work.flush()?;
-                return Ok(CastRowResult::Float64(value));
+                return Ok(value);
             }
             if let CastBody::DateFloat { target } = self.body {
                 let row =
@@ -1431,3 +1496,7 @@ mod binary_text_tests;
 #[cfg(test)]
 #[path = "cast_decimal_float_tests.rs"]
 mod decimal_float_tests;
+
+#[cfg(test)]
+#[path = "cast_decimal_float32_tests.rs"]
+mod decimal_float32_tests;

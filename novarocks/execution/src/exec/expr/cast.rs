@@ -37,7 +37,6 @@ use novarocks_type_contract::{
 };
 use novarocks_types::largeint;
 
-use num_traits::ToPrimitive;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
@@ -483,10 +482,9 @@ fn sanitize_non_finite_float32(arr: &Float32Array) -> ArrayRef {
             continue;
         }
         let value = arr.value(i);
-        if !value.is_finite() {
-            builder.append_null();
-        } else {
-            builder.append_value(value);
+        match novarocks_functions::decimal_float_cast::finite_f32_value(value) {
+            None => builder.append_null(),
+            Some(value) => builder.append_value(value),
         }
     }
     Arc::new(builder.finish()) as ArrayRef
@@ -2530,7 +2528,9 @@ fn cast_decimal256_to_float32(child_array: &ArrayRef, scale: i8) -> Result<Array
         } else {
             // Convert to f64 first for precision, then narrow to f32.
             // f64->f32 narrowing preserves +inf/-inf for out-of-range values.
-            values.push(Some(decimal256_to_f64(arr.value(row), scale) as f32));
+            values.push(Some(
+                novarocks_functions::decimal_float_cast::decimal256_to_f32(arr.value(row), scale),
+            ));
         }
     }
     Ok(Arc::new(Float32Array::from(values)) as ArrayRef)

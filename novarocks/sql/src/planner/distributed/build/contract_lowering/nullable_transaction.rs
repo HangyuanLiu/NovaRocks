@@ -382,6 +382,29 @@ impl ContractLoweringVisitor<'_> {
                             }
                         }
                     })?,
+                    ContractExprKind::Cast {
+                        expr,
+                        target,
+                        allow_throw_exception,
+                        ..
+                    } => {
+                        // The same statement owner authored this occurrence's reference.
+                        // Read its frozen boolean, never an ambient setting or default.
+                        if *allow_throw_exception != self.root_allow_throw_reference() {
+                            return Err(invalid(
+                                "cast seed differs from its statement semantic source",
+                            ));
+                        }
+                        let input = &self.construction_expression(fragment, *expr)?.ty;
+                        let mut revised = old.ty.clone();
+                        revised.nullable |= input.nullable
+                            || novarocks_functions::carrier_cast_can_produce_null(
+                                &input.data_type,
+                                target,
+                                self.root_allow_throw_exception,
+                            );
+                        revised
+                    }
                     ContractExprKind::Value(value) if dependency_changed => published_value_type(
                         &old.ty,
                         &self.construction_value(fragment, *value)?.ty,

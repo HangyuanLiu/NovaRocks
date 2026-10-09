@@ -258,11 +258,13 @@ fn fixture(
                 LiteralValue::Null
             } else {
                 match ty.data_type {
-                    DataType::Binary => LiteralValue::Binary(b"native producer".to_vec().into_boxed_slice()),
+                    DataType::Binary => {
+                        LiteralValue::Binary(b"native producer".to_vec().into_boxed_slice())
+                    }
                     DataType::Decimal128(..) => LiteralValue::Decimal128(0),
                     DataType::Decimal256(..) => {
                         LiteralValue::Decimal256(arrow_buffer::i256::ZERO.to_be_bytes())
-                    },
+                    }
                     DataType::Boolean => LiteralValue::Boolean(false),
                     DataType::Date32 => LiteralValue::Date32(0),
                     DataType::Int64 => LiteralValue::Int64(0),
@@ -320,11 +322,13 @@ fn fixture(
                 .unwrap()
         } else {
             let value = match source_type.data_type {
-                DataType::Binary => LiteralValue::Binary(b"native\0producer".to_vec().into_boxed_slice()),
+                DataType::Binary => {
+                    LiteralValue::Binary(b"native\0producer".to_vec().into_boxed_slice())
+                }
                 DataType::Decimal128(..) => LiteralValue::Decimal128(1),
                 DataType::Decimal256(..) => {
                     LiteralValue::Decimal256(arrow_buffer::i256::from_i128(1).to_be_bytes())
-                },
+                }
                 DataType::Boolean => LiteralValue::Boolean(true),
                 DataType::Date32 => LiteralValue::Date32(71),
                 DataType::Int64 => LiteralValue::Int64(71),
@@ -1121,3 +1125,6 @@ mod binary_text_profile_tests;
 
 #[path = "cast_decimal_float_tests.rs"]
 mod decimal_float_profile_tests;
+
+#[path = "cast_decimal_float32_tests.rs"]
+mod decimal_float32_profile_tests;

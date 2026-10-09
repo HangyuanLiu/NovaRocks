@@ -1357,3 +1357,10 @@ mod numeric_unary_public_transport_tests;
 
 #[cfg(test)]
 mod numeric_unary_writer_dml_source_tests;
+
+#[cfg(test)]
+mod cast_decimal_float32_oracle_tests;
+#[cfg(test)]
+mod legacy_decimal_float32_cast_baseline_tests;
+#[cfg(test)]
+mod decimal_float32_sql_own_null_tests;
