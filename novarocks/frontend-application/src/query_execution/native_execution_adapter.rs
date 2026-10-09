@@ -1413,6 +1413,7 @@ impl ProductionManifestAttemptProjection {
                     native_compatibility_id: self.runtime.native_compatibility_id,
                 },
                 data_runtime: self.runtime.data_runtime.clone(),
+                subscription_scope: self.work_scope.clone(),
                 convergence_source: Arc::clone(&self.runtime.process_observation),
             },
         )

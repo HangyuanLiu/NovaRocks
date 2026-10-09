@@ -66,6 +66,7 @@ pub(crate) struct ManifestAttemptTransport {
     pub(crate) status_subscription_error_budget: u32,
     pub(crate) wire: AttemptWireFacts,
     pub(crate) data_runtime: FrontendDataRuntime,
+    pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
     /// Live membership is used only as residual process-lifecycle evidence. It
     /// cannot change the frozen manifest or schedule a successor.
     pub(crate) convergence_source: BackendProcessObservationService,
@@ -187,6 +188,7 @@ pub(crate) fn assemble_manifest_round(
             Arc::clone(&observation),
             transport.status_subscription_error_budget,
             transport.data_runtime,
+            transport.subscription_scope,
         )
         .map_err(TaskExecutionError::Schedule)?,
     );

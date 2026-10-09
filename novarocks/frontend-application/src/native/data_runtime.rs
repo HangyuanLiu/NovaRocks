@@ -15,6 +15,7 @@ use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio::runtime::Handle;
 
 use super::apply_send_owner::{ApplySendOwner, ApplySendPort, DrainObservation};
+use super::subscription_owner::{NativeSubscriptionOwner, NativeSubscriptionPort};
 use super::transport_supervisor::NativeTransportSupervisor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_native_adapter::FrontendNativeTransport;
@@ -241,6 +242,8 @@ pub(crate) struct FrontendDataRuntime {
     apply_send_port: ApplySendPort,
     // Only the original runtime owns joins. Clones are capability projections.
     original_apply_owner: Option<Mutex<ApplySendOwner>>,
+    subscription_port: NativeSubscriptionPort,
+    original_subscription_owner: Option<Mutex<NativeSubscriptionOwner>>,
 }
 
 impl Clone for FrontendDataRuntime {
@@ -256,6 +259,8 @@ impl Clone for FrontendDataRuntime {
             connector_blocking_io: self.connector_blocking_io.clone(),
             apply_send_port: self.apply_send_port.clone(),
             original_apply_owner: None,
+            subscription_port: self.subscription_port.clone(),
+            original_subscription_owner: None,
         }
     }
 }
@@ -270,6 +275,7 @@ impl FrontendDataRuntime {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         task_transport_budget: TransportBudget,
+        subscription_scope_records_limit: usize,
     ) -> Result<Self, String> {
         // An inconsistent frozen geometry is refused before any channel. The
         // envelope's count part is logged; P00b freezes the coefficients.
@@ -303,6 +309,11 @@ impl FrontendDataRuntime {
                 .map_err(|_| {
                     "allocate Native Apply original process-item storage failed".to_owned()
                 })?;
+        let (original_subscription_owner, subscription_port) =
+            NativeSubscriptionOwner::new(handle.clone(), subscription_scope_records_limit)
+                .map_err(|_| {
+                    "allocate Native subscription original scope storage failed".to_owned()
+                })?;
         Ok(Self {
             handle,
             native_trust,
@@ -314,6 +325,8 @@ impl FrontendDataRuntime {
             connector_blocking_io,
             apply_send_port,
             original_apply_owner: Some(Mutex::new(original_apply_owner)),
+            subscription_port,
+            original_subscription_owner: Some(Mutex::new(original_subscription_owner)),
         })
     }
 
@@ -336,11 +349,15 @@ impl FrontendDataRuntime {
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
+            novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
         )
         .expect("the default task transport budget is valid");
         runtime
             .start_original_apply_reaper()
             .expect("the test role starts its original Apply owner once");
+        runtime
+            .start_original_subscription_reaper()
+            .expect("the test role starts its original subscription owner once");
         runtime
     }
 
@@ -410,6 +427,97 @@ impl FrontendDataRuntime {
 
     pub(crate) fn apply_send_port(&self) -> &ApplySendPort {
         &self.apply_send_port
+    }
+
+    pub(crate) fn start_original_subscription_reaper(&mut self) -> Result<(), String> {
+        self.original_subscription_owner
+            .as_mut()
+            .ok_or_else(|| {
+                "Native subscription start requested through a capability projection".to_owned()
+            })?
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .start_reaper()
+            .map_err(|error| format!("start original Native subscription owner: {error:?}"))
+    }
+
+    pub(crate) fn subscription_port(&self) -> &NativeSubscriptionPort {
+        &self.subscription_port
+    }
+
+    pub(crate) async fn drain_original_subscriptions_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let owner = self
+            .original_subscription_owner
+            .as_mut()
+            .ok_or_else(|| {
+                "Native subscription drain requested through a capability projection".to_owned()
+            })?
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        match owner.drain_until(deadline).await {
+            super::subscription_owner::DrainObservation::Joined => Ok(()),
+            failure => Err(format!("drain original Native subscriptions: {failure:?}")),
+        }
+    }
+
+    pub(crate) fn original_subscriptions_joined(&self) -> bool {
+        self.original_subscription_owner
+            .as_ref()
+            .is_some_and(|owner| {
+                owner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_joined()
+            })
+    }
+
+    /// While execution drains, a failed original reaper must still retire its
+    /// original children, otherwise those SAME Workload children block drain.
+    pub(crate) async fn recover_failed_subscription_reaper_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let owner = self
+            .original_subscription_owner
+            .as_mut()
+            .ok_or_else(|| {
+                "Native subscription recovery requested through a capability projection".to_owned()
+            })?
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        owner.wait_for_failed_reaper().await;
+        // Only an already failed/closed original reaper reaches this path.
+        // The same owner polls the same JHs in place, without a replacement.
+        match owner.drain_until(deadline).await {
+            super::subscription_owner::DrainObservation::Joined => Ok(()),
+            failure => Err(format!(
+                "recover original Native subscription reaper: {failure:?}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_original_subscription_reaper(&mut self) {
+        self.original_subscription_owner
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .abort_original_reaper();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_original_subscription_reaper_failure(&mut self) {
+        self.original_subscription_owner
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .wait_for_failed_reaper()
+            .await;
     }
 
     pub(crate) async fn drain_original_apply_until(
@@ -654,6 +762,7 @@ mod tests {
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
+            novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
         )
         .expect("the default task transport budget is valid")
     }

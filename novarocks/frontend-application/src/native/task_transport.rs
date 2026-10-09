@@ -1497,6 +1497,7 @@ impl TaskStatusSubscriber {
     ///
     /// This is a migration-only constructor. New ownership must use
     /// [`Self::new_context_aware`].
+    #[cfg(test)]
     pub(crate) fn new(
         backends: &[BackendProcessDescriptor],
         intake: StatusIntakeHandle,
@@ -1517,6 +1518,7 @@ impl TaskStatusSubscriber {
     }
 
     /// Builds the single-stream task and query-context observation transport.
+    #[cfg(test)]
     pub(crate) fn new_context_aware(
         backends: &[BackendProcessDescriptor],
         intake: StatusIntakeHandle,
@@ -2089,6 +2091,7 @@ pub(crate) struct CoveredTaskStatusSubscriber {
     intake: Arc<ObservationIntake>,
     error_budget: u32,
     data_runtime: FrontendDataRuntime,
+    work_scope: novarocks_workload_control::WorkScope,
     active: Mutex<BTreeMap<QueryContextRef, CoveredSubscription>>,
 }
 
@@ -2106,12 +2109,12 @@ struct CoveredSubscription {
     state: Arc<Mutex<SubscriptionState>>,
     applied_snapshot: Arc<Mutex<DecodedCoveredSubscription>>,
     reconciliation: tokio::sync::watch::Sender<DecodedCoveredSubscription>,
-    task: tokio::task::JoinHandle<()>,
+    task: super::subscription_owner::SubscriptionLease,
 }
 
 impl Drop for CoveredSubscription {
     fn drop(&mut self) {
-        self.task.abort();
+        self.task.stop();
     }
 }
 
@@ -2121,6 +2124,7 @@ impl CoveredTaskStatusSubscriber {
         intake: Arc<ObservationIntake>,
         error_budget: u32,
         data_runtime: FrontendDataRuntime,
+        work_scope: novarocks_workload_control::WorkScope,
     ) -> Result<Self, String> {
         if error_budget == 0 {
             return Err("the covered subscription error budget must be nonzero".to_owned());
@@ -2130,6 +2134,7 @@ impl CoveredTaskStatusSubscriber {
             intake,
             error_budget,
             data_runtime,
+            work_scope,
             active: Mutex::new(BTreeMap::new()),
         })
     }
@@ -2223,14 +2228,26 @@ impl CoveredTaskStatusSubscriber {
         let state = Arc::new(Mutex::new(SubscriptionState::Opening));
         let applied_snapshot = Arc::new(Mutex::new(request.clone()));
         let (reconciliation, receiver) = tokio::sync::watch::channel(request);
-        let task = self.data_runtime.spawn(run_covered_subscription(
-            target.client.clone(),
-            receiver,
-            Arc::clone(&applied_snapshot),
-            publisher,
-            self.error_budget,
-            Arc::clone(&state),
-        ));
+        let publisher = Arc::new(publisher);
+        let reservation = self
+            .data_runtime
+            .subscription_port()
+            .reserve(
+                &self.work_scope,
+                Some(Arc::clone(&publisher)),
+                Some(Arc::clone(&state)),
+            )
+            .map_err(|_| "Native subscription original responsibility refused".to_owned())?;
+        let task = reservation
+            .start(run_covered_subscription(
+                target.client.clone(),
+                receiver,
+                Arc::clone(&applied_snapshot),
+                publisher,
+                self.error_budget,
+                Arc::clone(&state),
+            ))
+            .map_err(|_| "Native subscription original start failed".to_owned())?;
         Ok(CoveredSubscription {
             state,
             applied_snapshot,
@@ -2408,7 +2425,7 @@ async fn run_covered_subscription(
     client: Client,
     mut reconciliation: tokio::sync::watch::Receiver<DecodedCoveredSubscription>,
     applied_snapshot: Arc<Mutex<DecodedCoveredSubscription>>,
-    publisher: ObservationPublisher,
+    publisher: Arc<ObservationPublisher>,
     error_budget: u32,
     state: Arc<Mutex<SubscriptionState>>,
 ) {
@@ -2975,6 +2992,59 @@ mod tests {
     // -----------------------------------------------------------------------
     // Fixtures
     // -----------------------------------------------------------------------
+
+    /// The original test role and the SAME Workload authority supplied to its
+    /// Covered subscriber. Cleanup joins original tasks before settling root.
+    struct CoveredRoleFixture {
+        runtime: FrontendDataRuntime,
+        workload: novarocks_workload_control::WorkloadControl,
+        root: Option<novarocks_workload_control::RootWork>,
+    }
+
+    impl CoveredRoleFixture {
+        fn new() -> Self {
+            use novarocks_workload_control::{
+                WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+            };
+            let config = WorkloadConfig::default();
+            config.validate().unwrap();
+            let workload = WorkloadControl::try_new_counted(config).unwrap().owner;
+            workload.mark_ready().unwrap();
+            let root = workload
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            Self {
+                runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+                workload,
+                root: Some(root),
+            }
+        }
+
+        fn scope(&self) -> novarocks_workload_control::WorkScope {
+            self.root.as_ref().unwrap().owner.scope().clone()
+        }
+
+        async fn settle(mut self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            self.runtime
+                .drain_original_subscriptions_until(deadline)
+                .await
+                .unwrap();
+            self.runtime
+                .drain_original_apply_until(deadline)
+                .await
+                .unwrap();
+            self.runtime
+                .drain_native_outgoing_until(deadline)
+                .await
+                .unwrap();
+            let root = self.root.take().unwrap();
+            root.owner.complete_after_terminal_cancel_settled();
+            root.business.release();
+            self.workload.close_admission();
+            assert!(self.workload.shutdown().is_ok());
+        }
+    }
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -3599,6 +3669,21 @@ mod tests {
                 self.endpoint.clone(),
                 self.control_endpoint.clone(),
             )
+        }
+
+        async fn settle(&mut self) -> bool {
+            for shutdown in &mut self.shutdown {
+                if let Some(shutdown) = shutdown.take() {
+                    let _ = shutdown.send(());
+                }
+            }
+            let mut joined = true;
+            for original in &mut self.served {
+                original.abort();
+                let result = original.await;
+                joined &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
+            }
+            joined
         }
     }
 
@@ -4684,7 +4769,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_stream_preserves_every_frame_and_reconnects_from_applied_cursors() {
         let backend = BackendProcessId::new_v7();
-        let loopback = Loopback::start().await;
+        let mut loopback = Loopback::start().await;
         let context = context(backend);
         let task = identity(1, backend);
         let frames = vec![
@@ -4759,11 +4844,13 @@ mod tests {
         let intake = Arc::new(
             ObservationIntake::new(16, 32, 32 * 4096, 4096, wake).expect("bounded intake"),
         );
+        let subscription_role = CoveredRoleFixture::new();
         let subscriber = CoveredTaskStatusSubscriber::new(
             &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             3,
-            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            subscription_role.runtime.clone(),
+            subscription_role.scope(),
         )
         .expect("covered transport");
         subscriber
@@ -4821,6 +4908,8 @@ mod tests {
             ));
         }
         subscriber.stop(context);
+        subscription_role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     /// Real HTTP/2 transport plus production FE serial owners. The peer is a
@@ -4847,7 +4936,7 @@ mod tests {
 
         let (mut round, clock, context, missing) =
             crate::task_execution::tests::covered_loopback_recovery_round();
-        let loopback = Loopback::start().await;
+        let mut loopback = Loopback::start().await;
         let frame = |fact, revision| {
             encode_covered_status_event(&CoveredStatusStreamEvent {
                 fact,
@@ -4897,12 +4986,14 @@ mod tests {
             )
             .unwrap(),
         );
+        let subscription_role = CoveredRoleFixture::new();
         let subscriber = Arc::new(
             CoveredTaskStatusSubscriber::new(
                 &[loopback.descriptor(context.backend_process_id())],
                 Arc::clone(&intake),
                 2,
-                FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+                subscription_role.runtime.clone(),
+                subscription_role.scope(),
             )
             .unwrap(),
         );
@@ -5063,13 +5154,15 @@ mod tests {
         );
         assert!(round.covered_observation_ready());
         subscriber.stop(context);
+        subscription_role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_unchanged_requires_a_version_in_the_physical_request() {
         for convergence in [false, true] {
             let backend = BackendProcessId::new_v7();
-            let loopback = Loopback::start().await;
+            let mut loopback = Loopback::start().await;
             let context = context(backend);
             let task = identity(1, backend);
             loopback
@@ -5079,11 +5172,13 @@ mod tests {
                 ObservationIntake::new(2, 4, 4 * 4096, 4096, Arc::new(CountingWake::default()))
                     .unwrap(),
             );
+            let subscription_role = CoveredRoleFixture::new();
             let subscriber = CoveredTaskStatusSubscriber::new(
                 &[loopback.descriptor(backend)],
                 Arc::clone(&intake),
                 2,
-                FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+                subscription_role.runtime.clone(),
+                subscription_role.scope(),
             )
             .unwrap();
             let mut request = DecodedCoveredSubscription {
@@ -5139,6 +5234,8 @@ mod tests {
             let mut runner = intake.try_enter().unwrap();
             assert!(runner.drain_ordered(1).is_empty());
             subscriber.stop(context);
+            subscription_role.settle().await;
+            assert!(loopback.settle().await);
         }
     }
 
@@ -5194,7 +5291,7 @@ mod tests {
             task.task_id(),
             BackendProcessId::new_v7(),
         );
-        let loopback = Loopback::start().await;
+        let mut loopback = Loopback::start().await;
         loopback
             .peer
             .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
@@ -5218,12 +5315,14 @@ mod tests {
             )
             .unwrap(),
         );
+        let subscription_role = CoveredRoleFixture::new();
         let subscriber = Arc::new(
             CoveredTaskStatusSubscriber::new(
                 &[loopback.descriptor(context.backend_process_id())],
                 Arc::clone(&intake),
                 2,
-                FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+                subscription_role.runtime.clone(),
+                subscription_role.scope(),
             )
             .unwrap(),
         );
@@ -5266,6 +5365,8 @@ mod tests {
             "identity violations cannot reopen the source as transport recovery"
         );
         subscriber.stop(context);
+        subscription_role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     fn covered_validation_request(
@@ -5284,6 +5385,143 @@ mod tests {
             quiesce_cursor: None,
             required_identities: vec![task],
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_covered_rpc_abort_keeps_original_publisher_until_future_destruction_exits() {
+        use std::sync::{
+            Condvar,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::task::Poll;
+        struct Hold {
+            entered: tokio::sync::Notify,
+            release: Mutex<bool>,
+            changed: Condvar,
+            exited: AtomicBool,
+        }
+        struct HeldCoveredFuture {
+            inner: Pin<Box<dyn Future<Output = ()> + Send>>,
+            hold: Arc<Hold>,
+        }
+        impl Future for HeldCoveredFuture {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+                self.inner.as_mut().poll(cx)
+            }
+        }
+        impl Drop for HeldCoveredFuture {
+            fn drop(&mut self) {
+                self.hold.entered.notify_one();
+                let mut release = self.hold.release.lock().unwrap();
+                while !*release {
+                    release = self.hold.changed.wait(release).unwrap();
+                }
+                self.hold.exited.store(true, Ordering::Release);
+                // The original Covered future/body fields drop only after this
+                // genuine destructor hold, on the protected original callback.
+            }
+        }
+        let mut loopback = Loopback::start().await;
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+        let mut role = CoveredRoleFixture::new();
+        let backend = BackendProcessId::new_v7();
+        let request = covered_validation_request(context(backend), identity(1, backend));
+        let intake = Arc::new(
+            ObservationIntake::new(1, 3, 3 * 4096, 4096, Arc::new(CountingWake::default()))
+                .unwrap(),
+        );
+        let others = [intake.subscribe().unwrap(), intake.subscribe().unwrap()];
+        let publisher = Arc::new(intake.subscribe().unwrap());
+        let state = Arc::new(Mutex::new(SubscriptionState::Opening));
+        let applied = Arc::new(Mutex::new(request.clone()));
+        let (reconciliation, receiver) = tokio::sync::watch::channel(request);
+        let hold = Arc::new(Hold {
+            entered: tokio::sync::Notify::new(),
+            release: Mutex::new(false),
+            changed: Condvar::new(),
+            exited: AtomicBool::new(false),
+        });
+        let watchdog_hold = Arc::clone(&hold);
+        let watchdog = std::thread::spawn(move || {
+            let release = watchdog_hold.release.lock().unwrap();
+            let (mut release, _) = watchdog_hold
+                .changed
+                .wait_timeout_while(release, Duration::from_secs(3), |release| !*release)
+                .unwrap();
+            *release = true;
+            watchdog_hold.changed.notify_all();
+        });
+        let reservation = role
+            .runtime
+            .subscription_port()
+            .reserve(
+                &role.scope(),
+                Some(Arc::clone(&publisher)),
+                Some(Arc::clone(&state)),
+            )
+            .unwrap();
+        let client = Client::for_endpoint(
+            loopback.endpoint.native_endpoint().clone(),
+            NativeEndpointDomain::BackendData,
+            backend,
+            role.runtime.clone(),
+        );
+        let lease = reservation
+            .start(HeldCoveredFuture {
+                inner: Box::pin(run_covered_subscription(
+                    client,
+                    receiver,
+                    applied,
+                    Arc::clone(&publisher),
+                    3,
+                    Arc::clone(&state),
+                )),
+                hold: Arc::clone(&hold),
+            })
+            .unwrap();
+        drop(publisher);
+        subscribe_requests(&loopback.peer, 1).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *state.lock().unwrap() != SubscriptionState::Live {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        lease.stop();
+        tokio::time::timeout(Duration::from_secs(2), hold.entered.notified())
+            .await
+            .unwrap();
+        let original_deadline = std::time::Instant::now() + Duration::from_millis(20);
+        let held_drain = role
+            .runtime
+            .drain_original_subscriptions_until(original_deadline)
+            .await;
+        let still_charged = intake.subscribe().is_err();
+        let not_joined = !role.runtime.original_subscriptions_joined();
+        *hold.release.lock().unwrap() = true;
+        hold.changed.notify_all();
+        let actual_drain = role
+            .runtime
+            .drain_original_subscriptions_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        let publisher_returned = intake.subscribe().is_ok();
+        drop(lease);
+        drop(reconciliation);
+        drop(others);
+        watchdog.join().unwrap();
+        role.settle().await;
+        let peer_joined = loopback.settle().await;
+        assert!(held_drain.is_err() && still_charged && not_joined);
+        assert!(
+            actual_drain.is_ok()
+                && publisher_returned
+                && hold.exited.load(Ordering::Acquire)
+                && peer_joined
+        );
     }
 
     #[test]
@@ -5429,7 +5667,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_subscription_blackhole_opening_exhausts_its_bounded_budget() {
         let backend = BackendProcessId::new_v7();
-        let loopback = Loopback::start().await;
+        let mut loopback = Loopback::start().await;
         let context = context(backend);
         let task = identity(1, backend);
         loopback
@@ -5439,11 +5677,13 @@ mod tests {
             ObservationIntake::new(1, 3, 3 * 4096, 4096, Arc::new(CountingWake::default()))
                 .unwrap(),
         );
+        let subscription_role = CoveredRoleFixture::new();
         let subscriber = CoveredTaskStatusSubscriber::new(
             &[loopback.descriptor(backend)],
             intake,
             1,
-            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            subscription_role.runtime.clone(),
+            subscription_role.scope(),
         )
         .unwrap();
         subscriber
@@ -5467,12 +5707,14 @@ mod tests {
         .expect("an opening blackhole cannot retain its transport indefinitely");
         assert_eq!(loopback.peer.subscribed().len(), 1);
         subscriber.stop(context);
+        subscription_role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_stream_stops_reading_while_its_one_pending_frame_waits() {
         let backend = BackendProcessId::new_v7();
-        let loopback = Loopback::start().await;
+        let mut loopback = Loopback::start().await;
         let context = context(backend);
         let task = identity(1, backend);
         let frames = (1..=3)
@@ -5501,11 +5743,13 @@ mod tests {
             )
             .expect("one queue frame and one pending frame"),
         );
+        let subscription_role = CoveredRoleFixture::new();
         let subscriber = CoveredTaskStatusSubscriber::new(
             &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             2,
-            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            subscription_role.runtime.clone(),
+            subscription_role.scope(),
         )
         .unwrap();
         subscriber
@@ -5565,12 +5809,14 @@ mod tests {
         intake.acknowledge_applied();
         assert_eq!(subscriber.state(context), Some(SubscriptionState::Live));
         subscriber.stop(context);
+        subscription_role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_reconciliation_releases_an_unread_stream_permit() {
         let backend = BackendProcessId::new_v7();
-        let loopback = Loopback::start().await;
+        let mut loopback = Loopback::start().await;
         let context = context(backend);
         let task = identity(1, backend);
         let first = encode_covered_status_event(&CoveredStatusStreamEvent {
@@ -5605,11 +5851,13 @@ mod tests {
             )
             .unwrap(),
         );
+        let subscription_role = CoveredRoleFixture::new();
         let subscriber = CoveredTaskStatusSubscriber::new(
             &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             2,
-            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            subscription_role.runtime.clone(),
+            subscription_role.scope(),
         )
         .unwrap();
         let request = DecodedCoveredSubscription {
@@ -5651,12 +5899,14 @@ mod tests {
         let mut runner = intake.try_enter().unwrap();
         assert_eq!(runner.drain_ordered(2).len(), 2);
         subscriber.stop(context);
+        subscription_role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_automatic_reconnect_uses_the_latest_applied_cursor_without_restarting_early() {
         let backend = BackendProcessId::new_v7();
-        let loopback = Loopback::start().await;
+        let mut loopback = Loopback::start().await;
         let context = context(backend);
         let task = identity(1, backend);
         loopback
@@ -5685,11 +5935,13 @@ mod tests {
             )
             .unwrap(),
         );
+        let subscription_role = CoveredRoleFixture::new();
         let subscriber = CoveredTaskStatusSubscriber::new(
             &[loopback.descriptor(backend)],
             Arc::clone(&intake),
             3,
-            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            subscription_role.runtime.clone(),
+            subscription_role.scope(),
         )
         .unwrap();
         let mut request = DecodedCoveredSubscription {
@@ -5730,6 +5982,8 @@ mod tests {
             Some(TaskStatusVersion::FIRST)
         );
         subscriber.stop(context);
+        subscription_role.settle().await;
+        assert!(loopback.settle().await);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -658,6 +658,11 @@ impl FrontendExecutionRuntimeOwner {
                 control.acknowledge();
             }
 
+            // Control traversal can advance the revision even when the next
+            // wait is immediately ready. Yield so the SAME Host can poll its
+            // original failed-subscription recovery alongside this drain.
+            tokio::task::yield_now().await;
+
             let wait = self
                 .workload
                 .as_ref()
@@ -1248,11 +1253,18 @@ impl FrontendApplicationHost {
                 FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
             })?;
         let query_runtime = data_runtime.clone();
+        execution.workload.validate().map_err(|error| {
+            FrontendApplicationError::new(
+                FrontendApplicationErrorKind::CoordinatorOpen,
+                error.to_string(),
+            )
+        })?;
         let data_runtime = FrontendDataRuntime::new_with_native_trust(
             data_runtime,
             native_trust,
             native_transport,
             execution.transport_budget.into_codec(),
+            execution.workload.scope_records_limit,
         )
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
@@ -1300,7 +1312,11 @@ impl FrontendApplicationHost {
 
         // Unique original Apply owner is now in Host. No Native caller has
         // received a projection yet; early try_new failure had no reaper.
-        if let Err(error) = host.data_runtime.start_original_apply_reaper() {
+        if let Err(error) = host
+            .data_runtime
+            .start_original_apply_reaper()
+            .and_then(|()| host.data_runtime.start_original_subscription_reaper())
+        {
             return Err(host
                 .cleanup_open_error(FrontendApplicationError::new(
                     FrontendApplicationErrorKind::CoordinatorOpen,
@@ -1988,7 +2004,21 @@ impl FrontendApplicationHost {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
         let mut primary_error: Option<String> = None;
-        if let Err(error) = self.execution_runtime_owner.shutdown_until(deadline).await {
+        let execution_result = {
+            let shutdown = self.execution_runtime_owner.shutdown_until(deadline);
+            tokio::pin!(shutdown);
+            // The healthy continuous reaper stays active throughout logical
+            // teardown. If it fails, borrow the SAME owner here so its original
+            // children cannot strand the Workload drain that precedes the tail.
+            tokio::select! {
+                result = &mut shutdown => result,
+                recovery = self.data_runtime.recover_failed_subscription_reaper_until(deadline) => {
+                    if let Err(error) = recovery { primary_error = Some(error); }
+                    shutdown.await
+                }
+            }
+        };
+        if let Err(error) = execution_result {
             if !self.execution_runtime_owner.is_shutdown_complete() {
                 return match primary_error {
                     Some(primary) => Err(format!("{primary}; cleanup failed: {error}")),
@@ -2041,6 +2071,23 @@ impl FrontendApplicationHost {
         // the SAME records and handles.
         if let Err(error) = self.data_runtime.drain_original_apply_until(deadline).await {
             if !self.data_runtime.original_apply_joined() {
+                return Err(match primary_error {
+                    Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                    None => error,
+                });
+            }
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {error}"));
+            } else {
+                primary_error = Some(error);
+            }
+        }
+        if let Err(error) = self
+            .data_runtime
+            .drain_original_subscriptions_until(deadline)
+            .await
+        {
+            if !self.data_runtime.original_subscriptions_joined() {
                 return Err(match primary_error {
                     Some(primary) => format!("{primary}; cleanup failed: {error}"),
                     None => error,

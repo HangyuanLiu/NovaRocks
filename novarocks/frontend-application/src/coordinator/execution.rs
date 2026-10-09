@@ -697,6 +697,7 @@ impl FrontendDistributedQueryCoordinator {
             self.data_runtime.clone(),
             credential_lease_source,
         )?;
+        let subscription_scope = binding.scope().clone();
         // The synchronous statement worker is the remaining T12 bridge. The
         // async initializer performs no Connector I/O on that worker and adds
         // no semaphore-waiter helper task, but this bridge still waits on the
@@ -805,6 +806,7 @@ impl FrontendDistributedQueryCoordinator {
         let handoff = RoundHandoff {
             delivery,
             internal_capacity,
+            subscription_scope,
             query_id,
             execution_id,
             statement_deadline,
@@ -849,6 +851,7 @@ impl FrontendDistributedQueryCoordinator {
         let RoundHandoff {
             delivery,
             internal_capacity,
+            subscription_scope,
             query_id,
             execution_id,
             statement_deadline,
@@ -1028,6 +1031,7 @@ impl FrontendDistributedQueryCoordinator {
                     .status_subscription_error_budget,
                 attempt,
                 data_runtime: self.data_runtime.clone(),
+                subscription_scope,
             },
         )
         .map_err(|error| failed(error.to_string()))?;
@@ -4060,6 +4064,7 @@ impl TaskRoundWaitWitness {
 struct RoundHandoff<'a> {
     delivery: ProductionRootDelivery,
     internal_capacity: Option<QueryResultCapacityBinding>,
+    subscription_scope: novarocks_workload_control::WorkScope,
     query_id: QueryId,
     execution_id: QueryExecutionId,
     statement_deadline: Instant,
