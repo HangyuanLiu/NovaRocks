@@ -518,23 +518,52 @@ pub fn encode_bitmap_single(value: u64) -> Vec<u8> {
 
 /// Encode a bitmap aggregate intermediate in its historical fixed-width SET
 /// layout. The general decoder accepts this alongside the compact SQL form.
+pub trait BitmapAggregateEncodePort: BitmapDecodePort {
+    fn before_aggregate_buffer(&mut self, bytes: usize) -> Result<(), Self::Error>;
+    fn before_aggregate_singleton(&mut self, value: u64) -> Result<(), Self::Error>;
+}
+impl BitmapAggregateEncodePort for LegacyBitmapPort {
+    fn before_aggregate_buffer(&mut self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+    fn before_aggregate_singleton(&mut self, _: u64) -> Result<(), String> {
+        Ok(())
+    }
+}
 pub fn encode_bitmap_aggregate(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
+    encode_bitmap_aggregate_with_port(values, &mut LegacyBitmapPort)
+}
+pub fn encode_bitmap_aggregate_with_port<P: BitmapAggregateEncodePort>(
+    values: &BTreeSet<u64>,
+    port: &mut P,
+) -> Result<Vec<u8>, P::Error> {
     if values.is_empty() {
+        port.before_aggregate_buffer(1)?;
         return Ok(vec![BITMAP_TYPE_EMPTY]);
     }
     if values.len() == 1 {
-        return Ok(encode_bitmap_single(values.first().copied().ok_or_else(
-            || "bitmap aggregate missing singleton value".to_string(),
-        )?));
+        let value = values
+            .first()
+            .copied()
+            .ok_or_else(|| port.data(format_args!("bitmap aggregate missing singleton value")))?;
+        port.before_aggregate_singleton(value)?;
+        return Ok(encode_bitmap_single(value));
     }
 
-    let count = u32::try_from(values.len())
-        .map_err(|_| format!("bitmap aggregate value count overflow: {}", values.len()))?;
-    let mut out = Vec::with_capacity(1 + 4 + values.len() * 8);
+    let count = u32::try_from(values.len()).map_err(|_| {
+        port.data(format_args!(
+            "bitmap aggregate value count overflow: {}",
+            values.len()
+        ))
+    })?;
+    let capacity = 1 + 4 + values.len() * 8;
+    port.before_aggregate_buffer(capacity)?;
+    let mut out = Vec::with_capacity(capacity);
     out.push(BITMAP_TYPE_SET);
     out.extend_from_slice(&count.to_le_bytes());
     for value in values {
         out.extend_from_slice(&value.to_le_bytes());
+        port.step()?;
     }
     Ok(out)
 }

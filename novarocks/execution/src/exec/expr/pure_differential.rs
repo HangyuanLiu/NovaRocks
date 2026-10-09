@@ -1839,3 +1839,7 @@ mod bitmap_union_int_tests;
 
 #[path = "pure_differential_map_agg_tests.rs"]
 mod pure_differential_map_agg_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_bitmap_agg_tests.rs"]
+mod bitmap_agg_tests;

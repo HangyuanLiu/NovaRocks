@@ -21,7 +21,7 @@ use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::bitmap_value::BitmapDecodePort;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
-use crate::opaque_memory::OpaqueRetainedCharge;
+use crate::bitmap_decode_resources::BitmapDecodeResources;
 use crate::{
     AggregateStateAllocator, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
     RowDataError, ScalarCallContract, ScalarCallInput, SelectedValues,
@@ -85,7 +85,7 @@ struct Port<'w, 'c, 'h> {
     ordinal: usize,
     allocator: &'h HostAggregateAllocator,
     work: &'w mut EvaluationCheckpoints<'c>,
-    copies: OpaqueRetainedCharge,
+    resources: BitmapDecodeResources,
     refused: bool,
 }
 impl Port<'_, '_, '_> {
@@ -97,31 +97,6 @@ impl Port<'_, '_, '_> {
                 Err(Failure::Kernel(cause))
             }
         }
-    }
-    fn reserve(&mut self, bytes: usize) -> Result<(), Failure> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        let retained = self
-            .copies
-            .bytes()
-            .checked_add(bytes)
-            .ok_or(Failure::Kernel(KernelFailure::ResourceExhausted))?;
-        Layout::from_size_align(bytes, 1)
-            .map_err(|_| Failure::Kernel(KernelFailure::ResourceExhausted))?;
-        let mut reservation = self.copies.reserve_operation(bytes).map_err(|cause| {
-            self.refused = true;
-            Failure::Kernel(cause)
-        })?;
-        self.copies
-            .reconcile_under_reservation(retained, &mut reservation)
-            .map_err(|cause| {
-                self.refused = true;
-                Failure::Kernel(cause)
-            })
-    }
-    fn resource() -> Failure {
-        Failure::Kernel(KernelFailure::ResourceExhausted)
     }
 }
 impl BitmapDecodePort for Port<'_, '_, '_> {
@@ -148,65 +123,30 @@ impl BitmapDecodePort for Port<'_, '_, '_> {
         let r = self.work.flush();
         self.observed(r)
     }
-    fn before_tree_insert(&mut self, _existing: usize) -> Result<(), Failure> {
-        // Holding every insertion's cumulative node ceiling until all original
-        // row temporaries die also covers split requests consuming earlier slack.
-        let layout =
-            novarocks_type_contract::owned_resources::btree::node_layout_typed::<u64, ()>()
-                .map_err(|_| Failure::Kernel(internal("bitmap tree source request model drift")))?;
-        self.boundary()?;
-        self.reserve(layout.size())
+    fn before_tree_insert(&mut self, existing: usize) -> Result<(), Failure> {
+        let result = self.resources.before_tree_insert(existing, self.work);
+        self.refused |= self.resources.refused();
+        result.map_err(Failure::Kernel)
     }
     fn before_tree_collection(&mut self, entries: usize) -> Result<(), Failure> {
-        let facts =
-            novarocks_type_contract::owned_resources::btree::insertion_only::<u64, ()>(entries)
-                .map_err(|_| Failure::Kernel(internal("bitmap tree source request model drift")))?;
-        self.boundary()?;
-        // The original BTreeSet::from_iter also collects and stable-sorts
-        // a Vec<u64> before bulk construction. Its input/sort scratch coexist.
-        let scratch = entries.max(4).checked_mul(24).ok_or_else(Self::resource)?;
-        let bound = facts
-            .request_bytes_upper_bound
-            .checked_add(scratch)
-            .ok_or_else(Self::resource)?;
-        self.reserve(bound)
+        let result = self.resources.before_tree_collection(entries, self.work);
+        self.refused |= self.resources.refused();
+        result.map_err(Failure::Kernel)
     }
     fn before_roaring(&mut self, bytes: usize) -> Result<(), Failure> {
-        // REVIEW GATE: pinned roaring 0.10.12 source request proof must be
-        // reviewed before this private draft can be registered. No header
-        // interpreter is added. Input extent bounds successful descriptions/
-        // stores; the fixed term includes malformed pre-read allocations.
-        let bound = bytes
-            .checked_mul(32768)
-            .and_then(|n| n.checked_add(1 << 20))
-            .ok_or_else(Self::resource)?;
-        self.boundary()?;
-        self.reserve(bound)
+        let result = self.resources.before_roaring(bytes, self.work);
+        self.refused |= self.resources.refused();
+        result.map_err(Failure::Kernel)
     }
     fn before_u32_collection(&mut self, entries: u64) -> Result<(), Failure> {
-        let entries = usize::try_from(entries).map_err(|_| Self::resource())?;
-        if entries == 0 {
-            return Ok(());
-        }
-        let layout = Layout::array::<u32>(entries.max(4)).map_err(|_| Self::resource())?;
-        self.boundary()?;
-        self.reserve(layout.size())
+        let result = self.resources.before_u32_collection(entries, self.work);
+        self.refused |= self.resources.refused();
+        result.map_err(Failure::Kernel)
     }
     fn before_render(&mut self, entries: usize) -> Result<(), Failure> {
-        // Original Vec<String>, original integer ToString capacity ceiling,
-        // and original join output coexist. No alternate renderer is installed.
-        if entries == 0 {
-            return Ok(());
-        }
-        let strings = Layout::array::<String>(entries.max(4))
-            .map_err(|_| Self::resource())?
-            .size();
-        let payload = entries
-            .checked_mul(32 + 21)
-            .and_then(|n| n.checked_add(strings))
-            .ok_or_else(Self::resource)?;
-        self.boundary()?;
-        self.reserve(payload)
+        let result = self.resources.before_render(entries, self.work);
+        self.refused |= self.resources.refused();
+        result.map_err(Failure::Kernel)
     }
 }
 pub(super) fn evaluate<'a>(
@@ -279,7 +219,7 @@ pub(super) fn evaluate<'a>(
                 ordinal,
                 allocator,
                 work: &mut work,
-                copies: OpaqueRetainedCharge::try_new(Arc::clone(host))?,
+                resources: BitmapDecodeResources::try_new(Arc::clone(host))?,
                 refused: false,
             };
             let rendered =

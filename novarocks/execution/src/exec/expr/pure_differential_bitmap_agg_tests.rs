@@ -23,7 +23,7 @@ use arrow::array::*;
 use novarocks_type_contract::FunctionValueType;
 fn check(ty: FunctionValueType, a: ArrayRef, distinct: bool) {
     let rows = a.len();
-    let mut spec = AggregateDiffSpec::new("bitmap_union_int")
+    let mut spec = AggregateDiffSpec::new("bitmap_agg")
         .typed_column(ty, a)
         .grouped((0..rows).map(|i| i % 3).collect(), 4)
         .partitions(3, 551389);
@@ -33,7 +33,7 @@ fn check(ty: FunctionValueType, a: ArrayRef, distinct: bool) {
     assert_aggregate_matches_v1(spec);
 }
 #[test]
-fn pure_differential_bitmap_union_int_complete_original_integer_boolean_domain() {
+fn pure_differential_bitmap_agg_complete_original_integer_boolean_domain() {
     for dtype in [
         DataType::Boolean,
         DataType::Int8,
@@ -80,7 +80,7 @@ fn pure_differential_bitmap_union_int_complete_original_integer_boolean_domain()
     );
 }
 #[test]
-fn pure_differential_bitmap_union_int_full_text_binary_decode_fallback_null_empty_shapes() {
+fn pure_differential_bitmap_agg_full_text_binary_decode_fallback_null_empty_shapes() {
     let text = vec![
         Some(" -1 "),
         Some("7"),
@@ -140,7 +140,7 @@ fn pure_differential_bitmap_union_int_full_text_binary_decode_fallback_null_empt
     }
 }
 #[test]
-fn pure_differential_bitmap_union_int_constant_columns_and_empty_final_groups() {
+fn pure_differential_bitmap_agg_constant_columns_and_empty_final_groups() {
     for a in [
         Arc::new(Int32Array::from(vec![Some(-1)])) as ArrayRef,
         Arc::new(Int32Array::from(vec![None])),
@@ -157,7 +157,7 @@ fn pure_differential_bitmap_union_int_constant_columns_and_empty_final_groups() 
         )
         .unwrap();
         assert_aggregate_matches_v1(
-            AggregateDiffSpec::new("bitmap_union_int")
+            AggregateDiffSpec::new("bitmap_agg")
                 .constant(pool.value(0).unwrap())
                 .constant_rows(7)
                 .grouped(vec![0, 1, 0, 1, 0, 1, 0], 3)
@@ -166,7 +166,7 @@ fn pure_differential_bitmap_union_int_constant_columns_and_empty_final_groups() 
     }
 }
 #[test]
-fn pure_differential_bitmap_union_int_original_full_nominal_carrier_domains() {
+fn pure_differential_bitmap_agg_original_full_nominal_carrier_domains() {
     use novarocks_type_contract::ValueLogicalType;
     for (dtype, logical) in [
         (DataType::Utf8, ValueLogicalType::Json),

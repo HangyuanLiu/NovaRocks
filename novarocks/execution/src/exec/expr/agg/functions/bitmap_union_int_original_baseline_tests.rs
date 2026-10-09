@@ -405,3 +405,79 @@ fn original_bitmap_union_int_actual_catalogue_fixed_arity_and_layout_memory_poli
         RetainedMemoryPolicy::AllocationTracked
     ));
 }
+#[test]
+fn original_bitmap_agg_binary_final_negative_null_and_exact_encoder_contract() {
+    for a in [
+        Arc::new(Int32Array::from(vec![Some(-1), Some(7), None, Some(7)])) as ArrayRef,
+        Arc::new(StringArray::from(vec![
+            Some("-1"),
+            Some("7"),
+            None,
+            Some("bad"),
+        ])),
+    ] {
+        let mut s = Original::new("bitmap_agg", a.data_type()).unwrap();
+        s.update(a).unwrap();
+        let intermediate = s.bytes().unwrap();
+        assert_eq!(intermediate, encode_bitmap(&BTreeSet::from([7])).unwrap());
+        let final_array = s.output(false);
+        assert_eq!(final_array.data_type(), &DataType::Binary);
+        assert_eq!(
+            final_array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            intermediate
+        );
+        let mut merged = Original::new("bitmap_agg", &DataType::Int32).unwrap();
+        merged.merge(binary(&[Some(intermediate)])).unwrap();
+        assert_eq!(
+            merged.bytes().unwrap(),
+            encode_bitmap(&BTreeSet::from([7])).unwrap()
+        );
+    }
+    for a in [
+        Arc::new(Int32Array::from(vec![None, None])) as ArrayRef,
+        Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
+    ] {
+        let mut s = Original::new("bitmap_agg", a.data_type()).unwrap();
+        s.update(a).unwrap();
+        assert!(s.bytes().is_none());
+        assert!(s.output(false).is_null(0));
+    }
+    let mut s = Original::new("bitmap_agg", &DataType::Binary).unwrap();
+    s.update(binary(&[Some(vec![0])])).unwrap();
+    assert_eq!(s.bytes().unwrap(), vec![0]);
+    assert_eq!(
+        s.output(false)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0),
+        &[0]
+    );
+}
+#[test]
+fn original_bitmap_agg_merge_full_data_and_first_prefix_are_unchanged() {
+    for bad in [vec![255], "雪".repeat(600).into_bytes()] {
+        let expected = decode_bitmap(&bad).unwrap_err();
+        let mut s = Original::new("bitmap_agg", &DataType::Int32).unwrap();
+        assert_eq!(
+            s.merge(binary(&[
+                Some(encode_bitmap(&BTreeSet::from([7])).unwrap()),
+                Some(bad.clone()),
+                Some(encode_bitmap(&BTreeSet::from([9])).unwrap())
+            ]))
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            s.bytes().unwrap(),
+            encode_bitmap(&BTreeSet::from([7])).unwrap()
+        );
+        if bad.len() > 512 {
+            assert!(expected.len() > 512);
+        }
+    }
+}

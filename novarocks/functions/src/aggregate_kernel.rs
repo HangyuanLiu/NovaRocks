@@ -869,7 +869,13 @@ where
         Ok(value) => observed.finish(Ok(value)).map_err(Into::into),
         // The lossless operation already returned its originating failure.
         // Its error exit has no optional observation or lifecycle footer.
-        Err(error) if kernel.has_invocation_data() => Err(error),
+        Err(crate::EvaluationFailure::Kernel(cause)) if kernel.has_invocation_data() => {
+            // Query the already-borrowed journal only: output validation may
+            // translate InvalidProgram structural failures, but a recorded
+            // control refusal retains its originating class and full cause.
+            // finish performs no callback, state traversal or optional footer.
+            observed.finish(Err(cause)).map_err(Into::into)
+        }
         Err(crate::EvaluationFailure::Kernel(cause)) => {
             observed.finish(Err(cause)).map_err(Into::into)
         }

@@ -325,3 +325,6 @@ pub mod aggregate_map_core;
 
 mod aggregate_map;
 mod aggregate_map_owner;
+
+mod aggregate_bitmap_union_int;
+mod aggregate_bitmap_union_int_owner;

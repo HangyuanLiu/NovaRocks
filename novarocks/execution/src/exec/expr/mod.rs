@@ -1548,3 +1548,6 @@ mod like_shared_actual_after_tests;
 mod legacy_float64_decimal128_baseline_tests;
 #[cfg(test)]
 mod cast_float64_decimal128_oracle_tests;
+
+#[cfg(test)]
+mod bitmap_agg_actual_sql_source_tests;

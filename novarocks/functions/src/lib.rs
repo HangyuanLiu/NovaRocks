@@ -2706,3 +2706,7 @@ pub mod hll_hash_core;
 
 pub mod native_like;
 pub use native_like::PreparedNativeLikeRecipe;
+
+pub mod bitmap_aggregate_core;
+
+mod bitmap_decode_resources;

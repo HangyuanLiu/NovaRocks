@@ -3072,6 +3072,9 @@ pub fn contribute_builtin_functions(
                     "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
                         Some(super::aggregate_array_owner::effects())
                     }
+                    "bitmap_union_int" | "bitmap_agg" => {
+                        Some(super::aggregate_bitmap_union_int_owner::effects())
+                    }
                     "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
                     "ds_hll_count_distinct"
                     | "approx_count_distinct_hll_sketch"
@@ -3220,6 +3223,14 @@ pub fn contribute_builtin_functions(
         }
         if declaration.name == "multi_distinct_count" {
             builder.register(super::aggregate_count_distinct_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if matches!(declaration.name, "bitmap_union_int" | "bitmap_agg") {
+            builder.register(super::aggregate_bitmap_union_int_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -5211,4 +5222,41 @@ pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
         .register(super::aggregate_map_owner::definition("map_agg", declaration, resolver).unwrap())
         .unwrap();
     builder.seal_bound().unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn bitmap_union_int_test_catalog() -> EngineFunctionCatalog {
+    let original = build_builtin_engine_function_catalog().unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    for declaration in builtin_aggregate_declarations()
+        .into_iter()
+        .filter(|item| matches!(item.name, "bitmap_union_int" | "bitmap_agg"))
+    {
+        let raw = original
+            .definition(declaration.name, FunctionKind::Aggregate)
+            .unwrap()
+            .binding_declaration()
+            .unwrap();
+        let binding = FunctionBindingDeclaration::try_new(
+            raw.function_id().clone(),
+            raw.kind(),
+            raw.overloads().iter().cloned().map(|mut overload| {
+                overload.effects = Some(super::aggregate_bitmap_union_int_owner::effects());
+                overload
+            }),
+        )
+        .unwrap();
+        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+        builder
+            .register(
+                super::aggregate_bitmap_union_int_owner::definition(
+                    declaration.name,
+                    binding,
+                    resolver,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    builder.seal().unwrap()
 }
