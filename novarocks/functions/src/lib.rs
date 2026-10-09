@@ -66,6 +66,7 @@ mod exact_overload_selection_tests;
 pub mod generate_series_core;
 mod higher_order_call;
 mod higher_order_kernel;
+pub mod hll;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;

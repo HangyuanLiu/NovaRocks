@@ -17,53 +17,10 @@
 
 //! Canonical StarRocks-compatible HLL scalar bytes and hash primitive.
 
-pub const HLL_DATA_EMPTY: u8 = 0;
-pub const HLL_DATA_EXPLICIT: u8 = 1;
-pub const MURMUR_SEED: u32 = 0xadc8_3b19;
-
-const MURMUR_PRIME: u64 = 0xc6a4_a793_5bd1_e995;
-
-pub fn encode_hll_empty() -> Vec<u8> {
-    vec![HLL_DATA_EMPTY]
-}
-
-pub fn encode_hll_single(hash: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + std::mem::size_of::<u64>());
-    out.push(HLL_DATA_EXPLICIT);
-    out.push(1);
-    out.extend_from_slice(&hash.to_le_bytes());
-    out
-}
-
-pub fn murmur_hash64a(data: &[u8], seed: u32) -> u64 {
-    let r: u32 = 47;
-    let mut h = (seed as u64) ^ (data.len() as u64).wrapping_mul(MURMUR_PRIME);
-
-    let mut offset = 0usize;
-    while offset + 8 <= data.len() {
-        let mut block = [0u8; 8];
-        block.copy_from_slice(&data[offset..offset + 8]);
-        let mut k = u64::from_le_bytes(block);
-        k = k.wrapping_mul(MURMUR_PRIME);
-        k ^= k >> r;
-        k = k.wrapping_mul(MURMUR_PRIME);
-        h ^= k;
-        h = h.wrapping_mul(MURMUR_PRIME);
-        offset += 8;
-    }
-
-    for (idx, byte) in data[offset..].iter().enumerate() {
-        h ^= (*byte as u64) << (idx * 8);
-    }
-    if offset < data.len() {
-        h = h.wrapping_mul(MURMUR_PRIME);
-    }
-
-    h ^= h >> r;
-    h = h.wrapping_mul(MURMUR_PRIME);
-    h ^= h >> r;
-    h
-}
+pub use novarocks_functions::hll::{
+    HLL_DATA_EMPTY, HLL_DATA_EXPLICIT, MURMUR_SEED, encode_hll_empty, encode_hll_single,
+    murmur_hash64a,
+};
 
 #[cfg(test)]
 mod tests {
