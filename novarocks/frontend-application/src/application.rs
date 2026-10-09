@@ -1286,7 +1286,7 @@ impl FrontendApplicationHost {
             },
             execution_runtime_owner,
             execution_role: backend.role(),
-            data_runtime: data_runtime.clone(),
+            data_runtime,
             topology: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
@@ -1297,6 +1297,17 @@ impl FrontendApplicationHost {
             mv_startup_isolation: execution.mv_startup_isolation.clone(),
             function_catalog: execution.function_catalog(),
         };
+
+        // Unique original Apply owner is now in Host. No Native caller has
+        // received a projection yet; early try_new failure had no reaper.
+        if let Err(error) = host.data_runtime.start_original_apply_reaper() {
+            return Err(host
+                .cleanup_open_error(FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::CoordinatorOpen,
+                    error,
+                ))
+                .await);
+        }
 
         if let Some(state_store) = state_store
             && let Err(error) = host
@@ -1441,8 +1452,12 @@ impl FrontendApplicationHost {
                 }
             }
         }
-        match ClusterBackendService::open(backend, tokio::runtime::Handle::current(), data_runtime)
-            .await
+        match ClusterBackendService::open(
+            backend,
+            tokio::runtime::Handle::current(),
+            host.data_runtime.clone(),
+        )
+        .await
         {
             Ok(topology) => host.topology = Some(topology),
             Err(error) => {
@@ -2020,6 +2035,22 @@ impl FrontendApplicationHost {
                 primary_error = Some(error);
             }
             return Err(primary_error.expect("catalog role runtime shutdown error is retained"));
+        }
+        // Execution and heartbeat shutdown precede Apply close. Retain this
+        // original role owner in Host on timeout so a shutdown retry joins
+        // the SAME records and handles.
+        if let Err(error) = self.data_runtime.drain_original_apply_until(deadline).await {
+            if !self.data_runtime.original_apply_joined() {
+                return Err(match primary_error {
+                    Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                    None => error,
+                });
+            }
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {error}"));
+            } else {
+                primary_error = Some(error);
+            }
         }
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {

@@ -14,6 +14,7 @@ use novarocks_task_codec::TransportBudget;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio::runtime::Handle;
 
+use super::apply_send_owner::{ApplySendOwner, ApplySendPort, DrainObservation};
 use super::transport_supervisor::NativeTransportSupervisor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_native_adapter::FrontendNativeTransport;
@@ -224,7 +225,6 @@ impl Drop for NativeDialReservation {
 /// Native transport ports are synchronous Core-facing traits.  Their RPC work
 /// runs on this role-owned handle, and they retain the historical two-path
 /// `block_on` behavior when called both inside and outside a Tokio context.
-#[derive(Clone)]
 pub(crate) struct FrontendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
@@ -234,6 +234,26 @@ pub(crate) struct FrontendDataRuntime {
     dial_gates: Arc<[tokio::sync::Mutex<()>; 4]>,
     task_transport_supervisor: NativeTransportSupervisor,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
+    apply_send_port: ApplySendPort,
+    // Only the original runtime owns joins. Clones are capability projections.
+    original_apply_owner: Option<Mutex<ApplySendOwner>>,
+}
+
+impl Clone for FrontendDataRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            native_trust: Arc::clone(&self.native_trust),
+            native_transport: self.native_transport.clone(),
+            transport_admission: self.transport_admission.clone(),
+            channels: Arc::clone(&self.channels),
+            dial_gates: Arc::clone(&self.dial_gates),
+            task_transport_supervisor: self.task_transport_supervisor.clone(),
+            connector_blocking_io: self.connector_blocking_io.clone(),
+            apply_send_port: self.apply_send_port.clone(),
+            original_apply_owner: None,
+        }
+    }
 }
 
 impl FrontendDataRuntime {
@@ -266,18 +286,30 @@ impl FrontendDataRuntime {
             coefficients_frozen = geometry.frontend.coefficients.is_some(),
             "Frontend Native transport admission composed"
         );
+        // Refuse fallible configuration before creating the original reaper.
+        let task_transport_supervisor =
+            NativeTransportSupervisor::from_transport(task_transport_budget)?;
+        let channels = Arc::new(Mutex::new(ChannelPools::default()));
+        let dial_gates = Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(())));
         let connector_blocking_io = ConnectorBlockingIoSupervisor::new(handle.clone());
+        let (original_apply_owner, apply_send_port) =
+            ApplySendOwner::new(handle.clone(), task_transport_budget)
+                // The existing constructor is Result<Self, String>; this boundary
+                // cannot preserve the typed TryReserveError. No Native F exists yet.
+                .map_err(|_| {
+                    "allocate Native Apply original process-item storage failed".to_owned()
+                })?;
         Ok(Self {
             handle,
             native_trust,
             native_transport,
             transport_admission,
-            channels: Arc::new(Mutex::new(ChannelPools::default())),
-            dial_gates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
-            task_transport_supervisor: NativeTransportSupervisor::from_transport(
-                task_transport_budget,
-            )?,
+            channels,
+            dial_gates,
+            task_transport_supervisor,
             connector_blocking_io,
+            apply_send_port,
+            original_apply_owner: Some(Mutex::new(original_apply_owner)),
         })
     }
 
@@ -295,13 +327,17 @@ impl FrontendDataRuntime {
             NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("fixed test caller"),
             NativeTransportMode::Disabled,
         );
-        Self::new_with_native_trust(
+        let mut runtime = Self::new_with_native_trust(
             handle,
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
         )
-        .expect("the default task transport budget is valid")
+        .expect("the default task transport budget is valid");
+        runtime
+            .start_original_apply_reaper()
+            .expect("the test role starts its original Apply owner once");
+        runtime
     }
 
     pub(crate) fn native_trust(&self) -> &Arc<NativeTrust> {
@@ -320,6 +356,53 @@ impl FrontendDataRuntime {
 
     pub(crate) fn task_transport_supervisor(&self) -> &NativeTransportSupervisor {
         &self.task_transport_supervisor
+    }
+
+    pub(crate) fn start_original_apply_reaper(&mut self) -> Result<(), String> {
+        let Some(owner) = self.original_apply_owner.as_mut() else {
+            return Err(
+                "Native Apply original start requested through a capability projection".to_owned(),
+            );
+        };
+        owner
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .start_reaper()
+            .map_err(|failure| failure.to_string())
+    }
+
+    pub(crate) fn apply_send_port(&self) -> &ApplySendPort {
+        &self.apply_send_port
+    }
+
+    pub(crate) async fn drain_original_apply_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let Some(owner) = self.original_apply_owner.as_mut() else {
+            return Err(
+                "Native Apply original drain requested through a capability projection".to_owned(),
+            );
+        };
+        // Exclusive Host access borrows its unique original owner without
+        // carrying a mutex guard across await. Capability projections stay Sync.
+        let owner = owner.get_mut().unwrap_or_else(|error| error.into_inner());
+        // Host calls only after the original Abort/Release/heartbeat callers exit.
+        owner.request_abort();
+        let observation = owner.drain_until(deadline).await;
+        match observation {
+            DrainObservation::Complete => Ok(()),
+            failure => Err(format!("{failure}; {:?}", owner.failure_snapshot())),
+        }
+    }
+
+    pub(crate) fn original_apply_joined(&self) -> bool {
+        self.original_apply_owner.as_ref().is_some_and(|owner| {
+            owner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_joined()
+        })
     }
 
     pub(crate) fn connector_blocking_io(&self) -> &ConnectorBlockingIoSupervisor {

@@ -93,18 +93,19 @@ use crate::task_execution::context_convergence::{
 };
 use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
-    TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationSink, TaskOperationSubmit,
+    TaskOperationQueueAdmission, TaskOperationSink, TaskOperationSubmit,
 };
 use crate::task_execution::status_intake::{
     ObservationFrame, ObservationIntake, ObservationPublisher, StatusEvent, StatusIntakeAdmission,
     StatusIntakeHandle, StatusIntakeWake,
 };
 
+use super::apply_send_owner::{ApplyReservations, OriginalDisposition};
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
 use super::transport_supervisor::{
-    NativeTransportBackpressure, NativeTransportEncodingPermit, NativeTransportLane,
-    NativeTransportReadyWake, NativeTransportWaiter,
+    NativeTransportBackpressure, NativeTransportLane, NativeTransportReadyWake,
+    NativeTransportWaiter,
 };
 
 /// How long a lost subscription waits before its next attempt, per failure in
@@ -847,6 +848,21 @@ impl TaskOperationSink for NativeTaskOperationSink {
             drop(batch.commit_queue_permits());
             return TaskOperationSubmit::Accepted;
         }
+        // The original batch still holds its exact process-item grants. Reserve
+        // only fixed bookkeeping custody BEFORE constructing any Native F.
+        let original_slot = match self
+            .data_runtime
+            .apply_send_port()
+            .reserve_original_slot(batch.operations().len())
+        {
+            Ok(slot) => slot,
+            Err(failure) => {
+                return TaskOperationSubmit::Rejected {
+                    batch,
+                    reason: failure.to_string(),
+                };
+            }
+        };
         let target = target.clone();
         let supervisor_lane = supervisor_lane(&batch);
         let mut encoding_permit = match self
@@ -855,7 +871,10 @@ impl TaskOperationSink for NativeTaskOperationSink {
             .try_reserve_encoding(&self.transport_waiter, backend, supervisor_lane)
         {
             Ok(permit) => permit,
-            Err(_) => return TaskOperationSubmit::Backpressured(batch),
+            Err(_) => {
+                drop(original_slot);
+                return TaskOperationSubmit::Backpressured(batch);
+            }
         };
 
         let mut operations = Vec::with_capacity(batch.operations().len());
@@ -894,6 +913,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
         }
         if operations.is_empty() {
             settle_unencodable(self, unencodable);
+            drop(original_slot);
             drop(batch.commit_queue_permits());
             return TaskOperationSubmit::Accepted;
         }
@@ -921,6 +941,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
                     );
                 }
                 settle_unencodable(self, unencodable);
+                drop(original_slot);
                 drop(batch.commit_queue_permits());
                 return TaskOperationSubmit::Accepted;
             }
@@ -939,17 +960,23 @@ impl TaskOperationSink for NativeTaskOperationSink {
         // A submission never blocks on a round trip: the batch leaves on the
         // role's runtime and its receipts come back through the intake, which
         // is what lets the frontend keep one serial runner.
-        // Construct the settlement owner before spawning: the runtime can
-        // drop a task before its first poll, and that must still settle every
-        // accepted operation before returning its reservations.
         let send = ApplySend {
             client,
             receipts: AcceptedOperationReceipts::new(acks, sent),
-            _queue_permits: queue_permits,
-            _encoding_permit: encoding_permit,
         };
-        self.data_runtime
-            .spawn(apply_operations(send, requests, submitted_at));
+        let reservations = ApplyReservations::new(queue_permits, encoding_permit);
+        // The pure async constructor does not poll user code. Once committed,
+        // this SAME slot owns F, its receipts and both original reservations,
+        // including close races. Accepted reports ownership, not wire success.
+        match original_slot.commit(reservations, apply_operations(send, requests, submitted_at)) {
+            OriginalDisposition::Started => {}
+            OriginalDisposition::ClosedAndRetiring => {
+                tracing::debug!("Native Apply original retired after role close")
+            }
+            OriginalDisposition::SpawnUnjoinable => {
+                tracing::error!("Native Apply spawn unwound without an original join handle")
+            }
+        }
         TaskOperationSubmit::Accepted
     }
 }
@@ -1075,18 +1102,17 @@ fn settle_unencodable(
     }
 }
 
-/// Everything one send owns beyond its request.
+/// The original client and first-wins receipts; its fixed record owns reservations.
 struct ApplySend {
     client: Client,
     receipts: AcceptedOperationReceipts,
-    _queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
-    _encoding_permit: NativeTransportEncodingPermit,
 }
 
 /// First-wins settlement for every operation an accepted send owns.
 ///
-/// Dropping the send future is an unknown transport outcome, including runtime
-/// shutdown and task abort. The guard publishes that fact for every operation
+/// Dropping the original send future is an unknown transport outcome, including
+/// role shutdown and task abort. Its record waits for actual task join and
+/// actual protected destructor join before returning process reservations. The guard publishes that fact for every operation
 /// not already settled before releasing the process reservations, so an owner
 /// can never remain in flight merely because its transport future disappeared.
 struct AcceptedOperationReceipts {
@@ -4057,26 +4083,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn submitting_to_a_closed_runtime_settles_once_and_returns_reservations() {
+    async fn submitting_after_original_role_drain_rejects_the_original_batch_without_a_send() {
         let backend = BackendProcessId::new_v7();
-        let fixture = sink_fixture(Loopback::start().await, backend);
+        let mut fixture = sink_fixture(Loopback::start().await, backend);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
-            .expect("build a runtime to close before submission");
-        let handle = runtime.handle().clone();
-        runtime.shutdown_background();
+            .expect("build the original role runtime");
+        let mut original_role = FrontendDataRuntime::new(runtime.handle().clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let original_drain = original_role.drain_original_apply_until(deadline).await;
+        let original_joined = original_role.original_apply_joined();
+        // The actual original task owner is drained while its runtime is alive.
+        tokio::task::block_in_place(|| runtime.shutdown_timeout(Duration::from_secs(2)));
         let mut sink = NativeTaskOperationSink::new(
             &[fixture.loopback.descriptor(backend)],
             TransportBudget::DEFAULT,
             test_attempt_facts(),
             fixture.acks.handle(),
-            FrontendDataRuntime::new(handle),
+            original_role,
         )
-        .expect("one frozen backend target on the closed runtime");
+        .expect("one frozen backend target after original role drain");
         // Keep the actual wire client on the live test runtime. Only the
-        // production send scheduling capability has been shut down.
+        // original role has closed. Rejection must precede any wire task.
         sink.targets
             .get_mut(&backend)
             .expect("frozen target")
@@ -4115,32 +4145,60 @@ mod tests {
         );
         assert!(fixture.acks.drain_events().is_empty());
 
-        // Exercise the actual sink: a closed runtime drops its accepted
-        // spawned future before the first poll, including its encoding permit.
-        assert!(matches!(
-            sink.try_submit(batch),
-            TaskOperationSubmit::Accepted
-        ));
+        // A closed original role rejects BEFORE constructing F. The caller
+        // keeps the exact batch for the existing definitely-unsent rollback.
+        let (rejected, returned_ids, reason, held_returned_items) = match sink.try_submit(batch) {
+            TaskOperationSubmit::Rejected { batch, reason } => {
+                let ids = batch
+                    .operations()
+                    .iter()
+                    .map(OperationIntent::operation_id)
+                    .collect::<Vec<_>>();
+                let held = supervisor.snapshot().retained_items;
+                drop(batch);
+                (true, ids, reason, held)
+            }
+            TaskOperationSubmit::Backpressured(batch) => {
+                drop(batch);
+                (false, Vec::new(), String::new(), 0)
+            }
+            TaskOperationSubmit::Accepted => (false, Vec::new(), String::new(), 0),
+        };
+        let acknowledgements = fixture.acks.drain_events();
+        let returned = supervisor.snapshot();
+        let applied = fixture.loopback.peer.applied();
+        let control_requests = fixture.loopback.peer.control_requests();
+        // Join the actual fixture servers before checking the collected result.
+        // Forced server cancellation is test cleanup, not role drain evidence.
+        for served in &fixture.loopback.served {
+            served.abort();
+        }
+        let mut server_cleanup = true;
+        for served in &mut fixture.loopback.served {
+            match tokio::time::timeout_at(deadline.into(), served).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                _ => server_cleanup = false,
+            }
+        }
 
-        let acknowledgements = fixture.acks.drain();
-        assert_eq!(
-            acknowledgements
-                .iter()
-                .map(OperationAcknowledgement::operation_id)
-                .collect::<Vec<_>>(),
-            expected_ids,
-        );
-        assert!(acknowledgements.iter().all(|ack| matches!(
-            ack.dispatch_result(),
-            OperationDispatchResult::TransportUnknown
-        )));
+        assert!(original_drain.is_ok(), "{original_drain:?}");
+        assert!(original_joined);
+        assert!(rejected);
+        assert!(reason.contains("closed"));
+        assert_eq!(returned_ids, expected_ids);
+        assert_eq!(held_returned_items, before.retained_items + 2);
         assert!(
-            fixture.acks.drain_events().is_empty(),
-            "settled exactly once"
+            acknowledgements.is_empty(),
+            "rejection cannot manufacture an ACK"
         );
-        assert_eq!(supervisor.snapshot(), before, "all reservations returned");
-        assert!(fixture.loopback.peer.applied().is_empty());
-        assert_eq!(fixture.loopback.peer.control_requests(), 0);
+        assert_eq!(
+            returned, before,
+            "caller returned its original reservations"
+        );
+        assert!(applied.is_empty());
+        assert_eq!(control_requests, 0);
+        assert!(server_cleanup);
     }
 
     #[test]
