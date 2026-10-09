@@ -2010,12 +2010,6 @@ async fn observe_context_convergence(
         match intake.publish(context, receipt) {
             Ok(admission) => {
                 assert!(admission.authorizes_cursor_advance());
-                tracing::debug!(
-                    %context,
-                    version = %receipt.version(),
-                    state = ?receipt.state(),
-                    "frontend retained worker stop and context fence"
-                );
                 *current = current.advanced_to(receipt.version());
                 return Ok(StreamObservation::Delivered);
             }
@@ -2501,6 +2495,12 @@ async fn run_covered_subscription(
                                 }
                                 _ => false,
                             };
+                            let convergence = match &event.fact {
+                                CoveredStatusStreamFact::ContextConvergence(receipt) => {
+                                    Some(*receipt)
+                                }
+                                _ => None,
+                            };
                             if let Err(error) = permit.publish(
                                 ObservationFrame::Covered {
                                     context,
@@ -2517,6 +2517,15 @@ async fn run_covered_subscription(
                                 );
                                 set_state(&state, SubscriptionState::Rejected);
                                 return;
+                            }
+                            if let Some(receipt) = convergence {
+                                tracing::debug!(
+                                    %context,
+                                    execution_id = ?context.query_execution_id(),
+                                    version = %receipt.version(),
+                                    state = ?receipt.state(),
+                                    "frontend retained worker stop and context fence"
+                                );
                             }
                             if new_liveness {
                                 observed_liveness = true;
