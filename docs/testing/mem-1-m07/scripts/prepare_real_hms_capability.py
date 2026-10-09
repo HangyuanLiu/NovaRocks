@@ -590,6 +590,12 @@ object M07HmsCapability {
     Seq("uri", "warehouse", "io-impl", "s3.endpoint", "s3.path-style-access", "s3.access-key-id", "s3.secret-access-key", "s3.region").foreach { key =>
       properties.put(key, spark.conf.get("spark.sql.catalog.hms_catalog." + key))
     }
+    // The canonical owner publishes its actual fixture region as s3.region.
+    // Direct S3FileIO consumes the public client.region key; unlike the
+    // Compose Spark service, this one-shot writer has no ambient AWS_REGION.
+    properties.put(org.apache.iceberg.aws.AwsClientProperties.CLIENT_REGION, properties.get("s3.region"))
+    require(new org.apache.iceberg.aws.AwsClientProperties(properties).clientRegion() ==
+      spark.conf.get("spark.sql.catalog.hms_catalog.s3.region"), "S3 client region binding differs")
     require(properties.get("warehouse") == warehouse, "HMS warehouse binding differs")
     properties.put(HiveCatalog.LIST_ALL_TABLES, "false"); properties.put("clients", "1")
     cat.initialize(catalogName, properties)

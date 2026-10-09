@@ -337,3 +337,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 无网络的锁定Spark镜像javap确认实际Hive2.3.9总连接轮数：初始attempt0>=retries0直接跳出，原helper误读成extra retries。当前helper/freezeinput改hms_connect_attempts1→Hive property1并readback1，failure retries0，允许首次connection而无额外retry；不改产品、scope/CL/caps/deadlines或旧freeze。需要新cleanHEAD、新UUID/newfreeze重新运行；并非重试unknowncreate。
 
 - 纠正后host-only四测试PASS/0.037s（包括reviewed freeze通过及initial attempts0提前拒绝）；第一次schema key漏改所致定向ERROR日志保留，已在provider新运行前修正，未放宽exact schema。
+
+
+### 2026-10-09 P09：HMS预检二次真实创建失败及显式S3 region接线
+
+- clean50a932335第二次预检实际baseline/default与create_namespace applied；create_table attempt后SdkClientException，尚无table/view创建成功记录，不能把未执行view写成Unsupported。safe effect ledger/原freeze保留于p09-hms-capability-preflight-v2-failed-20261009.json。全部host groups/PIDs、实际HMS/writer IDs/privateownerrecords消失，cleanup成功，未改共享fixture。
+- actual locked Spark javap确认AwsClientProperties只读取client.region；helper旧copy owner s3.region没有映射公开SDK region，one-shot容器亦没有标准Compose AWS_REGION环境。当前显式派生owner已发布region→public CLIENT_REGION并getter核对，无默认/猜测region。原exception cause仅hash，需新真实run确认因果；不以修正接线声称PASS，不重试旧unknowncreate。其余caps/clocks/input与zeroextra retries不变。

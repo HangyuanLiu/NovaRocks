@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "scope": "private stock HMS capability preflight second failure",
+  "source_revision": "50a9323357e1abb6da16f977ab90fbb8caecc0e4",
+  "status": "FAILED",
+  "native_started": false,
+  "bulk_ready": false,
+  "failure": {
+    "container_id": "0fee619086f4daf995168aae132bc5d21d231b336ed1ef1805112d4d9699643d",
+    "container_name": "nr-m07-hms-cap-77a1733ac71547ef91c249253213b63b-create",
+    "exit_code": 1,
+    "output_bytes": 1320,
+    "output_sha256": "31aad1c97aa07cc0bf0d80f38efda369a1f266fadeab980658ecd938e36f49dc",
+    "phase": "create",
+    "program_sha256": "8ed92587dd8ccdbc3d74e6703b319efe53f504316499b7dae514e752831a12be",
+    "record_sha256": [
+      "695373d9cf38c5ec6e24c74f2bc83ec5ed035845f6109d6ac463c8ce16496f5b",
+      "491e92120ce616829313086dc253c38415e5ec318d6d7b5781bad1eaf179060d",
+      "80938d466bb33b424e15290c4581bb95ed503b10adee56aa3a3a5c1323a180bb",
+      "a112f4b21917e54d561071a285a036d37852775533444b696af89b18ddd48c22",
+      "46ed239c59a29ebd95fdef0914ca6da7f40e258ef1702dd925b35b3f68502a6f"
+    ],
+    "records": [
+      {
+        "kind": "baseline",
+        "phase": "create",
+        "value": [
+          "default"
+        ]
+      },
+      {
+        "kind": "mutation",
+        "phase": "create",
+        "value": {
+          "namespace": "m07_cap_77a1733ac71547ef91c249253213b63b",
+          "object": "m07_cap_77a1733ac71547ef91c249253213b63b",
+          "operation": "create_namespace",
+          "state": "attempt"
+        }
+      },
+      {
+        "kind": "mutation",
+        "phase": "create",
+        "value": {
+          "namespace": "m07_cap_77a1733ac71547ef91c249253213b63b",
+          "object": "m07_cap_77a1733ac71547ef91c249253213b63b",
+          "operation": "create_namespace",
+          "state": "applied"
+        }
+      },
+      {
+        "kind": "mutation",
+        "phase": "create",
+        "value": {
+          "namespace": "m07_cap_77a1733ac71547ef91c249253213b63b",
+          "object": "cap_table",
+          "operation": "create_table",
+          "state": "attempt"
+        }
+      },
+      {
+        "kind": "failure",
+        "phase": "create",
+        "value": {
+          "exception_class": "software.amazon.awssdk.core.exception.SdkClientException",
+          "message_sha256": "4063cf31d791c6fcd46dec83054618f146115690d816b5d5cd4e522cbe5c82e6"
+        }
+      }
+    ],
+    "unconfirmed_mutations": [
+      "create_table",
+      "create_view"
+    ],
+    "writer_exited": true
+  },
+  "diagnosis": {
+    "actual_jar_api": "Locked stock Spark image AwsClientProperties.CLIENT_REGION is client.region; ctor reads only that map key and public clientRegion getter, builder only applies Region when non-null. Helper copied owner s3.region but supplied neither client.region nor Compose AWS_REGION env. This is an effective config gap; original SdkClientException cause remains a message hash, so region causality requires a corrected real run."
+  },
+  "cleanup": {
+    "complete": true,
+    "errors": [],
+    "all_owned_host_groups_gone": true,
+    "all_command_pids_absent": true,
+    "hms_and_writer_ids_absent": [
+      "eaecbf370e8efd57e556c22938468d5b24ffba38ba89734ee64c755ff45b889b",
+      "0fee619086f4daf995168aae132bc5d21d231b336ed1ef1805112d4d9699643d"
+    ],
+    "actual_private_owner_records_absent": [
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v2-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/hms/cat-ff2bcfd3257a/manifest.json",
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v2-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/cat-ff2bcfd3257a/record.json",
+      "logs/mem-1-m07/p09-real-hms-capability-preflight-v2-20261009/fixture-owner/b79582e0-9a8f-4fa8-93bc-71e5d8ccba24/runtimes/os-eec671f90159/record.json"
+    ]
+  },
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v2-20261009/status.json",
+      "sha256": "3927a7b6079e4cb7e1bfbcae95553f2bc1c1f5997280bcaac55876c11a22b9be",
+      "bytes": 16727
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v2-20261009/create-receipt.json",
+      "sha256": "7b51dc1ff4bce34918b0ae94453e68e6e550a21bae7eee028a7ca3dc3b7adf15",
+      "bytes": 1655
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-preflight-v2-20261009/bound-input.json",
+      "sha256": "b9660b6f7a9f078db0aebaa817d8b8e99f6eb80b5e7b5791a3d52c18ae45ce98",
+      "bytes": 5241
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-hms-capability-execution-freeze-v2-20261009.json",
+      "sha256": "8f01b612f1e4a326794f503f7b5041877de5183eb69d56f85003d7c32f4c6b81",
+      "bytes": 4955
+    },
+    {
+      "path": "logs/mem-1-m07/p09-stock-spark-aws-client-bytecode-20261009.log",
+      "sha256": "6923c7e2b2f1663d8770a917a6ae9f457530286ffe09a0411c475ed74cc28a1e",
+      "bytes": 24092
+    }
+  ]
+}

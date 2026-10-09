@@ -12,7 +12,7 @@
 
 模板仍为 `review_status=draft`、`frozen_before_execution=false`，直接使用会在 owner 创建前拒绝。`source_revision=null` 是唯一未绑定的源码身份字段：主 agent 先审阅、应用并提交 promotion，然后从模板生成 ignored 的独立不可变执行副本，将它绑定到实际干净已提交的 HEAD；不要向 tracked 模板写入包含其自身的尚未生成 commit。
 
-模板的 helper SHA256 是推广后源文件的真实 hash `68680324046fac51becbee6b389c719be44f39a26e7de1f7d576547c01553c23`；Scala 模板 SHA256 `265c62c47b6b62a487e2bd9163ad6fb6b6f1d2deb60034a4fa3a58365e658933`。execution copy 必须复核 helper、Scala、17 个源文件 pins、实际 BOM/canonical lock、实际 stock HMS/writer image、JAR 长度/SHA1 和本机绝对路径，最后才设置 `review_status=reviewed`、`frozen_before_execution=true`。模板的 `source.docker_binary` / `fixture_store` 是既有本机锁定输入路径，不是环境猜测；换主机时必须明确审阅并绑定实际输入。schema 使用 exact keys，没有额外 `helper_path` 字段；source 路径由本说明和实际 CLI 文件固定，helper 自身核对 `__file__` hash。
+模板的 helper SHA256 是推广后源文件的真实 hash `df41536c1102a08b9a8f5c4332cca30f36907011e96da863d1006901aaf10b34`；Scala 模板 SHA256 `881525d48642ae1713eead8f19471c328d8605becf33a52311b1f6460af0c56c`。execution copy 必须复核 helper、Scala、17 个源文件 pins、实际 BOM/canonical lock、实际 stock HMS/writer image、JAR 长度/SHA1 和本机绝对路径，最后才设置 `review_status=reviewed`、`frozen_before_execution=true`。模板的 `source.docker_binary` / `fixture_store` 是既有本机锁定输入路径，不是环境猜测；换主机时必须明确审阅并绑定实际输入。schema 使用 exact keys，没有额外 `helper_path` 字段；source 路径由本说明和实际 CLI 文件固定，helper 自身核对 `__file__` hash。
 
 CLI（仅示例，不表示已执行 provider）：
 
@@ -53,3 +53,9 @@ helper 仅改 Apache header 的句间空格/空行、docstring 去除 draft 标�
 clean 5fe6f4dfd首次预检只产生RuntimeMetaException failure marker，create没有成功mutation记录；完整private cleanup成功，失败收据保留于evidence/p09-hms-capability-preflight-v1-failed-20261009.json。实际stock Spark image内hive-metastore-2.3.9.jar SHA256为224b4a59344ff8136a68c0033801390f20d4d01c30ea5fd5dd9c4592f9c8a9ef。javap ctor/open证明METASTORETHRIFTCONNECTIONRETRIES是总连接轮数，原0在初始attempt0时直接退出连接loop。
 
 当前input明确hms_connect_attempts=1，映射Hive属性hive.metastore.connect.retries=1并typed readback为1；failure retries仍0。只允许一个初始connection round，没有额外retry。仓库helper原先误读第三方字段，纠正该测试工具不更改产品或原CL输入；所有其他scope/bounds/pins/image/JAR/API相同。旧immutable execution freeze不覆盖，后续运行绑定新的clean HEAD、新UUID private root与新immutable freeze，不重试上次未知创建。上文v5 promotion段落是历史机械推广边界；当前helper/Scala hashes反映此纠正。
+
+## 第二次真实运行纠正：直接S3FileIO显式region
+
+clean50a932335第二次预检实际namespace创建成功，table创建attempt后返回SdkClientException；没有table/view创建成功证据，所有私有资源和host已退出，原失败收据/effect ledger保留。锁定Spark镜像javap实际AwsClientProperties.CLIENT_REGION为client.region；constructor只读取这个key。helper直接创建HiveCatalog/S3FileIO只复制了owner的s3.region，而标准Compose Spark另有AWS_REGION环境，one-shot writer未继承该environment。
+
+当前从实际owner Spark config的s3.region映射到公开AwsClientProperties.CLIENT_REGION并通过公开clientRegion getter核对相等；无默认region/环境fallback/猜测endpoint或credential。原SdkClientException只保留class/message hash，region因果仍须新实际运行确认；此纠正闭合已证实的config缺口，不把推测写成运行PASS。其他input/caps/deadlines/retries和第三方/API来源保持不变。仍使用新cleanHEAD/新UUID/newfreeze，不重试前次unknowntable create。

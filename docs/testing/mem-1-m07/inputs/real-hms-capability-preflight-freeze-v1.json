@@ -6,8 +6,8 @@
   "review_status": "draft",
   "frozen_before_execution": false,
   "source_revision": null,
-  "helper_sha256": "68680324046fac51becbee6b389c719be44f39a26e7de1f7d576547c01553c23",
-  "scala_template_sha256": "265c62c47b6b62a487e2bd9163ad6fb6b6f1d2deb60034a4fa3a58365e658933",
+  "helper_sha256": "df41536c1102a08b9a8f5c4332cca30f36907011e96da863d1006901aaf10b34",
+  "scala_template_sha256": "881525d48642ae1713eead8f19471c328d8605becf33a52311b1f6460af0c56c",
   "source": {
     "docker_binary": "/Applications/Docker.app/Contents/Resources/bin/docker",
     "fixture_store": "/Users/harbor/.cache/novarocks/fixture-inputs",
