@@ -273,3 +273,13 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 
 - 干净d28682f9ca81b17d0368c0d6db5d5295d204ea43，无FE/native启动，实际task-private stock REST/MinIO实例；image/container digest精确匹配canonical f7d679d...。14实际HTTP完成fresh namespace、真table/view create、独立metadata load、pageSize1 exactlist、DELETE200+emptybody、最后namespace恢复empty；PREFLIGHT_PASS真实落盘。3.095s含启动；cleanup0，exact project全部container/private MinIO volume消失，共享fixture未改。
 - 收据p09-real-rest-cl-preflight-v2-pass-20261009.json保留source/helper/freeze/actualowner/sourceimage、实际provider ledger与全部raw hashes。标准metadata位置按server warehouse事实，client warehouse独立保存；不假造metadata/空views。不发布bulk READY，不声称native CL、并发peak或真实跨provider完成。下一原32×512table+512view真实外部producer及透明observer接入尚待，其他门及两个裁决仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09 P09：真实 stock REST CL 独立场景接入（定向验证，native 待执行）
+
+- 新显式场景 `catalog/mem-1-m07-real-rest-listing` 使用既有 `IsolatedIcebergRestFixture` 与 cluster-harness，外部 producer 在 FE 启动前完成实际 preflight、32×512 tables+512 views 和逐对象独立 GET，之后仅转发实际 REST 的 observer 绑定 FE catalog URI。原 controlled REST 场景及其边界输入保留；该场景不注入元数据、token、credentials 或错误。
+- 原 CL v3 N/M/page256/clients1,8,16 不变；本次 native SQL client120s、场景1800s、observer30s请求/16MiB body/64KiB request/256 owners 等在执行前固定。FE admission 与 lake discovery、information_schema、每32 namespace的 SHOW VIEWS、FORCE DROP 分阶段记录实际 pages/names/name bytes/emitted bytes/concurrent HTTP requests 与 FE PID/start/build 的100ms allocator sampled peak。并发 HTTP 请求数不冒充 SDK positions；socket accepted bytes 不冒充 FE consumed bytes。
+- 新 read-only `verify-after-drop` 仅发 GET，先核验同 bound freeze/source/owner 的 READY 与两份有限账本，再精确列出31 namespace，逐一比对31744存活对象的UUID/location/schema/metadata hash；target absence只依据正常 catalog namespace authority，不猜不存在对象的404类型，不单独声称 native DROP执行。该阶段在 FE 采样后运行，只发布 `VERIFICATION_PASS`。
+- 定向验证：producer17纯本地 PASS、observer13纯本地/synthetic loopback PASS、runner112 PASS/0FAIL/2ignored、fmt/diff-check PASS。收据 `p09-real-rest-cl-integration-focused-20261009.json`；仅测试接入，不是 bulk READY/native CL/跨provider/CM/CP验收。此前两项裁决、P00b/P09/P10未完成门仍OPEN；无push/PR/归档。
+
+- 执行前只读审查已修正验证层：native phase与resource convergence共用同一个固定1800s deadline，不在各phase重置；外部只读verification沿独立7200s producer时钟。SQL/observer/落盘错误分开保存，失败路径先kill/reap/join exactobserver再停止privatefixture，双cleanup失败聚合。修正后runner112 PASS/0FAIL/2ignored；真实执行仍未开始。

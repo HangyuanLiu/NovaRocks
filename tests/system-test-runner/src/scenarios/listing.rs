@@ -244,15 +244,13 @@ fn allocator(client: &reqwest::blocking::Client, port: u16) -> Result<AllocatorR
     })
 }
 
-fn measure(
+pub(super) fn measure(
     context: &mut ScenarioContext,
     phase: &'static str,
     operation: impl FnOnce() -> Result<Value>,
 ) -> Result<Value> {
     let sequence = context.actions().len();
-    context.action(format!(
-        "measure controlled CL phase {phase} sequence={sequence}"
-    ));
+    context.action(format!("measure CL phase {phase} sequence={sequence}"));
     let identities = context.recheck_live_process_launch_identities()?;
     let port = context.fe_http_port();
     let client = reqwest::blocking::Client::builder()

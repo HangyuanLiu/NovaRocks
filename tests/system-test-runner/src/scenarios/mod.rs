@@ -10,6 +10,7 @@ mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;
 mod listing;
+mod listing_real_rest;
 mod memory_attribution;
 mod mv_recovery;
 mod mv_uea7;
@@ -49,6 +50,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(query_output::scenarios());
     scenarios.extend(memory_attribution::scenarios());
     scenarios.push(Box::new(listing::CatalogListing));
+    scenarios.push(Box::new(listing_real_rest::RealRestListing::default()));
     scenarios.push(Box::new(listing::CatalogListingCancellation));
     scenarios.push(Box::new(listing::ObjectStoreListingBoundary));
     scenarios.extend(uea1_performance::scenarios());
