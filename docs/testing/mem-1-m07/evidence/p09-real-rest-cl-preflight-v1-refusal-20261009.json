@@ -1,0 +1,62 @@
+{
+  "source_revision": "d5a36caa61fa0d7f26b1259165577190361b38df",
+  "source_dirty": false,
+  "phase": "private-real-rest-preflight",
+  "run_id": "isolated-rest-m07-real-cl-517bd44b1ceb",
+  "compose_project": "nr-isolated-rest-m07-real-cl-517bd44b1ceb",
+  "workspace": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-real-rest-cl-preflight-v1-20261009/isolated-rest-m07-real-cl-517bd44b1ceb",
+  "helper_sha256": "9f8dfed6f2599539cfb9f100eadb447d10fb86b6ec395355b9e775d465d2b565",
+  "freeze_template_sha256": "bfb384ebaf9f6f75f2291ecefa19f7d4505561e924e13117135014c3c4d91d82",
+  "outcome": "preflight-refused-before-http",
+  "scope": "Actual stock REST table/view create/load/list/delete on a fresh private owner; no native CL or bulk input claim.",
+  "startup_exit_code": 0,
+  "actual_rest_image_id": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+  "actual_rest_container": "693e618f04dd",
+  "bound_freeze_sha256": "1831b44389b46ca9bea29c5064e68e49bfdb5c204a49bba4227a9c801a4fab1c",
+  "private_manifest_sha256": "e2510cfc9f6a867e50faa9d06b443f27553bd4a6c517451e4493a915bfdc332c",
+  "private_entry_id": "isolated-rest-m07-real-c-ce9f822a",
+  "preflight_exit_code": 1,
+  "duration_seconds": 2.883,
+  "cleanup_exit_code": 0,
+  "remaining_exact_project_containers": [],
+  "exact_private_volume_gone": true,
+  "task": "MEM-1-M07",
+  "root_cause": "Test producer assumed runtime.catalog.images.rest.image_id was the tag alias. render_isolated_stack initially stores alias, but isolated_start subsequently replaces image_id with backend.image_id(tag), the actual Docker digest. Correct source digest and exact live private REST container were observed. No HTTP was issued; not a view capability refusal.",
+  "provider_http_executed": false,
+  "raw_files": [
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v1-20261009/cleanup.log",
+      "sha256": "e59f4630164e87e488e94e2a3c9d971b09fe1bc3ea123a290d9850fb4c065136"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v1-20261009/launch-input.json",
+      "sha256": "a9483b81f206aee3d7b98fc47d00aade87854a9c619bf961b6753b0893d6e2ff"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v1-20261009/preflight-driver.log",
+      "sha256": "5e47fcde727eec1752ca6e7ad0ca1dd959fb0dc052bbde6f7ed46a973fd5bb38"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v1-20261009/preflight-status.json",
+      "sha256": "3b2da9a2d4276168e4bc67967f2428d6b6441c31c4f8a7d65e03ec5bf93d5471"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v1-20261009/producer-freeze-bound.json",
+      "sha256": "1831b44389b46ca9bea29c5064e68e49bfdb5c204a49bba4227a9c801a4fab1c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-real-rest-cl-preflight-v1-20261009/startup.log",
+      "sha256": "3b8b7dbc98df114d69f44379ac7de296e126a7c68fad39c88bef5f2a30b5ec93"
+    }
+  ],
+  "source_scripts": [
+    {
+      "path": "logs/mem-1-m07/real_rest_cl_producer_draft.py",
+      "sha256": "9f8dfed6f2599539cfb9f100eadb447d10fb86b6ec395355b9e775d465d2b565"
+    },
+    {
+      "path": "logs/mem-1-m07/run_real_rest_cl_preflight_draft.py",
+      "sha256": "8c7e279025ea7f28a1014b66aac6b9a43ce912d3051fa098f968d593843053d7"
+    }
+  ]
+}

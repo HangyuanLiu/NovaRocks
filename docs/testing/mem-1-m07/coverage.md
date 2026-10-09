@@ -261,3 +261,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 干净f25aca4b4c1d9e9b92062bde1d7f117b87a682b6及实际同build identity，三场景native1FE+3BE全部PASS（7.435s）；12精确PID均退出。新场景实际Data1=S/cursor R1/rows0、Data2=1B准确x/cursor R0/rows1且唯一continuation span、单独End3/rows1；全部direct请求consumed0，fresh census不退休。
 - 恢复后严格normal MySQL一行1048573B/5packets/schema/hash均符合独立oracle，无错误且正常End；旧ZeroAck与FinalAck/replay同矩阵复跑均PASS。收据p09-one-byte-continuation-native-pass-20261009.json保存准确source/binary/input、实际probe/wire/raw hashes。只闭合一字节合法续行，不冒充非法prefix-only、具体partial framing/fullpool或physical last alias退出。
 - 产品代码未变；上一共享Native产品切片C0在b6b3ad232为12295/0/7 PASS，本次仅test-only增量，最终同HEAD门仍OPEN。real CL/CM/CP/P00b/P10/final与两个语义裁决仍OPEN，无push/PR/归档。
+
+
+### 2026-10-09：真实REST private preflight首次输入核对拒绝
+
+- 私有stock REST/MinIO owner启动成功；实际canonical镜像digest及运行容器image均严格匹配。helper在任何HTTP前拒绝owner image alias假设：render_isolated_stack先存alias，isolated_start:423之后将image_id替换为Docker实际digest，tag保持alias。不是服务Unsupported或views失败。
+- 原helper/freeze/bound input/launcher与失败hash保留；exact project全部containers消失/private MinIO volume消失、canonical cleanup0，共享fixture未改。收据p09-real-rest-cl-preflight-v1-refusal-20261009.json。v2只修正test producer actualimage字段，全部32/512/512/数值期限不变；10纯本地parser测试PASS，真实preflight待重跑。未发布bulk READY/未运行native CL；其它门和两个裁决仍OPEN。
