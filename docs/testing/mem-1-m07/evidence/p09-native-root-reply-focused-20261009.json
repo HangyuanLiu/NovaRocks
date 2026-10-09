@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "scope": "Native RootReply actor and negative runner test integration; actual native pending",
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p novarocks-cluster-harness --lib --locked native_root_reply_fault -- --test-threads=1",
+      "passed": 9,
+      "failed": 0,
+      "filtered": 143,
+      "seconds": 0.01
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p novarocks-cluster-harness --lib --locked -- --test-threads=1",
+      "passed": 149,
+      "failed": 0,
+      "ignored": 3,
+      "seconds": 2.48
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p novarocks-system-test-runner --bin novarocks-system-tests --locked -- --test-threads=1",
+      "passed": 117,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 5.9
+    }
+  ],
+  "behavior_evidence": [
+    "Actual bounded H2 duplex NotReady wire/header/trailer transparent forwarding; no claimed/emitted mutation or deadline renewal",
+    "Same-length reordered protobuf decodes but actual canonical byte equality refuses",
+    "Shared OwnedBuffer cap refusal and actual Bytes clone/slice credit until last alias exits",
+    "Typed reset CANCEL exempt only for authenticated fully decoded ROOT exact identity different from full frozen target; same connection subsequent stream actual200",
+    "Actor stop joins actual listener/connection/stream owners and returns credit",
+    "Negative MySQL observer retains actual partial header/body on shared absolute deadline; oversize announced before allocation",
+    "Literal contract ERR oracle rejects incorrect sequence,1317,EOF,OK, with1105 positive control; Data optionalEnd None/Some consistency"
+  ],
+  "integration": [
+    "ScenarioLaunchConfig optional RootReply config defaultNone; actual runner.rs dispatch opt-in",
+    "Shared three Data actor endpoints, existing Control TCP budget unchanged",
+    "Special actor stop/join before FE/BE role shutdown; no failure reset",
+    "Cargo.lock adds nine direct harness dependency edges only; no version/source/checksum changes"
+  ],
+  "corrections": [
+    "Initial harness E0061 three old test start callsites now receiveNone+existing test trust fixture",
+    "Initial runner E0063 test observation now includes v4 non_target_peer_cancels=0",
+    "Raw failed logs preserved; no cap/deadline/input weakening"
+  ],
+  "limitations": [
+    "Component/harness proof only, not actual FE malformed RootReply acceptance",
+    "No product transport physical envelope or successful FE consumed bytes proved by actor counters",
+    "Three native scenes and same-cleanHEAD build pending; full M07/final gates remain open"
+  ],
+  "artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-actor-v4-focused-20261009.log",
+      "sha256": "58f4c1673292d0772feb1f54627b75410dd02265ad293227146393fec556d400",
+      "bytes": 5565
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-actor-v4-focused-v2-20261009.log",
+      "sha256": "3ac0ea69a14978ed8f9cb015739e9c5014fa3041b9501252049927c0b0a4dd1f",
+      "bytes": 1320
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-harness-regression-20261009.log",
+      "sha256": "ebc4a8a7f71697e3739650d4316c2def76d4931d712df5061fb9e1c4f2fbc06d",
+      "bytes": 14294
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-runner-v3-focused-20261009.log",
+      "sha256": "de369961a686e15ead9f9de84a225fb433ff9f423b1c6cba960214a0f9ac74db",
+      "bytes": 5520
+    },
+    {
+      "path": "logs/mem-1-m07/p09-root-reply-runner-v3-focused-v2-20261009.log",
+      "sha256": "50792dbea86f96510ba1fa3ea6af5a221a3fabd0d6826fe6d8d56af0fda46d9d",
+      "bytes": 17044
+    },
+    {
+      "path": "tests/cluster-harness/src/native_root_reply_fault.rs",
+      "sha256": "149b7fe6c27f4c02188282d032b90a3b215f0a72011fb65c518d1a0e5dec257f",
+      "bytes": 76406
+    },
+    {
+      "path": "tests/cluster-harness/src/lib.rs",
+      "sha256": "482155a29d93ee11189407497bc356b4947f73d2674435aa398fc255c2981153",
+      "bytes": 303107
+    },
+    {
+      "path": "tests/cluster-harness/src/effective_launch_config.rs",
+      "sha256": "f0b3f3e272025dd68a7548cf78056042e52f9070c9290fb11e135f4aec95b82c",
+      "bytes": 35488
+    },
+    {
+      "path": "tests/cluster-harness/Cargo.toml",
+      "sha256": "1b1d1efcb37f85d4eb1054c1fb8321b943fda2a92286a2dee9c8e59b1ecabcd0",
+      "bytes": 2024
+    },
+    {
+      "path": "tests/system-test-runner/src/scenarios/result_delivery_root_reply.rs",
+      "sha256": "f8b2b173859f99df091c96397f37fdb8e00886007d5533a57d47dcc01e6659c5",
+      "bytes": 43227
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/mysql_stream.rs",
+      "sha256": "5c77e7dfb0d1e67bb22723dc2c31947d6d2895d6942d79d4b6b1cb266e7df870",
+      "bytes": 68154
+    },
+    {
+      "path": "tests/system-test-runner/src/scenario.rs",
+      "sha256": "924409daa9cd221a3411ee5a4bf28ce5972c1a04234fbc0927f95aecd926f7c3",
+      "bytes": 22404
+    },
+    {
+      "path": "tests/system-test-runner/src/runner.rs",
+      "sha256": "b372b4ea05431ce7dbbac3d37ed7aa4697d8d53d43f4cf30cb692303baf5d866",
+      "bytes": 14535
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "6a35b28be2e44df38e3c1041f83bf42377636bd1570edd63d735bdac3fe86b1e",
+      "bytes": 190719
+    }
+  ]
+}

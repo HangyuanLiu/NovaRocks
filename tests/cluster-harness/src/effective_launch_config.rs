@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{CrossProcessNativeFaultProxyConfig, CrossProcessRuntime, LaunchProfile};
+use super::{
+    CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, CrossProcessRuntime,
+    LaunchProfile,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -81,6 +84,7 @@ pub(crate) struct EffectiveLaunchConfigInput<'a> {
     pub frontend_environment: &'a BTreeMap<String, String>,
     pub backend_environments: &'a [BTreeMap<String, String>],
     pub native_proxy_config: &'a CrossProcessNativeFaultProxyConfig,
+    pub native_root_reply_fault: Option<&'a CrossProcessRootReplyFaultConfig>,
     pub advertised_backend_grpc_ports: &'a [u16],
     pub advertised_backend_control_grpc_ports: &'a [u16],
 }
@@ -125,6 +129,8 @@ enum EnvironmentClassification {
 #[derive(Debug, Serialize)]
 struct NativeProxyContract {
     backends: Vec<NativeProxyBackendContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_reply_message_fault: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +197,14 @@ pub(crate) fn build_effective_launch_config_evidence(
                 },
             )
             .collect(),
+        root_reply_message_fault: input.native_root_reply_fault.map(|root| {
+            serde_json::json!({
+                "backend_indices":root.backend_indices,
+                "controller":"shared-one-target-slot-global-connection-stream-owned-buffer-bounds",
+                "actor":root.bounds.semantics(),
+                "control_tcp_budget":"original_backend_retained_byte_limit_separate_from_actor"
+            })
+        }),
     };
 
     let mut roles = Vec::with_capacity(input.cluster_size + 1);
@@ -709,6 +723,7 @@ mod tests {
             frontend_environment: &environments,
             backend_environments: &[environments.clone()],
             native_proxy_config: &native_proxy_config,
+            native_root_reply_fault: None,
             advertised_backend_grpc_ports: &[advertised_port.unwrap_or(ports.4)],
             advertised_backend_control_grpc_ports: &[advertised_control_port.unwrap_or(ports.5)],
         })
@@ -978,6 +993,7 @@ mod tests {
             frontend_environment: &environments,
             backend_environments: &[environments.clone()],
             native_proxy_config: &proxy,
+            native_root_reply_fault: None,
             advertised_backend_grpc_ports: &[1105],
             advertised_backend_control_grpc_ports: &[1205],
         };

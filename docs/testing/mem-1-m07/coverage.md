@@ -351,3 +351,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - required long id空table真实format2/spec0/unpartitioned/snapshots0，真实view format1/version1/defaultcatalog+namespace/唯一Spark SQL。独立fresh HiveCatalog filtered tables={cap_table}/views={cap_view}，第二public LIST_ALL_TABLES=true准确{cap_table,cap_view}；真实UUID/schema/location及table724B/view gzip442B metadata hashes在独立load完全一致。
 - host-only修正后四测试PASS/0.037s；实际48条host commands leaderreaped/groupgone/PID absent，4个writer+HMS实际容器ID均消失，private HMS/catalog/objectstore records消失，cleanup complete/无errors/无stickybarriers。收据p09-hms-capability-preflight-v3-pass-20261009.json保存actual identities/freeze/effects/metadata/raw hashes，v1/v2失败完整保留，共享fixture未改。
 - 此证据只闭合stock Java真实view capability/独立oracle和私有工具退出；没有启动NovaRocks、没有READY，不证明Native Rust mixed分类/list_views支持、原32×512+512大CL、性能或SDK/FE硬字节包络。其余P09/P00b/P10/final及既有两人工语义门OPEN，无push/PR/归档。
+
+
+### 2026-10-09 P09：真实FE非法RootReply actor/runner整合（定向PASS）
+
+- harness仅显式opt-in的3个Data H2 actor共享single-target slot/global credit/有限positions，原Control TCP默认与budget不变；three closed mutation仅profile2/kindfalse/准确4Bprefix。原真实reply先production decode+cursor校验，再共享creditedVec strictcanonical bytes；NotReady真实透传/no claim/no deadline refresh。typed peer CANCEL只对authenticated/decode完整/frozen fulltarget不同且非provisional ROOT单stream豁免，target/unknown/非ROOT/driver等wholefailure保留。特殊actor先实际stop/join再停FE/BE。
+- 9actor组件PASS/0.01s，harness全149/0/3ignored/2.48s；runner全117/0/2ignored/5.90s。真实duplex同长度非canonical、共享cap/Bytes最后alias、H2typedCANCEL后同连接健康stream、NotReady透传、stop实际join及MySQL partialdeadline/oversize/严格ERR拒绝反例通过。old3test calls E0061及test observation E0063均准确补齐、保留初始失败日志；未改caps/clocks/input。
+- 真实runner.rs dispatch已接Option/defaultNone，optional Data1 End无piggy合法/Some严格一致；observer同一absolute20s connect+read时钟在内返回有限partial证据，decoder-specific1105/HY000/sequence4原因必须完整。Cargo.lock仅9direct dependency edges、无版本/source/checksum升级。收据p09-native-root-reply-focused-20261009.json；实际FE三负例尚未执行，不冒充native拒绝/noACK/正常恢复与最终M07验收。无push/PR/归档。

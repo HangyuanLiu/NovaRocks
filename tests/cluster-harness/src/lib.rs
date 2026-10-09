@@ -23,6 +23,7 @@ pub mod isolated_iceberg_rest;
 pub mod listing_rest;
 pub mod loopback_s3;
 pub mod native_fault_proxy;
+pub mod native_root_reply_fault;
 pub mod process_resources;
 pub mod vended_rest_catalog;
 
@@ -30,6 +31,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use native_fault_proxy::{NativeFaultProxy, NativeFaultProxyControl};
+use native_root_reply_fault::{RootReplyFaultBounds, RootReplyFaultControl, RootReplyFaultProxy};
 use novarocks_failpoint::{
     QueryLifecycleFaultKind, arm_path as lifecycle_arm_path, cleanup_trigger_path,
     mv_known_committed_before_projector_cas_marker_path,
@@ -789,17 +791,46 @@ pub struct CrossProcessNativeFaultProxyConfig {
     pub backend_retained_byte_limits: BTreeMap<usize, u64>,
 }
 
+/// Explicitly selected Data endpoints share one H2 message actor controller. Its
+/// actor-owned buffer budget is separate from the unchanged Control TCP budget.
+#[derive(Clone, Debug)]
+pub struct CrossProcessRootReplyFaultConfig {
+    pub backend_indices: BTreeSet<usize>,
+    pub bounds: RootReplyFaultBounds,
+}
+
 #[derive(Default)]
 struct BackendNativeFaultProxies {
     proxies: BTreeMap<usize, NativeFaultProxy>,
     control_proxies: BTreeMap<usize, NativeFaultProxy>,
+    root_reply_proxies: BTreeMap<usize, RootReplyFaultProxy>,
 }
 
 impl BackendNativeFaultProxies {
     fn start(
         runtime: &CrossProcessRuntime,
         config: CrossProcessNativeFaultProxyConfig,
+        root_reply_fault: Option<&CrossProcessRootReplyFaultConfig>,
+        trust: &PreparedNativeTrustFixture,
     ) -> Result<Self> {
+        if let Some(root) = root_reply_fault {
+            root.bounds.validate()?;
+            ensure!(
+                !root.backend_indices.is_empty()
+                    && root.backend_indices.len() <= 3
+                    && root
+                        .backend_indices
+                        .iter()
+                        .all(|index| *index < runtime.be.len()
+                            && config.backend_retained_byte_limits.contains_key(index)),
+                "root reply actor requires an explicitly configured BE Data/Control proxy pair"
+            );
+            ensure!(
+                trust.fixture.mode() == NativeTrustFixtureMode::Plaintext
+                    && trust.fixture.advertise_host() == "127.0.0.1",
+                "root reply actor supports authenticated plaintext loopback IP only"
+            );
+        }
         for (&index, &limit) in &config.backend_retained_byte_limits {
             ensure!(
                 index < runtime.be.len(),
@@ -814,6 +845,32 @@ impl BackendNativeFaultProxies {
         for (index, limit) in config.backend_retained_byte_limits {
             let upstream = ([127, 0, 0, 1], runtime.be[index].grpc).into();
             let control_upstream = ([127, 0, 0, 1], runtime.be[index].control_grpc).into();
+            if let Some(root) =
+                root_reply_fault.filter(|root| root.backend_indices.contains(&index))
+            {
+                let endpoint = NativeEndpoint::from_host_port(
+                    trust.fixture.advertise_host(),
+                    runtime.fe_grpc_port,
+                )
+                .map_err(anyhow::Error::msg)?;
+                let subject = NativeCallerSubject::parse(format!("fe@{endpoint}"))
+                    .map_err(anyhow::Error::msg)?;
+                // This verifier uses the existing deployment trust. It never
+                // replaces the original caller's token on the upstream RPC.
+                let verifier = trust.probe_trust()?.server_admission();
+                let actor = RootReplyFaultProxy::start(
+                    upstream,
+                    index,
+                    result.root_reply_proxies.values().next(),
+                    root.bounds.clone(),
+                    verifier,
+                    subject,
+                )?;
+                let control = NativeFaultProxy::start(control_upstream, limit)?;
+                result.root_reply_proxies.insert(index, actor);
+                result.control_proxies.insert(index, control);
+                continue;
+            }
             let (proxy, control_proxy) =
                 NativeFaultProxy::start_pair(upstream, control_upstream, limit).with_context(
                     || format!("start Native Data and Control fault proxies for BE[{index}]"),
@@ -825,7 +882,10 @@ impl BackendNativeFaultProxies {
     }
 
     fn advertised_port(&self, index: usize) -> Option<u16> {
-        self.proxies.get(&index).map(|proxy| proxy.address().port())
+        self.root_reply_proxies
+            .get(&index)
+            .map(|proxy| proxy.address().port())
+            .or_else(|| self.proxies.get(&index).map(|proxy| proxy.address().port()))
     }
 
     fn advertised_ports(&self, runtime: &CrossProcessRuntime) -> Vec<u16> {
@@ -856,6 +916,9 @@ impl BackendNativeFaultProxies {
     }
 
     fn disconnect_backend(&self, index: usize) {
+        if let Some(proxy) = self.root_reply_proxies.get(&index) {
+            proxy.disconnect_all();
+        }
         if let Some(proxy) = self.proxies.get(&index) {
             proxy.control().disconnect_all();
         }
@@ -865,12 +928,47 @@ impl BackendNativeFaultProxies {
     }
 
     fn disconnect_all(&self) {
+        for proxy in self.root_reply_proxies.values() {
+            proxy.disconnect_all();
+        }
         for proxy in self.proxies.values().chain(self.control_proxies.values()) {
             proxy.control().disconnect_all();
         }
     }
 
+    fn stop_root_reply_actors(&mut self) -> Result<()> {
+        // Stop and join every shared actor listener before inspecting its core.
+        for proxy in self.root_reply_proxies.values_mut() {
+            proxy.stop();
+        }
+        let mut failures = Vec::new();
+        for (index, proxy) in &self.root_reply_proxies {
+            let observed = proxy.control().observation();
+            if !observed.shutdown_joined
+                || observed.active_listeners != 0
+                || observed.active_connections != 0
+                || observed.active_streams != 0
+                || observed.connection_positions != 0
+                || observed.stream_positions != 0
+                || observed.target_slots != 0
+                || observed.owned_buffer_bytes != 0
+                || !observed.failures.is_empty()
+                || observed.failure_overflow
+            {
+                failures.push(format!(
+                    "RootReply actor BE[{index}] failed its explicit join barrier"
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(failures.join("; "))
+        }
+    }
+
     fn stop(&mut self) {
+        let _ = self.stop_root_reply_actors();
         for proxy in self
             .proxies
             .values_mut()
@@ -3219,6 +3317,24 @@ impl CrossProcessServerHandle {
         options: CrossProcessClusterOptions,
         proxy_config: CrossProcessNativeFaultProxyConfig,
     ) -> Result<Self> {
+        Self::launch_with_native_fault_options(options, proxy_config, None)
+    }
+
+    /// Harness-only one-shot RootReply fault route. Existing launch/config
+    /// literals and the default TCP Data/Control path remain source-compatible.
+    pub fn launch_with_native_root_reply_fault(
+        options: CrossProcessClusterOptions,
+        proxy_config: CrossProcessNativeFaultProxyConfig,
+        root_reply_fault: CrossProcessRootReplyFaultConfig,
+    ) -> Result<Self> {
+        Self::launch_with_native_fault_options(options, proxy_config, Some(root_reply_fault))
+    }
+
+    fn launch_with_native_fault_options(
+        options: CrossProcessClusterOptions,
+        proxy_config: CrossProcessNativeFaultProxyConfig,
+        root_reply_fault_config: Option<CrossProcessRootReplyFaultConfig>,
+    ) -> Result<Self> {
         let CrossProcessClusterOptions {
             binary: novarocks_bin,
             fe_binary,
@@ -3300,7 +3416,12 @@ impl CrossProcessServerHandle {
             fe_mysql_port: reserved.fe_mysql_port.port(),
         };
         let native_proxy_config = proxy_config.clone();
-        let native_fault_proxies = BackendNativeFaultProxies::start(&runtime, proxy_config)?;
+        let native_fault_proxies = BackendNativeFaultProxies::start(
+            &runtime,
+            proxy_config,
+            root_reply_fault_config.as_ref(),
+            &native_trust_fixture,
+        )?;
         let be_grpc_ports = native_fault_proxies.advertised_ports(&runtime);
         let be_control_grpc_ports = native_fault_proxies.advertised_control_ports(&runtime);
 
@@ -3396,6 +3517,7 @@ impl CrossProcessServerHandle {
                     frontend_environment: &fe_environment,
                     backend_environments: &be_environments,
                     native_proxy_config: &native_proxy_config,
+                    native_root_reply_fault: root_reply_fault_config.as_ref(),
                     advertised_backend_grpc_ports: &be_grpc_ports,
                     advertised_backend_control_grpc_ports: &be_control_grpc_ports,
                 },
@@ -3680,6 +3802,17 @@ impl CrossProcessServerHandle {
         Ok(data.paired_with(control))
     }
 
+    /// Observe and arm the selected H2 response actor. The runner must
+    /// independently confirm the candidate's installed root before arming.
+    pub fn native_root_reply_fault(&self, index: usize) -> Result<RootReplyFaultControl> {
+        self.ensure_be_index(index)?;
+        self.native_fault_proxies
+            .root_reply_proxies
+            .get(&index)
+            .map(RootReplyFaultProxy::control)
+            .ok_or_else(|| anyhow::anyhow!("RootReply fault actor is not enabled for BE[{index}]"))
+    }
+
     /// Control only the actual Data proxy for domain-isolation scenarios.
     pub fn native_data_fault_proxy(&self, index: usize) -> Result<NativeFaultProxyControl> {
         self.ensure_be_index(index)?;
@@ -3959,6 +4092,13 @@ impl CrossProcessServerHandle {
     /// Stop this cluster explicitly. Retained artifacts remain available.
     pub fn shutdown(&mut self) -> Result<()> {
         let mut failures = Vec::new();
+        // Special H2 actors join while the role owners still exist. The
+        // ordinary TCP Data/Control proxies retain their original later stop.
+        if let Err(error) = self.native_fault_proxies.stop_root_reply_actors() {
+            failures.push(format!(
+                "join RootReply actors before role shutdown: {error:#}"
+            ));
+        }
         if let Err(error) = self.fe_process.stop() {
             failures.push(format!("stop cross-process FE: {error:#}"));
         }
@@ -6528,6 +6668,8 @@ mod tests {
         let proxies = BackendNativeFaultProxies::start(
             &runtime,
             CrossProcessNativeFaultProxyConfig::default(),
+            None,
+            &rendered_native_trust_fixture(),
         )
         .unwrap();
         assert!(proxies.proxies.is_empty());
@@ -6572,6 +6714,8 @@ mod tests {
             CrossProcessNativeFaultProxyConfig {
                 backend_retained_byte_limits: BTreeMap::from([(1, 1024)]),
             },
+            None,
+            &rendered_native_trust_fixture(),
         )
         .unwrap();
         let advertised = proxies.advertised_ports(&runtime);
@@ -6648,6 +6792,8 @@ mod tests {
                 CrossProcessNativeFaultProxyConfig {
                     backend_retained_byte_limits: BTreeMap::from([(index, limit)]),
                 },
+                None,
+                &rendered_native_trust_fixture(),
             );
             assert!(result.is_err());
         }
