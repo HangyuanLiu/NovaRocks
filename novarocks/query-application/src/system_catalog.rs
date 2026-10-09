@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::api::{build_utf8_query_result, build_utf8_table_query_result};
+use crate::api::{LocalResultBound, LocalTableBuilder};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_types::schema::ColumnDef;
@@ -139,29 +139,21 @@ fn schemata_columns() -> Vec<ColumnDef> {
 /// fixed to `catalog`. Byte-identical to the former core `build_schemata_batch`
 /// (`information_schema.rs`); schema exactly matches `schemata_columns()`.
 fn build_schemata_batch(catalog: &str, databases: &[String]) -> Result<Vec<RecordBatch>, String> {
-    let rows = databases
-        .iter()
-        .map(|database| {
-            vec![
-                Some(catalog.to_owned()),
-                Some(database.clone()),
-                Some("utf8".to_owned()),
-                Some("utf8_general_ci".to_owned()),
+    (|| -> Result<Vec<RecordBatch>, String> {
+        let mut table = LocalTableBuilder::try_new(SCHEMATA_COLUMNS, LocalResultBound::V1)?;
+        for database in databases {
+            // The fixed borrowed row has no source String or row-Vec copy. The
+            // builder checks the entire row before copying any cell into Arrow.
+            table.push_row(&[
+                Some(catalog),
+                Some(database.as_str()),
+                Some("utf8"),
+                Some("utf8_general_ci"),
                 None,
-            ]
-        })
-        .collect();
-    build_utf8_table_query_result(
-        &[
-            ("catalog_name", false),
-            ("schema_name", false),
-            ("default_character_set_name", false),
-            ("default_collation_name", false),
-            ("sql_path", true),
-        ],
-        rows,
-    )
-    .map(|result| result.into_batches())
+            ])?;
+        }
+        table.finish().map(|result| result.into_batches())
+    })()
     .map_err(|error| format!("build information_schema.schemata batch failed: {error}"))
 }
 
@@ -198,22 +190,20 @@ fn build_tables_batch(
     // Every row is a base table: this listing comes from the catalog's table
     // enumeration, and a catalog that also holds views reports those through
     // the view metadata surface instead.
-    let rows = tables
-        .iter()
-        .map(|(schema, name)| {
-            vec![
-                catalog.to_owned(),
-                schema.clone(),
-                name.clone(),
-                "BASE TABLE".to_owned(),
-            ]
-        })
-        .collect();
-    build_utf8_query_result(
-        &["table_catalog", "table_schema", "table_name", "table_type"],
-        rows,
-    )
-    .map(|result| result.into_batches())
+    (|| -> Result<Vec<RecordBatch>, String> {
+        let mut table = LocalTableBuilder::try_new(TABLES_COLUMNS, LocalResultBound::V1)?;
+        for (schema, name) in tables {
+            // Repeated catalog/schema/name text is charged before its first
+            // owned copy. The immutable snapshot remains the only source owner.
+            table.push_row(&[
+                Some(catalog),
+                Some(schema.as_str()),
+                Some(name.as_str()),
+                Some("BASE TABLE"),
+            ])?;
+        }
+        table.finish().map(|result| result.into_batches())
+    })()
     .map_err(|error| format!("build information_schema.tables batch failed: {error}"))
 }
 
@@ -388,6 +378,9 @@ mod tests {
             .expect("schema_name must be Utf8");
         assert_eq!(actual_schema_names.value(0), "db_a");
         assert_eq!(actual_schema_names.value(1), "db_b");
+        assert!(batch.column(4).is_null(0));
+        assert!(batch.column(4).is_null(1));
+        assert_eq!(batch.column(4).null_count(), 2);
     }
 
     #[test]
@@ -504,5 +497,49 @@ mod tests {
             0,
             "a namespace with no tables lists none, which is a real answer"
         );
+    }
+
+    #[test]
+    fn repeated_catalog_names_are_charged_to_the_whole_virtual_source() {
+        // The input name snapshot is small, but catalog text repeats in
+        // every output row. Refuse the complete table at the unchanged
+        // collector bound, even though the input names themselves fit.
+        let catalog = "c".repeat(1024);
+        let tables = vec![("db".to_owned(), "t".to_owned()); 32768];
+        let error = match SystemCatalogService::with_defaults().resolve(
+            "information_schema",
+            "tables",
+            &table_inputs(&catalog, &tables),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("repeated catalog cells must refuse the whole source"),
+        };
+        assert!(error.starts_with("build information_schema.tables batch failed:"));
+        assert!(error.contains("33554432 byte bound"));
+        assert_eq!(tables.len(), 32768);
+    }
+
+    #[test]
+    fn virtual_source_preserves_unicode_and_required_columns() {
+        let tables = [("库".to_owned(), "表".to_owned())];
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "information_schema",
+                "tables",
+                &table_inputs("目录", &tables),
+            )
+            .expect("valid Unicode source")
+            .expect("registered table");
+        let batch = &resolved.batches[0];
+        for (index, expected) in ["目录", "库", "表", "BASE TABLE"].into_iter().enumerate() {
+            let column = batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8");
+            assert_eq!(column.value(0), expected);
+            assert_eq!(column.null_count(), 0);
+            assert!(!resolved.columns[index].nullable);
+        }
     }
 }

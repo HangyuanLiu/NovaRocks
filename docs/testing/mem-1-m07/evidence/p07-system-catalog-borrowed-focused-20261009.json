@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "plan_task": "P07 FE virtual system-catalog source pre-copy gap",
+  "source_parent": "b15e09f33",
+  "outcome": "focused pass; new native and C0 milestone pending",
+  "checks": {
+    "system_catalog_and_rewriter": {
+      "passed": 13,
+      "failed": 0,
+      "filtered": 473
+    },
+    "read_only_review": "no blockers",
+    "fmt": "passed",
+    "diff_check": "passed"
+  },
+  "source": {
+    "path": "novarocks/query-application/src/system_catalog.rs",
+    "sha256": "e9b4e44f445b332896fc4d97bb5a7f0b4913ad8f36c47a841e3397d7cdb39539"
+  },
+  "raw_log": {
+    "path": "logs/mem-1-m07/p07-system-catalog-borrowed-focused-20261009.log",
+    "sha256": "871e3c2c0aa34ca88fdcd07a48942138034643296128e9a3c688f6a1e3b483a4"
+  },
+  "change": "Fixed borrowed rows feed the existing LocalTableBuilder directly instead of first collecting an owned all-row Vec/String copy. Entire try_new/push/finish scope retains original provider error prefix. Frozen32MiB actual collector and row/column bounds unchanged.",
+  "scope": "Closes source row pre-copy gap only. Result tests cover Unicode, required cells, schemata NULL and whole repeated-catalog rejection; they do not independently prove allocation-before-copy. Source structure plus existing builder preflight establish the missing copy boundary. Client query AST/planner/cache memory remains outside this source closure and is not blamed on Local96MiB or SDKD15. No claim that ~1.62GiB process peak falls or that full M07 is complete."
+}
