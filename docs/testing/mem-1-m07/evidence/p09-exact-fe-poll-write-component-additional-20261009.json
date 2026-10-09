@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "72a187455fd0672920b1f148de915f7a1157dcf5",
+  "checks": [
+    {
+      "suite": "Complete exact write gate component suite",
+      "passed": 19,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 1.25
+    }
+  ],
+  "initial_failures": [
+    "E0061/E0308: Pin receiver resolved fixture write to AsyncWriteExt::write; renamed scripted_poll and explicitly dispatch via get_mut"
+  ],
+  "boundaries": [
+    "Six deterministic NO-I/O scripted fixtures test scalar/writev Pending/inner waker, zero acceptance/original raw error, original framer WriteZero, n>offered sticky refusal, multiple Ready hash accumulation, empty slices at zero budget",
+    "One new real TCP fixture supplies actual stale baseline receipt; Receipt first cause survives invalid resume, explicit Stop wakes original writer, exact2B+EOF and parent original JoinSet drains",
+    "No gate implementation/API, clock/capacity, first-error immediate wake or default production path changed",
+    "Arbitrary custom panic-prone AsyncWrite is not supported; real TCP remains the intended carrier"
+  ],
+  "limitations": [
+    "Components only, no native FE SQL integration or original resident/missing-tail/full-concurrency acceptance",
+    "Final same-HEAD C0/C10 and other M07 gates remain open; no push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/mysql_write_gate.extra-tests.draft.rs",
+      "bytes": 17251,
+      "sha256": "10fcb1a16b2ceb17205585c263a3b77884d598872612ff037290b094af991dc5"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-component-v2-20261009.log",
+      "bytes": 56205,
+      "sha256": "59d679f070ba15aadd472da3a1a14f0a67c9d0477fb374f30cf27f1fcaa63371"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-component-v3-20261009.log",
+      "bytes": 54928,
+      "sha256": "e606bcf8b2ee9061d2badb43fe0b780bb7d25f038d294d9441035c7ee040f2a7"
+    },
+    {
+      "path": "novarocks/mysql-adapter/src/mysql_write_gate.rs",
+      "bytes": 66139,
+      "sha256": "b58b8099fc26649b43a4575d06f6edc341d1b7a00459fe3f7c0cedf72f942e5e"
+    }
+  ]
+}

@@ -1170,4 +1170,419 @@ mod tests {
         scope.stop();
         Ok(())
     }
+
+    mod scripted_gate_extra_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Wake;
+
+        #[derive(Clone, Copy)]
+        enum Step {
+            Pending,
+            Zero,
+            Error,
+            Ready(usize),
+            OverOffered,
+        }
+        struct ScriptState {
+            steps: [Step; 8],
+            steps_len: usize,
+            next: usize,
+            calls: usize,
+            vectored_calls: usize,
+            offered: [usize; 8],
+            // Fixed test fixture oracle; not a buffer in the Gate implementation.
+            accepted: [u8; 64],
+            accepted_len: usize,
+            pending: Option<Waker>,
+        }
+        struct Scripted(Arc<Mutex<ScriptState>>);
+        impl Scripted {
+            fn new(steps: &[Step]) -> (Self, Arc<Mutex<ScriptState>>) {
+                assert!(steps.len() <= 8);
+                let mut values = [Step::Zero; 8];
+                values[..steps.len()].copy_from_slice(steps);
+                let state = Arc::new(Mutex::new(ScriptState {
+                    steps: values,
+                    steps_len: steps.len(),
+                    next: 0,
+                    calls: 0,
+                    vectored_calls: 0,
+                    offered: [0; 8],
+                    accepted: [0; 64],
+                    accepted_len: 0,
+                    pending: None,
+                }));
+                (Self(Arc::clone(&state)), state)
+            }
+            fn scripted_poll(
+                &self,
+                cx: &Context<'_>,
+                slices: &[IoSlice<'_>],
+                vectored: bool,
+            ) -> Poll<io::Result<usize>> {
+                let mut state = self.0.lock().unwrap();
+                assert!(state.next < state.steps_len, "script exhausted");
+                assert!(state.calls < 8, "script call bound exceeded");
+                let offered = slices.iter().map(|slice| slice.len()).sum::<usize>();
+                let ordinal = state.calls;
+                state.offered[ordinal] = offered;
+                state.calls += 1;
+                state.vectored_calls += usize::from(vectored);
+                let step = state.steps[state.next];
+                state.next += 1;
+                match step {
+                    Step::Pending => {
+                        state.pending = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                    Step::Zero => Poll::Ready(Ok(0)),
+                    // Exact original io::Error identity, with no OS/network claim.
+                    Step::Error => Poll::Ready(Err(io::Error::from_raw_os_error(1234))),
+                    Step::OverOffered => Poll::Ready(Ok(offered + 1)),
+                    Step::Ready(n) => {
+                        assert!(n <= offered && state.accepted_len + n <= 64);
+                        let mut remaining = n;
+                        for slice in slices {
+                            let take = remaining.min(slice.len());
+                            let offset = state.accepted_len;
+                            state.accepted[offset..offset + take].copy_from_slice(&slice[..take]);
+                            state.accepted_len += take;
+                            remaining -= take;
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                        assert_eq!(remaining, 0);
+                        Poll::Ready(Ok(n))
+                    }
+                }
+            }
+        }
+        impl AsyncWrite for Scripted {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.get_mut()
+                    .scripted_poll(cx, &[IoSlice::new(bytes)], false)
+            }
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.get_mut().scripted_poll(cx, bytes, true)
+            }
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        type ScriptFixture = (
+            MysqlWriteTestScope,
+            MysqlWriteGate<Scripted>,
+            Arc<Mutex<ScriptState>>,
+        );
+        fn fixture(steps: &[Step], cut: u64) -> io::Result<ScriptFixture> {
+            let (connection, statement) = identities();
+            let scope =
+                MysqlWriteTestScope::new(connection, Instant::now() + Duration::from_secs(5));
+            let (inner, script) = Scripted::new(steps);
+            let gate = MysqlWriteGate::new(inner, &scope)?;
+            let writer = OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
+            scope.arm(statement, [0; 32], cut)?;
+            scope.begin_rows(statement, writer.receipt())?;
+            Ok((scope, writer.into_inner(), script))
+        }
+        fn invoke(
+            gate: &mut MysqlWriteGate<Scripted>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+            vectored: bool,
+        ) -> Poll<io::Result<usize>> {
+            if vectored {
+                Pin::new(gate).poll_write_vectored(
+                    cx,
+                    &[IoSlice::new(&[]), IoSlice::new(bytes), IoSlice::new(&[])],
+                )
+            } else {
+                Pin::new(gate).poll_write(cx, bytes)
+            }
+        }
+        fn assert_no_charge(scope: &MysqlWriteTestScope) {
+            let facts = scope.snapshot();
+            assert_eq!(facts.accepted_prefix_bytes, 0);
+            assert_eq!(facts.successful_inner_writes, 0);
+            assert_eq!(
+                facts.accepted_prefix_sha256,
+                <[u8; 32]>::from(Sha256::digest([]))
+            );
+            assert!(!facts.blocked_after_acceptance);
+        }
+
+        #[tokio::test]
+        async fn scripted_rows_pending_preserves_inner_waker_and_charges_only_ready()
+        -> io::Result<()> {
+            for vectored in [false, true] {
+                let (scope, mut gate, script) = fixture(&[Step::Pending, Step::Ready(1)], 3)?;
+                let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut cx = Context::from_waker(&waker);
+                assert!(invoke(&mut gate, &mut cx, b"abc", vectored).is_pending());
+                assert_no_charge(&scope);
+                assert!(scope.snapshot().failure.is_none());
+                // This is the INNER pending waker, not a synthetic Gate budget wake.
+                script.lock().unwrap().pending.take().unwrap().wake();
+                assert!(wake.0.load(Ordering::SeqCst) > 0);
+                assert!(matches!(
+                    invoke(&mut gate, &mut cx, b"abc", vectored),
+                    Poll::Ready(Ok(1))
+                ));
+                let facts = scope.snapshot();
+                assert_eq!(facts.accepted_prefix_bytes, 1);
+                assert_eq!(facts.successful_inner_writes, 1);
+                assert_eq!(
+                    facts.accepted_prefix_sha256,
+                    <[u8; 32]>::from(Sha256::digest(b"a"))
+                );
+                assert_eq!(script.lock().unwrap().calls, 2);
+                scope.stop();
+                drop(gate);
+                assert!(scope.snapshot().writer_exited); // Script destructor only, not TCP exit.
+            }
+            Ok(())
+        }
+        #[tokio::test]
+        async fn scripted_rows_zero_and_original_error_are_transparent_without_charge()
+        -> io::Result<()> {
+            for vectored in [false, true] {
+                let (scope, mut gate, script) = fixture(&[Step::Zero, Step::Error], 3)?;
+                let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
+                let mut cx = Context::from_waker(&waker);
+                assert!(matches!(
+                    invoke(&mut gate, &mut cx, b"abc", vectored),
+                    Poll::Ready(Ok(0))
+                ));
+                assert_no_charge(&scope);
+                let err = match invoke(&mut gate, &mut cx, b"abc", vectored) {
+                    Poll::Ready(Err(error)) => error,
+                    _ => panic!("original inner error was not forwarded"),
+                };
+                assert_eq!(err.raw_os_error(), Some(1234));
+                assert_no_charge(&scope);
+                assert!(
+                    scope.snapshot().failure.is_none(),
+                    "IO cause remains with original framing caller"
+                );
+                assert_eq!(script.lock().unwrap().calls, 2);
+                scope.stop();
+                drop(gate);
+            }
+            Ok(())
+        }
+        #[tokio::test]
+        async fn scripted_rows_zero_still_becomes_original_framer_write_zero() -> io::Result<()> {
+            let (scope, gate, _) = fixture(&[Step::Zero], 3)?;
+            let mut writer = OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
+            writer.start_row(3)?;
+            writer.push_slice(b"abc")?;
+            assert_eq!(
+                writer.flush_pending().await.unwrap_err().kind(),
+                io::ErrorKind::WriteZero
+            );
+            assert_eq!(writer.receipt().phase, WritePhase::Poisoned);
+            assert_no_charge(&scope);
+            scope.stop();
+            drop(writer);
+            assert!(scope.snapshot().writer_exited);
+            Ok(())
+        }
+        #[tokio::test]
+        async fn scripted_rows_overoffered_is_sticky_before_hash_or_acceptance_changes()
+        -> io::Result<()> {
+            for vectored in [false, true] {
+                let (scope, mut gate, script) = fixture(&[Step::OverOffered], 3)?;
+                let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
+                let mut cx = Context::from_waker(&waker);
+                let err = match invoke(&mut gate, &mut cx, b"abc", vectored) {
+                    Poll::Ready(Err(error)) => error,
+                    _ => panic!("invalid inner length was accepted"),
+                };
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(scope.snapshot().failure, Some(GateFailure::Length));
+                assert_no_charge(&scope);
+                // Existing Length wins over a later invalid controller transition.
+                assert!(scope.resume().is_err());
+                assert!(matches!(
+                    invoke(&mut gate, &mut cx, b"abc", vectored),
+                    Poll::Ready(Err(_))
+                ));
+                assert_eq!(script.lock().unwrap().calls, 1);
+                scope.stop();
+                assert_eq!(scope.snapshot().failure, Some(GateFailure::Length));
+                drop(gate);
+            }
+            Ok(())
+        }
+        #[tokio::test]
+        async fn scripted_rows_multiple_ready_and_pending_hash_only_actual_byte_prefixes()
+        -> io::Result<()> {
+            for vectored in [false, true] {
+                let (scope, mut gate, script) = fixture(
+                    &[
+                        Step::Ready(1),
+                        Step::Pending,
+                        Step::Ready(1),
+                        Step::Ready(1),
+                    ],
+                    3,
+                )?;
+                let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
+                let mut cx = Context::from_waker(&waker);
+                assert!(matches!(
+                    invoke(&mut gate, &mut cx, b"abc", vectored),
+                    Poll::Ready(Ok(1))
+                ));
+                assert!(invoke(&mut gate, &mut cx, b"bc", vectored).is_pending());
+                assert_eq!(scope.snapshot().accepted_prefix_bytes, 1);
+                script.lock().unwrap().pending.take().unwrap().wake();
+                assert!(matches!(
+                    invoke(&mut gate, &mut cx, b"bc", vectored),
+                    Poll::Ready(Ok(1))
+                ));
+                assert!(matches!(
+                    invoke(&mut gate, &mut cx, b"c", vectored),
+                    Poll::Ready(Ok(1))
+                ));
+                let facts = scope.snapshot();
+                assert_eq!(facts.accepted_prefix_bytes, 3);
+                assert_eq!(facts.successful_inner_writes, 3);
+                assert_eq!(
+                    facts.accepted_prefix_sha256,
+                    <[u8; 32]>::from(Sha256::digest(b"abc"))
+                );
+                assert_eq!(&script.lock().unwrap().accepted[..3], b"abc");
+                assert_eq!(script.lock().unwrap().calls, 4);
+                // Fifth poll is held by Gate; no fifth INNER poll or false charge.
+                assert!(invoke(&mut gate, &mut cx, b"d", vectored).is_pending());
+                assert!(scope.snapshot().blocked_after_acceptance);
+                assert_eq!(script.lock().unwrap().calls, 4);
+                scope.stop();
+                drop(gate);
+            }
+            Ok(())
+        }
+        #[tokio::test]
+        async fn scripted_rows_empty_scalar_and_slices_do_not_fabricate_gate_blocked()
+        -> io::Result<()> {
+            let (scope, mut gate, script) = fixture(&[Step::Ready(3), Step::Zero, Step::Zero], 3)?;
+            let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
+            let mut cx = Context::from_waker(&waker);
+            assert!(matches!(
+                Pin::new(&mut gate).poll_write(&mut cx, b"abc"),
+                Poll::Ready(Ok(3))
+            ));
+            assert!(matches!(
+                Pin::new(&mut gate).poll_write(&mut cx, &[]),
+                Poll::Ready(Ok(0))
+            ));
+            let empties = [IoSlice::new(&[]); 3];
+            assert!(matches!(
+                Pin::new(&mut gate).poll_write_vectored(&mut cx, &empties),
+                Poll::Ready(Ok(0))
+            ));
+            let facts = scope.snapshot();
+            assert_eq!(facts.accepted_prefix_bytes, 3);
+            assert_eq!(facts.successful_inner_writes, 1);
+            assert_eq!(
+                facts.accepted_prefix_sha256,
+                <[u8; 32]>::from(Sha256::digest(b"abc"))
+            );
+            assert!(!facts.blocked_after_acceptance);
+            assert_eq!(script.lock().unwrap().offered[..3], [3, 0, 0]);
+            assert!(Pin::new(&mut gate).poll_write(&mut cx, b"d").is_pending());
+            assert!(scope.snapshot().blocked_after_acceptance);
+            assert_eq!(script.lock().unwrap().calls, 3);
+            scope.stop();
+            drop(gate);
+            Ok(())
+        }
+
+        // This case is REAL TCP + public FramingCursor. Wrong-receipt controller
+        // failure does not invent an immediate wake contract: explicit Stop remains
+        // required, with the original bounded fixture parent retaining every child.
+        #[tokio::test]
+        async fn actual_blocked_tcp_wrong_receipt_then_stop_preserves_first_cause_and_joins()
+        -> io::Result<()> {
+            let (connection, statement) = identities();
+            let scope =
+                MysqlWriteTestScope::new(connection, Instant::now() + Duration::from_secs(5));
+            let mut children = JoinSet::new();
+            let primary = timeout_result(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    fixture_work(async {
+                        let (mut client, write) = pair().await?;
+                        let gate = MysqlWriteGate::new(write, &scope)?;
+                        scope.arm(statement, [0; 32], 2)?;
+                        let mut writer =
+                            OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
+                        scope.begin_rows(statement, writer.receipt())?;
+                        writer.start_row(8)?;
+                        writer.push_slice(b"abcdefgh")?;
+                        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+                        children.spawn(async move {
+                            let outcome = writer.flush_pending().await;
+                            drop(writer);
+                            outcome_tx
+                                .send(outcome)
+                                .map_err(|_| io::Error::other("writer outcome receiver exited"))?;
+                            Ok::<_, io::Error>(())
+                        });
+                        scope.wait_blocked().await?;
+                        // Begin-rows receipt is a genuine old public receipt, intentionally
+                        // stale for this negative case (no fake cursor field construction).
+                        let stale = scope.snapshot().baseline.unwrap();
+                        assert!(scope.record_cancel_receipt(statement, stale).is_err());
+                        assert_eq!(scope.snapshot().failure, Some(GateFailure::Receipt));
+                        assert!(scope.resume().is_err());
+                        scope.stop();
+                        assert_eq!(
+                            outcome_rx
+                                .await
+                                .map_err(io::Error::other)?
+                                .unwrap_err()
+                                .kind(),
+                            io::ErrorKind::InvalidData
+                        );
+                        let mut prefix = [0; 2];
+                        client.read_exact(&mut prefix).await?;
+                        assert_eq!(prefix, [8, 0]);
+                        assert_eq!(client.read(&mut [0; 1]).await?, 0);
+                        assert!(scope.snapshot().writer_exited);
+                        assert_eq!(scope.snapshot().failure, Some(GateFailure::Receipt));
+                        Ok(())
+                    }),
+                )
+                .await,
+            );
+            finish_fixture(&scope, &mut children, primary).await
+        }
+    }
 }

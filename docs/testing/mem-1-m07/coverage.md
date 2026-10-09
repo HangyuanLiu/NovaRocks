@@ -424,3 +424,9 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 新 mysql-adapter/mysql_write_gate.rs 仅 cfg(test)，真实OwnedWriteHalf scalar/writev原调用、Ready(n)才计费/hash，栈32IoSlice裁到cut，zero-budget后继非空poll Pending才发布blocked。固定scalar/FramingCursor/sha256/oneWaker，无body或lease aliases；实际owner token组合仍是组件fixture，不冒充Native身份。固定deadline/firstcause sticky，arm/begin/cancel/resume各一次，Stop不刷新clock/clear failure。
 - 12项真实TCP组件PASS/1.25s：scalar/writev cuts1..6、S+1实际cursor/hash、错误token/重复binding/begin/earlyresume、33slice拒绝、actualStop/原deadline、无writer control timeout、parentpanic/timeout与childJoinError。失败退出由父唯一JoinSet原handles abort+await实际join，再独立EOF；writer destructor fact不替代Task/root exit。原v1/v2 ignored草稿保留，v2修正detached句柄与control timeout sticky，测试无失败。
 - MySQL adapter全部79PASS/0FAIL/1.33s；原default产品路径/config/caps/SQL/deadline/Closing语义未改。收据p09-exact-fe-poll-write-component-20261009.json绑定sourcebase/raw hashes。真实FE接线、原大小行SQL/cuts、实际W2取消时coverage、small missing-tail/coalesced等仍OPEN，不能用合成component代替Native矩阵；其余门不变，无push/PR/归档。
+
+
+### 2026-10-09 P09：poll_write 闸门七项额外反例（19项组件PASS）
+
+- 六项固定脚本NO-I/O反例覆盖scalar/writev原Pending/waker、Ok0/原rawOSerror、framer原WriteZero、n>offered首错、多个Ready累积准确hash、zero-budget empty slices不假造blocked；与真实TCP/Native证据分列。第七项真实TCP使用实际stale baseline receipt使Receipt失败，resume拒绝、explicitStop唤醒、exact2B+EOF与原JoinSet实际全join。没有新增首错即时wakeup或泛化panic-prone inner合同。
+- 初次E0061/E0308因Pin receiver的方法名write解析到AsyncWriteExt；仅fixture改名scripted_poll并get_mut明确dispatch。完整19组件PASS/0FAIL/0ignored/1.25s，原错误日志及ignoreddraft保留；收据p09-exact-fe-poll-write-component-additional-20261009.json。gate实现/产品路径/caps/clock未变，Native接线及其余门仍OPEN。
