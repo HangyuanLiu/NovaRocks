@@ -1457,3 +1457,6 @@ mod native_bitnot_intrinsic_after_tests;
 
 #[cfg(test)]
 mod legacy_decimal128_rescale_baseline_tests;
+
+#[cfg(test)]
+mod approx_percentile_actual_sql_source_tests;

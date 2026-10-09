@@ -497,3 +497,6 @@ fn approx_percentile_differential_weighted_arity3_full_actual_declaration() {
 fn approx_percentile_differential_weighted_arity4_full_actual_declaration() {
     all_roles("percentile_approx_weighted", 4, true);
 }
+
+#[path = "pure_differential_approx_percentile_remaining_carriers.rs"]
+mod remaining_carriers;

@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Actual SQL author probe for the native NDV HAVING first blocker.
+//! Actual original CREATE TABLE facts and approximate percentile call authors.
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Field, Schema};
 use novarocks_physical_plan::{
@@ -49,17 +49,17 @@ use novarocks_sql::compiler::{
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-pub(super) fn ndv_sql_source(
+pub(super) fn approx_sql_source(
     sql: &str,
     emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    ndv_sql_source_with_semantics(
+    approx_sql_source_with_semantics(
         sql,
         emission_mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )
 }
-fn ndv_sql_source_with_semantics(
+fn approx_sql_source_with_semantics(
     sql: &str,
     emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
@@ -125,9 +125,15 @@ fn ndv_sql_source_with_semantics(
                         // These are the original CREATE TABLE facts, not inferred
                         // from the query projection or manufactured physical nodes.
                         let columns = [
-                            ("k", DataType::Int32),
+                            ("id", DataType::Int32),
                             ("v", DataType::Int32),
-                            ("s", DataType::Utf8),
+                            ("w", DataType::Int32),
+                            ("d", DataType::Date32),
+                            (
+                                "dt",
+                                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                            ),
+                            ("dbl", DataType::Float64),
                         ];
                         let schema = Arc::new(Schema::new(
                             columns
@@ -157,7 +163,7 @@ fn ndv_sql_source_with_semantics(
                         })
                         .unwrap()
                         .into_resolved_table();
-                        assert_eq!(catalog_table(&resolved).columns.len(), 3);
+                        assert_eq!(catalog_table(&resolved).columns.len(), 6);
                         for (actual, (name, ty)) in
                             catalog_table(&resolved).columns.iter().zip(&columns)
                         {
@@ -192,189 +198,127 @@ fn ndv_sql_source_with_semantics(
                 needs
                     .iter()
                     .map(|need| {
-                        ProviderReadFact::negotiated(need, provider_contract(need)).unwrap()
+                        ProviderReadFact::negotiated(
+                            need,
+                            super::ndv_filter_actual_sql_source_tests::provider_contract(need),
+                        )
+                        .unwrap()
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             ),
-            other => panic!("unexpected original NDV fixture needs: {other:?}"),
+            other => panic!("unexpected original approximate percentile fixture needs: {other:?}"),
         };
         progress = SqlCompiler::finish(compilation, facts, &control).unwrap();
     }
 }
 
-const HAVING: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;";
-const EMPTY_WHERE: &str = "SELECT ndv(v) AS ndv_empty, approx_count_distinct(v) AS approx_empty,\n       count(DISTINCT v) AS exact_empty\nFROM fixture.ndv_null_contract WHERE k = 999;";
-const NULL_WHERE: &str = "SELECT ndv(v) AS ndv_null, approx_count_distinct(v) AS approx_null,\n       count(DISTINCT v) AS exact_null\nFROM fixture.ndv_null_contract WHERE k = 1;";
-
-fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
-    use novarocks_physical_plan::NodeKind;
-    for (query, sql) in [(3, EMPTY_WHERE), (4, NULL_WHERE), (7, HAVING)] {
-        let source = ndv_sql_source(sql, mode);
-        let mut filters = 0;
-        let mut multi_predicate_filters = 0;
-        let mut aggregate_calls = 0;
-        for (fragment_id, fragment) in source.plan().fragments() {
+fn check_actual_approx(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
+    use novarocks_physical_plan::{
+        FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
+        StaticFunctionArgument,
+    };
+    use novarocks_type_contract::FunctionValueType;
+    let statements = [
+        "SELECT CAST(percentile_approx(v, 0.5) AS INT) AS approx50, CAST(percentile_approx(v, 0.9, 2048) AS INT) AS approx90, percentile_approx(v, array<double>[0.25, 0.5, 0.75], 2048) AS approx_quartiles FROM fixture.t_agg_percentile_semantics",
+        "SELECT CAST(percentile_approx_weighted(v, w, 0.5, 2048) AS INT) AS weighted50, CAST(percentile_approx_weighted(v, w, 0.9, 2048) AS INT) AS weighted90, percentile_approx_weighted(v, w, array<double>[0.25, 0.5, 0.75], 2048) AS weighted_quartiles FROM fixture.t_agg_percentile_semantics",
+    ];
+    for sql in statements {
+        let source = approx_sql_source(sql, mode);
+        let mut seen = 0;
+        for fragment in source.plan().fragments().values() {
             for node in fragment.nodes().values() {
-                match &node.kind {
-                    NodeKind::Filter { predicates } => {
-                        filters += 1;
-                        eprintln!(
-                            "NDV actual SQL query={query} mode={mode:?} fragment={:?} filter={:?} inputs={:?} predicate_count={} output={:?}",
-                            fragment_id,
-                            node.id,
-                            node.inputs,
-                            predicates.len(),
-                            node.output
-                        );
-                        assert_eq!(node.inputs.len(), 1);
-                        assert!(!predicates.is_empty());
-                        let input = fragment.nodes().get(&node.inputs[0]).unwrap();
-                        assert_eq!(node.output.columns, input.output.columns);
-                        for (ordinal, id) in predicates.iter().enumerate() {
-                            let expression = fragment.expressions().get(*id).unwrap();
-                            assert_eq!(expression.ty.data_type, DataType::Boolean);
-                            eprintln!(
-                                "NDV actual FilterPredicate ordinal={ordinal} id={id:?} expression={expression:?}"
-                            );
-                        }
-                        if predicates.len() > 1 {
-                            multi_predicate_filters += 1;
-                            assert_eq!(query, 7);
-                            assert_eq!(predicates.len(), 2);
-                        }
+                let NodeKind::Aggregate { calls, .. } = &node.kind else {
+                    continue;
+                };
+                for (ordinal, call) in calls.iter().enumerate() {
+                    let name = call.binding.function.function_id.as_str();
+                    if !matches!(
+                        name,
+                        "builtin.aggregate/percentile_approx/v1"
+                            | "builtin.aggregate/percentile_approx_weighted/v1"
+                    ) {
+                        continue;
                     }
-                    NodeKind::Aggregate { calls, .. } => {
-                        aggregate_calls += calls.len();
-                        for (ordinal, call) in calls.iter().enumerate() {
-                            eprintln!(
-                                "NDV actual aggregate query={query} mode={mode:?} node={:?} call={ordinal} authored={call:?}",
-                                node.id
-                            );
-                        }
+                    let site = PhysicalCallSite::Aggregate {
+                        node: node.id,
+                        call: u32::try_from(ordinal).unwrap(),
+                    };
+                    let request = fragment
+                        .call_requests()
+                        .get(PhysicalCallDefinition::Relational(site))
+                        .unwrap();
+                    assert_eq!(
+                        request.logical_argument_count,
+                        call.binding.function.argument_types.len()
+                    );
+                    for (actual, selected) in request
+                        .arguments
+                        .iter()
+                        .zip(call.binding.function.argument_types.iter())
+                    {
+                        let (
+                            StaticFunctionArgument::Value {
+                                value_type: actual, ..
+                            },
+                            FunctionArgumentType::Value(selected),
+                        ) = (actual, selected)
+                        else {
+                            panic!("actual Value channel")
+                        };
+                        assert_eq!(actual, selected);
                     }
-                    NodeKind::Scan {
-                        relation,
-                        residuals,
-                        ..
-                    } => {
-                        eprintln!(
-                            "NDV actual scan query={query} mode={mode:?} node={:?} relation={relation:?} residuals={residuals:?}",
-                            node.id
-                        );
-                    }
-                    _ => {}
+                    let role = if name == "builtin.aggregate/percentile_approx/v1" {
+                        1
+                    } else {
+                        2
+                    };
+                    let FunctionArgumentType::Value(rate) =
+                        &call.binding.function.argument_types[role]
+                    else {
+                        panic!("actual rate")
+                    };
+                    let expected = if matches!(rate.data_type, DataType::List(_)) {
+                        DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
+                    } else {
+                        DataType::Float64
+                    };
+                    assert_eq!(
+                        call.binding.function.result_type,
+                        FunctionValueType::new(expected, true)
+                    );
+                    assert_eq!(
+                        call.binding.intermediate_type,
+                        FunctionValueType::new(DataType::Binary, true)
+                    );
+                    assert!(
+                        matches!(rate.data_type, DataType::Decimal128(..) | DataType::List(_)),
+                        "native statements original authored rates"
+                    );
+                    eprintln!(
+                        "approximate actual SQL mode={mode:?} source={site:?} phase={:?} logical={:?} rate={rate:?} output={:?} state={:?}",
+                        call.binding.phase,
+                        request.arguments,
+                        call.binding.function.result_type,
+                        call.binding.intermediate_type
+                    );
+                    seen += 1;
                 }
             }
-            // This is diagnostic observation of the already-emitted original
-            // arena. It performs no lowering, decoder, rewriter or evaluation.
-            for (id, expression) in fragment.expressions().iter() {
-                eprintln!(
-                    "NDV actual original definition query={query} mode={mode:?} id={id:?} expression={expression:?}"
-                );
-            }
-            for (id, value) in fragment.values() {
-                eprintln!(
-                    "NDV actual original value query={query} mode={mode:?} id={id:?} value={value:?}"
-                );
-            }
         }
-        assert!(aggregate_calls > 0);
-        if query == 7 {
-            assert!(filters > 0);
-            assert_eq!(
-                multi_predicate_filters, 1,
-                "the original HAVING author retains two conjunct roots on one Filter"
-            );
-        } else {
-            assert_eq!(multi_predicate_filters, 0);
-        }
+        assert!(
+            seen >= 3,
+            "all original required three quantile projections"
+        );
     }
 }
-
 #[test]
-fn ndv_actual_filter_original_sql_source() {
-    source_probe(novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1);
+fn approximate_percentile_actual_original_sql_source() {
+    check_actual_approx(novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1)
 }
 #[test]
-fn ndv_actual_filter_candidate_sql_source() {
-    source_probe(
+fn approximate_percentile_actual_candidate_sql_source() {
+    check_actual_approx(
         novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
-}
-fn connector_binding() -> ConnectorReadBinding {
-    let provider_id = ConnectorProviderId::parse("iceberg").expect("provider id");
-    let instance_id = ConnectorInstanceId::parse("lakehouse").expect("instance id");
-    ConnectorReadBinding::new(
-        ConnectorInstanceDescriptor {
-            provider_id,
-            instance_id: instance_id.clone(),
-        },
-        CatalogHandle::new(instance_id, CatalogVersion::from_bytes([3; 32])),
     )
-}
-
-fn encoded(
-    binding: &ConnectorReadBinding,
-    category: ConnectorCodecCategory,
-) -> ConnectorEncodedPayload {
-    ConnectorEncodedPayload::new(
-        ConnectorEnvelopeHeader::new(
-            binding.descriptor().provider_id.clone(),
-            binding.catalog_handle().clone(),
-            category,
-            ConnectorCodecRevision::try_new(1).expect("codec revision"),
-        ),
-        vec![category as u8 + 1].into(),
-    )
-}
-
-pub(super) fn provider_contract(need: &ProviderReadNeed) -> ProviderReadStaticContract {
-    let binding = connector_binding();
-    ProviderReadStaticContract {
-        sql_binding: need.binding(),
-        request: ProviderReadRequestBinding::from_need(need),
-        read: ProviderReadReference {
-            binding: binding.clone(),
-            input_version: ExactInputVersion::try_new([9]).expect("input version"),
-            relation: ConnectorReadRelationPayload::new(
-                need.relation().relation_kind(),
-                encoded(&binding, ConnectorCodecCategory::ReadTable),
-                encoded(&binding, ConnectorCodecCategory::ReadView),
-            ),
-        },
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
-        selection_digest: [8; 32],
-        schema: need
-            .columns()
-            .iter()
-            .map(|column| {
-                ProviderReadColumnFact::new(
-                    column.ordinal(),
-                    ProviderColumnReference {
-                        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn),
-                    },
-                    column.engine_type().clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-        predicates: need
-            .predicates()
-            .iter()
-            .map(|predicate| {
-                ProviderReadPredicateFact::new(
-                    predicate.occurrence(),
-                    PredicateGuaranteeKind::Exact,
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-        limit: need.limit().map_or(
-            ProviderReadLimitFact::NotRequested,
-            ProviderReadLimitFact::Exact,
-        ),
-        provided_properties: ProviderReadProperties::unconstrained(),
-        coverage_evidence: Box::default(),
-    }
 }

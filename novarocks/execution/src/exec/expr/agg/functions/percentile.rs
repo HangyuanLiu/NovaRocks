@@ -15,17 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{Array, ArrayRef, BinaryBuilder, ListArray, StructArray};
+use arrow::array::{Array, ListArray};
+use arrow::array::{ArrayRef, BinaryBuilder, StructArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-use crate::exec::expr::agg::functions::common::{AggScalarValue, build_scalar_array};
-use crate::exec::expr::function::object::percentile_functions::{
-    numeric_value_at, payload_bytes_at,
-};
+use crate::exec::expr::agg::functions::common::build_scalar_array;
 use crate::exec::node::aggregate::AggFunction;
 use crate::exec::percentile;
 use crate::runtime::mem_tracker::MemTracker;
+use novarocks_functions::approx_percentile_aggregate_core::{
+    self as approx_core, ApproxPercentileDiagnostic,
+};
 
 use super::super::*;
 use super::AggregateFunction;
@@ -46,157 +47,19 @@ fn canonical_agg_name(name: &str) -> &str {
     name.split_once('|').map(|(base, _)| base).unwrap_or(name)
 }
 
-fn integer_value_at(array: &ArrayRef, row: usize, context: &str) -> Result<Option<i64>, String> {
-    Ok(numeric_value_at(array, row, context)?.map(|value| value as i64))
-}
-
-fn validate_quantile(context: &str, quantile: f64) -> Result<(), String> {
-    if !(0.0..=1.0).contains(&quantile) {
-        return Err(format!(
-            "{context}: percentile parameter must be between 0 and 1, got {}",
-            quantile
-        ));
-    }
-    Ok(())
-}
-
-fn apply_unweighted_quantiles(
-    state: &mut TrackedPercentileState,
-    array: &ArrayRef,
-    row: usize,
-    context: &str,
-) -> Result<(), String> {
-    if matches!(array.data_type(), DataType::List(_)) {
-        let list = array
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| format!("{context}: failed to downcast percentile array input"))?;
-        if list.is_null(row) {
-            return Ok(());
-        }
-        let offsets = list.value_offsets();
-        let start = offsets[row] as usize;
-        let end = offsets[row + 1] as usize;
-        let values = list.values();
-        let count = end.saturating_sub(start);
-        if count > percentile::MAX_QUANTILE_COUNT {
-            return Err(format!(
-                "{context}: percentile quantile count {count} exceeds {}",
-                percentile::MAX_QUANTILE_COUNT
-            ));
-        }
-        let mut quantiles = Vec::new();
-        quantiles
-            .try_reserve_exact(count)
-            .map_err(|_| format!("ResourceExhausted: {context} quantile array"))?;
-        for (idx, value_row) in (start..end).enumerate() {
-            let Some(quantile) = numeric_value_at(values, value_row, context)? else {
-                return Err(format!(
-                    "{context}: percentile array element[{idx}] cannot be null"
-                ));
-            };
-            validate_quantile(context, quantile)?;
-            quantiles.push(quantile);
-        }
-        return percentile::set_quantiles(state, &quantiles);
-    }
-
-    match numeric_value_at(array, row, context)? {
-        Some(quantile) => {
-            validate_quantile(context, quantile)?;
-            percentile::set_quantile(state, quantile)
-        }
-        None => Ok(()),
-    }
-}
-
-fn apply_weighted_quantiles(
-    state: &mut TrackedPercentileState,
-    array: &ArrayRef,
-    row: usize,
-    context: &str,
-) -> Result<(), String> {
-    if matches!(array.data_type(), DataType::List(_)) {
-        let list = array
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| format!("{context}: failed to downcast percentile array input"))?;
-        if list.is_null(row) {
-            return Ok(());
-        }
-        let offsets = list.value_offsets();
-        let start = offsets[row] as usize;
-        let end = offsets[row + 1] as usize;
-        let values = list.values();
-        let count = end.saturating_sub(start);
-        if count > percentile::MAX_QUANTILE_COUNT {
-            return Err(format!(
-                "{context}: percentile quantile count {count} exceeds {}",
-                percentile::MAX_QUANTILE_COUNT
-            ));
-        }
-        let mut quantiles = Vec::new();
-        quantiles
-            .try_reserve_exact(count)
-            .map_err(|_| format!("ResourceExhausted: {context} quantile array"))?;
-        for (idx, value_row) in (start..end).enumerate() {
-            let Some(quantile) = numeric_value_at(values, value_row, context)? else {
-                return Err(format!(
-                    "{context}: percentile array element[{idx}] cannot be null"
-                ));
-            };
-            validate_quantile(context, quantile)?;
-            quantiles.push(quantile);
-        }
-        return percentile::set_quantiles(state, &quantiles);
-    }
-
-    match numeric_value_at(array, row, context)? {
-        Some(quantile) => {
-            validate_quantile(context, quantile)?;
-            percentile::set_quantile(state, quantile)
-        }
-        None => Ok(()),
-    }
-}
-
-fn apply_compression_to_unweighted(
-    state: &mut TrackedPercentileState,
-    array: &ArrayRef,
-    row: usize,
-    context: &str,
-) -> Result<(), String> {
-    if let Some(value) = numeric_value_at(array, row, context)? {
-        percentile::set_compression(state, value)?;
-    }
-    Ok(())
-}
-
-fn apply_compression_to_weighted(
-    state: &mut TrackedPercentileState,
-    array: &ArrayRef,
-    row: usize,
-    context: &str,
-) -> Result<(), String> {
-    if let Some(value) = numeric_value_at(array, row, context)? {
-        percentile::set_compression(state, value)?;
-    }
-    Ok(())
-}
-
 fn merge_unweighted_payload_array(
     array: &ArrayRef,
     offset: usize,
     state_ptrs: &[AggStatePtr],
-    context: &str,
+    context: ApproxPercentileDiagnostic,
 ) -> Result<(), String> {
     for (row, &base) in state_ptrs.iter().enumerate() {
-        let Some(payload) = payload_bytes_at(array, row, context)? else {
+        let Some(payload) = approx_core::payload_for_merge(array, row, context)? else {
             continue;
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
         let state = unsafe { state_mut(ptr) };
-        percentile::merge_bounded_serialized_state_into(state, payload)?;
+        approx_core::merge_payload(state, payload)?;
     }
     Ok(())
 }
@@ -205,61 +68,23 @@ fn merge_weighted_payload_array(
     array: &ArrayRef,
     offset: usize,
     state_ptrs: &[AggStatePtr],
-    context: &str,
+    context: ApproxPercentileDiagnostic,
 ) -> Result<(), String> {
-    for (row, &base) in state_ptrs.iter().enumerate() {
-        let Some(payload) = payload_bytes_at(array, row, context)? else {
-            continue;
-        };
-        let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { state_mut(ptr) };
-        percentile::merge_bounded_serialized_state_into(state, payload)?;
-    }
-    Ok(())
+    merge_unweighted_payload_array(array, offset, state_ptrs, context)
 }
 
 fn update_unweighted_struct(
     array: &StructArray,
     offset: usize,
     state_ptrs: &[AggStatePtr],
-    context: &str,
+    context: ApproxPercentileDiagnostic,
 ) -> Result<(), String> {
-    let fields = array.columns();
-    if fields.len() < 2 {
-        return Err(format!(
-            "{context}: percentile_approx expects STRUCT(value, quantile[, compression]) input"
-        ));
-    }
-    let values = fields[0].clone();
-    let quantiles = fields[1].clone();
-    let compression = if fields.len() >= 3 {
-        Some(fields[2].clone())
-    } else {
-        None
-    };
-
+    let input = approx_core::UnweightedInput::try_new(array, context)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         let ptr = unsafe { (base as *mut u8).add(offset) };
         let state = unsafe { state_mut(ptr) };
-        apply_unweighted_quantiles(state, &quantiles, row, context)?;
-        if let Some(compression) = &compression {
-            apply_compression_to_unweighted(state, compression, row, context)?;
-        }
-        match values.data_type() {
-            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
-                if let Some(payload) = payload_bytes_at(&values, row, context)? {
-                    percentile::merge_bounded_serialized_state_into(state, payload)?;
-                }
-            }
-            _ => {
-                if let Some(value) = numeric_value_at(&values, row, context)? {
-                    percentile::add_value(state, value)?;
-                    percentile::validate_state(state)?;
-                }
-            }
-        }
+        input.update_row(state, row, context)?;
     }
-
     Ok(())
 }
 
@@ -267,44 +92,14 @@ fn update_weighted_struct(
     array: &StructArray,
     offset: usize,
     state_ptrs: &[AggStatePtr],
-    context: &str,
+    context: ApproxPercentileDiagnostic,
 ) -> Result<(), String> {
-    let fields = array.columns();
-    if fields.len() < 3 {
-        return Err(format!(
-            "{context}: percentile_approx_weighted expects STRUCT(value, weight, quantile[, compression]) input"
-        ));
-    }
-    let values = fields[0].clone();
-    let weights = fields[1].clone();
-    let quantiles = fields[2].clone();
-    let compression = if fields.len() >= 4 {
-        Some(fields[3].clone())
-    } else {
-        None
-    };
-
+    let input = approx_core::WeightedInput::try_new(array, context)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         let ptr = unsafe { (base as *mut u8).add(offset) };
         let state = unsafe { state_mut(ptr) };
-        apply_weighted_quantiles(state, &quantiles, row, context)?;
-        if let Some(compression) = &compression {
-            apply_compression_to_weighted(state, compression, row, context)?;
-        }
-        let Some(value) = numeric_value_at(&values, row, context)? else {
-            continue;
-        };
-        let weight = integer_value_at(&weights, row, context)?.unwrap_or_default();
-        if weight < 0 {
-            return Err(format!(
-                "{context}: percentile weight must be non-negative, got {}",
-                weight
-            ));
-        }
-        percentile::add_weighted_value(state, value, weight)?;
-        percentile::validate_state(state)?;
+        input.update_row(state, row, context)?;
     }
-
     Ok(())
 }
 
@@ -431,22 +226,32 @@ impl AggregateFunction for PercentileAgg {
                         struct_array,
                         offset,
                         state_ptrs,
-                        "percentile_approx_weighted",
+                        ApproxPercentileDiagnostic::WeightedUpdate,
                     )
                 } else {
                     merge_weighted_payload_array(
                         array,
                         offset,
                         state_ptrs,
-                        "percentile_approx_weighted",
+                        ApproxPercentileDiagnostic::WeightedUpdate,
                     )
                 }
             }
             AggKind::PercentileUnion | AggKind::PercentileApprox => {
                 if let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() {
-                    update_unweighted_struct(struct_array, offset, state_ptrs, "percentile_approx")
+                    update_unweighted_struct(
+                        struct_array,
+                        offset,
+                        state_ptrs,
+                        ApproxPercentileDiagnostic::UnweightedUpdate,
+                    )
                 } else {
-                    merge_unweighted_payload_array(array, offset, state_ptrs, "percentile_approx")
+                    merge_unweighted_payload_array(
+                        array,
+                        offset,
+                        state_ptrs,
+                        ApproxPercentileDiagnostic::UnweightedUpdate,
+                    )
                 }
             }
             other => Err(format!("unexpected percentile aggregate kind: {:?}", other)),
@@ -468,11 +273,14 @@ impl AggregateFunction for PercentileAgg {
                 array,
                 offset,
                 state_ptrs,
-                "percentile_approx_weighted_merge",
+                ApproxPercentileDiagnostic::WeightedMerge,
             ),
-            _ => {
-                merge_unweighted_payload_array(array, offset, state_ptrs, "percentile_approx_merge")
-            }
+            _ => merge_unweighted_payload_array(
+                array,
+                offset,
+                state_ptrs,
+                ApproxPercentileDiagnostic::UnweightedMerge,
+            ),
         }
     }
 
@@ -488,92 +296,44 @@ impl AggregateFunction for PercentileAgg {
         } else {
             &spec.output_type
         };
-
-        match &spec.kind {
-            AggKind::PercentileApproxWeighted => match output_type {
-                DataType::Binary => {
-                    let mut builder = BinaryBuilder::new();
-                    for &base in group_states {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        builder.append_value(percentile::encode_state(unsafe { state_ref(ptr) }));
-                    }
-                    Ok(Arc::new(builder.finish()))
+        match output_type {
+            DataType::Binary => {
+                let mut builder = BinaryBuilder::new();
+                for &base in group_states {
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    builder.append_value(percentile::encode_state(unsafe { state_ref(ptr) }));
                 }
-                DataType::Float64 => {
-                    let mut values = Vec::with_capacity(group_states.len());
-                    for &base in group_states {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value =
-                            percentile::quantile_from_state(unsafe { state_ref(ptr) }, None)?
-                                .map(AggScalarValue::Float64);
-                        values.push(value);
-                    }
-                    build_scalar_array(output_type, values)
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::Float64 | DataType::List(_) => {
+                let output = if matches!(output_type, DataType::Float64) {
+                    approx_core::ScalarOutput::Float64
+                } else {
+                    approx_core::ScalarOutput::List
+                };
+                let mut values = Vec::with_capacity(group_states.len());
+                for &base in group_states {
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    values.push(approx_core::scalar_output(
+                        unsafe { state_ref(ptr) },
+                        output,
+                    )?);
                 }
-                DataType::List(_) => {
-                    let mut values = Vec::with_capacity(group_states.len());
-                    for &base in group_states {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value = percentile::quantiles_from_state(unsafe { state_ref(ptr) })?
-                            .map(|items| {
-                                AggScalarValue::List(
-                                    items
-                                        .into_iter()
-                                        .map(|item| Some(AggScalarValue::Float64(item)))
-                                        .collect(),
-                                )
-                            });
-                        values.push(value);
-                    }
-                    build_scalar_array(output_type, values)
+                build_scalar_array(output_type, values)
+            }
+            other => {
+                if matches!(&spec.kind, AggKind::PercentileApproxWeighted) {
+                    Err(format!(
+                        "weighted percentile aggregate output type must be Binary/Float64/List, got {:?}",
+                        other
+                    ))
+                } else {
+                    Err(format!(
+                        "percentile aggregate output type must be Binary/Float64/List, got {:?}",
+                        other
+                    ))
                 }
-                other => Err(format!(
-                    "weighted percentile aggregate output type must be Binary/Float64/List, got {:?}",
-                    other
-                )),
-            },
-            _ => match output_type {
-                DataType::Binary => {
-                    let mut builder = BinaryBuilder::new();
-                    for &base in group_states {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        builder.append_value(percentile::encode_state(unsafe { state_ref(ptr) }));
-                    }
-                    Ok(Arc::new(builder.finish()))
-                }
-                DataType::Float64 => {
-                    let mut values = Vec::with_capacity(group_states.len());
-                    for &base in group_states {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value =
-                            percentile::quantile_from_state(unsafe { state_ref(ptr) }, None)?
-                                .map(AggScalarValue::Float64);
-                        values.push(value);
-                    }
-                    build_scalar_array(output_type, values)
-                }
-                DataType::List(_) => {
-                    let mut values = Vec::with_capacity(group_states.len());
-                    for &base in group_states {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value = percentile::quantiles_from_state(unsafe { state_ref(ptr) })?
-                            .map(|items| {
-                                AggScalarValue::List(
-                                    items
-                                        .into_iter()
-                                        .map(|item| Some(AggScalarValue::Float64(item)))
-                                        .collect(),
-                                )
-                            });
-                        values.push(value);
-                    }
-                    build_scalar_array(output_type, values)
-                }
-                other => Err(format!(
-                    "percentile aggregate output type must be Binary/Float64/List, got {:?}",
-                    other
-                )),
-            },
+            }
         }
     }
 }

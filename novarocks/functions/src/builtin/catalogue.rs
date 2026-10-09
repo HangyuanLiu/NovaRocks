@@ -3072,6 +3072,9 @@ pub fn contribute_builtin_functions(
                         Some(super::aggregate_count_distinct_owner::effects())
                     }
                     "any_value" => Some(super::aggregate_any_value_owner::effects()),
+                    "percentile_approx" | "percentile_approx_weighted" => {
+                        Some(super::aggregate_approx_percentile_owner::effects())
+                    }
                     "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
                         Some(super::aggregate_percentile_owner::effects())
                     }
@@ -3136,6 +3139,17 @@ pub fn contribute_builtin_functions(
         }
         if matches!(declaration.name, "min_n" | "max_n") {
             builder.register(super::aggregate_n_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if matches!(
+            declaration.name,
+            "percentile_approx" | "percentile_approx_weighted"
+        ) {
+            builder.register(super::aggregate_approx_percentile_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
