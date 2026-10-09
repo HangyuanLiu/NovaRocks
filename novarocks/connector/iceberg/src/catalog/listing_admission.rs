@@ -30,17 +30,88 @@ pub(crate) const LISTING_CONCURRENCY: usize = 8;
 #[derive(Debug)]
 pub(crate) struct ListingAdmission {
     positions: Arc<Semaphore>,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    observer: Arc<super::hms_listing_observer::Observer>,
 }
 
 impl Default for ListingAdmission {
     fn default() -> Self {
         Self {
             positions: Arc::new(Semaphore::new(LISTING_CONCURRENCY)),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            observer: Default::default(),
         }
     }
 }
 
 impl ListingAdmission {
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(crate) fn hms_snapshot(
+        &self,
+    ) -> Result<super::hms_listing_observer::Snapshot, &'static str> {
+        let mut snapshot = self.observer.snapshot()?;
+        snapshot.available_positions_sample = Some(self.positions.available_permits());
+        Ok(snapshot)
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(crate) fn reset_hms_observation_idle(
+        &self,
+        domain: uuid::Uuid,
+        phase: u64,
+        sequence: u64,
+    ) -> Result<u64, &'static str> {
+        self.observer.reset_idle(domain, phase, sequence)
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(super) async fn run_hms<T, F: Future<Output = Result<T, ConnectorError>>>(
+        &self,
+        context: &ConnectorRequestContext,
+        operation: super::hms_listing_observer::HmsListingOperation,
+        target_sha256: Option<[u8; 32]>,
+        make_call: impl FnOnce(super::hms_listing_observer::Invocation) -> F,
+    ) -> Result<T, ConnectorError> {
+        use super::hms_listing_observer::{ExitSelection, PermitOwner, WrapperExit};
+        let invocation = self
+            .observer
+            .begin(operation, target_sha256, context.deadline());
+        // PermitOwner is declared before both wrapper witness and the future.
+        // Cancelling/dropping this outer future cannot return the permit first.
+        let mut owner = PermitOwner {
+            invocation: invocation.clone(),
+            permit: None,
+        };
+        let _wrapper_exit = WrapperExit(invocation.clone());
+        let call = make_call(invocation.clone());
+        tokio::pin!(call);
+        if let Err(error) = context.check_active() {
+            invocation.select(ExitSelection::InitialCheck, context);
+            return Err(error);
+        }
+        let deadline = tokio::time::Instant::from_std(context.deadline());
+        let permit = tokio::select! {
+            biased;
+            _ = context.stop().stopped() => { invocation.select(ExitSelection::StopWaiting, context); return Err(cancelled()); },
+            _ = tokio::time::sleep_until(deadline) => { invocation.select(ExitSelection::DeadlineWaiting, context); return Err(expired()); },
+            permit = self.positions.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => { invocation.select(ExitSelection::AdmissionClosed, context);
+                    return Err(ConnectorError::new(ConnectorErrorKind::Internal, "catalog listing admission was closed")); }
+            },
+        };
+        owner.acquired(permit);
+        tokio::select! {
+            biased;
+            _ = context.stop().stopped() => { invocation.select(ExitSelection::StopAdmitted, context); Err(cancelled()) },
+            _ = tokio::time::sleep_until(deadline) => { invocation.select(ExitSelection::DeadlineAdmitted, context); Err(expired()) },
+            result = &mut call => {
+                invocation.select(if result.is_ok() { ExitSelection::ReadyOk } else { ExitSelection::ReadyErr }, context);
+                result
+            },
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn available_positions(&self) -> usize {
         self.positions.available_permits()
@@ -127,6 +198,8 @@ mod tests {
     async fn deadline_drops_sdk_before_returning_its_position() {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            observer: Default::default(),
         };
         let stop = ConnectorStopOwner::new();
         let dropped = Arc::new(AtomicBool::new(false));
@@ -150,6 +223,8 @@ mod tests {
     async fn stop_drops_sdk_before_returning_its_position() {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            observer: Default::default(),
         };
         let stop = ConnectorStopOwner::new();
         let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
@@ -204,3 +279,7 @@ mod tests {
         assert_eq!(gate.positions.available_permits(), LISTING_CONCURRENCY);
     }
 }
+
+#[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
+#[path = "hms_listing_observer_tests.rs"]
+mod hms_observation_tests;

@@ -60,6 +60,8 @@ pub(crate) mod error;
 pub(crate) mod factory;
 pub(crate) mod hadoop;
 pub(crate) mod hive;
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub(crate) mod hms_listing_observer;
 pub(crate) mod listing_admission;
 pub(crate) mod rest;
 

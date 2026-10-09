@@ -612,3 +612,14 @@ outer十case累计488.338s包含source/build哈希与独立prep，不替代/续�
 参数/溢出/实际error downcast **5 PASS**、app_config **65 PASS**、composition **8 PASS**，均0FAIL/0ignored/actual terminal0；Server非test lib+binarycheck、fmt/diff-checkPASS。后加一个cfg(test)错误类型回归，先前65/8的生产源未改。收据 `evidence/p08-sdk-listing-startup-components-20261009.json` pin实际源码、原draft、独立review与logs/profile；仅加server dev serde_json依赖，Cargo.lock只加既有workspace package边，无生产新依赖。
 
 加载门早于role启动，composition首句不冒充早于调用者已有runtime/scan资源。JSON/参数检查不证明List运行行为、SDK实际future退出、第三方内部硬字节界、Native大CL/CM。P08完整checked进程包络需P00b系数，运行期增容/全Hostdrain/里程碑C0及最终同SHA仍OPEN；其余P09/P00b/P10、人类语义和HMS IRU-7例外不变，无push/PR/归档。
+
+
+### 2026-10-09：P06s HMS 原 SDK 对象观测组件 PASS
+
+原 catalog generation 的 ListingAdmission allocation 增 default-off 私有 observer；HMS Names/Tables/Views delegate 把原 client 返回的实际 SDK future inline 交给 helper，首次poll/Ready/实际对象析构与 wrapper退出、原permit归还、settled分列，不新增SDKclient/后台task/globalregistry。默认feature-off与原collector/Unsupported/stop/absolute deadline保持；原SDK业务结果不因诊断invalid被替换。IRU-7 Nova HMS非只读正确性继续excluded，共享路径只保证编译。
+
+初次feature测试编译成功，前三项PASS后，原8pending对象＋第9等待的测试实际stack overflow/SIGABRT，terminal101；原日志保留FAIL。State与Snapshot改为同1024条fixed heap slice、独立snapshot clone，idle reset fill原allocation；未缩cap/输入或增thread stack。补phaseMAX sticky invalid；实际generic SDK poll panic反例保留原Arc payload、原future destructor在permit仍持位时退出、permit8恢复、证据invalid与后继原业务OK。deadline组件先poll确定actual SDK Pending，再await同一次100ms absolute deadline，不改生产clock。
+
+actual admission13 PASS、内部3 PASS，feature catalog80 PASS/default catalog67 PASS，均0FAIL/0ignored/terminal0；前两filter包含在80中，不累加。feature非test connectorlib与默认Serverlib+binarycheck、fmt/diffcheckPASS。收据 `docs/testing/mem-1-m07/evidence/p06s-hms-sdk-object-observer-components-20261009.json` pin实际七source/lock、原draft/v1/v2独立review和初始失败/最终通过logs；dev unoptimized/jobs1/incremental0/threads1。旧draft/失败和review bytes不覆盖。
+
+这些是NO-I/O generic future/catalog组件，不是stock Java、真实Thrift或Native HMS退出证明。observer UUID只识别allocation，非原ConnectorControlBinding instance/epoch/FE/QueryExecutionId；每snapshot独立持1024heap records，真实导出owner必须限制并存份数和persist-before-idle-reset。实际FE/generation/request-stop关联、有界出口/phase精确调用预算、原32×512table＋512trueview/clients1,8,16 Native大CL/SDK8取消恢复/四role退出仍OPEN；SDK对象Drop不冒充RPC/连接/返回body最后alias。本slice Native/stock服务0；heldlateACK/fullClosing64/backing/P08/P00b/P09/P10/final及两人工语义门不闭合，无push/PR/归档。

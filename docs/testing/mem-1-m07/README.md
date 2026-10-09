@@ -148,3 +148,14 @@ clean `1fb1319df` 的原 x S−1/S/S+1、wide q17 S+1缺尾、tiny1..6，十个�
 ### 2026-10-09：P08 SDK 参数联合启动校验组件 PASS
 
 原config load/FE/BE composition检查实际owner冻结V1参数与checked算术，无新增配置旋钮或跨域预算公式。参数5/app_config65/composition8项PASS，Server非test lib+binarycheck、fmt/diff-checkPASS；见[收据](evidence/p08-sdk-listing-startup-components-20261009.json)。参数/JSON一致性不能代替SDK实际退出、List运行行为或Native/CM；完整进程包络、P00b、P08里程碑C0及其它M07门仍OPEN。
+
+
+### 2026-10-09：P06s HMS 原 SDK 对象观测组件 PASS
+
+原 catalog generation 的 ListingAdmission allocation 增 default-off 私有 observer；HMS Names/Tables/Views delegate 把原 client 返回的实际 SDK future inline 交给 helper，首次poll/Ready/实际对象析构与 wrapper退出、原permit归还、settled分列，不新增SDKclient/后台task/globalregistry。默认feature-off与原collector/Unsupported/stop/absolute deadline保持；原SDK业务结果不因诊断invalid被替换。IRU-7 Nova HMS非只读正确性继续excluded，共享路径只保证编译。
+
+初次feature测试编译成功，前三项PASS后，原8pending对象＋第9等待的测试实际stack overflow/SIGABRT，terminal101；原日志保留FAIL。State与Snapshot改为同1024条fixed heap slice、独立snapshot clone，idle reset fill原allocation；未缩cap/输入或增thread stack。补phaseMAX sticky invalid；实际generic SDK poll panic反例保留原Arc payload、原future destructor在permit仍持位时退出、permit8恢复、证据invalid与后继原业务OK。deadline组件先poll确定actual SDK Pending，再await同一次100ms absolute deadline，不改生产clock。
+
+actual admission13 PASS、内部3 PASS，feature catalog80 PASS/default catalog67 PASS，均0FAIL/0ignored/terminal0；前两filter包含在80中，不累加。feature非test connectorlib与默认Serverlib+binarycheck、fmt/diffcheckPASS。收据 `docs/testing/mem-1-m07/evidence/p06s-hms-sdk-object-observer-components-20261009.json` pin实际七source/lock、原draft/v1/v2独立review和初始失败/最终通过logs；dev unoptimized/jobs1/incremental0/threads1。旧draft/失败和review bytes不覆盖。
+
+这些是NO-I/O generic future/catalog组件，不是stock Java、真实Thrift或Native HMS退出证明。observer UUID只识别allocation，非原ConnectorControlBinding instance/epoch/FE/QueryExecutionId；每snapshot独立持1024heap records，真实导出owner必须限制并存份数和persist-before-idle-reset。实际FE/generation/request-stop关联、有界出口/phase精确调用预算、原32×512table＋512trueview/clients1,8,16 Native大CL/SDK8取消恢复/四role退出仍OPEN；SDK对象Drop不冒充RPC/连接/返回body最后alias。本slice Native/stock服务0；heldlateACK/fullClosing64/backing/P08/P00b/P09/P10/final及两人工语义门不闭合，无push/PR/归档。

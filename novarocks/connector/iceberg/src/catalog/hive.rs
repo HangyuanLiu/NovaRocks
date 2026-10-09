@@ -99,10 +99,30 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 "external catalog listing requires an admitted request context",
             )
         })?;
-        self.delegate
-            .listing
-            .run(context, self.list_namespaces(bound))
-            .await
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        {
+            let target = None;
+            self.delegate
+                .listing
+                .run_hms(
+                    context,
+                    super::hms_listing_observer::HmsListingOperation::Namespaces,
+                    target,
+                    |invocation| async move {
+                        self.delegate
+                            .list_namespaces_observed(bound, &invocation)
+                            .await
+                    },
+                )
+                .await
+        }
+        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+        {
+            self.delegate
+                .listing
+                .run(context, self.list_namespaces(bound))
+                .await
+        }
     }
 
     async fn list_tables_for_read(
@@ -117,10 +137,31 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 "external catalog listing requires an admitted request context",
             )
         })?;
-        self.delegate
-            .listing
-            .run(context, self.list_tables(namespace, bound))
-            .await
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        {
+            use sha2::Digest;
+            let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
+            self.delegate
+                .listing
+                .run_hms(
+                    context,
+                    super::hms_listing_observer::HmsListingOperation::Tables,
+                    target,
+                    |invocation| async move {
+                        self.delegate
+                            .list_tables_observed(&namespace, bound, &invocation)
+                            .await
+                    },
+                )
+                .await
+        }
+        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+        {
+            self.delegate
+                .listing
+                .run(context, self.list_tables(namespace, bound))
+                .await
+        }
     }
 
     async fn list_views_for_request(
@@ -129,10 +170,31 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         context: novarocks_spi::connector::ConnectorRequestContext,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate
-            .listing
-            .run(&context, self.list_views(namespace, bound))
-            .await
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        {
+            use sha2::Digest;
+            let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
+            self.delegate
+                .listing
+                .run_hms(
+                    &context,
+                    super::hms_listing_observer::HmsListingOperation::Views,
+                    target,
+                    |invocation| async move {
+                        self.delegate
+                            .list_views_observed(&namespace, bound, &invocation)
+                            .await
+                    },
+                )
+                .await
+        }
+        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+        {
+            self.delegate
+                .listing
+                .run(&context, self.list_views(namespace, bound))
+                .await
+        }
     }
 
     async fn namespace_exists(
