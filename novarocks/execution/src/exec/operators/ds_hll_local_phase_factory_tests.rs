@@ -238,3 +238,7 @@ fn ds_hll_local_phase_before_real_factories_100k() {
         "actual tracker charges drop after every factory"
     );
 }
+
+#[cfg(test)]
+#[path = "ds_hll_local_stage_after_tests.rs"]
+mod ds_hll_local_stage_after_tests;

@@ -184,6 +184,7 @@ pub struct CompiledAggregateProcessorFactory {
     key_types: Vec<DataType>,
     output: ChunkSchemaRef,
     grouping: CompiledAggregateGrouping,
+    direct_input: Option<ChunkSchemaRef>,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -297,10 +298,96 @@ impl CompiledAggregateProcessorFactory {
             key_types,
             output,
             grouping,
+            direct_input: None,
             error,
         })
     }
 
+    /// Exactly the original local two-stage condition except for upstream
+    /// DOP, which the pipeline builder observes after building the input.
+    pub(crate) fn requires_local_update_stages(&self) -> bool {
+        self.groups == 0
+            && self.completes_groups()
+            && self.calls.iter().all(|call| {
+                call.contract.phase() == novarocks_functions::AggregateKernelPhase::Single
+            })
+    }
+    /// Consume the already prepared local lifecycle. The intermediate schema
+    /// is authored by each exact call's existing full intermediate type.
+    pub(crate) fn into_local_update_stages(self) -> Result<(Self, Self), String> {
+        if !self.requires_local_update_stages() {
+            return Err(
+                "compiled aggregate local stages differ from its actual update node".into(),
+            );
+        }
+        let mut partial_calls = Vec::with_capacity(self.calls.len());
+        let mut final_calls = Vec::with_capacity(self.calls.len());
+        let mut fields = Vec::with_capacity(self.calls.len());
+        for (ordinal, original) in self.calls.iter().enumerate() {
+            let stages = original.handle.local_stages().ok_or_else(|| {
+                format!("compiled aggregate call {ordinal} has no prepared local lifecycle")
+            })?;
+            if !Arc::ptr_eq(stages.source(), &original.contract) {
+                return Err(
+                    "compiled aggregate local stages have a different original call".into(),
+                );
+            }
+            let handle = stages.partial().clone();
+            partial_calls.push(CallPlan {
+                contract: Arc::clone(handle.contract()),
+                handle,
+                merge: false,
+                first_root: original.first_root,
+                roots: original.roots,
+            });
+            let handle = stages.final_stage().clone();
+            final_calls.push(CallPlan {
+                contract: Arc::clone(handle.contract()),
+                handle,
+                merge: true,
+                first_root: ordinal,
+                roots: 1,
+            });
+            fields.push(
+                original
+                    .contract
+                    .intermediate_type()
+                    .try_to_field(self.output.slots()[ordinal].name())
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let schema = arrow::datatypes::Schema::new_with_metadata(
+            fields,
+            self.output.arrow_schema_ref().metadata().clone(),
+        );
+        let intermediate =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, self.output.slot_ids())?;
+        let partial = Self {
+            name: format!("{} LOCAL_PARTIAL", self.name),
+            program: Arc::clone(&self.program),
+            sites: self.sites.clone(),
+            groups: 0,
+            calls: partial_calls,
+            key_types: Vec::new(),
+            output: intermediate,
+            grouping: CompiledAggregateGrouping::Partial,
+            direct_input: None,
+            error: Arc::clone(&self.error),
+        };
+        let final_stage = Self {
+            name: format!("{} LOCAL_FINAL", self.name),
+            program: self.program,
+            sites: Vec::new(),
+            groups: 0,
+            calls: final_calls,
+            key_types: Vec::new(),
+            output: self.output,
+            grouping: CompiledAggregateGrouping::Complete,
+            direct_input: Some(Arc::clone(&partial.output)),
+            error: self.error,
+        };
+        Ok((partial, final_stage))
+    }
     /// Whether every group of this aggregate must be owned by one driver.
     pub(crate) fn completes_groups(&self) -> bool {
         self.grouping == CompiledAggregateGrouping::Complete
@@ -321,6 +408,7 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
             calls: self.calls.clone(),
             key_types: self.key_types.clone(),
             output: Arc::clone(&self.output),
+            direct_input: self.direct_input.clone(),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             tracker: None,
             instances: None,
@@ -343,6 +431,7 @@ struct CompiledAggregateProcessor {
     calls: Vec<CallPlan>,
     key_types: Vec<DataType>,
     output: ChunkSchemaRef,
+    direct_input: Option<ChunkSchemaRef>,
     control: RuntimeKernelControl,
     tracker: Option<Arc<MemTracker>>,
     instances: Option<Vec<CompiledExpressionInstance>>,
@@ -611,20 +700,30 @@ impl CompiledAggregateProcessor {
     }
 
     fn consume(&mut self, chunk: &Chunk) -> ExecutionResult<()> {
-        instances(
-            &mut self.instances,
-            &self.program,
-            &self.sites,
-            &self.control,
-        )?;
-        self.ensure_state()?;
-        // Keys first, then each call's roots in call order; each root is
-        // evaluated once over every arriving row.
-        let instances = self.instances.as_mut().expect("instances were created");
-        let mut values = Vec::with_capacity(self.sites.len());
-        for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            values.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
-        }
+        let values = if let Some(expected) = &self.direct_input {
+            if chunk.chunk_schema() != expected.as_ref() {
+                return Err(ExecutionFailure::from(
+                    "compiled local aggregate state chunk differs from its actual intermediate schema",
+                ));
+            }
+            self.ensure_state()?;
+            chunk.batch.columns().to_vec()
+        } else {
+            instances(
+                &mut self.instances,
+                &self.program,
+                &self.sites,
+                &self.control,
+            )?;
+            self.ensure_state()?;
+            // Keys first, then each call's original roots in call order.
+            let instances = self.instances.as_mut().expect("instances were created");
+            let mut values = Vec::with_capacity(self.sites.len());
+            for (instance, site) in instances.iter_mut().zip(&self.sites) {
+                values.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            }
+            values
+        };
         let rows = chunk.len();
         let mapping = self.assign_groups(&values[..self.group_roots], rows)?;
         self.grow_states()?;
@@ -895,6 +994,7 @@ mod failure_latch_tests {
             calls: factory.calls,
             key_types: factory.key_types,
             output: factory.output,
+            direct_input: factory.direct_input,
             control: RuntimeKernelControl::new(Arc::clone(&error)),
             tracker: Some(Arc::clone(&tracker)),
             instances: None,

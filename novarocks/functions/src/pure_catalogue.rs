@@ -302,6 +302,19 @@ pub struct PureCallSpecialization {
     source: PurePreparationSource,
 }
 impl PureCallSpecialization {
+    /// Preserve the original specialization/effect proof while preparing
+    /// the local execution lifecycle of its actual aggregate owner.
+    pub fn prepare_local_aggregate_stages(
+        &mut self,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), KernelFailure> {
+        match &mut self.prepared {
+            PreparedPureKernel::Aggregate(handle) => handle.prepare_local_stages(control),
+            _ => Err(crate::kernel_control::invalid(
+                "local stages require an aggregate specialization",
+            )),
+        }
+    }
     /// Borrow the exact record frozen at atomic owner registration. Seven ABIs
     /// map to six prepared variants, so this is never inferred from a variant.
     pub fn implementation(&self) -> &PureImplementationDeclaration {

@@ -232,6 +232,22 @@ impl super::aggregate_window_adapter::InlineAggregateWindowKernel for BasicKerne
     }
 }
 impl PreparedAggregateKernel for BasicKernel {
+    fn clone_for_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure> {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(crate::kernel_control::compile_failure)?;
+        Ok(Arc::new(Self {
+            contract,
+            operation: self.operation,
+        }))
+    }
     type State = BasicState;
     type PreparedUpdateBatch<'batch> = SelectedAggregateUpdateInput<'batch, 'batch>;
     type PreparedMergeBatch<'batch> = SelectedAggregateMergeInput<'batch, 'batch>;

@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Exact NDV lifecycle over the original shared HLL register/state author.
-use super::aggregate_hll_core::{
-    self as core, HLL_REGISTERS_COUNT, HllError, HllRawState, HllWork,
-};
+use super::aggregate_hll_core::{self as core, HLL_REGISTERS_COUNT, HllError, HllRawState, HllWork};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
@@ -88,6 +86,19 @@ fn observed_evaluation<T>(
     }
 }
 impl PreparedAggregateKernel for NdvKernel {
+    fn clone_for_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure> {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(crate::kernel_control::compile_failure)?;
+        Ok(Arc::new(Self { contract }))
+    }
     type State = NdvState;
     type PreparedUpdateBatch<'a> = NdvUpdate<'a>;
     fn has_invocation_data(&self) -> bool {

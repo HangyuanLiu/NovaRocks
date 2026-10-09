@@ -21,9 +21,7 @@
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
-use crate::approx_percentile_aggregate_core::{
-    self as core, ApproxPercentileDiagnostic as Diagnostic,
-};
+use crate::approx_percentile_aggregate_core::{self as core, ApproxPercentileDiagnostic as Diagnostic};
 use crate::approx_percentile_core as digest;
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
@@ -255,6 +253,22 @@ impl ApproxPercentileKernel {
     }
 }
 impl PreparedAggregateKernel for ApproxPercentileKernel {
+    fn clone_for_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure> {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(crate::kernel_control::compile_failure)?;
+        Ok(Arc::new(Self {
+            contract,
+            operation: self.operation,
+        }))
+    }
     type State = ApproxPercentileState;
     type PreparedUpdateBatch<'a> = ApproxPercentileUpdate<'a>;
     type PreparedMergeBatch<'a> = ApproxPercentileMerge<'a>;

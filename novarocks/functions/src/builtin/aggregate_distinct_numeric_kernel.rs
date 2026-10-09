@@ -77,6 +77,22 @@ impl DistinctNumericKernel {
     }
 }
 impl PreparedAggregateKernel for DistinctNumericKernel {
+    fn clone_for_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure> {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(crate::kernel_control::compile_failure)?;
+        Ok(Arc::new(Self {
+            contract,
+            operation: self.operation,
+        }))
+    }
     type State = NumericDistinctState;
     type PreparedUpdateBatch<'a> = SelectedAggregateUpdateInput<'a, 'a>;
     type PreparedMergeBatch<'a> = SelectedAggregateMergeInput<'a, 'a>;

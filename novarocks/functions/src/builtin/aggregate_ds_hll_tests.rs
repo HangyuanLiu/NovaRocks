@@ -898,3 +898,7 @@ fn ds_hll_host_every_actual_owned_frontier_all_seven_causes_and_last_drop() {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_ds_hll_local_stage_tests.rs"]
+mod aggregate_ds_hll_local_stage_tests;

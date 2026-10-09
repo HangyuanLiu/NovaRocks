@@ -606,10 +606,19 @@ fn build_node(
             )?;
             let complete = factory.completes_groups();
             let mut build = build_node(program, *input, ctx, error)?;
-            if complete {
+            if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
+                let (partial, final_stage) = factory.into_local_update_stages()?;
+                // Preserve the original per-driver update, serialized state,
+                // local Single exchange, then one merge/final owner.
+                build.pipeline.factories.push(Box::new(partial));
                 build = gather_to_one(build, ctx, node_id);
+                build.pipeline.factories.push(Box::new(final_stage));
+            } else {
+                if complete {
+                    build = gather_to_one(build, ctx, node_id);
+                }
+                build.pipeline.factories.push(Box::new(factory));
             }
-            build.pipeline.factories.push(Box::new(factory));
             build.stream = if complete {
                 StreamDesc::single()
             } else {

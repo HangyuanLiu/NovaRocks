@@ -19,9 +19,7 @@
 //! Registration remains disabled until actual host and lifecycle probes pass.
 use super::aggregate_ds_hll_core::{self as core, TypedDsHllStateAccess, TypedDsHllStorage};
 use super::aggregate_ds_hll_failure::*;
-use super::aggregate_ds_hll_state::{
-    self as state_core, DsHllRetainedOperation, DsHllRetainedPort,
-};
+use super::aggregate_ds_hll_state::{self as state_core, DsHllRetainedOperation, DsHllRetainedPort};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::aggregate_scalar::ScalarStateError;
@@ -452,6 +450,22 @@ impl DsHllKernel {
     }
 }
 impl PreparedAggregateKernel for DsHllKernel {
+    fn clone_for_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure> {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(crate::kernel_control::compile_failure)?;
+        Ok(Arc::new(Self {
+            contract,
+            operation: self.operation,
+        }))
+    }
     type State = DsHllState;
     type PreparedUpdateBatch<'a> = DsHllUpdate<'a>;
     type PreparedMergeBatch<'a> = DsHllMerge<'a>;

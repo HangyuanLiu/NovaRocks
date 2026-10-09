@@ -41,6 +41,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct PreparedAggregateHandle {
     inner: Arc<dyn ErasedAggregateOps>,
+    local_stages: Option<Arc<PreparedAggregateLocalStages>>,
 }
 impl PreparedAggregateHandle {
     pub fn from_typed<K: PreparedAggregateKernel>(
@@ -62,7 +63,42 @@ impl PreparedAggregateHandle {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(compile_failure)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            local_stages: None,
+        })
+    }
+    /// Authored during controlled preparation from this exact Single handle.
+    pub fn prepare_local_stages(
+        &mut self,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), KernelFailure> {
+        if self.local_stages.is_some() {
+            return Err(invalid("local aggregate stages were already prepared"));
+        }
+        let source = Arc::clone(self.contract());
+        let (partial_contract, final_contract) =
+            AggregateCallContract::local_stages(&source, control)?;
+        let partial = self.inner.clone_local_phase(partial_contract, control)?;
+        let final_stage = self.inner.clone_local_phase(final_contract, control)?;
+        if partial.state_layout() != self.state_layout()
+            || final_stage.state_layout() != self.state_layout()
+            || partial.memory_policy() != self.memory_policy()
+            || final_stage.memory_policy() != self.memory_policy()
+        {
+            return Err(internal(
+                "local aggregate phase changed its exact state owner",
+            ));
+        }
+        self.local_stages = Some(Arc::new(PreparedAggregateLocalStages {
+            source,
+            partial,
+            final_stage,
+        }));
+        Ok(())
+    }
+    pub fn local_stages(&self) -> Option<&PreparedAggregateLocalStages> {
+        self.local_stages.as_deref()
     }
     pub fn contract(&self) -> &Arc<AggregateCallContract> {
         self.inner.contract()
@@ -346,7 +382,31 @@ trait BatchExecution {
     fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure>;
     fn rows_processed(&self) -> usize;
 }
+/// Two local execution phases of one original immutable call. Each phase
+/// owns its own state-column identity; no initialized state crosses owners.
+#[derive(Clone, Debug)]
+pub struct PreparedAggregateLocalStages {
+    source: Arc<AggregateCallContract>,
+    partial: PreparedAggregateHandle,
+    final_stage: PreparedAggregateHandle,
+}
+impl PreparedAggregateLocalStages {
+    pub fn source(&self) -> &Arc<AggregateCallContract> {
+        &self.source
+    }
+    pub fn partial(&self) -> &PreparedAggregateHandle {
+        &self.partial
+    }
+    pub fn final_stage(&self) -> &PreparedAggregateHandle {
+        &self.final_stage
+    }
+}
 trait ErasedAggregateOps: Send + Sync + fmt::Debug {
+    fn clone_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedAggregateHandle, KernelFailure>;
     fn contract(&self) -> &Arc<AggregateCallContract>;
     fn layout(&self) -> Layout;
     fn policy(&self) -> AggregateStateMemoryPolicy;
@@ -432,6 +492,37 @@ impl<K: PreparedAggregateKernel> TypedOps<K> {
     }
 }
 impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
+    fn clone_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedAggregateHandle, KernelFailure> {
+        self.validate_metadata()?;
+        if self.contract.phase() != crate::AggregateKernelPhase::Single
+            || !Arc::ptr_eq(self.contract.call(), contract.call())
+            || !matches!(
+                contract.phase(),
+                crate::AggregateKernelPhase::Partial | crate::AggregateKernelPhase::Final
+            )
+        {
+            return Err(invalid(
+                "local aggregate phase differs from its original Single owner",
+            ));
+        }
+        let kernel = self
+            .kernel
+            .clone_for_local_phase(Arc::clone(&contract), control)?;
+        if !Arc::ptr_eq(kernel.contract(), &contract)
+            || kernel.memory_policy() != self.policy
+            || kernel.has_invocation_data() != self.invocation_data
+            || kernel.requires_emission_context() != self.emission_context
+        {
+            return Err(internal(
+                "local aggregate phase replaced its immutable declaration",
+            ));
+        }
+        PreparedAggregateHandle::from_typed(kernel, control)
+    }
     fn contract(&self) -> &Arc<AggregateCallContract> {
         &self.contract
     }

@@ -102,6 +102,22 @@ where
 }
 
 impl PreparedAggregateKernel for PreparedExtrema {
+    fn clone_for_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure> {
+        Ok(Arc::new(match self {
+            Self::Fixed(kernel) => Self::Fixed(ExtremaKernel {
+                contract,
+                operation: kernel.operation,
+            }),
+            Self::Utf8(kernel) => Self::Utf8(Utf8ExtremaKernel {
+                contract,
+                operation: kernel.operation,
+            }),
+        }))
+    }
     type State = ExtremaState;
     type PreparedUpdateBatch<'a> = SelectedAggregateUpdateInput<'a, 'a>;
     type PreparedMergeBatch<'a> = SelectedAggregateMergeInput<'a, 'a>;

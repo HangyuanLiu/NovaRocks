@@ -107,6 +107,21 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
         Self: 'batch;
 
     fn contract(&self) -> &Arc<AggregateCallContract>;
+    /// Explicit same-owner phase construction. The framework supplies only
+    /// its authenticated local-stage contracts; semantic fields stay owned
+    /// by this concrete implementation. No old contract pointer is reused.
+    fn clone_for_local_phase(
+        &self,
+        _contract: Arc<AggregateCallContract>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure>
+    where
+        Self: Sized,
+    {
+        Err(invalid(
+            "aggregate owner has no local-stage phase implementation",
+        ))
+    }
     fn memory_policy(&self) -> AggregateStateMemoryPolicy;
     fn create_state(
         &self,

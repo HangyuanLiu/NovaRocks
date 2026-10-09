@@ -608,7 +608,7 @@ fn prepare_call(
         decimal_overflow_policy: frozen.decimal_overflow_policy,
         proof_scope: frozen.effects.proof_scope,
     };
-    let token = functions.prepare_frozen(
+    let mut token = functions.prepare_frozen(
         input,
         Arc::clone(&selection),
         &frozen.effects,
@@ -618,6 +618,15 @@ fn prepare_call(
         },
         work.control(),
     )?;
+    work.flush()?;
+    if matches!(&node.kind, NodeKind::Aggregate { group_by, calls, .. }
+        if group_by.is_empty() && !calls.is_empty()
+            && calls.iter().all(|call| call.binding.phase == AggregatePhase::Single))
+    {
+        token
+            .prepare_local_aggregate_stages(work.control())
+            .map_err(novarocks_functions::FunctionSpecializationFailure::Kernel)?;
+    }
     work.flush()?;
     Ok(token)
 }

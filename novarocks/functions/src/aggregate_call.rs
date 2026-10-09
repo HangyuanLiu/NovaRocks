@@ -296,6 +296,43 @@ impl AggregateCallContract {
             state_interpretation,
         })
     }
+    /// Preserve one real Single binding while exposing the original local
+    /// partial/merge lifecycle. These addresses are not physical call sites.
+    pub(crate) fn local_stages(
+        source: &Arc<Self>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(Arc<Self>, Arc<Self>), KernelFailure> {
+        if source.phase != AggregateKernelPhase::Single {
+            return Err(invalid(
+                "local aggregate stages require an actual Single source",
+            ));
+        }
+        let partial = Self::try_new_impl(
+            Arc::clone(&source.call),
+            crate::AggregatePreparationOptions {
+                phase: AggregateKernelPhase::Partial,
+                distinct: source.distinct,
+                order_keys: Arc::clone(&source.order_keys),
+                state_input_type: None,
+                state_interpretation: source.state_interpretation.clone(),
+            },
+            None,
+            control,
+        )?;
+        let final_stage = Self::try_new_impl(
+            Arc::clone(&source.call),
+            crate::AggregatePreparationOptions {
+                phase: AggregateKernelPhase::Final,
+                distinct: false,
+                order_keys: Arc::from([]),
+                state_input_type: Some(source.intermediate_type().clone()),
+                state_interpretation: source.state_interpretation.clone(),
+            },
+            None,
+            control,
+        )?;
+        Ok((Arc::new(partial), Arc::new(final_stage)))
+    }
     pub fn state_interpretation(
         &self,
     ) -> Option<&novarocks_type_contract::AggregateStateInterpretation> {
