@@ -1177,3 +1177,7 @@ mod tests {
         assert!(err.contains("output too large"));
     }
 }
+
+#[cfg(test)]
+#[path = "generate_series_original_baseline_tests.rs"]
+mod generate_series_original_baseline_tests;
