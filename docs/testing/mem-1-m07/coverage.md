@@ -632,3 +632,14 @@ actual admission13 PASS、内部3 PASS，feature catalog80 PASS/default catalog6
 实际 marker IO 保原 io::Error，私有有限 Debug/Display wrapper 经 source formatter-panic canary 验证；实际 run_one 的 launch_config/clock 拒绝保原 primary＋teardown Arc 身份，teardown 一次。scanner6 PASS、新 runner 反例3 PASS、runner全组件279 PASS/0FAIL/2既有ignored、neutral marker2 PASS、双feature FE server24 PASS/0FAIL/0ignored；重叠计数不累加。non-test Server default/neutral/both 三配置与runner check、fmt/diff-check PASS。初次错误 --lib 调用在编译前拒绝和fmt单行换行失败均保留原日志。收据 `docs/testing/mem-1-m07/evidence/p09-neutral-fe-source-components-20261009.json` pin实际11 source、原exact/lock、草稿、v1/v2独立review与实际logs；dev unoptimized/jobs1/incremental0/threads1。
 
 本切片 Native/stock服务0，不把prelaunch拒绝当成功启动、source/marker组件当实际Native身份或20s物理syscall抢占。旧同步startup/source等待保持前后clock拒晚成功；中间Passed artifact须配原runner终态0与外部独立final verifier。实际build identity/clean source input admission、具体held-response scene/原handle全分支settle、同context正BE holder/seal后两次ACK-only consumed1 accepted0、释放后原MySQL恢复/四role退出仍OPEN。fullClosing64/完整backing-lastalias/P08/P00b/P09/P10/final同SHA及两个人工语义门不闭合；IRU-7 HMS非只读正确性excluded，caps/deadlines不改，无push/PR/归档。
+
+
+### 2026-10-09：P07 完整 backing 与一字节末 alias 组件 PASS
+
+前一 neutral FE/source/clock 检查点为 `5e2857ee8`。仅扩展原 Worker guarded_bytes 和 Native root_result_reader 两个 integration-test binary 的既有 allocator oracle；固定8条actual pointer/Layout/ordinal，按实际Bytes地址范围认领唯一live backing，System.dealloc实际返回后才记free，替换同size最后pointer误判。原生产owner、budget/credit callback、Bytes::from_owner、cap/deadline/default路径与依赖未改。
+
+Worker实际1MiB Vec可见4B、最后1B slice：非末alias退出后原credit仍Blocked；原guard直接观察同allocation post-dealloc，再由原credit字段退出；之后完整1MiB可重新Granted。Native实际unary短wire仍持完整SEGMENT encoder backing，所有非末clone/slice退出仍retain root与copy credit；最后DATAalias退出后actualfree/physical_idle/完整COPY回用。ACK捕获真实decoder/send两块envelope backing，按ordinal区分合法同址ABA；ACK已经retire Data，只验证原fixed metadata owner，不伪称process Data位置仍满。第9块actualallocation使oracle sticky invalid，全部drop也不得声称reclamation成功。
+
+actual Worker完整7 PASS、Native reader完整27 PASS，均0FAIL/0ignored/terminal0；包含五项新增和所有原probe，不用新测试替代旧回归。fmt/diffcheckPASS；收据 `docs/testing/mem-1-m07/evidence/p07-physical-backing-components-20261009.json` pin两actualsource、未改productionowner/lock、原finaldraft/pins和logs；dev unoptimized/jobs1/incremental0/threads1。component-only，无Native/stock服务。
+
+只证明选定same-thread System Layout/capacity与post-return实际free，非usable size/RSS/cache或全部allocator；native credit退出顺序仍同时依据未改GuardedOwner字段序，Bytes wrapper固定metadata例外保持ADR-0168。Closing old+new copy峰值/returnable失败回滚、fixed-core完整backing、其它domain/window/Arrow及跨线程最后alias、held-response Native/fullClosing64/P08/P00b/P09/P10/final同SHA仍OPEN。两个人工语义门与IRU-7 HMS非只读excluded不改，无push/PR/归档。

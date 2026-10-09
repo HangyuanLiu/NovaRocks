@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "5e2857ee8454c556982e4826c128da7ade5ec598",
+  "status": "P07_SELECTED_ACTUAL_BACKING_LAST_ALIAS_COMPONENT_PASS_FULL_BACKING_NATIVE_OPEN",
+  "source_files": [
+    {
+      "path": "novarocks/worker/tests/guarded_bytes.rs",
+      "bytes": 15325,
+      "sha256": "1358693218de605850fff4a2f3a2b280666a8dc9b9e862f8dff602a288e3847f"
+    },
+    {
+      "path": "novarocks/native-adapter/tests/root_result_reader.rs",
+      "bytes": 54602,
+      "sha256": "dd7747f76addab39778de0064ff015a2b0d49878d1263a827be0204c19c8c886"
+    }
+  ],
+  "unchanged_production_owners": [
+    {
+      "path": "novarocks/worker/src/guarded_bytes.rs",
+      "bytes": 3108,
+      "sha256": "a98ec1dca1caeac8e6c5ccfb0cd4638d48ad4ff89827460be4e9a3d6f4e550a7"
+    },
+    {
+      "path": "novarocks/worker/src/result_buffer.rs",
+      "bytes": 84570,
+      "sha256": "42227ecb933f5ba0d1e0333d2062bdf03690329e4eb826e0633a43be40e7f649"
+    },
+    {
+      "path": "novarocks/native-adapter/src/root_result_reader.rs",
+      "bytes": 10428,
+      "sha256": "161155ab28b26a69f93f59c48663a240cfe58e2bbebc807ffdcae8bca1b3d4f6"
+    },
+    {
+      "path": "novarocks/native-adapter/src/root_result_unary.rs",
+      "bytes": 12915,
+      "sha256": "4a562eb3abe251e18b8ad0308dc66f4b5207650ca30eee988ee02b32766961cc"
+    }
+  ],
+  "dependency_lock": {
+    "path": "Cargo.lock",
+    "bytes": 190820,
+    "sha256": "329758dab8450639028e5ca6d150f400de0c56930d16154afad0a356823f6e10"
+  },
+  "draft_provenance": [
+    {
+      "path": "logs/mem-1-m07/p07-physical-backing-component-draft-v1/physical-backing-component.v1.draft.patch",
+      "bytes": 26247,
+      "sha256": "81e90682702211fddac0cfc63f682f96c685bb88f78186aecd1ca6d60b8c8151"
+    },
+    {
+      "path": "logs/mem-1-m07/p07-physical-backing-component-draft-v1/notes.md",
+      "bytes": 8160,
+      "sha256": "209f2a2e69703423b0de46e10cdc9f0081d9020787399e9c2892de3e1f3390f5"
+    },
+    {
+      "path": "logs/mem-1-m07/p07-physical-backing-component-draft-v1/sourcepins.json",
+      "bytes": 1669,
+      "sha256": "ade2587e9ec5bf87431669836a1bae1c7326153fc3ecea9d314f45002f0f7678"
+    },
+    {
+      "path": "logs/mem-1-m07/p07-physical-backing-component-draft-v1/artifact-hashes.json",
+      "bytes": 738,
+      "sha256": "e4a6668c8c2aaf56cea2452f957611a06191a9ea7b830b9bd34237f57f503510"
+    }
+  ],
+  "verification": [
+    {
+      "path": "logs/mem-1-m07/p07-physical-backing-worker-tests-20261009.log",
+      "bytes": 3345,
+      "sha256": "0ec71242cb5e1789080ae049b2345578f2e4635bcedc2dd5cee067750f4a25dc",
+      "scope": "complete guarded_bytes integration test binary; three new tests",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 8138,
+      "actual_terminal_exit_code": 0
+    },
+    {
+      "path": "logs/mem-1-m07/p07-physical-backing-native-reader-tests-20261009.log",
+      "bytes": 49796,
+      "sha256": "4c62913f65c2aa87e3a015dc00175de9eeb22013fdd0898dcabb81cdafe206cd",
+      "scope": "complete root_result_reader integration test binary; two new tests and all existing unary probes",
+      "passed": 27,
+      "failed": 0,
+      "ignored": 0,
+      "actual_session": 19458,
+      "actual_terminal_exit_code": 0
+    }
+  ],
+  "behavior": [
+    "A fixed eight-descriptor same-thread oracle records actual System allocation pointer, complete Layout and ordinal; it records free only after System.dealloc returns.",
+    "Actual one-byte Bytes aliases map by address range to their unique live backing, rather than choosing the last allocation with the same size.",
+    "The original worker process credit is still Blocked after all nonfinal aliases exit; original guard observes post-dealloc before its original credit field releases, after which complete capacity can be granted again.",
+    "Actual tonic unary Data uses its complete SEGMENT encoder backing despite a short wire body; all nonfinal clones/slices retain backing and original root/process-credit holders.",
+    "The actual ACK decoder and send buffers both have descriptors; decoder free and live DATA ordinal are separate even under valid address reuse.",
+    "ACK retires Data before projection and retains fixed metadata owners; its test does not falsely require the already returned process Data position to stay blocked.",
+    "Actual ninth allocation overflows the fixed oracle and keeps successful-reclamation evidence permanently invalid even after all allocations are dropped."
+  ],
+  "component_boundary": [
+    "Actual System Layout/capacity and same-thread post-return frees are proved for these selected owned allocations, not malloc usable size, RSS, allocator cache or all engine allocations.",
+    "The worker test directly observes original credit callback ordering; unary callback ordering also relies on the unchanged production GuardedOwner field order.",
+    "Selected component tonic bodies are not live H2/listener/FE or 1FE+3BE; there is no cross-thread last-drop claim.",
+    "Fixed Bytes wrapper metadata remains the existing ADR-0168 exception and frees after guard exit; no vendor patch or second wallet is introduced."
+  ],
+  "remaining_open": [
+    "Closing old/new copy coexistence, actual peak and returnable failure rollback.",
+    "Fixed-core complete backing and other domain/window/Arrow last-alias evidence.",
+    "Held-response Native, full Closing64, other P07/P08/P00b/P09/P10 and final same-SHA gates."
+  ],
+  "profile": "dev unoptimized; CARGO_BUILD_JOBS=1; CARGO_INCREMENTAL=0; --test-threads=1",
+  "production_semantics_changed": false,
+  "native_or_stock_services_started_in_this_slice": 0,
+  "hms_non_readonly_correctness": "EXCLUDED_BY_USER_IRU7_SCOPE",
+  "publish_authorized": false,
+  "goal_complete": false
+}

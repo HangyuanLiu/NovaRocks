@@ -861,11 +861,136 @@ impl UnaryFixture {
     }
 }
 
+// Same-thread component oracle only. No allocator hook allocates, logs, locks,
+// panics, or retains any body bytes. Eight actual allocations are the hard cap.
+const PHYSICAL_RECORD_CAP: usize = 8;
+#[derive(Clone, Copy, Debug, Default)]
+struct PhysicalAllocation {
+    pointer: usize,
+    bytes: usize,
+    align: usize,
+    dealloc_returned: bool,
+}
+impl PhysicalAllocation {
+    const EMPTY: Self = Self {
+        pointer: 0,
+        bytes: 0,
+        align: 0,
+        dealloc_returned: false,
+    };
+}
+#[derive(Clone, Copy, Debug)]
+struct PhysicalProbe {
+    selected_size: usize,
+    records: [PhysicalAllocation; PHYSICAL_RECORD_CAP],
+    used: usize,
+    invalid: bool,
+}
+impl PhysicalProbe {
+    const EMPTY: Self = Self {
+        selected_size: 0,
+        records: [PhysicalAllocation::EMPTY; PHYSICAL_RECORD_CAP],
+        used: 0,
+        invalid: false,
+    };
+    fn allocated(&mut self, pointer: *mut u8, layout: Layout) {
+        if self.selected_size == 0 || self.selected_size != layout.size() {
+            return;
+        }
+        if pointer.is_null()
+            || self.used == PHYSICAL_RECORD_CAP
+            || self.records[..self.used]
+                .iter()
+                .any(|record| record.pointer == pointer as usize && !record.dealloc_returned)
+        {
+            self.invalid = true;
+            return;
+        }
+        self.records[self.used] = PhysicalAllocation {
+            pointer: pointer as usize,
+            bytes: layout.size(),
+            align: layout.align(),
+            dealloc_returned: false,
+        };
+        self.used += 1;
+    }
+    fn live_pointer(&self, pointer: *mut u8) -> Option<usize> {
+        self.records[..self.used]
+            .iter()
+            .position(|record| record.pointer == pointer as usize && !record.dealloc_returned)
+    }
+    fn reallocated(
+        &mut self,
+        pointer: *mut u8,
+        result: *mut u8,
+        layout: Layout,
+        size: usize,
+    ) -> bool {
+        let Some(index) = self.live_pointer(pointer) else {
+            return false;
+        };
+        // Reallocation is never accepted as the no-growth proof. Keep enough
+        // exact identity to observe the eventual free, including realloc fail.
+        self.invalid = true;
+        if !result.is_null() {
+            self.records[index].pointer = result as usize;
+            self.records[index].bytes = size;
+            self.records[index].align = layout.align();
+        }
+        true
+    }
+    fn deallocated_after_return(&mut self, pointer: *mut u8, layout: Layout) {
+        let Some(index) = self.live_pointer(pointer) else {
+            return;
+        };
+        let record = &mut self.records[index];
+        if record.bytes != layout.size() || record.align != layout.align() {
+            self.invalid = true;
+            return;
+        }
+        record.dealloc_returned = true;
+    }
+    fn all_deallocated(&self) -> bool {
+        !self.invalid
+            && self.used > 0
+            && self.records[..self.used]
+                .iter()
+                .all(|record| record.dealloc_returned)
+    }
+    fn live_alias(&self, pointer: *const u8, bytes: usize) -> usize {
+        assert!(
+            !self.invalid,
+            "physical oracle overflow or invalid allocation"
+        );
+        assert!(bytes > 0, "empty alias cannot identify backing");
+        let start = pointer as usize;
+        let end = start.checked_add(bytes).expect("alias address overflow");
+        let mut matched = None;
+        for (index, record) in self.records[..self.used].iter().enumerate() {
+            if !record.dealloc_returned
+                && start >= record.pointer
+                && end
+                    <= record
+                        .pointer
+                        .checked_add(record.bytes)
+                        .expect("backing address overflow")
+            {
+                assert!(
+                    matched.replace(index).is_none(),
+                    "ambiguous physical backing"
+                );
+            }
+        }
+        matched.expect("actual alias must belong to one captured live allocation")
+    }
+}
+
 thread_local! {
-    static SEND_ALLOC_SIZE: Cell<usize> = const { Cell::new(0) };
-    static SEND_ALLOC_POINTER: Cell<usize> = const { Cell::new(0) };
+    static SEND_PHYSICAL: Cell<PhysicalProbe> = const { Cell::new(PhysicalProbe::EMPTY) };
     static SEND_ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
     static SEND_REALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+    // Compatibility aggregate for existing tests: every selected allocation
+    // must have returned from System.dealloc, not merely the last pointer.
     static SEND_FREED: Cell<bool> = const { Cell::new(false) };
 }
 struct SendAllocationProbe;
@@ -874,46 +999,75 @@ static SEND_ALLOCATOR: SendAllocationProbe = SendAllocationProbe;
 unsafe impl GlobalAlloc for SendAllocationProbe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
-        let selected = SEND_ALLOC_SIZE
-            .try_with(|size| size.get() != 0 && size.get() == layout.size())
-            .unwrap_or(false);
-        if selected {
-            let _ = SEND_ALLOC_POINTER.try_with(|value| value.set(pointer as usize));
-            let _ = SEND_ALLOC_COUNT.try_with(|value| value.set(value.get() + 1));
-            let _ = SEND_FREED.try_with(|value| value.set(false));
-        }
+        let _ = SEND_PHYSICAL.try_with(|cell| {
+            let mut probe = cell.get();
+            let selected = probe.selected_size != 0 && probe.selected_size == layout.size();
+            probe.allocated(pointer, layout);
+            cell.set(probe);
+            if selected {
+                let _ = SEND_ALLOC_COUNT.try_with(|count| count.set(count.get().saturating_add(1)));
+                let _ = SEND_FREED.try_with(|freed| freed.set(false));
+            }
+        });
         pointer
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let selected = SEND_ALLOC_POINTER
-            .try_with(|value| value.get() != 0 && value.get() == pointer as usize)
-            .unwrap_or(false);
         let result = unsafe { System.realloc(pointer, layout, size) };
-        if selected {
-            let _ = SEND_REALLOC_COUNT.try_with(|value| value.set(value.get() + 1));
-            let _ = SEND_ALLOC_POINTER.try_with(|value| value.set(result as usize));
-        }
+        let _ = SEND_PHYSICAL.try_with(|cell| {
+            let mut probe = cell.get();
+            if probe.reallocated(pointer, result, layout, size) {
+                let _ =
+                    SEND_REALLOC_COUNT.try_with(|count| count.set(count.get().saturating_add(1)));
+                let _ = SEND_FREED.try_with(|freed| freed.set(false));
+            }
+            cell.set(probe);
+        });
         result
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        let selected = SEND_ALLOC_POINTER
-            .try_with(|value| value.get() != 0 && value.get() == pointer as usize)
-            .unwrap_or(false);
         unsafe { System.dealloc(pointer, layout) };
-        if selected {
-            let _ = SEND_FREED.try_with(|value| value.set(true));
-        }
+        let _ = SEND_PHYSICAL.try_with(|cell| {
+            let mut probe = cell.get();
+            probe.deallocated_after_return(pointer, layout);
+            cell.set(probe);
+            let _ = SEND_FREED.try_with(|freed| freed.set(probe.all_deallocated()));
+        });
     }
 }
 fn start_send_probe(capacity: usize) {
-    SEND_ALLOC_POINTER.with(|value| value.set(0));
+    SEND_PHYSICAL.with(|cell| {
+        let mut probe = PhysicalProbe::EMPTY;
+        probe.selected_size = capacity;
+        cell.set(probe);
+    });
     SEND_ALLOC_COUNT.with(|value| value.set(0));
     SEND_REALLOC_COUNT.with(|value| value.set(0));
     SEND_FREED.with(|value| value.set(false));
-    SEND_ALLOC_SIZE.with(|value| value.set(capacity));
 }
 fn stop_send_probe() {
-    SEND_ALLOC_SIZE.with(|value| value.set(0));
+    SEND_PHYSICAL.with(|cell| {
+        let mut probe = cell.get();
+        probe.selected_size = 0;
+        cell.set(probe);
+    });
+}
+fn send_snapshot() -> PhysicalProbe {
+    SEND_PHYSICAL.with(Cell::get)
+}
+struct SendCapture;
+impl SendCapture {
+    fn begin(bytes: usize) -> Self {
+        start_send_probe(bytes);
+        Self
+    }
+    fn stop(&self) {
+        stop_send_probe();
+    }
+}
+impl Drop for SendCapture {
+    fn drop(&mut self) {
+        stop_send_probe();
+    }
 }
 fn unary_request(read: &RootResultRead) -> axum::http::Request<axum::body::Body> {
     let message = novarocks_task_codec::root_result::encode_read(read);
@@ -1252,4 +1406,128 @@ async fn unary_count_only_end_uses_the_same_frozen_codec_without_row_payload() {
     assert_eq!(end.output_rows, 1);
     drop(body);
     assert!(fixture.root.physical_idle());
+}
+
+#[tokio::test]
+async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_slice_drops() {
+    let fixture = UnaryFixture::new(false);
+    fixture.finish();
+    let capture = SendCapture::begin(SEGMENT);
+    let response = root_result_unary(
+        &fixture.reader,
+        unary_request(&fixture.request(Some(1), 0, 1)),
+    )
+    .await;
+    capture.stop();
+    let mut body = response.into_body();
+    let data = unary_data(&mut body).await;
+    let before = send_snapshot();
+    assert!(!before.invalid);
+    assert_eq!(before.used, 1);
+    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
+    let allocation = before.live_alias(data.as_ptr(), data.len());
+    assert_eq!(before.records[allocation].bytes, SEGMENT);
+    // The visible protobuf/wire bytes are genuinely short, but their original
+    // encoder allocation is the full granted SEGMENT-sized backing.
+    assert!(data.len() > 5 && data.len() < SEGMENT / 1024);
+    assert_eq!(before.live_alias(data.as_ptr(), 1), allocation);
+    let message = unary_message(&data);
+    let decoded = novarocks_task_codec::root_result::decode_reply(
+        message,
+        &fixture.request(Some(1), 0, 1),
+        0,
+        novarocks_proto_codec::FieldPath::root("root_reply"),
+    )
+    .unwrap();
+    let RootReadOutcome::Data(payload) = decoded.outcome else {
+        panic!("Data")
+    };
+    assert_eq!(payload.body().as_ref(), b"\x02\0\0\0\x011");
+    drop(payload);
+    let clone = data.clone();
+    let short = data.slice(5..6);
+    let last = short.clone();
+    assert_eq!(last.len(), 1);
+    assert_eq!(before.live_alias(last.as_ptr(), last.len()), allocation);
+    drop(data);
+    fixture.seal();
+    drop(body);
+    let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
+    for alias in [clone, short] {
+        drop(alias);
+        let state = send_snapshot();
+        assert!(!state.invalid);
+        assert!(!state.records[allocation].dealloc_returned);
+        assert!(!fixture.root.physical_idle());
+        assert!(matches!(
+            fixture.budget.try_reserve_process(1).unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+    }
+    assert_eq!(last.len(), 1);
+    drop(last);
+    let after = send_snapshot();
+    assert!(!after.invalid);
+    assert!(after.records[allocation].dealloc_returned);
+    assert!(after.all_deallocated());
+    assert!(fixture.root.physical_idle());
+    drop(fixture.fill_process(COPY));
+    drop(filler);
+}
+
+#[tokio::test]
+async fn unary_ack_same_size_decoder_and_send_backings_are_distinct_until_last_data_alias_exit() {
+    let fixture = UnaryFixture::new(false);
+    fixture.finish();
+    drop(owned(
+        fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
+    ));
+    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - fixture.header_bytes());
+    let capture = SendCapture::begin(RootProfileV1::ENVELOPE_BYTES);
+    let response =
+        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
+    capture.stop();
+    let mut body = response.into_body();
+    let data = unary_data(&mut body).await;
+    let before = send_snapshot();
+    assert!(!before.invalid);
+    assert_eq!(
+        before.used, 2,
+        "actual decoder and send buffers are both recorded"
+    );
+    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
+    let send_id = before.live_alias(data.as_ptr(), data.len());
+    let decoder_id = 1 - send_id;
+    assert!(before.records[decoder_id].dealloc_returned);
+    assert!(!before.records[send_id].dealloc_returned);
+    // Freed decoder and live send storage may legally reuse the same address.
+    // Their distinct ordinal/lifecycle facts, not pointer inequality, identify
+    // this response's actual DATA allocation.
+    let message = unary_message(&data);
+    assert_eq!(message.accepted_consumed_sequence, 1);
+    assert_eq!(
+        message.outcome,
+        Some(wire::fetch_root_result_response::Outcome::AckOnly(true))
+    );
+    let clone = data.clone();
+    let last = data.slice(5..6);
+    assert_eq!(before.live_alias(last.as_ptr(), last.len()), send_id);
+    drop(body);
+    drop(data);
+    drop(clone);
+    let middle = send_snapshot();
+    assert!(middle.records[decoder_id].dealloc_returned);
+    assert!(!middle.records[send_id].dealloc_returned);
+    assert!(!middle.all_deallocated());
+    assert!(!fixture.root.physical_idle());
+    // ACK retires the data position before projection, so its backing is held
+    // by the original fixed metadata reservation, not by process data credit.
+    // Do not assert that the already-released process data slot is blocked.
+    drop(last);
+    let after = send_snapshot();
+    assert!(!after.invalid);
+    assert!(after.all_deallocated());
+    assert!(fixture.root.physical_idle());
+    drop(fixture.fill_process(SEGMENT));
+    drop(filler);
 }
