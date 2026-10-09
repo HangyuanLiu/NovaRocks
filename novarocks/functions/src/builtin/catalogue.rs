@@ -3075,6 +3075,9 @@ pub fn contribute_builtin_functions(
                     "bitmap_union_int" | "bitmap_agg" => {
                         Some(super::aggregate_bitmap_union_int_owner::effects())
                     }
+                    "hll_union" | "hll_raw_agg" | "hll_union_agg" => {
+                        Some(super::aggregate_hll_payload_owner::effects())
+                    }
                     "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
                     "ds_hll_count_distinct"
                     | "approx_count_distinct_hll_sketch"
@@ -3223,6 +3226,17 @@ pub fn contribute_builtin_functions(
         }
         if declaration.name == "multi_distinct_count" {
             builder.register(super::aggregate_count_distinct_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if matches!(
+            declaration.name,
+            "hll_union" | "hll_raw_agg" | "hll_union_agg"
+        ) {
+            builder.register(super::aggregate_hll_payload_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -5192,38 +5206,6 @@ pub(super) fn ds_hll_host_test_catalog() -> EngineFunctionCatalog {
     builder.seal().unwrap()
 }
 
-// Test-only attachment to the original immutable binding and resolver authors.
-#[cfg(test)]
-pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
-    let native = build_builtin_engine_function_catalog().unwrap();
-    let original = native
-        .definition("map_agg", FunctionKind::Aggregate)
-        .unwrap()
-        .binding_declaration()
-        .unwrap();
-    let declaration = FunctionBindingDeclaration::try_new(
-        original.function_id().clone(),
-        original.kind(),
-        original.overloads().iter().cloned().map(|mut overload| {
-            overload.effects = Some(super::aggregate_map_owner::effects());
-            overload
-        }),
-    )
-    .unwrap();
-    let declaration_source = builtin_aggregate_declarations()
-        .into_iter()
-        .find(|declaration| declaration.name == "map_agg")
-        .unwrap();
-    let resolver = Arc::new(BuiltinAggregateResolver {
-        declaration: declaration_source,
-    });
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(super::aggregate_map_owner::definition("map_agg", declaration, resolver).unwrap())
-        .unwrap();
-    builder.seal_bound().unwrap()
-}
-
 #[cfg(test)]
 pub(super) fn bitmap_union_int_test_catalog() -> EngineFunctionCatalog {
     let original = build_builtin_engine_function_catalog().unwrap();
@@ -5259,4 +5241,69 @@ pub(super) fn bitmap_union_int_test_catalog() -> EngineFunctionCatalog {
             .unwrap();
     }
     builder.seal().unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn hll_payload_aggregate_test_catalog() -> EngineFunctionCatalog {
+    let original = build_builtin_engine_function_catalog().unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    for declaration in builtin_aggregate_declarations()
+        .into_iter()
+        .filter(|item| matches!(item.name, "hll_union" | "hll_raw_agg" | "hll_union_agg"))
+    {
+        let raw = original
+            .definition(declaration.name, FunctionKind::Aggregate)
+            .unwrap()
+            .binding_declaration()
+            .unwrap();
+        let binding = FunctionBindingDeclaration::try_new(
+            raw.function_id().clone(),
+            raw.kind(),
+            raw.overloads().iter().cloned().map(|mut overload| {
+                overload.effects = Some(super::aggregate_hll_payload_owner::effects());
+                overload
+            }),
+        )
+        .unwrap();
+        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+        builder
+            .register(
+                super::aggregate_hll_payload_owner::definition(declaration.name, binding, resolver)
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    builder.seal().unwrap()
+}
+
+// Test-only attachment to the original immutable binding and resolver authors.
+#[cfg(test)]
+pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
+    let native = build_builtin_engine_function_catalog().unwrap();
+    let original = native
+        .definition("map_agg", FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap();
+    let declaration = FunctionBindingDeclaration::try_new(
+        original.function_id().clone(),
+        original.kind(),
+        original.overloads().iter().cloned().map(|mut overload| {
+            overload.effects = Some(super::aggregate_map_owner::effects());
+            overload
+        }),
+    )
+    .unwrap();
+    let declaration_source = builtin_aggregate_declarations()
+        .into_iter()
+        .find(|declaration| declaration.name == "map_agg")
+        .unwrap();
+    let resolver = Arc::new(BuiltinAggregateResolver {
+        declaration: declaration_source,
+    });
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(super::aggregate_map_owner::definition("map_agg", declaration, resolver).unwrap())
+        .unwrap();
+    builder.seal_bound().unwrap()
 }

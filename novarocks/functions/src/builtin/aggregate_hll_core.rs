@@ -659,3 +659,99 @@ fn canonical_f64_bits_for_hll(value: f64) -> u64 {
 #[cfg(test)]
 #[path = "aggregate_hll_core_tests.rs"]
 mod tests;
+/// Original aggregate payload carrier projection; admission precedes NULL/empty rows.
+#[derive(Clone, Copy, Debug)]
+pub enum HllPayloadInputFailure<'a> {
+    Unsupported(&'a DataType),
+    Downcast(&'static str),
+}
+impl std::fmt::Display for HllPayloadInputFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(ty) => write!(
+                f,
+                "hll aggregate expects HLL/BINARY payload input, got {:?}",
+                ty
+            ),
+            Self::Downcast(message) => f.write_str(message),
+        }
+    }
+}
+pub enum HllPayloadInput<'a> {
+    Binary(&'a BinaryArray),
+    Utf8(&'a StringArray),
+    LargeBinary(&'a LargeBinaryArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+impl<'a> HllPayloadInput<'a> {
+    pub fn try_new(array: &'a ArrayRef) -> Result<Self, HllPayloadInputFailure<'a>> {
+        match array.data_type() {
+            DataType::Binary => array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .map(Self::Binary)
+                .ok_or(HllPayloadInputFailure::Downcast(
+                    "failed to downcast to BinaryArray",
+                )),
+            DataType::Utf8 => array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(Self::Utf8)
+                .ok_or(HllPayloadInputFailure::Downcast(
+                    "failed to downcast to StringArray",
+                )),
+            DataType::LargeBinary => array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .map(Self::LargeBinary)
+                .ok_or(HllPayloadInputFailure::Downcast(
+                    "failed to downcast to LargeBinaryArray",
+                )),
+            DataType::LargeUtf8 => array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .map(Self::LargeUtf8)
+                .ok_or(HllPayloadInputFailure::Downcast(
+                    "failed to downcast to LargeStringArray",
+                )),
+            other => Err(HllPayloadInputFailure::Unsupported(other)),
+        }
+    }
+    pub fn row(&self, row: usize) -> Option<&'a [u8]> {
+        macro_rules! bytes {
+            ($a:expr,$value:expr) => {
+                if $a.is_null(row) { None } else { Some($value) }
+            };
+        }
+        match self {
+            Self::Binary(a) => bytes!(a, a.value(row)),
+            Self::Utf8(a) => bytes!(a, a.value(row).as_bytes()),
+            Self::LargeBinary(a) => bytes!(a, a.value(row)),
+            Self::LargeUtf8(a) => bytes!(a, a.value(row).as_bytes()),
+        }
+    }
+}
+/// ONE original NULL/row traversal. Consumers supply only original state-address projection.
+pub fn merge_payload_rows<E>(
+    input: &HllPayloadInput<'_>,
+    rows: impl Iterator<Item = usize>,
+    mut consume: impl FnMut(usize, &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    for row in rows {
+        if let Some(bytes) = input.row(row) {
+            consume(row, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Original nullable HLL union result; the value-counting NDV zero projection belongs to its caller.
+pub fn nullable_payload_cardinality<A: HllRegisterAllocator>(
+    state: Option<&HllRawState<A>>,
+    work: &mut HllWork<'_, '_>,
+) -> Result<Option<i64>, HllError> {
+    match state {
+        Some(state) if state.has_value => estimate_cardinality(state, work).map(Some),
+        _ => Ok(None),
+    }
+}

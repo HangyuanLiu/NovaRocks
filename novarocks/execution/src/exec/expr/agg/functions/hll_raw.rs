@@ -128,54 +128,12 @@ fn merge_input_array(
     offset: usize,
     state_ptrs: &[AggStatePtr],
 ) -> Result<(), String> {
-    macro_rules! merge_payload {
-        ($arr:expr, $row:ident => $bytes:expr) => {{
-            for ($row, &base) in state_ptrs.iter().enumerate() {
-                if $arr.is_null($row) {
-                    continue;
-                }
-                let ptr = unsafe { (base as *mut u8).add(offset) };
-                let state = unsafe { get_or_init_state(ptr) };
-                merge_hll_bytes(state, $bytes)?;
-            }
-            Ok(())
-        }};
-    }
-
-    match array.data_type() {
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row))
-        }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row).as_bytes())
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row).as_bytes())
-        }
-        other => Err(format!(
-            "hll aggregate expects HLL/BINARY payload input, got {:?}",
-            other
-        )),
-    }
+    let input = core::HllPayloadInput::try_new(array).map_err(|failure| failure.to_string())?;
+    core::merge_payload_rows(&input, 0..state_ptrs.len(), |row, bytes| {
+        let ptr = unsafe { (state_ptrs[row] as *mut u8).add(offset) };
+        let state = unsafe { get_or_init_state(ptr) };
+        merge_hll_bytes(state, bytes)
+    })
 }
 
 fn hash_update_input_array(
@@ -360,14 +318,12 @@ impl AggregateFunction for HllRawAgg {
                     let state = unsafe { get_state(ptr) };
                     // Value-counting NDV aggregates return zero for empty or all-null
                     // groups. HLL union cardinality retains its nullable result.
-                    match state {
-                        Some(s) if s.has_value => {
-                            builder.append_value(estimate_cardinality(s));
-                        }
-                        _ if matches!(spec.kind, AggKind::HllRawHash) => {
-                            builder.append_value(0);
-                        }
-                        _ => builder.append_null(),
+                    match core::nullable_payload_cardinality(state, &mut HllWork::new(None))
+                        .expect("no-control legacy estimate is infallible")
+                    {
+                        Some(value) => builder.append_value(value),
+                        None if matches!(spec.kind, AggKind::HllRawHash) => builder.append_value(0),
+                        None => builder.append_null(),
                     }
                 }
                 Ok(std::sync::Arc::new(builder.finish()) as ArrayRef)
@@ -827,3 +783,7 @@ mod tests {
 #[cfg(test)]
 #[path = "legacy_ndv_hll_baseline_tests.rs"]
 mod legacy_ndv_hll_baseline_tests;
+
+#[cfg(test)]
+#[path = "hll_payload_aggregate_original_tests.rs"]
+mod original_payload_aggregate_tests;

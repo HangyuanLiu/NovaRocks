@@ -189,6 +189,11 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     fn has_invocation_data(&self) -> bool {
         false
     }
+    /// Exact owner setup may precede row traversal and reject an empty carrier.
+    /// Other owners retain the original empty-invocation preparation skip.
+    fn requires_empty_update_preparation(&self) -> bool {
+        false
+    }
     /// Only owners whose emission consumes the real host receipt opt in.
     fn requires_emission_context(&self) -> bool {
         false
@@ -575,11 +580,12 @@ impl<'batch, K: PreparedAggregateKernel> AggregateUpdateInvocation<'batch, K> {
                 invalid("aggregate update input differs from exact prepared contract").into(),
             );
         }
-        let prepared = if input.selection().is_empty() {
-            None
-        } else {
-            Some(kernel.prepare_update_evaluation(input, mapping, allocator, control)?)
-        };
+        let prepared =
+            if input.selection().is_empty() && !kernel.requires_empty_update_preparation() {
+                None
+            } else {
+                Some(kernel.prepare_update_evaluation(input, mapping, allocator, control)?)
+            };
         control.checkpoint(0)?;
         Ok(Self {
             kernel,

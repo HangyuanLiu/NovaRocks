@@ -1843,3 +1843,6 @@ mod pure_differential_map_agg_tests;
 #[cfg(test)]
 #[path = "pure_differential_bitmap_agg_tests.rs"]
 mod bitmap_agg_tests;
+
+#[path = "pure_differential_hll_payload_aggregate_tests.rs"]
+mod hll_payload_aggregate_tests;
