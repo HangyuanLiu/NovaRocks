@@ -18,14 +18,15 @@
 
 """Verify that every NovaRocks Cargo graph uses one DataSketches release.
 
-The contract is intentionally expressed in Cargo's resolved package graph and
-lockfiles.  Manifest spelling, consumer count, and source-tree shape are not
-dependency identities and therefore are not inspected here.
+The root manifest owns the exact stable release requirement; Cargo's resolved
+package graphs and committed lockfiles must agree on its identity and checksum.
+Consumer count and source-tree shape are not dependency identities.
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -33,9 +34,7 @@ from pathlib import Path
 
 
 PACKAGE = "datasketches"
-VERSION = "0.5.0"
 SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-CHECKSUM = "11c0bd7d22989969a619bae09147b992a6aa7f31dd4f9d9af6345f533744781f"
 
 # Build outputs, disposable test output, and checked-in third-party sources are
 # not NovaRocks-owned workspace roots.  A vendored package can still appear in
@@ -72,6 +71,28 @@ def load_toml(path: Path, description: str) -> dict:
         fail(f"cannot read {description} {path}: {error}")
     except tomllib.TOMLDecodeError as error:
         fail(f"invalid {description} {path}: {error}")
+
+
+def expected_version(repo_root: Path) -> str:
+    manifest = load_toml(repo_root / "Cargo.toml", "root Cargo manifest")
+    workspace = manifest.get("workspace", {})
+    dependencies = workspace.get("dependencies", {}) if isinstance(workspace, dict) else {}
+    if not isinstance(dependencies, dict) or PACKAGE not in dependencies:
+        fail(f"root manifest must declare {PACKAGE} in [workspace.dependencies]")
+    requirement = dependencies[PACKAGE]
+    if isinstance(requirement, dict):
+        requirement = requirement.get("version")
+    match = (
+        re.fullmatch(r"=\s*([0-9]+\.[0-9]+\.[0-9]+)", requirement)
+        if isinstance(requirement, str)
+        else None
+    )
+    if match is None:
+        fail(
+            f"root manifest {PACKAGE} must pin an exact stable release (=X.Y.Z): "
+            f"{requirement!r}"
+        )
+    return match.group(1)
 
 
 def discover_workspace_manifests(repo_root: Path) -> list[Path]:
@@ -136,10 +157,11 @@ def describe_package(package: dict) -> str:
     )
 
 
-def verify_metadata_package(package: dict, workspace: Path) -> None:
-    if package.get("version") != VERSION:
+def verify_metadata_package(package: dict, workspace: Path, expected: str) -> None:
+    if package.get("version") != expected:
         fail(
-            f"workspace {workspace} package version must be {VERSION}: "
+            f"workspace {workspace} package version must match the root manifest "
+            f"requirement ={expected}: "
             f"{describe_package(package)}"
         )
     if package.get("source") != SOURCE:
@@ -147,18 +169,13 @@ def verify_metadata_package(package: dict, workspace: Path) -> None:
             f"workspace {workspace} package source must be crates.io ({SOURCE}): "
             f"{describe_package(package)}"
         )
-    metadata_checksum = package.get("checksum")
-    if metadata_checksum is not None and metadata_checksum != CHECKSUM:
-        fail(
-            f"workspace {workspace} metadata checksum must be {CHECKSUM}: "
-            f"{describe_package(package)} checksum={metadata_checksum}"
-        )
 
 
-def verify_lock_record(record: dict, workspace: Path) -> None:
-    if record.get("version") != VERSION:
+def verify_lock_record(record: dict, workspace: Path, expected: str) -> str:
+    if record.get("version") != expected:
         fail(
-            f"workspace {workspace} Cargo.lock version must be {VERSION}: "
+            f"workspace {workspace} Cargo.lock version must match the root manifest "
+            f"requirement ={expected}: "
             f"version={record.get('version', '<missing>')} "
             f"source={record.get('source', '<path>')}"
         )
@@ -168,15 +185,17 @@ def verify_lock_record(record: dict, workspace: Path) -> None:
             f"version={record.get('version', '<missing>')} "
             f"source={record.get('source', '<path>')}"
         )
-    if record.get("checksum") != CHECKSUM:
+    checksum = record.get("checksum")
+    if not isinstance(checksum, str) or not checksum:
         fail(
-            f"workspace {workspace} Cargo.lock checksum must be {CHECKSUM}: "
+            f"workspace {workspace} Cargo.lock checksum must be present: "
             f"version={record.get('version', '<missing>')} "
             f"checksum={record.get('checksum', '<missing>')}"
         )
+    return checksum
 
 
-def verify_workspace(cargo: str, manifest: Path) -> bool:
+def verify_workspace(cargo: str, manifest: Path, expected: str) -> str | None:
     workspace = manifest.parent
     metadata = cargo_metadata(cargo, manifest)
     packages = metadata.get("packages")
@@ -214,12 +233,18 @@ def verify_workspace(cargo: str, manifest: Path) -> bool:
             f"metadata_nodes={len(metadata_packages)} lock_records={len(lock_records)}"
         )
     if not metadata_packages:
-        return False
+        return None
 
     package = metadata_packages[0]
     record = lock_records[0]
-    verify_metadata_package(package, workspace)
-    verify_lock_record(record, workspace)
+    verify_metadata_package(package, workspace, expected)
+    checksum = verify_lock_record(record, workspace, expected)
+    metadata_checksum = package.get("checksum")
+    if metadata_checksum is not None and metadata_checksum != checksum:
+        fail(
+            f"workspace {workspace} metadata checksum must match Cargo.lock checksum "
+            f"{checksum}: {describe_package(package)} checksum={metadata_checksum}"
+        )
     if (
         package.get("version") != record.get("version")
         or package.get("source") != record.get("source")
@@ -228,7 +253,7 @@ def verify_workspace(cargo: str, manifest: Path) -> bool:
             f"workspace {workspace} metadata package does not match Cargo.lock: "
             f"{describe_package(package)}"
         )
-    return True
+    return checksum
 
 
 def default_repo_root() -> Path:
@@ -256,22 +281,30 @@ def main() -> None:
     if not repo_root.is_dir():
         fail(f"repository root is not a directory: {repo_root}")
 
+    expected = expected_version(repo_root)
     manifests = discover_workspace_manifests(repo_root)
-    canonical_workspaces = [
-        manifest.parent
-        for manifest in manifests
-        if verify_workspace(arguments.cargo, manifest)
-    ]
+    canonical_workspaces = {}
+    for manifest in manifests:
+        checksum = verify_workspace(arguments.cargo, manifest, expected)
+        if checksum is not None:
+            canonical_workspaces[manifest.parent] = checksum
     if not canonical_workspaces:
         fail(
-            f"no canonical {PACKAGE} {VERSION} package was resolved by any of "
+            f"no canonical {PACKAGE} {expected} package was resolved by any of "
             f"the {len(manifests)} discovered workspaces"
         )
+    checksums = set(canonical_workspaces.values())
+    if len(checksums) != 1:
+        details = "; ".join(
+            f"{workspace}: {checksum}"
+            for workspace, checksum in canonical_workspaces.items()
+        )
+        fail(f"workspaces disagree on the {PACKAGE} checksum: {details}")
 
     print(
         "DataSketches source: PASS "
         f"({len(manifests)} workspaces, {len(canonical_workspaces)} canonical graphs, "
-        f"{VERSION}, crates.io, checksum {CHECKSUM})"
+        f"{expected}, crates.io, checksum {next(iter(checksums))})"
     )
 
 
