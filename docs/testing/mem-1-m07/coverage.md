@@ -417,3 +417,10 @@ P09 installed-root pre-native接入修正：此前request builder的wait=0违反
 - 本routine domain correctness patch仅同private client保留get_all_tables、串行≤100 requested names公开get_table_objects_by_name。真实params借用ASCII-case分类，固定两个bool[100]整batch核对identity/db/name membership/duplicate/count后才投影；view/foreign/无type参数不作base table。合法concurrent missing不补默认/不重试，RPC error原样传播。没有Iceberg load_table/S3metadata、新client/owner、字节计量钩子或view/page能力；原8positions/absoluteDeadline和SDK受信端点增长例外保持，SDK entity反序列化未获得硬byte界。PATCH.md记录领域补丁及C0入口。
 - vendor直接测试因非workspace+devdeps拒绝，纯helper拆独立同源table_projection.rs，由connector test直接include纳入既有C0，未加入外部vendor integration suite。初次E0597纠正为namespace String move到FastStr、RPC仅clone handle，test fixture使用owned值；失败日志保留。9projection定向PASS/0.00s，Iceberg全部1203/0/0ignored/7.93s；Cargo.lock只新增faststr/hive_metastore两条dev依赖边，无version/source/checksum变更。收据p09-hms-table-classification-focused-20261009.json。
 - 尚未实际Native Rust/stockHMS复跑，不宣称mixed native、SHOW VIEWS/FORCE zero-mutation或原大CL通过。small correctness preflight与原32×512table+512view大CL分别验证；lake/Paimon/其余P09/P00b/P10/final以及两人工语义门仍OPEN。无push/PR/归档。
+
+
+### 2026-10-09 P09：actual socket poll_write 闸门组件接入（Native仍OPEN）
+
+- 新 mysql-adapter/mysql_write_gate.rs 仅 cfg(test)，真实OwnedWriteHalf scalar/writev原调用、Ready(n)才计费/hash，栈32IoSlice裁到cut，zero-budget后继非空poll Pending才发布blocked。固定scalar/FramingCursor/sha256/oneWaker，无body或lease aliases；实际owner token组合仍是组件fixture，不冒充Native身份。固定deadline/firstcause sticky，arm/begin/cancel/resume各一次，Stop不刷新clock/clear failure。
+- 12项真实TCP组件PASS/1.25s：scalar/writev cuts1..6、S+1实际cursor/hash、错误token/重复binding/begin/earlyresume、33slice拒绝、actualStop/原deadline、无writer control timeout、parentpanic/timeout与childJoinError。失败退出由父唯一JoinSet原handles abort+await实际join，再独立EOF；writer destructor fact不替代Task/root exit。原v1/v2 ignored草稿保留，v2修正detached句柄与control timeout sticky，测试无失败。
+- MySQL adapter全部79PASS/0FAIL/1.33s；原default产品路径/config/caps/SQL/deadline/Closing语义未改。收据p09-exact-fe-poll-write-component-20261009.json绑定sourcebase/raw hashes。真实FE接线、原大小行SQL/cuts、实际W2取消时coverage、small missing-tail/coalesced等仍OPEN，不能用合成component代替Native矩阵；其余门不变，无push/PR/归档。

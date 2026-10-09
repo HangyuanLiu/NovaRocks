@@ -4071,6 +4071,7 @@ dependencies = [
  "novarocks-user-error",
  "novarocks-workload-control",
  "opensrv-mysql",
+ "sha2",
  "tokio",
  "tracing",
 ]

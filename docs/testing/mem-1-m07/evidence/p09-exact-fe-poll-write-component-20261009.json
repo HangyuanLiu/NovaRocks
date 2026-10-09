@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "a9a7ebe00f5216c7d58bc51e25a6c556d14a2637",
+  "purpose": "Test-only real TCP poll_write acceptance gate components; Native caller integration remains open",
+  "checks": [
+    {
+      "suite": "Exact real TCP gate and failure cleanup components",
+      "passed": 12,
+      "failed": 0,
+      "seconds": 1.25
+    },
+    {
+      "suite": "Full MySQL adapter",
+      "passed": 79,
+      "failed": 0,
+      "seconds": 1.33
+    }
+  ],
+  "boundaries": [
+    "Module compiled only under cfg(test); default product writer, config, deadlines and ownership unchanged",
+    "Scalar and vectored exact cuts1..6 count/hash only real OwnedWriteHalf Ready(n); subsequent blocked poll proves framer updated cursor",
+    "Cross-S real TCP cut S+1 matches actual framing receipt; synthetic fixture payload is not Native W2 or resident coverage proof",
+    "Fixed scope deadline, first cause sticky; early resume, duplicate arm/begin/IO and wrong StatementToken refused",
+    "Parent uniquely owns original JoinSet handles; stop/timeout/parent panic/child JoinError cleanup aborts and awaits all original tasks before asserting actual EOF",
+    "Controller and gate retain fixed scalar facts/hash/waker only, no offered data/result lease aliases",
+    "Cargo.lock only adds sha2 dependency edge to MySQL adapter; package versions unchanged"
+  ],
+  "limitations": [
+    "No Native SQL caller, real FE process/connection/StatementToken bind or external controller yet",
+    "No actual Native resident/missing tail/coalesced following rows evidence from these components",
+    "Synthetic fixtures do not prove natural kernel short-write distribution, physical allocator or root task exit",
+    "Exact P09 native matrix, full concurrency, CL, P00b/P10 and two pending semantic decisions remain open; no push/PR/archive"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "novarocks/mysql-adapter/src/mysql_write_gate.rs",
+      "bytes": 47487,
+      "sha256": "d8b99b264e607f84e7d882dae8fac208e0857ef8ca6cf885c79bab7db32d03f1"
+    },
+    {
+      "path": "logs/mem-1-m07/mysql_write_gate.v2.draft.rs",
+      "bytes": 47403,
+      "sha256": "aa6c98c00b8d892c527336e38dd4739a191fdaac6e7f9c6479446d0cd7f38acd"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-component-v1-20261009.log",
+      "bytes": 54562,
+      "sha256": "ab27ec4e50dbacd350122b091d1307811af6f2dc136cdbe305dff7199117cab0"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-fe-poll-write-adapter-regression-v1-20261009.log",
+      "bytes": 60594,
+      "sha256": "cfb287ad2b207fd64484950452e481968d19cfee2908439ea4b0b5d906198d58"
+    }
+  ]
+}
