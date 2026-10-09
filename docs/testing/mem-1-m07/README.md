@@ -140,3 +140,7 @@ clean `1fb1319df` 的原 x S−1/S/S+1、wide q17 S+1缺尾、tiny1..6，十个�
 ### 2026-10-09：P08 准确 Root support 完整绑定回归 PASS
 
 原完整 manifest 绑定在 access/Connector/TaskCreate 前拒绝准确 root 的缺失 V1 support；其它支持 BE 不能代替 root，legacy 非 root candidate 不妨碍支持 root。真实 whole-plan/freeze/encoder/bind_facts 回归及 artifact 共32 PASS，attempt owner12 PASS，fmt/diff-check通过。见[组件收据](evidence/p08-selected-root-support-components-20261009.json)。该组件采用有限 private request/schedule 事实，真实 QA ticket/公开 bind/Native 缺能力拒绝仍 OPEN；前一十场景 Native 早于新 guard。其它完整 M07 门和用户语义决定保持 OPEN，无发布。
+
+### 2026-10-09：P09 同原 response 持有 actor 组件 PASS
+
+原protocol10项和新held-response11项共21 PASS；non-test runner check、fmt/diff-check PASS。原handle保留/actualjoin、取消cleanup重入sticky失败、过期/早退出/panic、实际BE端口绑定均有定向组件覆盖。见[收据](evidence/p09-held-response-actor-components-20261009.json)。host H2 queued owner不是BE alias，Native新scene/source/clock/freeze、真实正holder/seal/lateACK/recovery与四role退出仍OPEN；其它完整M07门不关闭。

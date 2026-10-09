@@ -17,6 +17,9 @@
 
 //! Exact installed-root identity and bounded authenticated protocol probes.
 
+#[path = "result_delivery_root_held_response.rs"]
+pub(crate) mod held_response;
+
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;

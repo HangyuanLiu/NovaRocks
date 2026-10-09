@@ -596,3 +596,11 @@ outer十case累计488.338s包含source/build哈希与独立prep，不替代/续�
 完整生产绑定回归用真实 Values(Int64) whole-plan validation、root freeze、Native encoder 与 bind_facts，覆盖 ClientRows/CountOnly 缺支持拒绝、支持 root 与 legacy 非 root candidate 共存、foreign attempt 完整 root identity 拒绝。artifact **32 PASS / 0 FAIL / 0 ignored，0.08s**，attempt owner **12 PASS / 0 FAIL / 0 ignored，0.11s**；实际两个命令 exit0，fmt/diff-check PASS。收据 `evidence/p08-selected-root-support-components-20261009.json` 固定 integrated source/diff、两项独立审查、原草稿与实际日志 pins。
 
 测试使用 private finite request-bound/schedule 事实，未伪造 QA 私有 move-only AttemptSchedule 或 Connector 启动计数；实际 literal access 集为空。真实 QA ticket→公开 bind/activation 观测与 Native 缺能力拒绝仍 OPEN。前一十场景 Native 绑定 clean 1fb1319df、早于此 guard，不挪作新代码证据。P08 完整启动包络/SDK联合校验/运行期增容/Host drain、其它 P09/P00b/P10/final 门仍 OPEN；两个人工语义、cap/deadline 与 HMS IRU-7 例外不改，无 push/PR/归档。
+
+### P09 original held-response actor component PASS (2026-10-09)
+
+新增 runner 私有 actor 持同原 H2 response/stream/sender/driver；仅读实际 gRPC prefix，固定4KiB capture、16KiB frame/16 frame界，不释放credit、clone DATA或继续drain。外层borrowed owner保存spawn后的原handle；reset/drop/abort后actual await同handle才产join收据。start被取消、原clock过期、driver提前退出/panic均失败；确定性test-only原join前Notify barrier取消settle后，outer仍持原handle，重入实际join且sticky失败。prepare沿既有strictprobe连接advertised host+原runtime实际BEgrpc，不把proxyport记录成actual endpoint。
+
+原协议10项＋新actor11项定向 **21 PASS / 0 FAIL / 0 ignored，0.33s**；actual command terminal exit0。non-test runner check PASS（1m46s）、fmt/diff-check PASS。独立审查指出的v1重入误成功、端口错绑、expiry测试弃server join结果均已在v2修正，旧ignoredv1 bytes保留。收据 `evidence/p09-held-response-actor-components-20261009.json` pin源码/原草稿/独立review/实际日志/旧freeze与manifest/lock。
+
+真实duplex H2及本地Bytes::from_owner是host组件，不冒充BE alias/authenticated Native。held reply不完整decode；withheld是drop前lastsample，reset_requested仅方法调用，不能推BE收到RST。Drop仅abort不产join证明；新Native scene必须全部分支持同outer+runtime并actual settle、保存原primary和cleanup原因。独立原FE身份/launchclock、新可执行freeze、同context正BE send holder/seal后两次lateACK1维持accepted0、释放后context收敛/原MySQL恢复/四role退出仍OPEN；fullClosing64/backinglastalias/其余P08/P00b/P09/P10/final不闭合。无产品cap/deadline/依赖/旧input改动或publish。
