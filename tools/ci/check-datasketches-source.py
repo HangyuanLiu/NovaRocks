@@ -21,6 +21,7 @@
 The root manifest owns the exact stable release requirement; Cargo's resolved
 package graphs and committed lockfiles must agree on its identity and checksum.
 Consumer count and source-tree shape are not dependency identities.
+Design: ADR-0168 (docs/adr/ADR-0168-ci-dependency-guards-never-restate-versions.md)
 """
 
 import argparse

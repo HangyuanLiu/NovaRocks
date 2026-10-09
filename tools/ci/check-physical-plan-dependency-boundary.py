@@ -42,6 +42,7 @@ dependency tree:
 Neither source is sufficient on its own. Dependency versions belong to the
 root manifest and Cargo.lock; this checker owns package authority and the
 closed dependency surface, not a second version policy.
+Design: ADR-0168 (docs/adr/ADR-0168-ci-dependency-guards-never-restate-versions.md)
 """
 
 import argparse

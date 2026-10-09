@@ -5,6 +5,7 @@ domain: [crate-boundary]
 status: active
 supersedes: [ADR-0134]
 superseded-by: null
+partially-superseded-by: [ADR-0168]
 date: 2026-09-17
 provenance:
   - "discussion: 2026-09-17 DataSketches stable release adoption"
