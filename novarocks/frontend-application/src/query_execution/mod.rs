@@ -29,6 +29,7 @@ pub(crate) mod connector_domain;
 pub mod constant_eval;
 pub mod contract;
 mod core_bindings;
+mod dependency_artifact_storage;
 pub mod distributed_rewrite;
 pub mod dml;
 pub mod fragment_scheduling;
