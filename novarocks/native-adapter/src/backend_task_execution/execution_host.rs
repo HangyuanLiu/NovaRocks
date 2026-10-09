@@ -73,7 +73,7 @@ use novarocks_execution_contract::task_execution::identity::{QueryContextRef, Ta
 use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
-    TaskState,
+    TaskState, TerminationDetail,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
@@ -1289,8 +1289,9 @@ impl FragmentStandDown for RunningFragmentHandle {
 }
 
 /// The first stand-down a task was asked for. It is latched, not queued: a
-/// later reason never rewrites the first one, which is the same first-wins
-/// rule the status owner applies to termination.
+/// later reason never rewrites the first one. The latch only decides what the
+/// fragment is told; the task's terminal is arbitrated by its status owner,
+/// where an abort may still supersede a published cancellation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum StandDown {
     Cancel(CancelReason),
@@ -1299,6 +1300,15 @@ enum StandDown {
 }
 
 impl StandDown {
+    /// The termination this stand-down proposes to the status owner.
+    const fn proposal(self) -> TerminationDetail {
+        match self {
+            Self::Cancel(reason) => TerminationDetail::Canceled(reason),
+            Self::Quiesce => TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            Self::Abort(cause) => TerminationDetail::Aborted(cause),
+        }
+    }
+
     fn reason(self) -> FragmentCancelReason {
         match self {
             Self::Cancel(reason) => FragmentCancelReason::new(reason.as_str()),
@@ -1508,20 +1518,7 @@ fn settle_finished_root_result(reporter: &TaskStatusReporter, stand_down: StandD
         novarocks_worker::result_buffer::discard_task(reporter.identity());
     }
     if !current.is_terminal() {
-        match stand_down {
-            StandDown::Cancel(reason) => {
-                reporter.canceling(reason);
-                reporter.canceled(reason);
-            }
-            StandDown::Quiesce => {
-                reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
-                reporter.canceled(CancelReason::UpstreamNoLongerNeeded);
-            }
-            StandDown::Abort(cause) => {
-                reporter.aborting(cause);
-                reporter.aborted(cause);
-            }
-        }
+        reporter.conclude_termination(stand_down.proposal(), TaskOutputFacts::default());
     }
     if !matches!(stand_down, StandDown::Quiesce) {
         reporter.release_output();
@@ -1602,48 +1599,32 @@ fn report_terminal_with_root(
     // its pipeline did next. The owner latched the termination and already
     // published the terminating state, and first-wins means the pipeline's own
     // outcome — including a success that raced the cancel, which is exactly
-    // what a `LIMIT` query produces — cannot rewrite it.
+    // what a `LIMIT` query produces — cannot rewrite it. The latch is this
+    // runnable's first request only; the status owner arbitrates it against
+    // the stand-down it published, which may since have escalated to an abort.
     if let Some(stand_down) = stand_down {
-        match stand_down {
-            StandDown::Cancel(reason) => {
-                reporter.canceling(reason);
-                let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
-                    && (!matches!(sink_kind, FragmentSinkKind::Result) || context_handoff)
-                {
-                    // The cancellation won the lifecycle race, but the
-                    // non-root sink still ran to success. Preserve that
-                    // independent fact so a consumer can distinguish this
-                    // race from a sink that actually stopped early.
-                    TaskOutputFacts::new(true)
-                } else {
-                    TaskOutputFacts::default()
-                };
-                reporter.canceled_with_output(reason, output);
-            }
-            StandDown::Quiesce => {
-                if let FragmentOutcome::Failed(error) = fact.outcome() {
-                    report_failure(
-                        reporter,
-                        TaskFailure::new(
-                            TaskFailureCategory::Execution,
-                            SafeDetail::truncating(&error.to_string()),
-                        ),
-                    );
-                } else {
-                    reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
-                    let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
-                        && (!matches!(sink_kind, FragmentSinkKind::Result) || context_handoff)
-                    {
-                        TaskOutputFacts::new(true)
-                    } else {
-                        TaskOutputFacts::default()
-                    };
-                    reporter.canceled_with_output(CancelReason::UpstreamNoLongerNeeded, output);
-                }
-            }
-            StandDown::Abort(cause) => {
-                reporter.aborting(cause);
-                reporter.aborted(cause);
+        // The stand-down won the lifecycle race, but a non-root sink or a
+        // bounded root with completed Context handoff may still have run to
+        // success. Preserve that independent output fact; it does not prove
+        // consumer acknowledgement or physical allocation reclamation.
+        let output = if !matches!(stand_down, StandDown::Abort(_))
+            && matches!(fact.outcome(), FragmentOutcome::Succeeded)
+            && (!matches!(sink_kind, FragmentSinkKind::Result) || context_handoff)
+        {
+            TaskOutputFacts::new(true)
+        } else {
+            TaskOutputFacts::default()
+        };
+        match (stand_down, fact.outcome()) {
+            (StandDown::Quiesce, FragmentOutcome::Failed(error)) => report_failure(
+                reporter,
+                TaskFailure::new(
+                    TaskFailureCategory::Execution,
+                    SafeDetail::truncating(&error.to_string()),
+                ),
+            ),
+            _ => {
+                reporter.conclude_termination(stand_down.proposal(), output);
             }
         }
         if !matches!(stand_down, StandDown::Quiesce)
@@ -1689,7 +1670,10 @@ fn report_terminal_with_root(
                 reporter.flushing();
             }
             _ => {
-                reporter.finished(TaskOutputFacts::new(true));
+                // The Worker publishes a stand-down before it tells this
+                // runnable, so a completion in between still finds the task
+                // terminating and must complete that stand-down instead.
+                reporter.conclude_success(TaskOutputFacts::new(true));
                 reporter.release_output();
             }
         },
@@ -1717,14 +1701,16 @@ fn report_terminal_with_root(
     }
 }
 
-/// Publishes FAILING before FAILED.
+/// Concludes a task on its own failure, through FAILING to FAILED.
 ///
-/// The terminal is unreachable in one step from RUNNING: the state machine
-/// requires the terminating state first, so skipping it would leave the task
-/// running forever in the owner's view.
+/// The status owner moves through the terminating state the state machine
+/// requires, and keeps an abort that already won: a failure cannot rewrite a
+/// stand-down the Worker published before this runnable heard of it.
 fn report_failure(reporter: &TaskStatusReporter, failure: TaskFailure) {
-    reporter.failing(failure.clone());
-    reporter.failed(failure);
+    reporter.conclude_termination(
+        TerminationDetail::Failed(failure),
+        TaskOutputFacts::default(),
+    );
     reporter.release_output();
 }
 
@@ -1813,6 +1799,7 @@ mod tests {
     };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
+        TerminationDetail,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{connector_read as connector_dto, novarocks as proto, plan};
@@ -3868,6 +3855,122 @@ mod tests {
 
         assert_eq!(owner.state(), TaskState::Canceled);
         assert!(!owner.current().output().responsibility_complete());
+        assert!(owner.output_released());
+    }
+
+    /// The runnable's latch keeps the first stand-down it was asked for, while
+    /// the Worker may still escalate the task's published cancellation to an
+    /// abort. The terminal report completes the abort instead of proposing a
+    /// cancellation the state machine no longer admits.
+    #[test]
+    fn a_latched_stand_down_completes_the_abort_that_superseded_it() {
+        let outcomes = || {
+            [
+                FragmentOutcome::Succeeded,
+                FragmentOutcome::Cancelled {
+                    reason: FragmentCancelReason::new("cancel reached the fragment"),
+                },
+                FragmentOutcome::Failed(FragmentExecutionError::new(
+                    FragmentExecutionErrorKind::Pipeline,
+                    "driver failed",
+                )),
+            ]
+        };
+        let mut case = 0;
+        for latched in [
+            StandDown::Cancel(CancelReason::UpstreamNoLongerNeeded),
+            StandDown::Quiesce,
+        ] {
+            for outcome in outcomes() {
+                case += 1;
+                let (owner, reporter) = reporter_for(identity(35, 1, case));
+                reporter.running();
+                owner.advance(
+                    TaskState::Canceling,
+                    Some(TerminationDetail::Canceled(
+                        CancelReason::UpstreamNoLongerNeeded,
+                    )),
+                    TaskOutputFacts::default(),
+                );
+                owner.advance(
+                    TaskState::Aborting,
+                    Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+                    TaskOutputFacts::default(),
+                );
+
+                report_terminal(
+                    &reporter,
+                    FragmentSinkKind::Noop,
+                    &terminal_fact(outcome),
+                    Some(latched),
+                );
+
+                let current = owner.current();
+                assert_eq!(
+                    (current.state(), current.termination().cloned()),
+                    (
+                        TaskState::Aborted,
+                        Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed))
+                    ),
+                    "case {case}: {latched:?}"
+                );
+                assert!(owner.convergence().conclusion_stable(), "case {case}");
+            }
+        }
+    }
+
+    /// The Worker publishes a stand-down before it tells the runnable. A
+    /// completion that lands in between finds no latch, and still completes
+    /// the stand-down that won rather than proposing its own outcome.
+    #[test]
+    fn a_completion_before_the_stand_down_reaches_the_runnable_completes_it() {
+        let (owner, reporter) = reporter_for(identity(36, 1, 1));
+        reporter.running();
+        owner.advance(
+            TaskState::Canceling,
+            Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+            TaskOutputFacts::default(),
+        );
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Noop,
+            &terminal_fact(FragmentOutcome::Succeeded),
+            None,
+        );
+        assert_eq!(owner.state(), TaskState::Canceled);
+        assert!(
+            owner.current().output().responsibility_complete(),
+            "the non-root sink that ran to success keeps that fact"
+        );
+        assert!(owner.output_released());
+
+        let (owner, reporter) = reporter_for(identity(36, 1, 2));
+        reporter.running();
+        owner.advance(
+            TaskState::Aborting,
+            Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+            TaskOutputFacts::default(),
+        );
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Noop,
+            &terminal_fact(FragmentOutcome::Failed(FragmentExecutionError::new(
+                FragmentExecutionErrorKind::Pipeline,
+                "driver failed",
+            ))),
+            None,
+        );
+        let current = owner.current();
+        assert_eq!(
+            (current.state(), current.termination().cloned()),
+            (
+                TaskState::Aborted,
+                Some(TerminationDetail::Aborted(AbortCause::QueryFailed))
+            ),
+            "a late failure cannot rewrite the abort that already won"
+        );
         assert!(owner.output_released());
     }
 

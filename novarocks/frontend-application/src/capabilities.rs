@@ -815,7 +815,8 @@ pub fn background_maintenance_attempt(
     };
     let connector_context = crate::connector::connector_request_context_for_execution_on_runtime(
         None, &execution, runtime,
-    )?;
+    )?
+    .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::JobAttempt);
     Ok(BackgroundMaintenanceAttempt::new(
         execution,
         connector_context,

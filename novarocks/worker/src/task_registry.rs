@@ -1296,7 +1296,6 @@ impl TaskExecutionRegistry {
             receiver_installed: false,
             capability_installed: false,
             failure: None,
-            stop: None,
             committed: false,
         };
         let _ = transaction.abandon(
@@ -1430,12 +1429,10 @@ impl TaskExecutionRegistry {
             receiver_installed: false,
             capability_installed: false,
             failure: None,
-            stop: None,
             committed: false,
         };
 
-        if let Some(stop) = transaction.cell.stop() {
-            transaction.stop = Some(stop);
+        if transaction.cell.stop().is_some() {
             return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
@@ -1485,8 +1482,7 @@ impl TaskExecutionRegistry {
                 rejection.detail().as_str(),
             );
         }
-        if let Some(stop) = transaction.cell.stop() {
-            transaction.stop = Some(stop);
+        if transaction.cell.stop().is_some() {
             return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
@@ -1520,8 +1516,7 @@ impl TaskExecutionRegistry {
             }
         };
 
-        if let Some(stop) = transaction.cell.stop() {
-            transaction.stop = Some(stop);
+        if transaction.cell.stop().is_some() {
             return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
@@ -4161,7 +4156,6 @@ struct CreationTransaction<'a> {
     receiver_installed: bool,
     capability_installed: bool,
     failure: Option<CreationFailure>,
-    stop: Option<PreparationStop>,
     committed: bool,
 }
 
@@ -4179,7 +4173,7 @@ impl CreationTransaction<'_> {
             detail: detail.clone(),
         };
         if self.cell.accepted_status().is_some() {
-            self.stop = self.cell.claim_failure(failure.clone());
+            self.cell.claim_failure(failure.clone());
         }
         self.failure = Some(failure);
         OperationReceipt::rejected(operation, outcome, detail)
@@ -4321,26 +4315,17 @@ impl Drop for CreationTransaction<'_> {
         });
         let accepted = self.cell.accepted_status();
         if let Some(status) = &accepted {
-            if self.failure.is_none() && self.stop.is_none() {
-                self.stop = self.cell.claim_failure(failure.clone());
+            if self.failure.is_none() {
+                self.cell.claim_failure(failure.clone());
             }
-            let reporter = TaskStatusReporter::new(Arc::clone(status));
-            let stop = self.stop.or_else(|| {
-                if self.failure.is_some() {
-                    None
-                } else {
-                    self.cell.stop()
-                }
-            });
-            match stop {
-                Some(PreparationStop::Cancel(reason)) => {
-                    reporter.canceling(reason);
-                    reporter.canceled(reason);
-                }
-                Some(PreparationStop::Abort(cause)) => {
-                    reporter.aborting(cause);
-                    reporter.aborted(cause);
-                }
+            // The cell orders this creation's own failure against every stop
+            // request, so it is read here rather than from whatever an earlier
+            // preparation checkpoint saw: a cancel may have escalated to an
+            // abort since. The status owner then arbitrates that proposal
+            // against the stand-down it already published, in one step.
+            let proposal = match self.cell.stop() {
+                Some(PreparationStop::Cancel(reason)) => TerminationDetail::Canceled(reason),
+                Some(PreparationStop::Abort(cause)) => TerminationDetail::Aborted(cause),
                 None => {
                     let category = if failure.outcome == OperationOutcome::ResourceExhausted {
                         TaskFailureCategory::ResourceExhausted
@@ -4355,15 +4340,17 @@ impl Drop for CreationTransaction<'_> {
                                 )
                                 .expect("fixed preparation detail is bounded")
                             });
-                    let failure = novarocks_execution_contract::TaskFailure::new_in_phase(
-                        category,
-                        detail,
-                        novarocks_execution_contract::TaskFailurePhase::Preparation,
-                    );
-                    reporter.failing(failure.clone());
-                    reporter.failed(failure);
+                    TerminationDetail::Failed(
+                        novarocks_execution_contract::TaskFailure::new_in_phase(
+                            category,
+                            detail,
+                            novarocks_execution_contract::TaskFailurePhase::Preparation,
+                        ),
+                    )
                 }
-            }
+            };
+            status.conclude_termination(proposal, TaskOutputFacts::default());
+            let reporter = TaskStatusReporter::new(Arc::clone(status));
             reporter.release_output();
             reporter.note_actual_stopped();
             reporter.note_resources_converged();

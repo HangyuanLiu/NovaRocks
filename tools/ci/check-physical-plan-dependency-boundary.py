@@ -39,7 +39,10 @@ dependency tree:
   variation, so optional and target-specific edges cannot hide an unaudited
   closure behind a different build configuration.
 
-Neither source is sufficient on its own.
+Neither source is sufficient on its own. Dependency versions belong to the
+root manifest and Cargo.lock; this checker owns package authority and the
+closed dependency surface, not a second version policy.
+Design: ADR-0168 (docs/adr/ADR-0168-ci-dependency-guards-never-restate-versions.md)
 """
 
 import argparse
@@ -85,17 +88,9 @@ RESOLVED_PACKAGE_ALLOW_LIST = frozenset(
 )
 
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-EXTERNAL_PACKAGE_ALLOW_LIST = {
-    "arrow-schema": {
-        "id": f"{CRATES_IO_SOURCE}#arrow-schema@58.2.0",
-        "source": CRATES_IO_SOURCE,
-        "version": "58.2.0",
-    },
-    "bytes": {
-        "id": f"{CRATES_IO_SOURCE}#bytes@1.11.0",
-        "source": CRATES_IO_SOURCE,
-        "version": "1.11.0",
-    },
+EXTERNAL_PACKAGE_SOURCES = {
+    "arrow-schema": CRATES_IO_SOURCE,
+    "bytes": CRATES_IO_SOURCE,
 }
 
 NORMAL = None
@@ -331,25 +326,25 @@ class Graph:
             fail([f"Cargo tree package identity is ambiguous: {label}"])
         return matches[0]
 
-    def external_package(self, name, expected):
-        matches = [
-            package
-            for package in self.packages_by_name.get(name, [])
-            if package["id"] == expected["id"]
-            and package["source"] == expected["source"]
-            and package["version"] == expected["version"]
-            and Path(package["manifest_path"]).name == "Cargo.toml"
-            and Path(package["manifest_path"]).parent.name
-            == f"{name}-{expected['version']}"
-        ]
-        if len(matches) > 1:
-            fail(
-                [
-                    "Cargo metadata contains more than one audited external "
-                    f"package identity for {name}: {expected['id']}"
-                ]
-            )
-        return matches[0] if matches else None
+    def external_packages(self, name, source):
+        """Resolve registry authorities using each package's own version."""
+
+        matches = []
+        for package in self.packages_by_name.get(name, []):
+            manifest = Path(package["manifest_path"]).resolve()
+            version = package["version"]
+            if (
+                package["id"] == f"{source}#{name}@{version}"
+                and package["source"] == source
+                and manifest.name == "Cargo.toml"
+                and manifest.parent.name == f"{name}-{version}"
+                and len(manifest.parents) >= 4
+                and manifest.parents[2].name == "src"
+                and manifest.parents[3].name == "registry"
+                and manifest.is_file()
+            ):
+                matches.append(package)
+        return matches
 
 
 def package_identity(package):
@@ -381,10 +376,33 @@ def resolved_package_allow_list(graph):
     ]
     packages.extend(
         package
-        for name, expected in sorted(EXTERNAL_PACKAGE_ALLOW_LIST.items())
-        if (package := graph.external_package(name, expected)) is not None
+        for name, source in sorted(EXTERNAL_PACKAGE_SOURCES.items())
+        for package in graph.external_packages(name, source)
     )
     return frozenset(package_identity(package) for package in packages)
+
+
+def verify_external_identity_uniqueness(closure):
+    """Allow removal, but never multiple authorities for one external name."""
+
+    violations = []
+    for name in sorted(EXTERNAL_PACKAGE_SOURCES):
+        identities = {
+            package_identity(package): package
+            for package in closure.values()
+            if package["name"] == name
+        }
+        if len(identities) > 1:
+            violations.append(
+                "resolved normal dependency closure contains more than one "
+                f"identity for {name}: "
+                + "; ".join(
+                    describe_package_identity(package)
+                    for _, package in sorted(identities.items(), key=lambda item: str(item[0]))
+                )
+            )
+    return violations
+
 
 def declared_dependencies_by_kind(package):
     """Return canonical package names, including optional and renamed edges."""
@@ -656,6 +674,7 @@ def verify_resolved_closure(manifest_path, graph):
             "the exact audited allow-list: "
             + "; ".join(describe_package_identity(package) for package in unexpected)
         )
+    violations.extend(verify_external_identity_uniqueness(closure))
     return closure, violations
 
 

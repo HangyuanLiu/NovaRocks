@@ -2869,6 +2869,46 @@ impl IcebergWriteSessionControl {
         let (namespace, table_name) = request.table.rsplit_once('.').ok_or_else(|| {
             invalid("Iceberg write target must be a namespace-qualified table name")
         })?;
+        use crate::catalog::admission::{
+            CatalogAdmissionRequest, CatalogOperation, connector_unsupported,
+        };
+        let operation = match &request.flavor {
+            ConnectorWriteSessionFlavor::Ordinary => match request.intent {
+                novarocks_spi::connector::ConnectorWriteIntent::Append => CatalogOperation::Append,
+                novarocks_spi::connector::ConnectorWriteIntent::Overwrite
+                | novarocks_spi::connector::ConnectorWriteIntent::PartitionOverwrite => {
+                    CatalogOperation::Overwrite
+                }
+                novarocks_spi::connector::ConnectorWriteIntent::RowDelta => {
+                    CatalogOperation::RowDelta
+                }
+            },
+            ConnectorWriteSessionFlavor::StagedCreate(_) => CatalogOperation::CreateTable(
+                crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+            ),
+            ConnectorWriteSessionFlavor::ManagedPublication { .. }
+            | ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
+                CatalogOperation::PublishDocuments
+            }
+            ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
+            ConnectorWriteSessionFlavor::CopyOnWrite { .. } => CatalogOperation::CopyOnWrite,
+            ConnectorWriteSessionFlavor::DistributedRewrite(shape) => match shape {
+                ConnectorDistributedRewriteShape::DataFiles { .. } => {
+                    CatalogOperation::RewriteDataFiles
+                }
+                ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
+                    CatalogOperation::RewritePositionDeletes
+                }
+            },
+        };
+        self.runtime
+            .novarocks_catalog()
+            .admit(&CatalogAdmissionRequest::new(
+                operation,
+                crate::catalog::CatalogTableName::new(namespace, table_name),
+                request.context.initiation(),
+            ))
+            .map_err(connector_unsupported)?;
         // A staged target is the one target that cannot be looked up: the
         // catalog will not know it until the publication that owns it commits.
         // So its frozen facts arrive with the request, and this branch reads

@@ -29,7 +29,7 @@
 //! Peer/lane quotas for dialed connections and the incoming key a connection
 //! is sealed to are tracked here too, with the same exit points.
 //!
-//! Design: ADR-0168 (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
+//! Design: ADR-0170 (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 
 use std::fmt;
 use std::io;

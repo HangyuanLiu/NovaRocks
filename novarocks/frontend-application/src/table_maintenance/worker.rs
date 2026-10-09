@@ -393,11 +393,22 @@ fn cleanup_candidate_locations(
 /// Frontend-only provider binding capture for a product-gated OPTIMIZE job.
 pub(crate) struct FrontendOptimizeTargetCapturePort<'a> {
     engine: &'a dyn TableMaintenanceEngine,
+    statement: bool,
 }
 
 impl<'a> FrontendOptimizeTargetCapturePort<'a> {
     pub(crate) fn new(engine: &'a dyn TableMaintenanceEngine) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            statement: false,
+        }
+    }
+
+    pub(crate) fn for_statement(engine: &'a dyn TableMaintenanceEngine) -> Self {
+        Self {
+            engine,
+            statement: true,
+        }
     }
 }
 
@@ -406,10 +417,23 @@ impl OptimizeTargetCapturePort for FrontendOptimizeTargetCapturePort<'_> {
         &self,
         target: &novarocks_table_maintenance::MaintenanceTarget,
     ) -> Result<CapturedOptimizeTarget, String> {
+        if self.statement {
+            let captured = self.engine.capture_admitted_optimize_target(target)?;
+            if captured.completion
+                == novarocks_table_maintenance::OptimizeCompletionMode::AwaitTerminal
+                && self.engine.statement_cancellation().is_none()
+            {
+                return Err(
+                    "OPTIMIZE requires the admitted statement cancellation scope".to_string(),
+                );
+            }
+            return Ok(captured);
+        }
         let object_id = self.engine.capture_target_object_id(target)?;
         Ok(CapturedOptimizeTarget {
             object_id: object_id.as_bytes().to_vec(),
             base_snapshot_id: self.engine.current_snapshot_id(target)?,
+            completion: novarocks_table_maintenance::OptimizeCompletionMode::Detached,
         })
     }
 }

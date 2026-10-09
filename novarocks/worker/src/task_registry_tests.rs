@@ -191,6 +191,12 @@ struct TestTaskHost {
     retain_normal_close: bool,
     inbound_capabilities: Option<Arc<TaskInboundCapabilities>>,
     install_gate: Option<Arc<InstallGate>>,
+    /// Restricts `install_gate` to creations of this static plan, so a peer
+    /// task of the same context can install while another one is held.
+    install_gate_plan: Option<&'static [u8]>,
+    /// Parks the named task's creation rollback after it decided how to stop
+    /// and before it publishes that task's terminal.
+    rollback_gate: Option<(TaskId, Arc<InstallGate>)>,
     prepared_bodies: Mutex<Vec<Bytes>>,
     prepared_root: Mutex<Option<Arc<crate::root_result_channel::RootResultChannel>>>,
     receivers_installed: AtomicUsize,
@@ -237,10 +243,14 @@ impl TaskExecutionHost for TestTaskHost {
         _descriptor: &TaskDescriptor,
         input: TaskCreationInput,
     ) -> Result<crate::PreparedTaskInstallation, HostRejection> {
-        if let Some(gate) = &self.install_gate {
+        let (plan, _assignment) = input.into_parts();
+        if let Some(gate) = &self.install_gate
+            && self
+                .install_gate_plan
+                .is_none_or(|gated| plan.bytes().as_ref() == gated)
+        {
             gate.wait_for_release();
         }
-        let (plan, _assignment) = input.into_parts();
         self.prepared_bodies
             .lock()
             .expect("test prepared bodies")
@@ -290,6 +300,11 @@ impl TaskExecutionHost for TestTaskHost {
     }
 
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
+        if let Some((task, gate)) = &self.rollback_gate
+            && descriptor.identity().task_id() == *task
+        {
+            gate.wait_for_release();
+        }
         if let Some(capabilities) = &self.inbound_capabilities {
             capabilities.remove(descriptor);
         }
@@ -3735,4 +3750,166 @@ fn preparation_charge_adds_private_input_to_incoming_domain_backing_bound() {
     wait_for_accepted_installed(&fixture.registry, &request);
     wait_for_preparation_exit(&fixture.registry, identity);
     assert_eq!(fixture.registry.preparation_snapshot().bytes, 0);
+}
+
+/// A preparation that already decided to stand down normally can lose that
+/// stand-down to a context abort before its rollback publishes the task's
+/// terminal. This is the native shape: the frontend cancels a non-root task
+/// whose parent stage failed, and the backend's own settle pass escalates the
+/// same peer failure into a context abort right afterwards.
+#[test]
+fn preparation_rollback_concludes_on_the_stand_down_that_won() {
+    for (case, (plan, escalate)) in [
+        (STREAM_PLAN, true),
+        (REFUSED_PLAN, true),
+        (STREAM_PLAN, false),
+        (REFUSED_PLAN, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let install_gate = Arc::new(InstallGate::held());
+        let rollback_gate = Arc::new(InstallGate::held());
+        let _install_release = PreparationGateRelease(Arc::clone(&install_gate));
+        let _rollback_release = PreparationGateRelease(Arc::clone(&rollback_gate));
+        let preparing_task = TaskId::new(4).expect("nonzero task");
+        let fixture = Fixture::new(TestTaskHost {
+            install_gate: Some(Arc::clone(&install_gate)),
+            install_gate_plan: Some(plan),
+            rollback_gate: Some((preparing_task, Arc::clone(&rollback_gate))),
+            ..TestTaskHost::default()
+        });
+        let query_execution = execution(31_000 + case as i64);
+        let context = fixture.context(query_execution);
+        establish(&fixture.registry, context);
+        let source = fixture
+            .registry
+            .status_source(context)
+            .expect("context source");
+
+        let peer_identity = task(query_execution, fixture.backend);
+        let peer = fixture.create(descriptor(peer_identity), Vec::new());
+        assert_eq!(
+            fixture
+                .registry
+                .accept_create_task(&peer, body(RESULT_PLAN))
+                .outcome(),
+            OperationOutcome::Accepted,
+            "case {case}"
+        );
+        wait_for_accepted_installed(&fixture.registry, &peer);
+        let peer_reporter = fixture.task_host.reporters.lock().expect("test reporters")[0].clone();
+        assert!(matches!(
+            peer_reporter.running(),
+            crate::StatusAdvance::Published(_)
+        ));
+
+        let preparing_identity = TaskIdentity::new(
+            query_execution,
+            StageId::new(2).expect("nonzero stage"),
+            preparing_task,
+            fixture.backend,
+        );
+        let preparing = fixture.create(
+            descriptor_with(preparing_identity, UniqueId::new(4, 4), 1, 1),
+            Vec::new(),
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .accept_create_task(&preparing, body(plan))
+                .outcome(),
+            OperationOutcome::Accepted,
+            "case {case}"
+        );
+        install_gate.wait_until_entered();
+
+        let cancel = fixture.registry.cancel_task(&CancelTask::new(
+            TaskOperationId::new_v7(),
+            preparing_identity,
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        assert_eq!(cancel.outcome(), OperationOutcome::Accepted, "case {case}");
+        assert_eq!(
+            source.latest(preparing_identity).expect("accepted").state(),
+            TaskState::Canceling,
+            "case {case}"
+        );
+
+        // Preparation returns, observes the normal stand-down, and starts
+        // rolling back; it is parked before it publishes the terminal.
+        install_gate.release();
+        rollback_gate.wait_until_entered();
+
+        if escalate {
+            assert!(matches!(
+                peer_reporter.failing(novarocks_execution_contract::TaskFailure::new(
+                    TaskFailureCategory::Execution,
+                    novarocks_execution_contract::SafeDetail::new("injected peer failure")
+                        .expect("bounded detail"),
+                )),
+                crate::StatusAdvance::Published(_)
+            ));
+            fixture.registry.advance_deadlines();
+            assert_eq!(
+                fixture.registry.termination_cause(context),
+                Some(AbortCause::PeerTaskFailed),
+                "case {case}"
+            );
+            assert_eq!(
+                source.latest(preparing_identity).expect("accepted").state(),
+                TaskState::Aborting,
+                "case {case}: the context fan-out escalates the stand-down"
+            );
+        }
+
+        rollback_gate.release();
+        wait_for_terminal_record(&fixture.registry, preparing_identity);
+        wait_for_preparation_exit(&fixture.registry, preparing_identity);
+        let terminal = source
+            .latest(preparing_identity)
+            .expect("retained terminal");
+        let expected = if escalate {
+            (
+                TaskState::Aborted,
+                TerminationDetail::Aborted(AbortCause::PeerTaskFailed),
+            )
+        } else {
+            (
+                TaskState::Canceled,
+                TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            )
+        };
+        assert_eq!(
+            (terminal.state(), terminal.termination().cloned()),
+            (expected.0, Some(expected.1)),
+            "case {case}"
+        );
+        assert!(!terminal.installed(), "case {case}");
+        assert_eq!(
+            fixture.task_host.submitted.load(Ordering::SeqCst),
+            1,
+            "case {case}: only the peer was submitted"
+        );
+
+        if escalate {
+            assert!(matches!(
+                peer_reporter.failed(novarocks_execution_contract::TaskFailure::new(
+                    TaskFailureCategory::Execution,
+                    novarocks_execution_contract::SafeDetail::new("injected peer failure")
+                        .expect("bounded detail"),
+                )),
+                crate::StatusAdvance::Published(_)
+            ));
+            peer_reporter.release_output();
+            peer_reporter.note_actual_stopped();
+            peer_reporter.note_resources_converged();
+            fixture.registry.advance_deadlines();
+            assert_eq!(
+                fixture.registry.context_state(context),
+                QueryContextState::TerminalRetained,
+                "case {case}: every task is a terminal record"
+            );
+        }
+    }
 }

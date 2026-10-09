@@ -300,6 +300,42 @@ impl IcebergMetadata {
 }
 
 impl ConnectorMetadata for IcebergMetadata {
+    fn admit_table_job(
+        &self,
+        request: novarocks_spi::connector::ConnectorTableJobAdmissionRequest,
+    ) -> Result<novarocks_spi::connector::ConnectorTableJobAdmission, ConnectorError> {
+        use crate::catalog::admission::{
+            CatalogAdmission, CatalogAdmissionRequest, CatalogInitiation, CatalogOperation,
+            connector_unsupported,
+        };
+        use novarocks_spi::connector::{ConnectorTableJobAdmission, ConnectorTableJobKind};
+        if request.table.instance_id != self.descriptor.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table job has a foreign connector instance",
+            ));
+        }
+        self.validate_context(&request.context)?;
+        let operation = match request.job {
+            ConnectorTableJobKind::Statistics => CatalogOperation::Statistics,
+            ConnectorTableJobKind::RewriteDataFiles => CatalogOperation::RewriteDataFiles,
+        };
+        self.runtime
+            .novarocks_catalog()
+            .admit(&CatalogAdmissionRequest::new(
+                operation,
+                crate::catalog::CatalogTableName::new(request.table.namespace, request.table.table),
+                CatalogInitiation::StatementJob,
+            ))
+            .map(|admission| match admission {
+                CatalogAdmission::Admitted => ConnectorTableJobAdmission::Detached,
+                CatalogAdmission::AdmittedAwaitingCompletion => {
+                    ConnectorTableJobAdmission::AwaitTerminal
+                }
+            })
+            .map_err(connector_unsupported)
+    }
+
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.descriptor.instance_id
     }
@@ -2163,16 +2199,35 @@ mod plan_splits_pruning_tests {
     }
 
     fn provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
+        provider_with_catalog("hadoop", "127.0.0.1:1")
+    }
+
+    fn provider_with_catalog(
+        catalog_type: &str,
+        address: &str,
+    ) -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
-        let configuration = crate::catalog_config::parse_catalog_configuration(
-            "ice",
-            &[(
+        let mut properties = vec![
+            ("iceberg.catalog.type".to_string(), catalog_type.to_string()),
+            (
                 "iceberg.catalog.warehouse".to_string(),
                 warehouse.path().display().to_string(),
-            )],
-        )
-        .expect("configuration");
+            ),
+        ];
+        if catalog_type == "hive" {
+            properties.push((
+                "hive.metastore.uris".to_string(),
+                format!("thrift://{address}"),
+            ));
+        } else if catalog_type == "rest" {
+            properties.push((
+                "iceberg.catalog.uri".to_string(),
+                format!("http://{address}"),
+            ));
+        }
+        let configuration = crate::catalog_config::parse_catalog_configuration("ice", &properties)
+            .expect("configuration");
         let binding = IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
@@ -2196,6 +2251,50 @@ mod plan_splits_pruning_tests {
             runtime,
         );
         (executor, warehouse, provider)
+    }
+
+    #[test]
+    fn table_job_admission_uses_the_exact_owner_without_any_external_io() {
+        use novarocks_spi::connector::{
+            ConnectorTableJobAdmission, ConnectorTableJobAdmissionRequest, ConnectorTableJobKind,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        for catalog_type in ["hive", "hadoop", "rest"] {
+            let (_executor, warehouse, provider) = provider_with_catalog(catalog_type, &address);
+            for job in [
+                ConnectorTableJobKind::Statistics,
+                ConnectorTableJobKind::RewriteDataFiles,
+            ] {
+                let answer = provider.admit_table_job(ConnectorTableJobAdmissionRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor.instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("orders"),
+                    },
+                    job,
+                    context: context(),
+                });
+                match catalog_type {
+                    "hive" => {
+                        let error = answer.unwrap_err();
+                        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                        assert!(error.message().contains("read-only compatibility entry"));
+                    }
+                    "hadoop" => {
+                        assert_eq!(answer.unwrap(), ConnectorTableJobAdmission::AwaitTerminal)
+                    }
+                    "rest" => assert_eq!(answer.unwrap(), ConnectorTableJobAdmission::Detached),
+                    _ => unreachable!(),
+                }
+                assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+        }
     }
 
     fn exact_revision_handle(

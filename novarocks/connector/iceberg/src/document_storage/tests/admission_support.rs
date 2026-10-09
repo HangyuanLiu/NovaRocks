@@ -14,8 +14,8 @@ use novarocks_spi::connector::ConnectorError;
 use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
 use crate::catalog::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use crate::catalog::{
-    CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTablePage, CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
+    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
     ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
     StagedCommitResult, StagedCreateStart,
 };
@@ -73,8 +73,18 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         self.inner.implementation_name()
     }
 
-    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported> {
-        self.inner.admit_create(intent)
+    fn admit_operation(
+        &self,
+        operation: &crate::catalog::admission::CatalogOperation,
+        target: &crate::catalog::admission::CatalogAdmissionTarget,
+    ) -> Result<(), CatalogUnsupported> {
+        self.inner.admit_operation(operation, target)
+    }
+    fn admit_initiation(
+        &self,
+        request: &crate::catalog::admission::CatalogAdmissionRequest,
+    ) -> Result<crate::catalog::admission::CatalogAdmission, CatalogUnsupported> {
+        self.inner.admit_initiation(request)
     }
 
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {

@@ -362,6 +362,16 @@ impl fmt::Debug for ResolvedVendedS3Access {
     }
 }
 
+/// The host-owned origin of this connector operation. Statement-submitted job
+/// admission is a separate metadata request, not a request-context origin.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConnectorRequestInitiation {
+    #[default]
+    Statement,
+    JobAttempt,
+    Background,
+}
+
 #[derive(Clone)]
 pub struct ConnectorRequestContext {
     // Design: ADR-0156. Operation control and authorized access do not imply
@@ -376,6 +386,7 @@ pub struct ConnectorRequestContext {
     request_scope: ConnectorRequestScope,
     execution_source: Option<ExecutionSource>,
     fresh_catalog_observation_required: bool,
+    initiation: ConnectorRequestInitiation,
 }
 
 /// The one execution source an attempt request reads for: the exact scope
@@ -466,7 +477,18 @@ impl ConnectorRequestContext {
             request_scope: ConnectorRequestScope::new(),
             execution_source: None,
             fresh_catalog_observation_required: false,
+            initiation: ConnectorRequestInitiation::Statement,
         })
+    }
+
+    /// Preserve the host's operation origin through request projections.
+    pub fn with_initiation(mut self, initiation: ConnectorRequestInitiation) -> Self {
+        self.initiation = initiation;
+        self
+    }
+
+    pub const fn initiation(&self) -> ConnectorRequestInitiation {
+        self.initiation
     }
 
     /// Bind this context to the reservation-owned attempt sidecar. A retry
@@ -684,8 +706,8 @@ mod tests {
 
     use super::{
         ConnectorOperationControl, ConnectorPlanningContext, ConnectorRangeScope,
-        ConnectorRequestContext, ConnectorStorageResolver, ResolvedVendedS3Access,
-        StorageAccessRequest, VendedS3SeedMaterial,
+        ConnectorRequestContext, ConnectorRequestInitiation, ConnectorStorageResolver,
+        ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
     };
     use crate::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorErrorKind,
@@ -697,6 +719,38 @@ mod tests {
     use novarocks_secret::SecretValue;
 
     use crate::connector::read_stack::ConnectorSourceOperations;
+
+    #[test]
+    fn request_initiation_defaults_to_statement_and_survives_projections() {
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        assert_eq!(request.initiation(), ConnectorRequestInitiation::Statement);
+        for initiation in [
+            ConnectorRequestInitiation::Statement,
+            ConnectorRequestInitiation::JobAttempt,
+            ConnectorRequestInitiation::Background,
+        ] {
+            let request = request.clone().with_initiation(initiation);
+            assert_eq!(
+                request.clone().after_external_effect().initiation(),
+                initiation
+            );
+            let projected = request
+                .clone()
+                .with_storage_resolver(Arc::new(RejectingResolver))
+                .with_vended_credential_lease_sink(Arc::new(RejectingSink))
+                .without_attempt_capabilities();
+            assert_eq!(projected.initiation(), initiation);
+            let planning =
+                ConnectorPlanningContext::try_from_request(projected).expect("planning projection");
+            assert_eq!(planning.request().initiation(), initiation);
+        }
+    }
 
     #[test]
     fn admitted_stop_reaches_every_request_clone_without_changing_deadline() {

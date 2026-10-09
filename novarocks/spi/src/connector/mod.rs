@@ -100,8 +100,9 @@ pub use codec::{
 };
 pub use context::{
     ConnectorAttemptContext, ConnectorOperationControl, ConnectorPlanningContext,
-    ConnectorRangeScope, ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
-    ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
+    ConnectorRangeScope, ConnectorRequestContext, ConnectorRequestInitiation,
+    ConnectorRequestScope, ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
+    VendedS3SeedMaterial,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -178,7 +179,8 @@ pub use metadata::{
     ConnectorTableColumnPlanningFact, ConnectorTableColumnRole, ConnectorTableColumnSemanticKind,
     ConnectorTableColumnVisibility, ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
     ConnectorTableDefinitionStructField, ConnectorTableDefinitionType,
-    ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableJobAdmission,
+    ConnectorTableJobAdmissionRequest, ConnectorTableJobKind, ConnectorTableMetadata,
     ConnectorTableObjectBinding, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
     ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTablePlanningFacts,
     ConnectorTableRequest, ConnectorTableResolution, ConnectorTableUniqueConstraint,

@@ -201,6 +201,29 @@ class FixtureContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             RESOLVER.validate_error(error, resolved["dataset_key"])
 
+    def test_new_unrelated_lock_entries_do_not_change_producer_projection(self):
+        lock = json.loads((ROOT / "docker/fixture-inputs/lock.json").read_text())
+        declarations = self.model["fixture"]["producer_lock_projections"]
+        baseline = RESOLVER.producer_lock_projections(ROOT, declarations)
+        lock["images"]["independent-builder"] = {
+            "source": "example.invalid/builder", "platform": "linux/arm64",
+            "manifest_digest": "sha256:independent", "alias": "fixture/builder:locked",
+        }
+        lock["artifacts"]["independent-source.tar.gz"] = {
+            "url": "https://example.invalid/source.tar.gz", "bytes": 42, "sha1": "independent",
+        }
+        lock["derived_images"]["independent-catalog"] = {
+            "platform": "linux/arm64", "alias": "fixture/catalog:current",
+            "bases": {"BUILDER": "independent-builder", "REST_BASE": "iceberg-rest"},
+            "dockerfile": "other/Dockerfile", "artifacts": ["independent-source.tar.gz"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "docker/fixture-inputs/lock.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(lock))
+            self.assertEqual(baseline, RESOLVER.producer_lock_projections(root, declarations))
+
 
 if __name__ == "__main__":
     unittest.main()

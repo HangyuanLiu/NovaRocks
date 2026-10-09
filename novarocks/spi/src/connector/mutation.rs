@@ -991,6 +991,15 @@ pub struct ConnectorCatalogMutationReconcileRequest {
 pub trait ConnectorCatalogMutation: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
+    /// Admit a complete mutation before a consumer decomposes it into reads
+    /// and child mutations. This method must perform no external side effect.
+    /// Execution must repeat admission; this answer is not a reusable permit.
+    fn admit(&self, _request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation does not support preflight admission",
+        ))
+    }
     fn execute(
         &self,
         request: ConnectorCatalogMutationRequest,
@@ -1063,6 +1072,25 @@ impl ConnectorCatalogMutationLease {
     /// Builds a provider request behind an FE-owned control-runtime lease.
     /// Provider incarnation remains internal to retain legacy external
     /// evidence validation without exposing it to FE application callers.
+    pub fn admit_operation(
+        &self,
+        operation_id: ConnectorMutationOperationId,
+        operation: ConnectorCatalogMutationOperation,
+        context: ConnectorRequestContext,
+    ) -> Result<(), ConnectorError> {
+        let request = ConnectorCatalogMutationRequest {
+            operation_id,
+            target: ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.provider_incarnation,
+            },
+            operation,
+            context,
+        };
+        self.validate_request(&request)?;
+        self.mutation.admit(&request)
+    }
+
     pub fn execute_operation(
         &self,
         operation_id: ConnectorMutationOperationId,
@@ -1194,6 +1222,71 @@ mod tests {
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorManagedPartitionTransform,
         ConnectorProviderId, ConnectorTableIdentity, ProviderBindingEpoch,
     };
+
+    #[test]
+    fn catalog_mutation_preflight_defaults_to_unsupported_without_dispatch() {
+        use super::*;
+        struct Capability {
+            descriptor: ConnectorInstanceDescriptor,
+        }
+        impl ConnectorCatalogMutation for Capability {
+            fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+                &self.descriptor
+            }
+            fn incarnation(&self) -> ProviderBindingEpoch {
+                ProviderBindingEpoch::from_bytes([1; 16])
+            }
+            fn execute(
+                &self,
+                _: ConnectorCatalogMutationRequest,
+            ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+            {
+                panic!("preflight must not dispatch a mutation")
+            }
+            fn reconcile(
+                &self,
+                _: ConnectorCatalogMutationReconcileRequest,
+            ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+            {
+                panic!("preflight must not reconcile a mutation")
+            }
+        }
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("analytics").unwrap(),
+        };
+        let lease = ConnectorCatalogMutationLease::new(
+            descriptor.clone(),
+            ConnectorControlRuntimeId::new(),
+            ProviderBindingEpoch::from_bytes([1; 16]),
+            Arc::new(Capability {
+                descriptor: descriptor.clone(),
+            }),
+            || {},
+        )
+        .unwrap();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            crate::connector::ConnectorStopOwner::new().view(),
+            1024,
+            4096,
+        )
+        .unwrap();
+        let error = lease
+            .admit_operation(
+                ConnectorMutationOperationId::new(),
+                ConnectorCatalogMutationOperation::DropNamespace {
+                    namespace: ConnectorNamespaceIdentity {
+                        instance_id: descriptor.instance_id,
+                        namespace: "db".into(),
+                    },
+                    policy: DropPolicy::FailIfMissing,
+                },
+                context,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    }
 
     fn table() -> ConnectorTableIdentity {
         ConnectorTableIdentity {

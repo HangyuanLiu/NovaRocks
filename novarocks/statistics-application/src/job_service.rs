@@ -39,7 +39,7 @@ pub struct StatisticsJobService {
 
 /// The process-local, event-driven runner for submitted statistics jobs.
 ///
-/// SQL only submits work and never synchronously executes an attempt. The
+/// SQL submits work; an admitted statement may await its actual conclusion. The
 /// product owns the runner, its wakeup queue, and its stop/join evidence;
 /// role composition supplies only the concrete attempt adapter and runtime.
 pub struct StatisticsJobRuntime {
@@ -74,8 +74,23 @@ impl StatisticsJobService {
         self.repository.create_now_admitted(request, admission)
     }
 
+    pub async fn wait_for_conclusion(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.repository.wait_for_conclusion(id).await
+    }
+
     pub async fn list(&self) -> Result<Vec<StatisticsJob>, StatisticsRepositoryError> {
         self.repository.list().await
+    }
+
+    /// Cancel without fabricating a fresh wall-clock observation.
+    pub async fn request_cancel_without_time(
+        &self,
+        job_id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.repository.request_cancel_without_time(job_id).await
     }
 
     pub async fn request_cancel(
@@ -194,8 +209,23 @@ impl StatisticsJobRuntime {
         Ok(job)
     }
 
+    pub async fn wait_for_conclusion(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.service.wait_for_conclusion(id).await
+    }
+
     pub async fn list(&self) -> Result<Vec<StatisticsJob>, StatisticsRepositoryError> {
         self.service.list().await
+    }
+
+    /// Cancel without fabricating a fresh wall-clock observation.
+    pub async fn request_cancel_without_time(
+        &self,
+        job_id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.service.request_cancel_without_time(job_id).await
     }
 
     pub async fn request_cancel(

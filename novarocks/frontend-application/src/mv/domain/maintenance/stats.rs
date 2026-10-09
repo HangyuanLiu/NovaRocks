@@ -152,7 +152,8 @@ pub fn collect_table_stats_with_ports(
     let context = crate::connector::connector_request_context(
         None,
         novarocks_spi::connector::ConnectorStopOwner::new().view(),
-    )?;
+    )?
+    .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background);
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
     let identity = ConnectorTableIdentity {
         instance_id: instance_id.clone(),

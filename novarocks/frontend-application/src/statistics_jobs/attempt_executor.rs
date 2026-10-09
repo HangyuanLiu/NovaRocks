@@ -269,6 +269,10 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
             deadline,
             cancellation,
         )
+        .map(|context| {
+            context
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::JobAttempt)
+        })
         .map_err(StatisticsApplicationError::new)
     }
 

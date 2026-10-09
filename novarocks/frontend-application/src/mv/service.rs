@@ -649,7 +649,8 @@ fn execute_scheduled_refresh(
             context.execution(),
             &dependencies.runtime,
         ) {
-            Ok(context) => context,
+            Ok(context) => context
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background),
             Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error),
         };
     if cancellation.is_cancelled() {

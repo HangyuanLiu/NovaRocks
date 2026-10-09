@@ -1,5 +1,5 @@
 ---
-id: ADR-0168
+id: ADR-0170
 title: "Third-party crates are bounded through public configuration, not forked for resource accounting"
 domain: [crate-boundary, memory-governance]
 status: active

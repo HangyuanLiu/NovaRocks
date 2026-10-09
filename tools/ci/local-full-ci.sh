@@ -362,11 +362,15 @@ prepare_runtime() {
       require_runtime_var NOVA_ENV_RUNTIME_DIR &&
       require_runtime_var NOVA_ENV_MYSQL_PORT &&
       require_runtime_var NOVAROCKS_ICEBERG_REST_URI &&
+      require_runtime_var NOVAROCKS_ICEBERG_REST_MV_URI &&
       require_runtime_var NOVA_ENV_REST_ENV_FILE &&
+      require_runtime_var NOVA_ENV_MANIFEST &&
       require_runtime_var NOVA_ENV_OBJECT_STORE_RUNTIME &&
       require_runtime_var NOVA_ENV_CATALOG_RUNTIME &&
       require_runtime_var AWS_S3_ENDPOINT &&
       record_fixture_runtime &&
+      echo "+ python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest <runtime-manifest>" &&
+      python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST" &&
       PAIMON_FIXTURE_DIR="$CI_RUN_DIR/paimon-fixture" &&
       PAIMON_FIXTURE_RUN_ID="ci-${CI_COMMIT_SHA:0:12}-$(basename "$CI_RUN_DIR")" &&
       echo "+ docker/paimon-read/prepare.sh --env-file <runtime-env> --run-id $PAIMON_FIXTURE_RUN_ID --output-dir <ci-run>/paimon-fixture" &&
@@ -436,6 +440,7 @@ record_fixture_runtime() {
   echo "NOVA_ENV_PUBLICATION_DIR=$(dirname "$NOVA_ENV_REST_ENV_FILE")"
   echo "AWS_S3_ENDPOINT=$AWS_S3_ENDPOINT"
   echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
+  echo "NOVAROCKS_ICEBERG_REST_MV_URI=$NOVAROCKS_ICEBERG_REST_MV_URI"
 }
 
 reset_frontend_state_store_stage() {
@@ -1353,8 +1358,8 @@ main() {
   run_cargo_gates
   # System Scenarios run before the SQL suites so a topology, readiness,
   # restart, fault or cleanup break surfaces before the much longer SQL tier.
-  # The stage needs no Docker fixture: every registered scenario builds its
-  # Iceberg warehouse on the local filesystem.
+  # Most default scenarios use local warehouses. Target replacement owns an
+  # isolated REST/S3 fixture using the inputs verified during runtime preparation.
   run_system_scenario_fixture_stage
   run_system_scenarios_stage
   reset_frontend_state_store_stage

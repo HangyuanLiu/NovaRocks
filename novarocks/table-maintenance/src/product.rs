@@ -265,6 +265,10 @@ impl TableMaintenanceProduct {
         self.jobs.list().await
     }
 
+    pub async fn request_cancel_optimize(&self, handle: JobHandle) -> Result<(), String> {
+        self.jobs.request_cancel(handle).await
+    }
+
     pub async fn wait_optimize(&self, handle: JobHandle) -> Result<MaintenanceJobState, String> {
         self.jobs.wait_for_completion(handle).await
     }

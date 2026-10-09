@@ -54,6 +54,9 @@
 //! actually performs. A trait method whose only content is a forward to a
 //! primitive no caller wants is a second way to do one thing.
 
+pub(crate) mod admission;
+#[cfg(test)]
+pub(crate) mod admission_test_support;
 pub(crate) mod delegate;
 pub(crate) mod dispatch;
 pub(crate) mod error;
@@ -114,6 +117,10 @@ impl CatalogTableName {
             namespace: namespace.into(),
             name: name.into(),
         }
+    }
+
+    pub(crate) fn from_identifier(ident: &crate::iceberg::TableIdent) -> Self {
+        Self::new(ident.namespace.as_ref().join("."), ident.name.clone())
     }
 
     pub(crate) fn canonical(&self) -> Arc<str> {
@@ -226,6 +233,7 @@ pub(crate) struct ConditionalCreateRequest {
 /// implementation prepared it.
 #[derive(Debug)]
 pub(crate) struct ConditionalCreateAttempt {
+    pub(crate) target: CatalogTableName,
     pub(crate) facts: ConditionalCreateFacts,
     inner: ConditionalCreateAttemptState,
 }
@@ -239,8 +247,10 @@ impl ConditionalCreateAttempt {
     pub(crate) fn hadoop(
         attempt: crate::hadoop_catalog::HadoopCreateAttempt,
         facts: ConditionalCreateFacts,
+        target: CatalogTableName,
     ) -> Self {
         Self {
+            target,
             facts,
             inner: ConditionalCreateAttemptState::Hadoop(Box::new(attempt)),
         }
@@ -621,16 +631,29 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         evidence: ConditionalCreateEvidence,
     ) -> Result<ConditionalCreateVerdict, ConnectorError>;
 
-    /// Decide whether a create with this intent can be admitted.
-    ///
-    /// This is not a capability table. It is the same decision
-    /// [`NovaRocksCatalog::new_create_table_transaction`] makes, reachable by
-    /// callers that must refuse before they build a table definition — a CTAS
-    /// has to be turned away before its source runs, and building the
-    /// definition first would already be work done on a request that cannot
-    /// succeed. Implementations answer it from the same inputs, and the
-    /// constructor calls it, so the two cannot drift apart.
-    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported>;
+    /// One local operation rule, shared by admission and the mutation owner.
+    fn admit_operation(
+        &self,
+        operation: &admission::CatalogOperation,
+        target: &admission::CatalogAdmissionTarget,
+    ) -> Result<(), CatalogUnsupported>;
+
+    fn admit_initiation(
+        &self,
+        _request: &admission::CatalogAdmissionRequest,
+    ) -> Result<admission::CatalogAdmission, CatalogUnsupported> {
+        Ok(admission::CatalogAdmission::Admitted)
+    }
+
+    // Design: ADR-0169 (docs/adr/ADR-0169-read-only-hms-and-single-writer-admission.md)
+    fn admit(
+        &self,
+        request: &admission::CatalogAdmissionRequest,
+    ) -> Result<admission::CatalogAdmission, CatalogUnsupported> {
+        request.operation.validate_target(&request.target)?;
+        self.admit_operation(&request.operation, &request.target)?;
+        self.admit_initiation(request)
+    }
 
     /// Begin a transaction that creates a table.
     ///

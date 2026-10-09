@@ -869,7 +869,10 @@ pub(super) fn lower_table_writer_node(
         binding.execution(),
         execution_id,
         node_id,
-        Arc::new(NativeConnectorWriteObservationPort),
+        Arc::new(NativeConnectorWriteObservationPort::new(
+            ctx.backend_process_id()
+                .map_err(|error| error.into_native(path.clone()))?,
+        )),
         crate::debug_environment::debug_emit_connector_writer_marker(),
     ));
     let fragment_encoder = Arc::new(RoleBoundCommitFragmentEncoder::new(
@@ -1248,6 +1251,7 @@ mod tests {
 
     fn write_decode_context(execution: Arc<RecordingWriteExecution>) -> NativePlanDecodeContext {
         NativePlanDecodeContext::default()
+            .with_backend_process_id(novarocks_types::BackendProcessId::new_v7())
             .with_typed_scan_runtime(Some(test_write_scan_runtime(
                 execution_id(),
                 fragment_instance_id(),

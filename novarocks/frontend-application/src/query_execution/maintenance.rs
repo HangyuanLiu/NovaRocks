@@ -209,6 +209,10 @@ impl AutomaticMaintenanceContext {
                 self.cancellation.clone(),
             ),
         }
+        .map(|context| {
+            context
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
+        })
     }
 
     pub fn ensure_active(&self) -> Result<(), String> {
@@ -323,6 +327,19 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<Arc<dyn TableMaintenanceEngine>, String>;
+
+    fn capture_admitted_optimize_target(
+        &self,
+        _target: &MaintenanceTarget,
+    ) -> Result<novarocks_table_maintenance::job_service::CapturedOptimizeTarget, String> {
+        Err("table maintenance job admission is unsupported".to_string())
+    }
+
+    fn statement_cancellation(
+        &self,
+    ) -> Option<(novarocks_spi::connector::ConnectorStopView, Instant)> {
+        None
+    }
 
     fn resolve_target(
         &self,
@@ -749,6 +766,69 @@ fn capture_target_object_id_with_ports(
     captured_target_object_id_from_connector_result(binding)
 }
 
+/// Capture the completion rule and physical object from one exact generation.
+/// The product calls this only after acquiring its target activity gate.
+fn capture_admitted_optimize_target_with_ports(
+    controls: &dyn ConnectorControlResolver,
+    target: &MaintenanceTarget,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<novarocks_table_maintenance::job_service::CapturedOptimizeTarget, String> {
+    use novarocks_spi::connector::{
+        ConnectorReadReferenceFactsRequest, ConnectorTableJobAdmission,
+        ConnectorTableJobAdmissionRequest, ConnectorTableJobKind,
+    };
+    use novarocks_table_maintenance::{
+        OptimizeCompletionMode, job_service::CapturedOptimizeTarget,
+    };
+    let identity = RequestScopedMaintenanceEngine::target_identity(target)?;
+    let lease = controls
+        .acquire_current(&identity.instance_id)
+        .map_err(|error| error.to_string())?;
+    let completion = match lease
+        .binding()
+        .metadata()
+        .admit_table_job(ConnectorTableJobAdmissionRequest {
+            table: identity.clone(),
+            job: ConnectorTableJobKind::RewriteDataFiles,
+            context: context.clone(),
+        })
+        .map_err(|error| error.to_string())?
+    {
+        ConnectorTableJobAdmission::Detached => OptimizeCompletionMode::Detached,
+        ConnectorTableJobAdmission::AwaitTerminal => OptimizeCompletionMode::AwaitTerminal,
+    };
+    let context = crate::connector::context_for_planning_lease(&lease, context)?;
+    let captured = lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: identity.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    let facts = lease
+        .binding()
+        .metadata()
+        .read_reference_facts(ConnectorReadReferenceFactsRequest {
+            table: identity,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    let base_snapshot_id = facts.current_snapshot_id().ok_or_else(|| {
+        format!(
+            "iceberg table {}.{}.{} has no current snapshot",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    Ok(CapturedOptimizeTarget {
+        object_id: captured.object_id.as_bytes().to_vec(),
+        base_snapshot_id,
+        completion,
+    })
+}
+
 fn rebind_target_object_with_ports(
     controls: &dyn ConnectorControlResolver,
     target: &MaintenanceTarget,
@@ -912,6 +992,26 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             self.execution.clone(),
             self.connector_context.clone(),
         )))
+    }
+
+    fn capture_admitted_optimize_target(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<novarocks_table_maintenance::job_service::CapturedOptimizeTarget, String> {
+        capture_admitted_optimize_target_with_ports(
+            self.kernel.connector_control().as_ref(),
+            target,
+            self.connector_context.clone(),
+        )
+    }
+
+    fn statement_cancellation(
+        &self,
+    ) -> Option<(novarocks_spi::connector::ConnectorStopView, Instant)> {
+        Some((
+            self.connector_context.stop().clone(),
+            self.connector_context.deadline(),
+        ))
     }
 
     fn resolve_target(
@@ -1835,6 +1935,220 @@ mod maintenance_attempt_context_tests {
         maintenance_target_rebind_from_connector_result,
     };
     use novarocks_table_maintenance::MaintenanceTargetRebind;
+
+    #[test]
+    fn optimize_admission_capture_and_snapshot_use_one_generation() {
+        use novarocks_spi::connector::*;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Generation {
+            instance: ConnectorInstanceId,
+            marker: u8,
+            admission: Option<ConnectorTableJobAdmission>,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl ConnectorMetadata for Generation {
+            fn instance_id(&self) -> &ConnectorInstanceId {
+                &self.instance
+            }
+            fn namespace_exists(
+                &self,
+                _: ConnectorNamespaceRequest,
+            ) -> Result<bool, ConnectorError> {
+                panic!("unexpected discovery")
+            }
+            fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+                panic!("unexpected discovery")
+            }
+            fn list_tables(
+                &self,
+                _: ConnectorListTablesRequest,
+            ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+                panic!("unexpected discovery")
+            }
+            fn load_table(
+                &self,
+                _: ConnectorTableRequest,
+            ) -> Result<ConnectorTableMetadata, ConnectorError> {
+                panic!("unexpected load")
+            }
+            fn admit_table_job(
+                &self,
+                request: ConnectorTableJobAdmissionRequest,
+            ) -> Result<ConnectorTableJobAdmission, ConnectorError> {
+                assert_eq!(request.job, ConnectorTableJobKind::RewriteDataFiles);
+                self.calls.lock().unwrap().push("admit");
+                self.admission.ok_or_else(|| {
+                    ConnectorError::new(ConnectorErrorKind::Unsupported, "read-only generation")
+                })
+            }
+            fn capture_table_object_binding(
+                &self,
+                request: ConnectorTableObjectCaptureRequest,
+            ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+                self.calls.lock().unwrap().push("capture");
+                Ok(ConnectorTableObjectBinding {
+                    object_id: ConnectorTableObjectId::try_new(Bytes::from(vec![self.marker]))
+                        .unwrap(),
+                    metadata: ConnectorTableMetadata {
+                        identity: request.table,
+                        schema: Arc::new(arrow::datatypes::Schema::empty()),
+                        planning_facts: ConnectorTablePlanningFacts::default(),
+                        definition_facts: ConnectorTableDefinitionFacts::default(),
+                        version: None,
+                        statistics_data_version: None,
+                        table: ConnectorTableHandle::try_new(
+                            self.instance.clone(),
+                            Bytes::from(vec![self.marker]),
+                        )
+                        .unwrap(),
+                    },
+                })
+            }
+            fn read_reference_facts(
+                &self,
+                request: ConnectorReadReferenceFactsRequest,
+            ) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
+                self.calls.lock().unwrap().push("reference");
+                ConnectorReadReferenceFacts::try_new(
+                    vec![i64::from(self.marker)],
+                    Vec::new(),
+                    Vec::new(),
+                    Some(i64::from(self.marker)),
+                    &request.context,
+                )
+            }
+        }
+        impl ConnectorScanPlanning for Generation {
+            fn instance_id(&self) -> &ConnectorInstanceId {
+                &self.instance
+            }
+            fn begin_scan(
+                &self,
+                _: &ConnectorTableHandle,
+                _: ConnectorBeginScanRequest,
+            ) -> Result<ConnectorScan, ConnectorError> {
+                panic!("unexpected scan")
+            }
+            fn plan_splits(
+                &self,
+                _: &ConnectorScanHandle,
+                _: ConnectorSplitPlanningRequest,
+            ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+                panic!("unexpected scan")
+            }
+        }
+        impl ConnectorExecutionDistribution for Generation {
+            fn declaration(
+                &self,
+                _: &ConnectorRequestContext,
+            ) -> Result<ConnectorProviderBinding, ConnectorError> {
+                panic!("unexpected distribution")
+            }
+        }
+        struct SwitchingResolver {
+            generations: Vec<Arc<ConnectorControlBinding>>,
+            acquired: AtomicUsize,
+        }
+        impl ConnectorControlResolver for SwitchingResolver {
+            fn observe_current_binding(
+                &self,
+                _: &ConnectorInstanceId,
+            ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
+                panic!("must acquire exact lease")
+            }
+            fn observe_current_control_runtime(
+                &self,
+                _: &ConnectorInstanceId,
+            ) -> Result<ConnectorControlRuntimeId, ConnectorError> {
+                panic!("must acquire exact lease")
+            }
+            fn acquire_current(
+                &self,
+                _: &ConnectorInstanceId,
+            ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+                let index = self.acquired.fetch_add(1, Ordering::AcqRel);
+                Ok(ConnectorControlPlanningLease::new(
+                    Arc::clone(&self.generations[index.min(1)]),
+                    || {},
+                ))
+            }
+        }
+        for admission in [
+            Some(ConnectorTableJobAdmission::Detached),
+            Some(ConnectorTableJobAdmission::AwaitTerminal),
+            None,
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let instance = ConnectorInstanceId::parse("catalog").unwrap();
+            let mut generations = Vec::new();
+            for marker in [1, 2] {
+                let capability = Arc::new(Generation {
+                    instance: instance.clone(),
+                    marker,
+                    admission,
+                    calls: Arc::clone(&calls),
+                });
+                generations.push(Arc::new(
+                    ConnectorControlBinding::try_new(
+                        ConnectorInstanceDescriptor {
+                            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                            instance_id: instance.clone(),
+                        },
+                        ProviderBindingEpoch::from_bytes([marker; 16]),
+                        capability.clone(),
+                        capability.clone(),
+                        capability,
+                        None,
+                    )
+                    .unwrap(),
+                ));
+            }
+            let controls = SwitchingResolver {
+                generations,
+                acquired: AtomicUsize::new(0),
+            };
+            let context =
+                crate::connector::connector_request_context(None, ConnectorStopOwner::new().view())
+                    .unwrap();
+            let result = super::capture_admitted_optimize_target_with_ports(
+                &controls,
+                &novarocks_table_maintenance::MaintenanceTarget {
+                    catalog: "catalog".into(),
+                    namespace: "db".into(),
+                    table: "t".into(),
+                },
+                context,
+            );
+            assert_eq!(
+                controls.acquired.load(Ordering::Acquire),
+                1,
+                "capture must not reacquire a replacement generation"
+            );
+            if let Some(admission) = admission {
+                let captured = result.unwrap();
+                assert_eq!(captured.object_id, vec![1]);
+                assert_eq!(captured.base_snapshot_id, 1);
+                assert_eq!(
+                    captured.completion,
+                    match admission {
+                        ConnectorTableJobAdmission::Detached =>
+                            novarocks_table_maintenance::OptimizeCompletionMode::Detached,
+                        ConnectorTableJobAdmission::AwaitTerminal =>
+                            novarocks_table_maintenance::OptimizeCompletionMode::AwaitTerminal,
+                    }
+                );
+                assert_eq!(*calls.lock().unwrap(), ["admit", "capture", "reference"]);
+            } else {
+                assert!(result.unwrap_err().contains("read-only generation"));
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    ["admit"],
+                    "refused job must not capture or read provider facts"
+                );
+            }
+        }
+    }
 
     #[test]
     fn source_context_and_connector_request_share_one_cancellation_flag() {

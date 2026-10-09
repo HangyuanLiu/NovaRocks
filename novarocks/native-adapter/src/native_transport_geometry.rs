@@ -27,7 +27,7 @@
 //! handshake and queued request) are measured and frozen by P00b; until then
 //! the envelope reports only its structural part and claims no byte bound.
 //!
-//! Design: ADR-0168 (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
+//! Design: ADR-0170 (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 
 use std::io;
 

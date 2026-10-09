@@ -2497,6 +2497,18 @@ async fn run_covered_subscription(
                                 }
                                 _ => false,
                             };
+                            let convergence = match &event.fact {
+                                CoveredStatusStreamFact::ContextConvergence(receipt) => {
+                                    Some(*receipt)
+                                }
+                                _ => None,
+                            };
+                            let terminal = match &event.fact {
+                                CoveredStatusStreamFact::Status(status) if status.is_terminal() => {
+                                    Some((status.identity(), status.state()))
+                                }
+                                _ => None,
+                            };
                             if let Err(error) = permit.publish(
                                 ObservationFrame::Covered {
                                     context,
@@ -2513,6 +2525,25 @@ async fn run_covered_subscription(
                                 );
                                 set_state(&state, SubscriptionState::Rejected);
                                 return;
+                            }
+                            if let Some(receipt) = convergence {
+                                tracing::debug!(
+                                    %context,
+                                    execution_id = ?context.query_execution_id(),
+                                    version = %receipt.version(),
+                                    state = ?receipt.state(),
+                                    "frontend retained worker stop and context fence"
+                                );
+                            }
+                            if let Some((identity, state)) = terminal {
+                                tracing::debug!(
+                                    execution_id = ?identity.query_execution_id(),
+                                    stage = identity.stage_id().get(),
+                                    task = identity.task_id().get(),
+                                    backend = %identity.backend_process_id(),
+                                    ?state,
+                                    "frontend retained task terminal"
+                                );
                             }
                             if new_liveness {
                                 observed_liveness = true;

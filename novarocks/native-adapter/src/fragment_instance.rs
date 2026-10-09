@@ -38,12 +38,13 @@ use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks as proto;
-use novarocks_types::QueryId;
+use novarocks_types::{BackendProcessId, QueryId};
 
 /// The immutable Execution facts of one fragment instance.
 #[derive(Debug)]
 pub struct NativeFragmentInstanceInput {
     pub query_id: QueryId,
+    pub backend_process_id: BackendProcessId,
     pub fragment_instance_id: FragmentInstanceId,
     pub backend_num: BackendNum,
     pub query_options: QueryOptions,
@@ -79,6 +80,7 @@ pub(crate) fn task_sink_edge_ids_path() -> FieldPath {
 /// | Kernel fact | Owner |
 /// |---|---|
 /// | query id | the exact query execution the task identity names |
+/// | backend process id | the exact process the admitted task identity names |
 /// | fragment instance id | the descriptor's kernel key |
 /// | backend num | the assignment's instance ordinal |
 /// | per-node scan ranges | the assignment's initial scan ranges |
@@ -160,6 +162,7 @@ pub fn project_task_instance(
     let identity = descriptor.identity();
     Ok(NativeFragmentInstanceInput {
         query_id: identity.query_execution_id().query_id(),
+        backend_process_id: identity.backend_process_id(),
         fragment_instance_id: FragmentInstanceId::new(descriptor.fragment_instance_id()),
         backend_num,
         query_options,
@@ -336,6 +339,11 @@ mod tests {
             instance.query_id,
             QueryId::new(7, 8),
             "the identity's query"
+        );
+        assert_eq!(
+            instance.backend_process_id,
+            descriptor.identity().backend_process_id(),
+            "the admitted task's exact backend process"
         );
         assert_eq!(
             instance.fragment_instance_id.get(),

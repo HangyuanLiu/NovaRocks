@@ -19,7 +19,7 @@ under the License.
 
 # Iceberg REST + MinIO + Spark Test Environment
 
-此目录提供开发与 CI 的 Iceberg REST Catalog、MinIO 和 Spark fixture。共享模式按已验证输入生成运行实例：同输入附着同一实例，输入变化允许版本并存；一个对象存储实例可供多个 catalog 使用。旧 `nr-iceberg-rest` / `nr-iceberg-hive` 项目、数据和卷不会被自动接管、迁移或删除。
+此目录提供开发与 CI 的 Iceberg REST Catalog、MinIO 和 Spark fixture。每个 catalog 实例同时运行 stock `rest` 与 `rest-mv`：后者保存 view version 的 `storage-table`，前者保留为不支持该字段的对照。共享模式按已验证输入生成运行实例：同输入附着同一实例，输入变化允许运行实例并存；一个对象存储实例可供多个 catalog 使用。输入供给只有一份当前 lock/BOM，不支持多个 lock 同机并存。旧 `nr-iceberg-rest` / `nr-iceberg-hive` 项目、数据和卷不会被自动接管、迁移或删除。
 
 ## 输入、实例与端点
 
@@ -33,7 +33,7 @@ docker/iceberg-rest/up.sh
 
 `NOVA_FIXTURE_STORE` 指定 BOM store。provision 可以下载、pull 和 build；verify、共享 runtime owner 和普通测试消费者只读取本机 BOM 与镜像。BOM 前置条件缺失/不一致返回 75；CI 归为 BLOCKED。端口不可用、身份不符、外部连接和其他 owner 失败归为 VERIFY FAILED，不进入 Cargo gates。
 
-`docker/fixture-inputs/verify.sh` 默认核验全量 BOM；Iceberg runtime owner 使用封闭的 `iceberg-rest` consumer，核验其服务镜像及由 lock 声明推导的 Spark base/JAR 闭包。两者都要求当前全局 READY/lock/BOM，且严格检查所需输入的定义、校验和、平台、标签与精确镜像 ID。独立 Paimon 输入的定义变化不会阻塞未消费它的 Iceberg runtime；所需输入失败仍返回 75，不自动供给或拉取。
+`docker/fixture-inputs/verify.sh` 默认核验全量 BOM；Iceberg runtime owner 使用封闭的 `iceberg-rest` consumer，核验其服务镜像及由 lock 声明推导的 Spark base/JAR、`rest-mv` 构建镜像、运行 base 与源码包闭包。两者都要求当前全局 READY/lock/BOM，且严格检查所需输入的定义、校验和、平台、标签与精确镜像 ID。独立 Paimon 输入的定义变化不会阻塞未消费它的 Iceberg runtime；所需输入失败仍返回 75，不自动供给或拉取。
 
 供给阶段仍可能移动 daemon 全局 derived-image alias，私有 BOM store 本身不隔离 alias。owner 为实例保存独立标签和真实 image ID；benchmark bootstrap 先 bind，再读取本次 publication，并核对实际 Spark 容器 image ID 与 BOM producer。精确供给快照的竞态消除属于后续工作，不能把当前核验描述为已经消除竞态。
 
@@ -72,7 +72,10 @@ source "$fixture_publication/env.sh"
 - `NOVA_ENV_OBJECT_STORE_RUNTIME`、`NOVA_ENV_CATALOG_RUNTIME`、`NOVA_ENV_OBJECT_STORE_CONTAINER`：精确实例及 MinIO 容器身份。
 - `NOVA_ENV_COMPOSE_PROJECT/FILE/ENV`：catalog 保存的项目与定义。
 - `AWS_S3_ENDPOINT`、`NOVAROCKS_ICEBERG_REST_URI`：实际 host 端点。
+- `NOVAROCKS_ICEBERG_REST_MV_URI`、`NOVA_ENV_REST_MV_PORT`：`rest-mv` 的实际 host 端点与端口。
 - `NOVA_ENV_REST_SERVER_WAREHOUSE_URI`：catalog 服务端 warehouse；`NOVA_ENV_REST_WAREHOUSE_URI` / `NOVAROCKS_ICEBERG_REST_WAREHOUSE` 是客户端 warehouse，不能混用。
+- `NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI`：`rest-mv` 服务端 warehouse；`NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE` 是 worktree 的客户端 warehouse（`s3://warehouse/<env-id>/rest-mv`）。两种服务分别使用自己的 SQLite 卷和 warehouse。
+- `manifest.json.iceberg_rest_mv`：`uri`、`warehouse`、`server_default_warehouse`；runner 的 `[env].iceberg_rest_mv_uri` 与 `[env].iceberg_rest_mv_warehouse` 使用相同端点。
 - `NOVAROCKS_FE_CONFIG/BE_CONFIG/SQL_TEST_CONFIG`、`NOVAROCKS_SPARK_DEFAULTS`：同 publication 的配置。
 - `manifest.json.runtime`：两个运行记录、owner locator、producer receipt、profile、control URI、template model hash、publication/entry 路径。
 
@@ -86,6 +89,8 @@ source docker/iceberg-rest/runtime/current/env.sh
 ```
 
 这是 Codex setup 路径，不调用 Docker，也不验证 BOM。它沿用保存的 owner locator；保存的两个记录为 ready 时可以发布配置，但 `ready=true` 不证明当前服务健康。首次或记录缺失/deleting 时发布 unbound，`env.sh` 可 source 且 `NOVA_ENV_READY=false`，没有占位端点/镜像。正常 up 才验证、恢复与附着。只做 prepare 的 fresh worktree 仍可由 benchmark bootstrap 完成 bind，不能要求它预先具有端点。
+
+切换前的 catalog 记录没有 `rest-mv`，offline prepare 仍可恢复其原有端点，但不会发布 MV 端点；runner 会报告缺少必需的 `iceberg_rest_mv_*` 配置。运行正常 `up.sh` 后才会绑定包含 `rest-mv` 的实例。
 
 ## 启动消费者
 
@@ -106,9 +111,23 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 后台启动 server 时，首个连接必须等待该进程日志中的 `NOVAROCKS_READY`，不能只 probe MySQL port。all-in-one 是 smoke 便利形态，产品验收为 1FE+3BE。
 
-Spark 使用生成的 Docker 网络端点（`rest:8181` 与 `minio:9000`）；host 消费者使用生成的 host 端点。`spark-shell.sh`、Paimon prepare、Trino interop 和 benchmark bootstrap 接收明确的 `NOVA_ENV_REST_ENV_FILE`。benchmark 是 `s3://novarocks/shared/benchmarks` 下的不可变 READY fixture；worktree purge 不删除它。新的对象存储为空，第一次 ensure 需要重建数据，--check 不负责补建。
+Spark 使用生成的 Docker 网络端点（`rest:8181`、`rest-mv:8181` 与 `minio:9000`）；host 消费者使用生成的 host 端点。生成的 `ice_rest_mv` catalog 使用 `NOVAROCKS_SPARK_REST_MV_URI=http://rest-mv:8181`，默认 catalog 仍为 `ice_rest`。`spark-shell.sh`、Paimon prepare、Trino interop 和 benchmark bootstrap 接收明确的 `NOVA_ENV_REST_ENV_FILE`。benchmark 是 `s3://novarocks/shared/benchmarks` 下的不可变 READY fixture；worktree purge 不删除它。新的对象存储为空，第一次 ensure 需要重建数据，--check 不负责补建。
 
 HMS 由 `docker/iceberg-hive/` 的 owner 管理，按精确 catalog 接网；它的数据库与容器不归 REST owner。HMS 活着时，普通和 force catalog 删除均以 `ExternalAttachmentsPresent` 拒绝。先用 HMS down 撤销精确连接、退出自己的项目，再删除 catalog。不要以 REST owner 停止别人的 HMS 项目。
+
+## MV 合约检查与切换
+
+加载上述 publication 后，可以运行轻量合约探针：
+
+```bash
+python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"
+```
+
+探针创建独立 namespace，检查 `rest-mv` 保存字段、只改指针产生不同版本、显式 null，以及 stock `rest` 丢弃字段的对照和普通 view/table 行为；退出时清理本次对象，不重启共享服务。CI 每轮在记录运行端点后、Paimon 与 Cargo 阶段前运行它；合约或环境错误归为准备阶段的 VERIFY FAILED。重建容器的 `lifecycle` 检查仅接受私有隔离栈。配方、维护工具及三种探针模式见 [rest-mv README](rest-mv/README.md)。
+
+引入 `rest-mv` 的 lock 采用一次 0/1 切换：合入后每台机器按新 lock 执行一次 `docker/fixture-inputs/provision.sh`，各 worktree rebase 后重新运行 `docker/iceberg-rest/up.sh` 并加载新 publication。旧 lock 的 worktree 会在 verify 时 BLOCKED（75）；已运行的旧 catalog 可以继续存在。新 catalog key 包含 `rest-mv`，对象存储输入与 benchmark contract ID 不变，因此复用同一 owner 下的对象存储和已有标准数据。
+
+全部 derived image 构建成功后才更新别名、BOM 与 READY；构建失败保持原状。提交段仍非原子，提交中断可能使 verify BLOCKED，需要重跑 provision。旧 catalog 不自动迁移或删除；确认其 worktree 与外部 endpoint 已退出后，按下一节的 owner locator 和精确 ID 执行 `fixture-runtime.sh delete <catalog-id>`。
 
 ## 显式解绑与实例管理
 
@@ -135,7 +154,7 @@ docker/iceberg-rest/fixture-runtime.sh --root "$fixture_root" --daemon "$fixture
 - 外部 endpoint 尚在时普通/force catalog delete 都在进入 deleting、停止或清理前拒绝。先退出各消费者，再按精确记录操作。
 - 删除持久化 `deleting + deletion_id`；重试复核同一操作身份，逐步核验资源与标签消失后退休记录。旧删除者不能删除同 key 重建后的新资源。
 
-共享模式的 `down.sh --docker/--volumes` 被拒绝，使用上面的显式 manager。隔离 harness 设置 `NOVA_ENV_SHARED_DOCKER=false`、唯一 `nr-isolated-rest-*` 项目和 `NOVA_ENV_UPDATE_CURRENT=false`，不改共享 current；它保留精确项目/卷确认的私有 teardown。publication-hook profile 在创建前选定，不先启动 stock 再替换 REST。
+共享模式的 `down.sh --docker/--volumes` 被拒绝，使用上面的显式 manager。隔离 harness 设置 `NOVA_ENV_SHARED_DOCKER=false`、唯一 `nr-isolated-rest-*` 项目和 `NOVA_ENV_UPDATE_CURRENT=false`，不改共享 current；它同时运行 `rest` 与 `rest-mv`，保留精确项目/卷确认的私有 teardown。publication-hook profile 在创建前选定，只修改 `rest`；`rest-mv` 沿用普通镜像、端口与存储。
 
 旧 REST/Hive 退出是独立的用户操作：确认旧消费者已退出、数据已保存且无其它 worktree 使用后再安排。新 owner 不扫描或删除它们。运行实例所有权规则见 [ADR-0165](../../docs/adr/ADR-0165-versioned-fixture-runtime-ownership.md)。
 

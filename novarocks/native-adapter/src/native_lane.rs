@@ -28,7 +28,7 @@
 //! bounded by their public configuration and verified by the transport
 //! measurement gate; see `native_transport_geometry`.
 //!
-//! Design: ADR-0168 (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
+//! Design: ADR-0170 (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 
 use std::fmt;
 use std::future::Future;

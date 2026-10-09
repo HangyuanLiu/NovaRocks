@@ -642,7 +642,7 @@ Worker实际1MiB Vec可见4B、最后1B slice：非末alias退出后原credit仍
 
 actual Worker完整7 PASS、Native reader完整27 PASS，均0FAIL/0ignored/terminal0；包含五项新增和所有原probe，不用新测试替代旧回归。fmt/diffcheckPASS；收据 `docs/testing/mem-1-m07/evidence/p07-physical-backing-components-20261009.json` pin两actualsource、未改productionowner/lock、原finaldraft/pins和logs；dev unoptimized/jobs1/incremental0/threads1。component-only，无Native/stock服务。
 
-只证明选定same-thread System Layout/capacity与post-return实际free，非usable size/RSS/cache或全部allocator；native credit退出顺序仍同时依据未改GuardedOwner字段序，Bytes wrapper固定metadata例外保持ADR-0168。Closing old+new copy峰值/returnable失败回滚、fixed-core完整backing、其它domain/window/Arrow及跨线程最后alias、held-response Native/fullClosing64/P08/P00b/P09/P10/final同SHA仍OPEN。两个人工语义门与IRU-7 HMS非只读excluded不改，无push/PR/归档。
+只证明选定same-thread System Layout/capacity与post-return实际free，非usable size/RSS/cache或全部allocator；native credit退出顺序仍同时依据未改GuardedOwner字段序，Bytes wrapper固定metadata例外保持ADR-0170。Closing old+new copy峰值/returnable失败回滚、fixed-core完整backing、其它domain/window/Arrow及跨线程最后alias、held-response Native/fullClosing64/P08/P00b/P09/P10/final同SHA仍OPEN。两个人工语义门与IRU-7 HMS非只读excluded不改，无push/PR/归档。
 
 
 ### 2026-10-09：P09 held-response / late ACK 场景组件 PASS

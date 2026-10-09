@@ -46,7 +46,7 @@ under the License.
 
 ### Catalog 与存储
 
-- [Catalog 接入](catalog.md) ——  Hadoop ✅ / REST 🚧 / Glue ❌ / HMS ❌ / Nessie ❌ / JDBC ❌
+- [Catalog 接入](catalog.md) ——  Hadoop ✅ / REST 🚧 / Glue ❌ / HMS 只读兼容 ✅（写入 ❌） / Nessie ❌ / JDBC ❌
 - [对象存储与 FileIO](storage-and-fileio.md) —— 本地 / HDFS / S3 / OSS ✅；Azure / GCS / COS / OBS ❌
 
 ### 表与格式版本

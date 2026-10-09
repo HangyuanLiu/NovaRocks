@@ -170,6 +170,15 @@ bump. Line references are into `src/` of this directory.
   allocation accounting or exit hook inside the SDK. Delete these patches
   and use upstream when it exposes equivalent single-page or streaming APIs.
 
+- Updated the two format-version upgrade tests to await the vendored
+  asynchronous `TransactionAction::apply` before committing. Independent
+  crate validation exposed the stale synchronous callers on both Rust 1.92.0
+  and 1.98.1; this is a baseline test correction recorded during IRU-1,
+  not a new-toolchain compatibility patch. The same tests now explicitly
+  expect zero reload GET requests: the vendored commit path consumes the
+  authoritative commit response directly. Their POST and result/error
+  assertions remain intact. Production behavior is unchanged.
+
 ## Validation
 
 Diff base: upstream `iceberg-catalog-rest` 0.9.0 and 0.9.1 ship a

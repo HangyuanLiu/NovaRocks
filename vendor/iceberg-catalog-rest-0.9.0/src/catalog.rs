@@ -4506,6 +4506,7 @@ mod tests {
 
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .expect(0)
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
@@ -4647,6 +4648,7 @@ mod tests {
 
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .expect(0)
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",

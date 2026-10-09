@@ -985,9 +985,14 @@ fn encode_reply(
     writer.flag(hub.original_writer_exited)?;
     writer.gate(hub.gate)?;
     if matches!(wire_version, WireVersion::V2) {
-        writer.original_freeze_scalars(hub.original_freeze)?;
-        if writer.length > 744 {
-            return Err(ControlClass::Length);
+        #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
+        return Err(ControlClass::Fields);
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+        {
+            writer.original_freeze_scalars(hub.original_freeze)?;
+            if writer.length > 744 {
+                return Err(ControlClass::Length);
+            }
         }
     }
     let length = writer.length;
@@ -999,9 +1004,10 @@ fn encode_reply(
 #[path = "unix_control_tests.rs"]
 mod tests;
 
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
 #[path = "original_freeze_encoder.rs"]
 mod original_freeze_encoder;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mem-1-m07-exact-mysql-write"))]
 #[path = "unix_control_v2_tests.rs"]
 mod v2_tests;

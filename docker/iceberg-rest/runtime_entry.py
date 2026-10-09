@@ -43,6 +43,8 @@ MANAGED = """NOVA_ENV_CONFIG_FILE NOVA_ENV_ID NOVA_ENV_SHARED_DOCKER NOVA_ENV_CO
 NOVA_ENV_RUNTIME_DIR NOVA_ENV_CURRENT_DIR NOVA_ENV_REST_ENV_FILE NOVA_ENV_MANIFEST NOVA_ENV_README
 NOVA_ENV_COMPOSE_FILE NOVA_ENV_COMPOSE_ENV NOVA_ENV_MINIO_PORT NOVA_ENV_MINIO_CONSOLE_PORT
 NOVA_ENV_REST_PORT NOVA_ENV_SPARK_UI_PORT NOVA_ENV_MYSQL_PORT NOVA_ENV_FE_GRPC_PORT
+NOVA_ENV_REST_MV_PORT NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI NOVAROCKS_SPARK_REST_MV_URI
+NOVAROCKS_ICEBERG_REST_MV_URI NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE
 NOVA_ENV_FE_HTTP_PORT NOVA_ENV_BE_GRPC_PORT NOVA_ENV_BE_CONTROL_GRPC_PORT NOVA_ENV_BE_HTTP_PORT NOVAROCKS_NATIVE_SHARED_SECRET
 AWS_S3_ENDPOINT AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY MINIO_ROOT_USER MINIO_ROOT_PASSWORD
 iceberg_object_store_credential_name iceberg_object_store_credential_generation CATALOG_WAREHOUSE_URI
@@ -123,6 +125,9 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         manifest["minio"] = {"endpoint": endpoint["minio_endpoint"], "console": endpoint["minio_console"],
                               "access_key_id": ak, "secret_access_key": sk, "volume": os_record["volumes"][0]}
         manifest["iceberg_rest"] = {"uri": endpoint["rest_uri"], "warehouse": rest, "server_default_warehouse": cat["server_warehouse"]}
+        if "rest-mv" in cat["images"]:
+            manifest["iceberg_rest_mv"] = {"uri": endpoint["rest_mv_uri"], "warehouse": warehouse["rest_mv_client"],
+                                           "server_default_warehouse": runtime.server_warehouse(cat, "rest-mv")}
         manifest["spark"] = {"image": cat["images"]["spark"]["tag"], "spark_version": versions["spark"], "iceberg_version": versions["iceberg"],
             "ui": endpoint["spark_ui"], "container_rest_uri": endpoint["container_rest_uri"], "container_minio_endpoint": endpoint["container_minio_endpoint"],
             "defaults_file": str(publication / "spark-defaults.conf"), "v3_smoke_sql": str(publication / "spark-iceberg-v3-smoke.sql"), "helper": str(repo / "docker/iceberg-rest/spark-sql.sh")}
@@ -154,6 +159,14 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             "NOVA_FIXTURE_INPUT_BOM": config["fixture_inputs"]["bom"], "NOVA_FIXTURE_INPUT_LOCK_SHA256": config["fixture_inputs"]["lock_sha256"],
         })
         exports.update({"NOVA_ENV_" + name.upper() + "_PORT": value for name, value in ports.items()})
+        if "rest-mv" in cat["images"]:
+            exports.update({
+                "NOVA_ENV_REST_MV_PORT": cat["ports"]["rest_mv"],
+                "NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI": manifest["iceberg_rest_mv"]["server_default_warehouse"],
+                "NOVAROCKS_ICEBERG_REST_MV_URI": endpoint["rest_mv_uri"],
+                "NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE": warehouse["rest_mv_client"],
+                "NOVAROCKS_SPARK_REST_MV_URI": endpoint["container_rest_mv_uri"],
+            })
         if context.get("control_uri"):
             exports["NOVA_ENV_PUBLICATION_HOOK_CONTROL_URI"] = context["control_uri"]
         render_role_configs(staging, stable, env_id, ports, trust)
@@ -161,6 +174,8 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
                   "iceberg_catalog_type": "hadoop", "iceberg_catalog_warehouse": warehouse["catalog"], "iceberg_test_warehouse": warehouse["test"],
                   "iceberg_rest_uri": endpoint["rest_uri"], "iceberg_rest_warehouse": rest, "iceberg_object_store_credential_name": "iceberg-test-data",
                   "iceberg_object_store_credential_generation": "v1", "benchmark_shared_root": config["benchmark"]["shared_root"], "fixture_env_file": str(publication / "env.sh")}
+        if "rest-mv" in cat["images"]:
+            values.update(iceberg_rest_mv_uri=endpoint["rest_mv_uri"], iceberg_rest_mv_warehouse=warehouse["rest_mv_client"])
         text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\nport = ' + json_string(ports["mysql"]) + '\nuser = "root"\npassword = ""\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in values.items()))
         sql_values = {"type": "iceberg", "iceberg.catalog.type": "rest", "uri": endpoint["rest_uri"], "warehouse": rest,
                       "aws.s3.endpoint": endpoint["minio_endpoint"],
@@ -179,6 +194,11 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             "spark.sql.catalog.ice_rest.s3.region": "us-east-1", "spark.sql.defaultCatalog": "ice_rest", "spark.hadoop.fs.s3a.endpoint": endpoint["container_minio_endpoint"],
             "spark.hadoop.fs.s3a.access.key": ak, "spark.hadoop.fs.s3a.secret.key": sk, "spark.hadoop.fs.s3a.path.style.access": "true",
             "spark.hadoop.fs.s3a.connection.ssl.enabled": "false", "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"}
+        if "rest-mv" in cat["images"]:
+            spark.update({key.replace("spark.sql.catalog.ice_rest", "spark.sql.catalog.ice_rest_mv", 1): value
+                          for key, value in spark.items() if key.startswith("spark.sql.catalog.ice_rest")})
+            spark.update({"spark.sql.catalog.ice_rest_mv.uri": endpoint["container_rest_mv_uri"],
+                          "spark.sql.catalog.ice_rest_mv.warehouse": warehouse["rest_mv_client"]})
         text_file(staging, "spark-defaults.conf", ''.join(f'{key} {value}\n' for key, value in spark.items()))
         text_file(staging, "spark-iceberg-v3-smoke.sql", "CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_v3;\n\nDROP TABLE IF EXISTS ice_rest.nr_v3.spark_v3_smoke;\n\nCREATE TABLE ice_rest.nr_v3.spark_v3_smoke (\n  id BIGINT,\n  data STRING,\n  category STRING,\n  ts TIMESTAMP\n) USING iceberg\nTBLPROPERTIES (\n  'format-version' = '3',\n  'write.row-lineage' = 'true',\n  'write.format.default' = 'parquet'\n);\n\nINSERT INTO ice_rest.nr_v3.spark_v3_smoke VALUES\n  (1, 'spark-v3-a', 'alpha', TIMESTAMP '2026-05-07 00:00:00'),\n  (2, 'spark-v3-b', 'beta', TIMESTAMP '2026-05-07 00:01:00'),\n  (3, 'spark-v3-c', 'alpha', TIMESTAMP '2026-05-07 00:02:00');\n\nSELECT * FROM ice_rest.nr_v3.spark_v3_smoke ORDER BY id;\n")
     text_file(staging, "env.sh", '# Generated fixture publication.\nunset ' + ' '.join(MANAGED) + '\n' + ''.join(f'export {key}={shlex.quote(str(value))}\n' for key, value in exports.items()))
@@ -290,16 +310,19 @@ def render_isolated_stack(bom: dict, project: str, ports: dict, out: Path, confi
     text += "volumes:\n" + ''.join(blocks(templates["os"]["volumes"]).values()) + ''.join(blocks(templates["cat"]["volumes"]).values()) + templates["os"]["networks"]
     images = {"minio": bom["images"]["minio"]["alias"], "mc": bom["images"]["minio-mc"]["alias"],
               "rest": hook_image if profile == "publication-hook" else bom["images"]["iceberg-rest"]["alias"],
+              "rest-mv": bom["derived_images"]["rest-mv"]["image_id"],
               "spark": bom["derived_images"]["iceberg-spark"]["image_id"]}
     images["mc-init"] = images["mc"]
-    for key in ("minio", "minio_console", "rest", "spark"):
+    rest_services = runtime.rest_services({"images": images})
+    for key in ("minio", "minio_console", "rest", "rest_mv", "spark"):
         if not 0 < int(ports[key]) < 65536:
             raise runtime.RuntimeFailure("PortUnavailable", key)
     key = runtime.digest({"project": project, "templates": text, "images": images, "profile": profile})
     credentials = config["credentials"]
     values = {"NOVA_FIXTURE_OWNER": project, "NOVA_FIXTURE_KEY": key, "NOVA_FIXTURE_KIND": "isolated", "NOVA_FIXTURE_PROJECT": project,
               "MINIO_ROOT_USER": credentials["access_key"], "MINIO_ROOT_PASSWORD": credentials["secret_key"],
-              "NOVA_ENV_REST_SERVER_WAREHOUSE_URI": config["warehouses"]["rest_client"]}
+              "NOVA_ENV_REST_SERVER_WAREHOUSE_URI": config["warehouses"]["rest_client"],
+              "NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI": config["warehouses"]["rest_mv_client"]}
     values.update({service.upper().replace('-', '_') + '_IMAGE': image for service, image in images.items()})
     values.update({'NOVA_ENV_' + name.upper() + '_PORT': value for name, value in ports.items() if name != 'control'})
     if profile == "publication-hook":
@@ -309,9 +332,12 @@ def render_isolated_stack(bom: dict, project: str, ports: dict, out: Path, confi
     record = {"id": project, "key": key, "kind": "isolated", "namespace": project, "project": project,
         "network": project + "_iceberg_net", "ports": ports, "compose_file": str(out / "compose.yml"), "compose_env": str(out / "compose.env"),
         "images": {name: {"tag": image, "image_id": image} for name, image in images.items()}, "config": {"credentials": credentials},
-        "volumes": [project + "_minio-data", project + "_rest-catalog"], "required_services": ["minio", "mc-init", "rest", "spark"],
-        "service_ports": {"minio": {"9000/tcp": ports["minio"], "9001/tcp": ports["minio_console"]}, "rest": {"8181/tcp": ports["rest"]}, "spark": {"4040/tcp": ports["spark"]}},
-        "health_urls": [f'http://127.0.0.1:{ports["minio"]}/minio/health/live', f'http://127.0.0.1:{ports["rest"]}/v1/config'],
+        "volumes": [project + "_minio-data"] + [project + "_" + service + "-catalog" for service in rest_services],
+        "required_services": ["minio", "mc-init", *rest_services, "spark"],
+        "service_ports": {"minio": {"9000/tcp": ports["minio"], "9001/tcp": ports["minio_console"]}, "spark": {"4040/tcp": ports["spark"]},
+                          **{service: {"8181/tcp": ports[service.replace('-', '_')]} for service in rest_services}},
+        "health_urls": [f'http://127.0.0.1:{ports["minio"]}/minio/health/live'] +
+                       [f'http://127.0.0.1:{ports[service.replace("-", "_")]}/v1/config' for service in rest_services],
         "server_warehouse": config["warehouses"]["rest_client"]}
     if profile == 'publication-hook':
         record['service_ports']['rest']['8182/tcp'] = ports['control']
@@ -397,7 +423,8 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
             'benchmark': {'shared_root': benchmark_root, 'build_timeout_seconds': timeout},
             'versions': {'spark': settings.get('NOVA_ENV_SPARK_VERSION', '3.5.5-java17'), 'iceberg': settings.get('NOVA_ENV_ICEBERG_VERSION', '1.11.0')},
             'fixture_inputs': old_config.get('fixture_inputs') or {'bom': str(store / 'bom.json'), 'lock_sha256': None, 'verified': False},
-            'warehouses': {'catalog': f's3://novarocks/{env_id}/iceberg-catalog', 'test': f's3://novarocks/{env_id}/novarocks-sql-test-iceberg-extra', 'rest_client': f's3://warehouse/{env_id}/rest'}}
+            'warehouses': {'catalog': f's3://novarocks/{env_id}/iceberg-catalog', 'test': f's3://novarocks/{env_id}/novarocks-sql-test-iceberg-extra',
+                           'rest_client': f's3://warehouse/{env_id}/rest', 'rest_mv_client': f's3://warehouse/{env_id}/rest-mv'}}
 
 
 def verify_inputs(config: dict) -> dict:
@@ -412,7 +439,7 @@ def verify_inputs(config: dict) -> dict:
 
 def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_image: str | None, bom: dict) -> dict:
     offset = int(hashlib.sha1(config['env_id'].encode()).hexdigest()[:8], 16)
-    ports = choose_ports({'minio': 19000, 'minio_console': 20000, 'rest': 21000, 'spark': 22000}, offset)
+    ports = choose_ports({'minio': 19000, 'minio_console': 20000, 'rest': 21000, 'spark': 22000, 'rest_mv': 24000}, offset)
     if profile == 'publication-hook':
         ports['control'] = int(os.environ.get('NOVA_ENV_PUBLICATION_HOOK_CONTROL_PORT', '0'))
     result = render_isolated_stack(bom, project, ports, entry, config, profile=profile, hook_image=hook_image)

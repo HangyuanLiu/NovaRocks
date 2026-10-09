@@ -1,5 +1,9 @@
 # MEM-1 M07 执行证据
 
+> 2026-10-09：用户已授权先发布实现 PR，再以第二个 PR 完成测试、修复与收尾。
+> 当前交付边界见 [分批交付记录](pr-delivery-split.md)。下文“无发布授权”均为当时的历史状态；
+> M07 整体验收仍进行中，历史收据不代替发布版本或最终同 SHA 的验证。
+
 > 原始日志及批量测试产物已于 2026-10-06 移至 Git 外的本地归档；保存边界、历史 SHA 映射与获取限制见 [证据保存说明](evidence/README.md)。历史文件路径仅作归档定位，不表示仓库内存在原始产物。
 
 本目录记录已批准的 spec / plan 第 5 版的本地实施与验收。P00/P01/P02/P03 本地检查点已保存，P04 正在执行；这里的目标参数或源码审查不代表产品已经实现或通过验收。
@@ -20,7 +24,7 @@ P00b测量、P09原生1FE+3BE/性能与P10仍OPEN。c_*仍null，旧FE/BE保护�
 
 ## 第 6 版（2026-10-06）
 
-spec 与 plan 已改为第 6 版并获批：计量边界改为 NovaRocks 自有对象；撤回十个第三方 vendor patch，Native 传输只用上游公开配置与库外准入（ADR-0168）。执行在同一分支继续，先合入 main（`f008e2682`），再剥离 v5 的传输计费。R1 已删除的模块：`native_transport_capacity`、`native_response`、`native_task_executor`、`native_channel_worker_capacity` 及专测补丁的集成测试；保留并迁移的 D12 行为：Data/Control 独立 listener 与拒绝不失败的 accept 循环、端点方法分类、按 peer process/endpoint/lane 的单飞有界 channel 缓存、调用方进程签名与连接封印。R2 待补：每 lane 的 FE 连接数与 stream 位置持有到 body 退出、DNS 在自有阻塞闭包中解析、FD 上限、lane 指标与 NIG-1 交接口径。下文第 5 版记录保留为历史。
+spec 与 plan 已改为第 6 版并获批：计量边界改为 NovaRocks 自有对象；撤回十个第三方 vendor patch，Native 传输只用上游公开配置与库外准入（ADR-0170）。执行在同一分支继续，先合入 main（`f008e2682`），再剥离 v5 的传输计费。R1 已删除的模块：`native_transport_capacity`、`native_response`、`native_task_executor`、`native_channel_worker_capacity` 及专测补丁的集成测试；保留并迁移的 D12 行为：Data/Control 独立 listener 与拒绝不失败的 accept 循环、端点方法分类、按 peer process/endpoint/lane 的单飞有界 channel 缓存、调用方进程签名与连接封印。R2 待补：每 lane 的 FE 连接数与 stream 位置持有到 body 退出、DNS 在自有阻塞闭包中解析、FD 上限、lane 指标与 NIG-1 交接口径。下文第 5 版记录保留为历史。
 
 2026-10-08 P00b 部分输出：[结构算术](transport-envelope-v1.md) / [JSON](transport-envelope-v1.json)
 按当前 R2 geometry 复算；profile 与 check_profile 不再使用 v5 每连接2MiB、Native3GiB/整体16GiB
@@ -178,7 +182,7 @@ Worker实际1MiB Vec可见4B、最后1B slice：非末alias退出后原credit仍
 
 actual Worker完整7 PASS、Native reader完整27 PASS，均0FAIL/0ignored/terminal0；包含五项新增和所有原probe，不用新测试替代旧回归。fmt/diffcheckPASS；收据 `docs/testing/mem-1-m07/evidence/p07-physical-backing-components-20261009.json` pin两actualsource、未改productionowner/lock、原finaldraft/pins和logs；dev unoptimized/jobs1/incremental0/threads1。component-only，无Native/stock服务。
 
-只证明选定same-thread System Layout/capacity与post-return实际free，非usable size/RSS/cache或全部allocator；native credit退出顺序仍同时依据未改GuardedOwner字段序，Bytes wrapper固定metadata例外保持ADR-0168。Closing old+new copy峰值/returnable失败回滚、fixed-core完整backing、其它domain/window/Arrow及跨线程最后alias、held-response Native/fullClosing64/P08/P00b/P09/P10/final同SHA仍OPEN。两个人工语义门与IRU-7 HMS非只读excluded不改，无push/PR/归档。
+只证明选定same-thread System Layout/capacity与post-return实际free，非usable size/RSS/cache或全部allocator；native credit退出顺序仍同时依据未改GuardedOwner字段序，Bytes wrapper固定metadata例外保持ADR-0170。Closing old+new copy峰值/returnable失败回滚、fixed-core完整backing、其它domain/window/Arrow及跨线程最后alias、held-response Native/fullClosing64/P08/P00b/P09/P10/final同SHA仍OPEN。两个人工语义门与IRU-7 HMS非只读excluded不改，无push/PR/归档。
 
 
 ### 2026-10-09：P09 held-response / late ACK 场景组件 PASS

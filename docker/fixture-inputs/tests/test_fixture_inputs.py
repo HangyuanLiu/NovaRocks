@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -225,19 +226,19 @@ class ConsumerClosureTests(unittest.TestCase):
         lock = {"schema": 1, "images": {}, "artifacts": {}, "derived_images": {}}
         bom = {"schema": 1, "artifact_dir": "artifacts", "images": {}, "artifacts": {}, "derived_images": {}}
         infos = {}
-        for name in ("minio", "minio-mc", "iceberg-rest", "iceberg-spark-base", "paimon-spark-base"):
+        for name in ("minio", "minio-mc", "iceberg-rest", "iceberg-spark-base", "paimon-spark-base", "gradle-builder"):
             item = {"alias": f"fixture/{name}:locked", "platform": "linux/arm64", "manifest_digest": f"sha256:{name}"}
             lock["images"][name] = item
             bom["images"][name] = item.copy()
             infos[item["alias"]] = {"Id": item["manifest_digest"], "Os": "linux", "Architecture": "arm64"}
-        for name in ("spark.jar", "paimon.jar"):
+        for name in ("spark.jar", "paimon.jar", "source.tar.gz"):
             path = artifacts / name; path.write_bytes(b"fixture")
             item = {"bytes": 7, "sha1": hashlib.sha1(b"fixture").hexdigest()}
             lock["artifacts"][name] = item
             bom["artifacts"][name] = fixture_inputs.validate_artifact(path, item)
-        for name, base, jar in (("iceberg-spark", "iceberg-spark-base", "spark.jar"), ("paimon-writer", "paimon-spark-base", "paimon.jar")):
+        for name, base, jar in (("iceberg-spark", "iceberg-spark-base", "spark.jar"), ("paimon-writer", "paimon-spark-base", "paimon.jar"), ("rest-mv", "gradle-builder", "source.tar.gz")):
             definition = repo / f"{name}.txt"; definition.write_text(name)
-            item = {"alias": f"fixture/{name}:current", "platform": "linux/arm64", "base": base, "artifacts": [jar], "definition_files": [definition.name]}
+            item = {"alias": f"fixture/{name}:current", "platform": "linux/arm64", "bases": ({"BUILDER": base, "REST_BASE": "iceberg-rest"} if name == "rest-mv" else {"SPARK_BASE": base}), "artifacts": [jar], "definition_files": [definition.name]}
             lock["derived_images"][name] = item
             digest = fixture_inputs.definition_sha256(repo, item["definition_files"])
             bom["derived_images"][name] = {"alias": item["alias"], "platform": item["platform"], "definition_sha256": digest, "image_id": f"sha256:{name}-id"}
@@ -255,20 +256,21 @@ class ConsumerClosureTests(unittest.TestCase):
     def test_actual_iceberg_consumer_closure_is_exact(self):
         lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
         images, artifacts, derived = fixture_inputs.required_input_names(lock, "iceberg-rest")
-        self.assertEqual(images, {"minio", "minio-mc", "iceberg-rest", "iceberg-spark-base"})
-        self.assertEqual(derived, {"iceberg-spark"})
-        self.assertEqual(artifacts, set(lock["derived_images"]["iceberg-spark"]["artifacts"]))
+        self.assertEqual(images, {"minio", "minio-mc", "iceberg-rest", "iceberg-spark-base", "gradle-builder"})
+        self.assertEqual(derived, {"iceberg-spark", "rest-mv"})
+        self.assertEqual(artifacts, set(lock["derived_images"]["iceberg-spark"]["artifacts"]) | set(lock["derived_images"]["rest-mv"]["artifacts"]))
         self.assertNotIn("paimon-writer", derived)
         self.assertNotIn("paimon-spark-base", images)
 
     def test_declared_dependency_changes_are_followed_without_name_based_exclusions(self):
         lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
-        lock["derived_images"]["iceberg-spark"]["base"] = "paimon-spark-base"
+        lock["derived_images"]["iceberg-spark"]["bases"]["BUILDER"] = "paimon-spark-base"
         lock["derived_images"]["iceberg-spark"]["artifacts"].append("paimon-s3.jar")
         images, artifacts, derived = fixture_inputs.required_input_names(lock, "iceberg-rest")
         self.assertIn("paimon-spark-base", images)
+        self.assertIn("iceberg-spark-base", images)
         self.assertIn("paimon-s3.jar", artifacts)
-        self.assertEqual(derived, {"iceberg-spark"})
+        self.assertEqual(derived, {"iceberg-spark", "rest-mv"})
 
     def test_full_verifier_rejects_unrelated_drift_but_iceberg_consumer_does_not_read_it(self):
         store, repo, lock, infos = self.fixture()
@@ -276,18 +278,24 @@ class ConsumerClosureTests(unittest.TestCase):
         with mock.patch.object(verify_module, "inspect_image", side_effect=infos.__getitem__) as inspect:
             verified = verify_module.verify(store, repo, lock, consumer="iceberg-rest")
             self.assertEqual(verified["schema"], 1)
-            self.assertEqual(set(call.args[0] for call in inspect.call_args_list), {"fixture/minio:locked", "fixture/minio-mc:locked", "fixture/iceberg-rest:locked", "fixture/iceberg-spark-base:locked", "fixture/iceberg-spark:current"})
+            self.assertEqual(set(call.args[0] for call in inspect.call_args_list), {"fixture/minio:locked", "fixture/minio-mc:locked", "fixture/iceberg-rest:locked", "fixture/iceberg-spark-base:locked", "fixture/iceberg-spark:current", "fixture/gradle-builder:locked", "fixture/rest-mv:current"})
             with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "definition mismatch: paimon-writer"):
                 verify_module.verify(store, repo, lock)
 
     def test_required_definition_checksum_identity_and_platform_stay_strict(self):
-        for fault in ("definition", "artifact", "image-id", "platform", "base-digest"):
+        for fault in ("definition", "artifact", "image-id", "platform", "base-digest",
+                      "mv-definition", "mv-artifact", "mv-image-id", "mv-platform", "builder-digest"):
             with self.subTest(fault=fault):
                 store, repo, lock, infos = self.fixture()
                 if fault == "definition": (repo / "iceberg-spark.txt").write_text("changed")
                 elif fault == "artifact": (store / "artifacts/spark.jar").write_bytes(b"changed")
                 elif fault == "image-id": infos["fixture/iceberg-spark:current"]["Id"] = "sha256:wrong"
                 elif fault == "platform": infos["fixture/iceberg-spark:current"]["Architecture"] = "amd64"
+                elif fault == "mv-definition": (repo / "rest-mv.txt").write_text("changed")
+                elif fault == "mv-artifact": (store / "artifacts/source.tar.gz").write_bytes(b"changed")
+                elif fault == "mv-image-id": infos["fixture/rest-mv:current"]["Id"] = "sha256:wrong"
+                elif fault == "mv-platform": infos["fixture/rest-mv:current"]["Architecture"] = "amd64"
+                elif fault == "builder-digest": infos["fixture/gradle-builder:locked"]["Id"] = "sha256:wrong"
                 else: infos["fixture/iceberg-spark-base:locked"]["Id"] = "sha256:wrong"
                 with mock.patch.object(verify_module, "inspect_image", side_effect=infos.__getitem__), self.assertRaises(fixture_inputs.FixtureInputError):
                     verify_module.verify(store, repo, lock, consumer="iceberg-rest")
@@ -315,6 +323,209 @@ class ConsumerClosureTests(unittest.TestCase):
                 selected[category].pop(name)
                 with self.assertRaises(fixture_inputs.FixtureInputError):
                     fixture_inputs.required_input_names(selected, "iceberg-rest")
+
+
+class DerivedImageBuildTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = self.root / "repo"
+        self.recipe = self.repo / "recipe"
+        self.recipe.mkdir(parents=True)
+        (self.recipe / "Dockerfile").write_text("ARG BUILDER\nARG REST_BASE\nFROM ${REST_BASE}\n")
+        (self.recipe / "patches").mkdir()
+        (self.recipe / "patches/0001.patch").write_text("fixture patch\n")
+        self.staging = self.root / "staging"
+        (self.staging / "artifacts").mkdir(parents=True)
+        (self.staging / "artifacts/source.tar.gz").write_bytes(b"source")
+        self.lock = {
+            "schema": 1,
+            "images": {
+                name: {"source": f"example.invalid/{name}", "platform": "linux/arm64",
+                       "manifest_digest": f"sha256:{name}", "alias": f"fixture/{name}:locked"}
+                for name in ("builder", "rest", "unrelated")
+            },
+            "artifacts": {
+                "source.tar.gz": {"url": "https://example.invalid/source.tar.gz", "bytes": 6,
+                                  "sha1": hashlib.sha1(b"source").hexdigest()},
+                "unrelated.jar": {"url": "https://example.invalid/unrelated.jar", "bytes": 5,
+                                  "sha1": hashlib.sha1(b"other").hexdigest()},
+            },
+            "derived_images": {
+                "rest-mv": {"platform": "linux/arm64", "alias": "fixture/rest-mv:current",
+                            "bases": {"BUILDER": "builder", "REST_BASE": "rest"},
+                            "dockerfile": "recipe/Dockerfile", "context": "recipe",
+                            "definition_files": ["recipe/Dockerfile", "recipe/patches/0001.patch"],
+                            "artifacts": ["source.tar.gz"]},
+            },
+        }
+        self.lock_path = self.root / "lock.json"
+        self.write_lock()
+
+    def write_lock(self):
+        self.lock_path.write_text(json.dumps(self.lock))
+
+    def image_info(self, identity):
+        return {"Id": identity, "Os": "linux", "Architecture": "arm64"}
+
+    def build_command(self, command):
+        if command[:2] == ["docker", "build"]:
+            iidfile = Path(command[command.index("--iidfile") + 1])
+            iidfile.write_text(f"sha256:{iidfile.stem}\n")
+
+    def test_lock_rejects_old_base_and_invalid_named_bases(self):
+        item = self.lock["derived_images"]["rest-mv"]
+        item["base"] = "rest"
+        self.write_lock()
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "unsupported base field"):
+            fixture_inputs.load_lock(self.lock_path)
+        del item["base"]
+        for bases in ({}, [], {"BUILDER": "missing"}, {"BAD=ARG": "builder"}):
+            with self.subTest(bases=bases):
+                item["bases"] = bases
+                self.write_lock()
+                with self.assertRaises(fixture_inputs.FixtureInputError):
+                    fixture_inputs.load_lock(self.lock_path)
+
+    def test_lock_rejects_context_outside_repository(self):
+        for context in ("../outside", "/outside", "", None):
+            with self.subTest(context=context):
+                self.lock["derived_images"]["rest-mv"]["context"] = context
+                self.write_lock()
+                with self.assertRaises(fixture_inputs.FixtureInputError):
+                    fixture_inputs.load_lock(self.lock_path)
+
+    def test_context_copies_declared_inputs_with_relative_layout(self):
+        out = self.root / "out"
+        provision_module.build_context(self.lock, "rest-mv", self.repo, self.staging / "artifacts", out)
+        self.assertEqual((out / "Dockerfile").read_bytes(), (self.recipe / "Dockerfile").read_bytes())
+        self.assertEqual((out / "patches/0001.patch").read_bytes(), b"fixture patch\n")
+        self.assertEqual((out / "artifacts/source.tar.gz").read_bytes(), b"source")
+        self.assertFalse((out / "artifacts/unrelated.jar").exists())
+
+    def test_context_rejects_unlisted_files_and_missing_dockerfile_definition(self):
+        (self.recipe / "extra.txt").write_text("unlocked input")
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "not a definition input: recipe/extra.txt"):
+            provision_module.build_context(self.lock, "rest-mv", self.repo, self.staging / "artifacts", self.root / "out")
+        self.assertFalse((self.root / "out").exists())
+        (self.recipe / "extra.txt").unlink()
+        self.lock["derived_images"]["rest-mv"]["definition_files"].remove("recipe/Dockerfile")
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "Dockerfile is not a definition input"):
+            provision_module.build_context(self.lock, "rest-mv", self.repo, self.staging / "artifacts", self.root / "out")
+
+    def test_context_rejects_symlinks_and_artifact_overlay(self):
+        (self.recipe / "escape").symlink_to(self.root)
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "must not contain symlinks"):
+            provision_module.build_context(self.lock, "rest-mv", self.repo, self.staging / "artifacts", self.root / "out")
+        (self.recipe / "escape").unlink()
+        (self.recipe / "artifacts").mkdir()
+        (self.recipe / "artifacts/source.tar.gz").write_bytes(b"overlay")
+        self.lock["derived_images"]["rest-mv"]["definition_files"].append("recipe/artifacts/source.tar.gz")
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "reserves artifacts"):
+            provision_module.build_context(self.lock, "rest-mv", self.repo, self.staging / "artifacts", self.root / "out")
+
+    def test_named_bases_build_without_alias_and_return_exact_image_id(self):
+        with mock.patch.object(provision_module, "run", side_effect=self.build_command) as run, mock.patch.object(
+            provision_module, "inspect_image", side_effect=self.image_info
+        ) as inspect:
+            receipts = provision_module.build_derived_images(self.lock, self.repo, self.staging, "lock-sha")
+        command = run.call_args.args[0]
+        arguments = [command[index + 1] for index, value in enumerate(command) if value == "--build-arg"]
+        self.assertEqual(arguments, ["BUILDER=fixture/builder:locked", "REST_BASE=fixture/rest:locked"])
+        self.assertNotIn("-t", command)
+        self.assertNotIn("fixture/rest-mv:current", command)
+        inspect.assert_called_once_with("sha256:rest-mv")
+        self.assertEqual(receipts["rest-mv"]["image_id"], "sha256:rest-mv")
+        self.assertEqual(receipts["rest-mv"]["definition_sha256"], fixture_inputs.definition_sha256(self.repo, self.lock["derived_images"]["rest-mv"]["definition_files"]))
+
+    def test_definition_digest_changes_when_a_context_input_changes(self):
+        definitions = self.lock["derived_images"]["rest-mv"]["definition_files"]
+        before = fixture_inputs.definition_sha256(self.repo, definitions)
+        (self.recipe / "patches/0001.patch").write_text("changed patch\n")
+        after = fixture_inputs.definition_sha256(self.repo, definitions)
+        self.assertNotEqual(before, after)
+
+    def test_failed_second_build_does_not_tag_or_publish(self):
+        self.lock["derived_images"]["second"] = {
+            **self.lock["derived_images"]["rest-mv"], "alias": "fixture/second:current"
+        }
+        self.write_lock()
+        store = self.root / "store"
+        store.mkdir()
+        (store / "bom.json").write_bytes(b"old BOM\n")
+        (store / "READY").write_bytes(b"old READY\n")
+        def fake_artifacts(lock, staging):
+            (staging / "artifacts").mkdir()
+            (staging / "artifacts/source.tar.gz").write_bytes(b"source")
+            return {}
+        def fail_second(command):
+            self.build_command(command)
+            if command[:2] == ["docker", "build"] and Path(command[-1]).name == "second":
+                raise fixture_inputs.FixtureInputError("build failed")
+        with mock.patch.object(provision_module, "prepare_images", return_value={}), mock.patch.object(
+            provision_module, "prepare_artifacts", side_effect=fake_artifacts
+        ), mock.patch.object(provision_module, "run", side_effect=fail_second) as run, mock.patch.object(
+            provision_module, "inspect_image", side_effect=self.image_info
+        ), self.assertRaisesRegex(fixture_inputs.FixtureInputError, "build failed"):
+            provision_module.provision(store, self.repo, self.lock_path, [], 30)
+        self.assertEqual([call.args[0][:2] for call in run.call_args_list], [["docker", "build"], ["docker", "build"]])
+        self.assertEqual((store / "bom.json").read_bytes(), b"old BOM\n")
+        self.assertEqual((store / "READY").read_bytes(), b"old READY\n")
+        self.assertFalse((store / "generations").exists())
+
+    def test_successful_provision_tags_all_images_after_builds_then_publishes(self):
+        self.lock["derived_images"]["second"] = {
+            **self.lock["derived_images"]["rest-mv"], "alias": "fixture/second:current"
+        }
+        self.write_lock()
+        store = self.root / "store"
+        def fake_download(url, output):
+            output.write_bytes(b"source" if output.name == "source.tar.gz" else b"other")
+        def assert_publication_order(command):
+            self.build_command(command)
+            self.assertFalse((store / "READY").exists())
+            self.assertFalse((store / "bom.json").exists())
+        with mock.patch.object(provision_module, "prepare_images", return_value={}), mock.patch.object(
+            provision_module, "download", side_effect=fake_download
+        ), mock.patch.object(provision_module, "run", side_effect=assert_publication_order) as run, mock.patch.object(
+            provision_module, "inspect_image", side_effect=self.image_info
+        ):
+            provision_module.provision(store, self.repo, self.lock_path, [], 30)
+        self.assertEqual([call.args[0][:2] for call in run.call_args_list], [["docker", "build"], ["docker", "build"], ["docker", "tag"], ["docker", "tag"]])
+        bom = fixture_inputs.read_json(store / "bom.json")
+        self.assertEqual(bom["derived_images"]["rest-mv"]["image_id"], "sha256:rest-mv")
+        self.assertEqual(bom["derived_images"]["second"]["image_id"], "sha256:second")
+        self.assertEqual((store / "READY").read_text(), f"sha256:{bom['lock_sha256']}\n")
+        self.assertTrue((store / bom["artifact_dir"] / "source.tar.gz").is_file())
+
+    def test_context_only_selects_dependencies_without_accessing_store_or_building(self):
+        out = self.root / "out"
+        store = self.root / "store"
+        store.mkdir()
+        (store / "bom.json").write_bytes(b"old BOM\n")
+        (store / "READY").write_bytes(b"old READY\n")
+        def fake_download(url, output):
+            output.write_bytes(b"source")
+        with mock.patch.object(provision_module, "prepare_images", return_value={}) as images, mock.patch.object(
+            provision_module, "download", side_effect=fake_download
+        ) as download, mock.patch.object(provision_module, "run") as run, mock.patch.object(
+            provision_module, "fixture_store_lock"
+        ) as lock, mock.patch.object(provision_module, "fixture_store") as fixture_store, mock.patch.object(
+            sys, "argv", ["provision.py", "--repo-root", str(self.repo), "--lock", str(self.lock_path),
+                          "--store", str(store), "--context-only", "rest-mv", "--out", str(out)]
+        ):
+            self.assertEqual(provision_module.main(), 0)
+        self.assertEqual(set(images.call_args.args[0]["images"]), {"builder", "rest"})
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual(download.call_args.args[0], "https://example.invalid/source.tar.gz")
+        run.assert_not_called()
+        lock.assert_not_called()
+        fixture_store.assert_not_called()
+        self.assertEqual((store / "bom.json").read_bytes(), b"old BOM\n")
+        self.assertEqual((store / "READY").read_bytes(), b"old READY\n")
+        self.assertEqual(set(path.name for path in store.iterdir()), {"bom.json", "READY"})
+        self.assertEqual((out / "patches/0001.patch").read_bytes(), b"fixture patch\n")
 
 
 if __name__ == "__main__":

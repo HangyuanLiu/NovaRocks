@@ -557,58 +557,18 @@ pub(crate) fn execute_drop_database_statement(
             .connector_control()
             .acquire_current(&instance_id)
             .map_err(|error| error.to_string())?;
-        // `IF EXISTS` applies to the complete FORCE decomposition.  In
-        // particular, do not ask a remote catalog to enumerate a namespace
-        // which the final DropNamespace mutation would correctly treat as a
-        // no-op.
-        let namespace_identity = ConnectorNamespaceIdentity {
-            instance_id: instance_id.clone(),
-            namespace: Arc::from(target.namespace.as_str()),
+        let Some((tables, views)) = enumerate_admitted_force_drop_children(
+            &lease,
+            ConnectorNamespaceIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+            },
+            if_exists,
+            connector_context,
+        )?
+        else {
+            return Ok(StatementResult::Ok);
         };
-        let namespace_exists = lease
-            .binding()
-            .metadata()
-            .namespace_exists(novarocks_spi::connector::ConnectorNamespaceRequest {
-                namespace: namespace_identity.clone(),
-                context: connector_context.clone(),
-            })
-            .map_err(|error| error.to_string())?;
-        if !namespace_exists {
-            if if_exists {
-                return Ok(StatementResult::Ok);
-            }
-            return Err(format!("namespace `{}` does not exist", target.namespace));
-        }
-        let mut tables = lease
-            .binding()
-            .metadata()
-            .list_tables(novarocks_spi::connector::ConnectorListTablesRequest {
-                namespace: namespace_identity.clone(),
-                bound: novarocks_spi::connector::ConnectorListingBound::V1,
-                context: connector_context.clone(),
-            })
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|identity| identity.table.to_string())
-            .collect::<Vec<_>>();
-        tables.sort();
-        // Complete every child enumeration before the first destructive mutation.
-        // Unsupported view metadata cannot establish authoritative absence.
-        let view_metadata = lease
-            .binding()
-            .view_metadata()
-            .ok_or_else(|| "view enumeration is not supported by this catalog".to_string())?;
-        let mut views = view_metadata
-            .list_views(novarocks_spi::connector::ConnectorListViewsRequest {
-                namespace: namespace_identity,
-                bound: novarocks_spi::connector::ConnectorListingBound::V1,
-                context: connector_context.clone(),
-            })
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|identity| identity.view.to_string())
-            .collect::<Vec<_>>();
-        views.sort();
         for table in tables {
             crate::connector::mutation::execute_catalog_mutation(
                 context.connector_control(),
@@ -668,6 +628,81 @@ pub(crate) fn execute_drop_database_statement(
         connector_context.clone(),
     )?;
     Ok(StatementResult::Ok)
+}
+
+fn enumerate_admitted_force_drop_children(
+    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    namespace_identity: ConnectorNamespaceIdentity,
+    if_exists: bool,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Option<(Vec<String>, Vec<String>)>, String> {
+    // FORCE is one namespace mutation. Ask the exact owner before its
+    // decomposition can encounter a weaker read or child-operation error.
+    lease
+        .derive_mutation_lease()
+        .and_then(|mutation| {
+            mutation.admit_operation(
+                novarocks_spi::connector::ConnectorMutationOperationId::new(),
+                ConnectorCatalogMutationOperation::DropNamespace {
+                    namespace: namespace_identity.clone(),
+                    policy: if if_exists {
+                        DropPolicy::NoOpIfMissing
+                    } else {
+                        DropPolicy::FailIfMissing
+                    },
+                },
+                connector_context.clone(),
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    let namespace_exists = lease
+        .binding()
+        .metadata()
+        .namespace_exists(novarocks_spi::connector::ConnectorNamespaceRequest {
+            namespace: namespace_identity.clone(),
+            context: connector_context.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    if !namespace_exists {
+        if if_exists {
+            return Ok(None);
+        }
+        return Err(format!(
+            "namespace `{}` does not exist",
+            namespace_identity.namespace
+        ));
+    }
+    let mut tables = lease
+        .binding()
+        .metadata()
+        .list_tables(novarocks_spi::connector::ConnectorListTablesRequest {
+            namespace: namespace_identity.clone(),
+            bound: novarocks_spi::connector::ConnectorListingBound::V1,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|identity| identity.table.to_string())
+        .collect::<Vec<_>>();
+    tables.sort();
+    // Complete every child enumeration before the first destructive mutation.
+    // Unsupported view metadata cannot establish authoritative absence.
+    let view_metadata = lease
+        .binding()
+        .view_metadata()
+        .ok_or_else(|| "view enumeration is not supported by this catalog".to_string())?;
+    let mut views = view_metadata
+        .list_views(novarocks_spi::connector::ConnectorListViewsRequest {
+            namespace: namespace_identity.clone(),
+            bound: novarocks_spi::connector::ConnectorListingBound::V1,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|identity| identity.view.to_string())
+        .collect::<Vec<_>>();
+    views.sort();
+    Ok(Some((tables, views)))
 }
 
 pub(crate) fn execute_drop_table_statement(
@@ -748,7 +783,7 @@ pub(crate) fn execute_drop_table_statement(
         .ensure_no_ready_downstream_dependencies(&dependency_identity)
         .map_err(|error| error.to_string())?;
     let instance_id = mutation_instance_id(&target.catalog)?;
-    match crate::connector::mutation::execute_catalog_mutation(
+    match crate::connector::mutation::resolve_catalog_mutation(
         context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::DropTable {
@@ -766,7 +801,12 @@ pub(crate) fn execute_drop_table_statement(
         },
         connector_context.clone(),
     ) {
-        Ok(_) => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+            if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =
+                completed.finalization
+            {
+                return Err(novarocks_query_application::engine_error::EngineError::commit_known_committed_finalize_failed(failure.to_string()).to_string());
+            }
             if target.provider_id.as_str() == "iceberg" {
                 context.catalog_service().invalidate_table(
                     &target.catalog,
@@ -777,32 +817,65 @@ pub(crate) fn execute_drop_table_statement(
             }
             Ok(StatementResult::Ok)
         }
-        Err(err) if if_exists && err.contains("NotFound") => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure }
+            if if_exists
+                && failure.kind()
+                    == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound =>
+        {
             if target.provider_id.as_str() == "iceberg" {
                 cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
             }
             Ok(StatementResult::Ok)
         }
-        Err(err) => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
             // A DROP TABLE aimed at a view must say so instead of "unknown
             // table" — views and tables are separate REST resources.
-            if target.provider_id.as_str() == "iceberg"
-                && external_view_exists(
-                    context,
-                    &target.catalog,
-                    &target.namespace,
-                    &target.table,
-                    connector_context,
-                )?
-            {
-                return Err(format!(
-                    "{}.{}.{} is a view, use DROP VIEW",
-                    target.catalog, target.namespace, target.table
-                ));
-            }
-            Err(err)
+            drop_table_failure_with_view_check(failure, || {
+                if target.provider_id.as_str() == "iceberg"
+                    && external_view_exists(
+                        context,
+                        &target.catalog,
+                        &target.namespace,
+                        &target.table,
+                        connector_context,
+                    )?
+                {
+                    Ok(Some(format!(
+                        "{}.{}.{} is a view, use DROP VIEW",
+                        target.catalog, target.namespace, target.table
+                    )))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => Err(
+            novarocks_query_application::engine_error::EngineError::commit_unknown(
+                failure.to_string(),
+            )
+            .to_string(),
+        ),
+        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
+            Err(error.to_string())
         }
     }
+}
+
+fn drop_table_failure_with_view_check(
+    failure: novarocks_spi::connector::ConnectorMutationFailure,
+    view_error: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<StatementResult, String> {
+    if failure.kind() == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound
+        && let Some(error) = view_error()?
+    {
+        return Err(error);
+    }
+    Err(
+        novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
+            failure.to_string(),
+        )
+        .to_string(),
+    )
 }
 
 fn is_missing_table_guard_error(err: &str) -> bool {
@@ -1615,7 +1688,265 @@ fn default_out_of_range(type_name: &str, value: i64) -> String {
 }
 
 #[cfg(test)]
+mod force_drop_admission_tests {
+    use super::*;
+    use novarocks_spi::connector::*;
+    use std::sync::Mutex;
+
+    struct Capability {
+        descriptor: ConnectorInstanceDescriptor,
+        admitted: bool,
+        exists: bool,
+        views_supported: bool,
+        calls: Mutex<Vec<&'static str>>,
+    }
+    impl ConnectorMetadata for Capability {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
+            self.calls.lock().unwrap().push("exists");
+            Ok(self.exists)
+        }
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            panic!("unexpected table lookup")
+        }
+        fn list_tables(
+            &self,
+            request: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            self.calls.lock().unwrap().push("tables");
+            Ok(["z", "a"]
+                .into_iter()
+                .map(|table| ConnectorTableIdentity {
+                    instance_id: self.descriptor.instance_id.clone(),
+                    namespace: request.namespace.namespace.clone(),
+                    table: table.into(),
+                })
+                .collect())
+        }
+        fn load_table(
+            &self,
+            _: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            panic!("unexpected table lookup")
+        }
+    }
+    impl ConnectorScanPlanning for Capability {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+        fn begin_scan(
+            &self,
+            _: &ConnectorTableHandle,
+            _: ConnectorBeginScanRequest,
+        ) -> Result<ConnectorScan, ConnectorError> {
+            panic!("unexpected scan")
+        }
+        fn plan_splits(
+            &self,
+            _: &ConnectorScanHandle,
+            _: ConnectorSplitPlanningRequest,
+        ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+            panic!("unexpected scan")
+        }
+    }
+    impl ConnectorExecutionDistribution for Capability {
+        fn declaration(
+            &self,
+            _: &ConnectorRequestContext,
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            panic!("unexpected distribution")
+        }
+    }
+    impl ConnectorCatalogMutation for Capability {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            ProviderBindingEpoch::from_bytes([1; 16])
+        }
+        fn admit(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
+            self.calls.lock().unwrap().push("admit");
+            assert!(
+                matches!(&request.operation, ConnectorCatalogMutationOperation::DropNamespace { namespace, .. } if namespace.namespace.as_ref() == "db")
+            );
+            if self.admitted {
+                Ok(())
+            } else {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "read-only compatibility entry",
+                ))
+            }
+        }
+        fn execute(
+            &self,
+            _: ConnectorCatalogMutationRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
+            panic!("enumeration must finish before any child mutation")
+        }
+        fn reconcile(
+            &self,
+            _: ConnectorCatalogMutationReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
+            panic!("unexpected reconcile")
+        }
+    }
+    impl ConnectorViewMetadata for Capability {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            ProviderBindingEpoch::from_bytes([1; 16])
+        }
+        fn view_exists(&self, _: ConnectorViewRequest) -> Result<bool, ConnectorError> {
+            panic!("unexpected view lookup")
+        }
+        fn load_view(
+            &self,
+            _: ConnectorViewRequest,
+        ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+            panic!("unexpected view lookup")
+        }
+        fn list_views(
+            &self,
+            request: ConnectorListViewsRequest,
+        ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
+            self.calls.lock().unwrap().push("views");
+            if !self.views_supported {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "view enumeration is unsupported",
+                ));
+            }
+            Ok(["v2", "v1"]
+                .into_iter()
+                .map(|view| ConnectorViewIdentity {
+                    instance_id: self.descriptor.instance_id.clone(),
+                    namespace: request.namespace.namespace.clone(),
+                    view: view.into(),
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn force_drop_admits_before_reads_and_keeps_complete_enumeration() {
+        for (admitted, exists, views_supported) in [
+            (false, true, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let descriptor = ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: ConnectorInstanceId::parse("catalog").unwrap(),
+            };
+            let capability = Arc::new(Capability {
+                descriptor: descriptor.clone(),
+                admitted,
+                exists,
+                views_supported,
+                calls: Mutex::new(Vec::new()),
+            });
+            let binding = ConnectorControlBinding::try_new(
+                descriptor.clone(),
+                ProviderBindingEpoch::from_bytes([1; 16]),
+                capability.clone(),
+                capability.clone(),
+                capability.clone(),
+                Some(capability.clone()),
+            )
+            .unwrap()
+            .try_with_view_metadata(Some(capability.clone()))
+            .unwrap();
+            let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+            let context =
+                crate::connector::connector_request_context(None, ConnectorStopOwner::new().view())
+                    .unwrap();
+            let result = enumerate_admitted_force_drop_children(
+                &lease,
+                ConnectorNamespaceIdentity {
+                    instance_id: descriptor.instance_id,
+                    namespace: "db".into(),
+                },
+                true,
+                &context,
+            );
+            if !admitted {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("read-only compatibility entry")
+                );
+                assert_eq!(*capability.calls.lock().unwrap(), ["admit"]);
+            } else if !exists {
+                assert_eq!(result.unwrap(), None);
+                assert_eq!(*capability.calls.lock().unwrap(), ["admit", "exists"]);
+            } else if !views_supported {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("view enumeration is unsupported")
+                );
+                assert_eq!(
+                    *capability.calls.lock().unwrap(),
+                    ["admit", "exists", "tables", "views"]
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    Some((
+                        vec!["a".to_string(), "z".to_string()],
+                        vec!["v1".to_string(), "v2".to_string()]
+                    ))
+                );
+                assert_eq!(
+                    *capability.calls.lock().unwrap(),
+                    ["admit", "exists", "tables", "views"]
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod drop_table_if_exists_tests {
+    #[test]
+    fn non_missing_mutation_failures_preserve_the_error_without_view_io() {
+        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+        for kind in [
+            ConnectorMutationFailureKind::Unsupported,
+            ConnectorMutationFailureKind::Unavailable,
+            ConnectorMutationFailureKind::PermissionDenied,
+        ] {
+            let message = "read-only compatibility entry";
+            let result = super::drop_table_failure_with_view_check(
+                ConnectorMutationFailure::new(kind, message),
+                || panic!("non-NotFound failure must not query a view"),
+            );
+            assert!(result.unwrap_err().contains(message));
+        }
+    }
+
+    #[test]
+    fn missing_table_mutation_still_distinguishes_a_view() {
+        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+        let result = super::drop_table_failure_with_view_check(
+            ConnectorMutationFailure::new(ConnectorMutationFailureKind::NotFound, "table missing"),
+            || Ok(Some("target is a view, use DROP VIEW".into())),
+        );
+        assert_eq!(result.unwrap_err(), "target is a view, use DROP VIEW");
+        let result = super::drop_table_failure_with_view_check(
+            ConnectorMutationFailure::new(ConnectorMutationFailureKind::NotFound, "table missing"),
+            || Ok(None),
+        );
+        assert!(result.unwrap_err().contains("table missing"));
+    }
+
     #[test]
     fn guard_missing_table_error_is_soft_drop_candidate_but_mv_error_is_not() {
         assert!(super::is_missing_table_guard_error(
