@@ -441,7 +441,8 @@ fn caller_sender_actual_captured_type_and_cv_prefix_refuse_before_pending_flush(
     let f = fixture();
     let c = Control::default();
     let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
-    let mut initial = Model::new(SOURCE, &types, &f.pools, None).unwrap();
+    let mut initial =
+        Model::<std::convert::Infallible>::new(SOURCE, &types, &f.pools, None).unwrap();
     initial.check(limits()).unwrap();
     let initial_work = initial.facts.cumulative_work_upper_bound;
     // Exercise the actual captured loan helpers at a caller-owned pending
@@ -461,7 +462,10 @@ fn caller_sender_actual_captured_type_and_cv_prefix_refuse_before_pending_flush(
                 }
                 Ok(())
             };
-            let mut model = Model::new(SOURCE, &types, &f.pools, Some(&mut parent)).unwrap();
+            let mut host_parent = |facts: &CallRequestProjectionFacts| {
+                parent(facts).map_err(HostError::<std::convert::Infallible>::from)
+            };
+            let mut model = Model::new(SOURCE, &types, &f.pools, Some(&mut host_parent)).unwrap();
             let outcome = if constant {
                 validate_constant(
                     p::ConstantReference {
@@ -478,7 +482,7 @@ fn caller_sender_actual_captured_type_and_cv_prefix_refuse_before_pending_flush(
                 verify_id(&types, 0, &int(), &mut model, limits(), &mut work)
             };
             assert!(matches!(
-                finish(work, outcome),
+                finish(work, outcome.map_err(ProjectionFailure::without_host)),
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(captures, 1);

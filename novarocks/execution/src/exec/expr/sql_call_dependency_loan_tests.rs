@@ -393,3 +393,6 @@ fn sql_call_dependency_loan_original_aggregate_all_phases_keep_source_and_state_
     assert!(merges >= 2);
     work.finish().unwrap();
 }
+
+#[path = "sql_dependency_request_host_abort_tests.rs"]
+mod sql_dependency_request_host_abort_tests;

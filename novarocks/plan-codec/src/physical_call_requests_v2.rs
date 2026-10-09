@@ -31,8 +31,8 @@ use std::fmt;
 mod encode;
 mod read;
 pub(crate) use encode::encode_call_requests_in;
-pub use encode::prepare_call_requests_encode_in;
 pub use encode::{PreparedCallRequestsEncode, encode_call_requests, prepare_call_requests_encode};
+pub use encode::{prepare_call_requests_encode_in, prepare_call_requests_encode_with_host_in};
 pub use read::{PreparedCallRequestsDecode, decode_call_requests, prepare_call_requests_decode};
 pub(crate) use read::{decode_call_requests_in, prepare_call_requests_decode_in};
 
@@ -120,6 +120,43 @@ impl From<SemanticsCodecError> for CallRequestCodecError {
         }
     }
 }
+
+impl<H> From<CompileControlError>
+    for crate::host_projection_v2::ProjectionFailure<CallRequestCodecError, H>
+{
+    fn from(cause: CompileControlError) -> Self {
+        Self::Codec(cause.into())
+    }
+}
+impl<H> From<TypeCodecError>
+    for crate::host_projection_v2::ProjectionFailure<CallRequestCodecError, H>
+{
+    fn from(error: TypeCodecError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<ConstantReferenceError>
+    for crate::host_projection_v2::ProjectionFailure<CallRequestCodecError, H>
+{
+    fn from(error: ConstantReferenceError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<CallRequestError>
+    for crate::host_projection_v2::ProjectionFailure<CallRequestCodecError, H>
+{
+    fn from(error: CallRequestError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<SemanticsCodecError>
+    for crate::host_projection_v2::ProjectionFailure<CallRequestCodecError, H>
+{
+    fn from(error: SemanticsCodecError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+
 impl fmt::Display for CallRequestCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

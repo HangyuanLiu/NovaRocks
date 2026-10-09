@@ -36,6 +36,15 @@ use novarocks_type_contract::{CompilePhase, FunctionValueType, PureCompileContro
 use std::mem::size_of;
 
 type Error = CallRequestCodecError;
+use crate::host_projection_v2::{AdmissionRefusal, ProjectionFailure};
+type HostError<H> = ProjectionFailure<Error, H>;
+type HostAdmit<'a, H> = dyn FnMut(&CallRequestProjectionFacts) -> Result<(), HostError<H>> + 'a;
+fn project_admission<H>(error: AdmissionRefusal<H>) -> HostError<H> {
+    match error {
+        AdmissionRefusal::Control(cause) => cause.into(),
+        AdmissionRefusal::Host(error) => ProjectionFailure::Host(error),
+    }
+}
 fn shape(message: &'static str) -> Error {
     Error::InvalidShape(message)
 }
@@ -75,8 +84,8 @@ fn checked_shape(
 
 // This uses the shared checked numerical/layout algebra. The source floor is
 // necessary storage only, not a full backing invoice or allocator grant.
-struct Model<'parent, 'callback> {
-    parent: Option<&'parent mut CallRequestAdmit<'callback>>,
+struct Model<'parent, 'callback, H> {
+    parent: Option<&'parent mut HostAdmit<'callback, H>>,
     work_peak: usize,
     facts: CallRequestProjectionFacts,
     items: usize,
@@ -87,12 +96,12 @@ struct Model<'parent, 'callback> {
     source: usize,
     known: usize,
 }
-impl<'parent, 'callback> Model<'parent, 'callback> {
+impl<'parent, 'callback, H> Model<'parent, 'callback, H> {
     fn new(
         source: usize,
         types: &EncodedTypeTable<'_>,
         pools: &ConstantPools,
-        parent: Option<&'parent mut CallRequestAdmit<'callback>>,
+        parent: Option<&'parent mut HostAdmit<'callback, H>>,
     ) -> Result<Self, Error> {
         let (roots, fields) = types.source_counts();
         let type_floor = add(
@@ -132,7 +141,7 @@ impl<'parent, 'callback> Model<'parent, 'callback> {
         }
         Ok(())
     }
-    fn check(&mut self, limits: CallRequestProjectionLimits) -> Result<(), Error> {
+    fn check(&mut self, limits: CallRequestProjectionLimits) -> Result<(), HostError<H>> {
         admitted(self.facts.definition_count, limits.max_definitions)?;
         admitted(self.facts.type_reference_count, limits.max_type_references)?;
         admitted(
@@ -162,7 +171,7 @@ impl<'parent, 'callback> Model<'parent, 'callback> {
             add(add(owned, lookup)?, add(copies, self.delegated)?)?;
         admitted(self.facts.cumulative_work_upper_bound, limits.max_work)?;
         if self.source < self.known {
-            return Err(shape("request source invoice omits original backing"));
+            return Err((shape("request source invoice omits original backing")).into());
         }
         if let Some(parent) = self.parent.as_deref_mut() {
             self.work_peak = self.work_peak.max(self.facts.cumulative_work_upper_bound);
@@ -178,7 +187,7 @@ impl<'parent, 'callback> Model<'parent, 'callback> {
         left: &FunctionValueType,
         right: &FunctionValueType,
         limits: CallRequestProjectionLimits,
-    ) -> Result<(), Error> {
+    ) -> Result<(), HostError<H>> {
         if self.parent.is_some() {
             let prefix = type_binding_prefix_work_upper_bound_in(left, right, self.source)?;
             let base = self.delegated;
@@ -195,7 +204,7 @@ impl<'parent, 'callback> Model<'parent, 'callback> {
         right: &FunctionValueType,
         limits: CallRequestProjectionLimits,
         w: &mut CompileCheckpoints<'_>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, HostError<H>> {
         self.comparison_prefix(left, right, limits)?;
         self.check(limits)?;
         // Subtract actual accumulated work, not the replacement peak for this
@@ -206,7 +215,7 @@ impl<'parent, 'callback> Model<'parent, 'callback> {
             .ok_or_else(resource)?;
         let compared = if self.parent.is_some() {
             let base = self.delegated;
-            verify_type_binding_admitted_in::<Error>(
+            verify_type_binding_admitted_in::<HostError<H>>(
                 left,
                 right,
                 self.source,
@@ -243,21 +252,21 @@ impl PreparedCallRequestsEncode<'_, '_> {
         &self.facts
     }
 }
-fn verify_id(
+fn verify_id<H>(
     types: &EncodedTypeTable<'_>,
     id: u32,
     expected: &FunctionValueType,
-    model: &mut Model<'_, '_>,
+    model: &mut Model<'_, '_, H>,
     limits: CallRequestProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<(), Error> {
+) -> Result<(), HostError<H>> {
     // Linear source lookup is admitted by Model before delegating. The
     // captured branch admits the actual selected root before the old flush.
     if model.parent.is_none() {
         w.flush()?;
     }
     let actual = if model.parent.is_some() {
-        types.value_type_captured::<Error>(
+        types.value_type_captured::<HostError<H>>(
             id,
             &mut |actual, work| {
                 model.comparison_prefix(expected, actual, limits)?;
@@ -273,20 +282,18 @@ fn verify_id(
     w.flush()?;
     let actual = actual.ok_or_else(|| shape("request supplied value type ID is absent"))?;
     if !model.compare(expected, actual, limits, w)? {
-        return Err(shape(
-            "request complete type differs from its supplied type root",
-        ));
+        return Err((shape("request complete type differs from its supplied type root")).into());
     }
     Ok(())
 }
-fn validate_constant(
+fn validate_constant<H>(
     reference: novarocks_physical_plan::ConstantReference,
     expected: &FunctionValueType,
     pools: &ConstantPools,
-    model: &mut Model<'_, '_>,
+    model: &mut Model<'_, '_, H>,
     limits: CallRequestProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<(), Error> {
+) -> Result<(), HostError<H>> {
     // Address-only selection keeps original Field/backing/ordinal and avoids
     // the bucketed metadata comparator's unaccounted heap scratch.
     model.check(limits)?;
@@ -294,7 +301,7 @@ fn validate_constant(
         w.flush()?;
     }
     let selected = if model.parent.is_some() {
-        pools.resolve_source_captured_observed::<Error>(
+        pools.resolve_source_captured_observed::<HostError<H>>(
             reference,
             &mut |selected, work| {
                 capture_constant(selected, expected, model, limits)?;
@@ -306,12 +313,13 @@ fn validate_constant(
     } else {
         pools
             .resolve_source_observed(reference, w)
-            .map_err(Error::from)
+            .map_err(HostError::<H>::from)
     };
     let selected = match selected {
-        Err(Error::Control(cause)) => {
-            return Err(Error::Control(cause));
+        Err(ProjectionFailure::Codec(Error::Control(cause))) => {
+            return Err((Error::Control(cause)).into());
         }
+        Err(ProjectionFailure::Host(error)) => return Err(ProjectionFailure::Host(error)),
         outcome => {
             w.step()?;
             w.flush()?;
@@ -320,19 +328,20 @@ fn validate_constant(
     };
     capture_constant(&selected, expected, model, limits)?;
     if !model.compare(expected, selected.value_type(), limits, w)? {
-        return Err(Error::Constant(
+        return Err((Error::Constant(
             novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(reference),
-        ));
+        ))
+        .into());
     }
     w.step()?;
     Ok(())
 }
-fn capture_constant(
+fn capture_constant<H>(
     selected: &novarocks_physical_plan::ConstantValue,
     expected: &FunctionValueType,
-    model: &mut Model<'_, '_>,
+    model: &mut Model<'_, '_, H>,
     limits: CallRequestProjectionLimits,
-) -> Result<(), Error> {
+) -> Result<(), HostError<H>> {
     let backing = usize::try_from(
         selected
             .pool()
@@ -344,13 +353,13 @@ fn capture_constant(
     model.check(limits)?;
     model.comparison_prefix(expected, selected.value_type(), limits)
 }
-fn count_request_header(
+fn count_request_header<H>(
     request: &PhysicalCallRequest,
     ids: &CallRequestTypeIds<'_>,
-    model: &mut Model<'_, '_>,
+    model: &mut Model<'_, '_, H>,
     owned_source: &mut usize,
     limits: CallRequestProjectionLimits,
-) -> Result<(), Error> {
+) -> Result<(), HostError<H>> {
     model.items = add(model.items, request.arguments.len())?;
     *owned_source = add(
         *owned_source,
@@ -363,13 +372,13 @@ fn count_request_header(
     model.request::<wire::OriginalFunctionArgument>(request.arguments.len())?;
     model.check(limits)
 }
-fn count_lambda_header(
+fn count_lambda_header<H>(
     parameter_types: &[FunctionValueType],
     parameters: &[u32],
-    model: &mut Model<'_, '_>,
+    model: &mut Model<'_, '_, H>,
     owned_source: &mut usize,
     limits: CallRequestProjectionLimits,
-) -> Result<(), Error> {
+) -> Result<(), HostError<H>> {
     model.facts.type_reference_count = add(
         model.facts.type_reference_count,
         add(parameter_types.len(), 1)?,
@@ -386,16 +395,16 @@ fn count_lambda_header(
     model.request::<u32>(parameter_types.len())?;
     model.check(limits)
 }
-fn preflight(
+fn preflight<H>(
     source: &FragmentCallRequests,
     types: &EncodedTypeTable<'_>,
     ids: &[CallRequestTypeIds<'_>],
     pools: &ConstantPools,
     invoice: usize,
     limits: CallRequestProjectionLimits,
-    parent: Option<&mut CallRequestAdmit<'_>>,
+    parent: Option<&mut HostAdmit<'_, H>>,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<CallRequestProjectionFacts, Error> {
+) -> Result<CallRequestProjectionFacts, HostError<H>> {
     let mut model = Model::new(invoice, types, pools, parent)?;
     model.facts.definition_count = source.entries().len();
     model.known = model.known.max(add(
@@ -492,7 +501,7 @@ fn preflight(
                 }
                 _ => {
                     w.step()?;
-                    return Err(shape("request argument ID variant differs from source"));
+                    return Err((shape("request argument ID variant differs from source")).into());
                 }
             }
             model.check(limits)?;
@@ -542,7 +551,7 @@ fn preflight(
                     }
                     verify_id(types, *result, result_type, &mut model, limits, w)?;
                 }
-                _ => return Err(shape("request admitted argument shape changed")),
+                _ => return Err((shape("request admitted argument shape changed")).into()),
             }
             w.step()?;
         }
@@ -567,7 +576,7 @@ pub fn prepare_call_requests_encode<'loan, 'source>(
     control: &'loan dyn PureCompileControl,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, Error> {
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = preflight(
+    let result = preflight::<std::convert::Infallible>(
         source,
         types,
         type_ids,
@@ -585,7 +594,7 @@ pub fn prepare_call_requests_encode<'loan, 'source>(
         control,
         facts,
     });
-    finish(w, result)
+    finish(w, result.map_err(ProjectionFailure::without_host))
 }
 fn reserve<T>(n: usize, w: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Error> {
     bytes::<T>(n)?;
@@ -693,6 +702,52 @@ pub fn prepare_call_requests_encode_in<'loan, 'source, 'control: 'loan>(
     admit: &mut CallRequestAdmit<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, Error> {
+    prepare_call_requests_encode_with_host_in(
+        source,
+        types,
+        type_ids,
+        pools,
+        source_retained_bytes,
+        limits,
+        &mut |facts| admit(facts).map_err(AdmissionRefusal::<std::convert::Infallible>::Control),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+/// Same immutable source/type/pool loans, with a nominal capture-only refusal.
+pub fn prepare_call_requests_encode_with_host_in<'loan, 'source, 'control: 'loan, H>(
+    source: &'loan FragmentCallRequests,
+    types: &'loan EncodedTypeTable<'source>,
+    type_ids: &'loan [CallRequestTypeIds<'loan>],
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: CallRequestProjectionLimits,
+    admit: &mut dyn FnMut(&CallRequestProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedCallRequestsEncode<'loan, 'source>, HostError<H>> {
+    prepare_call_requests_encode_host_core(
+        source,
+        types,
+        type_ids,
+        pools,
+        source_retained_bytes,
+        limits,
+        &mut |facts| admit(facts).map_err(project_admission),
+        work,
+    )
+}
+
+pub fn prepare_call_requests_encode_host_core<'loan, 'source, 'control: 'loan, H>(
+    source: &'loan FragmentCallRequests,
+    types: &'loan EncodedTypeTable<'source>,
+    type_ids: &'loan [CallRequestTypeIds<'loan>],
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: CallRequestProjectionLimits,
+    admit: &mut HostAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedCallRequestsEncode<'loan, 'source>, HostError<H>> {
     let facts = preflight(
         source,
         types,
@@ -717,11 +772,23 @@ pub(crate) fn encode_call_requests_in(
     admit: &mut CallRequestAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::FragmentCallRequests, Error> {
+    encode_call_requests_with_host_in(
+        token,
+        &mut |facts| admit(facts).map_err(AdmissionRefusal::<std::convert::Infallible>::Control),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+fn encode_call_requests_with_host_in<H>(
+    token: PreparedCallRequestsEncode<'_, '_>,
+    admit: &mut dyn FnMut(&CallRequestProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FragmentCallRequests, HostError<H>> {
     if !std::ptr::addr_eq(token.control, work.control()) {
-        return Err(shape("request encoder belongs to another controller"));
+        return Err(shape("request encoder belongs to another controller").into());
     }
-    admit(&token.facts)?;
-    emit_core(token, work)
+    admit(&token.facts).map_err(project_admission)?;
+    emit_core(token, work).map_err(ProjectionFailure::Codec)
 }
 impl PreparedCallRequestsEncode<'_, '_> {
     pub fn emit_in(
@@ -730,6 +797,13 @@ impl PreparedCallRequestsEncode<'_, '_> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<wire::FragmentCallRequests, Error> {
         encode_call_requests_in(self, admit, work)
+    }
+    pub fn emit_with_host_in<H>(
+        self,
+        admit: &mut dyn FnMut(&CallRequestProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<wire::FragmentCallRequests, HostError<H>> {
+        encode_call_requests_with_host_in(self, admit, work)
     }
 }
 
