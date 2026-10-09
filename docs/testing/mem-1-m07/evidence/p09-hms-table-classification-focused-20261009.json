@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "source_base_revision": "9a059a5fff70d42367cb98ce1722e93e5f92f4fe",
+  "purpose": "HMS true table classification excludes real view/foreign params without loading metadata files",
+  "checks": [
+    {
+      "suite": "Actual provider projection source in connector C0",
+      "passed": 9,
+      "failed": 0,
+      "seconds": 0.0
+    },
+    {
+      "suite": "Full Iceberg connector",
+      "passed": 1203,
+      "failed": 0,
+      "seconds": 7.93
+    }
+  ],
+  "initial_failures": [
+    "Vendor dependency cannot be tested as a non-workspace package with dev-dependencies; authoritative projection source is now directly compiled by existing connector tests",
+    "First connector compilation E0597: FastStr From dynamic borrowed str needs owned input; moved namespace String into one shared FastStr handle, cloned handles for RPCs; tests construct owned fixture strings"
+  ],
+  "boundaries": [
+    "Provider owns get_all_tables then serial actual HMS entity batches of100, complete structural projection before any batch result",
+    "Real params table_type ASCII-case iceberg yields base table; iceberg-view, foreign or absent param excluded, matching stock ASCII property semantics",
+    "Validate requested count/identity, returned identity/namespace/name membership/uniqueness; declared errors propagate; concurrent missing entities are omitted without retry/fill",
+    "Same existing HMS client and outer admission/deadline; no load_table or S3 metadata reads, no new view/page capability",
+    "Name/entity response decoding and SDK accumulation remain trusted endpoint internal growth, not new hard byte envelope",
+    "Cargo.lock adds only two existing dev-dependency edges; all package versions/sources/checksums unchanged"
+  ],
+  "limitations": [
+    "Unit projection and full connector tests passed; actual stock-HMS Native Rust classification still requires new clean-HEAD run",
+    "Static locked Iceberg1.11 Jar capability is source evidence only, not current native run",
+    "Original32namespace*512table+512view CL matrix, views/FORCE refusal/zero mutation, lake support and Paimon gates remain open",
+    "No push/PR/archive or full M07 acceptance"
+  ],
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-hms-table-classification-focused-20261009.log",
+      "bytes": 128,
+      "sha256": "bc331e13d8a05259ef4f69f067d97bf4ffe79b35b3bafe85ddd1491fcdca10b9"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-table-classification-focused-v2-20261009.log",
+      "bytes": 876,
+      "sha256": "6a647e40aaf8d4649be6af1a696d7b12852e891afc5126360a065fc52e3fee43"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-table-classification-focused-v3-20261009.log",
+      "bytes": 5165,
+      "sha256": "520dcb62541dd592be77629c0332e56225877c98e27e16e8376566662180fb9d"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-hms-table-classification-iceberg-regression-20261009.log",
+      "bytes": 125269,
+      "sha256": "cf5ed5a7376066076f66d49a303d52b836f4ed3e9277ad21f3047020c14654c9"
+    }
+  ]
+}

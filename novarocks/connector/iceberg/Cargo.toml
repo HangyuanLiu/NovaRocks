@@ -63,6 +63,8 @@ novarocks-spi.workspace = true
 novarocks-types.workspace = true
 
 [dev-dependencies]
+faststr = "0.2"
+hive_metastore = "0.2"
 tempfile.workspace = true
 
 [build-dependencies]

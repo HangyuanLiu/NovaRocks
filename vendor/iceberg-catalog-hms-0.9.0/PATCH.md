@@ -39,3 +39,21 @@ Its `iceberg` dependency (`version = "0.9.0"`) is redirected to
   classifies absence from the error kind alone (there is no message-sniffing
   fallback), so without this a Hive catalog would report an absent table as an
   unavailable control plane.
+
+- `src/catalog.rs` `HmsCatalog::list_tables`: classify names from `get_all_tables`
+  using actual HMS entity parameters from `get_table_objects_by_name`, in
+  serial batches of at most 100 requested names on the existing client. Only
+  `parameters["table_type"]` equal to `iceberg` ignoring ASCII case is emitted
+  as an Iceberg table; views and foreign table kinds are excluded. Validate
+  returned entity identity, membership, uniqueness and batch count before
+  projection. Entities missing after the initial name listing are omitted,
+  matching the stock Java catalog's non-snapshot listing behavior. Transport
+  and declared RPC failures remain errors. This is an accurate-classification
+  fix, not SDK allocation accounting or a response-byte bound. It adds no
+  Iceberg table/metadata-file loads, new client ownership, retries, view
+  capability or paged listing capability.
+
+  The pure `src/table_projection.rs` source is compiled directly by the existing
+  NovaRocks Iceberg connector's tests so its classification contract is covered
+  in workspace C0 without adding the vendor package or its external integration
+  tests as workspace members.
