@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "plan_revision": 7,
+  "date": "2026-10-09",
+  "source_base_revision": "7677f3f5db2e84939b22c32cd03a563f3d4633b6",
+  "status": "READER_DRIVER_ADMISSION_PRELAUNCH_COMPONENT_PASS_NATIVE_TEN_CASES_OPEN",
+  "source_files": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 190805,
+      "sha256": "acfc730a94658877487d173fcf4026b5070b6d54aaef9c229437ed3e8cbb3270"
+    },
+    {
+      "path": "novarocks-server/src/main.rs",
+      "bytes": 21199,
+      "sha256": "b07463c8b443aeda6cd015e2e9aa448c33ef03446d6aa5a83bc354fc25f2e787"
+    },
+    {
+      "path": "novarocks/version/build.rs",
+      "bytes": 3217,
+      "sha256": "faa84466c724c3116f16c950207d3ece1d7dc45274d1a2cdcef07a269df1edc9"
+    },
+    {
+      "path": "novarocks/version/src/lib.rs",
+      "bytes": 24484,
+      "sha256": "58cf937cf6578cc22f63b518951460066af1cbf707bd92fd9e622a145f1bcece"
+    },
+    {
+      "path": "tests/cluster-harness/src/lib.rs",
+      "bytes": 309521,
+      "sha256": "a48de16796801b9061a55c256814b5e588ead2057ccac6f8dc000ce2d693f5e2"
+    },
+    {
+      "path": "tests/system-test-runner/Cargo.toml",
+      "bytes": 2109,
+      "sha256": "2082363d634464cfb50ea2c797b56c1e5dd0652bec37aa519983172dfa2e5258"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/mysql_stream.rs",
+      "bytes": 68252,
+      "sha256": "8a530d00d00bd408c77bf18de5419ea8c70ad3a8d90011ed97e75980c587f104"
+    },
+    {
+      "path": "tests/system-test-runner/src/cli.rs",
+      "bytes": 11081,
+      "sha256": "51dd8eb5950c57fba96b3bae05dd1182413dfff84621abdb34638a1ead305ccd"
+    },
+    {
+      "path": "tests/system-test-runner/src/config.rs",
+      "bytes": 2458,
+      "sha256": "a72e137840f3e9ce028bdb6b4773b10893fa6c7d6284dd8dbb5c4f06c9b0c937"
+    },
+    {
+      "path": "tests/system-test-runner/src/exact_mysql_fixture_clock.rs",
+      "bytes": 7974,
+      "sha256": "571490fedc6864bce4cd461318a2874b9af6688e2a5bf188715ad55dcbebddf5"
+    },
+    {
+      "path": "tests/system-test-runner/src/main.rs",
+      "bytes": 1352,
+      "sha256": "5120acf3791d0a978d7794794bea0164961a882b2094861d2fc3cad945b4ff67"
+    },
+    {
+      "path": "tests/system-test-runner/src/runner.rs",
+      "bytes": 31481,
+      "sha256": "9e2c489dd38dbadf1bbf9bde13e0672c380f458cb3c4085a461dc07cb1902ce4"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenario.rs",
+      "bytes": 24386,
+      "sha256": "af484da09609bd98afde78e52cc8a0efd5483c2d13e17bf904362c2c688ad10c"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenarios/mod.rs",
+      "bytes": 3809,
+      "sha256": "d9c2e8b9a51daeba8bd6354d32a231690cf560c6f5a8ff0654c4a0d79d1ae83f"
+    },
+    {
+      "path": "tests/cluster-harness/src/exact_mysql_prelaunch_check_tests.rs",
+      "bytes": 3539,
+      "sha256": "dbe63789cdb1e44387649d93ba5bfafe6bacc59a0d6f0ab231e1070b22eac2d2"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/mysql_stream/exact_result_reader.rs",
+      "bytes": 39144,
+      "sha256": "16ac21705e0b0fcd6d1f8ec7b99e97815595c817ed5095acba2bab34543ae6a5"
+    },
+    {
+      "path": "tests/system-test-runner/src/actors/mysql_stream/exact_result_reader_tests.rs",
+      "bytes": 42807,
+      "sha256": "5c84fd4192f2b8edb9bb8d569dd5bb55c4385066979ddec20d72d37a8fcbf2a7"
+    },
+    {
+      "path": "tests/system-test-runner/src/exact_native_admission.rs",
+      "bytes": 27169,
+      "sha256": "f02f3720b71b72711f78edb6bd73a9b6bcfb778548b559c137f93b221cd9272f"
+    },
+    {
+      "path": "tests/system-test-runner/src/exact_native_admission_test_binding.json",
+      "bytes": 1451,
+      "sha256": "04b0d141377a6a025d43bdf009f26e1b132b3dc2cfdb2f4340c2b738d6f1c47c"
+    },
+    {
+      "path": "tests/system-test-runner/src/exact_native_admission_tests.rs",
+      "bytes": 9843,
+      "sha256": "7ae5540dfb372d60ab1fdc6657d16c18da9b2f551aaad821ac75024e3c8c8b7c"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenarios/exact_mysql_native_driver.rs",
+      "bytes": 51148,
+      "sha256": "c5c4d86c763d9614caf445b1278677a9695ce68bbefb599864af9ca1cd1760d5"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenarios/exact_mysql_native_driver_tests.rs",
+      "bytes": 14665,
+      "sha256": "e3947f44a5877a67576246bdc1ec1317208c4d7d48d857f7bc666d8733dd4971"
+    },
+    {
+      "path": "tests/system-test-runner/src/scenarios/exact_mysql_prepared_config.rs",
+      "bytes": 7188,
+      "sha256": "79b136f4631fbea1f453bc590a81c73ac2f4bab1a223412fd69dc1f2d33dd968"
+    },
+    {
+      "path": "tools/testing/test_verify_exact_native_final.py",
+      "bytes": 19144,
+      "sha256": "c312ed46bade6bdf8fb50990f3473e50295924ccbf69038074637d688d8081a2"
+    },
+    {
+      "path": "tools/testing/verify_exact_native_final.py",
+      "bytes": 28705,
+      "sha256": "ac81d5c7718d3680d5480c8cda97196cfd710015ad0df807a66518705354cf1f"
+    }
+  ],
+  "logs": [
+    {
+      "path": "logs/mem-1-m07/p09-exact-reader-components-v1-20261009.log",
+      "bytes": 10725,
+      "sha256": "373b40f8befd79070a783340bd6bbb652b6b5bb9d2b8706d7d0d51455bf17856"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-reader-driver-components-v2-20261009.log",
+      "bytes": 27104,
+      "sha256": "f5968c9c6199f6e5d81b27f1dcf592243cc0f90525df8c4b08d1497d8b82f29e"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-reader-driver-components-v3-20261009.log",
+      "bytes": 26614,
+      "sha256": "6140cd221a53ac56d0c9303a3c99c334937cc29018842ba188c04fa937a9f978"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-build-provenance-version-components-v1-20261009.log",
+      "bytes": 2106,
+      "sha256": "ef7818ed20b6717742e345535925a72831ff8688faff2251615c1a0bc4c99d3c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-reader-driver-runner-milestone-v4-20261009.log",
+      "bytes": 40120,
+      "sha256": "6942cb8af66956d6f05b65cdfebb3212c533a5631854d018488678972f139cdc"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-prelaunch-config-runner-components-v5-20261009.log",
+      "bytes": 6932,
+      "sha256": "e938b8edbd9891651952353ba020ba3b3624e530f8f7d568e1db4a61c8891277"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-prelaunch-config-runner-components-v6-20261009.log",
+      "bytes": 29281,
+      "sha256": "3b5aee026d480a5974a32c858786a279c3b3c5ca42d37c4e0e9589763f193e56"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-original-prelaunch-harness-component-v1-20261009.log",
+      "bytes": 525,
+      "sha256": "e952c06de6ffe2cbef29c64f35863c963c7db2d6614713d5752324b3ff70bd72"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-build-diagnostic-feature-check-v1-20261009.log",
+      "bytes": 186830,
+      "sha256": "584d76226cbd9907c223fdca3ede8307a731bc8c6c8c0542dce939b32272615c"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-build-diagnostic-default-check-v1-20261009.log",
+      "bytes": 184321,
+      "sha256": "541c0dcf62e5b49ac320d7c0518d3c469a1a6688be8e14e953a60ec069afc824"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-final-verifier-host-v1-20261009.log",
+      "bytes": 3272,
+      "sha256": "23728a713ec29d61e68ecaae3cc8e2d6f85255a5b14ce199ed9530a5ff59ebeb"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-native-admission-components-v1-20261009.log",
+      "bytes": 9578,
+      "sha256": "66ac47e320445c64df8f1a475084f38f7295d8c2f63c52214a598f250cdec306"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-native-runner-milestone-v7-20261009.log",
+      "bytes": 37563,
+      "sha256": "0e4508f4dd19bfe98b73de47b3e55767850c80932f01ba2c1488a24493610631"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-exact-native-dispatch-components-v8-20261009.log",
+      "bytes": 24943,
+      "sha256": "07e8dbdeca43dfbd63e3d4e683a1e0fa15360b60cd4689e8bef8dc2799260e16"
+    }
+  ],
+  "draft_and_review_provenance": [
+    {
+      "path": "logs/mem-1-m07/exact-native-admission-v1/source-pins.json",
+      "bytes": 2995,
+      "sha256": "850904e3b21ee157830124ba2ebca84ac13b9823af823dbf427ce2f4c70f8ff2"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-native-final-verifier-v1/sourcepins.draft.json",
+      "bytes": 2915,
+      "sha256": "b54f4e9d9b05d9213f124c19b19685c51118d78fd0a62155f0b7809c86f0a325"
+    },
+    {
+      "path": "logs/mem-1-m07/exact-admission-independent-review-v1/review.md",
+      "bytes": 7852,
+      "sha256": "257b9605bd2b1d3338f0cb9c73eddd2afce2cdf7b9fccfbbf17fe522ca7b05b3"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-prelaunch-config-independent-review-v1/review.md",
+      "bytes": 6206,
+      "sha256": "4ef3863d45f5eec5620cba865ba656dd81a145c964dd8a3f42571802891bb34b"
+    }
+  ],
+  "verification": {
+    "profile": "dev/test unoptimized",
+    "jobs": 1,
+    "incremental": false,
+    "test_threads": 1,
+    "runner_milestone": {
+      "passed": 262,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 15.52
+    },
+    "later_exact_dispatch": {
+      "passed": 141,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 9.58
+    },
+    "python_pure_mock": {
+      "passed": 17,
+      "failed": 0,
+      "seconds": 0.01
+    },
+    "prelaunch_harness": {
+      "passed": 1,
+      "failed": 0,
+      "seconds": 0.02
+    },
+    "feature_server_check": "PASS",
+    "default_server_check": "PASS",
+    "native_roles_started_this_slice": 0,
+    "docker_started_this_slice": 0
+  },
+  "failure_history": [
+    "wide loopback producer omitted the next lenenc prefix; fixed producer test only",
+    "socket locator exceeded original cap on macOS; independent locator moved under /tmp",
+    "prepared artifact tests needed explicit tempfile dev dependency; compile failure preserved"
+  ],
+  "scope": "Exact original reader, ten-case driver and strict before/after admission; real Native ten-case matrix, actual four-role exits and external final integration remain OPEN. No backing last-alias/fullClosing64/lateACK proof.",
+  "excluded_by_user": "IRU-7 retires HMS non-readonly behavior; touched retiring paths require compilation only",
+  "remaining": [
+    "native original ten cases",
+    "fullClosing64/latealias/ACK/backing/coalesced/flush/missing/natural short write",
+    "Client320/Compute256/Hshort64/Closing64 stress",
+    "P08 remaining Host/config/protection audit",
+    "HMS/Paimon real large CL and SDK actual future exit",
+    "P00b measured coefficients/macOS/release CL CM CP/Linux handoff",
+    "P10 ADR/final same SHA C0 C10",
+    "two unresolved human semantics: Ordinary saturation and producer wait in write budget"
+  ],
+  "published": false
+}

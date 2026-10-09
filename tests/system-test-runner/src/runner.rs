@@ -9,6 +9,16 @@ use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHa
 use std::fs;
 
 pub fn run(cli: Cli) -> Result<()> {
+    let exact = cli.exact_mysql_execution_binding.is_some();
+    let result = run_dispatch(cli);
+    if exact {
+        finish_exact_mysql_scenario(result.err(), Ok(()), Ok(()))
+    } else {
+        result
+    }
+}
+
+fn run_dispatch(cli: Cli) -> Result<()> {
     let scenarios = scenarios::all();
     if cli.list || cli.list_default {
         for scenario in list_scenarios(&scenarios, cli.list_default)? {
@@ -23,6 +33,51 @@ pub fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let config = RunnerConfig::from_cli(&cli)?;
+    if let Some(binding) = &config.exact_mysql_execution_binding {
+        #[cfg(unix)]
+        {
+            if config.cluster_size != 3
+                || config.launch_profile != novarocks_cluster_harness::LaunchProfile::FaultScenario
+            {
+                bail!("exact MySQL execution requires fault-scenario 1FE+3BE");
+            }
+            let admitted = crate::exact_native_admission::admit(
+                binding,
+                &config.binary,
+                &config.base_config_path,
+            )?;
+            let exact =
+                scenarios::exact_mysql_native_driver::scenarios_from_admitted(admitted.clone())?;
+            let selected = select_exact(&exact, &cli.only)?;
+            for scenario in selected {
+                let current = crate::exact_native_admission::admit(
+                    binding,
+                    &config.binary,
+                    &config.base_config_path,
+                )?;
+                anyhow::ensure!(
+                    current == admitted,
+                    "original admission changed before exact scene launch"
+                );
+                run_one(scenario, &config)?;
+                // Final source/binary drift is an admission failure even when
+                // the original scene already settled successfully. This new
+                // preparation check cannot renew its original 20-second clock.
+                let after = crate::exact_native_admission::admit(
+                    binding,
+                    &config.binary,
+                    &config.base_config_path,
+                )?;
+                anyhow::ensure!(
+                    after == admitted,
+                    "original admission changed during exact scene"
+                );
+            }
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        bail!("exact MySQL execution requires Unix original fixture ownership");
+    }
     if let Some(binding) = &cli.hms_classification_binding {
         if config.cluster_size != 3
             || config.launch_profile != novarocks_cluster_harness::LaunchProfile::FaultScenario
@@ -61,6 +116,22 @@ fn list_scenarios(
     } else {
         Ok(scenarios.iter().map(|scenario| scenario.as_ref()).collect())
     }
+}
+
+#[cfg(unix)]
+fn select_exact<'a>(
+    scenarios: &'a [Box<dyn Scenario>],
+    only: &[String],
+) -> Result<Vec<&'a dyn Scenario>> {
+    if only.is_empty() {
+        return Ok(scenarios.iter().map(|scenario| scenario.as_ref()).collect());
+    }
+    let unique: std::collections::BTreeSet<_> = only.iter().collect();
+    anyhow::ensure!(
+        only.len() <= scenarios.len() && unique.len() == only.len(),
+        "exact matrix selectors must be unique original cases"
+    );
+    select(scenarios, only)
 }
 
 fn select<'a>(
@@ -164,16 +235,47 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         config_overlay: launch_config.config_overlay,
         native_trust_fixture: launch_config.native_trust_fixture,
     };
-    let handle = match launch_config.native_root_reply_fault {
-        Some(root_fault) => CrossProcessServerHandle::launch_with_native_root_reply_fault(
+    let handle = if let Some(clock) = exact_mysql_clock {
+        if launch_config.native_root_reply_fault.is_some()
+            || !launch_config
+                .native_fault_proxies
+                .backend_retained_byte_limits
+                .is_empty()
+        {
+            finish_exact_mysql_scenario(
+                Some(anyhow::anyhow!(
+                    "exact MySQL prelaunch config freeze requires direct original roles"
+                )),
+                Ok(()),
+                scenario.teardown(),
+            )?;
+            unreachable!();
+        }
+        CrossProcessServerHandle::launch_with_exact_mysql_prelaunch_check(
             cluster_options,
-            launch_config.native_fault_proxies,
-            root_fault,
-        ),
-        None => CrossProcessServerHandle::launch_with_native_fault_proxies(
-            cluster_options,
-            launch_config.native_fault_proxies,
-        ),
+            &|artifact| {
+                clock.remaining("original prepared config freeze")?;
+                scenario.freeze_prepared_exact_config(
+                    artifact,
+                    &scenario_root,
+                    clock.deadline(),
+                )?;
+                clock.remaining("original prepared config freeze completion")?;
+                Ok(())
+            },
+        )
+    } else {
+        match launch_config.native_root_reply_fault {
+            Some(root_fault) => CrossProcessServerHandle::launch_with_native_root_reply_fault(
+                cluster_options,
+                launch_config.native_fault_proxies,
+                root_fault,
+            ),
+            None => CrossProcessServerHandle::launch_with_native_fault_proxies(
+                cluster_options,
+                launch_config.native_fault_proxies,
+            ),
+        }
     }
     .with_context(|| format!("launch system scenario {}", scenario.name()));
     let handle = match handle {
@@ -233,8 +335,13 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             .as_ref()
             .map(|path| format!(" --uea1-workload-manifest {}", path.display()))
             .unwrap_or_default();
+        let exact_binding = config
+            .exact_mysql_execution_binding
+            .as_ref()
+            .map(|path| format!(" --exact-mysql-execution-binding {}", path.display()))
+            .unwrap_or_default();
         eprintln!(
-            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {} --launch-profile {}{}",
+            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {} --launch-profile {}{}{}",
             context.name(),
             config.binary.display(),
             config.base_config_path.display(),
@@ -243,6 +350,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             config.timeout.as_secs(),
             launch_profile,
             manifest,
+            exact_binding,
         );
         let cluster_cleanup = if exact_mysql_clock.is_some() {
             context.shutdown_exact_mysql_fixture()
@@ -309,6 +417,9 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let evidence_path = context
         .write_evidence(ScenarioEvidenceOutcome::Passed)
         .with_context(|| format!("write passing scenario evidence for {}", context.name()))?;
+    if let Some(clock) = exact_mysql_clock {
+        clock.remaining("settled original role and final evidence completion")?;
+    }
     println!(
         "scenario={} PASS evidence={}",
         scenario.name(),
@@ -553,6 +664,54 @@ pub(crate) fn exact_mysql_failure_presentation(error: &anyhow::Error) -> Option<
 #[cfg(test)]
 mod exact_mysql_presentation_tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn original_binding_parse_error_remains_owned_but_terminal_is_finite() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let binding = root.path().join("binding.json");
+        let base = root.path().join("base.toml");
+        let canary = "0123456789abcdef0123456789abcdef";
+        fs::write(&binding, format!("{{\"{canary}\":true}}"))?;
+        fs::write(&base, "[server]\nhost='127.0.0.1'\n")?;
+        let cli = Cli::parse([
+            "--binary".into(),
+            std::env::current_exe()?.display().to_string(),
+            "--config".into(),
+            base.display().to_string(),
+            "--artifact-root".into(),
+            root.path().join("artifacts").display().to_string(),
+            "--launch-profile".into(),
+            "fault-scenario".into(),
+            "--cluster-size".into(),
+            "3".into(),
+            "--exact-mysql-execution-binding".into(),
+            binding.display().to_string(),
+        ])?;
+        let result = run(cli);
+        root.close()?;
+        let error = result.unwrap_err();
+        assert!(error.chain().any(|source| source.is::<serde_json::Error>()));
+        assert!(format!("{error:#}").contains(canary));
+        assert!(
+            !exact_mysql_failure_presentation(&error)
+                .unwrap()
+                .contains(canary)
+        );
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn explicit_exact_selection_includes_all_and_refuses_duplicate_or_foreign_cases() {
+        let scenarios = crate::scenarios::all();
+        assert_eq!(
+            select_exact(&scenarios, &[]).unwrap().len(),
+            scenarios.len()
+        );
+        let name = scenarios[0].name().to_owned();
+        assert_eq!(select_exact(&scenarios, &[name.clone()]).unwrap().len(), 1);
+        assert!(select_exact(&scenarios, &[name.clone(), name]).is_err());
+        assert!(select_exact(&scenarios, &["foreign-original-case".into()]).is_err());
+    }
     #[test]
     fn terminal_presentation_does_not_expand_retained_raw_source_canary() {
         let canary = "0123456789abcdef0123456789abcdef";
@@ -624,6 +783,7 @@ mod exact_mysql_prelaunch_teardown_tests {
             timeout: Duration::from_secs(20),
             launch_profile: LaunchProfile::FaultScenario,
             uea1_workload_manifest: None,
+            exact_mysql_execution_binding: None,
         };
         let mut observations = Vec::new();
         for (profile, count, frontend, backends) in [

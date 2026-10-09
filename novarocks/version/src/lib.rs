@@ -349,6 +349,12 @@ pub const fn native_build_identity() -> &'static str {
     NATIVE_BUILD_IDENTITY
 }
 
+/// Actual build-time Git commit, independently of an explicit native build identity.
+/// Empty for builds without an available Git checkout.
+pub const fn build_git_commit() -> &'static str {
+    env!("NOVAROCKS_GIT_COMMIT_FULL")
+}
+
 /// Short version string reported via heartbeat, e.g. "novarocks-1b9f054a".
 /// Matches StarRocks BE convention of "version-commit".
 pub fn short_version() -> &'static str {

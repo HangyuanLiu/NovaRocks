@@ -559,3 +559,14 @@ Root observer沿原三BE日志 baseline prefix hash与原四launch实例，严�
 定向73 PASS/1.14s、Root8 PASS/0.01s、harness11 PASS/2.07s；补whole-source5反例、source projection1、actual IOcause2后，完整runner组件里程碑 **217 PASS / 0 FAIL / 2 existing ignored / 7.09s**。迭代用dev/test unoptimized、jobs1/incremental0/threads1；首次ClientFailure手工fixture缺cause的E0063 compile FAIL原日志保留，已修。fmt/diffcheck PASS。收据 `docs/testing/mem-1-m07/evidence/p09-independent-original-sources-components-20261009.json` pin实际源/原草稿/两次独立review/failed+passed日志；旧input/oracle draft保留原字节。
 
 本slice Native/Docker0，不把paired Unix/host shell/scalar DTO测试当真实FE/BE证据。bounded original MySQL reader、clean-source new inputfreeze、scene driver和actual Unix/握手/Root/wire精确取消矩阵仍待接入运行；fullClosing64/latealias/ACK/recovery/四role实际退出及其余P09/P00b/P10/final门仍OPEN。同步topology/file syscalls只作deadline前后拒晚成功，不声称物理whole-launch/scan硬20s；census不声称FE/BE原子cut。HMS非只读按IRU-7用户授权excluded，两个待裁决语义/caps/clock不变。无push/PR/归档。
+
+
+### P09 original exact reader / driver / admission integration checkpoint (2026-10-09)
+
+有界原MySQL reader及原十场景driver已接入：保留原x S−1/S/S+1、wide q17 S+1 missing-tail、tiny1..6 SQL/cut/hash；4096 scratch、同原socket/握手CID/absolute clock，实际partial EOF与零response follow-up不按ErrorKind放行。原driver使用private FE-only Unix pair、独立raw bind/Root source和固定16control位置；original prepared config在四role spawn之前冻结实际secret-free artifact，operation前与四role cleanup后复核同File/identity/hash/clock。原20s在launch前一次捕获，实际all-role cleanup即使过期仍执行，并在最终证据写入后拒迟到成功。
+
+严格execution admission已接opt-in CLI，默认registry不变：原large/tiny不可执行草稿字节不改；另要求真实clean source/full commit、实际server/runner binary/hash/build/config、原input stream hash，每case前后同pins再核验。server仅feature提供启动前fullcommit诊断；runnerfullcommit与NativeBuild分别检验。capture原Child、双EOF/exit0/stderr0与一次prep30s、command5s（setup/spawn在内）成立才准入；失败1s actualreap仍未知则保留同Child失败，不把Drop当退出。所有opt-in失败source保留但终端仅有限verdict。
+
+完整runner组件里程碑262 PASS/0 FAIL/2既有ignored/15.52s；后补dispatch唯一选择/canary与pre-spawn clock后定向141 PASS/0 FAIL/9.58s。prelaunch harness真实host反例1 PASS/0.02s，确认callback拒绝在任何role spawn之前；Python最终verifier17纯mock PASS/0.010s。version10组件及feature/default server check PASS。迭代dev/test unoptimized、jobs1/incremental0/threads1；先前wide测试producer缺lenenc/socketlocator过长/tempfile缺依赖失败原日志保留，修正后通过。收据 `docs/testing/mem-1-m07/evidence/p09-exact-native-reader-driver-admission-components-20261009.json`。
+
+本slice Native/Docker0。final verifier组件不是实际运行验收：必须外部独立冻结原launch PID/birth tokens与pre-role artifact，原runner实际wait0、schema5与operation/raw/source/build一致后四PID实际ESRCH；external orchestration与原生十场景仍OPEN。fullClosing64/latealias/ACK/backing/其余压力、provider大CL、P00b/CM/CP/Linux/P10/final及两人工语义裁决不闭合。HMS非只读按IRU-7用户scope excluded；无push/PR/归档。

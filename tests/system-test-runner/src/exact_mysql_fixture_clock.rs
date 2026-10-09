@@ -80,6 +80,42 @@ impl ExactMysqlPrelaunchClock {
         );
         Ok(remaining)
     }
+    /// Always settle the original owners, including on an expired clock.
+    /// Cleanup success cannot admit a late four-role settlement.
+    pub(crate) fn settle_original_roles(self, cleanup: impl FnOnce() -> Result<()>) -> Result<()> {
+        let cleanup = cleanup();
+        let deadline = self
+            .remaining("all original role cleanup settlement")
+            .map(|_| ());
+        match (cleanup, deadline) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(cleanup), Err(deadline)) => {
+                Err(OriginalRolesSettlementFailure { cleanup, deadline }.into())
+            }
+        }
+    }
+}
+
+struct OriginalRolesSettlementFailure {
+    cleanup: anyhow::Error,
+    deadline: anyhow::Error,
+}
+impl std::fmt::Debug for OriginalRolesSettlementFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::fmt::Display for OriginalRolesSettlementFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = &self.deadline;
+        f.write_str("original role cleanup and original deadline failed; both sources retained")
+    }
+}
+impl std::error::Error for OriginalRolesSettlementFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cleanup.as_ref())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -89,6 +125,52 @@ mod tests {
         env.fe.insert(SOCKET.into(), "private".into());
         env.fe.insert(NONCE.into(), "private".into());
         env
+    }
+    #[test]
+    fn expired_role_settlement_still_runs_cleanup_and_retains_original_source() {
+        let clock = ExactMysqlPrelaunchClock::capture_at(
+            &environment(),
+            Instant::now() - Duration::from_secs(25),
+        )
+        .unwrap()
+        .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let error = clock
+            .settle_original_roles(|| {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::from_raw_os_error(5).into())
+            })
+            .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        let failure = error
+            .downcast_ref::<OriginalRolesSettlementFailure>()
+            .unwrap();
+        assert_eq!(
+            failure
+                .cleanup
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(5)
+        );
+        assert!(!format!("{failure}").contains("Input/output"));
+    }
+    #[test]
+    fn role_cleanup_crossing_original_clock_never_admits_late_success() {
+        let clock = ExactMysqlPrelaunchClock {
+            deadline: Instant::now(),
+            started_at: SystemTime::now(),
+        };
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            clock
+                .settle_original_roles(|| {
+                    calls.set(1);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(calls.get(), 1);
     }
     #[test]
     fn original_origin_is_preserved_without_new_scene_clock() {

@@ -5,7 +5,9 @@ mod catalog_state;
 mod connector;
 mod distributed_writer;
 #[cfg(unix)]
-mod exact_mysql_native_oracle;
+pub(crate) mod exact_mysql_native_driver;
+#[cfg(unix)]
+pub(crate) mod exact_mysql_native_oracle;
 mod exchange_normal_close;
 mod frontend_lifecycle;
 pub(crate) mod hms_classification_preflight;

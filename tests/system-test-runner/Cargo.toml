@@ -57,3 +57,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 tonic = { workspace = true, features = ["transport"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -65,6 +65,16 @@ pub trait Scenario: Send + Sync {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()>;
 
+    /// The explicit exact fixture freezes original prepared config facts before role launch.
+    fn freeze_prepared_exact_config(
+        &self,
+        _artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence,
+        _scenario_root: &Path,
+        _original_deadline: Instant,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Releases an external fixture created while preparing this scenario.
     ///
     /// The runner calls this after both successful and failed cluster runs, as
@@ -278,7 +288,9 @@ impl ScenarioContext {
             let clock = self
                 .exact_mysql_clock
                 .context("exact MySQL scene has no prelaunch clock")?;
-            self.handle.shutdown_exact_mysql_fixture(clock.deadline())
+            clock.settle_original_roles(|| {
+                self.handle.shutdown_exact_mysql_fixture(clock.deadline())
+            })
         }
         #[cfg(not(unix))]
         {

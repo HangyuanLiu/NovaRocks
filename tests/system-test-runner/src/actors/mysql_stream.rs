@@ -32,6 +32,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio::time::timeout as async_timeout;
 
+#[cfg(unix)]
+#[path = "mysql_stream/exact_result_reader.rs"]
+pub(crate) mod exact_result_reader;
+
 pub struct MysqlStream {
     stream: TcpStream,
 }

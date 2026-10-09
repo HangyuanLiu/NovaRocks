@@ -3323,7 +3323,7 @@ impl CrossProcessServerHandle {
         options: CrossProcessClusterOptions,
         proxy_config: CrossProcessNativeFaultProxyConfig,
     ) -> Result<Self> {
-        Self::launch_with_native_fault_options(options, proxy_config, None)
+        Self::launch_with_native_fault_options(options, proxy_config, None, None)
     }
 
     /// Harness-only one-shot RootReply fault route. Existing launch/config
@@ -3333,13 +3333,27 @@ impl CrossProcessServerHandle {
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault: CrossProcessRootReplyFaultConfig,
     ) -> Result<Self> {
-        Self::launch_with_native_fault_options(options, proxy_config, Some(root_reply_fault))
+        Self::launch_with_native_fault_options(options, proxy_config, Some(root_reply_fault), None)
+    }
+
+    /// Explicit fixture-only check after preparing exact configs, before any role spawn.
+    pub fn launch_with_exact_mysql_prelaunch_check(
+        options: CrossProcessClusterOptions,
+        check: &dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>,
+    ) -> Result<Self> {
+        Self::launch_with_native_fault_options(
+            options,
+            CrossProcessNativeFaultProxyConfig::default(),
+            None,
+            Some(check),
+        )
     }
 
     fn launch_with_native_fault_options(
         options: CrossProcessClusterOptions,
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault_config: Option<CrossProcessRootReplyFaultConfig>,
+        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
     ) -> Result<Self> {
         let CrossProcessClusterOptions {
             binary: novarocks_bin,
@@ -3529,6 +3543,9 @@ impl CrossProcessServerHandle {
                 },
             )?;
 
+        if let Some(check) = prelaunch_check {
+            check(&effective_launch_config_evidence)?;
+        }
         // Start FE before BEs so every backend uses the same authenticated
         // self-registration ingress from its first announce attempt.
         let _ = reserved.fe_http_port.release();
@@ -8069,3 +8086,7 @@ impl std::error::Error for ExactMysqlRoleShutdownError {
             .map(|error| error.as_ref())
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "exact_mysql_prelaunch_check_tests.rs"]
+mod exact_mysql_prelaunch_check_tests;
