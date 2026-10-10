@@ -509,6 +509,15 @@ mod tests {
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={} build_identity={} hms_listing_observe=true",
+            novarocks_version::build_git_commit(),
+            novarocks_version::native_build_identity()
+        );
+        return;
+    }
     #[cfg(feature = "mem-1-m07-closing-pressure")]
     if args.as_slice() == ["--mem-1-m07-closing-pressure-build-identity"] {
         println!(

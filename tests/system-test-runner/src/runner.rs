@@ -116,6 +116,21 @@ fn run_dispatch(cli: Cli) -> Result<()> {
         #[cfg(not(unix))]
         bail!("exact MySQL execution requires Unix original fixture ownership");
     }
+    if let Some(binding) = &cli.hms_bulk_readonly_binding {
+        #[cfg(unix)]
+        {
+            let scenario = scenarios::hms_bulk_readonly_native::HmsBulkReadonlyNative::admit(
+                binding,
+                &config.binary,
+                &config.base_config_path,
+            )?;
+            let result = run_one(&scenario, &config);
+            let recheck = scenario.recheck_admission();
+            return finish_exact_mysql_scenario(result.err(), recheck, Ok(()));
+        }
+        #[cfg(not(unix))]
+        bail!("HMS readonly bulk requires original Unix role owners");
+    }
     if let Some(binding) = &cli.hms_classification_binding {
         if config.cluster_size != 3
             || config.launch_profile != novarocks_cluster_harness::LaunchProfile::FaultScenario

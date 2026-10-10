@@ -789,3 +789,6 @@ mod tests;
 
 #[path = "held_native_admission.rs"]
 pub(crate) mod held_native_admission;
+
+#[path = "hms_native_admission.rs"]
+pub(crate) mod hms_native_admission;
