@@ -40,6 +40,21 @@ pub struct WriterOwnedResourceFacts {
 
 pub(crate) trait OwnedCopy {
     type Error: From<ConnectorError>;
+    fn prepare_field_materialization(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn materialized_field(
+        &mut self,
+        _: &novarocks_type_contract::owned_resources::metadata_materialization::SharedMaterializedField,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn materialized_schema(
+        &mut self,
+        _: &novarocks_type_contract::owned_resources::metadata_materialization::SharedMaterializedSchema,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn materializes(&self) -> bool {
         true
     }

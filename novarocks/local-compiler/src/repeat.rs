@@ -392,6 +392,7 @@ fn lower_core(
         }
     }
     let mut fields = Vec::new();
+    let mut original_fields = layout.metadata_materializations().map(|_| Vec::new());
     for (ordinal, value) in shape.child.output.columns.iter().enumerate() {
         let source = fragment
             .values()
@@ -424,11 +425,19 @@ fn lower_core(
         work.flush()?;
         // Preserve the original header/metadata, changing only the authored
         // nullable root and, when exact result binding applies, its label.
-        let mut output_field = field.as_ref().clone().with_nullable(output_type.nullable);
-        if let Some(name) = name {
-            output_field = output_field.with_name(name);
+        if let Some(original_fields) = original_fields.as_mut() {
+            let mut output_field = novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::clone_from_source(field, layout.metadata_materializations()).with_nullable_owned(output_type.nullable);
+            if let Some(name) = name {
+                output_field = output_field.with_name_owned(name);
+            }
+            original_fields.push(output_field);
+        } else {
+            let mut output_field = field.as_ref().clone().with_nullable(output_type.nullable);
+            if let Some(name) = name {
+                output_field = output_field.with_name(name);
+            }
+            fields.push(output_field);
         }
-        fields.push(output_field);
         work.flush()?;
         work.step()?;
     }
@@ -461,9 +470,15 @@ fn lower_core(
             format!("local_{}_{}", local.index(), ordinal)
         };
         work.flush()?;
-        let field = ty.try_to_field(name);
-        work.flush()?;
-        fields.push(field?);
+        if let Some(original_fields) = original_fields.as_mut() {
+            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
+            work.flush()?;
+            original_fields.push(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field?));
+        } else {
+            let field = ty.try_to_field(name);
+            work.flush()?;
+            fields.push(field?);
+        }
         work.step()?;
     }
     let mut null_slot_ids = Vec::new();
@@ -480,10 +495,26 @@ fn lower_core(
         work.step()?;
     }
     work.flush()?;
-    let schema = Arc::new(Schema::new(fields));
+    let (schema, original_schema) = match (original_fields, layout.metadata_materializations()) {
+        (Some(fields), Some(source)) => {
+            let inherited = source.field_namespace();
+            let namespace = match package.original_metadata_namespace() {
+                Some(package_source) => inherited.join_original_observed(package_source, work)?,
+                None => inherited,
+            };
+            let original = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::from_original_fields(fields, namespace).into_original_schema();
+            (original.schema_owner().schema().clone(), Some(original))
+        }
+        _ => (Arc::new(Schema::new(fields)), None),
+    };
     let slots: Arc<[SlotId]> = Arc::from(planned_slots);
     work.flush()?;
-    let output_layout = StaticLayout::try_new_for_compile(schema, slots, work.control())?;
+    let output_layout = match original_schema {
+        Some(source) => {
+            StaticLayout::try_new_materialized_for_compile(source, slots, work.control())?
+        }
+        None => StaticLayout::try_new_for_compile(schema, slots, work.control())?,
+    };
     let kind = ProgramNodeKind::Repeat {
         input: child,
         repeat_times: shape.sets.len(),

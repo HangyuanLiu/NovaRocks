@@ -300,6 +300,14 @@ pub(crate) fn relation_layout(
     slots: &[SlotId],
     control: &dyn PureCompileControl,
 ) -> Result<StaticLayout, FragmentCompileError> {
+    relation_layout_with_source(schema, slots, None, control)
+}
+fn relation_layout_with_source(
+    schema: &WriterRelationSchema,
+    slots: &[SlotId],
+    namespace: Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
+    control: &dyn PureCompileControl,
+) -> Result<StaticLayout, FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = (|| {
         if slots.len() != schema.fields.len() {
@@ -308,21 +316,37 @@ pub(crate) fn relation_layout(
             ));
         }
         let mut fields = Vec::new();
-        reserve_vec(&mut fields, schema.fields.len(), &mut work)?;
+        if namespace.is_none() {
+            reserve_vec(&mut fields, schema.fields.len(), &mut work)?;
+        }
+        let mut original_fields = if namespace.is_some() {
+            let mut fields = Vec::new();
+            reserve_vec(&mut fields, schema.fields.len(), &mut work)?;
+            Some(fields)
+        } else {
+            None
+        };
         for field in schema.fields.iter() {
             work.flush()?;
-            let lowered = field.ty.try_to_field(field.name.to_string());
-            work.flush()?;
-            fields.push(lowered?);
+            if let Some(original_fields) = original_fields.as_mut() {
+                let lowered = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(&field.ty, field.name.to_string());
+                work.flush()?;
+                original_fields.push(lowered?);
+            } else {
+                let lowered = field.ty.try_to_field(field.name.to_string());
+                work.flush()?;
+                fields.push(lowered?);
+            }
             work.step()?;
         }
         work.flush()?;
-        StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(slots),
-            work.control(),
-        )
-        .map_err(Into::into)
+        match (original_fields, namespace) {
+            (Some(fields), Some(namespace)) => {
+                let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
+                StaticLayout::try_new_materialized_for_compile(source, Arc::from(slots), work.control())
+            }
+            _ => StaticLayout::try_new_for_compile(Arc::new(Schema::new(fields)), Arc::from(slots), work.control()),
+        }.map_err(Into::into)
     })();
     if matches!(&result, Err(FragmentCompileError::Control(_))) {
         return result;
@@ -410,7 +434,16 @@ fn lower_writer_core(
     let mut channels = Vec::new();
     reserve_vec(&mut nodes, width, work)?;
     reserve_vec(&mut types, width, work)?;
-    reserve_vec(&mut fields, width, work)?;
+    if recipe.draft().original_metadata_namespace().is_none() {
+        reserve_vec(&mut fields, width, work)?;
+    }
+    let mut original_fields = if recipe.draft().original_metadata_namespace().is_some() {
+        let mut fields = Vec::new();
+        reserve_vec(&mut fields, width, work)?;
+        Some(fields)
+    } else {
+        None
+    };
     reserve_vec(&mut ordinals, width, work)?;
     reserve_vec(
         &mut channels,
@@ -445,7 +478,16 @@ fn lower_writer_core(
         types.push(FunctionArgumentType::Value(ty.clone()));
         // The provider's own field, with the nullability of the value that
         // feeds it; the provider-link law keeps every other fact exact.
-        fields.push(binding.field().clone().with_nullable(ty.nullable));
+        if let Some(original_fields) = original_fields.as_mut() {
+            original_fields.push(
+                binding
+                    .original_field_materialization()
+                    .clone()
+                    .with_nullable_owned(ty.nullable),
+            );
+        } else {
+            fields.push(binding.field().clone().with_nullable(ty.nullable));
+        }
         channels.push((
             ProgramChannelSite::Layout {
                 node: id,
@@ -459,11 +501,24 @@ fn lower_writer_core(
         work.step()?;
     }
     work.flush()?;
-    let projection_layout = StaticLayout::try_new_for_compile(
-        Arc::new(Schema::new(fields)),
-        Arc::from(input.projection_slots),
-        work.control(),
-    )?;
+    let projection_layout = match (
+        original_fields,
+        recipe.draft().original_metadata_namespace(),
+    ) {
+        (Some(fields), Some(namespace)) => {
+            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::from_original_fields(fields, namespace.clone()).into_original_schema();
+            StaticLayout::try_new_materialized_for_compile(
+                source,
+                Arc::from(input.projection_slots),
+                work.control(),
+            )?
+        }
+        _ => StaticLayout::try_new_for_compile(
+            Arc::new(Schema::new(fields)),
+            Arc::from(input.projection_slots),
+            work.control(),
+        )?,
+    };
     work.flush()?;
     // A slot read needs no exception, dictionary or session-timezone
     // capability; the arena is distinct from the Main arena by design.
@@ -483,7 +538,12 @@ fn lower_writer_core(
     })?;
     let arena = Arc::new(arena);
     work.flush()?;
-    let multiplex = relation_layout(&target.output_schema, input.output_slots, work.control())?;
+    let multiplex = relation_layout_with_source(
+        &target.output_schema,
+        input.output_slots,
+        package.original_metadata_namespace(),
+        work.control(),
+    )?;
     for (ordinal, field) in target.output_schema.fields.iter().enumerate() {
         channels.push((
             ProgramChannelSite::Layout {
@@ -648,7 +708,12 @@ pub(crate) fn lower_finish(
             ));
         }
         work.flush()?;
-        let root = relation_layout(&spec.output_schema, slots, work.control())?;
+        let root = relation_layout_with_source(
+            &spec.output_schema,
+            slots,
+            package.original_metadata_namespace(),
+            work.control(),
+        )?;
         let statistics = crate::writer_statistics::lower_finish_statistics(
             package,
             spec,

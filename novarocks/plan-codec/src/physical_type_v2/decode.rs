@@ -33,11 +33,9 @@ use novarocks_type_contract::{
     MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, ValueTypeError,
     field_logical_type,
 };
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 use wire::carrier_type_definition::Kind;
+use novarocks_type_contract::owned_resources::metadata_materialization::{MaterializedMetadataMap};
 
 use super::graph::{Index, Node, add, required};
 
@@ -663,6 +661,16 @@ fn decode_body<'source>(
     let mut carriers = BTreeMap::new();
     let mut fields = BTreeMap::new();
     let mut values = BTreeMap::new();
+    let mut field_loans = if package {
+        let mut loans = Vec::new();
+        loans
+            .try_reserve_exact(table.fields.len())
+            .map_err(|_| E::from(CompileControlError::ResourceExhausted))?;
+        work.step()?;
+        Some(loans)
+    } else {
+        None
+    };
     for node in order {
         work.step()?;
         match node {
@@ -699,7 +707,9 @@ fn decode_body<'source>(
                     })
                 })?;
                 let mut metadata = opaque(package, work, |_| {
-                    Ok(HashMap::with_capacity(source.metadata.len()))
+                    Ok(MaterializedMetadataMap::with_capacity(
+                        source.metadata.len(),
+                    ))
                 })?;
                 for entry in &source.metadata {
                     work.step()?;
@@ -710,14 +720,18 @@ fn decode_body<'source>(
                         Ok(())
                     })?;
                 }
-                let field = field.with_metadata(metadata);
+                let field = metadata.into_field(field);
                 if strict(receiver.as_ref(), node, work)? {
                     opaque(package, work, |_| {
-                        field_logical_type(&field).map_err(E::from)
+                        field_logical_type(field.field()).map_err(E::from)
                     })?;
                 }
                 opaque(package, work, |_| {
-                    fields.insert(id, Arc::new(field));
+                    let field = field.into_shared();
+                    if let Some(loans) = field_loans.as_mut() {
+                        loans.push(field.loan());
+                    }
+                    fields.insert(id, field.into_original_field_ref());
                     Ok(())
                 })?;
             }
@@ -780,7 +794,23 @@ fn decode_body<'source>(
             work,
         )?;
     }
+    let metadata_namespace = match field_loans {
+        Some(loans) => {
+            // TypeDecodeModel admitted the exact source record Vec/shrink/Arc
+            // before original materialization. No decoded Field is cloned.
+            work.flush()?;
+            let loans = loans.into_boxed_slice();
+            work.step()?;
+            work.flush()?;
+            let loans = loans.into();
+            work.step()?;
+            work.flush()?;
+            Some(novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace::from_original_loans(loans))
+        }
+        None => None,
+    };
     Ok(DecodedTypeTable {
+        metadata_namespace,
         carriers,
         fields,
         values,

@@ -882,7 +882,17 @@ fn named_layout(
         .result()
         .filter(|result| labels && result.output.columns == node.output.columns);
     let mut fields = Vec::new();
-    reserve_vec(&mut fields, types.len(), work)?;
+    if package.original_metadata_namespace().is_none() {
+        reserve_vec(&mut fields, types.len(), work)?;
+    }
+    let mut original_fields = match package.original_metadata_namespace() {
+        Some(_) => {
+            let mut original_fields = Vec::new();
+            reserve_vec(&mut original_fields, types.len(), work)?;
+            Some(original_fields)
+        }
+        None => None,
+    };
     for (ordinal, ty) in types.iter().enumerate() {
         let name = match result {
             Some(result) => {
@@ -895,17 +905,33 @@ fn named_layout(
             None => format!("local_{}_{}", local.index(), ordinal),
         };
         work.flush()?;
-        let field = ty.try_to_field(name);
-        work.flush()?;
-        fields.push(field?);
+        if let Some(original_fields) = original_fields.as_mut() {
+            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
+            work.flush()?;
+            original_fields.push(field?);
+        } else {
+            let field = ty.try_to_field(name);
+            work.flush()?;
+            fields.push(field?);
+        }
         work.step()?;
     }
     work.flush()?;
-    let layout = StaticLayout::try_new_for_compile(
-        Arc::new(Schema::new(fields)),
-        Arc::from(slots),
-        work.control(),
-    )?;
+    let layout = match (original_fields, package.original_metadata_namespace()) {
+        (Some(fields), Some(namespace)) => {
+            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
+            StaticLayout::try_new_materialized_for_compile(
+                source,
+                Arc::from(slots),
+                work.control(),
+            )?
+        }
+        _ => StaticLayout::try_new_for_compile(
+            Arc::new(Schema::new(fields)),
+            Arc::from(slots),
+            work.control(),
+        )?,
+    };
     work.flush()?;
     Ok(layout)
 }
@@ -1004,11 +1030,45 @@ fn lower_core(
         }
     }
     work.flush()?;
-    let scope = StaticLayout::try_new_for_compile(
-        Arc::new(Schema::new(scope_fields)),
-        Arc::from(scope_slots),
-        work.control(),
-    )?;
+    let scope = if probe.layout.metadata_materializations().is_some()
+        || build.layout.metadata_materializations().is_some()
+    {
+        let count = [probe.layout, build.layout]
+            .iter()
+            .try_fold(0usize, |count, layout| {
+                count
+                    .checked_add(
+                        layout
+                            .metadata_materializations()
+                            .map_or(0, |source| source.fields().len()),
+                    )
+                    .ok_or(CompileControlError::ResourceExhausted)
+            })?;
+        let mut loans = Vec::new();
+        reserve_vec(&mut loans, count, work)?;
+        for layout in [probe.layout, build.layout] {
+            if let Some(source) = layout.metadata_materializations() {
+                for loan in source.fields() {
+                    loans.push(loan.clone());
+                    work.step()?;
+                }
+            }
+        }
+        work.flush()?;
+        let schema = novarocks_type_contract::owned_resources::metadata_materialization::MaterializedMetadataMap::new_for_original_reserve().into_schema(scope_fields).into_shared();
+        let source = novarocks_type_contract::owned_resources::metadata_materialization::SchemaMetadataMaterializations::from_materialized_owners(schema, loans.into());
+        StaticLayout::try_new_materialized_for_compile(
+            source,
+            Arc::from(scope_slots),
+            work.control(),
+        )?
+    } else {
+        StaticLayout::try_new_for_compile(
+            Arc::new(Schema::new(scope_fields)),
+            Arc::from(scope_slots),
+            work.control(),
+        )?
+    };
     work.flush()?;
     let join = planned.join;
     let canonical = named_layout(

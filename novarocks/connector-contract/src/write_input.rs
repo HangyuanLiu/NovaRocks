@@ -55,19 +55,31 @@ impl ConnectorWriteBinding {
 #[derive(Clone, Debug)]
 pub struct ConnectorWriteFieldBinding {
     token: ConnectorWriteFieldToken,
-    field: Field,
+    field: novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization,
 }
 
 impl PartialEq for ConnectorWriteFieldBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.token == other.token && crate::arrow_fields_exact(&self.field, &other.field)
+        self.token == other.token && crate::arrow_fields_exact(self.field(), other.field())
     }
 }
 impl Eq for ConnectorWriteFieldBinding {}
 
 impl ConnectorWriteFieldBinding {
     pub fn new(token: ConnectorWriteFieldToken, field: Field) -> Self {
-        Self { token, field }
+        Self { token, field: novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Plain(field) }
+    }
+
+    pub(crate) fn from_owned_materialization(
+        token: ConnectorWriteFieldToken,
+        field: novarocks_type_contract::owned_resources::metadata_materialization::MaterializedField,
+    ) -> Self {
+        Self { token, field: novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field) }
+    }
+
+    /// Borrow the exact immutable writer-owned field and its constructor fact.
+    pub fn original_field_materialization(&self) -> &novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization{
+        &self.field
     }
 
     pub const fn token(&self) -> ConnectorWriteFieldToken {
@@ -75,7 +87,7 @@ impl ConnectorWriteFieldBinding {
     }
 
     pub fn field(&self) -> &Field {
-        &self.field
+        self.field.field()
     }
 }
 
@@ -367,7 +379,8 @@ impl<F> ConnectorWriteInput<F> {
                 context.reserve_exit(reserved)?;
             }
             for binding in fields.field_refs() {
-                let field = crate::schema::owned_field_core(binding.field(), context)?;
+                let field =
+                    crate::schema::owned_field_materialization_core(binding.field(), context)?;
                 if materializes {
                     let field = field.ok_or_else(|| {
                         ConnectorError::new(
@@ -375,7 +388,17 @@ impl<F> ConnectorWriteInput<F> {
                             "writer owned copy did not materialize a field",
                         )
                     })?;
-                    output.push(ConnectorWriteFieldBinding::new(binding.token(), field));
+                    output.push(if context.source_invoice().is_some() {
+                        ConnectorWriteFieldBinding::from_owned_materialization(
+                            binding.token(),
+                            field,
+                        )
+                    } else {
+                        ConnectorWriteFieldBinding::new(
+                            binding.token(),
+                            field.into_original_field(),
+                        )
+                    });
                 }
                 context.step()?;
             }

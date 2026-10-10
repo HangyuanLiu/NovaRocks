@@ -1979,7 +1979,7 @@ pub fn decode_read_scans_observed(
                 last = *f;
                 Ok(())
             };
-            c::ConnectorReadPublicFacts::try_new_from_borrowed_schema_observed(
+            c::ConnectorReadPublicFacts::try_new_from_borrowed_schema_with_materializations_observed(
                 source,
                 kind,
                 schema,

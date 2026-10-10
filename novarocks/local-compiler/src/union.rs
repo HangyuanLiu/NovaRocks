@@ -270,7 +270,17 @@ fn output_layout(
         }
     }
     let mut fields = Vec::<Field>::new();
-    reserve_vec(&mut fields, slots.len(), work)?;
+    if package.original_metadata_namespace().is_none() {
+        reserve_vec(&mut fields, slots.len(), work)?;
+    }
+    let mut original_fields = match package.original_metadata_namespace() {
+        Some(_) => {
+            let mut original_fields = Vec::new();
+            reserve_vec(&mut original_fields, slots.len(), work)?;
+            Some(original_fields)
+        }
+        None => None,
+    };
     for (ordinal, &value) in node.output.columns.iter().enumerate() {
         let definition = package.fragment().values().get(&value);
         let result_name = result_names.and_then(|result| result.fields.get(ordinal));
@@ -288,19 +298,39 @@ fn output_layout(
             name
         };
         work.flush()?;
-        let field = definition.ty.try_to_field(name);
-        work.step()?;
-        work.flush()?;
-        fields.push(field?);
+        if let Some(original_fields) = original_fields.as_mut() {
+            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(&definition.ty, name);
+            work.step()?;
+            work.flush()?;
+            original_fields.push(field?);
+        } else {
+            let field = definition.ty.try_to_field(name);
+            work.step()?;
+            work.flush()?;
+            fields.push(field?);
+        }
         work.step()?;
     }
     let copied_slots = copy_items(slots, work)?;
     work.flush()?;
-    let schema = Arc::new(Schema::new(fields));
+    let materialized = match (original_fields, package.original_metadata_namespace()) {
+        (Some(fields), Some(namespace)) => Some(novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema()),
+        _ => None,
+    };
+    let schema = if let Some(source) = &materialized {
+        source.schema_owner().schema().clone()
+    } else {
+        Arc::new(Schema::new(fields))
+    };
     let slots = Arc::from(copied_slots);
     work.step()?;
     work.flush()?;
-    let layout = StaticLayout::try_new_for_compile(schema, slots, work.control())?;
+    let layout = match materialized {
+        Some(source) => {
+            StaticLayout::try_new_materialized_for_compile(source, slots, work.control())?
+        }
+        None => StaticLayout::try_new_for_compile(schema, slots, work.control())?,
+    };
     work.flush()?;
     Ok(layout)
 }

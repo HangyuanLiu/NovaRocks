@@ -21,9 +21,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_connector_contract::{
-    ConnectorWriteRecipeDraft, FrozenConnectorRead, WriteTargetOrdinal,
-};
+use novarocks_connector_contract::{ConnectorWriteRecipeDraft, FrozenConnectorRead, WriteTargetOrdinal};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
     SemanticParameterError, SemanticParameterProjectionError, SemanticParameterRef,
@@ -75,8 +73,16 @@ pub struct FragmentPackageAdmission {
     pub property_projection_limits: crate::PropertyProofProjectionLimits,
 }
 
-#[derive(Clone, Debug)]
-pub struct FragmentPackage(FragmentPackageInput);
+#[derive(Clone)]
+pub struct FragmentPackage(
+    FragmentPackageInput,
+    Option<novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
+);
+impl fmt::Debug for FragmentPackage {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_tuple("FragmentPackage").field(&self.0).finish()
+    }
+}
 
 type PackageResourceAdmission<'a> = dyn FnMut(&novarocks_type_contract::ControlOwnedResourceFacts) -> Result<(), CompileControlError>
     + 'a;
@@ -90,6 +96,18 @@ enum PackageValidation<'borrow, 'control, 'admit> {
 }
 
 impl FragmentPackage {
+    /// Attach only positive loans from the same decoded Field namespace.
+    /// No semantic plan facts, runtime capability or capacity grant changes.
+    pub fn with_original_metadata_namespace(
+        mut self,
+        namespace: novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace,
+    ) -> Self {
+        self.1 = Some(namespace);
+        self
+    }
+    pub fn original_metadata_namespace(&self) -> Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>{
+        self.1.as_ref()
+    }
     pub fn try_new(
         input: FragmentPackageInput,
         admission: FragmentPackageAdmission,
@@ -246,7 +264,7 @@ impl FragmentPackage {
                     &mut resource_work,
                 );
                 if matches!(result, Err(FragmentPackageError::Control(_))) {
-                    return result.map(|_| Self(input));
+                    return result.map(|_| Self(input, None));
                 }
                 resource_work
                     .finish()
@@ -313,7 +331,7 @@ impl FragmentPackage {
         if closure.entries().len() != input.parameters.entries().len() {
             return Err(FragmentPackageError::UnusedParameters);
         }
-        let package = Self(input);
+        let package = Self(input, None);
         match &mut observation {
             PackageValidation::Plain(control) => {
                 package.0.pruning.validate_package(&package, *control)

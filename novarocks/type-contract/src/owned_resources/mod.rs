@@ -28,3 +28,5 @@ pub mod layout;
 pub mod profile;
 pub mod type_validation;
 pub mod vec;
+
+pub mod metadata_materialization;

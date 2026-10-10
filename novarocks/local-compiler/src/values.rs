@@ -20,9 +20,7 @@
 //! evaluator runs at runtime; nothing is evaluated or folded here. This is not
 //! an expression evaluator or an opaque Arrow memory grant.
 
-use crate::{
-    assert_rows::reserve_vec, expressions::LoweredExpressions, lowering::FragmentCompileError,
-};
+use crate::{assert_rows::reserve_vec, expressions::LoweredExpressions, lowering::FragmentCompileError};
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::{
@@ -36,9 +34,7 @@ use novarocks_functions::{
 use novarocks_local_program::{
     ProgramExprId, ProgramNodeKind, StaticExprKind, StaticLayout, StaticValues, StaticValuesCell,
 };
-use novarocks_physical_plan::{
-    ExprId, ExprKind, ExpressionRootRole, FragmentPackage, PhysicalNode,
-};
+use novarocks_physical_plan::{ExprId, ExprKind, ExpressionRootRole, FragmentPackage, PhysicalNode};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ExpressionUseId, PureCompileControl,
     ValueTypeVisit, validate_arrow_carrier_parameters_observed,
@@ -262,7 +258,17 @@ fn lower_core(
     }
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
-    reserve_vec(&mut fields, slots.len(), work)?;
+    if package.original_metadata_namespace().is_none() {
+        reserve_vec(&mut fields, slots.len(), work)?;
+    }
+    let mut original_fields = match package.original_metadata_namespace() {
+        Some(_) => {
+            let mut original_fields = Vec::new();
+            reserve_vec(&mut original_fields, slots.len(), work)?;
+            Some(original_fields)
+        }
+        None => None,
+    };
     reserve_vec(&mut columns, slots.len(), work)?;
     for (ordinal, output) in node.output.columns.iter().enumerate() {
         let ty = &package
@@ -284,9 +290,15 @@ fn lower_core(
         } else {
             format!("local_values_{}_{}", node.id.get(), ordinal)
         };
-        let field = ty.try_to_field(name);
-        work.flush()?;
-        fields.push(field?);
+        if let Some(original_fields) = original_fields.as_mut() {
+            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
+            work.flush()?;
+            original_fields.push(field?);
+        } else {
+            let field = ty.try_to_field(name);
+            work.flush()?;
+            fields.push(field?);
+        }
         let column = if constant_cells[ordinal] == 0 {
             // The sole Arrow empty constructor follows the admitted type. Its
             // internal type walk/allocation remains opaque, not a MEM grant.
@@ -371,11 +383,21 @@ fn lower_core(
         work.step()?;
     }
     work.flush()?;
-    let layout = StaticLayout::try_new_for_compile(
-        Arc::new(Schema::new(fields)),
-        Arc::from(slots),
-        work.control(),
-    )?;
+    let layout = match (original_fields, package.original_metadata_namespace()) {
+        (Some(fields), Some(namespace)) => {
+            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
+            StaticLayout::try_new_materialized_for_compile(
+                source,
+                Arc::from(slots),
+                work.control(),
+            )?
+        }
+        _ => StaticLayout::try_new_for_compile(
+            Arc::new(Schema::new(fields)),
+            Arc::from(slots),
+            work.control(),
+        )?,
+    };
     work.flush()?;
     if !dynamic.is_empty() {
         let values = StaticValues::try_new_with_cells_for_compile(

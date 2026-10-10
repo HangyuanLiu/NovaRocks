@@ -28,13 +28,14 @@ use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConnectorReadPublicFacts {
     source: ConnectorReadStaticFacts<ScanColumnId>,
     metadata_kind: Option<ConnectorReadMetadataKind>,
     schema: Arc<Schema>,
     logical_types: Arc<[ValueLogicalType]>,
     charged_bytes: usize,
+    metadata_materializations: Option<novarocks_type_contract::owned_resources::metadata_materialization::SchemaMetadataMaterializations>,
 }
 impl PartialEq for ConnectorReadPublicFacts {
     fn eq(&self, other: &Self) -> bool {
@@ -76,6 +77,29 @@ impl ConnectorReadPublicFacts {
     ) -> Result<Self, PureProviderCompileError<ConnectorError>> {
         let mut context = ObservedCopy::new(source_retained_bytes, admit, work)?;
         Self::try_new_core(source, metadata_kind, schema, logical_types, &mut context)
+    }
+
+    /// Optional source receipts follow the SAME original count/materialize
+    /// body. They add no schema validity law or live execution capability.
+    pub fn try_new_from_borrowed_schema_with_materializations_observed(
+        source: ConnectorReadStaticFacts<ScanColumnId>,
+        metadata_kind: Option<ConnectorReadMetadataKind>,
+        schema: &Schema,
+        logical_types: Vec<ValueLogicalType>,
+        source_retained_bytes: usize,
+        admit: &mut impl FnMut(&WriterOwnedResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PureProviderCompileError<ConnectorError>> {
+        let mut original = ObservedCopy::new(source_retained_bytes, admit, work)?;
+        let mut context =
+            crate::metadata_materialization_copy::MetadataMaterializationCopy::new(&mut original);
+        let mut value =
+            Self::try_new_core(source, metadata_kind, schema, logical_types, &mut context)?;
+        value.metadata_materializations = Some(context.finish()?);
+        Ok(value)
+    }
+    pub fn metadata_materializations(&self) -> Option<&novarocks_type_contract::owned_resources::metadata_materialization::SchemaMetadataMaterializations>{
+        self.metadata_materializations.as_ref()
     }
 
     fn try_new_core<O: OwnedCopy>(
@@ -217,6 +241,7 @@ impl ConnectorReadPublicFacts {
             schema,
             logical_types,
             charged_bytes: budget.bytes,
+            metadata_materializations: None,
         })
     }
 
@@ -844,3 +869,15 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "read_public/owned_tests.rs"]
 mod owned_tests;
+
+impl std::fmt::Debug for ConnectorReadPublicFacts {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("ConnectorReadPublicFacts")
+            .field("source", &self.source)
+            .field("metadata_kind", &self.metadata_kind)
+            .field("schema", &self.schema)
+            .field("logical_types", &self.logical_types)
+            .field("charged_bytes", &self.charged_bytes)
+            .finish()
+    }
+}

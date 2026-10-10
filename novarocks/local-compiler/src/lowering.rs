@@ -1076,393 +1076,418 @@ fn lower(
         local_ids.insert(source, id);
         let source_id = DiagnosticSourceNodeId::new(source.get());
         allowed.insert(source_id);
-        let (kind, layout) =
-            match &node.kind {
-                NodeKind::Values { .. } => {
-                    work.flush()?;
-                    lower_values(package, node, &expressions, &planned.slots, work.control())?
-                }
-                NodeKind::ExchangeSource { .. } => {
-                    work.flush()?;
-                    let lowered = lower_exchange_source(
-                        package,
-                        node,
-                        &planned.slots,
-                        options.exchange_wait,
-                        work.control(),
-                    )?;
-                    source_requirements.push(BindingRequirement::ExchangeInput {
-                        node: id,
-                        layout: lowered.layout.clone(),
-                    });
-                    exchange_inputs.insert(id, lowered.input);
-                    (lowered.kind, lowered.layout)
-                }
-                NodeKind::Scan { .. } => {
-                    let recipe = reads.remove(&source).ok_or(FragmentCompileError::Invalid(
-                        "missing provider read recipe",
-                    ))?;
-                    let filters = runtime_filters.take_scan(
-                        source,
-                        id,
-                        expressions.runtime_filter_key_ids.get(&source),
-                        work,
-                    )?;
-                    work.flush()?;
-                    let lowered = lower_scan(
-                        node,
-                        id,
-                        recipe,
-                        filters.filters,
-                        &planned.slots,
-                        &expressions.ids,
-                        work.control(),
-                    )?;
-                    source_requirements.push(lowered.requirement);
-                    source_requirements.extend(filters.requirements);
-                    filter_roots.extend(filters.roots);
-                    scan_inputs.insert(id, lowered.input);
-                    scan_layouts.insert(id);
-                    (lowered.kind, lowered.layout)
-                }
-                NodeKind::Sort { .. } => {
-                    let child = *local_ids
+        let (kind, layout) = match &node.kind {
+            NodeKind::Values { .. } => {
+                work.flush()?;
+                lower_values(package, node, &expressions, &planned.slots, work.control())?
+            }
+            NodeKind::ExchangeSource { .. } => {
+                work.flush()?;
+                let lowered = lower_exchange_source(
+                    package,
+                    node,
+                    &planned.slots,
+                    options.exchange_wait,
+                    work.control(),
+                )?;
+                source_requirements.push(BindingRequirement::ExchangeInput {
+                    node: id,
+                    layout: lowered.layout.clone(),
+                });
+                exchange_inputs.insert(id, lowered.input);
+                (lowered.kind, lowered.layout)
+            }
+            NodeKind::Scan { .. } => {
+                let recipe = reads.remove(&source).ok_or(FragmentCompileError::Invalid(
+                    "missing provider read recipe",
+                ))?;
+                let filters = runtime_filters.take_scan(
+                    source,
+                    id,
+                    expressions.runtime_filter_key_ids.get(&source),
+                    work,
+                )?;
+                work.flush()?;
+                let lowered = lower_scan(
+                    node,
+                    id,
+                    recipe,
+                    filters.filters,
+                    &planned.slots,
+                    &expressions.ids,
+                    work.control(),
+                )?;
+                source_requirements.push(lowered.requirement);
+                source_requirements.extend(filters.requirements);
+                filter_roots.extend(filters.roots);
+                scan_inputs.insert(id, lowered.input);
+                scan_layouts.insert(id);
+                (lowered.kind, lowered.layout)
+            }
+            NodeKind::Sort { .. } => {
+                let child = *local_ids
+                    .get(&node.inputs[0])
+                    .ok_or(FragmentCompileError::Invalid("missing lowered sort child"))?;
+                work.flush()?;
+                lower_sort(
+                    node,
+                    child,
+                    nodes[child.index()].output_layout(),
+                    &expressions.ids,
+                    work.control(),
+                )?
+            }
+            NodeKind::Window(_) => {
+                let child =
+                    *local_ids
                         .get(&node.inputs[0])
-                        .ok_or(FragmentCompileError::Invalid("missing lowered sort child"))?;
-                    work.flush()?;
-                    lower_sort(
-                        node,
-                        child,
-                        nodes[child.index()].output_layout(),
-                        &expressions.ids,
-                        work.control(),
-                    )?
-                }
-                NodeKind::Window(_) => {
-                    let child =
-                        *local_ids
-                            .get(&node.inputs[0])
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered window child",
-                            ))?;
-                    work.flush()?;
-                    crate::window::lower_window(
-                        package,
-                        node,
-                        child,
-                        nodes[child.index()].output_layout(),
-                        &expressions.ids,
-                        &planned.slots,
-                        work.control(),
-                    )?
-                }
-                NodeKind::Aggregate { .. } => {
-                    let child =
-                        *local_ids
-                            .get(&node.inputs[0])
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered aggregate child",
-                            ))?;
-                    work.flush()?;
-                    let lowered = lower_aggregate(
-                        package,
-                        node,
-                        child,
-                        &expressions.ids,
-                        &planned.slots,
-                        work.control(),
-                    )?;
-                    aggregates.insert(id, lowered.fact);
-                    (lowered.kind, lowered.layout)
-                }
-                NodeKind::TopN { .. } => {
-                    let child = *local_ids
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered window child",
+                        ))?;
+                work.flush()?;
+                crate::window::lower_window(
+                    package,
+                    node,
+                    child,
+                    nodes[child.index()].output_layout(),
+                    &expressions.ids,
+                    &planned.slots,
+                    work.control(),
+                )?
+            }
+            NodeKind::Aggregate { .. } => {
+                let child =
+                    *local_ids
                         .get(&node.inputs[0])
-                        .ok_or(FragmentCompileError::Invalid("missing lowered TopN child"))?;
-                    work.flush()?;
-                    lower_topn(
-                        node,
-                        child,
-                        nodes[child.index()].output_layout(),
-                        &expressions.ids,
-                        work.control(),
-                    )?
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered aggregate child",
+                        ))?;
+                work.flush()?;
+                let lowered = lower_aggregate(
+                    package,
+                    node,
+                    child,
+                    &expressions.ids,
+                    &planned.slots,
+                    work.control(),
+                )?;
+                aggregates.insert(id, lowered.fact);
+                (lowered.kind, lowered.layout)
+            }
+            NodeKind::TopN { .. } => {
+                let child = *local_ids
+                    .get(&node.inputs[0])
+                    .ok_or(FragmentCompileError::Invalid("missing lowered TopN child"))?;
+                work.flush()?;
+                lower_topn(
+                    node,
+                    child,
+                    nodes[child.index()].output_layout(),
+                    &expressions.ids,
+                    work.control(),
+                )?
+            }
+            NodeKind::Filter { predicates } => {
+                let child = *local_ids
+                    .get(&node.inputs[0])
+                    .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
+                let mut local_predicates = Vec::with_capacity(predicates.len());
+                for predicate in predicates {
+                    local_predicates.push(*expressions.ids.get(predicate).ok_or(
+                        FragmentCompileError::Invalid("missing predicate definition"),
+                    )?);
+                    work.step()?;
                 }
-                NodeKind::Filter { predicates } => {
-                    let child = *local_ids
+                work.flush()?;
+                let local_predicates = local_predicates.into_boxed_slice();
+                work.flush()?;
+                (
+                    ProgramNodeKind::Filter {
+                        input: child,
+                        predicates: local_predicates,
+                    },
+                    nodes[child.index()].output_layout().clone(),
+                )
+            }
+            NodeKind::Limit { limit, offset } => {
+                let child = *local_ids
+                    .get(&node.inputs[0])
+                    .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
+                let limit = limit
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| FragmentCompileError::Invalid("limit exceeds host range"))?;
+                let offset = usize::try_from(*offset)
+                    .map_err(|_| FragmentCompileError::Invalid("offset exceeds host range"))?;
+                (
+                    ProgramNodeKind::Limit {
+                        input: child,
+                        limit,
+                        offset,
+                    },
+                    nodes[child.index()].output_layout().clone(),
+                )
+            }
+            NodeKind::Unpivot { .. } => {
+                let child =
+                    *local_ids
                         .get(&node.inputs[0])
-                        .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
-                    let mut local_predicates = Vec::with_capacity(predicates.len());
-                    for predicate in predicates {
-                        local_predicates.push(*expressions.ids.get(predicate).ok_or(
-                            FragmentCompileError::Invalid("missing predicate definition"),
-                        )?);
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered Unpivot child",
+                        ))?;
+                let sources = channels_plan.unpivot_sources.get(&source).ok_or(
+                    FragmentCompileError::Invalid("missing planned Unpivot input sources"),
+                )?;
+                work.flush()?;
+                lower_unpivot(
+                    package,
+                    node,
+                    id,
+                    UnpivotLoweringInput {
+                        node: child,
+                        layout: nodes[child.index()].output_layout(),
+                        sources,
+                        expressions: &expressions.ids,
+                    },
+                    &planned.slots,
+                    work.control(),
+                )?
+            }
+            NodeKind::ChangeEventExpand { .. } => {
+                let child =
+                    *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered change-event child",
+                        ))?;
+                work.flush()?;
+                lower_change_events(
+                    package,
+                    node,
+                    id,
+                    child,
+                    &planned.slots,
+                    &expressions.ids,
+                    work.control(),
+                )?
+            }
+            NodeKind::AssertOneRow(_) => {
+                let child =
+                    *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered assertion child",
+                        ))?;
+                let keys = channels_plan.assertion_keys.get(&source).ok_or(
+                    FragmentCompileError::Invalid("missing planned assertion keys"),
+                )?;
+                work.flush()?;
+                lower_assert_rows(
+                    node,
+                    child,
+                    nodes[child.index()].output_layout(),
+                    keys,
+                    work.control(),
+                )?
+            }
+            NodeKind::Repeat { .. } => {
+                let child =
+                    *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered Repeat child",
+                        ))?;
+                work.flush()?;
+                lower_repeat(
+                    package,
+                    node,
+                    id,
+                    (child, nodes[child.index()].output_layout()),
+                    &planned.slots,
+                    work.control(),
+                )?
+            }
+            NodeKind::Project {
+                expressions: projected,
+            } => {
+                let child = *local_ids
+                    .get(&node.inputs[0])
+                    .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
+                let mut fields = Vec::new();
+                let mut original_fields = package.original_metadata_namespace().map(|_| Vec::new());
+                let mut slots = Vec::new();
+                let mut exprs = Vec::new();
+                let mut is_result_output = result
+                    .is_some_and(|result| node.output.columns.len() == result.output.columns.len());
+                if let Some(result) = result.filter(|_| is_result_output) {
+                    for (actual, expected) in node.output.columns.iter().zip(&result.output.columns)
+                    {
                         work.step()?;
-                    }
-                    work.flush()?;
-                    let local_predicates = local_predicates.into_boxed_slice();
-                    work.flush()?;
-                    (
-                        ProgramNodeKind::Filter {
-                            input: child,
-                            predicates: local_predicates,
-                        },
-                        nodes[child.index()].output_layout().clone(),
-                    )
-                }
-                NodeKind::Limit { limit, offset } => {
-                    let child = *local_ids
-                        .get(&node.inputs[0])
-                        .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
-                    let limit = limit
-                        .map(usize::try_from)
-                        .transpose()
-                        .map_err(|_| FragmentCompileError::Invalid("limit exceeds host range"))?;
-                    let offset = usize::try_from(*offset)
-                        .map_err(|_| FragmentCompileError::Invalid("offset exceeds host range"))?;
-                    (
-                        ProgramNodeKind::Limit {
-                            input: child,
-                            limit,
-                            offset,
-                        },
-                        nodes[child.index()].output_layout().clone(),
-                    )
-                }
-                NodeKind::Unpivot { .. } => {
-                    let child =
-                        *local_ids
-                            .get(&node.inputs[0])
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered Unpivot child",
-                            ))?;
-                    let sources = channels_plan.unpivot_sources.get(&source).ok_or(
-                        FragmentCompileError::Invalid("missing planned Unpivot input sources"),
-                    )?;
-                    work.flush()?;
-                    lower_unpivot(
-                        package,
-                        node,
-                        id,
-                        UnpivotLoweringInput {
-                            node: child,
-                            layout: nodes[child.index()].output_layout(),
-                            sources,
-                            expressions: &expressions.ids,
-                        },
-                        &planned.slots,
-                        work.control(),
-                    )?
-                }
-                NodeKind::ChangeEventExpand { .. } => {
-                    let child =
-                        *local_ids
-                            .get(&node.inputs[0])
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered change-event child",
-                            ))?;
-                    work.flush()?;
-                    lower_change_events(
-                        package,
-                        node,
-                        id,
-                        child,
-                        &planned.slots,
-                        &expressions.ids,
-                        work.control(),
-                    )?
-                }
-                NodeKind::AssertOneRow(_) => {
-                    let child =
-                        *local_ids
-                            .get(&node.inputs[0])
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered assertion child",
-                            ))?;
-                    let keys = channels_plan.assertion_keys.get(&source).ok_or(
-                        FragmentCompileError::Invalid("missing planned assertion keys"),
-                    )?;
-                    work.flush()?;
-                    lower_assert_rows(
-                        node,
-                        child,
-                        nodes[child.index()].output_layout(),
-                        keys,
-                        work.control(),
-                    )?
-                }
-                NodeKind::Repeat { .. } => {
-                    let child =
-                        *local_ids
-                            .get(&node.inputs[0])
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered Repeat child",
-                            ))?;
-                    work.flush()?;
-                    lower_repeat(
-                        package,
-                        node,
-                        id,
-                        (child, nodes[child.index()].output_layout()),
-                        &planned.slots,
-                        work.control(),
-                    )?
-                }
-                NodeKind::Project {
-                    expressions: projected,
-                } => {
-                    let child = *local_ids
-                        .get(&node.inputs[0])
-                        .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
-                    let mut fields = Vec::new();
-                    let mut slots = Vec::new();
-                    let mut exprs = Vec::new();
-                    let mut is_result_output = result.is_some_and(|result| {
-                        node.output.columns.len() == result.output.columns.len()
-                    });
-                    if let Some(result) = result.filter(|_| is_result_output) {
-                        for (actual, expected) in
-                            node.output.columns.iter().zip(&result.output.columns)
-                        {
-                            work.step()?;
-                            if actual != expected {
-                                is_result_output = false;
-                                break;
-                            }
+                        if actual != expected {
+                            is_result_output = false;
+                            break;
                         }
                     }
-                    for (ordinal, (expr, value)) in projected.iter().enumerate() {
-                        work.step()?;
-                        let definition = physical.expressions().get(*expr).ok_or(
-                            FragmentCompileError::Invalid("missing projection definition"),
-                        )?;
-                        let value_type = &physical
-                            .values()
-                            .get(value)
-                            .ok_or(FragmentCompileError::Invalid("missing projection value"))?
-                            .ty;
-                        work.flush()?;
-                        if !definition
-                            .ty
-                            .exactly_equals_observed::<FragmentCompileError>(value_type, || {
-                                work.step().map_err(Into::into)
-                            })?
-                        {
-                            return Err(FragmentCompileError::Invalid(
-                                "projection output type differs from definition",
-                            ));
-                        }
-                        // Full result labels are authoritative only when the entire
-                        // ordered output matches, including repeated occurrences.
-                        let name = if is_result_output {
-                            let field = result
-                                .and_then(|result| result.fields.get(ordinal))
-                                .ok_or(FragmentCompileError::Invalid("missing result field"))?;
-                            field.alias.as_deref().unwrap_or(&field.name).to_string()
-                        } else {
-                            format!("local_{}_{}", id.index(), ordinal)
-                        };
+                }
+                for (ordinal, (expr, value)) in projected.iter().enumerate() {
+                    work.step()?;
+                    let definition =
+                        physical
+                            .expressions()
+                            .get(*expr)
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing projection definition",
+                            ))?;
+                    let value_type = &physical
+                        .values()
+                        .get(value)
+                        .ok_or(FragmentCompileError::Invalid("missing projection value"))?
+                        .ty;
+                    work.flush()?;
+                    if !definition
+                        .ty
+                        .exactly_equals_observed::<FragmentCompileError>(value_type, || {
+                            work.step().map_err(Into::into)
+                        })?
+                    {
+                        return Err(FragmentCompileError::Invalid(
+                            "projection output type differs from definition",
+                        ));
+                    }
+                    // Full result labels are authoritative only when the entire
+                    // ordered output matches, including repeated occurrences.
+                    let name = if is_result_output {
+                        let field = result
+                            .and_then(|result| result.fields.get(ordinal))
+                            .ok_or(FragmentCompileError::Invalid("missing result field"))?;
+                        field.alias.as_deref().unwrap_or(&field.name).to_string()
+                    } else {
+                        format!("local_{}_{}", id.index(), ordinal)
+                    };
+                    if let Some(original_fields) = original_fields.as_mut() {
+                        original_fields.push(novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(value_type, name).map_err(|error| {
+                                FragmentCompileError::Owner {
+                                    phase: "projection field",
+                                    error: Box::new(error),
+                                }
+                            })?);
+                    } else {
                         fields.push(value_type.try_to_field(name).map_err(|error| {
                             FragmentCompileError::Owner {
                                 phase: "projection field",
                                 error: Box::new(error),
                             }
                         })?);
-                        work.flush()?;
-                        slots.push(*planned.slots.get(ordinal).ok_or(
-                            FragmentCompileError::Invalid("missing planned output occurrence"),
-                        )?);
-                        exprs.push(*expressions.ids.get(expr).ok_or(
-                            FragmentCompileError::Invalid("missing projection expression"),
-                        )?);
                     }
                     work.flush()?;
-                    let layout = StaticLayout::try_new_for_compile(
+                    slots.push(*planned.slots.get(ordinal).ok_or(
+                        FragmentCompileError::Invalid("missing planned output occurrence"),
+                    )?);
+                    exprs.push(
+                        *expressions
+                            .ids
+                            .get(expr)
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing projection expression",
+                            ))?,
+                    );
+                }
+                work.flush()?;
+                let layout = match (original_fields, package.original_metadata_namespace()) {
+                    (Some(fields), Some(namespace)) => {
+                        let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
+                        StaticLayout::try_new_materialized_for_compile(
+                            source,
+                            Arc::from(slots),
+                            work.control(),
+                        )?
+                    }
+                    _ => StaticLayout::try_new_for_compile(
                         Arc::new(Schema::new(fields)),
                         Arc::from(slots),
                         work.control(),
-                    )?;
-                    (
-                        ProgramNodeKind::Project {
-                            input: child,
-                            is_subordinate: false,
-                            exprs,
-                            expr_slot_ids: layout.slots().to_vec(),
-                            expr_slot_schemas: None,
-                            output_indices: None,
-                        },
-                        layout,
-                    )
-                }
-                NodeKind::TableWriter { .. } => {
-                    let child_source = node.inputs[0];
-                    let child =
-                        *local_ids
-                            .get(&child_source)
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered table writer child",
-                            ))?;
-                    let recipe = writes.remove(&source).ok_or(FragmentCompileError::Invalid(
-                        "missing provider write recipe",
+                    )?,
+                };
+                (
+                    ProgramNodeKind::Project {
+                        input: child,
+                        is_subordinate: false,
+                        exprs,
+                        expr_slot_ids: layout.slots().to_vec(),
+                        expr_slot_schemas: None,
+                        output_indices: None,
+                    },
+                    layout,
+                )
+            }
+            NodeKind::TableWriter { .. } => {
+                let child_source = node.inputs[0];
+                let child = *local_ids
+                    .get(&child_source)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing lowered table writer child",
                     ))?;
-                    let projection_slots = channels_plan.writer_projections.get(&source).ok_or(
-                        FragmentCompileError::Invalid("missing planned writer projection"),
-                    )?;
-                    work.flush()?;
-                    let lowered = crate::writer::lower_writer(
-                        package,
-                        node,
-                        id,
-                        &recipe,
-                        crate::writer::WriterLoweringInput {
-                            child,
-                            child_node: &physical.nodes()[&child_source],
-                            child_layout: nodes[child.index()].output_layout(),
-                            output_slots: &planned.slots,
-                            projection_slots,
-                        },
-                        work.control(),
-                    )?;
-                    source_requirements.push(lowered.requirement);
-                    channels.extend(lowered.channels);
-                    writer_flows.push(lowered.flow);
-                    program_writes.insert(id, recipe);
-                    (lowered.kind, lowered.layout)
-                }
-                NodeKind::TableFinish(_) => {
-                    let child =
-                        *local_ids
-                            .get(&node.inputs[0])
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing lowered table finish child",
-                            ))?;
-                    let statistics_slots = channels_plan.finish_statistics.get(&source).ok_or(
-                        FragmentCompileError::Invalid("missing planned finish statistics"),
-                    )?;
-                    work.flush()?;
-                    let lowered = crate::writer::lower_finish(
-                        package,
-                        node,
-                        id,
-                        crate::writer::FinishLoweringInput {
-                            child,
-                            child_layout: nodes[child.index()].output_layout(),
-                            slots: &planned.slots,
-                            statistics_slots,
-                            expressions: &expressions.ids,
-                        },
-                        work.control(),
-                    )?;
-                    source_requirements.push(lowered.requirement);
-                    channels.extend(lowered.channels);
-                    (lowered.kind, lowered.layout)
-                }
-                _ => {
-                    return Err(FragmentCompileError::Invalid(
-                        "validated node family changed",
-                    ));
-                }
-            };
+                let recipe = writes.remove(&source).ok_or(FragmentCompileError::Invalid(
+                    "missing provider write recipe",
+                ))?;
+                let projection_slots = channels_plan.writer_projections.get(&source).ok_or(
+                    FragmentCompileError::Invalid("missing planned writer projection"),
+                )?;
+                work.flush()?;
+                let lowered = crate::writer::lower_writer(
+                    package,
+                    node,
+                    id,
+                    &recipe,
+                    crate::writer::WriterLoweringInput {
+                        child,
+                        child_node: &physical.nodes()[&child_source],
+                        child_layout: nodes[child.index()].output_layout(),
+                        output_slots: &planned.slots,
+                        projection_slots,
+                    },
+                    work.control(),
+                )?;
+                source_requirements.push(lowered.requirement);
+                channels.extend(lowered.channels);
+                writer_flows.push(lowered.flow);
+                program_writes.insert(id, recipe);
+                (lowered.kind, lowered.layout)
+            }
+            NodeKind::TableFinish(_) => {
+                let child =
+                    *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered table finish child",
+                        ))?;
+                let statistics_slots = channels_plan.finish_statistics.get(&source).ok_or(
+                    FragmentCompileError::Invalid("missing planned finish statistics"),
+                )?;
+                work.flush()?;
+                let lowered = crate::writer::lower_finish(
+                    package,
+                    node,
+                    id,
+                    crate::writer::FinishLoweringInput {
+                        child,
+                        child_layout: nodes[child.index()].output_layout(),
+                        slots: &planned.slots,
+                        statistics_slots,
+                        expressions: &expressions.ids,
+                    },
+                    work.control(),
+                )?;
+                source_requirements.push(lowered.requirement);
+                channels.extend(lowered.channels);
+                (lowered.kind, lowered.layout)
+            }
+            _ => {
+                return Err(FragmentCompileError::Invalid(
+                    "validated node family changed",
+                ));
+            }
+        };
         for (actual, expected) in layout.slots().iter().zip(planned.slots.iter()) {
             work.step()?;
             if actual != expected {

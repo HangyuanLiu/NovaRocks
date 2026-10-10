@@ -20,6 +20,9 @@ use crate::owned_copy::PlainCopy;
 use crate::{ConnectorError, ConnectorErrorKind, owned_copy::OwnedCopy};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::owned_resources::{hashmap, layout};
+use novarocks_type_contract::owned_resources::metadata_materialization::{
+    MaterializedField, MaterializedMetadataMap,
+};
 use std::{alloc::Layout, collections::HashMap, sync::Arc};
 
 fn absent() -> ConnectorError {
@@ -54,6 +57,14 @@ pub(crate) fn owned_field_core<O: OwnedCopy>(
     field: &Field,
     context: &mut O,
 ) -> Result<Option<Field>, O::Error> {
+    owned_field_materialization_core(field, context)
+        .map(|value| value.map(MaterializedField::into_original_field))
+}
+
+pub(crate) fn owned_field_materialization_core<O: OwnedCopy>(
+    field: &Field,
+    context: &mut O,
+) -> Result<Option<MaterializedField>, O::Error> {
     let base = context.add(size_of::<Field>(), field.name().capacity())?;
     let base = context.add(
         base,
@@ -75,14 +86,13 @@ pub(crate) fn owned_field_core<O: OwnedCopy>(
     // Preserve physical dictionary identity/order, omitted by ordinary Field
     // equality and Field::new. The existing constructor remains the author.
     #[allow(deprecated)]
-    let copied = Field::new_dict(
+    let copied = metadata.into_field(Field::new_dict(
         name,
         data_type,
         field.is_nullable(),
         field.dict_id().unwrap_or(0),
         field.dict_is_ordered().unwrap_or(false),
-    )
-    .with_metadata(metadata);
+    ));
     context.step()?;
     context.flush()?;
     Ok(Some(copied))
@@ -94,7 +104,7 @@ fn owned_metadata_core<O: OwnedCopy>(
     base: usize,
     prefunded_buckets: Option<usize>,
     context: &mut O,
-) -> Result<Option<HashMap<String, String>>, O::Error> {
+) -> Result<Option<MaterializedMetadataMap>, O::Error> {
     let entries = source.len();
     let buckets = if let Some(buckets) = prefunded_buckets {
         buckets
@@ -108,8 +118,8 @@ fn owned_metadata_core<O: OwnedCopy>(
     context.metadata_iteration(entries, 2)?;
     let mut metadata = if context.materializes() {
         context.flush()?;
-        let mut map = HashMap::new();
-        let result = map.try_reserve(entries);
+        let mut map = MaterializedMetadataMap::new_for_original_reserve();
+        let result = map.try_reserve_original(entries);
         context.reserve_exit(result)?;
         Some(map)
     } else {
@@ -203,10 +213,11 @@ pub(crate) fn owned_schema_core<O: OwnedCopy>(
     let fields: arrow_schema::Fields = fields.into();
     context.step()?;
     context.flush()?;
-    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    let schema = metadata.into_schema(fields).into_shared();
     context.step()?;
     context.flush()?;
-    Ok(Some(schema))
+    context.materialized_schema(&schema)?;
+    Ok(Some(schema.into_original_schema_ref()))
 }
 
 fn owned_arc_field<O: OwnedCopy>(
@@ -217,16 +228,18 @@ fn owned_arc_field<O: OwnedCopy>(
     let minimum = layout::arc_layout(Layout::new::<Field>()).map_err(|_| context.arithmetic())?;
     context.source_floor(minimum.size())?;
     context.work(128)?;
-    let field = owned_field_core(field, context)?;
+    context.prepare_field_materialization()?;
+    let field = owned_field_materialization_core(field, context)?;
     if !context.materializes() {
         return Ok(None);
     }
     let field = present(field, context)?;
     context.flush()?;
-    let field = Arc::new(field);
+    let field = field.into_shared();
     context.step()?;
     context.flush()?;
-    Ok(Some(field))
+    context.materialized_field(&field)?;
+    Ok(Some(field.into_original_field_ref()))
 }
 
 fn union_requests<O: OwnedCopy>(count: usize, context: &mut O) -> Result<(), O::Error> {

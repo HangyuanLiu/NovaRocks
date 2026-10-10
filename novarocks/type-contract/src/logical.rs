@@ -210,6 +210,32 @@ pub fn validate_value_type_structure_with_scratch_observed<'a, E: From<ValueType
 
 fn validate_value_type_structure_with_pending<'a, E: From<ValueTypeError>>(
     pending: &mut impl TypePending<'a>,
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    visit_value_type_with_pending(pending, false, observe)
+}
+
+/// Borrow the owned edges of the original derived DataType::clone. All FieldRef,
+/// Fields, UnionFields and timezone Arc occurrences are shared; only Dictionary
+/// Box children recurse. The same pending scratch and source matcher below own
+/// the traversal. This numerical loan performs no clone or allocation grant.
+/// The caller owns scratch initialization before borrowing this entrypoint.
+pub fn visit_original_data_type_clone_with_scratch_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    scratch: &mut [Option<(&'a DataType, usize)>; MAX_VALUE_TYPE_NODES],
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut pending = BorrowedTypePending {
+        slots: scratch,
+        len: 0,
+    };
+    pending.push((root, 1));
+    visit_value_type_with_pending(&mut pending, true, observe)
+}
+
+fn visit_value_type_with_pending<'a, E: From<ValueTypeError>>(
+    pending: &mut impl TypePending<'a>,
+    original_owned_clone: bool,
     mut observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut visited = 0usize;
@@ -234,6 +260,15 @@ fn validate_value_type_structure_with_pending<'a, E: From<ValueTypeError>>(
             pending.push((child, depth + 1));
             Ok(())
         };
+        if original_owned_clone {
+            // Derived clone copies the Dictionary's two Box<DataType> values.
+            // Every other carrier's descendants are behind shared Arc owners.
+            if let DataType::Dictionary(key, value) = ty {
+                push(key, None)?;
+                push(value, None)?;
+            }
+            continue;
+        }
         match ty {
             DataType::List(field)
             | DataType::LargeList(field)

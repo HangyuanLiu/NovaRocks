@@ -75,7 +75,17 @@ fn lower_core(
     let mut addresses = BTreeMap::new();
     let mut effect_slot = None;
     reserve_vec(&mut output_slots, slots.len(), work)?;
-    reserve_vec(&mut fields, slots.len(), work)?;
+    if package.original_metadata_namespace().is_none() {
+        reserve_vec(&mut fields, slots.len(), work)?;
+    }
+    let mut original_fields = match package.original_metadata_namespace() {
+        Some(_) => {
+            let mut original_fields = Vec::new();
+            reserve_vec(&mut original_fields, slots.len(), work)?;
+            Some(original_fields)
+        }
+        None => None,
+    };
     let result_port = package.result().filter(|r| r.output == node.output);
     for (ordinal, (&value, &slot)) in node.output.columns.iter().zip(slots).enumerate() {
         let fresh = addresses.insert(value, slot).is_none();
@@ -111,9 +121,15 @@ fn lower_core(
             None => format!("local_{}_{}", local.index(), ordinal),
         };
         work.flush()?;
-        let field = ty.try_to_field(name)?;
-        work.flush()?;
-        fields.push(field);
+        if let Some(original_fields) = original_fields.as_mut() {
+            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name)?;
+            work.flush()?;
+            original_fields.push(field);
+        } else {
+            let field = ty.try_to_field(name)?;
+            work.flush()?;
+            fields.push(field);
+        }
         output_slots.push(slot);
         work.step()?;
     }
@@ -160,10 +176,25 @@ fn lower_core(
         work.step()?;
     }
     work.flush()?;
-    let schema = Arc::new(Schema::new(fields));
+    let materialized = match (original_fields, package.original_metadata_namespace()) {
+        (Some(fields), Some(namespace)) => Some(novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema()),
+        _ => None,
+    };
+    let schema = if let Some(source) = &materialized {
+        source.schema_owner().schema().clone()
+    } else {
+        Arc::new(Schema::new(fields))
+    };
     let output_layout_slots: Arc<[SlotId]> = Arc::from(slots);
     work.flush()?;
-    let layout = StaticLayout::try_new_for_compile(schema, output_layout_slots, work.control())?;
+    let layout = match materialized {
+        Some(source) => StaticLayout::try_new_materialized_for_compile(
+            source,
+            output_layout_slots,
+            work.control(),
+        )?,
+        None => StaticLayout::try_new_for_compile(schema, output_layout_slots, work.control())?,
+    };
     Ok((
         ProgramNodeKind::ChangeEventExpand {
             input: child,

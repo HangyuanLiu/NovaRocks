@@ -22,15 +22,83 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_types::SlotId;
+use novarocks_type_contract::owned_resources::metadata_materialization::{
+    MaterializedMetadataMap, MetadataFieldLoan, OriginalFieldMaterialization,
+    OriginalMetadataClone, SchemaMetadataMaterializations,
+};
 use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ChunkFieldSchema {
     logical_type: Option<LogicalType>,
     children: Vec<ChunkFieldSchema>,
 }
 
+impl Clone for ChunkFieldSchema {
+    fn clone(&self) -> Self {
+        match self.clone_core(true, &mut |_| Ok::<(), std::convert::Infallible>(())) {
+            Ok(Some(value)) => value,
+            Ok(None) => unreachable!("original semantic clone materializes"),
+            Err(cause) => match cause {},
+        }
+    }
+}
+
+/// Requests of the original immutable semantic-child Vec clone. The same
+/// recursive clone body below owns both this borrowed numerical projection and
+/// materialization. No Field/DataType grammar, metadata map or grant is inferred.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChunkFieldSchemaCloneRequest {
+    pub allocation_requests: usize,
+    pub request_bytes: usize,
+}
 impl ChunkFieldSchema {
+    fn clone_core<E>(
+        &self,
+        materializes: bool,
+        observe: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Option<Self>, E> {
+        // The original derived Vec::clone allocates len elements, then clones
+        // them in source order. Copy of the Option<LogicalType> precedes it.
+        let logical_type = self.logical_type;
+        observe(self.children.len())?;
+        let mut children = materializes.then(|| Vec::with_capacity(self.children.len()));
+        for child in &self.children {
+            if let Some(value) = child.clone_core(materializes, observe)? {
+                children
+                    .as_mut()
+                    .expect("materializing semantic clone")
+                    .push(value);
+            }
+        }
+        Ok(children.map(|children| Self {
+            logical_type,
+            children,
+        }))
+    }
+    pub(crate) fn original_clone_request_observed<E: From<novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError>>(
+        &self,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<ChunkFieldSchemaCloneRequest, E>{
+        use novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError;
+        let mut request = ChunkFieldSchemaCloneRequest::default();
+        self.clone_core(false, &mut |count| {
+            let layout = std::alloc::Layout::array::<Self>(count)
+                .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))?;
+            if layout.size() != 0 {
+                request.allocation_requests = request
+                    .allocation_requests
+                    .checked_add(1)
+                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
+                request.request_bytes = request
+                    .request_bytes
+                    .checked_add(layout.size())
+                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
+            }
+            observe()
+        })?;
+        Ok(request)
+    }
     pub(crate) fn new(logical_type: Option<LogicalType>, children: Vec<Self>) -> Self {
         Self {
             logical_type,
@@ -117,7 +185,7 @@ impl ChunkFieldSchema {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ChunkSlotSchema {
     slot_id: SlotId,
-    field: Field,
+    field: OriginalFieldMaterialization,
     field_schema: ChunkFieldSchema,
     unique_id: Option<i32>,
 }
@@ -139,11 +207,25 @@ impl ChunkSlotSchema {
         field_schema: Option<ChunkFieldSchema>,
         unique_id: Option<i32>,
     ) -> Result<Self, String> {
+        Self::try_new_owned_field(
+            slot_id,
+            OriginalFieldMaterialization::Plain(field),
+            field_schema,
+            unique_id,
+        )
+    }
+
+    fn try_new_owned_field(
+        slot_id: SlotId,
+        field: OriginalFieldMaterialization,
+        field_schema: Option<ChunkFieldSchema>,
+        unique_id: Option<i32>,
+    ) -> Result<Self, String> {
         Ok(Self {
             slot_id,
             field_schema: match field_schema {
                 Some(schema) => schema,
-                None => ChunkFieldSchema::from_field(&field)?,
+                None => ChunkFieldSchema::from_field(field.field())?,
             },
             field,
             unique_id,
@@ -152,12 +234,12 @@ impl ChunkSlotSchema {
 
     /// Return a copy of this slot schema with nullable set to the given value.
     pub fn with_nullable(&self, nullable: bool) -> Self {
-        if self.field.is_nullable() == nullable {
+        if self.field.field().is_nullable() == nullable {
             return self.clone();
         }
         Self {
             slot_id: self.slot_id,
-            field: self.field.clone().with_nullable(nullable),
+            field: self.field.with_nullable_original(nullable),
             field_schema: self.field_schema.clone(),
             unique_id: self.unique_id,
         }
@@ -181,7 +263,7 @@ impl ChunkSlotSchema {
     }
 
     pub fn with_slot_id(&self, slot_id: SlotId) -> Result<Self, String> {
-        Self::try_new_with_field(
+        Self::try_new_owned_field(
             slot_id,
             self.field.clone(),
             Some(self.field_schema.clone()),
@@ -203,19 +285,19 @@ impl ChunkSlotSchema {
     }
 
     pub fn field(&self) -> &Field {
-        &self.field
+        self.field.field()
     }
 
     pub fn name(&self) -> &str {
-        self.field.name()
+        self.field.field().name()
     }
 
     pub fn nullable(&self) -> bool {
-        self.field.is_nullable()
+        self.field.field().is_nullable()
     }
 
     pub fn data_type(&self) -> &DataType {
-        self.field.data_type()
+        self.field.field().data_type()
     }
 
     pub fn unique_id(&self) -> Option<i32> {
@@ -227,12 +309,13 @@ impl ChunkSlotSchema {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ChunkSchema {
     slots: Vec<ChunkSlotSchema>,
     arrow_schema: SchemaRef,
     slot_ids: Vec<SlotId>,
     index_by_slot: HashMap<SlotId, usize>,
+    metadata_materializations: Option<SchemaMetadataMaterializations>,
 }
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
@@ -278,10 +361,20 @@ fn reconcile_chunk_field_to_data_type(
 }
 
 fn rebuild_chunk_field(expected: &Field, data_type: DataType, nullable: bool) -> Field {
-    Field::new(expected.name(), data_type, nullable).with_metadata(expected.metadata().clone())
+    novarocks_type_contract::owned_resources::metadata_materialization::rebuild_original_field(
+        expected, data_type, nullable,
+    )
 }
 
 fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<DataType, String> {
+    reconcile_chunk_data_type_core(expected, actual, &mut ReconcileMetadataSources::None)
+}
+
+fn reconcile_chunk_data_type_core(
+    expected: &DataType,
+    actual: &DataType,
+    sources: &mut ReconcileMetadataSources<'_>,
+) -> Result<DataType, String> {
     if expected == actual {
         return Ok(expected.clone());
     }
@@ -291,14 +384,18 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
     }
     match (expected, actual) {
         (DataType::List(expected_field), DataType::List(actual_field)) => Ok(DataType::List(
-            reconcile_nested_chunk_field(expected_field, actual_field)?,
+            reconcile_nested_chunk_field(expected_field, actual_field, sources)?,
         )),
-        (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => Ok(
-            DataType::LargeList(reconcile_nested_chunk_field(expected_field, actual_field)?),
-        ),
+        (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => {
+            Ok(DataType::LargeList(reconcile_nested_chunk_field(
+                expected_field,
+                actual_field,
+                sources,
+            )?))
+        }
         (DataType::Map(expected_field, expected_ordered), DataType::Map(actual_field, _)) => {
             Ok(DataType::Map(
-                reconcile_nested_chunk_field(expected_field, actual_field)?,
+                reconcile_nested_chunk_field(expected_field, actual_field, sources)?,
                 *expected_ordered,
             ))
         }
@@ -307,7 +404,7 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
                 .iter()
                 .zip(actual_fields.iter())
                 .map(|(expected_field, actual_field)| {
-                    reconcile_nested_chunk_field(expected_field, actual_field)
+                    reconcile_nested_chunk_field(expected_field, actual_field, sources)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(DataType::Struct(fields.into()))
@@ -319,13 +416,79 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
 fn reconcile_nested_chunk_field(
     expected: &Arc<Field>,
     actual: &Arc<Field>,
+    sources: &mut ReconcileMetadataSources<'_>,
 ) -> Result<Arc<Field>, String> {
-    let data_type = reconcile_chunk_data_type(expected.data_type(), actual.data_type())?;
-    Ok(Arc::new(rebuild_chunk_field(
-        expected,
-        data_type,
-        expected.is_nullable() || actual.is_nullable(),
-    )))
+    let data_type =
+        reconcile_chunk_data_type_core(expected.data_type(), actual.data_type(), sources)?;
+    let nullable = expected.is_nullable() || actual.is_nullable();
+    match sources {
+        ReconcileMetadataSources::None => {
+            Ok(Arc::new(rebuild_chunk_field(expected, data_type, nullable)))
+        }
+        ReconcileMetadataSources::Original { original, emitted } => {
+            let (field, loan) = original
+                .rebuild_field_original(expected, data_type, nullable)
+                .into_shared();
+            if let Some(loan) = loan {
+                emitted.push(loan);
+            }
+            Ok(field)
+        }
+    }
+}
+
+enum ReconcileMetadataSources<'a> {
+    None,
+    Original {
+        original: &'a SchemaMetadataMaterializations,
+        emitted: Vec<MetadataFieldLoan>,
+    },
+}
+impl<'a> ReconcileMetadataSources<'a> {
+    fn from_original(source: Option<&'a SchemaMetadataMaterializations>) -> Self {
+        match source {
+            None => Self::None,
+            Some(original) => Self::Original {
+                original,
+                emitted: Vec::new(),
+            },
+        }
+    }
+    fn finish(self) -> Option<SchemaMetadataMaterializations> {
+        match self {
+            Self::None => None,
+            Self::Original { original, emitted } => {
+                Some(original.with_additional_original_loans(emitted))
+            }
+        }
+    }
+}
+
+fn reconcile_owned_chunk_field(
+    expected: &OriginalFieldMaterialization,
+    actual: &DataType,
+    actual_nullable: bool,
+    sources: &mut ReconcileMetadataSources<'_>,
+) -> Result<OriginalFieldMaterialization, String> {
+    let data_type = reconcile_chunk_data_type_core(expected.field().data_type(), actual, sources)?;
+    let nullable = expected.field().is_nullable() || actual_nullable;
+    let field = if &data_type == expected.field().data_type()
+        && nullable == expected.field().is_nullable()
+    {
+        expected.clone()
+    } else {
+        expected.rebuild_original(data_type, nullable)
+    };
+    // Preserve both original operations: root Arc publication, then the
+    // original owned slot Field clone. The new loan follows that exact Arc.
+    let (shared, loan) = field.into_shared();
+    let result = match &loan {
+        Some(loan) => OriginalFieldMaterialization::Materialized(
+            loan.clone_original(&shared).expect("exact reconciled root"),
+        ),
+        None => OriginalFieldMaterialization::Plain(shared.as_ref().clone()),
+    };
+    Ok(result)
 }
 
 fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool {
@@ -355,9 +518,12 @@ impl ChunkSchema {
                 let (field_schema, unique_id) = layout
                     .slot_metadata_at(index)
                     .ok_or_else(|| format!("local program slot {index} lacks metadata"))?;
-                ChunkSlotSchema::try_new_with_field(
+                ChunkSlotSchema::try_new_owned_field(
                     *slot,
-                    field.as_ref().clone(),
+                    OriginalFieldMaterialization::clone_from_source(
+                        field,
+                        layout.metadata_materializations(),
+                    ),
                     Some(crate::exec::expr::static_program::thaw_field_schema(
                         field_schema,
                     )),
@@ -365,9 +531,18 @@ impl ChunkSchema {
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(Arc::new(Self::try_new_with_schema_metadata(
+        let metadata = match layout.metadata_materializations() {
+            Some(source) => {
+                ChunkMetadataSource::Original(source.schema_owner().clone_metadata_original())
+            }
+            None => ChunkMetadataSource::Foreign(layout.schema().metadata().clone()),
+        };
+        Ok(Arc::new(Self::try_new_with_metadata_source(
             slots,
-            layout.schema().metadata().clone(),
+            metadata,
+            layout
+                .metadata_materializations()
+                .map(|source| source.fields()),
         )?))
     }
 
@@ -382,15 +557,32 @@ impl ChunkSchema {
             .iter()
             .zip(layout.slots())
             .map(|(field, slot)| {
-                ChunkSlotSchema::try_new_with_field(*slot, field.as_ref().clone(), None, None)
+                ChunkSlotSchema::try_new_owned_field(
+                    *slot,
+                    OriginalFieldMaterialization::clone_from_source(
+                        field,
+                        layout.metadata_materializations(),
+                    ),
+                    None,
+                    None,
+                )
             })
             .collect::<Result<Vec<_>, String>>()?;
         if slots.len() != layout.schema().fields().len() {
             return Err("compiled layout slot and field counts differ".to_string());
         }
-        Ok(Arc::new(Self::try_new_with_schema_metadata(
+        let metadata = match layout.metadata_materializations() {
+            Some(source) => {
+                ChunkMetadataSource::Original(source.schema_owner().clone_metadata_original())
+            }
+            None => ChunkMetadataSource::Foreign(layout.schema().metadata().clone()),
+        };
+        Ok(Arc::new(Self::try_new_with_metadata_source(
             slots,
-            layout.schema().metadata().clone(),
+            metadata,
+            layout
+                .metadata_materializations()
+                .map(|source| source.fields()),
         )?))
     }
 
@@ -402,9 +594,22 @@ impl ChunkSchema {
         slots: Vec<ChunkSlotSchema>,
         metadata: HashMap<String, String>,
     ) -> Result<Self, String> {
+        Self::try_new_with_metadata_source(slots, ChunkMetadataSource::Foreign(metadata), None)
+    }
+
+    fn try_new_with_metadata_source(
+        slots: Vec<ChunkSlotSchema>,
+        metadata: ChunkMetadataSource,
+        inherited: Option<&[MetadataFieldLoan]>,
+    ) -> Result<Self, String> {
         let mut index_by_slot = HashMap::with_capacity(slots.len());
         let mut slot_ids = Vec::with_capacity(slots.len());
         let mut fields = Vec::with_capacity(slots.len());
+        let mut loans = inherited.map(|source| {
+            let mut loans = Vec::with_capacity(source.len() + slots.len());
+            loans.extend(source.iter().cloned());
+            loans
+        });
         for (idx, slot) in slots.iter().enumerate() {
             if index_by_slot.insert(slot.slot_id(), idx).is_some() {
                 return Err(format!(
@@ -414,15 +619,44 @@ impl ChunkSchema {
                 ));
             }
             slot_ids.push(slot.slot_id());
-            fields.push(Arc::new(slot.field().clone()));
+            let (field, loan) = slot.field.clone().into_shared();
+            fields.push(field);
+            if let (Some(loans), Some(loan)) = (loans.as_mut(), loan) {
+                loans.push(loan);
+            }
         }
+        let (arrow_schema, metadata_materializations) = match metadata {
+            ChunkMetadataSource::Foreign(metadata) => (
+                Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                    fields, metadata,
+                )),
+                None,
+            ),
+            ChunkMetadataSource::EmptyOriginal(metadata) => {
+                let schema = metadata.into_schema(fields).into_shared();
+                let arrow_schema = schema.schema().clone();
+                let origins = SchemaMetadataMaterializations::from_materialized_owners(
+                    schema,
+                    loans.unwrap_or_default().into(),
+                );
+                (arrow_schema, Some(origins))
+            }
+            ChunkMetadataSource::Original(metadata) => {
+                let schema = metadata.into_schema(fields).into_shared();
+                let arrow_schema = schema.schema().clone();
+                let origins = SchemaMetadataMaterializations::from_materialized_owners(
+                    schema,
+                    loans.unwrap_or_default().into(),
+                );
+                (arrow_schema, Some(origins))
+            }
+        };
         Ok(Self {
             slots,
-            arrow_schema: Arc::new(arrow::datatypes::Schema::new_with_metadata(
-                fields, metadata,
-            )),
+            arrow_schema,
             slot_ids,
             index_by_slot,
+            metadata_materializations,
         })
     }
 
@@ -432,7 +666,13 @@ impl ChunkSchema {
             arrow_schema: Arc::new(arrow::datatypes::Schema::empty()),
             slot_ids: Vec::new(),
             index_by_slot: HashMap::new(),
+            metadata_materializations: None,
         }
+    }
+
+    /// Positive original metadata construction loans, never a MEM grant.
+    pub(crate) fn metadata_materializations(&self) -> Option<&SchemaMetadataMaterializations> {
+        self.metadata_materializations.as_ref()
     }
 
     pub fn slots(&self) -> &[ChunkSlotSchema] {
@@ -508,7 +748,16 @@ impl ChunkSchema {
             })?;
             slots.push(slot);
         }
-        Self::try_new(slots)
+        match self.metadata_materializations() {
+            Some(source) => Self::try_new_with_metadata_source(
+                slots,
+                ChunkMetadataSource::EmptyOriginal(
+                    MaterializedMetadataMap::new_for_original_reserve(),
+                ),
+                Some(source.fields()),
+            ),
+            None => Self::try_new(slots),
+        }
     }
 
     pub fn with_fields_in_order(&self, fields: Vec<Field>) -> Result<Self, String> {
@@ -531,10 +780,25 @@ impl ChunkSchema {
 
     pub fn concat(parts: &[ChunkSchemaRef]) -> Result<Self, String> {
         let mut slots = Vec::new();
+        let mut origins = None::<Vec<MetadataFieldLoan>>;
         for part in parts {
             slots.extend_from_slice(part.slots());
+            if let Some(source) = part.metadata_materializations() {
+                origins
+                    .get_or_insert_with(Vec::new)
+                    .extend(source.fields().iter().cloned());
+            }
         }
-        Self::try_new(slots)
+        match origins {
+            Some(origins) => Self::try_new_with_metadata_source(
+                slots,
+                ChunkMetadataSource::EmptyOriginal(
+                    MaterializedMetadataMap::new_for_original_reserve(),
+                ),
+                Some(&origins),
+            ),
+            None => Self::try_new(slots),
+        }
     }
 }
 
@@ -549,6 +813,8 @@ pub(super) fn align_chunk_schema_to_batch(
             chunk_schema.slots().len()
         ));
     }
+    let mut sources =
+        ReconcileMetadataSources::from_original(chunk_schema.metadata_materializations());
     let mut slots = Vec::with_capacity(batch.num_columns());
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         let expected = chunk_schema
@@ -573,13 +839,40 @@ pub(super) fn align_chunk_schema_to_batch(
         }
         let root = format!("slot {} ({})", expected.slot_id(), expected.name());
         check_chunk_data_type(expected.data_type(), field.data_type(), &root)?;
-        let reconciled_field = reconcile_chunk_field_to_field(expected.field(), field.as_ref())?;
-        slots.push(
-            expected
-                .with_field_and_slot_id(expected.slot_id(), reconciled_field.as_ref().clone())?,
-        );
+        if chunk_schema.metadata_materializations().is_some() {
+            let field = reconcile_owned_chunk_field(
+                &expected.field,
+                field.data_type(),
+                field.is_nullable(),
+                &mut sources,
+            )?;
+            slots.push(ChunkSlotSchema::try_new_owned_field(
+                expected.slot_id(),
+                field,
+                Some(expected.field_schema.clone()),
+                expected.unique_id,
+            )?);
+        } else {
+            let reconciled_field =
+                reconcile_chunk_field_to_field(expected.field(), field.as_ref())?;
+            slots.push(
+                expected.with_field_and_slot_id(
+                    expected.slot_id(),
+                    reconciled_field.as_ref().clone(),
+                )?,
+            );
+        }
     }
-    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+    let materializations = sources.finish();
+    let schema = match materializations.as_ref() {
+        Some(source) => ChunkSchema::try_new_with_metadata_source(
+            slots,
+            ChunkMetadataSource::EmptyOriginal(MaterializedMetadataMap::new_for_original_reserve()),
+            Some(source.fields()),
+        )?,
+        None => ChunkSchema::try_new(slots)?,
+    };
+    Ok(Arc::new(schema))
 }
 
 pub(super) fn align_chunk_schema_to_columns(
@@ -593,6 +886,8 @@ pub(super) fn align_chunk_schema_to_columns(
             chunk_schema.slots().len()
         ));
     }
+    let mut sources =
+        ReconcileMetadataSources::from_original(chunk_schema.metadata_materializations());
     let mut slots = Vec::with_capacity(columns.len());
     for (idx, column) in columns.iter().enumerate() {
         let expected = chunk_schema
@@ -601,17 +896,43 @@ pub(super) fn align_chunk_schema_to_columns(
             .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
         let root = format!("slot {} ({})", expected.slot_id(), expected.name());
         check_chunk_data_type(expected.data_type(), column.data_type(), &root)?;
-        let reconciled_field = reconcile_chunk_field_to_data_type(
-            expected.field(),
-            column.data_type(),
-            column.null_count() > 0,
-        )?;
-        slots.push(
-            expected
-                .with_field_and_slot_id(expected.slot_id(), reconciled_field.as_ref().clone())?,
-        );
+        if chunk_schema.metadata_materializations().is_some() {
+            let field = reconcile_owned_chunk_field(
+                &expected.field,
+                column.data_type(),
+                column.null_count() > 0,
+                &mut sources,
+            )?;
+            slots.push(ChunkSlotSchema::try_new_owned_field(
+                expected.slot_id(),
+                field,
+                Some(expected.field_schema.clone()),
+                expected.unique_id,
+            )?);
+        } else {
+            let reconciled_field = reconcile_chunk_field_to_data_type(
+                expected.field(),
+                column.data_type(),
+                column.null_count() > 0,
+            )?;
+            slots.push(
+                expected.with_field_and_slot_id(
+                    expected.slot_id(),
+                    reconciled_field.as_ref().clone(),
+                )?,
+            );
+        }
     }
-    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+    let materializations = sources.finish();
+    let schema = match materializations.as_ref() {
+        Some(source) => ChunkSchema::try_new_with_metadata_source(
+            slots,
+            ChunkMetadataSource::EmptyOriginal(MaterializedMetadataMap::new_for_original_reserve()),
+            Some(source.fields()),
+        )?,
+        None => ChunkSchema::try_new(slots)?,
+    };
+    Ok(Arc::new(schema))
 }
 
 #[cfg(test)]
@@ -991,3 +1312,37 @@ mod tests {
         assert!(err.contains("Timestamp(Nanosecond, None)"), "err={err}");
     }
 }
+
+// Numerical resource provenance is deliberately absent from semantic equality
+// and original Debug output. It cannot change a Chunk's field contract.
+impl std::fmt::Debug for ChunkSchema {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("ChunkSchema")
+            .field("slots", &self.slots)
+            .field("arrow_schema", &self.arrow_schema)
+            .field("slot_ids", &self.slot_ids)
+            .field("index_by_slot", &self.index_by_slot)
+            .finish()
+    }
+}
+impl PartialEq for ChunkSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.slots == other.slots
+            && self.arrow_schema == other.arrow_schema
+            && self.slot_ids == other.slot_ids
+            && self.index_by_slot == other.index_by_slot
+    }
+}
+impl Eq for ChunkSchema {}
+enum ChunkMetadataSource {
+    Foreign(HashMap<String, String>),
+    Original(OriginalMetadataClone),
+    EmptyOriginal(MaterializedMetadataMap),
+}
+
+#[cfg(test)]
+#[path = "metadata_materialization_tests.rs"]
+mod metadata_materialization_tests;
+
+#[path = "metadata_request.rs"]
+mod metadata_request;

@@ -159,7 +159,17 @@ fn lower_core(
         .result()
         .filter(|result| result.output.columns == node.output.columns);
     let mut fields: Vec<Field> = Vec::new();
-    reserve_vec(&mut fields, slots.len(), work)?;
+    if package.original_metadata_namespace().is_none() {
+        reserve_vec(&mut fields, slots.len(), work)?;
+    }
+    let mut original_fields = match package.original_metadata_namespace() {
+        Some(_) => {
+            let mut original_fields = Vec::new();
+            reserve_vec(&mut original_fields, slots.len(), work)?;
+            Some(original_fields)
+        }
+        None => None,
+    };
     for (ordinal, value) in node.output.columns.iter().enumerate() {
         let ty = &package
             .fragment()
@@ -196,17 +206,33 @@ fn lower_core(
             (None, None) => format!("local_exchange_{}_{}", node.id.get(), ordinal),
         };
         work.flush()?;
-        let field = ty.try_to_field(name);
-        work.flush()?;
-        fields.push(field?);
+        if let Some(original_fields) = original_fields.as_mut() {
+            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
+            work.flush()?;
+            original_fields.push(field?);
+        } else {
+            let field = ty.try_to_field(name);
+            work.flush()?;
+            fields.push(field?);
+        }
         work.step()?;
     }
     work.flush()?;
-    let layout = StaticLayout::try_new_for_compile(
-        Arc::new(Schema::new(fields)),
-        Arc::from(slots),
-        work.control(),
-    )?;
+    let layout = match (original_fields, package.original_metadata_namespace()) {
+        (Some(fields), Some(namespace)) => {
+            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
+            StaticLayout::try_new_materialized_for_compile(
+                source,
+                Arc::from(slots),
+                work.control(),
+            )?
+        }
+        _ => StaticLayout::try_new_for_compile(
+            Arc::new(Schema::new(fields)),
+            Arc::from(slots),
+            work.control(),
+        )?,
+    };
     work.flush()?;
     Ok(LoweredExchangeSource {
         kind: ProgramNodeKind::ExchangeSource {

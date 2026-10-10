@@ -203,9 +203,20 @@ fn lower_core(
     // The provider authored these fields; the layout keeps names, field and
     // schema metadata exactly. The schema copy is opaque and only observed.
     work.flush()?;
-    let schema = Arc::new(public.schema().clone());
+    let materializations = public
+        .metadata_materializations()
+        .map(|origin| origin.clone_original_schema());
+    let schema = if let Some(origin) = &materializations {
+        origin.schema_owner().schema().clone()
+    } else {
+        Arc::new(public.schema().clone())
+    };
     work.flush()?;
-    let layout = StaticLayout::try_new_for_compile(schema, Arc::from(slots), work.control())?;
+    let layout = if let Some(origin) = materializations {
+        StaticLayout::try_new_materialized_for_compile(origin, Arc::from(slots), work.control())?
+    } else {
+        StaticLayout::try_new_for_compile(schema, Arc::from(slots), work.control())?
+    };
     work.flush()?;
     let source = ProgramScanSource::from(recipe);
     let relation = source.relation_header().clone();

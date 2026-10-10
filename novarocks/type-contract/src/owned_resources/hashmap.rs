@@ -103,8 +103,11 @@ fn group_layout() -> Result<Layout, HashMapResourceError> {
     }
 }
 
-/// Only HashMap::new(), one try_reserve(unique_count), and no more than that
-/// many unique inserts. No removals, prior allocation, or second growth.
+/// Only an empty HashMap followed by one reserve/try_reserve(unique_count),
+/// or with_capacity(unique_count), and at most that many insertion occurrences.
+/// Rust 1.92 std's ONE-entry array From route uses empty + extend + reserve(1).
+/// These constructors share RawTable capacity_to_buckets/TableLayout below.
+/// No removals, prior allocation, mutable escape, or second growth are covered.
 /// raw/mod.rs capacity_to_buckets/TableLayout are the sole source formula.
 /// RandomState construction/OS seed acquisition is separately caller-owned.
 pub fn fresh_table_layout<K, V>(

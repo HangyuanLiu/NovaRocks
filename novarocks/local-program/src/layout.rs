@@ -21,6 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow_schema::{Schema, SchemaRef};
+use novarocks_type_contract::owned_resources::metadata_materialization::SchemaMetadataMaterializations;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, MAX_UNOBSERVED_COMPILE_WORK,
     PureCompileControl,
@@ -50,11 +51,12 @@ impl StaticSlotMetadata {
 
 /// Immutable Arrow schema plus exact execution slot order. No Chunk or lease
 /// is retained by this type.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StaticLayout {
     schema: SchemaRef,
     slots: Arc<[SlotId]>,
     slot_metadata: Option<Arc<[StaticSlotMetadata]>>,
+    metadata_materializations: Option<SchemaMetadataMaterializations>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,7 +261,23 @@ impl StaticLayout {
             schema,
             slots,
             slot_metadata,
+            metadata_materializations: None,
         })
+    }
+    /// Consume the positively paired original Schema owner. No public API
+    /// accepts an unrelated schema plus a fabricated numerical receipt.
+    pub fn try_new_materialized_for_compile(
+        metadata_materializations: SchemaMetadataMaterializations,
+        slots: Arc<[SlotId]>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, LayoutCompileError> {
+        let schema = metadata_materializations.schema_owner().schema().clone();
+        let mut layout = Self::try_new_for_compile(schema, slots, control)?;
+        layout.metadata_materializations = Some(metadata_materializations);
+        Ok(layout)
+    }
+    pub fn metadata_materializations(&self) -> Option<&SchemaMetadataMaterializations> {
+        self.metadata_materializations.as_ref()
     }
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
@@ -301,21 +319,53 @@ impl StaticLayout {
             index_by_slot.insert(slot, index);
             work.step()?;
         }
-        let mut fields = Vec::with_capacity(output_columns.len());
+        let mut fields = if self.metadata_materializations.is_some() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(output_columns.len())
+        };
+        let mut materialized_fields = self
+            .metadata_materializations
+            .as_ref()
+            .map(|_| Vec::with_capacity(output_columns.len()));
         for slot in output_columns {
             let index = index_by_slot.get(slot).copied();
             work.step()?;
             let index = index.ok_or(LayoutError::UnknownSlot)?;
-            let field = work.opaque(|| Ok(self.schema.field(index).clone()))?;
-            fields.push(field);
+            if let (Some(origins), Some(materialized)) = (
+                self.metadata_materializations.as_ref(),
+                materialized_fields.as_mut(),
+            ) {
+                work.flush()?;
+                let field = origins
+                    .clone_field_original_observed(&self.schema.fields()[index], &mut || {
+                        work.step()
+                    })?;
+                work.flush()?;
+                materialized.push(field);
+            } else {
+                let field = work.opaque(|| Ok(self.schema.field(index).clone()))?;
+                fields.push(field);
+            }
             work.step()?;
         }
-        let projected_schema = work.opaque(|| {
-            Ok(Arc::new(Schema::new_with_metadata(
-                fields,
-                self.schema.metadata().clone(),
-            )))
-        })?;
+        let projected_materializations = if let (Some(origins), Some(fields)) =
+            (self.metadata_materializations.as_ref(), materialized_fields)
+        {
+            Some(work.opaque(|| Ok(origins.project_original_schema(fields)))?)
+        } else {
+            None
+        };
+        let projected_schema = if let Some(origins) = &projected_materializations {
+            origins.schema_owner().schema().clone()
+        } else {
+            work.opaque(|| {
+                Ok(Arc::new(Schema::new_with_metadata(
+                    fields,
+                    self.schema.metadata().clone(),
+                )))
+            })?
+        };
         let mut projected_slots = Vec::with_capacity(output_columns.len());
         for slot in output_columns {
             projected_slots.push(*slot);
@@ -334,7 +384,10 @@ impl StaticLayout {
         } else {
             None
         };
-        Self::try_new_inner(projected_schema, projected_slots, projected_metadata, work)
+        let mut projected =
+            Self::try_new_inner(projected_schema, projected_slots, projected_metadata, work)?;
+        projected.metadata_materializations = projected_materializations;
+        Ok(projected)
     }
     /// A deterministic identity over the full Arrow schema and exact slot order.
     /// Object keys are sorted explicitly, including Arrow metadata.
@@ -984,5 +1037,15 @@ mod tests {
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=quantum]);
         }
+    }
+}
+
+impl std::fmt::Debug for StaticLayout {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("StaticLayout")
+            .field("schema", &self.schema)
+            .field("slots", &self.slots)
+            .field("slot_metadata", &self.slot_metadata)
+            .finish()
     }
 }

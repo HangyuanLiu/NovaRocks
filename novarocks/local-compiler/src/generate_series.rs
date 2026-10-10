@@ -162,7 +162,17 @@ pub(crate) fn lower(
     let mut channels = Vec::new();
     let mut nodes = Vec::new();
     let mut operators = Vec::new();
-    reserve_vec(&mut fields, width, work)?;
+    if package.original_metadata_namespace().is_none() {
+        reserve_vec(&mut fields, width, work)?;
+    }
+    let mut original_fields = match package.original_metadata_namespace() {
+        Some(_) => {
+            let mut original_fields = Vec::new();
+            reserve_vec(&mut original_fields, width, work)?;
+            Some(original_fields)
+        }
+        None => None,
+    };
     reserve_vec(&mut backing, width, work)?;
     reserve_vec(&mut cells, width, work)?;
     reserve_vec(&mut channels, width + 1, work)?;
@@ -181,11 +191,15 @@ pub(crate) fn lower(
             "series bound definition was not lowered",
         ))?;
         work.flush()?;
-        fields.push(source.ty.try_to_field(format!(
-            "local_series_bound_{}_{}",
-            physical.id.get(),
-            column
-        ))?);
+        if let Some(original_fields) = original_fields.as_mut() {
+            original_fields.push(novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(&source.ty, format!("local_series_bound_{}_{}", physical.id.get(), column))?);
+        } else {
+            fields.push(source.ty.try_to_field(format!(
+                "local_series_bound_{}_{}",
+                physical.id.get(),
+                column
+            ))?);
+        }
         work.flush()?;
         backing.push(new_empty_array(&source.ty.data_type));
         work.flush()?;
@@ -205,11 +219,21 @@ pub(crate) fn lower(
         work.step()?;
     }
     work.flush()?;
-    let bounds_layout = StaticLayout::try_new_for_compile(
-        Arc::new(Schema::new(fields)),
-        Arc::clone(&planned.parameter_slots),
-        work.control(),
-    )?;
+    let bounds_layout = match (original_fields, package.original_metadata_namespace()) {
+        (Some(fields), Some(namespace)) => {
+            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
+            StaticLayout::try_new_materialized_for_compile(
+                source,
+                Arc::clone(&planned.parameter_slots),
+                work.control(),
+            )?
+        }
+        _ => StaticLayout::try_new_for_compile(
+            Arc::new(Schema::new(fields)),
+            Arc::clone(&planned.parameter_slots),
+            work.control(),
+        )?,
+    };
     work.flush()?;
     let values = StaticValues::try_new_with_cells_for_compile(
         1,
@@ -231,13 +255,24 @@ pub(crate) fn lower(
     } else {
         format!("local_series_{}_0", physical.id.get())
     };
-    let field = output_ty.try_to_field(label)?;
-    work.flush()?;
-    let output_layout = StaticLayout::try_new_for_compile(
-        Arc::new(Schema::new(vec![field])),
-        Arc::from(output_slots),
-        work.control(),
-    )?;
+    let output_layout = if let Some(namespace) = package.original_metadata_namespace() {
+        let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(output_ty, label)?;
+        work.flush()?;
+        let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(vec![field], namespace.clone()).into_original_schema();
+        StaticLayout::try_new_materialized_for_compile(
+            source,
+            Arc::from(output_slots),
+            work.control(),
+        )?
+    } else {
+        let field = output_ty.try_to_field(label)?;
+        work.flush()?;
+        StaticLayout::try_new_for_compile(
+            Arc::new(Schema::new(vec![field])),
+            Arc::from(output_slots),
+            work.control(),
+        )?
+    };
     work.flush()?;
     let source = DiagnosticSourceNodeId::new(physical.id.get());
     nodes.push(ProgramNode::new_local(

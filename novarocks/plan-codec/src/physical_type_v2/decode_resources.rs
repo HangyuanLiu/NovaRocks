@@ -143,6 +143,12 @@ impl TypeDecodeModel {
         model.request(array::<Node>(vertices)?, 1)?;
         model.request(array::<Frame>(vertices)?, 1)?;
         model.request(arc(Layout::new::<Field>())?, table.fields.len())?;
+        // Same original package Field namespace's weak origin records. These
+        // are pre-admitted before their Vec and final Arc slice publication.
+        type Loan =
+            novarocks_type_contract::owned_resources::metadata_materialization::MetadataFieldLoan;
+        model.request(array::<Loan>(table.fields.len())?, 2)?;
+        model.request(arc(array::<Loan>(table.fields.len())?)?, 1)?;
         // One terminal ConnectorError contains fixed writer-law text or a
         // bounded logical-enum diagnostic (under128 bytes). Rust1.92 String
         // growth has at most128 requests and <=4*128 cumulative payload bytes.

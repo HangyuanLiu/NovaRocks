@@ -100,6 +100,31 @@ fn push_geometry<T>(
     })
 }
 
+/// Cumulative requests for the declared original `Vec::new` followed by exactly
+/// `count` pushes. This does not inspect an arbitrary existing Vec or infer its
+/// capacity; both this loan and reserve_for_push_in use ONE push_geometry.
+/// The caller owns each visit's control and the complete operation admission.
+pub fn original_fresh_push_requests<T, E: From<ControlResourceError>>(
+    count: usize,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut len = 0;
+    let mut capacity = if size_of::<T>() == 0 { usize::MAX } else { 0 };
+    let mut requests = 0_usize;
+    while len < count {
+        let facts = push_geometry::<T>(len, capacity).map_err(E::from)?;
+        if let Some(layout) = facts.requested_backing {
+            requests = requests
+                .checked_add(layout.size())
+                .ok_or_else(|| E::from(resource()))?;
+        }
+        len = facts.next_len;
+        capacity = facts.requested_capacity;
+        observe()?;
+    }
+    Ok(requests)
+}
+
 /// Capture the next original push request from this actual default-Global Vec.
 /// A full new layout is a cumulative request contribution; old/new coexistence
 /// and cleanup are separate caller facts. Spare capacity requests no backing.

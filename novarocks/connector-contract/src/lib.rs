@@ -26,6 +26,7 @@ mod codec;
 mod error;
 mod identity;
 mod mutation;
+mod metadata_materialization_copy;
 mod owned_copy;
 mod predicate;
 mod pure_catalogue;

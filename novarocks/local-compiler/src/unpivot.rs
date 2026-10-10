@@ -352,7 +352,7 @@ fn lower_core(
         ))?;
         // The complete child header is borrowed; only an exact result label
         // may replace its diagnostic name during output materialization.
-        source_fields.insert(output, input.layout.schema().field(ordinal));
+        source_fields.insert(output, &input.layout.schema().fields()[ordinal]);
         passthrough_columns.push(UnpivotPassthrough {
             input_slot_id,
             output_slot_id,
@@ -501,25 +501,42 @@ fn lower_core(
         }
     }
     let mut fields = Vec::new();
+    let mut original_fields = input.layout.metadata_materializations().map(|_| Vec::new());
     for (ordinal, &value) in node.output.columns.iter().enumerate() {
         let name = result_names
             .and_then(|r| r.fields.get(ordinal))
             .map(|f| f.alias.as_deref().unwrap_or(&f.name));
         work.flush()?;
-        let field = if let Some(source) = source_fields.get(&value) {
-            let mut field = (**source).clone();
-            if let Some(name) = name {
-                field = field.with_name(name);
-            }
-            field
+        if let Some(original_fields) = original_fields.as_mut() {
+            let field = if let Some(source) = source_fields.get(&value) {
+                let mut field = novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::clone_from_source(source, input.layout.metadata_materializations());
+                if let Some(name) = name {
+                    field = field.with_name_owned(name);
+                }
+                field
+            } else {
+                novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(
+                    value_type(fragment, value)?, name.map(str::to_owned).unwrap_or_else(|| format!("local_{}_{}", local.index(), ordinal)),
+                )?)
+            };
+            work.flush()?;
+            original_fields.push(field);
         } else {
-            value_type(fragment, value)?.try_to_field(
-                name.map(str::to_owned)
-                    .unwrap_or_else(|| format!("local_{}_{}", local.index(), ordinal)),
-            )?
-        };
-        work.flush()?;
-        fields.push(field);
+            let field = if let Some(source) = source_fields.get(&value) {
+                let mut field = (***source).clone();
+                if let Some(name) = name {
+                    field = field.with_name(name);
+                }
+                field
+            } else {
+                value_type(fragment, value)?.try_to_field(
+                    name.map(str::to_owned)
+                        .unwrap_or_else(|| format!("local_{}_{}", local.index(), ordinal)),
+                )?
+            };
+            work.flush()?;
+            fields.push(field);
+        }
         work.step()?;
     }
     let max_output_rows = usize::try_from(spec.max_output_rows)
@@ -530,10 +547,29 @@ fn lower_core(
         return Err(UnpivotLoweringError::Invalid("Unpivot bounds are zero"));
     }
     work.flush()?;
-    let schema = Arc::new(Schema::new(fields));
+    let (schema, original_schema) = match (
+        original_fields,
+        input.layout.metadata_materializations(),
+    ) {
+        (Some(fields), Some(source)) => {
+            let inherited = source.field_namespace();
+            let namespace = match package.original_metadata_namespace() {
+                Some(package_source) => inherited.join_original_observed(package_source, work)?,
+                None => inherited,
+            };
+            let original = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::from_original_fields(fields, namespace).into_original_schema();
+            (original.schema_owner().schema().clone(), Some(original))
+        }
+        _ => (Arc::new(Schema::new(fields)), None),
+    };
     let slots = Arc::from(planned_slots);
     work.flush()?;
-    let layout = StaticLayout::try_new_for_compile(schema, slots, work.control())?;
+    let layout = match original_schema {
+        Some(source) => {
+            StaticLayout::try_new_materialized_for_compile(source, slots, work.control())?
+        }
+        None => StaticLayout::try_new_for_compile(schema, slots, work.control())?,
+    };
     Ok((
         ProgramNodeKind::Unpivot {
             input: input.node,

@@ -38,13 +38,34 @@ pub const MAX_CONNECTOR_WRITE_INPUT_FIELDS: usize =
 
 pub const MAX_CONNECTOR_WRITER_HANDLE_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ConnectorWriteRecipeDraft {
     binding: ConnectorWriteBinding,
     payload: ConnectorEncodedPayload,
     input: Arc<ConnectorWriteInputShape>,
     charged_bytes: usize,
+    original_metadata_namespace: Option<novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
 }
+
+impl std::fmt::Debug for ConnectorWriteRecipeDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorWriteRecipeDraft")
+            .field("binding", &self.binding)
+            .field("payload", &self.payload)
+            .field("input", &self.input)
+            .field("charged_bytes", &self.charged_bytes)
+            .finish()
+    }
+}
+impl PartialEq for ConnectorWriteRecipeDraft {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding
+            && self.payload == other.payload
+            && self.input == other.input
+            && self.charged_bytes == other.charged_bytes
+    }
+}
+impl Eq for ConnectorWriteRecipeDraft {}
 
 impl ConnectorWriteRecipeDraft {
     pub fn try_new(
@@ -71,7 +92,11 @@ impl ConnectorWriteRecipeDraft {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, PureProviderCompileError<ConnectorError>> {
         let mut observer = ObservedCopy::new(source_retained_bytes, admit, work)?;
-        Self::try_new_core(binding, payload, input, &mut observer)
+        let mut materialization =
+            crate::metadata_materialization_copy::MetadataMaterializationCopy::new(&mut observer);
+        let mut result = Self::try_new_core(binding, payload, input, &mut materialization)?;
+        result.original_metadata_namespace = Some(materialization.finish_namespace()?);
+        Ok(result)
     }
 
     /// Resolve original borrowed field loans through the same writer law and
@@ -88,7 +113,11 @@ impl ConnectorWriteRecipeDraft {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, PureProviderCompileError<ConnectorError>> {
         let mut observer = ObservedCopy::new(source_retained_bytes, admit, work)?;
-        Self::try_new_core(binding, payload, input, &mut observer)
+        let mut materialization =
+            crate::metadata_materialization_copy::MetadataMaterializationCopy::new(&mut observer);
+        let mut result = Self::try_new_core(binding, payload, input, &mut materialization)?;
+        result.original_metadata_namespace = Some(materialization.finish_namespace()?);
+        Ok(result)
     }
 
     fn try_new_core<F: crate::write_input::WriteInputFields, O: OwnedCopy>(
@@ -228,6 +257,7 @@ impl ConnectorWriteRecipeDraft {
             payload,
             input,
             charged_bytes,
+            original_metadata_namespace: None,
         })
     }
 
@@ -240,6 +270,10 @@ impl ConnectorWriteRecipeDraft {
     pub fn input(&self) -> &ConnectorWriteInputShape {
         &self.input
     }
+    pub fn original_metadata_namespace(&self) -> Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>{
+        self.original_metadata_namespace.as_ref()
+    }
+
     pub const fn charged_bytes(&self) -> usize {
         self.charged_bytes
     }

@@ -756,7 +756,7 @@ pub(crate) fn decode_fragment_package_in(
     )?;
 
     // L9: the original checked Package constructor on this same scope.
-    Ok(p::FragmentPackage::try_new_in(
+    let package = p::FragmentPackage::try_new_in(
         p::FragmentPackageInput {
             constants: pools,
             version: metadata.version,
@@ -775,7 +775,11 @@ pub(crate) fn decode_fragment_package_in(
         limits.admission,
         &mut |_| Ok(()),
         work,
-    )?)
+    )?;
+    Ok(match types.metadata_namespace() {
+        Some(namespace) => package.with_original_metadata_namespace(namespace.clone()),
+        None => package,
+    })
 }
 
 #[cfg(test)]

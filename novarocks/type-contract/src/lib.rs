@@ -79,6 +79,7 @@ pub use logical::{
     preserves_nested_logical_identity_observed, validate_nested_logical_types,
     validate_nested_logical_types_observed, validate_value_type_structure_observed,
     validate_value_type_structure_with_scratch_observed,
+    visit_original_data_type_clone_with_scratch_observed,
 };
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,

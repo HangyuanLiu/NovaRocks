@@ -173,11 +173,15 @@ pub struct TypeProjectionLimits {
 }
 
 pub struct DecodedTypeTable {
+    pub(super) metadata_namespace: Option<novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
     pub(super) carriers: BTreeMap<u32, DataType>,
     pub(super) fields: BTreeMap<u32, Arc<Field>>,
     pub(super) values: BTreeMap<u32, FunctionValueType>,
 }
 impl DecodedTypeTable {
+    pub fn metadata_namespace(&self) -> Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>{
+        self.metadata_namespace.as_ref()
+    }
     pub fn carrier(&self, id: u32) -> Option<&DataType> {
         self.carriers.get(&id)
     }
