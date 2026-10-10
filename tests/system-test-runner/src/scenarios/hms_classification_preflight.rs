@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optional small HMS correctness preflight. This does not replace the large CL input.
+//! Optional small readonly HMS preflight. This does not replace the large CL input.
 use super::connector::require_three_backends;
 use super::hms_bulk_readonly_native::{
     HmsRegistration, finish_evidence_errors, install_credential_overlays, register,
@@ -225,7 +225,7 @@ impl Scenario for HmsClassificationPreflight {
         let mut facts = json!({"schema_version":1,"scope":"small-hms-classification-only", "assertions":"pending",
             "launch_identities":identities, "parent_freeze_sha256":self.input.parent_freeze_sha256,
             "pre_native_oracle_sha256":self.input.pre_native_oracle_sha256,
-            "mutation_rpc_count":"unobserved; source/component pre-mutation guarantee only"});
+            "mutation_operations":"excluded: IRU-7 owns HMS mutation correctness"});
         let receipt = context
             .scenario_root()
             .join("hms-classification-assertions.json");
@@ -291,11 +291,9 @@ impl Scenario for HmsClassificationPreflight {
             facts["phase"] = json!("show-views");
             self.remaining()?;
             facts["show_views"] = require_view_refusal(client.query_drop("SHOW VIEWS"))?;
-            facts["phase"] = json!("drop-database-force");
-            self.remaining()?;
-            facts["drop_database_force"] = require_view_refusal(
-                client.query_drop(format!("DROP DATABASE {catalog}.{namespace} FORCE")),
-            )?;
+            // IRU-7 owns HMS mutation correctness. This readonly preflight never
+            // issues DROP DATABASE; the external fixture owner checks unchanged
+            // metadata and performs its own cleanup after all native roles exit.
             self.remaining()?;
             facts["phase"] = json!("complete");
             Ok(())
@@ -318,7 +316,7 @@ impl Scenario for HmsClassificationPreflight {
             .map_err(anyhow::Error::from)
             .and_then(|raw| std::fs::write(receipt, raw).map_err(Into::into));
         finish_evidence_errors(primary, diagnostic, saved)?;
-        context.action("small HMS exact table projection and precise view/FORCE refusals passed; mutation RPC count unobserved");
+        context.action("small readonly HMS exact table projection and precise view refusal passed; HMS mutations excluded for IRU-7");
         Ok(())
     }
 }
