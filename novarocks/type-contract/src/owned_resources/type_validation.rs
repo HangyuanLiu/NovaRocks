@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The original fixed scratch geometry of the borrowed type grammar.
-//! This stack layout is not a heap request, allocator/CPU bound or MEM grant.
-//! Callers admit initialization work before creating the actual scratch.
+//! Request geometry of the original type-validation pending storage.
+//! Neither the fixed scratch nor the dynamic request bound grants memory.
+//! Callers admit initialization and the complete original operation separately.
 
 use arrow_schema::DataType;
 use std::alloc::Layout;
@@ -35,3 +35,46 @@ pub fn scratch_layout() -> Layout {
 pub fn scratch_work_upper_bound() -> usize {
     scratch_layout().size()
 }
+
+/// Cumulative heap-request upper bound for the original dynamic validator.
+/// Its initial `vec![(root, 1)]` requests one element. The sole walk checks
+/// visited + pending before every child push, so pending length never exceeds
+/// MAX_VALUE_TYPE_NODES, including on a type or observer error. Pops cannot
+/// increase capacity. The locked growth sequence after the exact one-element
+/// backing is a subsequence of the original fresh-push sequence starting at
+/// four elements. Include both, without replacing or pre-running validation.
+///
+/// This deliberately bounds every original shape; it does not inspect a
+/// foreign Vec's capacity or claim that the maximum is actually allocated.
+/// Element payloads are borrowed. Each emitted Layout is one possible original
+/// request contribution, including the initial request; no tail is included.
+pub fn original_dynamic_pending_allocation_requests_observed<
+    E: From<crate::ControlResourceError>,
+>(
+    observe: &mut impl FnMut() -> Result<(), E>,
+    allocations: &mut Option<super::metadata_materialization::MetadataAllocationLoan<'_, E>>,
+) -> Result<usize, E> {
+    if !super::profile::LOCKED_TOOLCHAIN {
+        return Err(crate::ControlResourceError::SourceModel(
+            "Type validation pending source model drift",
+        )
+        .into());
+    }
+    let initial = Layout::new::<(&DataType, usize)>();
+    if let Some(allocations) = allocations.as_deref_mut() {
+        allocations(initial, 1)?;
+    }
+    observe()?;
+    let growth = super::vec::original_fresh_push_allocation_requests_observed::<
+        (&DataType, usize),
+        E,
+    >(crate::MAX_VALUE_TYPE_NODES, observe, allocations)?;
+    initial.size().checked_add(growth).ok_or_else(|| {
+        E::from(crate::ControlResourceError::from(
+            crate::CompileControlError::ResourceExhausted,
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests;
