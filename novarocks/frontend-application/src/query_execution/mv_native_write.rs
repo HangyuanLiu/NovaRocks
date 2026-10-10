@@ -211,6 +211,13 @@ pub(crate) fn prepare_completed_mv_write(
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan, control,
         )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
         .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,

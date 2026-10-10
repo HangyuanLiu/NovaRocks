@@ -283,6 +283,12 @@ fn preflight_encode(
             model.refs = model.items;
             model.request::<u32>(input.output.columns.len(), 1)?;
             model.request::<wire::ResultField>(input.fields.len(), 1)?;
+            if input.scalar_schema.is_some() {
+                model.request::<u8>(
+                    crate::physical_fragment_envelope_v2::root_projection_request_bytes()?,
+                    1,
+                )?;
+            }
             model.delegated_work = mul(
                 input.fields.len(),
                 add(values.types().source_counts().0, 8)?,
@@ -312,6 +318,12 @@ fn preflight_encode(
     if !admission.observed() {
         model.request::<u32>(input.output.columns.len(), 1)?;
         model.request::<wire::ResultField>(input.fields.len(), 1)?;
+        if input.scalar_schema.is_some() {
+            model.request::<u8>(
+                crate::physical_fragment_envelope_v2::root_projection_request_bytes()?,
+                1,
+            )?;
+        }
         let roots = values.types().source_counts().0;
         model.delegated_work = add(
             model.delegated_work,
@@ -455,6 +467,12 @@ fn preflight_decode(
             model.refs = model.items;
             model.request::<p::ValueId>(columns, 2)?;
             model.request::<p::ResultField>(input.fields.len(), 2)?;
+            if input.scalar_schema.is_some() {
+                model.request::<u8>(
+                    crate::physical_fragment_envelope_v2::root_projection_request_bytes()?,
+                    1,
+                )?;
+            }
             let lookup = crate::btree_resources_v2::lookup_work(values.types().value_types().len())
                 .map_err(invalid)?;
             model.delegated_work = mul(input.fields.len(), mul(lookup, 2)?)?;
@@ -475,6 +493,12 @@ fn preflight_decode(
     if !admission.observed() {
         model.request::<p::ValueId>(output.value_ids.len(), 2)?;
         model.request::<p::ResultField>(input.fields.len(), 2)?;
+        if input.scalar_schema.is_some() {
+            model.request::<u8>(
+                crate::physical_fragment_envelope_v2::root_projection_request_bytes()?,
+                1,
+            )?;
+        }
         let lookup = crate::btree_resources_v2::lookup_work(values.types().value_types().len())
             .map_err(invalid)?;
         model.delegated_work = mul(input.fields.len(), mul(lookup, 2)?)?;
@@ -649,6 +673,7 @@ fn emit_encode(
             alias,
             value_id: Some(field.value.get()),
             value_type_id: Some(*id),
+            domain: Some(encode_domain(field.domain)),
         });
         w.step()?;
     }
@@ -659,6 +684,15 @@ fn emit_encode(
             value_ids: columns,
         }),
         fields,
+        scalar_schema: match &input.scalar_schema {
+            Some(schema) => {
+                w.flush()?;
+                let output = novarocks_proto_codec::scalar_result::encode_scalar_schema(schema);
+                w.flush()?;
+                Some(output)
+            }
+            None => None,
+        },
     }))
 }
 fn emit_decode(
@@ -694,6 +728,10 @@ fn emit_decode(
                 w,
             )?),
             ty,
+            domain: decode_domain(
+                required(field.domain, "result field domain is absent", w)?,
+                w,
+            )?,
         });
         w.step()?;
     }
@@ -710,6 +748,20 @@ fn emit_decode(
                 w,
             )?),
             columns: boxed(columns, w)?,
+        },
+        scalar_schema: match &input.scalar_schema {
+            Some(schema) => {
+                w.flush()?;
+                let output = novarocks_proto_codec::scalar_result::decode_scalar_schema(
+                    schema,
+                    output.value_ids.len(),
+                    novarocks_proto_codec::FieldPath::root("result.scalar_schema"),
+                )
+                .map_err(Error::Root)?;
+                w.flush()?;
+                Some(output)
+            }
+            None => None,
         },
         fields: boxed(fields, w)?,
     }))
@@ -878,3 +930,32 @@ pub(crate) fn prepare_result_decode<'input, 'values, 'loan, 'wire, 'control>(
 #[cfg(test)]
 #[path = "physical_result_v2/tests.rs"]
 mod tests;
+
+fn encode_domain(domain: p::ResultValueDomain) -> i32 {
+    use p::ResultValueDomain as P;
+    use wire::ResultValueDomain as W;
+    (match domain {
+        P::Plain => W::Plain,
+        P::Json => W::Json,
+        P::Variant => W::Variant,
+        P::Hll => W::Hll,
+        P::Bitmap => W::Bitmap,
+        P::Object => W::Object,
+        P::Percentile => W::Percentile,
+    }) as i32
+}
+fn decode_domain(raw: i32, w: &mut CompileCheckpoints<'_>) -> Result<p::ResultValueDomain, Error> {
+    use p::ResultValueDomain as P;
+    use wire::ResultValueDomain as W;
+    let decoded = W::try_from(raw).map_err(|_| invalid("unknown result value domain"));
+    w.step()?;
+    Ok(match decoded? {
+        W::Plain => P::Plain,
+        W::Json => P::Json,
+        W::Variant => P::Variant,
+        W::Hll => P::Hll,
+        W::Bitmap => P::Bitmap,
+        W::Object => P::Object,
+        W::Percentile => P::Percentile,
+    })
+}

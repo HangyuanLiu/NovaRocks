@@ -71,9 +71,12 @@ mod cancellation;
 mod observation;
 mod queue;
 mod resource;
+mod result_window;
 mod scope;
 
-pub use admission::{QueryAdmission, Stage, StageAdmission, StagePermit, StageRequest};
+pub use admission::{
+    QueryAdmission, ResultQueryAdmission, Stage, StageAdmission, StagePermit, StageRequest,
+};
 pub use cancellation::{CancellationReason, CancellationView};
 pub use observation::{
     ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationEndSnapshot, ObligationKey,
@@ -82,16 +85,19 @@ pub use observation::{
 };
 pub use resource::{
     AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, ResourceConfig,
-    ResourceSnapshot, ResultCredit, ResultCreditReservationError, ResultCreditSnapshot,
-    ResultCreditStage,
+    ResourceSnapshot,
+};
+pub use result_window::{
+    ResultCapacityConfig, ResultCapacityHandle, ResultCapacitySnapshot, ResultClosingCut,
+    ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
 };
 pub use scope::{
-    BusinessPermit, DeadlineExpiryHandle, PendingQueryRoot, QueryConcurrencyPermit,
-    RootAdmissionHandle, RootWork, ServingState, WorkCancellationRequestOutcome,
-    WorkCancellationRequester, WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope,
-    WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig, WorkloadControl,
-    WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision, WorkloadShutdown,
-    WorkloadShutdownError, WorkloadShutdownFailure,
+    BusinessPermit, CountedWorkloadControlParts, DeadlineExpiryHandle, PendingQueryRoot,
+    QueryConcurrencyPermit, RootAdmissionHandle, RootWork, ServingState,
+    WorkCancellationRequestOutcome, WorkCancellationRequester, WorkClass, WorkId, WorkOwner,
+    WorkRequest, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig,
+    WorkloadControl, WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision,
+    WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 /// Admission failures never imply cancellation, physical stop, or release.
@@ -108,15 +114,9 @@ pub enum WorkError {
     CapacityWaitTimeout,
     AlreadyAdmitted,
     AlreadyWaitingForResource(ResourceClass),
-    AlreadyWaitingForResultFetch,
-    AlreadyWaitingForResultDecode,
     Conflict,
     OwnerStillPresent,
     ArithmeticOverflow,
-    InvalidResultCreditTransition {
-        from: ResultCreditStage,
-        requested: ResultCreditStage,
-    },
 }
 
 impl std::fmt::Display for WorkError {
@@ -134,21 +134,9 @@ impl std::fmt::Display for WorkError {
             Self::AlreadyWaitingForResource(class) => {
                 write!(f, "Work already has a {class:?} resource capacity wait")
             }
-            Self::AlreadyWaitingForResultFetch => {
-                f.write_str("Work already has a result fetch capacity wait")
-            }
-            Self::AlreadyWaitingForResultDecode => {
-                f.write_str("Work already has a result decode capacity wait")
-            }
             Self::Conflict => f.write_str("Work identity has conflicting facts"),
             Self::OwnerStillPresent => f.write_str("Work still has an active owner"),
             Self::ArithmeticOverflow => f.write_str("Work accounting overflow"),
-            Self::InvalidResultCreditTransition { from, requested } => {
-                write!(
-                    f,
-                    "Invalid result-credit transition from {from:?} to {requested:?}"
-                )
-            }
         }
     }
 }

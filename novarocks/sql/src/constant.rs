@@ -404,3 +404,32 @@ pub(crate) fn format_constant_observed(
     work.finish()?;
     Ok(quoted)
 }
+
+/// Stream selected diagnostic output into the caller's bounded writer.
+/// An inner fmt refusal leaves the caller's typed budget journal authoritative.
+pub(crate) fn write_constant_observed(
+    value: &ConstantValue,
+    control: &dyn PureCompileControl,
+    output: &mut dyn std::fmt::Write,
+) -> Result<std::fmt::Result, crate::compiler::SqlCompileError> {
+    let ty = value.value_type();
+    let quoted = ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
+        && matches!(
+            ty.data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+        && value
+            .try_utf8_borrowed_observed(CompilePhase::LowerProgram, control)?
+            .is_some();
+    if quoted && output.write_str("'").is_err() {
+        return Ok(Err(std::fmt::Error));
+    }
+    let result = value.write_diagnostic_observed(CompilePhase::LowerProgram, control, output)?;
+    if result.is_err() {
+        return Ok(result);
+    }
+    if quoted {
+        return Ok(output.write_str("'"));
+    }
+    Ok(Ok(()))
+}

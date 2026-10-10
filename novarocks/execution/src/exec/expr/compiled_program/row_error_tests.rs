@@ -468,6 +468,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             })
             .unwrap();
         fields.push(ResultField {
+            domain: crate::test_result_domain::result_value_domain(&ty),
             name: format!("result_{}", fields.len()).into(),
             alias: None,
             value: id,
@@ -583,6 +584,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     }
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&output].output.clone(),
         fields: fields.into_boxed_slice(),

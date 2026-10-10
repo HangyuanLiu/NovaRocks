@@ -988,6 +988,11 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
         SqlType::Binary => "VARBINARY".to_string(),
         SqlType::Bitmap => "BITMAP".to_string(),
         SqlType::Hll => "HLL".to_string(),
+        SqlType::Object | SqlType::Percentile => {
+            return Err(
+                "internal opaque value domains have no public Iceberg SQL type name".into(),
+            );
+        }
         SqlType::Boolean => "BOOLEAN".to_string(),
         SqlType::Date => "DATE".to_string(),
         SqlType::DateTime => "DATETIME".to_string(),

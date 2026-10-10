@@ -791,6 +791,13 @@ fn prepare_planned_ctas_connector_write(
             plan,
             &completion_control,
         )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
         .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
@@ -1625,6 +1632,11 @@ impl CtasEngine for DmlExecutionKernel {
             &request.execution,
             &connector_context,
         )?;
+        if planned.source.has_private_output_domain() {
+            return Err(internal_failure(
+                "CTAS source contains an unsupported internal opaque value domain",
+            ));
+        }
         let source_columns = planned.source.output_columns();
         if source_columns.is_empty() {
             return Err(CtasFailure {
@@ -1633,6 +1645,8 @@ impl CtasEngine for DmlExecutionKernel {
                 user_error: None,
             });
         }
+        crate::query_execution::dml::iceberg_ctas::validate_source_domains(&source_columns)
+            .map_err(internal_failure)?;
         let output_schema = Arc::new(arrow::datatypes::Schema::new(
             source_columns
                 .iter()

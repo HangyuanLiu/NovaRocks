@@ -502,6 +502,25 @@ where
             .unwrap_or(TargetReadiness::Unobserved)
     }
 
+    /// Inspect a readiness value while its runtime owner still lends it.
+    /// A bounded listing can refuse a large reason before cloning it.
+    pub(crate) fn with_readiness<R>(
+        &self,
+        target: &T,
+        inspect: impl FnOnce(&TargetReadiness) -> R,
+    ) -> R {
+        let entries = self
+            .inner
+            .lock()
+            .expect("MV application runtime lock poisoned");
+        inspect(
+            entries
+                .get(target)
+                .map(|entry| &entry.readiness)
+                .unwrap_or(&TargetReadiness::Unobserved),
+        )
+    }
+
     pub(crate) fn set_unavailable(&self, target: T, reason: String) {
         self.inner
             .lock()

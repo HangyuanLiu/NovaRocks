@@ -154,6 +154,50 @@ impl CompletedPhysicalPlanCandidate {
         }
     }
 
+    /// Consume the same source before any plan aliases are published.
+    pub fn freeze_root_output(
+        self,
+        output: novarocks_result_contract::FrozenRootOutput,
+    ) -> Result<Self, FinalPlanCompletionError> {
+        let contract = novarocks_result_contract::RootOutputContract::new(
+            novarocks_result_contract::RootProfileId::V1,
+            output,
+        );
+        let source = match self.source {
+            CompletedPlanSource::Sql(source) => {
+                let source =
+                    Arc::try_unwrap(source).map_err(|_| FinalPlanCompletionError::Compiler {
+                        message: Arc::from(
+                            "root purpose must be frozen before plan aliases are published",
+                        ),
+                    })?;
+                CompletedPlanSource::Sql(Arc::new(source.with_root_output(contract).map_err(
+                    |error| FinalPlanCompletionError::InvalidPlan {
+                        message: Arc::from(error.to_string()),
+                    },
+                )?))
+            }
+            CompletedPlanSource::Program(plan) => {
+                let plan =
+                    Arc::try_unwrap(plan).map_err(|_| FinalPlanCompletionError::Compiler {
+                        message: Arc::from(
+                            "root purpose must be frozen before plan aliases are published",
+                        ),
+                    })?;
+                CompletedPlanSource::Program(Arc::new(plan.with_root_output(contract).map_err(
+                    |error| FinalPlanCompletionError::InvalidPlan {
+                        message: Arc::from(error.to_string()),
+                    },
+                )?))
+            }
+        };
+        Ok(Self {
+            source,
+            display_intent: self.display_intent,
+            display_annotations: self.display_annotations,
+        })
+    }
+
     pub fn plan(&self) -> &Arc<PhysicalPlan> {
         match &self.source {
             CompletedPlanSource::Sql(source) => source.plan_arc(),
@@ -196,7 +240,14 @@ impl CompletedPhysicalPlanCandidate {
         // operator tree. What the plan states to the backend is a different
         // question, and it has its own level.
         let lines = if matches!(level, novarocks_sql::compiler::ExplainLevel::Contract) {
-            render_completed_plan(self.plan(), &self.display_annotations, level, None, budget)
+            render_completed_plan(
+                self.plan(),
+                &self.display_annotations,
+                level,
+                None,
+                budget,
+                control,
+            )
         } else {
             render_completed_plan_tree(self.plan(), level, control)
         };
@@ -814,6 +865,89 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn root_purpose_freeze_preserves_plan_version_display_and_access() {
+        use novarocks_result_contract::FrozenRootOutput;
+        let driver = FinalPlanCompletionDriver::new(Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        }));
+        let (_root, scope) = scope();
+        for client in [false, true] {
+            let completed = driver
+                .complete(
+                    request(
+                        "SELECT 1 AS display",
+                        SqlCompileControl::unbounded(),
+                        SqlCompileIntent::Explain {
+                            level: ExplainLevel::Normal,
+                            analyze: false,
+                        },
+                    ),
+                    &scope,
+                )
+                .await
+                .unwrap();
+            let version = completed.candidate().plan().version();
+            let intent = completed.candidate().display_intent();
+            let annotations = completed.candidate().display_annotations().to_vec();
+            let expected_lines = completed
+                .candidate()
+                .render_explain_lines(
+                    ExplainRenderBudget::default(),
+                    &SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+            let output = if client {
+                FrozenRootOutput::ClientRows(
+                    novarocks_sql::compiler::client_render_schema(completed.candidate().plan(), 0)
+                        .unwrap(),
+                )
+            } else {
+                FrozenRootOutput::CountOnly
+            };
+            let completed = completed.freeze_root_output(output).unwrap();
+            let candidate = completed.candidate();
+            assert_eq!(candidate.plan().version(), version);
+            assert_eq!(candidate.display_intent(), intent);
+            assert_eq!(candidate.display_annotations(), annotations);
+            assert_eq!(
+                candidate
+                    .render_explain_lines(
+                        ExplainRenderBudget::default(),
+                        &SqlCompileControl::unbounded(),
+                    )
+                    .unwrap(),
+                expected_lines
+            );
+            assert!(completed.access().is_empty());
+            assert!(novarocks_physical_plan::validate_plan(candidate.plan()).is_ok());
+            let (_, access) = completed
+                .freeze_root_output(FrozenRootOutput::CountOnly)
+                .unwrap_err();
+            assert!(access.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn root_purpose_freeze_refuses_published_alias_without_cloning_a_plan() {
+        let driver = FinalPlanCompletionDriver::new(Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        }));
+        let (_root, scope) = scope();
+        let completed = driver.complete(values_request(), &scope).await.unwrap();
+        let alias = completed.candidate().clone();
+        let (_, access) = completed
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
+            .unwrap_err();
+        assert!(access.is_empty());
+        let result = alias.plan().result_port().unwrap();
+        assert!(matches!(
+            alias.plan().fragments()[&result.fragment].sink(),
+            novarocks_physical_plan::FragmentSink::Result
+        ));
+        assert_eq!(Arc::strong_count(alias.plan()), 1);
     }
 
     /// A statement compiled to be executed has no EXPLAIN text to give.

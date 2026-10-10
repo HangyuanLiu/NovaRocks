@@ -658,6 +658,7 @@ struct PaimonGenericControl {
     warehouse: Arc<str>,
     access: Arc<dyn PaimonRoleFileIoFactory>,
     async_runtime: PaimonAsyncRuntime,
+    listing_admission: crate::catalog::listing_admission::ListingAdmission,
 }
 
 impl PaimonGenericControl {
@@ -671,6 +672,7 @@ impl PaimonGenericControl {
             .access
             .bind_file_io(&self.properties, &self.warehouse, request)?;
         PaimonFileSystemCatalog::try_new(&self.warehouse, host_io, resources)
+            .map(|catalog| catalog.with_listing_admission(self.listing_admission.clone()))
     }
 
     fn prepare_read(
@@ -709,9 +711,10 @@ impl ConnectorMetadata for PaimonGenericControl {
         self.ensure_instance(&request.instance_id)?;
         let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
-        let entries = self
-            .async_runtime
-            .block_on(&resources, async move { catalog.list_databases().await })??;
+        let bound = request.bound;
+        let entries = self.async_runtime.block_on(&resources, async move {
+            catalog.list_databases(bound).await
+        })??;
         Ok(entries.map(|entries| {
             entries
                 .into_iter()
@@ -725,27 +728,23 @@ impl ConnectorMetadata for PaimonGenericControl {
 
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.namespace.instance_id)?;
-        Ok(self
-            .list_namespaces(ConnectorListNamespacesRequest {
-                instance_id: request.namespace.instance_id.clone(),
-                context: request.context,
-            })?
-            .iter()
-            .any(|value| value.namespace == request.namespace.namespace))
+        let resources = PaimonRequestControl::from_request(&request.context);
+        let catalog = self.catalog(&request.context)?;
+        let namespace = request.namespace.namespace;
+        self.async_runtime.block_on(&resources, async move {
+            catalog.namespace_exists(&namespace).await
+        })?
     }
 
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.table.instance_id)?;
         let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
-        let namespace = request.table.namespace.clone();
-        let entries = self.async_runtime.block_on(&resources, async move {
-            catalog.list_tables(&namespace).await
-        })??;
-        Ok(entries
-            .entries()
-            .iter()
-            .any(|name| name == request.table.table.as_ref()))
+        self.async_runtime.block_on(&resources, async move {
+            catalog
+                .table_exists(&request.table.namespace, &request.table.table)
+                .await
+        })?
     }
 
     fn list_tables(
@@ -756,8 +755,9 @@ impl ConnectorMetadata for PaimonGenericControl {
         let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
         let namespace = request.namespace.namespace.clone();
+        let bound = request.bound;
         let entries = self.async_runtime.block_on(&resources, async move {
-            catalog.list_tables(&namespace).await
+            catalog.list_tables(&namespace, bound).await
         })??;
         Ok(entries.map(|entries| {
             entries
@@ -891,6 +891,7 @@ impl ConnectorControlRoleBindingFactory for PaimonControlRoleBindingFactory {
                 warehouse: Arc::clone(&warehouse),
                 access: Arc::clone(&access),
                 async_runtime: async_runtime.clone(),
+                listing_admission: crate::catalog::listing_admission::ListingAdmission::default(),
             });
             let control = ConnectorControlBinding::try_new(
                 descriptor.clone(),

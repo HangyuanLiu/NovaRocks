@@ -118,6 +118,7 @@ fn bind(
         ProgramNodeId::new(1),
         recipe,
         &CompiledWriteTask {
+            backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             runtime,
             fragment_instance_id: FINST,
             query_options: &options,
@@ -195,6 +196,7 @@ fn a_compiled_finish_binds_the_canonical_carrier_validator() {
     bind_compiled_finish(
         ProgramNodeId::new(2),
         &CompiledWriteTask {
+            backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             runtime: &runtime,
             fragment_instance_id: FINST,
             query_options: &options,
@@ -521,6 +523,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FragmentId::new(2),
         output: OutputPort {
             node: finish,
@@ -529,6 +532,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         fields: outputs
             .iter()
             .map(|field| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: field.name.clone(),
                 alias: None,
                 value: field.value,

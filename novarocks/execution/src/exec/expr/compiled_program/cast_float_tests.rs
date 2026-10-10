@@ -396,9 +396,11 @@ pub(super) fn inherited_round_fixture_with_target(
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fid,
         output: fragment.nodes()[&output_node].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "float_cast_after_round".into(),
             alias: None,
             value,

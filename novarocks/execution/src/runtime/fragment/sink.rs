@@ -51,6 +51,7 @@ pub(crate) fn materialize_fragment_sink(
         transmitter,
         result_session,
         None,
+        None,
         std::sync::Arc::clone(&runtime_error),
     )
     .map(|materialized| materialized.factory)
@@ -66,6 +67,9 @@ pub(crate) fn materialize_fragment_sink_with_result(
     instance: &FragmentInstanceSpec,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
+    root_result_session: Option<
+        std::sync::Arc<dyn crate::runtime::fragment::io::RootResultSession>,
+    >,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
     runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<MaterializedFragmentSink, FragmentLaunchError> {
@@ -80,6 +84,7 @@ pub(crate) fn materialize_fragment_sink_with_result(
         program.root_plan_node_id().get(),
         transmitter,
         result_session,
+        root_result_session,
         edge_gates,
         std::sync::Arc::clone(&runtime_error),
     )
@@ -134,6 +139,7 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
         transmitter,
         result_session,
         None,
+        None,
         std::sync::Arc::clone(&runtime_error),
     )
     .map(|materialized| materialized.factory)
@@ -147,10 +153,32 @@ fn materialize_fragment_sink_components_impl(
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
+    root_result_session: Option<
+        std::sync::Arc<dyn crate::runtime::fragment::io::RootResultSession>,
+    >,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
     runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<MaterializedFragmentSink, FragmentLaunchError> {
     match (program, assignment) {
+        (StaticSinkProgram::RootResult(contract), FragmentSinkAssignment::None) => {
+            let session = root_result_session.ok_or_else(|| {
+                materialization_error("frozen root requires its opened bounded session")
+            })?;
+            if session.spec().contract.as_ref() != contract.as_ref() {
+                return Err(materialization_error(
+                    "bounded root session has a different frozen contract",
+                ));
+            }
+            let maximum_dop =
+                novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                    .root_maximum_root_drivers as i32;
+            let factory =
+                crate::exec::operators::RootResultSinkFactory::try_new(session, maximum_dop)
+                    .map_err(materialization_error)?;
+            Ok(MaterializedFragmentSink {
+                factory: Box::new(factory),
+            })
+        }
         (StaticSinkProgram::Result, FragmentSinkAssignment::None) => {
             let session = result_session.ok_or_else(|| {
                 materialization_error("RESULT_SINK requires an opened Fragment result session")
@@ -253,14 +281,21 @@ pub(crate) fn materialize_compiled_sink(
     let sink = graph
         .sink()
         .ok_or_else(|| materialization_error("compiled local program has no static sink"))?;
-    if !matches!(sink, StaticSinkProgram::Result) && result_sink.is_some() {
+    if !matches!(
+        sink,
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)
+    ) && result_sink.is_some()
+    {
         return Err(materialization_error(format!(
             "compiled {} sink cannot take a result sink",
             sink_program_name(sink)
         )));
     }
     match (sink, assignment) {
-        (StaticSinkProgram::Result, FragmentSinkAssignment::None) => result_sink
+        (
+            StaticSinkProgram::Result | StaticSinkProgram::RootResult(_),
+            FragmentSinkAssignment::None,
+        ) => result_sink
             .ok_or_else(|| materialization_error("compiled RESULT_SINK requires a result sink")),
         (StaticSinkProgram::Noop, FragmentSinkAssignment::None) => {
             Ok(Box::new(NoopSinkFactory::new()))
@@ -488,6 +523,7 @@ fn materialization_error(detail: impl Into<String>) -> FragmentLaunchError {
 fn sink_program_name(program: &StaticSinkProgram) -> &'static str {
     match program {
         StaticSinkProgram::Result => "result",
+        StaticSinkProgram::RootResult(_) => "root_result",
         StaticSinkProgram::Noop => "noop",
         StaticSinkProgram::DataStream { .. } => "data_stream",
         StaticSinkProgram::MultiCastDataStream { .. } => "multi_cast_data_stream",
@@ -724,6 +760,7 @@ mod tests {
                 &instance,
                 test_transmitter(),
                 None,
+                None,
                 Some(std::sync::Arc::clone(&gates)),
                 std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             )
@@ -732,6 +769,7 @@ mod tests {
                 &program,
                 &instance,
                 test_transmitter(),
+                None,
                 None,
                 None,
                 std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),

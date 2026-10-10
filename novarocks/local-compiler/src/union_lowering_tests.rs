@@ -413,12 +413,14 @@ fn finish_package(
     let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&root].output.clone(),
         fields: result_values
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("original_{ordinal}").into_boxed_str(),
                 alias: Some(format!("selected_{ordinal}").into_boxed_str()),
                 value: *value,

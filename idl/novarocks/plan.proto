@@ -29,6 +29,7 @@ import "catalog.proto";
 import "connector_read.proto";
 import "connector_write.proto";
 import "expr.proto";
+import "result.proto";
 
 // Whole-query distributed plan.
 // Owner: produced by the future FE/native plan encoder and consumed by the
@@ -683,6 +684,7 @@ message CteMulticastFlavor {
 // future BE/native plan prepare layer.
 message DataSink {
   oneof kind {
+    novarocks.result.RootOutputContract root_result = 9; // Bounded, purpose-frozen root output.
     bool result = 1;                                      // true for a result sink.
     bool noop = 2;                                        // true for a no-op sink.
     ChangeStreamRouterSink change_stream_router = 4; // Iceberg change-stream router sink.

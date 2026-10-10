@@ -38,7 +38,8 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorMutationFailureKind, ExternalMutationEffect,
+    ConnectorError, ConnectorErrorKind, ConnectorListingBound, ConnectorListingCollector,
+    ConnectorMutationFailureKind, ExternalMutationEffect,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -68,15 +69,26 @@ pub(super) fn table_ident(name: &CatalogTableName) -> Result<TableIdent, Connect
         .map_err(|error| invalid(format!("build Iceberg identity for {name}: {error}")))
 }
 
+/// Order a bounded listing and drop duplicate names.
+pub(super) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Delegation onto one concrete catalog client.
 #[derive(Debug)]
 pub(super) struct CatalogDelegate {
     client: Arc<dyn Catalog>,
+    pub(super) listing: Arc<super::listing_admission::ListingAdmission>,
 }
 
 impl CatalogDelegate {
     pub(super) fn new(client: Arc<dyn Catalog>) -> Self {
-        Self { client }
+        Self {
+            client,
+            listing: Default::default(),
+        }
     }
 
     pub(super) fn client(&self) -> &Arc<dyn Catalog> {
@@ -85,22 +97,56 @@ impl CatalogDelegate {
 
     // ---- Reads ----------------------------------------------------------
 
-    pub(super) async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
-        let namespaces = self
-            .client
-            .list_namespaces(None)
-            .await
-            .map_err(|error| map_read_error(&error))?;
-        let mut names = namespaces
+    /// The vendored clients expose namespace enumeration only as one complete
+    /// listing, so the bound is enforced on that listing as it is retained.
+    pub(super) async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_namespaces_inner(
+            bound,
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(super) async fn list_namespaces_observed(
+        &self,
+        bound: ConnectorListingBound,
+        invocation: &super::hms_listing_observer::Invocation,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_namespaces_inner(bound, Some(invocation)).await
+    }
+
+    async fn list_namespaces_inner(
+        &self,
+        bound: ConnectorListingBound,
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")] invocation: Option<
+            &super::hms_listing_observer::Invocation,
+        >,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let mut collector = ConnectorListingCollector::new(bound)?;
+        let namespaces = {
+            let sdk = self.client.list_namespaces(None);
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            let result = super::hms_listing_observer::sdk_call(invocation, sdk).await;
+            #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+            let result = sdk.await;
+            result
+        }
+        .map_err(|error| map_read_error(&error))?;
+        for name in namespaces
             .into_iter()
             .flat_map(|ident| ident.inner())
             // A leading dot marks catalog-internal bookkeeping namespaces,
             // including the CTAS staging root, which SQL must never see.
             .filter(|name| !name.starts_with('.'))
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
+        {
+            collector.push(name)?;
+        }
+        Ok(sorted_unique(collector.finish()?))
     }
 
     pub(super) async fn namespace_exists(
@@ -114,23 +160,56 @@ impl CatalogDelegate {
             .map_err(|error| map_read_error(&error))
     }
 
+    /// One complete table listing from a client without a paging capability,
+    /// bounded as it is retained.
     pub(super) async fn list_tables(
         &self,
         namespace: &CatalogNamespaceName,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_tables_inner(
+            namespace,
+            bound,
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(super) async fn list_tables_observed(
+        &self,
+        namespace: &CatalogNamespaceName,
+        bound: ConnectorListingBound,
+        invocation: &super::hms_listing_observer::Invocation,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_tables_inner(namespace, bound, Some(invocation))
+            .await
+    }
+
+    async fn list_tables_inner(
+        &self,
+        namespace: &CatalogNamespaceName,
+        bound: ConnectorListingBound,
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")] invocation: Option<
+            &super::hms_listing_observer::Invocation,
+        >,
     ) -> Result<Vec<String>, ConnectorError> {
         let ident = namespace_ident(namespace)?;
-        let tables = self
-            .client
-            .list_tables(&ident)
-            .await
-            .map_err(|error| map_read_error(&error))?;
-        let mut names = tables
-            .into_iter()
-            .map(|ident| ident.name)
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
+        let mut collector = ConnectorListingCollector::new(bound)?;
+        let tables = {
+            let sdk = self.client.list_tables(&ident);
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            let result = super::hms_listing_observer::sdk_call(invocation, sdk).await;
+            #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+            let result = sdk.await;
+            result
+        }
+        .map_err(|error| map_read_error(&error))?;
+        for table in tables {
+            collector.push(table.name)?;
+        }
+        Ok(sorted_unique(collector.finish()?))
     }
 
     pub(super) async fn table_exists(
@@ -166,23 +245,56 @@ impl CatalogDelegate {
             .map_err(|error| map_read_error(&error))
     }
 
+    /// The vendored clients expose view enumeration only as one complete
+    /// listing, so the bound is enforced on that listing as it is retained.
     pub(super) async fn list_views(
         &self,
         namespace: &CatalogNamespaceName,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_views_inner(
+            namespace,
+            bound,
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(super) async fn list_views_observed(
+        &self,
+        namespace: &CatalogNamespaceName,
+        bound: ConnectorListingBound,
+        invocation: &super::hms_listing_observer::Invocation,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_views_inner(namespace, bound, Some(invocation))
+            .await
+    }
+
+    async fn list_views_inner(
+        &self,
+        namespace: &CatalogNamespaceName,
+        bound: ConnectorListingBound,
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")] invocation: Option<
+            &super::hms_listing_observer::Invocation,
+        >,
     ) -> Result<Vec<String>, ConnectorError> {
         let ident = namespace_ident(namespace)?;
-        let views = self
-            .client
-            .list_views(&ident)
-            .await
-            .map_err(|error| map_read_error(&error))?;
-        let mut names = views
-            .into_iter()
-            .map(|ident| ident.name)
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
+        let mut collector = ConnectorListingCollector::new(bound)?;
+        let views = {
+            let sdk = self.client.list_views(&ident);
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            let result = super::hms_listing_observer::sdk_call(invocation, sdk).await;
+            #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+            let result = sdk.await;
+            result
+        }
+        .map_err(|error| map_read_error(&error))?;
+        for view in views {
+            collector.push(view.name)?;
+        }
+        Ok(sorted_unique(collector.finish()?))
     }
 
     pub(super) async fn load_view(

@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "topology": "1FE+3BE",
+  "scope": "Cancellation while a real client pauses reads: observe a held Closing window after KILL returns with Client released, full row plus ERR1317 and native same-socket reuse; incomplete large row emits a positive wire prefix, physically closes the socket and refuses a zero-response follow-up without new BE tasks. KILL start/return/resume times are recorded; the 2s post-KILL observation is not the production 5s Closing deadline origin. Excludes explicit framing cursor/tail bytes proof, full pools, ACK-only and allocator exit.",
+  "segment_bytes": 1048576,
+  "client_receive_buffer_bytes": 4096,
+  "max_applied_receive_buffer_bytes": 65536,
+  "mysql_client_max_packet_bytes": 67108864,
+  "query_observation_ms": 20000,
+  "metadata_wait_ms": 5000,
+  "held_phase_ms": 5000,
+  "closing_phase_ms": 2000,
+  "phase_sample_interval_ms": 100,
+  "phase_max_samples": 51,
+  "expected_mysql_error_code": 1317,
+  "health": {
+    "sql": "SELECT SUM(generate_series) AS total FROM generate_series(1, 100)",
+    "expected_row_sha256": "6dab454b19ecc06d337eb421a7ecc69aaa272a74fdf3a6bf7b81900ca94758b1"
+  },
+  "cases": [
+    {
+      "sql": "SELECT REPEAT('x', 1048576) AS payload FROM generate_series(1, 1)",
+      "expected_columns": 1,
+      "expected_schema": [
+        {
+          "name": "payload",
+          "mysql_type": 253
+        }
+      ],
+      "expected_rows": 1,
+      "expected_row_payload_bytes": 1048580,
+      "expected_packets": 5,
+      "expected_row_sha256": "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8",
+      "name": "result-delivery/unread-row-cancel-closing-window",
+      "mode": "resident",
+      "native_row_bytes": 1048584
+    },
+    {
+      "sql": "SELECT REPEAT('q', 1048575 + generate_series) AS c0, REPEAT('q', 1048575 + generate_series) AS c1, REPEAT('q', 1048575 + generate_series) AS c2, REPEAT('q', 1048575 + generate_series) AS c3, REPEAT('q', 1048575 + generate_series) AS c4, REPEAT('q', 1048575 + generate_series) AS c5, REPEAT('q', 1048575 + generate_series) AS c6, REPEAT('q', 1048575 + generate_series) AS c7, REPEAT('q', 1048575 + generate_series) AS c8, REPEAT('q', 1048575 + generate_series) AS c9, REPEAT('q', 1048575 + generate_series) AS c10, REPEAT('q', 1048575 + generate_series) AS c11, REPEAT('q', 1048575 + generate_series) AS c12, REPEAT('q', 1048575 + generate_series) AS c13, REPEAT('q', 1048575 + generate_series) AS c14, REPEAT('q', 1048575 + generate_series) AS c15, REPEAT('q', 1048575 + generate_series) AS c16 FROM generate_series(1, 1)",
+      "expected_columns": 17,
+      "expected_schema": [
+        {
+          "name": "c0",
+          "mysql_type": 253
+        },
+        {
+          "name": "c1",
+          "mysql_type": 253
+        },
+        {
+          "name": "c2",
+          "mysql_type": 253
+        },
+        {
+          "name": "c3",
+          "mysql_type": 253
+        },
+        {
+          "name": "c4",
+          "mysql_type": 253
+        },
+        {
+          "name": "c5",
+          "mysql_type": 253
+        },
+        {
+          "name": "c6",
+          "mysql_type": 253
+        },
+        {
+          "name": "c7",
+          "mysql_type": 253
+        },
+        {
+          "name": "c8",
+          "mysql_type": 253
+        },
+        {
+          "name": "c9",
+          "mysql_type": 253
+        },
+        {
+          "name": "c10",
+          "mysql_type": 253
+        },
+        {
+          "name": "c11",
+          "mysql_type": 253
+        },
+        {
+          "name": "c12",
+          "mysql_type": 253
+        },
+        {
+          "name": "c13",
+          "mysql_type": 253
+        },
+        {
+          "name": "c14",
+          "mysql_type": 253
+        },
+        {
+          "name": "c15",
+          "mysql_type": 253
+        },
+        {
+          "name": "c16",
+          "mysql_type": 253
+        }
+      ],
+      "expected_rows": 1,
+      "expected_row_payload_bytes": 17825860,
+      "expected_packets": 22,
+      "expected_row_sha256": "51433c7930844aec5dca09a6dcb7e13e1a98801a483a30b04f9f3be064c9ffb4",
+      "name": "result-delivery/partial-large-row-cancel-poisons-socket",
+      "mode": "missing-tail",
+      "native_row_bytes": 17825864
+    }
+  ]
+}

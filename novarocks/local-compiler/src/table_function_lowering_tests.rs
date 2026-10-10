@@ -638,6 +638,7 @@ fn package(
     .unwrap();
     let output = fragment.nodes()[&fragment.root()].output.clone();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: output.clone(),
         fields: output
@@ -645,6 +646,7 @@ fn package(
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("c{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,

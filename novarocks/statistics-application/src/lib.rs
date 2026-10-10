@@ -30,6 +30,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_workload_control::{
     QueryConcurrencyPermit, WorkClass, WorkOwner, WorkRequest, WorkScope,
 };
@@ -276,6 +277,58 @@ impl fmt::Display for StatisticsRepositoryError {
 
 impl std::error::Error for StatisticsRepositoryError {}
 
+/// Move-only receipt for one independently admitted statistics business root.
+/// All three inputs must name the exact host/root; no capacity is acquired here.
+pub struct StatisticsJobAdmission {
+    owner: WorkOwner,
+    query_concurrency: QueryConcurrencyPermit,
+    result_capacity: QueryResultCapacityBinding,
+}
+impl StatisticsJobAdmission {
+    pub fn try_new(
+        owner: WorkOwner,
+        query_concurrency: QueryConcurrencyPermit,
+        window: novarocks_workload_control::ResultWindowGrant,
+    ) -> Result<Self, StatisticsRepositoryError> {
+        let scope = owner.scope();
+        if !query_concurrency.is_for_scope(&scope)
+            || window.class() != novarocks_workload_control::ResultWindowClass::Internal
+        {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics admission requires its exact query permit and Internal window",
+            ));
+        }
+        window
+            .check_backing_total(
+                novarocks_workload_control::ResultCapacityConfig::V1.all_objects_bytes[2],
+            )
+            .map_err(work_error)?;
+        let result_capacity = QueryResultCapacityBinding::try_new(&scope, window.retain_alias())
+            .map_err(work_error)?;
+        Ok(Self {
+            owner,
+            query_concurrency,
+            result_capacity,
+        })
+    }
+}
+
+/// A phase's cancellation/attribution scope and the independently owned job's
+/// original capacity are separate facts. Preparation may exit before collect.
+pub struct StatisticsAttemptContext {
+    stage_scope: WorkScope,
+    root_result_capacity: QueryResultCapacityBinding,
+}
+impl StatisticsAttemptContext {
+    pub fn stage_scope(&self) -> &WorkScope {
+        &self.stage_scope
+    }
+    pub fn root_result_capacity(&self) -> &QueryResultCapacityBinding {
+        &self.root_result_capacity
+    }
+}
+
 struct LiveJob {
     job: StatisticsJob,
     /// The business root remains owned until actual runtime convergence, not
@@ -284,6 +337,7 @@ struct LiveJob {
     /// An independently submitted statistics job is warehouse compute. Its
     /// permit lasts through actual job convergence, alongside the root owner.
     query_concurrency: Option<QueryConcurrencyPermit>,
+    result_capacity: Option<QueryResultCapacityBinding>,
 }
 
 #[derive(Default)]
@@ -305,41 +359,25 @@ impl StatisticsJobRepository {
         Self::default()
     }
 
-    /// Submission consumes the business root.  The observer of an ANALYZE
-    /// command therefore cannot detach and accidentally cancel the job root.
-    pub async fn create(
-        &self,
-        request: StatisticsJobCreate,
-        owner: WorkOwner,
-    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.create_now(request, owner)
-    }
-
-    /// Submit a statistics job after it has received the warehouse query
-    /// permit. The repository owns both facts until terminal convergence.
+    /// Submit a statistics job with its exact whole-window admission receipt.
     pub async fn create_admitted(
         &self,
         request: StatisticsJobCreate,
-        owner: WorkOwner,
-        query_concurrency: QueryConcurrencyPermit,
+        admission: StatisticsJobAdmission,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.create_now_with_permit(request, owner, Some(query_concurrency))
+        self.create_now_admitted(request, admission)
     }
 
-    pub(crate) fn create_now(
+    fn create_now_admitted(
         &self,
         request: StatisticsJobCreate,
-        owner: WorkOwner,
+        admission: StatisticsJobAdmission,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.create_now_with_permit(request, owner, None)
-    }
-
-    fn create_now_with_permit(
-        &self,
-        request: StatisticsJobCreate,
-        owner: WorkOwner,
-        query_concurrency: Option<QueryConcurrencyPermit>,
-    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        let StatisticsJobAdmission {
+            owner,
+            query_concurrency,
+            result_capacity,
+        } = admission;
         let mut state = self.lock()?;
         if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
             return Err(StatisticsRepositoryError::new(
@@ -353,7 +391,8 @@ impl StatisticsJobRepository {
             LiveJob {
                 job: job.clone(),
                 owner: Some(owner),
-                query_concurrency,
+                query_concurrency: Some(query_concurrency),
+                result_capacity: Some(result_capacity),
             },
         );
         drop(state);
@@ -377,6 +416,22 @@ impl StatisticsJobRepository {
                     .find(|entry| entry.job.id == id)
                     .map(|entry| entry.job.clone())
             }))
+    }
+
+    pub async fn wait_for_conclusion(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let job = self.get(id).await?.ok_or_else(|| Self::not_found(id))?;
+            if job.state.is_terminal() && job.convergence.is_complete() {
+                return Ok(job);
+            }
+            notified.await;
+        }
     }
 
     pub async fn list(&self) -> Result<Vec<StatisticsJob>, StatisticsRepositoryError> {
@@ -430,10 +485,27 @@ impl StatisticsJobRepository {
         self.request_cancel_now(id, at_ms)
     }
 
+    /// Deliver cancellation even if no fresh wall-clock observation is available.
+    /// Existing observation timestamps are retained; no time is invented.
+    pub async fn request_cancel_without_time(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.request_cancel_with_time(id, None)
+    }
+
     pub(crate) fn request_cancel_now(
         &self,
         id: StatisticsJobId,
         at_ms: i64,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.request_cancel_with_time(id, Some(at_ms))
+    }
+
+    fn request_cancel_with_time(
+        &self,
+        id: StatisticsJobId,
+        at_ms: Option<i64>,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         let mut state = self.lock()?;
         let mut entry = state
@@ -441,20 +513,23 @@ impl StatisticsJobRepository {
             .remove(&id)
             .ok_or_else(|| Self::not_found(id))?;
         entry.job.cancel_requested = true;
-        entry.job.updated_at_ms = at_ms;
+        if let Some(at_ms) = at_ms {
+            entry.job.updated_at_ms = at_ms;
+        }
         if entry.job.state == StatisticsJobState::Active(StatisticsJobPhase::Submitted) {
             entry.job.state = StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled);
             entry.job.failure = Some(StatisticsFailure {
                 compile_control: None,
                 message: Arc::from("statistics job cancelled before collection"),
             });
-            entry.job.completed_at_ms = Some(at_ms);
+            entry.job.completed_at_ms = at_ms;
             entry.job.convergence = StatisticsConvergence {
                 collection_stopped: true,
                 execution_resources_released: true,
                 provider_session_closed: true,
             };
             drop(entry.query_concurrency.take());
+            drop(entry.result_capacity.take());
             if let Some(owner) = entry.owner.take() {
                 owner.complete();
             }
@@ -511,6 +586,7 @@ impl StatisticsJobRepository {
                 provider_session_closed: true,
             };
             drop(entry.query_concurrency.take());
+            drop(entry.result_capacity.take());
             if let Some(owner) = entry.owner.take() {
                 owner.complete();
             }
@@ -645,6 +721,7 @@ impl StatisticsJobRepository {
         entry.job.updated_at_ms = at_ms;
         if entry.job.state.is_terminal() && entry.job.convergence.is_complete() {
             drop(entry.query_concurrency.take());
+            drop(entry.result_capacity.take());
             if let Some(owner) = entry.owner.take() {
                 owner.complete();
             }
@@ -704,16 +781,22 @@ impl StatisticsJobRepository {
 /// makes the worker's convergence records evidence from the phase contract,
 /// rather than an inference from the terminal business conclusion.
 pub trait StatisticsAttemptExecutor: Send + Sync + 'static {
-    fn prepare(&self, job: &StatisticsJob, scope: &WorkScope)
-    -> Result<(), StatisticsAttemptError>;
+    fn prepare(
+        &self,
+        job: &StatisticsJob,
+        context: &StatisticsAttemptContext,
+    ) -> Result<(), StatisticsAttemptError>;
 
-    fn collect(&self, job: &StatisticsJob, scope: &WorkScope)
-    -> Result<(), StatisticsAttemptError>;
+    fn collect(
+        &self,
+        job: &StatisticsJob,
+        context: &StatisticsAttemptContext,
+    ) -> Result<(), StatisticsAttemptError>;
 
     fn publish(
         &self,
         job: &StatisticsJob,
-        scope: &WorkScope,
+        context: &StatisticsAttemptContext,
     ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError>;
 }
 
@@ -774,11 +857,14 @@ impl StatisticsWorker {
         let Some(job) = self.repository.claim_next(at_ms).await? else {
             return Ok(None);
         };
-        let root_scope = self.root_scope(job.id)?;
+        let (root_scope, result_capacity) = self.root_scope_and_capacity(job.id)?;
         let preparation = root_scope
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
-        let preparation_scope = preparation.scope();
+        let preparation_scope = StatisticsAttemptContext {
+            stage_scope: preparation.scope(),
+            root_result_capacity: result_capacity.clone(),
+        };
         if let Err(error) = self.executor.prepare(&job, &preparation_scope) {
             preparation.complete();
             return self
@@ -798,7 +884,10 @@ impl StatisticsWorker {
         let collection = root_scope
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
-        let collection_scope = collection.scope();
+        let collection_scope = StatisticsAttemptContext {
+            stage_scope: collection.scope(),
+            root_result_capacity: result_capacity.clone(),
+        };
         if let Err(error) = self.executor.collect(&job, &collection_scope) {
             collection.complete();
             self.repository
@@ -840,7 +929,10 @@ impl StatisticsWorker {
         let publication = root_scope
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
-        let publication_scope = publication.scope();
+        let publication_scope = StatisticsAttemptContext {
+            stage_scope: publication.scope(),
+            root_result_capacity: result_capacity.clone(),
+        };
         let result = self.executor.publish(&job, &publication_scope);
         publication.complete();
         let (conclusion, publication_fact, failure, finalization_failure) = match result {
@@ -925,12 +1017,24 @@ impl StatisticsWorker {
         Ok(Some(terminal))
     }
 
-    fn root_scope(&self, id: StatisticsJobId) -> Result<WorkScope, StatisticsRepositoryError> {
+    fn root_scope_and_capacity(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<(WorkScope, QueryResultCapacityBinding), StatisticsRepositoryError> {
         let state = self.repository.lock()?;
         state
             .active
             .get(&id)
-            .map(|entry| entry.owner.as_ref().expect("active job owns root").scope())
+            .map(|entry| {
+                (
+                    entry.owner.as_ref().expect("active job owns root").scope(),
+                    entry
+                        .result_capacity
+                        .as_ref()
+                        .expect("active job owns its result capacity")
+                        .clone(),
+                )
+            })
             .ok_or_else(|| StatisticsJobRepository::not_found(id))
     }
 
@@ -1022,7 +1126,14 @@ mod tests {
         }
     }
 
-    fn root() -> WorkOwner {
+    async fn root() -> StatisticsJobAdmission {
+        root_with_capacity().await.0
+    }
+
+    async fn root_with_capacity() -> (
+        StatisticsJobAdmission,
+        novarocks_workload_control::ResultCapacityHandle,
+    ) {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -1032,11 +1143,107 @@ mod tests {
             },
         )
         .expect("control");
+        let capacity = control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .expect("capacity");
         control.mark_ready().expect("ready");
-        control
-            .try_begin_root(WorkRequest::new(WorkClass::Statistics))
-            .expect("root")
+        let root = control
+            .root_admission()
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .expect("root");
+        let (permit, window) = root
             .owner
+            .scope()
+            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
+            .unwrap()
+            .await
+            .unwrap();
+        (
+            StatisticsJobAdmission::try_new(root.owner, permit, window).unwrap(),
+            capacity,
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_job_cancel_returns_only_its_own_holder_and_last_alias_releases_capacity() {
+        let (admission, capacity) = root_with_capacity().await;
+        let retained = admission.result_capacity.clone();
+        let repository = StatisticsJobRepository::new();
+        let job = repository
+            .create_admitted(create(1), admission)
+            .await
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let cancelled = repository.request_cancel(job.id, 2).await.unwrap();
+        assert!(cancelled.convergence.is_complete());
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        assert!(
+            repository
+                .lock()
+                .unwrap()
+                .terminal
+                .back()
+                .unwrap()
+                .result_capacity
+                .is_none()
+        );
+        drop(retained);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[tokio::test]
+    async fn admission_refuses_a_foreign_host_query_permit_even_when_root_ids_match() {
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
+        let make = || {
+            let control = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 1024 * 1024,
+                    control_bytes: 1024,
+                    per_scope_bytes: 1024 * 1024 - 1024,
+                },
+            )
+            .unwrap();
+            let capacity = control
+                .configure_result_capacity(ResultCapacityConfig::V1)
+                .unwrap();
+            control.mark_ready().unwrap();
+            (control, capacity)
+        };
+        let (control, capacity) = make();
+        let (foreign, foreign_capacity) = make();
+        let first = control
+            .root_admission()
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .unwrap();
+        let second = foreign
+            .root_admission()
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .unwrap();
+        assert_eq!(first.owner.scope().id(), second.owner.scope().id());
+        let (permit, window) = first
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Internal)
+            .unwrap()
+            .await
+            .unwrap();
+        let (foreign_permit, foreign_window) = second
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Internal)
+            .unwrap()
+            .await
+            .unwrap();
+        let refused = StatisticsJobAdmission::try_new(first.owner, foreign_permit, window)
+            .err()
+            .unwrap();
+        assert_eq!(refused.kind(), StatisticsRepositoryErrorKind::Conflict);
+        drop(permit);
+        drop(foreign_window);
+        second.owner.complete();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(foreign_capacity.snapshot().held_positions, [0; 4]);
     }
 
     struct RecordingExecutor {
@@ -1053,7 +1260,7 @@ mod tests {
         fn prepare(
             &self,
             _job: &StatisticsJob,
-            scope: &WorkScope,
+            context: &StatisticsAttemptContext,
         ) -> Result<(), StatisticsAttemptError> {
             self.started
                 .send(())
@@ -1063,7 +1270,7 @@ mod tests {
                 .expect("release lock")
                 .recv()
                 .expect("test releases the background preparation");
-            scope.check().map_err(|error| {
+            context.stage_scope().check().map_err(|error| {
                 StatisticsAttemptError::Cancelled(StatisticsFailure {
                     compile_control: None,
                     message: Arc::from(error.to_string()),
@@ -1074,7 +1281,7 @@ mod tests {
         fn collect(
             &self,
             _job: &StatisticsJob,
-            _scope: &WorkScope,
+            _context: &StatisticsAttemptContext,
         ) -> Result<(), StatisticsAttemptError> {
             Ok(())
         }
@@ -1082,7 +1289,7 @@ mod tests {
         fn publish(
             &self,
             _job: &StatisticsJob,
-            _scope: &WorkScope,
+            _context: &StatisticsAttemptContext,
         ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
             Ok(StatisticsPublicationOutcome {
                 fact: StatisticsPublicationFact::KnownCommitted,
@@ -1095,9 +1302,24 @@ mod tests {
         fn prepare(
             &self,
             _job: &StatisticsJob,
-            scope: &WorkScope,
+            context: &StatisticsAttemptContext,
         ) -> Result<(), StatisticsAttemptError> {
-            scope.check().map_err(|error| {
+            context
+                .root_result_capacity()
+                .scope()
+                .check()
+                .expect("job root remains live across phases");
+            assert_eq!(
+                context.root_result_capacity().class(),
+                novarocks_workload_control::ResultWindowClass::Internal
+            );
+            assert!(
+                !context
+                    .root_result_capacity()
+                    .window_alias()
+                    .is_for_scope(context.stage_scope())
+            );
+            context.stage_scope().check().map_err(|error| {
                 StatisticsAttemptError::Failed(StatisticsFailure {
                     compile_control: None,
                     message: Arc::from(error.to_string()),
@@ -1108,9 +1330,24 @@ mod tests {
         fn collect(
             &self,
             _job: &StatisticsJob,
-            scope: &WorkScope,
+            context: &StatisticsAttemptContext,
         ) -> Result<(), StatisticsAttemptError> {
-            scope.check().map_err(|error| {
+            context
+                .root_result_capacity()
+                .scope()
+                .check()
+                .expect("job root remains live across phases");
+            assert_eq!(
+                context.root_result_capacity().class(),
+                novarocks_workload_control::ResultWindowClass::Internal
+            );
+            assert!(
+                !context
+                    .root_result_capacity()
+                    .window_alias()
+                    .is_for_scope(context.stage_scope())
+            );
+            context.stage_scope().check().map_err(|error| {
                 StatisticsAttemptError::Failed(StatisticsFailure {
                     compile_control: None,
                     message: Arc::from(error.to_string()),
@@ -1121,9 +1358,24 @@ mod tests {
         fn publish(
             &self,
             _job: &StatisticsJob,
-            scope: &WorkScope,
+            context: &StatisticsAttemptContext,
         ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
-            scope.check().map_err(|error| {
+            context
+                .root_result_capacity()
+                .scope()
+                .check()
+                .expect("job root remains live across phases");
+            assert_eq!(
+                context.root_result_capacity().class(),
+                novarocks_workload_control::ResultWindowClass::Internal
+            );
+            assert!(
+                !context
+                    .root_result_capacity()
+                    .window_alias()
+                    .is_for_scope(context.stage_scope())
+            );
+            context.stage_scope().check().map_err(|error| {
                 StatisticsAttemptError::Failed(StatisticsFailure {
                     compile_control: None,
                     message: Arc::from(error.to_string()),
@@ -1150,7 +1402,10 @@ mod tests {
     #[tokio::test]
     async fn job_query_attempt_and_publication_have_distinct_v7_identities() {
         let repository = StatisticsJobRepository::new();
-        let job = repository.create(create(1), root()).await.expect("create");
+        let job = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .expect("create");
         let claimed = repository.claim_next(2).await.expect("claim").expect("job");
         assert_ne!(
             job.id.as_uuid(),
@@ -1177,7 +1432,10 @@ mod tests {
     #[tokio::test]
     async fn submitted_is_not_success_and_an_observer_has_no_cancellation_authority() {
         let repository = StatisticsJobRepository::new();
-        let job = repository.create(create(1), root()).await.expect("create");
+        let job = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .expect("create");
         assert_eq!(
             job.state,
             StatisticsJobState::Active(StatisticsJobPhase::Submitted)
@@ -1189,7 +1447,10 @@ mod tests {
     #[tokio::test]
     async fn job_service_owns_submission_listing_and_cancellation() {
         let service = StatisticsJobService::new();
-        let submitted = service.submit(create(1), root()).await.expect("submit");
+        let submitted = service
+            .submit_admitted(create(1), root().await)
+            .await
+            .expect("submit");
         assert_eq!(service.list().await.expect("list"), vec![submitted.clone()]);
 
         let cancelled = service
@@ -1217,7 +1478,10 @@ mod tests {
             tokio::runtime::Handle::current(),
         );
 
-        let submitted = runtime.submit(create(1), root()).await.expect("submit");
+        let submitted = runtime
+            .submit_admitted(create(1), root().await)
+            .await
+            .expect("submit");
         tokio::task::spawn_blocking(move || {
             started_rx
                 .recv_timeout(Duration::from_secs(1))
@@ -1279,7 +1543,10 @@ mod tests {
             tokio::runtime::Handle::current(),
         );
 
-        let submitted = runtime.submit(create(1), root()).await.expect("submit");
+        let submitted = runtime
+            .submit_admitted(create(1), root().await)
+            .await
+            .expect("submit");
         tokio::task::spawn_blocking(move || {
             started_rx
                 .recv_timeout(Duration::from_secs(1))
@@ -1341,7 +1608,10 @@ mod tests {
             tokio::runtime::Handle::current(),
         );
 
-        let submitted = runtime.submit(create(1), root()).await.expect("submit");
+        let submitted = runtime
+            .submit_admitted(create(1), root().await)
+            .await
+            .expect("submit");
         tokio::task::spawn_blocking(move || {
             started_rx
                 .recv_timeout(Duration::from_secs(1))
@@ -1385,7 +1655,7 @@ mod tests {
 
         runtime.request_stop_for_process_exit();
         let error = runtime
-            .submit(create(1), root())
+            .submit_admitted(create(1), root().await)
             .await
             .expect_err("stopping worker rejects admission");
         assert_eq!(error.kind(), StatisticsRepositoryErrorKind::Conflict);
@@ -1399,7 +1669,10 @@ mod tests {
     #[tokio::test]
     async fn process_stop_converges_a_queued_root_without_dispatching_it() {
         let service = StatisticsJobService::new();
-        let queued = service.submit(create(1), root()).await.expect("queue job");
+        let queued = service
+            .submit_admitted(create(1), root().await)
+            .await
+            .expect("queue job");
         let runtime = StatisticsJobRuntime::start(
             service.clone(),
             Arc::new(RecordingExecutor {
@@ -1438,7 +1711,10 @@ mod tests {
             finalization_fails: false,
         });
         let worker = StatisticsWorker::new(repository.clone(), executor.clone());
-        let job = repository.create(create(1), root()).await.expect("create");
+        let job = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .expect("create");
         let terminal = worker.run_one(2).await.expect("run").expect("terminal");
         assert_eq!(
             terminal.state,
@@ -1465,7 +1741,10 @@ mod tests {
             finalization_fails: true,
         });
         let worker = StatisticsWorker::new(repository.clone(), executor);
-        let job = repository.create(create(1), root()).await.expect("create");
+        let job = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .expect("create");
         let terminal = worker.run_one(2).await.expect("run").expect("terminal");
         assert_eq!(
             terminal.state,
@@ -1503,7 +1782,7 @@ mod tests {
             fn prepare(
                 &self,
                 _job: &StatisticsJob,
-                _scope: &WorkScope,
+                _context: &StatisticsAttemptContext,
             ) -> Result<(), StatisticsAttemptError> {
                 Err(StatisticsAttemptError::Stale(StatisticsFailure {
                     compile_control: None,
@@ -1514,7 +1793,7 @@ mod tests {
             fn collect(
                 &self,
                 _job: &StatisticsJob,
-                _scope: &WorkScope,
+                _context: &StatisticsAttemptContext,
             ) -> Result<(), StatisticsAttemptError> {
                 unreachable!("stale preparation must not start collection")
             }
@@ -1522,14 +1801,17 @@ mod tests {
             fn publish(
                 &self,
                 _job: &StatisticsJob,
-                _scope: &WorkScope,
+                _context: &StatisticsAttemptContext,
             ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
                 unreachable!("stale preparation must not publish")
             }
         }
 
         let repository = StatisticsJobRepository::new();
-        let job = repository.create(create(1), root()).await.expect("create");
+        let job = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .expect("create");
         let terminal = StatisticsWorker::new(repository, Arc::new(StaleExecutor))
             .run_one(2)
             .await
@@ -1546,7 +1828,10 @@ mod tests {
     #[tokio::test]
     async fn terminal_conclusion_does_not_synthesize_resource_convergence() {
         let repository = StatisticsJobRepository::new();
-        let job = repository.create(create(1), root()).await.expect("create");
+        let job = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .expect("create");
         let claimed = repository.claim_next(2).await.expect("claim").expect("job");
         let terminal = repository
             .conclude(
@@ -1578,5 +1863,113 @@ mod tests {
             .await
             .expect("actual convergence");
         assert!(converged.convergence.is_complete());
+    }
+    #[tokio::test]
+    async fn conclusion_wait_requires_all_actual_convergence_facts() {
+        let repository = StatisticsJobRepository::new();
+        let job = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .unwrap();
+        repository.claim_next(2).await.unwrap().unwrap();
+        let wait = repository.wait_for_conclusion(job.id);
+        tokio::pin!(wait);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        repository
+            .conclude(
+                job.id,
+                StatisticsJobPhase::Preparing,
+                StatisticsJobConclusion::Failed,
+                StatisticsPublicationFact::NotStarted,
+                Some(StatisticsFailure {
+                    compile_control: None,
+                    message: Arc::from("failed"),
+                }),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        repository
+            .record_convergence(
+                job.id,
+                StatisticsConvergence {
+                    collection_stopped: true,
+                    execution_resources_released: true,
+                    provider_session_closed: false,
+                },
+                4,
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        repository
+            .record_convergence(
+                job.id,
+                StatisticsConvergence {
+                    collection_stopped: false,
+                    execution_resources_released: false,
+                    provider_session_closed: true,
+                },
+                5,
+            )
+            .await
+            .unwrap();
+        let terminal = wait.await.unwrap();
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
+        );
+        assert!(terminal.convergence.is_complete());
+        assert_eq!(
+            repository.wait_for_conclusion(job.id).await.unwrap(),
+            terminal
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_wait_returns_only_the_complete_terminal_record() {
+        let service = StatisticsJobService::new();
+        let job = service
+            .submit_admitted(create(1), root().await)
+            .await
+            .unwrap();
+        service.request_cancel(job.id, 2).await.unwrap();
+        let terminal = service.wait_for_conclusion(job.id).await.unwrap();
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
+        assert!(terminal.convergence.is_complete());
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_clock_preserves_observation_time_and_converges() {
+        let service = StatisticsJobService::new();
+        let job = service
+            .submit_admitted(create(17), root().await)
+            .await
+            .unwrap();
+        service.request_cancel_without_time(job.id).await.unwrap();
+        let terminal = service.wait_for_conclusion(job.id).await.unwrap();
+        assert_eq!(terminal.updated_at_ms, 17);
+        assert_eq!(
+            terminal.completed_at_ms, None,
+            "no completion time is fabricated"
+        );
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
+        assert!(terminal.convergence.is_complete());
     }
 }

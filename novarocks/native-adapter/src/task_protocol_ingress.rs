@@ -785,7 +785,7 @@ mod tests {
             &self,
             _descriptor: &TaskDescriptor,
             input: TaskCreationInput,
-        ) -> Result<PreparedTaskFacts, HostRejection> {
+        ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
             let (fragment, _assignment) = input.into_parts();
             self.prepared
                 .lock()
@@ -801,7 +801,10 @@ mod tests {
                     format!("static fragment is not decodable: {error}"),
                 )
             })?;
-            Ok(PreparedTaskFacts::new(decoded.sink_kind()))
+            novarocks_worker::PreparedTaskInstallation::new(
+                PreparedTaskFacts::new(decoded.sink_kind()),
+                None,
+            )
         }
 
         fn remove_receiver(&self, _descriptor: &TaskDescriptor) {}

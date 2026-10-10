@@ -153,6 +153,12 @@ impl ExplainRenderBudget {
                 "EXPLAIN render budget requires non-zero line and byte limits",
             ));
         }
+        let frozen = Self::default();
+        if max_lines > frozen.max_lines || max_bytes > frozen.max_bytes {
+            return Err(invalid_request(
+                "EXPLAIN render budget cannot exceed the frozen output bounds",
+            ));
+        }
         Ok(Self {
             max_lines,
             max_bytes,
@@ -441,28 +447,42 @@ fn validate_profile(
     plan: &PhysicalPlan,
     profile: &SqlCompletedExplainProfile,
 ) -> Result<(), String> {
-    let expected_fragments = plan.fragments().keys().copied().collect::<BTreeSet<_>>();
-    let actual_fragments = profile.fragments.keys().copied().collect::<BTreeSet<_>>();
-    if expected_fragments != actual_fragments {
-        let missing = expected_fragments.difference(&actual_fragments).count();
-        let extra = actual_fragments.difference(&expected_fragments).count();
+    if plan.fragments().keys().ne(profile.fragments.keys()) {
+        let missing = plan
+            .fragments()
+            .keys()
+            .filter(|fragment| !profile.fragments.contains_key(*fragment))
+            .count();
+        let extra = profile
+            .fragments
+            .keys()
+            .filter(|fragment| !plan.fragments().contains_key(*fragment))
+            .count();
         return Err(format!(
             "EXPLAIN ANALYZE fragment coverage mismatch: missing=[count={missing}], extra=[count={extra}]"
         ));
     }
-    let expected_operators = plan
-        .fragments()
-        .iter()
-        .flat_map(|(fragment, plan)| {
+    let expected_operators = || {
+        plan.fragments().iter().flat_map(|(fragment, plan)| {
             plan.nodes()
                 .keys()
                 .map(|node| SqlExplainNodeKey::new(*fragment, *node))
         })
-        .collect::<BTreeSet<_>>();
-    let actual_operators = profile.operators.keys().copied().collect::<BTreeSet<_>>();
-    if expected_operators != actual_operators {
-        let missing = expected_operators.difference(&actual_operators).count();
-        let extra = actual_operators.difference(&expected_operators).count();
+    };
+    if expected_operators().ne(profile.operators.keys().copied()) {
+        let missing = expected_operators()
+            .filter(|operator| !profile.operators.contains_key(operator))
+            .count();
+        let extra = profile
+            .operators
+            .keys()
+            .filter(|operator| {
+                !plan
+                    .fragments()
+                    .get(&operator.fragment)
+                    .is_some_and(|fragment| fragment.nodes().contains_key(&operator.node))
+            })
+            .count();
         return Err(format!(
             "EXPLAIN ANALYZE operator coverage mismatch: missing=[count={missing}], extra=[count={extra}]"
         ));
@@ -470,22 +490,113 @@ fn validate_profile(
     Ok(())
 }
 
-struct ExplainRenderOutput {
+pub(super) struct RenderDiagnostic<'a> {
+    pub(super) control: &'a dyn novarocks_type_contract::PureCompileControl,
+    error: std::cell::RefCell<Option<SqlCompileError>>,
+}
+impl<'a> RenderDiagnostic<'a> {
+    pub(super) fn new(control: &'a dyn novarocks_type_contract::PureCompileControl) -> Self {
+        Self {
+            control,
+            error: std::cell::RefCell::new(None),
+        }
+    }
+    pub(super) fn take_error(&self) -> Option<SqlCompileError> {
+        self.error.borrow_mut().take()
+    }
+    fn fail(&self, error: SqlCompileError) -> fmt::Result {
+        let mut journal = self.error.borrow_mut();
+        if journal.is_none() {
+            *journal = Some(error);
+        }
+        Err(fmt::Error)
+    }
+    pub(super) fn constant(
+        &self,
+        value: &novarocks_constant_contract::ConstantValue,
+        output: &mut dyn fmt::Write,
+    ) -> fmt::Result {
+        match crate::constant::write_constant_observed(value, self.control, output) {
+            Ok(result) => result,
+            Err(error) => self.fail(error),
+        }
+    }
+    pub(super) fn plan_constant(
+        &self,
+        plan: &PhysicalPlan,
+        reference: novarocks_physical_plan::ConstantReference,
+        expected: &novarocks_type_contract::FunctionValueType,
+        output: &mut dyn fmt::Write,
+    ) -> fmt::Result {
+        let result = (|| -> Result<_, SqlCompileError> {
+            let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                self.control,
+                novarocks_type_contract::CompilePhase::LowerProgram,
+            )?;
+            let value = plan
+                .constants()
+                .resolve_observed(reference, expected, &mut work)
+                .map_err(|error| match error {
+                    novarocks_physical_plan::ConstantReferenceError::Control(error) => error.into(),
+                    novarocks_physical_plan::ConstantReferenceError::Constant(error) => {
+                        error.into()
+                    }
+                    other => SqlCompileError::InvalidRequest(other.to_string()),
+                })?;
+            work.finish()?;
+            Ok(value)
+        })();
+        match result {
+            Ok(value) => self.constant(&value, output),
+            Err(error) => self.fail(error),
+        }
+    }
+}
+
+pub(super) struct ExplainRenderOutput<'control> {
     budget: ExplainRenderBudget,
     bytes: usize,
     lines: Vec<String>,
+    work: Option<novarocks_type_contract::CompileCheckpoints<'control>>,
 }
 
-impl ExplainRenderOutput {
-    fn new(budget: ExplainRenderBudget) -> Self {
+impl<'control> ExplainRenderOutput<'control> {
+    pub(super) fn new(budget: ExplainRenderBudget) -> Self {
         Self {
             budget,
             bytes: 0,
             lines: Vec::new(),
+            work: None,
         }
     }
 
-    fn push(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), SqlCompileError> {
+    pub(super) fn new_observed(
+        budget: ExplainRenderBudget,
+        control: &'control dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, SqlCompileError> {
+        let mut output = Self::new(budget);
+        output.work = Some(novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::LowerProgram,
+        )?);
+        Ok(output)
+    }
+
+    pub(super) fn observe(&mut self) -> Result<(), SqlCompileError> {
+        if let Some(work) = &mut self.work {
+            work.step()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_observed(mut self) -> Result<Vec<String>, SqlCompileError> {
+        if let Some(work) = self.work.take() {
+            work.finish()?;
+        }
+        Ok(self.lines)
+    }
+
+    pub(super) fn push(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), SqlCompileError> {
         if self.lines.len() >= self.budget.max_lines {
             return Err(explain_budget_exceeded(self.budget));
         }
@@ -499,12 +610,42 @@ impl ExplainRenderOutput {
             .max_bytes
             .checked_sub(used)
             .ok_or_else(|| explain_budget_exceeded(self.budget))?;
+        // Completed lines have exact capacities. One growing line stays
+        // within the remaining logical bound, including during replacement:
+        // all live payloads plus a copied allocation use at most 2 * 8 MiB.
+        // Header growth, per-line allocation allowance and bounded auxiliary
+        // indexes fit separately within the Local conversion workspace.
         let mut line = String::new();
-        let mut writer = BoundedStringWriter {
-            output: &mut line,
-            remaining,
+        let mut control_error = None;
+        let result = {
+            let mut writer = BoundedStringWriter {
+                output: &mut line,
+                remaining,
+                work: self.work.as_mut(),
+                control_error: &mut control_error,
+            };
+            fmt::write(&mut writer, arguments)
         };
-        fmt::write(&mut writer, arguments).map_err(|_| explain_budget_exceeded(self.budget))?;
+        if let Some(error) = control_error {
+            return Err(error);
+        }
+        result.map_err(|_| explain_budget_exceeded(self.budget))?;
+        self.observe()?;
+        let line = line.into_boxed_str().into_string();
+        if self.lines.len() == self.lines.capacity() {
+            let capacity = self
+                .lines
+                .capacity()
+                .saturating_mul(2)
+                .max(1)
+                .min(self.budget.max_lines);
+            self.lines
+                .try_reserve_exact(capacity - self.lines.len())
+                .map_err(|_| explain_budget_exceeded(self.budget))?;
+            if self.lines.capacity() != capacity {
+                return Err(explain_budget_exceeded(self.budget));
+            }
+        }
         self.bytes = used
             .checked_add(line.len())
             .ok_or_else(|| explain_budget_exceeded(self.budget))?;
@@ -512,11 +653,11 @@ impl ExplainRenderOutput {
         Ok(())
     }
 
-    fn finish(self) -> Vec<String> {
+    pub(super) fn finish(self) -> Vec<String> {
         self.lines
     }
 
-    fn ensure_prefix_fits(&self, bytes: usize) -> Result<(), SqlCompileError> {
+    pub(super) fn ensure_prefix_fits(&self, bytes: usize) -> Result<(), SqlCompileError> {
         let separator = usize::from(!self.lines.is_empty());
         let used = self
             .bytes
@@ -530,17 +671,54 @@ impl ExplainRenderOutput {
     }
 }
 
-struct BoundedStringWriter<'a> {
+struct BoundedStringWriter<'a, 'control> {
     output: &'a mut String,
     remaining: usize,
+    work: Option<&'a mut novarocks_type_contract::CompileCheckpoints<'control>>,
+    control_error: &'a mut Option<SqlCompileError>,
 }
 
-impl Write for BoundedStringWriter<'_> {
+impl Write for BoundedStringWriter<'_, '_> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
         if value.len() > self.remaining {
             return Err(fmt::Error);
         }
-        self.output.push_str(value);
+        let needed = self
+            .output
+            .len()
+            .checked_add(value.len())
+            .ok_or(fmt::Error)?;
+        if needed > self.output.capacity() {
+            let maximum = self
+                .output
+                .len()
+                .checked_add(self.remaining)
+                .ok_or(fmt::Error)?;
+            let capacity = needed
+                .max(self.output.capacity().saturating_mul(2))
+                .min(maximum);
+            self.output
+                .try_reserve_exact(capacity - self.output.len())
+                .map_err(|_| fmt::Error)?;
+            if self.output.capacity() != capacity {
+                return Err(fmt::Error);
+            }
+        }
+        let mut start = 0;
+        while start < value.len() {
+            let mut end = start.saturating_add(1024).min(value.len());
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.output.push_str(&value[start..end]);
+            if let Some(work) = &mut self.work {
+                if let Err(error) = work.step() {
+                    *self.control_error = Some(error.into());
+                    return Err(fmt::Error);
+                }
+            }
+            start = end;
+        }
         self.remaining -= value.len();
         Ok(())
     }
@@ -566,6 +744,7 @@ fn render_plan(
         level,
         profile,
         budget,
+        &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
 
@@ -581,9 +760,10 @@ pub fn render_completed_plan(
     level: ExplainLevel,
     profile: Option<&SqlCompletedExplainProfile>,
     budget: ExplainRenderBudget,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<String>, SqlCompileError> {
     let context = RenderContext::new(plan, level, profile)?;
-    let mut lines = ExplainRenderOutput::new(budget);
+    let mut lines = ExplainRenderOutput::new_observed(budget, control)?;
     lines.push(format_args!(
         "PHYSICAL PLAN version={}, contract-revision={}",
         format_hex(plan.version().as_bytes()),
@@ -644,7 +824,7 @@ pub fn render_completed_plan(
         render_expression_definitions(&context, *fragment_id, fragment, &mut lines)?;
         render_nodes_iterative(&context, *fragment_id, fragment, &mut lines)?;
     }
-    Ok(lines.finish())
+    lines.finish_observed()
 }
 
 struct AnnotationIndex<'a> {
@@ -1025,6 +1205,11 @@ fn render_sink(
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
     match sink {
+        FragmentSink::RootResult(contract) => lines.push(format_args!(
+            "  SINK root-result {:?} profile={}",
+            contract.kind(),
+            contract.profile().get()
+        ))?,
         FragmentSink::Result => lines.push(format_args!("  SINK result"))?,
         FragmentSink::Stream { edge } => {
             lines.push(format_args!("  SINK stream edge=edge{}", edge.get()))?
@@ -2525,13 +2710,13 @@ fn render_operator_profile(
     }
 }
 
-struct NodeContractLines<'a> {
-    output: &'a mut ExplainRenderOutput,
+struct NodeContractLines<'a, 'control> {
+    output: &'a mut ExplainRenderOutput<'control>,
     error: Option<SqlCompileError>,
 }
 
-impl<'a> NodeContractLines<'a> {
-    fn new(output: &'a mut ExplainRenderOutput) -> Self {
+impl<'a, 'control> NodeContractLines<'a, 'control> {
+    fn new(output: &'a mut ExplainRenderOutput<'control>) -> Self {
         Self {
             output,
             error: None,
@@ -2560,7 +2745,7 @@ fn render_node_contract(
     fragment: &Fragment,
     node: &PhysicalNode,
     pad: &str,
-    lines: &mut NodeContractLines<'_>,
+    lines: &mut NodeContractLines<'_, '_>,
 ) {
     let plan = context.plan;
     let level = context.level;
@@ -4587,9 +4772,11 @@ mod tests {
         plan.add_fragment(deep_fragment)
             .expect("deep fragment in plan");
         plan.set_result_port(novarocks_physical_plan::ResultPort {
+            scalar_schema: None,
             fragment: fragment_id,
             output,
             fields: Box::from([novarocks_physical_plan::ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "one".into(),
                 alias: None,
                 value,

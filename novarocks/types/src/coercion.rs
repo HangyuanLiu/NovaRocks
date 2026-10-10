@@ -33,7 +33,8 @@ pub use novarocks_type_contract::{comparison_common_type, decimal_compare_type, 
 ///
 /// So a nested field keeps only what the type says: a list's element is
 /// `item`, a map's entries are `entries` of `key` and `value`, struct fields
-/// keep the names the statement gave them, and none of them carries metadata.
+/// keep the names the statement gave them, and only logical identity metadata
+/// survives.
 /// What each field admits is left exactly as it was: nullability is a fact
 /// about the values, not decoration.
 pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
@@ -79,18 +80,39 @@ pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
                 return data_type.clone();
             }
             DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(Fields::from(vec![
-                        field("key", &fields[0]),
-                        field("value", &fields[1]),
-                    ])),
-                    entries.is_nullable(),
+                Arc::new(with_invalid_container_marker(
+                    Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            field("key", &fields[0]),
+                            field("value", &fields[1]),
+                        ])),
+                        entries.is_nullable(),
+                    ),
+                    entries
+                        .metadata()
+                        .contains_key(crate::logical::NR_LOGICAL_TYPE_KEY),
                 )),
                 *sorted,
             )
         }
         other => other.clone(),
+    }
+}
+
+fn with_invalid_container_marker(field: Field, has_marker: bool) -> Field {
+    // The Map entries container cannot own any scalar logical domain. Keep a
+    // bounded rejection witness through normalization instead of erasing it.
+    if has_marker {
+        field.with_metadata(
+            [(
+                crate::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
+                "invalid".to_owned(),
+            )]
+            .into(),
+        )
+    } else {
+        field
     }
 }
 
@@ -369,6 +391,25 @@ mod tests {
     fn wider_type_float32_vs_decimal_returns_float64() {
         let result = wider_type(&DataType::Float32, &DataType::Decimal128(18, 6));
         assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn mixed_decimal_integer_common_type_covers_the_integer_range() {
+        for (integer, precision) in [
+            (DataType::Int8, 4),
+            (DataType::Int16, 6),
+            (DataType::Int32, 11),
+            (DataType::Int64, 20),
+        ] {
+            let decimal = DataType::Decimal128(2, 1);
+            let expected = DataType::Decimal128(precision, 1);
+            assert_eq!(wider_type(&decimal, &integer), expected);
+            assert_eq!(wider_type(&integer, &decimal), expected);
+        }
+        assert_eq!(
+            wider_type(&DataType::Decimal128(38, 37), &DataType::Int64),
+            DataType::Decimal256(56, 37)
+        );
     }
 
     #[test]

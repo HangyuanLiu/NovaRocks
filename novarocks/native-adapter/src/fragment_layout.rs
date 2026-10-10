@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
-use novarocks_plan_codec::native_type::decode_field_type;
+use novarocks_plan_codec::native_type::{decode_field_type_owned, preflight_native_output_fields};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
@@ -76,6 +76,8 @@ pub fn decode_output_layout(
     columns: &[common::OutputColumn],
     path: FieldPath,
 ) -> Result<NativeOutputLayout, ProtocolError> {
+    preflight_native_output_fields(columns)
+        .map_err(|detail| error(path.clone(), ProtocolErrorKind::Capacity, detail))?;
     let mut slots = Vec::with_capacity(columns.len());
     let mut seen = HashMap::with_capacity(columns.len());
     for (index, column) in columns.iter().enumerate() {
@@ -101,7 +103,7 @@ pub fn decode_output_layout(
                 ),
             )
         })?;
-        let field = decode_field_type(&column.name, column.nullable, type_desc).map_err(|detail| {
+        let field = decode_field_type_owned(&column.name, column.nullable, type_desc).map_err(|detail| {
             error(
                 column_path.field("type"),
                 ProtocolErrorKind::InvalidValue,
@@ -112,8 +114,14 @@ pub fn decode_output_layout(
             )
         })?;
         slots.push(
-            ChunkSchema::slot_schema_from_arrow_field(slot_id, &field)
-                .map_err(|detail| error(path.clone(), ProtocolErrorKind::InvalidValue, detail))?,
+            ChunkSlotSchema::try_new_with_metadata_origins(
+                slot_id,
+                Arc::clone(field.field()),
+                field.metadata_origins().clone(),
+                None,
+                None,
+            )
+            .map_err(|detail| error(path.clone(), ProtocolErrorKind::InvalidValue, detail))?,
         );
     }
     let chunk_schema = ChunkSchema::try_new(slots.clone())

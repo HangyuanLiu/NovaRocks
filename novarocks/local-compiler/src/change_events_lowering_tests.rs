@@ -364,12 +364,14 @@ fn try_fixture(
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let output = fragment.nodes()[&root].output.columns.clone();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fid,
         output: fragment.nodes()[&root].output.clone(),
         fields: output
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("original_{ordinal}").into_boxed_str(),
                 alias: Some(format!("selected_{ordinal}").into_boxed_str()),
                 value: *value,

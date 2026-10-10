@@ -51,9 +51,15 @@ printf 'SPARK_STATISTICS_SOURCE_READY\n'
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0};
 
 -- query 3
+-- Wait for this case's own job, not any SUCCEEDED job on the shared
+-- frontend. The table is unique to this case and analyzed exactly once.
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=SUCCEEDED
+-- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
+-- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=table=puffin_spark_${uuid0}
+-- @result_rows_count=1
+-- @result_rows_expect=state=SUCCEEDED
 -- @skip_result_check=true
 SHOW ANALYZE JOBS;
 

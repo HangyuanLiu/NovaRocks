@@ -22,7 +22,7 @@ pub const LOCKED_TOOLCHAIN: bool =
     matches_compiler(env!("NOVAROCKS_OWNED_RESOURCE_RUST").as_bytes());
 
 const fn matches_compiler(actual: &[u8]) -> bool {
-    let expected = b"1.92.0";
+    let expected = b"1.98.1";
     if actual.len() != expected.len() {
         return false;
     }

@@ -1376,6 +1376,7 @@ mod tests {
                     }),
                     node_id: 2,
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: vec![sleep],
                     expr_slot_ids: vec![slot],
                     expr_slot_schemas: None,

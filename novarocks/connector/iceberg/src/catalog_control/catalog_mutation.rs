@@ -39,9 +39,14 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::catalog::CatalogTransactionStart;
+use crate::catalog::admission::{
+    CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogOperation, connector_unsupported,
+};
 use crate::catalog::error::CatalogOutcome;
 use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
+use crate::catalog::{
+    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTransactionStart,
+};
 use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};
 use crate::iceberg::spec::{
     FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
@@ -76,11 +81,20 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         self.incarnation()
     }
 
+    fn admit(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
+        validate_request(self, request)?;
+        self.runtime()
+            .novarocks_catalog()
+            .admit(&catalog_admission_request(request))
+            .map(|_| ())
+            .map_err(connector_unsupported)
+    }
+
     fn execute(
         &self,
         request: ConnectorCatalogMutationRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-        if let Err(error) = validate_request(self, &request) {
+        if let Err(error) = ConnectorCatalogMutation::admit(self, &request) {
             return Ok(known_uncommitted(error));
         }
         if let ConnectorCatalogMutationOperation::UpdateApplicationDocuments { intent } =
@@ -211,6 +225,89 @@ impl ConnectorCatalogMutation for IcebergMetadata {
             .map_err(|error| invalid(format!("decode Iceberg mutation evidence: {error}")))?;
         reconcile_evidence(self, decoded.target, request.evidence, &request.context)
     }
+}
+
+/// Ask the generation's owner before any operation-specific discovery or I/O.
+/// This match is exhaustive so a new SPI mutation must select its admission.
+fn catalog_admission_request(request: &ConnectorCatalogMutationRequest) -> CatalogAdmissionRequest {
+    use ConnectorCatalogMutationOperation as Mutation;
+    let table_target = |table: &ConnectorTableIdentity| {
+        CatalogAdmissionTarget::Table(CatalogTableName::new(
+            table.namespace.clone(),
+            table.table.clone(),
+        ))
+    };
+    let (operation, target) = match &request.operation {
+        Mutation::CreateNamespace { namespace, .. } => (
+            CatalogOperation::CreateNamespace,
+            CatalogAdmissionTarget::Namespace(CatalogNamespaceName::new(
+                namespace.namespace.clone(),
+            )),
+        ),
+        Mutation::DropNamespace { namespace, .. } => (
+            CatalogOperation::DropNamespace,
+            CatalogAdmissionTarget::Namespace(CatalogNamespaceName::new(
+                namespace.namespace.clone(),
+            )),
+        ),
+        Mutation::CreateTable { table, .. } => (
+            CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            table_target(table),
+        ),
+        Mutation::BootstrapEmptyTableSnapshot { table, .. } => {
+            (CatalogOperation::BootstrapSnapshot, table_target(table))
+        }
+        Mutation::UpdateApplicationDocuments { intent } => (
+            CatalogOperation::UpdateDocuments,
+            table_target(intent.observation().target()),
+        ),
+        Mutation::DropTable { table, .. } => (CatalogOperation::DropTable, table_target(table)),
+        Mutation::CreateView { view, policy, .. } => (
+            match policy {
+                CreateOrReplacePolicy::FailIfExists | CreateOrReplacePolicy::NoOpIfExists => {
+                    CatalogOperation::CreateView
+                }
+                CreateOrReplacePolicy::ReplaceIfExists => CatalogOperation::ReplaceView,
+            },
+            CatalogAdmissionTarget::Table(CatalogTableName::new(
+                view.namespace.clone(),
+                view.view.clone(),
+            )),
+        ),
+        Mutation::DropView { view, .. } => (
+            CatalogOperation::DropView,
+            CatalogAdmissionTarget::Table(CatalogTableName::new(
+                view.namespace.clone(),
+                view.view.clone(),
+            )),
+        ),
+        Mutation::AlterSchema { table, .. } => (CatalogOperation::AlterSchema, table_target(table)),
+        Mutation::AlterPartitionSpec { table, .. } => {
+            (CatalogOperation::AlterPartitionSpec, table_target(table))
+        }
+        Mutation::AlterProperties { table, .. } => {
+            (CatalogOperation::AlterProperties, table_target(table))
+        }
+        Mutation::AlterRef { table, action } => (
+            match action {
+                ConnectorRefAction::Create { kind, .. } => match kind {
+                    novarocks_spi::connector::ConnectorRefKind::Branch => {
+                        CatalogOperation::CreateBranch
+                    }
+                    novarocks_spi::connector::ConnectorRefKind::Tag => CatalogOperation::CreateTag,
+                },
+                ConnectorRefAction::Drop { kind, .. } => match kind {
+                    novarocks_spi::connector::ConnectorRefKind::Branch => {
+                        CatalogOperation::DropBranch
+                    }
+                    novarocks_spi::connector::ConnectorRefKind::Tag => CatalogOperation::DropTag,
+                },
+                ConnectorRefAction::FastForwardBranch { .. } => CatalogOperation::FastForwardBranch,
+            },
+            table_target(table),
+        ),
+    };
+    CatalogAdmissionRequest::new(operation, target, request.context.initiation())
 }
 
 fn validate_request(
@@ -354,10 +451,17 @@ fn execute_operation(
             policy,
         } => {
             ensure_owner(provider, &view.instance_id)?;
+            // The collision probe enumerates the namespace and observes the
+            // production listing bound: an over-bound namespace refuses the
+            // create instead of answering from a partial listing.
             if provider
                 .runtime()
-                .list_tables_for_request(&view.namespace, context)
-                .map_err(unavailable)?
+                .list_tables_for_request(
+                    &view.namespace,
+                    context,
+                    novarocks_spi::connector::ConnectorListingBound::V1,
+                )
+                .map_err(|(kind, message)| ConnectorError::new(kind, message))?
                 .iter()
                 .any(|table| table.eq_ignore_ascii_case(&view.view))
             {
@@ -3530,9 +3634,9 @@ mod tests {
     use crate::resources::IcebergMetadataResources;
 
     /// Hadoop deliberately rejects document-management admission. These tests
-    /// retain that production gate and replace only admission with a token
-    /// issuer; preparation, observation, mutation, transaction, and reconcile
-    /// all remain the production Iceberg implementations.
+    /// use an explicitly admitted owner and replace the document admission
+    /// token issuer; preparation, observation, mutation, transaction, and
+    /// reconcile all remain the production Iceberg implementations.
     #[derive(Clone)]
     struct HadoopDocumentTestCapability {
         storage: Arc<crate::document_storage::IcebergDocumentStorage>,
@@ -3626,6 +3730,377 @@ mod tests {
             runtime,
         );
         (executor, warehouse, provider)
+    }
+
+    /// Only document publication tests replace the owner's admission rule.
+    /// The Hadoop client and all publication/reconciliation behavior stay real.
+    fn document_provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
+        let (executor, warehouse, provider) = provider();
+        let runtime = IcebergMetadataContext::with_catalog_for_test(
+            provider.runtime().control_state().clone(),
+            provider.runtime().resources().clone(),
+            crate::catalog::admission_test_support::all_admitted(Arc::clone(
+                provider.runtime().novarocks_catalog(),
+            )),
+        );
+        let provider = IcebergMetadata::new(
+            provider.descriptor().clone(),
+            provider.incarnation(),
+            Arc::new(runtime),
+        );
+        (executor, warehouse, provider)
+    }
+
+    struct RefuseFileIo;
+
+    impl novarocks_fs::FileIoRuntime for RefuseFileIo {
+        fn block_on_bytes(
+            &self,
+            _: novarocks_fs::FileBytesFuture,
+        ) -> novarocks_fs::FileResult<Bytes> {
+            panic!("refused catalog mutation must not perform FileIO")
+        }
+
+        fn block_on_u64(&self, _: novarocks_fs::FileU64Future) -> novarocks_fs::FileResult<u64> {
+            panic!("refused catalog mutation must not perform FileIO")
+        }
+    }
+
+    impl novarocks_fs::FileTaskSpawner for RefuseFileIo {
+        fn spawn(
+            &self,
+            _: novarocks_fs::FileTaskFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            panic!("refused catalog mutation must not spawn FileIO")
+        }
+
+        fn spawn_detached_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) {
+            panic!("refused catalog mutation must not spawn blocking FileIO")
+        }
+    }
+
+    #[test]
+    fn hms_catalog_mutation_variants_refuse_before_catalog_or_file_io() {
+        use novarocks_spi::connector::{
+            ConnectorNamespaceIdentity, ConnectorRefKind, ConnectorRefreshPublicationGuard,
+            ConnectorRequestInitiation, ConnectorViewDefinition, ConnectorViewDialect,
+            ConnectorViewIdentity, LakePublicationId,
+        };
+        // Build an opaque, valid document intent using the explicit publication
+        // test owner. No preparation is performed through the HMS generation.
+        let (_document_executor, _document_warehouse, document_provider) = document_provider();
+        let document_table = managed_table(&document_provider);
+        let document_request =
+            application_document_update_fixture(&document_provider, &document_table).request;
+        let operation_id = document_request.operation_id;
+
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("HMS warehouse");
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").expect("metastore spy");
+        endpoint.set_nonblocking(true).unwrap();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".into(), "hive".into()),
+                (
+                    "iceberg.catalog.warehouse".into(),
+                    warehouse.path().display().to_string(),
+                ),
+                (
+                    "hive.metastore.uris".into(),
+                    format!("thrift://{}", endpoint.local_addr().unwrap()),
+                ),
+            ],
+        )
+        .expect("HMS configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(RefuseFileIo),
+            Arc::new(RefuseFileIo),
+        );
+        let runtime = Arc::new(
+            IcebergMetadataContext::try_new(
+                IcebergCatalogControlState::new(configuration),
+                IcebergMetadataResources::new(binding, executor.handle().clone()),
+            )
+            .expect("HMS generation must not connect"),
+        );
+        let provider = IcebergMetadata::new(
+            document_provider.descriptor().clone(),
+            document_provider.incarnation(),
+            runtime,
+        );
+        let table = document_table;
+        let namespace = ConnectorNamespaceIdentity {
+            instance_id: table.instance_id.clone(),
+            namespace: table.namespace.clone(),
+        };
+        let view = ConnectorViewIdentity {
+            instance_id: table.instance_id.clone(),
+            namespace: table.namespace.clone(),
+            view: "v".into(),
+        };
+        let mut operations = vec![
+            (
+                ConnectorCatalogMutationOperation::CreateNamespace {
+                    namespace: namespace.clone(),
+                    policy: CreatePolicy::FailIfExists,
+                },
+                CatalogOperation::CreateNamespace,
+            ),
+            (
+                ConnectorCatalogMutationOperation::DropNamespace {
+                    namespace,
+                    policy: DropPolicy::FailIfMissing,
+                },
+                CatalogOperation::DropNamespace,
+            ),
+            (
+                create_request(
+                    &provider,
+                    ConnectorMutationOperationId::new(),
+                    CreatePolicy::FailIfExists,
+                )
+                .operation,
+                CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            ),
+            (
+                ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
+                    table: table.clone(),
+                    expected_current_snapshot: None,
+                    properties: Vec::new(),
+                },
+                CatalogOperation::BootstrapSnapshot,
+            ),
+            (
+                document_request.operation,
+                CatalogOperation::UpdateDocuments,
+            ),
+            (
+                ConnectorCatalogMutationOperation::DropTable {
+                    table: table.clone(),
+                    policy: DropPolicy::FailIfMissing,
+                    data_disposition: ConnectorDropTableDataDisposition::Purge,
+                },
+                CatalogOperation::DropTable,
+            ),
+            (
+                ConnectorCatalogMutationOperation::DropView {
+                    view: view.clone(),
+                    policy: DropPolicy::FailIfMissing,
+                },
+                CatalogOperation::DropView,
+            ),
+            (
+                ConnectorCatalogMutationOperation::AlterSchema {
+                    table: table.clone(),
+                    changes: Vec::new(),
+                },
+                CatalogOperation::AlterSchema,
+            ),
+            (
+                ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                    table: table.clone(),
+                    add: Vec::new(),
+                    drop: Vec::new(),
+                },
+                CatalogOperation::AlterPartitionSpec,
+            ),
+            (
+                ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: Vec::new(),
+                    authority: ConnectorPropertyAuthority::UserStatement,
+                    expected_committed_partitioning: None,
+                },
+                CatalogOperation::AlterProperties,
+            ),
+            (
+                ConnectorCatalogMutationOperation::AlterRef {
+                    table: table.clone(),
+                    action: ConnectorRefAction::FastForwardBranch {
+                        source_branch: "staging".into(),
+                        target_branch: "main".into(),
+                        committed_version: ConnectorCommittedVersion::try_new(
+                            Bytes::from_static(b"version"),
+                            Some(1),
+                        )
+                        .unwrap(),
+                        expected_target_snapshot_id: None,
+                        expected_table_uuid: "table-uuid".into(),
+                        guard: ConnectorRefreshPublicationGuard::new(LakePublicationId::new_v7()),
+                    },
+                },
+                CatalogOperation::FastForwardBranch,
+            ),
+        ];
+        for policy in [
+            CreateOrReplacePolicy::FailIfExists,
+            CreateOrReplacePolicy::NoOpIfExists,
+            CreateOrReplacePolicy::ReplaceIfExists,
+        ] {
+            operations.push((
+                ConnectorCatalogMutationOperation::CreateView {
+                    view: view.clone(),
+                    columns: Vec::new(),
+                    definition: ConnectorViewDefinition {
+                        dialect: ConnectorViewDialect::StarRocks,
+                        raw_sql: "SELECT 1".into(),
+                        default_catalog: None,
+                        default_namespace: table.namespace.clone(),
+                        source_format: None,
+                    },
+                    comment: None,
+                    properties: Vec::new(),
+                    policy,
+                },
+                if policy == CreateOrReplacePolicy::ReplaceIfExists {
+                    CatalogOperation::ReplaceView
+                } else {
+                    CatalogOperation::CreateView
+                },
+            ));
+        }
+        for (kind, create, drop) in [
+            (
+                ConnectorRefKind::Branch,
+                CatalogOperation::CreateBranch,
+                CatalogOperation::DropBranch,
+            ),
+            (
+                ConnectorRefKind::Tag,
+                CatalogOperation::CreateTag,
+                CatalogOperation::DropTag,
+            ),
+        ] {
+            operations.push((
+                ConnectorCatalogMutationOperation::AlterRef {
+                    table: table.clone(),
+                    action: ConnectorRefAction::Create {
+                        kind,
+                        name: "ref".into(),
+                        snapshot_id: Some(1),
+                        policy: CreateOrReplacePolicy::FailIfExists,
+                        expected_table_uuid: None,
+                    },
+                },
+                create,
+            ));
+            operations.push((
+                ConnectorCatalogMutationOperation::AlterRef {
+                    table: table.clone(),
+                    action: ConnectorRefAction::Drop {
+                        kind,
+                        name: "ref".into(),
+                        policy: DropPolicy::FailIfMissing,
+                    },
+                },
+                drop,
+            ));
+        }
+        assert_eq!(
+            operations.len(),
+            18,
+            "all variants, view policies and ref actions are exercised"
+        );
+        for (operation, expected) in operations {
+            for initiation in [
+                ConnectorRequestInitiation::Statement,
+                ConnectorRequestInitiation::JobAttempt,
+                ConnectorRequestInitiation::Background,
+            ] {
+                let request = ConnectorCatalogMutationRequest {
+                    operation_id,
+                    target: ConnectorProviderBindingKey {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        incarnation: provider.incarnation(),
+                    },
+                    operation: operation.clone(),
+                    context: context().with_initiation(initiation),
+                };
+                let admission = catalog_admission_request(&request);
+                assert_eq!(admission.operation, expected);
+                assert_eq!(admission.initiation, initiation.into());
+                let error = ConnectorCatalogMutation::admit(&provider, &request)
+                    .expect_err("preflight must use the same read-only owner");
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                assert!(error.to_string().contains("read-only compatibility entry"));
+                match provider.execute(request).expect("typed refusal") {
+                    ExternalMutationOutcome::KnownUncommitted { failure } => {
+                        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+                        assert!(
+                            failure
+                                .to_string()
+                                .contains("read-only compatibility entry")
+                        );
+                        assert!(failure.to_string().contains(expected.name()));
+                    }
+                    _ => panic!("HMS refusal must be known uncommitted"),
+                }
+                assert_eq!(
+                    endpoint.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "{} connected to HMS",
+                    expected.name()
+                );
+                assert_eq!(
+                    std::fs::read_dir(warehouse.path()).unwrap().count(),
+                    0,
+                    "{} wrote a file",
+                    expected.name()
+                );
+            }
+        }
+        let mut invalid = create_request(
+            &provider,
+            ConnectorMutationOperationId::new(),
+            CreatePolicy::FailIfExists,
+        );
+        invalid.target.incarnation = ProviderBindingEpoch::from_bytes([7; 16]);
+        assert!(
+            matches!(provider.execute(invalid).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure } if failure.kind() == ConnectorMutationFailureKind::InvalidRequest),
+            "generation validation must precede owner admission"
+        );
+    }
+
+    #[test]
+    fn hadoop_background_mutation_is_refused_before_an_existing_object_no_op() {
+        use novarocks_spi::connector::{ConnectorNamespaceIdentity, ConnectorRequestInitiation};
+        let (_executor, warehouse, provider) = provider();
+        let request = ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                namespace: ConnectorNamespaceIdentity {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    namespace: "admission".into(),
+                },
+                policy: CreatePolicy::NoOpIfExists,
+            },
+            context: context(),
+        };
+        assert!(matches!(
+            provider.execute(request.clone()).unwrap(),
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                ..
+            }
+        ));
+        let before = std::fs::read_dir(warehouse.path()).unwrap().count();
+        let background = ConnectorCatalogMutationRequest {
+            context: context().with_initiation(ConnectorRequestInitiation::Background),
+            ..request
+        };
+        assert!(matches!(
+            provider.execute(background).unwrap(),
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::Unsupported
+        ));
+        assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), before);
     }
 
     fn document_storage_lease(
@@ -4159,7 +4634,7 @@ mod tests {
 
     #[test]
     fn application_document_execute_dispatches_one_set_properties_without_advancing_snapshot() {
-        let (_executor, _warehouse, provider) = provider();
+        let (_executor, _warehouse, provider) = document_provider();
         let table = managed_table(&provider);
         let before = provider
             .runtime()
@@ -4303,7 +4778,7 @@ mod tests {
 
     #[test]
     fn application_document_reconcile_is_exact_positive_and_mismatch_stays_unknown() {
-        let (_executor, _warehouse, provider) = provider();
+        let (_executor, _warehouse, provider) = document_provider();
         let table = managed_table(&provider);
         let update = application_document_update_fixture(&provider, &table);
         let exact = application_document_evidence(

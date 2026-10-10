@@ -2748,6 +2748,10 @@ fn unreachable_rest_runtime() -> (
         &[
             ("iceberg.catalog.type".to_string(), "rest".to_string()),
             ("uri".to_string(), "http://127.0.0.1:1".to_string()),
+            (
+                "warehouse".to_string(),
+                "file:///tmp/novarocks-staged-session".to_string(),
+            ),
         ],
     )
     .expect("configuration");
@@ -3273,5 +3277,327 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
                     .contains("authoritative scalar integer declaration")
             );
         }
+    }
+}
+
+// Reuse the catalog and filesystem tripwires used by document admission tests.
+#[path = "../../document_storage/tests/admission_support.rs"]
+mod owner_admission_support;
+
+fn refusing_write_runtime(
+    kind: &str,
+) -> (
+    tokio::runtime::Runtime,
+    Arc<crate::metadata_context::IcebergMetadataContext>,
+    Arc<owner_admission_support::AdmissionCatalogSpy>,
+    Arc<owner_admission_support::AdmissionFileIoSpy>,
+    tempfile::TempDir,
+) {
+    let executor = tokio::runtime::Runtime::new().expect("runtime");
+    let warehouse = tempfile::tempdir().expect("warehouse");
+    let mut properties = vec![
+        ("iceberg.catalog.type".to_string(), kind.to_string()),
+        (
+            "warehouse".to_string(),
+            format!("file://{}", warehouse.path().display()),
+        ),
+    ];
+    if kind == "hive" {
+        properties.push((
+            "hive.metastore.uris".to_string(),
+            "thrift://127.0.0.1:1".to_string(),
+        ));
+    }
+    let configuration = crate::catalog_config::parse_catalog_configuration("unit", &properties)
+        .expect("configuration");
+    let file_io = Arc::new(owner_admission_support::AdmissionFileIoSpy::default());
+    let binding = IcebergReadBinding::new(
+        None,
+        FsAccessResolver::new(),
+        file_io.clone(),
+        file_io.clone(),
+    );
+    let state = crate::catalog_control::IcebergCatalogControlState::new(configuration);
+    let resources =
+        crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone());
+    let native =
+        crate::metadata_context::IcebergMetadataContext::try_new(state.clone(), resources.clone())
+            .expect("native runtime");
+    let spy = Arc::new(owner_admission_support::AdmissionCatalogSpy::new(
+        Arc::clone(native.novarocks_catalog()),
+    ));
+    let runtime = Arc::new(
+        crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
+            state,
+            resources,
+            spy.clone(),
+        ),
+    );
+    (executor, runtime, spy, file_io, warehouse)
+}
+
+/// Mint a structurally valid declaration under an explicitly admitted test
+/// owner; the production owner is still asked again by begin_write.
+fn document_publication_for_refusal(
+    runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
+    incarnation: ProviderBindingEpoch,
+    catalog_handle: CatalogHandle,
+) -> (
+    ConnectorWriteSessionFlavor,
+    novarocks_spi::connector::ConnectorWriteBaseVersion,
+) {
+    use novarocks_spi::connector::{
+        CatalogProperties, ConnectorControlBinding, ConnectorControlPlanningLease,
+        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
+        ConnectorDocumentPublicationDeclaration, ConnectorDocumentStorageBinding,
+        ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorTableIdentity,
+        ConnectorTableObjectId, ConnectorWriteBaseVersion, LakePublicationId,
+    };
+    let admitted_runtime = Arc::new(
+        crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
+            runtime.control_state().clone(),
+            runtime.resources().clone(),
+            crate::catalog::admission_test_support::all_admitted(Arc::clone(
+                runtime.novarocks_catalog(),
+            )),
+        ),
+    );
+    let provider = Arc::new(crate::metadata::IcebergMetadata::new(
+        descriptor("unit"),
+        incarnation,
+        Arc::clone(&admitted_runtime),
+    ));
+    let storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
+        descriptor("unit"),
+        incarnation,
+        admitted_runtime,
+    ));
+    let documents = ConnectorDocumentStorageBinding::try_new(
+        descriptor("unit"),
+        incarnation,
+        Some(storage.clone()),
+        Some(storage),
+    )
+    .expect("document binding");
+    let binding = ConnectorControlBinding::try_new(
+        descriptor("unit"),
+        incarnation,
+        provider.clone(),
+        provider.clone(),
+        Arc::new(crate::provider_binding::IcebergInstanceDistribution::new(
+            descriptor("unit"),
+            incarnation,
+        )),
+        Some(provider),
+    )
+    .and_then(|binding| {
+        binding.with_catalog_properties(
+            CatalogProperties::new(
+                catalog_handle.clone(),
+                descriptor("unit").provider_id,
+                1,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("properties"),
+        )
+    })
+    .and_then(|binding| binding.try_with_document_storage(Some(documents)))
+    .expect("control binding");
+    let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+        .derive_document_storage_lease()
+        .expect("document lease");
+    let publication_id = LakePublicationId::new_v7();
+    let object_id = ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"table-object"))
+        .expect("object id");
+    let admission = lease
+        .admit_management(
+            ConnectorDocumentManagementAdmissionRequest::try_new(
+                ConnectorProviderBindingKey {
+                    instance_id: descriptor("unit").instance_id.clone(),
+                    incarnation,
+                },
+                catalog_handle,
+                ConnectorMutationOperationId::from_bytes(publication_id.to_bytes()),
+                ConnectorTableIdentity {
+                    instance_id: descriptor("unit").instance_id,
+                    namespace: Arc::from("db"),
+                    table: Arc::from("staged"),
+                },
+                Some(object_id.clone()),
+                ConnectorDocumentManagementOperation::Publication,
+                request_context(),
+            )
+            .expect("admission request"),
+        )
+        .expect("test owner admission");
+    let base =
+        ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"test-base")).expect("base");
+    let declaration = ConnectorDocumentPublicationDeclaration::try_new(
+        publication_id,
+        admission,
+        object_id,
+        base.clone(),
+        ConnectorManagedPublicationTechnique::Full,
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        None,
+        None,
+    )
+    .expect("declaration");
+    (
+        ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+            declaration,
+            shape: ConnectorManagedPublicationShape::Data,
+        },
+        base,
+    )
+}
+
+fn all_write_admission_requests(
+    runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
+    incarnation: ProviderBindingEpoch,
+    catalog_handle: CatalogHandle,
+) -> Vec<(
+    String,
+    novarocks_spi::connector::write_stack::session::ConnectorWriteBeginRequest,
+)> {
+    use novarocks_spi::connector::ConnectorWriteIntent;
+    let staged = staged_target_handle(runtime, incarnation);
+    let ordinary = |intent| {
+        let mut request = staged_begin_request(staged.clone());
+        request.flavor = ConnectorWriteSessionFlavor::Ordinary;
+        request.intent = intent;
+        request
+    };
+    let mut requests = [
+        ("append", ConnectorWriteIntent::Append),
+        ("overwrite", ConnectorWriteIntent::Overwrite),
+        (
+            "partition overwrite",
+            ConnectorWriteIntent::PartitionOverwrite,
+        ),
+        ("row delta", ConnectorWriteIntent::RowDelta),
+    ]
+    .into_iter()
+    .map(|(name, intent)| (name.to_string(), ordinary(intent)))
+    .collect::<Vec<_>>();
+    let mut equality_delete = ordinary(ConnectorWriteIntent::RowDelta);
+    equality_delete.input = novarocks_spi::connector::ConnectorWriteInputRequest::EqualityDelete {
+        equality_fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+            Field::new("id", DataType::Int64, false),
+        )],
+    };
+    requests.push(("equality delete".to_string(), equality_delete));
+    for (name, flavor) in [
+        (
+            "staged create",
+            ConnectorWriteSessionFlavor::StagedCreate(staged.clone()),
+        ),
+        (
+            "managed publication",
+            publication_flavor(
+                ConnectorManagedPublicationTechnique::Full,
+                ConnectorManagedPublicationShape::Data,
+            ),
+        ),
+        ("row mutation", ConnectorWriteSessionFlavor::RowMutation),
+        (
+            "copy on write",
+            ConnectorWriteSessionFlavor::CopyOnWrite {
+                selection: cow_selection(&[]),
+                match_contract: copy_on_write_match_contract(),
+            },
+        ),
+        (
+            "data rewrite",
+            ConnectorWriteSessionFlavor::DistributedRewrite(DATA_FILE_REWRITE),
+        ),
+        (
+            "position delete rewrite",
+            ConnectorWriteSessionFlavor::DistributedRewrite(POSITION_DELETE_REWRITE),
+        ),
+    ] {
+        let mut request = ordinary(ConnectorWriteIntent::Append);
+        request.flavor = flavor;
+        requests.push((name.to_string(), request));
+    }
+    let (flavor, base) = document_publication_for_refusal(runtime, incarnation, catalog_handle);
+    let mut request = ordinary(ConnectorWriteIntent::Overwrite);
+    request.flavor = flavor;
+    request.base = Some(base);
+    requests.push(("document publication".to_string(), request));
+    requests
+}
+
+#[test]
+fn hms_write_admission_refuses_every_flavor_without_catalog_or_filesystem_io() {
+    assert_write_admission_refused_without_io(
+        "hive",
+        novarocks_spi::connector::ConnectorRequestInitiation::Statement,
+        "read-only compatibility entry",
+    );
+}
+
+#[test]
+fn hadoop_background_write_admission_refuses_every_flavor_without_io() {
+    assert_write_admission_refused_without_io(
+        "hadoop",
+        novarocks_spi::connector::ConnectorRequestInitiation::Background,
+        "Hadoop Iceberg catalog",
+    );
+}
+
+fn assert_write_admission_refused_without_io(
+    kind: &str,
+    initiation: novarocks_spi::connector::ConnectorRequestInitiation,
+    expected_message: &str,
+) {
+    use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+    let (_executor, runtime, catalog, file_io, _warehouse) = refusing_write_runtime(kind);
+    let incarnation = ProviderBindingEpoch::new();
+    let catalog_handle = CatalogHandle::new(
+        descriptor("unit").instance_id,
+        CatalogVersion::from_bytes([1; 32]),
+    );
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        incarnation,
+        catalog_handle.clone(),
+        Arc::clone(&runtime),
+    );
+    let requests = all_write_admission_requests(&runtime, incarnation, catalog_handle);
+    assert_eq!(
+        requests.len(),
+        12,
+        "all flavors, intents and equality delete"
+    );
+    for (name, mut request) in requests {
+        request.context = request.context.with_initiation(initiation);
+        let error = control
+            .begin_write(request)
+            .expect_err("owner must refuse before I/O");
+        assert_eq!(
+            error.kind(),
+            ConnectorErrorKind::Unsupported,
+            "{kind}: {name}"
+        );
+        let message = if kind == "hadoop" {
+            match name.as_str() {
+                "managed publication" | "document publication" => {
+                    "application-document management requires an Iceberg REST catalog"
+                }
+                "staged create" => "staged-create protocol",
+                _ => "requires a single writer: background",
+            }
+        } else {
+            expected_message
+        };
+        assert!(
+            error.message().contains(message),
+            "{kind}: {name}: {}",
+            error.message()
+        );
+        catalog.assert_no_io();
+        file_io.assert_no_dispatch();
     }
 }

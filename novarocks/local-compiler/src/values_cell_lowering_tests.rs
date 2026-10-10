@@ -240,6 +240,7 @@ fn cast_package(chain: bool) -> Arc<FragmentPackage> {
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control::good()).unwrap();
     let output = fragment.nodes()[&root].output.clone();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: output.clone(),
         fields: output
@@ -247,6 +248,7 @@ fn cast_package(chain: bool) -> Arc<FragmentPackage> {
             .iter()
             .enumerate()
             .map(|(index, &value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("v{index}").into(),
                 alias: None,
                 value,

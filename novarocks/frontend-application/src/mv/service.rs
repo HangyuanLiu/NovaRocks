@@ -447,6 +447,7 @@ fn run_scheduled_refreshes(
         let AdmittedBackgroundQuery {
             owner,
             query_concurrency,
+            result_capacity,
         } = match admit_background_query(
             &dependencies.root_admission,
             &dependencies.runtime,
@@ -501,7 +502,8 @@ fn run_scheduled_refreshes(
             // for every due MV. Keeping the activity lease and governed root local
             // to the same transition makes `complete` the exact terminal
             // observation before the next event starts.
-            let disposition = execute_scheduled_refresh(dependencies, &request, cancellation);
+            let disposition =
+                execute_scheduled_refresh(dependencies, &request, cancellation, &result_capacity);
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
             if let Some((disposition_kind, reason)) = scheduler_outcome_log_fields(&disposition) {
                 tracing::warn!(
@@ -535,6 +537,8 @@ fn run_scheduled_refreshes(
 struct AdmittedBackgroundQuery {
     owner: WorkOwner,
     query_concurrency: QueryConcurrencyPermit,
+    result_capacity:
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 }
 
 fn admit_background_query(
@@ -543,10 +547,21 @@ fn admit_background_query(
     class: WorkClass,
 ) -> Result<AdmittedBackgroundQuery, novarocks_workload_control::WorkError> {
     let root = root_admission.begin_warehouse_root(WorkRequest::new(class))?;
-    let query_concurrency = runtime.block_on(async { root.owner.scope().admit_query()?.await })?;
+    let (query_concurrency, window) = runtime.block_on(async {
+        root.owner
+            .scope()
+            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)?
+            .await
+    })?;
+    let result_capacity =
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(),
+            window.retain_alias(),
+        )?;
     Ok(AdmittedBackgroundQuery {
         owner: root.owner,
         query_concurrency,
+        result_capacity,
     })
 }
 
@@ -586,6 +601,7 @@ fn execute_scheduled_refresh(
     dependencies: &RefreshWorkerDependencies,
     request: &ScheduledRefreshRequest,
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+    result_capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> ScheduledRefreshDisposition {
     if scheduled_refresh_test_barrier(&request.target, &cancellation) {
         return ScheduledRefreshDisposition::ShutdownCancelled(None);
@@ -628,14 +644,20 @@ fn execute_scheduled_refresh(
             ..SessionOptimizerSettings::default()
         },
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    ));
+    ))
+    .with_result_capacity(result_capacity.clone());
+    let context = match context {
+        Ok(context) => context,
+        Err(error) => return ScheduledRefreshDisposition::InvariantViolation(error.to_string().into()),
+    };
     let connector_context =
         match crate::connector::connector_request_context_for_execution_on_runtime(
             None,
             context.execution(),
             &dependencies.runtime,
         ) {
-            Ok(context) => context,
+            Ok(context) => context
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background),
             Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.into()),
         };
     if cancellation.is_cancelled() {

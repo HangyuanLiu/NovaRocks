@@ -504,6 +504,7 @@ fn edge(
 
 fn result_port(fragment: FragmentId, node: NodeId, output: &[ValueId]) -> ResultPort {
     ResultPort {
+        scalar_schema: None,
         fragment,
         output: novarocks_physical_plan::OutputPort {
             node,
@@ -513,6 +514,7 @@ fn result_port(fragment: FragmentId, node: NodeId, output: &[ValueId]) -> Result
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(&int64(true)),
                 name: format!("c{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,

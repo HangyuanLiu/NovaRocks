@@ -162,6 +162,8 @@ pub(crate) struct HmsCatalogConfig {
     props: HashMap<String, String>,
 }
 
+use crate::table_projection::{HMS_TABLE_OBJECT_BATCH_SIZE, project_iceberg_table_batch};
+
 struct HmsClient(ThriftHiveMetastoreClient);
 
 /// Hive metastore Catalog.
@@ -303,11 +305,7 @@ impl Catalog for HmsCatalog {
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
         let name = validate_namespace(namespace)?;
 
-        let db = self
-            .client
-            .0
-            .get_database(name.clone().into())
-            .await;
+        let db = self.client.0.get_database(name.clone().into()).await;
         let db = match db {
             Ok(MaybeException::Ok(value)) => value,
             Ok(MaybeException::Exception(ThriftHiveMetastoreGetDatabaseException::O1(_))) => {
@@ -427,21 +425,34 @@ impl Catalog for HmsCatalog {
     /// - `Err(...)` if an error occurs during namespace validation or while
     /// querying the database.
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        let name = validate_namespace(namespace)?;
+        let name: faststr::FastStr = validate_namespace(namespace)?.into();
 
-        let tables = self
+        let names = self
             .client
             .0
-            .get_all_tables(name.into())
+            .get_all_tables(name.clone())
             .await
             .map(from_thrift_exception)
             .map_err(from_thrift_error)??;
 
-        let tables = tables
-            .iter()
-            .map(|table| TableIdent::new(namespace.clone(), table.to_string()))
-            .collect();
-
+        let mut tables = Vec::new();
+        for batch in names.chunks(HMS_TABLE_OBJECT_BATCH_SIZE) {
+            // These are HMS entities, not Iceberg metadata files. Keep the same
+            // client and outer listing admission/deadline for every batch.
+            let objects = self
+                .client
+                .0
+                .get_table_objects_by_name(name.clone(), batch.to_vec())
+                .await
+                .map(from_thrift_exception)
+                .map_err(from_thrift_error)??;
+            let iceberg = project_iceberg_table_batch(name.as_str(), batch, &objects)?;
+            for (index, table) in batch.iter().enumerate() {
+                if iceberg[index] {
+                    tables.push(TableIdent::new(namespace.clone(), table.to_string()));
+                }
+            }
+        }
         Ok(tables)
     }
 
@@ -659,51 +670,10 @@ impl Catalog for HmsCatalog {
         ))
     }
 
-    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
-        let table_ident = commit.identifier().clone();
-        let db_name = validate_namespace(table_ident.namespace())?;
-        let table_name = table_ident.name.clone();
-
-        let current_table = self.load_table(&table_ident).await?;
-        let current_metadata_location = current_table.metadata_location_result()?.to_string();
-        let staged_table = commit.apply(current_table)?;
-        let new_metadata_location = staged_table.metadata_location_result()?.to_string();
-
-        staged_table
-            .metadata()
-            .write_to(staged_table.file_io(), &new_metadata_location)
-            .await?;
-
-        let mut hive_table = self
-            .client
-            .0
-            .get_table(db_name.clone().into(), table_name.clone().into())
-            .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
-        let hms_metadata_location = get_metadata_location(&hive_table.parameters)?;
-        if hms_metadata_location != current_metadata_location {
-            return Err(Error::new(
-                ErrorKind::CatalogCommitConflicts,
-                format!(
-                    "HMS metadata_location changed during commit for {db_name}.{table_name}: expected {current_metadata_location}, got {hms_metadata_location}"
-                ),
-            ));
-        }
-
-        update_hive_table_metadata(
-            &mut hive_table,
-            staged_table.metadata(),
-            &current_metadata_location,
-            &new_metadata_location,
-        )?;
-
-        self.client
-            .0
-            .alter_table(db_name.into(), table_name.into(), hive_table)
-            .await
-            .map_err(from_thrift_error)?;
-
-        Ok(staged_table)
+    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Updating a table is not supported yet",
+        ))
     }
 }

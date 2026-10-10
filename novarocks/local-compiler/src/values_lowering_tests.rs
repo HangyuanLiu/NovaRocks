@@ -256,6 +256,7 @@ pub(super) fn build_typed(
         .iter()
         .enumerate()
         .map(|(index, &value)| ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: format!("result-{index}").into(),
             alias: Some(format!("alias-{index}").into()),
             value,
@@ -263,6 +264,7 @@ pub(super) fn build_typed(
         })
         .collect();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: fragment.nodes()[&root].output.clone(),
         fields,

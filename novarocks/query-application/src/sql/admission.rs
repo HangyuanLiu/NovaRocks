@@ -155,6 +155,33 @@ pub fn negotiated_query_statements(sql: &str) -> Result<Vec<&str>, QueryServiceE
     Ok(statements)
 }
 
+/// Reserved control connections use the same session authentication and KILL
+/// authorization as ordinary connections, but cannot admit ordinary SQL work.
+/// Validate the entire bounded batch before executing any fragment.
+pub fn admit_control_connection_batch(sql: &str) -> Result<(), QueryServiceError> {
+    if sql.len() > 16 * 1024 {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::Unsupported,
+            "control SQL exceeds its diagnostic input bound",
+        ));
+    }
+    let mut cursor = SqlBatchCursor::new(sql);
+    while let Some(fragment) = cursor.next_fragment()? {
+        let statement = parse_optional_single_statement(fragment)
+            .map_err(|error| query_service_parse_error(error, fragment))?;
+        if !matches!(
+            statement,
+            None | Some(ParsedStatement::Session(ast::SessionStatement::Kill(_)))
+        ) {
+            return Err(QueryServiceError::new(
+                QueryServiceErrorKind::Unsupported,
+                "control connection only accepts KILL",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Return the single executable SQL statement admitted without negotiated
 /// multi-statement support. Empty fragments and comments have no effect.
 pub fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceError> {
@@ -251,6 +278,32 @@ pub fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, 
 mod tests {
     use super::*;
     use crate::sql::parse_single_statement;
+
+    #[test]
+    fn reserved_control_batch_refuses_ordinary_sql_before_any_fragment_executes() {
+        for sql in [
+            "KILL QUERY 7",
+            "KILL CONNECTION 7",
+            "/* control */ KILL QUERY 7; KILL QUERY 8",
+            "-- nothing\n",
+        ] {
+            admit_control_connection_batch(sql).unwrap();
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT @@max_allowed_packet",
+            "select @@max_allowed_packet",
+            "SET @v=1",
+            "USE db",
+            "SHOW FULL PROCESSLIST",
+            "KILL QUERY 7; SELECT 1",
+            "KILL QUERY 7; SET @v=1",
+        ] {
+            assert!(admit_control_connection_batch(sql).is_err(), "{sql}");
+        }
+        assert!(admit_control_connection_batch(&" ".repeat(16 * 1024 + 1)).is_err());
+        assert!(admit_control_connection_batch(&" ".repeat(16 * 1024)).is_ok());
+    }
 
     #[test]
     fn definitions_and_direct_replay_have_explicit_semantic_admission() {
@@ -352,6 +405,18 @@ mod tests {
             typed_statement_work_class(&management),
             WorkClass::Management
         );
+        // A waiting submitting statement must not hold the warehouse query
+        // slot needed by its independently governed statistics/optimize job.
+        for sql in [
+            "ANALYZE TABLE lake.db.events",
+            "ALTER TABLE lake.db.events OPTIMIZE",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse job-submitting statement");
+            assert_eq!(
+                typed_statement_work_class(&statement),
+                WorkClass::Management
+            );
+        }
     }
 
     #[test]

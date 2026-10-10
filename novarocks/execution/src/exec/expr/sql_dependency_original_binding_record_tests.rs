@@ -183,7 +183,7 @@ fn sql_dependency_original_binding_record_real_grant_charge_prost_and_drop() {
     source(|types, inputs| {
         let dir = Directory::new();
         let owner = owner();
-        let resources = owner.resources();
+        let resources = owner.resources().expect("test workload resource authority");
         let task = owner
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
@@ -242,7 +242,7 @@ fn sql_dependency_original_binding_record_missing_grant_is_not_late_permission_a
     source(|types, inputs| {
         let dir = Directory::new();
         let owner = owner();
-        let resources = owner.resources();
+        let resources = owner.resources().expect("test workload resource authority");
         let task = owner
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
@@ -298,7 +298,7 @@ fn sql_dependency_original_binding_record_output_failure_releases_dto_before_sto
     source(|types, inputs| {
         let dir = Directory::new();
         let owner = owner();
-        let resources = owner.resources();
+        let resources = owner.resources().expect("test workload resource authority");
         let task = owner
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
@@ -346,8 +346,8 @@ fn sql_dependency_original_binding_record_foreign_stock_keeps_actual_authority_c
         let dir = Directory::new();
         let a = owner();
         let b = owner();
-        let ar = a.resources();
-        let br = b.resources();
+        let ar = a.resources().expect("test workload resource authority");
+        let br = b.resources().expect("test workload resource authority");
         let ta = a
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
@@ -417,7 +417,7 @@ fn sql_dependency_original_binding_record_every_control_refusal_has_no_footer_or
             for at in range {
                 let dir = Directory::new();
                 let owner = owner();
-                let resources = owner.resources();
+                let resources = owner.resources().expect("test workload resource authority");
                 let task = owner
                     .try_begin_root(WorkRequest::new(WorkClass::Query))
                     .unwrap();

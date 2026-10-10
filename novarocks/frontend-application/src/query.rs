@@ -28,7 +28,9 @@ use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
-use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
+use crate::query::compiler::{
+    FrontendQueryCompiler, FrontendQueryCompilerError, FrontendQueryPurpose,
+};
 use crate::query_execution::completion::PreparedQueryOperation;
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
@@ -91,7 +93,7 @@ use novarocks_query_application::sql::admission::{
 };
 use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
-use novarocks_query_application::sql::kill::execute_kill_statement;
+use novarocks_query_application::sql::kill::execute_control_session_statement;
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
@@ -112,7 +114,7 @@ use novarocks_user_error::UserError;
 use novarocks_workload_control::WorkError;
 use novarocks_workload_control::WorkOwner;
 use novarocks_workload_control::{
-    LocalResourceAuthority, RootAdmissionHandle, WorkClass, WorkRequest,
+    ResultWindowAlias, ResultWindowClass, RootAdmissionHandle, WorkClass, WorkRequest,
 };
 
 pub(crate) mod compiler;
@@ -172,10 +174,15 @@ where
                         format!("product command scope is no longer active: {error}"),
                     )
                 })?;
-                call(&request_context, &command_context).map_err(Into::into)
+                let window = command_context.result_window_alias();
+                let result = call(&request_context, &command_context).map_err(Into::into);
+                // The receipt retains this alias even if the awaiting future
+                // disappears while the blocking worker is still producing.
+                Ok((result, window))
             })
             .await
             .map_err(|error| command_error(CommandErrorKind::Failed, error))?
+            .and_then(|(result, _window)| result)
     })
 }
 
@@ -222,11 +229,16 @@ where
                         format!("specialized command scope is no longer active: {error}"),
                     )
                 })?;
-                call(&request_context, &command_context)
-                    .map_err(|error| command_error(CommandErrorKind::Failed, error))
+                let window = command_context.result_window_alias();
+                let result = call(&request_context, &command_context)
+                    .map_err(|error| command_error(CommandErrorKind::Failed, error));
+                // The receipt retains this alias even if the awaiting future
+                // disappears while the blocking worker is still producing.
+                Ok((result, window))
             })
             .await
             .map_err(|error| command_error(CommandErrorKind::Failed, error))?
+            .and_then(|(result, _window)| result)
     })
 }
 
@@ -465,40 +477,68 @@ fn process_list_result(
     processes: Vec<novarocks_query_application::session_control::SessionProcess>,
     full: bool,
 ) -> Result<QueryResult, String> {
-    use arrow::array::{Int64Array, StringArray};
+    use novarocks_query_application::api::LocalResultBound;
 
-    let schema = process_list_schema();
-    let ids: Int64Array = processes
-        .iter()
-        .map(|process| Some(i64::from(process.connection_id)))
-        .collect();
-    let users: StringArray = processes
-        .iter()
-        .map(|process| Some(process.principal.as_ref()))
-        .collect();
-    let hosts: StringArray = processes.iter().map(|_| None::<&str>).collect();
-    let databases: StringArray = processes.iter().map(|_| None::<&str>).collect();
-    let commands: StringArray = processes
-        .iter()
-        .map(|process| Some(process.command()))
-        .collect();
-    let times: Int64Array = processes
-        .iter()
-        .map(|process| Some(i64::try_from(process.elapsed.as_secs()).unwrap_or(i64::MAX)))
-        .collect();
-    let states: StringArray = processes.iter().map(|_| None::<&str>).collect();
-    let info: StringArray = processes
+    // The snapshot shares each statement text with its session. Count the
+    // whole result from it before building any array; FULL output can carry
+    // every running statement's complete text.
+    let info = processes
         .iter()
         .map(|process| {
-            process.statement.as_ref().map(|text| {
+            process.statement.as_deref().map(|text| {
                 if full {
-                    text.to_string()
+                    std::borrow::Cow::Borrowed(text)
                 } else {
-                    truncate_process_list_info(text)
+                    std::borrow::Cow::Owned(truncate_process_list_info(text))
                 }
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let bytes = processes
+        .iter()
+        .zip(&info)
+        .try_fold(0_usize, |total, (process, info)| {
+            [
+                size_of::<i64>(),
+                process.principal.len(),
+                0,
+                0,
+                process.command().len(),
+                size_of::<i64>(),
+                0,
+                info.as_deref().map_or(0, str::len),
+            ]
+            .into_iter()
+            .try_fold(total, |total, cell| {
+                total.checked_add(LocalResultBound::cell_bytes(cell))
+            })
+        })
+        .unwrap_or(usize::MAX);
+    LocalResultBound::V1.admit(processes.len(), bytes)?;
+
+    let schema = process_list_schema();
+    let mut ids = arrow::array::Int64Builder::with_capacity(processes.len());
+    let mut times = arrow::array::Int64Builder::with_capacity(processes.len());
+    for process in &processes {
+        ids.append_value(i64::from(process.connection_id));
+        times.append_value(i64::try_from(process.elapsed.as_secs()).unwrap_or(i64::MAX));
+    }
+    let ids = ids.finish();
+    let times = times.finish();
+    // All requested values/offset/validity storage is covered by the borrowed
+    // whole-table preflight above. Iterator constructors cannot infer string
+    // bytes and may geometrically replace a nearly full values buffer.
+    let users = process_list_text_column(
+        processes
+            .iter()
+            .map(|process| Some(process.principal.as_ref())),
+    )?;
+    let hosts = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
+    let databases = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
+    let commands =
+        process_list_text_column(processes.iter().map(|process| Some(process.command())))?;
+    let states = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
+    let info = process_list_text_column(info.iter().map(Option::as_deref))?;
 
     let batch = arrow::record_batch::RecordBatch::try_new(
         Arc::clone(&schema),
@@ -532,6 +572,22 @@ fn process_list_result(
     })
 }
 
+/// Only the closed SHOW PROCESSLIST source uses this constructor. Count
+/// borrowed cells first; no source alias is installed in the new Arrow graph.
+fn process_list_text_column<'a>(
+    values: impl ExactSizeIterator<Item = Option<&'a str>> + Clone,
+) -> Result<arrow::array::StringArray, String> {
+    let bytes = values.clone().flatten().try_fold(0usize, |sum, value| {
+        sum.checked_add(value.len())
+            .ok_or("SHOW PROCESSLIST text capacity overflows")
+    })?;
+    let mut builder = arrow::array::StringBuilder::with_capacity(values.len(), bytes);
+    for value in values {
+        builder.append_option(value);
+    }
+    Ok(builder.finish())
+}
+
 /// Truncates on a character boundary, so a multi-byte statement cannot be cut
 /// into invalid UTF-8.
 fn truncate_process_list_info(text: &str) -> String {
@@ -546,12 +602,14 @@ impl SpecializedStatementRoute for TypedCommandRoute {
         &self,
         full: bool,
         _context: &RequestContext,
-        _command_context: &CommandContext,
+        command_context: &CommandContext,
     ) -> CommandFuture {
         // The registry snapshot is taken here, under its own lock, and the
         // rest is pure projection, so this route needs no blocking executor.
+        let window = command_context.result_window_alias();
         let processes = self.sessions.list_processes();
         Box::pin(async move {
+            let _window = window;
             process_list_result(processes, full)
                 .map(StatementResult::Query)
                 .map_err(|error| {
@@ -692,8 +750,16 @@ async fn execute_synchronous_stage<T, F>(
     cancellation: QueryCancellationView,
     diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
+    result_window: Option<ResultWindowAlias>,
     call: F,
-) -> Result<(Result<T, RoutedExecutionError>, WorkOwner), String>
+) -> Result<
+    (
+        Result<T, RoutedExecutionError>,
+        WorkOwner,
+        Option<ResultWindowAlias>,
+    ),
+    String,
+>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, RoutedExecutionError> + Send + 'static,
@@ -710,8 +776,26 @@ where
             } else {
                 call()
             };
-            (result, execution_owner)
+            (result, execution_owner, result_window)
         })
+        .await
+}
+
+/// A preparation worker and its unclaimed result retain the admitted window.
+/// Cancelling the waiter does not interrupt a synchronous compiler or release
+/// the capability while that compiler can still construct its output.
+async fn execute_cancellable_preparation<T, F>(
+    executor: &QueryCpuExecutor,
+    cancellation: QueryCancellationView,
+    window: Option<ResultWindowAlias>,
+    prepare: F,
+) -> Result<(T, Option<ResultWindowAlias>), QueryCpuRunError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    executor
+        .run_cancellable(cancellation, move || (prepare(), window))
         .await
 }
 
@@ -724,6 +808,7 @@ async fn execute_prepared_dml_statement<P, Prepare, Execute>(
     cancellation: QueryCancellationView,
     diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
+    result_window: Option<ResultWindowAlias>,
     prepare: Prepare,
     execute: Execute,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
@@ -732,37 +817,39 @@ where
     Prepare: FnOnce() -> Result<P, RoutedExecutionError> + Send + 'static,
     Execute: FnOnce(P) -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
 {
-    let (prepared, execution_owner) = execute_synchronous_stage(
+    let (prepared, execution_owner, result_window) = execute_synchronous_stage(
         executor.clone(),
         cancellation.clone(),
         diagnostic_statement,
         execution_owner,
+        result_window,
         prepare,
     )
     .await?;
     match prepared {
-        Ok(prepared) => {
-            execute_synchronous_stage(
-                executor,
-                cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || execute(prepared),
-            )
-            .await
-        }
+        Ok(prepared) => execute_synchronous_stage(
+            executor,
+            cancellation,
+            diagnostic_statement,
+            execution_owner,
+            result_window,
+            move || execute(prepared),
+        )
+        .await
+        .map(|(result, owner, _window)| (result, owner)),
         Err(error) => Ok((Err(error), execution_owner)),
     }
 }
 
-/// The profile coordinator waits synchronously for native task progress. Keep
-/// that wait on the bounded blocking executor so the data runtime can poll its
-/// admission and observation RPCs, including a single backend's first send.
+/// Keep EXPLAIN dispatch and its result alias on the bounded blocking executor.
+/// The profile coordinator waits synchronously for native task progress, so the
+/// data runtime must remain free to poll admission and observation RPCs.
 async fn execute_prepared_explain_statement<P, Execute>(
     executor: QueryBlockingExecutor,
     cancellation: QueryCancellationView,
     diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
+    result_window: Option<ResultWindowAlias>,
     prepared: Result<P, RoutedExecutionError>,
     execute: Execute,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
@@ -771,23 +858,22 @@ where
     Execute: FnOnce(P) -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
 {
     match prepared {
-        Ok(prepared) => {
-            executor
-                .execute(move || {
-                    let _diagnostic_scope =
-                        crate::preparation_diagnostics::enter_statement(diagnostic_statement);
-                    let result = if cancellation.is_cancelled() {
-                        Err(RoutedExecutionError::Engine(
-                            "typed statement was cancelled before prepared query execution began"
-                                .to_owned(),
-                        ))
-                    } else {
-                        execute(prepared)
-                    };
-                    (result, execution_owner)
-                })
-                .await
-        }
+        Ok(prepared) => executor
+            .execute(move || {
+                let _diagnostic_scope =
+                    crate::preparation_diagnostics::enter_statement(diagnostic_statement);
+                let result = if cancellation.is_cancelled() {
+                    Err(RoutedExecutionError::Engine(
+                        "typed statement was cancelled before prepared query execution began"
+                            .to_owned(),
+                    ))
+                } else {
+                    execute(prepared)
+                };
+                (result, execution_owner, result_window)
+            })
+            .await
+            .map(|(result, owner, _window)| (result, owner)),
         Err(error) => Ok((Err(error), execution_owner)),
     }
 }
@@ -825,7 +911,6 @@ pub struct FrontendQueryService {
     query_execution: QueryExecutionService,
     logical_read_launcher: Arc<dyn LogicalReadLauncher>,
     workload_root_admission: RootAdmissionHandle,
-    workload_resources: LocalResourceAuthority,
     role: ClusterRole,
     topology: BackendTopologyService,
     dml: Arc<DmlService>,
@@ -859,7 +944,6 @@ impl FrontendQueryService {
         query_execution: QueryExecutionService,
         logical_read_launcher: Arc<dyn LogicalReadLauncher>,
         workload_root_admission: RootAdmissionHandle,
-        workload_resources: LocalResourceAuthority,
         role: ClusterRole,
         topology: BackendTopologyService,
         dml: Arc<DmlService>,
@@ -892,7 +976,6 @@ impl FrontendQueryService {
             query_execution,
             logical_read_launcher,
             workload_root_admission,
-            workload_resources,
             role,
             topology,
             dml,
@@ -1051,16 +1134,26 @@ impl FrontendQuerySession {
         statement: &ast::SessionStatement,
     ) -> Result<StatementResult, QueryServiceError> {
         let token = self.token()?;
+        if let Some(result) = execute_control_session_statement(
+            source,
+            statement,
+            token,
+            &self.service.query_control,
+            self.service.client_connection_control.as_ref(),
+        ) {
+            return result;
+        }
         let mut governed = self
             .service
             .query_control
-            .begin_governed_statement(
+            .begin_governed_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 WorkClass::Management,
                 None,
                 None,
                 Some(Arc::from(source)),
+                ResultWindowClass::Local,
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let result = match statement {
@@ -1094,7 +1187,9 @@ impl FrontendQuerySession {
                 }
                 Ok(StatementResult::Ok)
             }
-            ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
+            ast::SessionStatement::Kill(_) => {
+                unreachable!("KILL enters the dedicated control route before ordinary admission")
+            },
             ast::SessionStatement::TransactionControl(statement) => Err(
                 QueryServiceError::from_user_error(
                     SessionAdmitError::TransactionUnsupported.to_user_error(
@@ -1109,24 +1204,13 @@ impl FrontendQuerySession {
             ),
         };
         match result {
-            Ok(StatementResult::Ok) => {
-                governed.complete_execution();
-                Ok(StatementResult::GovernedCompletion(
-                    GovernedCompletionStatementResult::new(
-                        self.service.workload_resources.clone(),
-                        governed,
-                    ),
-                ))
-            }
+            Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
+                GovernedCompletionStatementResult::new(governed),
+            )),
             Ok(StatementResult::Query(result)) => {
-                governed.complete_execution();
-                Ok(StatementResult::GovernedQuery(
-                    GovernedImmediateStatementResult::new(
-                        result,
-                        self.service.workload_resources.clone(),
-                        governed,
-                    ),
-                ))
+                // Local delivery may still use transitional LRA credits under
+                // this exact scope. Its root exits at the protocol terminal.
+                Ok(self.governed_local_result(result, governed))
             }
             Ok(
                 StatementResult::GovernedQuery(_)
@@ -1138,6 +1222,17 @@ impl FrontendQuerySession {
                 governed,
             )),
             Err(error) => Ok(self.governed_typed_error(error, governed)),
+        }
+    }
+
+    fn governed_local_result(
+        &self,
+        result: QueryResult,
+        statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
+    ) -> StatementResult {
+        match GovernedImmediateStatementResult::try_new(result, statement) {
+            Ok(result) => StatementResult::GovernedQuery(result),
+            Err((error, statement)) => self.governed_typed_error(internal_error(error), statement),
         }
     }
 
@@ -1187,21 +1282,6 @@ impl FrontendQuerySession {
         Ok(())
     }
 
-    fn execute_session_kill(
-        &self,
-        source: &str,
-        statement: &ast::KillStatement,
-    ) -> Result<StatementResult, QueryServiceError> {
-        let requester = self.token()?;
-        execute_kill_statement(
-            source,
-            statement,
-            requester,
-            &self.service.query_control,
-            self.service.client_connection_control.as_ref(),
-        )
-    }
-
     async fn init_database_with_cancellation(
         &self,
         schema: &str,
@@ -1241,7 +1321,15 @@ impl FrontendQuerySession {
         statement_token: StatementToken,
         cancellation: novarocks_workload_control::CancellationView,
         preparation_scope: &novarocks_workload_control::WorkScope,
+        preparation_window: Option<ResultWindowAlias>,
+        purpose: FrontendQueryPurpose,
     ) -> Result<PreparedQueryOperation, GovernedPreparationError> {
+        if preparation_window.as_ref().map(ResultWindowAlias::class) != Some(purpose.window_class())
+        {
+            return Err(GovernedPreparationError::Service(internal_error(
+                "query preparation requires its exact admitted result window",
+            )));
+        }
         let parsed_statement =
             state
                 .substitute_user_variables(parsed_statement)
@@ -1281,6 +1369,13 @@ impl FrontendQuerySession {
             optimizer_settings,
             sql_semantics.clone(),
         ));
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            preparation_scope,
+            preparation_window.as_ref().expect("preparation validated its window").clone(),
+        ).map_err(|error| GovernedPreparationError::Service(internal_error(error.to_string())))?;
+        let context = context.with_result_capacity(capacity).map_err(|error| {
+            GovernedPreparationError::Service(internal_error(error.to_string()))
+        })?;
         let query_options = with_query_hints(
             query_options_from_session_settings(&execution_settings),
             &sql_semantics,
@@ -1293,10 +1388,11 @@ impl FrontendQuerySession {
         let preparation_scope = preparation_scope.clone();
         let observed_sql =
             crate::preparation_diagnostics::statement_observations_active().then(|| sql.to_owned());
-        let prepared = self
-            .service
-            .query_cpu_executor
-            .run_cancellable(cancellation, move || {
+        let (prepared, _preparation_window) = execute_cancellable_preparation(
+            &self.service.query_cpu_executor,
+            cancellation,
+            preparation_window,
+            move || {
                 let _diagnostic_scope =
                     crate::preparation_diagnostics::enter_statement(statement_token);
                 let _observation_scope = observed_sql.as_deref().and_then(|sql| {
@@ -1304,20 +1400,22 @@ impl FrontendQuerySession {
                 });
                 compiler.prepare_statement(
                     &parsed_statement,
+                    purpose,
                     &context,
                     Some(query_options),
                     &preparation_scope,
                 )
-            })
-            .await
-            .map_err(|error| match error {
-                QueryCpuRunError::Cancelled(reason) => {
-                    GovernedPreparationError::Cancelled(cancellation_error(reason))
-                }
-                QueryCpuRunError::Executor(error) => {
-                    GovernedPreparationError::Service(internal_error(error))
-                }
-            })?;
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            QueryCpuRunError::Cancelled(reason) => {
+                GovernedPreparationError::Cancelled(cancellation_error(reason))
+            }
+            QueryCpuRunError::Executor(error) => {
+                GovernedPreparationError::Service(internal_error(error))
+            }
+        })?;
         match prepared {
             Ok(operation) => Ok(operation),
             Err(FrontendQueryCompilerError::Engine(error)) => {
@@ -1350,21 +1448,36 @@ impl FrontendQuerySession {
         for assignment in &set.assignments {
             self.admit_session_set_assignment(&source, assignment)?;
         }
-        let mut staged_state = self.state.lock().map_err(poisoned_state)?.clone();
-        let (deadline, timeout_ms) = governed_query_deadline(&staged_state)?;
+        let (deadline, timeout_ms) = {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            governed_query_deadline(&state)?
+        };
+        let window_class = if set
+            .assignments
+            .iter()
+            .any(|assignment| matches!(&assignment.value, ast::SetValue::Query(_)))
+        {
+            ResultWindowClass::Internal
+        } else {
+            ResultWindowClass::Local
+        };
         let token = self.token()?;
         let mut statement = self
             .service
             .query_control
-            .begin_queued_governed_query_statement(
+            .begin_queued_governed_query_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
                 Some(Arc::from(source.as_str())),
+                window_class,
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
+        // The staged/live session overlap and every scalar child belong to
+        // this one whole window, acquired before copying or compiling them.
+        let mut staged_state = self.state.lock().map_err(poisoned_state)?.clone();
         for assignment in &set.assignments {
             let ast::SetTarget::UserVariable(variable) = &assignment.target else {
                 if let Err(error) = self.apply_session_set_assignment_to_state(
@@ -1408,7 +1521,12 @@ impl FrontendQuerySession {
                     ));
                 }
             };
-            staged_state.set_user_variable(&variable.value, value);
+            if let Err(message) = staged_state.set_user_variable(&variable.value, value) {
+                return Ok(self.governed_typed_error(
+                    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, message),
+                    statement,
+                ));
+            }
         }
         let mut live_state = self.state.lock().map_err(poisoned_state)?;
         match statement.seal_success_visibility() {
@@ -1418,7 +1536,6 @@ impl FrontendQuerySession {
                 statement.complete_execution();
                 Ok(StatementResult::GovernedCompletion(
                     GovernedCompletionStatementResult::new(
-                        self.service.workload_resources.clone(),
                         statement,
                     ),
                 ))
@@ -1429,7 +1546,7 @@ impl FrontendQuerySession {
                 drop(live_state);
                 Ok(self.governed_typed_error(governed_cancellation_error(reason), statement))
             }
-            novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Stale => {
+            novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Stale | novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Failed => {
                 drop(live_state);
                 Ok(self.governed_typed_error(
                     internal_error(
@@ -1460,6 +1577,8 @@ impl FrontendQuerySession {
                 statement.token(),
                 statement.cancellation().clone(),
                 statement.scope(),
+                statement.result_window_alias(),
+                FrontendQueryPurpose::ScalarValue,
             )
             .await
             .map_err(|error| match error {
@@ -1479,7 +1598,7 @@ impl FrontendQuerySession {
             PreparedQueryOperation::Immediate(operation) => {
                 let result = match operation.into_result() {
                     StatementResult::Query(result) => {
-                        query_result_to_user_variable_literal(&result).map_err(scalar_query_error)
+                        novarocks_query_application::sql::user_variable::local_mv_scalar_result_to_user_variable_literal(&result).map_err(scalar_query_error)
                     }
                     _ => Err(internal_error(
                         "SET scalar query preparation returned non-query immediate output",
@@ -1489,10 +1608,25 @@ impl FrontendQuerySession {
                 result
             }
             PreparedQueryOperation::LogicalRead(read) => {
+                let scalar_schema = read.scalar_schema().cloned();
+                let result_window = match statement.result_window_alias() {
+                    Some(window) => match window.for_child(&child.scope()) {
+                        Ok(window) => Some(window),
+                        Err(error) => {
+                            child.complete();
+                            return Err(internal_error(format!(
+                                "bind SET scalar child result window: {error}"
+                            )));
+                        }
+                    },
+                    None => None,
+                };
                 let start = {
                     let _observation_scope =
                         crate::preparation_diagnostics::enter_bound_statement(statement.token());
-                    self.service.logical_read_launcher.start(read, child)
+                    self.service
+                        .logical_read_launcher
+                        .start(read, child, result_window)
                 };
                 let started = start.await;
                 let mut execution = match started {
@@ -1514,7 +1648,7 @@ impl FrontendQuerySession {
                         "SET scalar query returned completion-only output",
                     ));
                 };
-                consume_governed_scalar_stream(&mut execution, stream).await
+                consume_governed_scalar_stream(&mut execution, stream, scalar_schema.as_ref()).await
             }
             PreparedQueryOperation::Distributed(_) => {
                 child.complete();
@@ -1530,22 +1664,29 @@ impl FrontendQuerySession {
         sql: String,
         parsed_statement: ParsedStatement,
     ) -> Result<StatementResult, QueryServiceError> {
-        debug_assert!(matches!(&parsed_statement, ParsedStatement::Query(_)));
-        let state = self.state.lock().map_err(poisoned_state)?.clone();
-        let (deadline, timeout_ms) = governed_query_deadline(&state)?;
+        let ParsedStatement::Query(query) = &parsed_statement else {
+            return Err(internal_error("read admission requires a query statement"));
+        };
+        let purpose = FrontendQueryPurpose::client_query(query);
+        let (deadline, timeout_ms) = {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            governed_query_deadline(&state)?
+        };
         let token = self.token()?;
         let mut statement = self
             .service
             .query_control
-            .begin_queued_governed_query_statement(
+            .begin_queued_governed_query_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
                 Some(Arc::from(sql.as_str())),
+                purpose.window_class(),
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
+        let state = self.state.lock().map_err(poisoned_state)?.clone();
         let prepared = match self
             .prepare_governed_query_operation(
                 &sql,
@@ -1556,6 +1697,8 @@ impl FrontendQuerySession {
                 statement.token(),
                 statement.cancellation().clone(),
                 statement.scope(),
+                statement.result_window_alias(),
+                purpose,
             )
             .await
         {
@@ -1572,13 +1715,9 @@ impl FrontendQuerySession {
         let read = match prepared {
             PreparedQueryOperation::Immediate(operation) => {
                 return match operation.into_result() {
-                    StatementResult::Query(result) => Ok(StatementResult::GovernedQuery(
-                        GovernedImmediateStatementResult::new(
-                            result,
-                            self.service.workload_resources.clone(),
-                            statement,
-                        ),
-                    )),
+                    StatementResult::Query(result) => {
+                        Ok(self.governed_local_result(result, statement))
+                    }
                     StatementResult::GovernedQuery(_)
                     | StatementResult::StreamingQuery(_)
                     | StatementResult::GovernedCompletion(_)
@@ -1610,7 +1749,9 @@ impl FrontendQuerySession {
         let start = {
             let _observation_scope =
                 crate::preparation_diagnostics::enter_bound_statement(statement.token());
-            self.service.logical_read_launcher.start(read, owner)
+            self.service
+                .logical_read_launcher
+                .start(read, owner, statement.result_window_alias())
         };
         let execution = match start.await {
             Ok(execution) => execution,
@@ -1621,7 +1762,6 @@ impl FrontendQuerySession {
         };
         novarocks_query_application::protocol_delivery::StreamingStatementResult::try_from_execution(
             execution,
-            self.service.workload_resources.clone(),
             statement,
         )
         .map(StatementResult::StreamingQuery)
@@ -1634,16 +1774,12 @@ impl FrontendQuerySession {
         parsed_statement: ParsedStatement,
     ) -> Result<StatementResult, QueryServiceError> {
         reject_plain_query_from_legacy_typed_route(&parsed_statement)?;
-        let state = self.state.lock().map_err(poisoned_state)?.clone();
-        let parsed_statement = state
-            .substitute_user_variables(parsed_statement)
-            .map_err(|error| internal_error(error.to_string()))?;
-        novarocks_query_application::sql::admission::admit_persisted_definition_semantics(
-            &sql,
-            &parsed_statement,
-            state.sql_semantics(),
-        )?;
-        let query_timeout_secs = state.execution_settings().query_timeout_secs();
+        let query_timeout_secs = self
+            .state
+            .lock()
+            .map_err(poisoned_state)?
+            .execution_settings()
+            .query_timeout_secs();
         let session_deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()
                 .checked_add(Duration::from_secs(seconds))
@@ -1671,28 +1807,51 @@ impl FrontendQuerySession {
         let timeout_ms = timeout_duration.map(timeout_message_millis);
         let token = self.token()?;
         let work_class = typed_statement_work_class(&parsed_statement);
+        let preparation_purpose = match &parsed_statement {
+            ParsedStatement::ExplainQuery(explain)
+                if explain.format == ast::ExplainFormat::Analyze =>
+            {
+                Some(FrontendQueryPurpose::ProfileCountOnly)
+            }
+            ParsedStatement::ExplainQuery(_) => Some(FrontendQueryPurpose::LocalRows),
+            _ => None,
+        };
+        let window_class = typed_statement_result_window_class(&parsed_statement);
         let mut statement = if work_class == WorkClass::Query {
             self.service
                 .query_control
-                .begin_queued_governed_query_statement(
+                .begin_queued_governed_query_statement_with_result(
                     token,
                     &self.service.workload_root_admission,
                     deadline.map(tokio::time::Instant::from_std),
                     timeout_ms,
                     Some(Arc::from(sql.as_str())),
+                    window_class,
                 )
                 .await
         } else {
-            self.service.query_control.begin_governed_statement(
-                token,
-                &self.service.workload_root_admission,
-                work_class,
-                deadline.map(tokio::time::Instant::from_std),
-                timeout_ms,
-                Some(Arc::from(sql.as_str())),
-            )
+            self.service
+                .query_control
+                .begin_governed_statement_with_result(
+                    token,
+                    &self.service.workload_root_admission,
+                    work_class,
+                    deadline.map(tokio::time::Instant::from_std),
+                    timeout_ms,
+                    Some(Arc::from(sql.as_str())),
+                    window_class,
+                )
         }
         .map_err(|error| self.governed_statement_begin_error(error))?;
+        let state = self.state.lock().map_err(poisoned_state)?.clone();
+        let parsed_statement = state
+            .substitute_user_variables(parsed_statement)
+            .map_err(|error| internal_error(error.to_string()))?;
+        novarocks_query_application::sql::admission::admit_persisted_definition_semantics(
+            &sql,
+            &parsed_statement,
+            state.sql_semantics(),
+        )?;
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),
@@ -1769,6 +1928,25 @@ impl FrontendQuerySession {
         let add_files_engine = Arc::clone(&self.service.add_files_engine);
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
+        let window = match statement.result_window_alias() {
+            Some(window) => window,
+            None => {
+                return Ok(self.governed_typed_error(
+                    internal_error("typed statement has no admitted result capacity"),
+                    statement,
+                ));
+            }
+        };
+        let capacity = match novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(statement.scope(), window) {
+            Ok(capacity) => capacity,
+            Err(error) => return Ok(self.governed_typed_error(internal_error(error.to_string()), statement)),
+        };
+        let context = match context.with_result_capacity(capacity) {
+            Ok(context) => context,
+            Err(error) => {
+                return Ok(self.governed_typed_error(internal_error(error.to_string()), statement));
+            }
+        };
         let query_options = with_query_hints(
             query_options_from_session_settings(&execution_settings),
             &sql_semantics,
@@ -1801,6 +1979,18 @@ impl FrontendQuerySession {
             diagnostic_statement,
             Arc::clone(&self.principal),
         );
+        let command_context = match statement.result_window_alias() {
+            Some(window) => match command_context.with_result_window(window) {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(
+                        self.governed_typed_error(internal_error(error.to_string()), statement)
+                    );
+                }
+            },
+            None => command_context,
+        };
+        let producer_window = command_context.result_window_alias();
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
@@ -1811,7 +2001,7 @@ impl FrontendQuerySession {
         let mut worker: Pin<Box<dyn Future<Output = _> + Send>> = match parsed_statement {
             statement @ ParsedStatement::ExplainQuery(_) => Box::pin(async move {
                 let execution_cancellation = worker_cancellation.clone();
-                let (prepared, execution_owner) = query_cpu_executor
+                let (prepared, execution_owner, producer_window) = query_cpu_executor
                     .run(move || {
                         let _diagnostic_scope =
                             crate::preparation_diagnostics::enter_statement(diagnostic_statement);
@@ -1824,6 +2014,8 @@ impl FrontendQuerySession {
                             compiler
                                 .prepare_statement(
                                     &statement,
+                                    preparation_purpose
+                                        .expect("EXPLAIN has an admitted preparation purpose"),
                                     &context,
                                     Some(query_options),
                                     &preparation_scope,
@@ -1840,7 +2032,9 @@ impl FrontendQuerySession {
                                     }
                                 })
                         };
-                        (result, execution_owner)
+                        // The result receipt retains the alias even when its
+                        // awaiting session disappears before CPU work exits.
+                        (result, execution_owner, producer_window)
                     })
                     .await?;
                 execute_prepared_explain_statement(
@@ -1848,6 +2042,7 @@ impl FrontendQuerySession {
                     execution_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     prepared,
                     move |operation| {
                         execute_prepared_query(operation, &query_execution)
@@ -1868,6 +2063,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_delete(
                             prepare_engine.as_ref(),
@@ -1898,6 +2094,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_insert(
                             prepare_engine.as_ref(),
@@ -1928,6 +2125,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_delete(
                             prepare_engine.as_ref(),
@@ -1961,6 +2159,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_typed_mutation(
                             prepare_engine.as_ref(),
@@ -1992,6 +2191,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_ctas(
                             prepare_engine.as_ref(),
@@ -2049,6 +2249,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         prepare_dml
                             .prepare_truncate(
@@ -2080,6 +2281,7 @@ impl FrontendQuerySession {
                             worker_cancellation,
                             diagnostic_statement,
                             execution_owner,
+                            producer_window,
                             move || {
                                 prepare_dml
                                     .prepare_add_files(
@@ -2291,18 +2493,9 @@ impl FrontendQuerySession {
             ));
         }
         match result {
-            Ok(StatementResult::Query(result)) => Ok(StatementResult::GovernedQuery(
-                GovernedImmediateStatementResult::new(
-                    result,
-                    self.service.workload_resources.clone(),
-                    statement,
-                ),
-            )),
+            Ok(StatementResult::Query(result)) => Ok(self.governed_local_result(result, statement)),
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
-                GovernedCompletionStatementResult::new(
-                    self.service.workload_resources.clone(),
-                    statement,
-                ),
+                GovernedCompletionStatementResult::new(statement),
             )),
             Ok(
                 StatementResult::GovernedQuery(_)
@@ -2334,11 +2527,7 @@ impl FrontendQuerySession {
         error: QueryServiceError,
         statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
     ) -> StatementResult {
-        StatementResult::GovernedError(GovernedErrorStatementResult::new(
-            error,
-            self.service.workload_resources.clone(),
-            statement,
-        ))
+        StatementResult::GovernedError(GovernedErrorStatementResult::new(error, statement))
     }
 }
 
@@ -2412,16 +2601,17 @@ impl QuerySession for FrontendQuerySession {
     ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
     {
         let token = self.token()?;
-        let mut statement = self
+        let statement = self
             .service
             .query_control
-            .begin_governed_statement(
+            .begin_governed_statement_with_result(
                 token,
                 &self.service.workload_root_admission,
                 WorkClass::Management,
                 None,
                 None,
                 None,
+                ResultWindowClass::Local,
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let cancellation = QueryCancellationView::governed(
@@ -2432,19 +2622,13 @@ impl QuerySession for FrontendQuerySession {
             .init_database_with_cancellation(schema, cancellation)
             .await
         {
-            Ok(()) => {
-                statement.complete_execution();
-                Ok(
-                    novarocks_query_application::session::QuerySessionStatement::output_owned(
-                        StatementResult::GovernedCompletion(
-                            GovernedCompletionStatementResult::new(
-                                self.service.workload_resources.clone(),
-                                statement,
-                            ),
-                        ),
-                    ),
-                )
-            }
+            Ok(()) => Ok(
+                novarocks_query_application::session::QuerySessionStatement::output_owned(
+                    StatementResult::GovernedCompletion(GovernedCompletionStatementResult::new(
+                        statement,
+                    )),
+                ),
+            ),
             Err(error) => Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
                     self.governed_typed_error(error, statement),
@@ -2634,9 +2818,43 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+/// Work classification selects statement admission; the output purpose
+/// independently selects its result capacity. Foreground MV refresh and
+/// repartition and foreground distributed maintenance rewrites are management
+/// commands whose writes produce InternalFacts.
+fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWindowClass {
+    match statement {
+        ParsedStatement::Dml(_)
+        | ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Refresh(_)) => {
+            ResultWindowClass::Internal
+        }
+        ParsedStatement::ExplainQuery(explain) if explain.format == ast::ExplainFormat::Analyze => {
+            ResultWindowClass::Internal
+        }
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Alter(alter))
+            if matches!(
+                alter.action,
+                ast::MaterializedViewAlterAction::Repartition(_)
+            ) =>
+        {
+            ResultWindowClass::Internal
+        }
+        ParsedStatement::Maintenance(ast::MaintenanceStatement::Call(call))
+            if matches!(call.procedure.parts.as_slice(), [_, namespace, procedure]
+                if namespace.value.eq_ignore_ascii_case("system")
+                    && (procedure.value.eq_ignore_ascii_case("rewrite_data_files")
+                        || procedure.value.eq_ignore_ascii_case("rewrite_position_delete_files"))) =>
+        {
+            ResultWindowClass::Internal
+        }
+        _ => ResultWindowClass::Local,
+    }
+}
+
 async fn consume_governed_scalar_stream(
     execution: &mut novarocks_query_application::api::ExecutionHandle,
     mut stream: novarocks_query_application::api::QueryResultStream,
+    scalar_schema: Option<&novarocks_result_contract::ScalarSchema>,
 ) -> Result<String, QueryServiceError> {
     let schema = match stream.begin_schema() {
         Some(schema) => schema,
@@ -2659,13 +2877,24 @@ async fn consume_governed_scalar_stream(
         let _ = execution.request_cancel();
         return Err(scalar_query_error(message));
     }
-    let field = &schema.schema().fields()[0];
-    let column = QueryResultColumn::new(
-        field.name(),
-        field.data_type().clone(),
-        field.nullable(),
-        field.logical_type().cloned(),
+    use novarocks_query_application::api::ResultRowCarrier;
+    use novarocks_result_contract::{BorrowedScalarRecord, InternalResultDomain, RootOutputKind};
+    let relayed = matches!(
+        schema.row_carrier(),
+        ResultRowCarrier::Relayed {
+            kind: RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
+            client_rows: None
+        }
     );
+    if !relayed || scalar_schema.is_none() {
+        let message = "SET scalar query has no matching frozen typed scalar contract";
+        schema.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::InvalidRequest,
+            message,
+        ));
+        let _ = execution.request_cancel();
+        return Err(scalar_query_error(message.to_string()));
+    }
     schema.complete();
 
     let mut value = None;
@@ -2684,40 +2913,57 @@ async fn consume_governed_scalar_stream(
             }
         };
         match delivery {
-            ResultDelivery::Batch(delivery) => {
-                let rows = delivery.batch().num_rows();
-                if rows > 1 || (rows == 1 && value.is_some()) {
-                    let message = "Subquery returns more than 1 row".to_string();
-                    delivery.fail(QueryExecutionError::new(
-                        QueryExecutionErrorKind::InvalidRequest,
-                        message.clone(),
-                    ));
-                    let _ = execution.request_cancel();
-                    return Err(scalar_query_error(message));
-                }
-                if rows == 1 {
-                    let result = QueryResult {
-                        columns: vec![column.clone()],
-                        batches: vec![delivery.batch().clone()],
-                    };
-                    value = match query_result_to_user_variable_literal(&result) {
-                        Ok(value) => Some(value),
-                        Err(message) => {
-                            delivery.fail(QueryExecutionError::new(
-                                QueryExecutionErrorKind::InvalidRequest,
-                                message.clone(),
-                            ));
-                            let _ = execution.request_cancel();
-                            return Err(scalar_query_error(message));
-                        }
-                    };
-                }
-                if let Err(error) = delivery.complete_decoded() {
-                    let _ = execution.request_cancel();
-                    return Err(governed_query_execution_error(error));
+            ResultDelivery::Segment(delivery) => {
+                let decoded = (|| {
+                    if !relayed
+                        || delivery.kind()
+                            != RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1)
+                    {
+                        return Err(
+                            "SET scalar query received a foreign root output domain".to_string()
+                        );
+                    }
+                    if value.is_some() {
+                        return Err("SET scalar producer returned more than one record".to_string());
+                    }
+                    let frozen =
+                        scalar_schema.expect("a typed scalar carrier has its frozen contract");
+                    let record = BorrowedScalarRecord::try_decode(frozen, delivery.body())
+                        .map_err(|error| format!("SET scalar record: {error}"))?;
+                    let rows = record.rows();
+                    if delivery.rows() != rows {
+                        return Err(
+                            "SET scalar record row count differs from its delivery".to_string()
+                        );
+                    }
+                    novarocks_query_application::sql::user_variable::borrowed_scalar_record_to_user_variable_literal(&record)
+                })();
+                match decoded {
+                    Ok(literal) => {
+                        value = Some(literal);
+                        delivery.complete();
+                    }
+                    Err(message) => {
+                        delivery.fail(QueryExecutionError::new(
+                            QueryExecutionErrorKind::InvalidRequest,
+                            message.clone(),
+                        ));
+                        let _ = execution.request_cancel();
+                        return Err(scalar_query_error(message));
+                    }
                 }
             }
             ResultDelivery::End(delivery) => {
+                if value.is_none() {
+                    let message = "SET typed scalar query ended without its required record";
+                    delivery.fail(QueryExecutionError::new(
+                        QueryExecutionErrorKind::InvalidRequest,
+                        message,
+                    ));
+                    let _ = execution.request_cancel();
+                    return Err(scalar_query_error(message.to_string()));
+                }
+
                 delivery.complete();
                 return Ok(value.unwrap_or_else(|| "null".to_string()));
             }
@@ -2883,6 +3129,59 @@ mod tests {
     }
 
     #[test]
+    fn typed_command_result_capacity_follows_output_purpose() {
+        let refresh = parse_single_statement("REFRESH MATERIALIZED VIEW mv")
+            .expect("parse foreground MV refresh");
+        assert_eq!(typed_statement_work_class(&refresh), WorkClass::Management);
+        assert_eq!(
+            typed_statement_result_window_class(&refresh),
+            ResultWindowClass::Internal
+        );
+
+        for sql in [
+            "INSERT INTO target VALUES (1)",
+            "EXPLAIN ANALYZE SELECT 1",
+            "CALL ice.system.rewrite_data_files(table => 'db.orders')",
+            "CALL ice.system.rewrite_position_delete_files(table => 'db.orders')",
+            "CALL ice.SYSTEM.REWRITE_POSITION_DELETE_FILES(table => 'db.orders')",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse internal output command");
+            assert_eq!(
+                typed_statement_result_window_class(&statement),
+                ResultWindowClass::Internal,
+                "{sql}"
+            );
+        }
+        let repartition =
+            parse_single_statement("ALTER MATERIALIZED VIEW mv REPARTITION BY (bucket(id, 4))")
+                .expect("parse foreground MV repartition");
+        assert_eq!(
+            typed_statement_work_class(&repartition),
+            WorkClass::Management
+        );
+        assert_eq!(
+            typed_statement_result_window_class(&repartition),
+            ResultWindowClass::Internal
+        );
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "SHOW MATERIALIZED VIEWS",
+            "ALTER MATERIALIZED VIEW mv PAUSE REFRESH",
+            "CREATE DATABASE result_capacity_test",
+            "CALL ice.system.rewrite_manifests(table => 'db.orders')",
+            "CALL ice.system.expire_snapshots(table => 'db.orders', retain_last => 1)",
+            "CALL ice.other.rewrite_position_delete_files(table => 'db.orders')",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse local output command");
+            assert_eq!(
+                typed_statement_result_window_class(&statement),
+                ResultWindowClass::Local,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn frontend_projects_query_application_session_settings_to_native_options() {
         let mut settings = SessionExecutionSettings::default();
         settings.set_query_timeout_secs(17);
@@ -2927,10 +3226,9 @@ mod tests {
     ) -> (
         ResultStreamTestProducer,
         novarocks_query_application::api::ExecutionHandle,
-        LocalResourceAuthority,
         novarocks_query_application::test_support::TestResultDeliveryReceipt,
     ) {
-        ResultStreamTestProducer::open(
+        let (producer, execution, _resources, receipt) = ResultStreamTestProducer::open(
             QueryExecutionId::new(
                 QueryId::new(83, 1),
                 AttemptId::new(1).expect("test attempt"),
@@ -2944,7 +3242,8 @@ mod tests {
                 per_scope_bytes: 1024 * 1024 - 1024,
             },
         )
-        .expect("open scalar result stream")
+        .expect("open scalar result stream");
+        (producer, execution, receipt)
     }
 
     #[test]
@@ -2995,146 +3294,341 @@ mod tests {
         assert_eq!(full_info, text);
     }
 
+    #[test]
+    fn full_process_list_preallocates_long_text_without_geometric_value_slack() {
+        use arrow::array::{StringArray, StringBuilder};
+        use novarocks_query_application::session_control::SessionProcess;
+
+        let text: Arc<str> = Arc::from("x".repeat(65_537));
+        let processes = (0..3)
+            .map(|connection_id| SessionProcess {
+                connection_id,
+                principal: Arc::from("root"),
+                elapsed: Duration::from_secs(1),
+                statement: Some(Arc::clone(&text)),
+            })
+            .collect();
+        let result = process_list_result(processes, true).unwrap();
+        let info = result.batches[0]
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let requested = 3 * text.len();
+        // The public preallocated builder is the capacity oracle; do not
+        // assume Arrow's alignment or allocator rounding in product code.
+        let reserved = StringBuilder::with_capacity(3, requested).finish();
+        assert_eq!(info.values().capacity(), reserved.values().capacity());
+        for row in 0..3 {
+            assert_eq!(info.value(row), text.as_ref());
+        }
+        assert_eq!(result.columns[0].data_type(), &DataType::Int64);
+        assert_eq!(result.columns[5].data_type(), &DataType::Int64);
+        // This workload exercises the old iterator's replacement buffer,
+        // rather than merely restating the current constructor.
+        let iterator_built: StringArray = std::iter::repeat_n(Some(text.as_ref()), 3).collect();
+        assert!(iterator_built.values().capacity() > info.values().capacity());
+    }
+
+    #[test]
+    fn full_process_list_beyond_the_local_bound_is_refused_before_building() {
+        use novarocks_query_application::api::LocalResultBound;
+        use novarocks_query_application::session_control::SessionProcess;
+        use std::time::Duration;
+
+        // Every session shares one large running statement; FULL output would
+        // carry all of them, the truncated output stays small.
+        let statement: Arc<str> = Arc::from("x".repeat(1024 * 1024).as_str());
+        let sessions = LocalResultBound::V1.bytes / (1024 * 1024) + 1;
+        let processes = (0..sessions)
+            .map(|index| SessionProcess {
+                connection_id: u32::try_from(index).expect("small id"),
+                principal: Arc::from("root"),
+                elapsed: Duration::from_secs(1),
+                statement: Some(Arc::clone(&statement)),
+            })
+            .collect::<Vec<_>>();
+        let error = process_list_result(processes.clone(), true).expect_err("FULL is too large");
+        assert!(error.contains("byte bound"), "{error}");
+        assert_eq!(
+            process_list_result(processes, false)
+                .expect("truncated output")
+                .row_count(),
+            sessions
+        );
+    }
+
     fn scalar_field(nullable: bool) -> ResultField {
         ResultField::new("value", DataType::Int64, nullable, None)
     }
 
-    fn scalar_batch(values: Vec<Option<i64>>) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                true,
-            )])),
-            vec![Arc::new(Int64Array::from(values))],
+    fn relayed_scalar_fixture() -> (
+        ResultStreamTestProducer,
+        novarocks_query_application::api::ExecutionHandle,
+        novarocks_query_application::test_support::TestResultDeliveryReceipt,
+        novarocks_types::QueryExecutionId,
+        novarocks_result_contract::ScalarSchema,
+    ) {
+        use novarocks_result_contract::{
+            InternalResultDomain, RootOutputKind, ScalarField, ScalarSchema, ScalarValueType,
+        };
+        let execution_id = novarocks_types::QueryExecutionId::new(
+            novarocks_types::QueryId::new(71, 1),
+            novarocks_types::AttemptId::new(1).unwrap(),
         )
-        .expect("scalar batch")
+        .unwrap();
+        let schema = ScalarSchema::try_new(ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::SignedInteger(64),
+        })
+        .unwrap();
+        let (producer, execution, _resources, receipt) =
+            ResultStreamTestProducer::open_with_carrier(
+                execution_id,
+                vec![scalar_field(true)],
+                1,
+                ResourceConfig {
+                    total_bytes: 1 << 20,
+                    control_bytes: 1024,
+                    per_scope_bytes: (1 << 20) - 1024,
+                },
+                novarocks_query_application::api::ResultRowCarrier::relayed(
+                    RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        (producer, execution, receipt, execution_id, schema)
+    }
+
+    fn scalar_root_reply(
+        execution_id: novarocks_types::QueryExecutionId,
+        schema: &novarocks_result_contract::ScalarSchema,
+        leaf: novarocks_result_contract::BorrowedScalarLeaf<'_>,
+        sequence: u64,
+    ) -> (
+        novarocks_execution_contract::root_result::RootResultReply,
+        u64,
+    ) {
+        use novarocks_execution_contract::{
+            TaskIdentity,
+            root_result::{RootReadOutcome, RootResultData, RootResultReply},
+        };
+        use novarocks_result_contract::{
+            InternalResultDomain, RootOutputKind, RootProfileId, ScalarLeafCursor,
+        };
+        use novarocks_types::{StageId, TaskId};
+        let cursor = ScalarLeafCursor::try_new(schema, leaf).unwrap();
+        let rows = cursor.rows();
+        let mut body = vec![0; cursor.encoded_len()];
+        cursor.copy_range(0, &mut body).unwrap();
+        let kind = RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1);
+        (
+            RootResultReply {
+                root_task: TaskIdentity::new(
+                    execution_id,
+                    StageId::new(1).unwrap(),
+                    TaskId::new(1).unwrap(),
+                    novarocks_types::BackendProcessId::new_v7(),
+                ),
+                profile: RootProfileId::V1,
+                kind,
+                accepted_consumed: 0,
+                outcome: RootReadOutcome::Data(
+                    RootResultData::try_new(
+                        kind,
+                        std::num::NonZeroU64::new(sequence).unwrap(),
+                        bytes::Bytes::from(body),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            },
+            rows,
+        )
     }
 
     #[tokio::test]
-    async fn governed_scalar_stream_settles_each_batch_before_eof() {
-        let (producer, mut execution, resources, schema_receipt) =
-            scalar_stream_fixture(vec![scalar_field(false)]);
-        let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
-            panic!("expected row output")
-        };
-
-        let producer_side = async {
-            assert_eq!(
-                schema_receipt.wait().await,
-                TestResultDeliveryDisposition::Completed
-            );
-            let batch_receipt = producer
-                .enqueue_batch(0, scalar_batch(vec![Some(7)]))
-                .await
-                .expect("enqueue scalar batch");
-            assert_eq!(
-                batch_receipt.wait().await,
-                TestResultDeliveryDisposition::Completed
-            );
-            assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
-            let end_receipt = producer.enqueue_end(1).await;
-            assert_eq!(
-                end_receipt.wait().await,
-                TestResultDeliveryDisposition::Completed
-            );
-            producer.finish();
-        };
-        let (value, ()) = tokio::join!(
-            consume_governed_scalar_stream(&mut execution, stream),
-            producer_side
-        );
-
-        assert_eq!(value.expect("scalar query succeeds"), "7");
-        assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_maps_empty_and_null_to_null() {
-        for (batch, expected) in [(None, "null"), (Some(scalar_batch(vec![None])), "NULL")] {
-            let (producer, mut execution, _resources, schema_receipt) =
-                scalar_stream_fixture(vec![scalar_field(true)]);
-            let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output")
-            else {
-                panic!("expected row output")
+    async fn governed_scalar_stream_consumes_typed_value_null_and_no_rows_after_success_end() {
+        use novarocks_result_contract::BorrowedScalarLeaf as V;
+        for (leaf, expected) in [
+            (V::SignedInteger { bits: 64, value: 7 }, "7"),
+            (V::Null, "NULL"),
+            (V::NoRows, "null"),
+        ] {
+            let (producer, mut execution, schema_receipt, execution_id, schema) =
+                relayed_scalar_fixture();
+            let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
+                panic!("rows");
             };
-            let producer_side = async {
+            let capacity = producer.result_capacity();
+            let (reply, rows) = scalar_root_reply(execution_id, &schema, leaf, 1);
+            let produce = async {
                 assert_eq!(
                     schema_receipt.wait().await,
                     TestResultDeliveryDisposition::Completed
                 );
-                let mut sequence = 0;
-                if let Some(batch) = batch {
-                    let receipt = producer
-                        .enqueue_batch(sequence, batch)
-                        .await
-                        .expect("enqueue null batch");
-                    assert_eq!(
-                        receipt.wait().await,
-                        TestResultDeliveryDisposition::Completed
-                    );
-                    sequence += 1;
-                }
-                let receipt = producer.enqueue_end(sequence).await;
                 assert_eq!(
-                    receipt.wait().await,
+                    producer
+                        .enqueue_segment(0, reply, None, rows)
+                        .await
+                        .unwrap()
+                        .wait()
+                        .await,
                     TestResultDeliveryDisposition::Completed
                 );
+                assert_eq!(
+                    producer.enqueue_end(1).await.wait().await,
+                    TestResultDeliveryDisposition::Completed
+                );
+                assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
                 producer.finish();
+                assert_eq!(capacity.snapshot().held_positions, [0; 4]);
             };
-            let (value, ()) = tokio::join!(
-                consume_governed_scalar_stream(&mut execution, stream),
-                producer_side
+            let (result, ()) = tokio::join!(
+                consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
+                produce
             );
-            assert_eq!(value.expect("empty or null scalar succeeds"), expected);
+            assert_eq!(result.unwrap(), expected);
         }
     }
 
     #[tokio::test]
-    async fn governed_scalar_stream_rejects_multiple_rows_and_cancels_execution() {
-        let (producer, mut execution, resources, schema_receipt) =
-            scalar_stream_fixture(vec![scalar_field(false)]);
-        let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
-            panic!("expected row output")
+    async fn governed_scalar_stream_refuses_missing_duplicate_foreign_and_late_failed_records() {
+        use novarocks_result_contract::{BorrowedScalarLeaf, InternalResultDomain, RootOutputKind};
+        for fault in ["missing", "duplicate", "foreign", "late"] {
+            let (producer, mut execution, schema_receipt, execution_id, schema) =
+                relayed_scalar_fixture();
+            let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
+                panic!("rows");
+            };
+            let produce = async {
+                assert_eq!(
+                    schema_receipt.wait().await,
+                    TestResultDeliveryDisposition::Completed
+                );
+                if fault == "missing" {
+                    assert!(matches!(
+                        producer.enqueue_end(0).await.wait().await,
+                        TestResultDeliveryDisposition::Failed(_)
+                    ));
+                } else {
+                    let (mut reply, rows) =
+                        scalar_root_reply(execution_id, &schema, BorrowedScalarLeaf::NoRows, 1);
+                    if fault == "foreign" {
+                        reply.kind = RootOutputKind::InternalFacts(
+                            InternalResultDomain::StatisticsArtifactV1,
+                        );
+                        let novarocks_execution_contract::root_result::RootReadOutcome::Data(data) =
+                            &reply.outcome
+                        else {
+                            panic!("data");
+                        };
+                        reply.outcome =
+                            novarocks_execution_contract::root_result::RootReadOutcome::Data(
+                                novarocks_execution_contract::root_result::RootResultData::try_new(
+                                    reply.kind,
+                                    data.sequence(),
+                                    data.body().clone(),
+                                    None,
+                                )
+                                .unwrap(),
+                            );
+                    }
+                    let receipt = producer
+                        .enqueue_segment(0, reply, None, rows)
+                        .await
+                        .unwrap()
+                        .wait()
+                        .await;
+                    if fault == "foreign" {
+                        assert!(matches!(receipt, TestResultDeliveryDisposition::Failed(_)));
+                    } else {
+                        assert_eq!(receipt, TestResultDeliveryDisposition::Completed);
+                        if fault == "duplicate" {
+                            let (reply, rows) = scalar_root_reply(
+                                execution_id,
+                                &schema,
+                                BorrowedScalarLeaf::NoRows,
+                                2,
+                            );
+                            assert!(matches!(
+                                producer
+                                    .enqueue_segment(1, reply, None, rows)
+                                    .await
+                                    .unwrap()
+                                    .wait()
+                                    .await,
+                                TestResultDeliveryDisposition::Failed(_)
+                            ));
+                        } else {
+                            producer.fail(QueryExecutionError::new(
+                                QueryExecutionErrorKind::Failed,
+                                "late scalar failure",
+                            ));
+                        }
+                    }
+                }
+                producer.finish();
+            };
+            let (result, ()) = tokio::join!(
+                consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
+                produce
+            );
+            assert!(result.is_err(), "{fault}");
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_scalar_stream_rejects_foreign_record_row_count_and_cancels_execution() {
+        let (producer, mut execution, schema_receipt, execution_id, schema) =
+            relayed_scalar_fixture();
+        let capacity = producer.result_capacity();
+        let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
+            panic!("scalar rows");
         };
+        let (reply, _) = scalar_root_reply(
+            execution_id,
+            &schema,
+            novarocks_result_contract::BorrowedScalarLeaf::NoRows,
+            1,
+        );
         let producer_side = async {
             assert_eq!(
                 schema_receipt.wait().await,
                 TestResultDeliveryDisposition::Completed
             );
-            let receipt = producer
-                .enqueue_batch(0, scalar_batch(vec![Some(1), Some(2)]))
-                .await
-                .expect("enqueue multirow batch");
+            let receipt = producer.enqueue_segment(0, reply, None, 2).await.unwrap();
             assert!(matches!(
                 receipt.wait().await,
                 TestResultDeliveryDisposition::Failed(_)
             ));
         };
         let (result, ()) = tokio::join!(
-            consume_governed_scalar_stream(&mut execution, stream),
+            consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
             producer_side
         );
-
-        let error = result.expect_err("multirow scalar must fail");
+        let error = result.expect_err("record and delivery row counts must agree");
         assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
         assert_eq!(
             producer.cancellation_reason(),
             Some(WorkCancellationReason::Requested)
         );
-        assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
         producer.finish();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[tokio::test]
     async fn governed_scalar_stream_rejects_schema_and_fails_its_delivery() {
         let fields = vec![scalar_field(false), scalar_field(false)];
-        let (producer, mut execution, _resources, schema_receipt) = scalar_stream_fixture(fields);
+        let (producer, mut execution, schema_receipt) = scalar_stream_fixture(fields);
         let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
             panic!("expected row output")
         };
 
-        let error = consume_governed_scalar_stream(&mut execution, stream)
+        let error = consume_governed_scalar_stream(&mut execution, stream, None)
             .await
             .expect_err("two-column scalar result must fail");
         assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
@@ -3151,8 +3645,8 @@ mod tests {
 
     #[tokio::test]
     async fn governed_scalar_stream_failure_cancels_execution_after_schema_ack() {
-        let (producer, mut execution, _resources, schema_receipt) =
-            scalar_stream_fixture(vec![scalar_field(false)]);
+        let (producer, mut execution, schema_receipt, _execution_id, schema) =
+            relayed_scalar_fixture();
         let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
             panic!("expected row output")
         };
@@ -3161,7 +3655,7 @@ mod tests {
             "test scalar stream failure",
         ));
 
-        let error = consume_governed_scalar_stream(&mut execution, stream)
+        let error = consume_governed_scalar_stream(&mut execution, stream, Some(&schema))
             .await
             .expect_err("failed scalar result stream must fail");
         assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
@@ -3244,6 +3738,7 @@ mod tests {
         let descriptor = BackendProcessDescriptor::try_new(
             novarocks_types::BackendProcessId::new_v7(),
             RuntimeEndpoint::new("127.0.0.1", 9030).expect("test endpoint"),
+            RuntimeEndpoint::new("control-0.test.invalid", 19061).expect("test control endpoint"),
             "test-deployment",
             "test-build",
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
@@ -3289,6 +3784,222 @@ mod tests {
         (workload, root, cancellation)
     }
 
+    async fn assert_abandoned_synchronous_window(for_explain: bool) {
+        use novarocks_query_application::cpu::{
+            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+        };
+        use novarocks_workload_control::{ResultCapacityConfig, WorkloadConfig, WorkloadControl};
+
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let (owner, business, query_permit, window) = if for_explain {
+            let root = workload
+                .root_admission()
+                .begin_query_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let (permit, window) = root
+                .owner
+                .scope()
+                .admit_query_with_result(ResultWindowClass::Local)
+                .unwrap()
+                .await
+                .unwrap();
+            (root.owner, None, Some(permit), window)
+        } else {
+            let (root, window) = workload
+                .root_admission()
+                .try_begin_root_with_result(
+                    WorkRequest::new(WorkClass::Management),
+                    ResultWindowClass::Local,
+                )
+                .unwrap();
+            (root.owner, Some(root.business), None, window)
+        };
+        let cancellation =
+            QueryCancellationView::governed(owner.scope().cancellation().unwrap(), None);
+        let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        ))
+        .unwrap();
+        let executor = blocking.executor();
+        let alias = window.retain_alias();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            let produce = move || {
+                started.send(()).unwrap();
+                let (open, changed) = &*worker_gate;
+                let (open, _) = changed
+                    .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| !*open)
+                    .unwrap();
+                assert!(*open, "test worker gate timed out");
+                Ok(StatementResult::Ok)
+            };
+            if for_explain {
+                execute_prepared_explain_statement(
+                    executor,
+                    cancellation,
+                    StatementToken::new(SessionToken::new(91, 1), 1),
+                    owner,
+                    Some(alias),
+                    Ok(()),
+                    move |()| produce(),
+                )
+                .await
+            } else {
+                execute_synchronous_stage(
+                    executor,
+                    cancellation,
+                    StatementToken::new(SessionToken::new(91, 1), 1),
+                    owner,
+                    Some(alias),
+                    produce,
+                )
+                .await
+                .map(|(result, owner, _window)| (result, owner))
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(business) = business {
+            business.release();
+        }
+        drop(query_permit);
+        drop(window);
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        let (open, changed) = &*gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+        blocking
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[tokio::test]
+    async fn abandoned_synchronous_command_retains_its_window_until_actual_worker_exit() {
+        assert_abandoned_synchronous_window(false).await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_explain_dispatch_retains_local_window_until_actual_worker_exit() {
+        assert_abandoned_synchronous_window(true).await;
+    }
+
+    async fn assert_cancelled_preparation_window_until_worker_exit(class: ResultWindowClass) {
+        use novarocks_query_application::cpu::{QueryCpuExecutorConfig, QueryCpuExecutorOwner};
+        use novarocks_workload_control::{ResultCapacityConfig, WorkloadConfig, WorkloadControl};
+
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let root = workload
+            .root_admission()
+            .begin_query_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let (permit, window) = root
+            .owner
+            .scope()
+            .admit_query_with_result(class)
+            .unwrap()
+            .await
+            .unwrap();
+        let source = QueryCancellationSource::new();
+        let cancellation = source.view();
+        let mut cpu = QueryCpuExecutorOwner::try_new(QueryCpuExecutorConfig::with_idle_keepalive(
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+        let executor = cpu.executor();
+        let alias = window.retain_alias();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            execute_cancellable_preparation(&executor, cancellation, Some(alias), move || {
+                started.send(()).unwrap();
+                let (open, changed) = &*worker_gate;
+                let (open, _) = changed
+                    .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| !*open)
+                    .unwrap();
+                assert!(*open, "test compiler gate timed out");
+                StatementResult::Ok
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        source.request(QueryCancellationReason::ClientDisconnected);
+        assert!(matches!(
+            caller.await.unwrap(),
+            Err(QueryCpuRunError::Cancelled(
+                QueryCancellationReason::ClientDisconnected
+            ))
+        ));
+        drop(permit);
+        root.owner.complete();
+        drop(window);
+        let expected = match class {
+            ResultWindowClass::Client => [1, 0, 0, 0],
+            ResultWindowClass::Local => [0, 1, 0, 0],
+            ResultWindowClass::Internal => [0, 0, 1, 0],
+            ResultWindowClass::Closing => unreachable!("preparation cannot enter Closing"),
+        };
+        assert_eq!(capacity.snapshot().held_positions, expected);
+        let (open, changed) = &*gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+        cpu.shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_scalar_preparation_keeps_internal_window_until_worker_exit() {
+        assert_cancelled_preparation_window_until_worker_exit(ResultWindowClass::Internal).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_client_preparation_keeps_client_window_until_worker_exit() {
+        assert_cancelled_preparation_window_until_worker_exit(ResultWindowClass::Client).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_local_read_preparation_keeps_local_window_until_worker_exit() {
+        assert_cancelled_preparation_window_until_worker_exit(ResultWindowClass::Local).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn prepared_explain_wait_leaves_native_runtime_free_to_poll_first_send() {
         use novarocks_query_application::cpu::{
@@ -3309,6 +4020,7 @@ mod tests {
                 cancellation,
                 StatementToken::new(SessionToken::new(91, 1), 1),
                 root.owner,
+                None,
                 Ok(()),
                 move |()| {
                     let signal = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -3371,6 +4083,7 @@ mod tests {
             cancellation,
             StatementToken::new(SessionToken::new(91, 1), 1),
             root.owner,
+            None,
             Ok(()),
             |()| panic!("cancelled profile must not dispatch prepared execution"),
         )

@@ -39,7 +39,7 @@ pub fn arc_layout(payload: Layout) -> Result<Layout, LayoutResourceError> {
     if !LOCKED_TOOLCHAIN {
         return Err(LayoutResourceError::SourceModel);
     }
-    // Rust 1.92 alloc/sync.rs ArcInner is repr(C, align(2)): strong/weak
+    // Rust 1.98.1 alloc/sync.rs ArcInner is repr(C, align(2)): strong/weak
     // counters followed by the actual payload, including an empty slice.
     let counters = Layout::new::<[AtomicUsize; 2]>();
     let header = counters

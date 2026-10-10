@@ -429,6 +429,7 @@ fn fixture() -> Fixture {
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FINISH_FRAGMENT,
         output: OutputPort {
             node: finish,
@@ -437,6 +438,7 @@ fn fixture() -> Fixture {
         fields: outputs
             .iter()
             .map(|field| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: field.name.clone(),
                 alias: None,
                 value: field.value,
@@ -1504,6 +1506,7 @@ fn statistics_fixture() -> StatisticsFixture {
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FINISH_FRAGMENT,
         output: OutputPort {
             node: finish,
@@ -1512,6 +1515,7 @@ fn statistics_fixture() -> StatisticsFixture {
         fields: outputs
             .iter()
             .map(|field| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: field.name.clone(),
                 alias: None,
                 value: field.value,

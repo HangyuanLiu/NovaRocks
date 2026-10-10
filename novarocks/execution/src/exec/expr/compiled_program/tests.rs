@@ -514,6 +514,7 @@ fn package_with_dictionary(
         FrozenFragmentCalls::try_new(&fragment, &physical_uses, call_entries, &FixtureControl)
             .unwrap();
     let mut result_fields = vec![ResultField {
+        domain: crate::test_result_domain::result_value_domain(&result_type),
         name: "sample".into(),
         alias: None,
         value: sample_value,
@@ -521,6 +522,7 @@ fn package_with_dictionary(
     }];
     if twin {
         result_fields.push(ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "sample_twin".into(),
             alias: None,
             value: twin_value,
@@ -529,12 +531,14 @@ fn package_with_dictionary(
     }
     result_fields.extend([
         ResultField {
+            domain: crate::test_result_domain::result_value_domain(&seed_type),
             name: "seed_a".into(),
             alias: None,
             value: seed_value,
             ty: seed_type.clone(),
         },
         ResultField {
+            domain: crate::test_result_domain::result_value_domain(&seed_type),
             name: "seed_b".into(),
             alias: None,
             value: seed_value,
@@ -542,6 +546,7 @@ fn package_with_dictionary(
         },
     ]);
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&limit].output.clone(),
         fields: result_fields.into_boxed_slice(),

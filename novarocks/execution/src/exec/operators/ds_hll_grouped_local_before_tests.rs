@@ -87,12 +87,18 @@ fn grouped_program(two_phase: bool, nullable: bool) -> Arc<LocalProgram> {
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([117; 16]).unwrap());
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment,
         fields: output
             .columns
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(&if ordinal == 0 {
+                    key_type.clone()
+                } else {
+                    bound.result_type()
+                }),
                 name: if ordinal == 0 { "grp" } else { "estimate" }.into(),
                 alias: None,
                 value: *value,

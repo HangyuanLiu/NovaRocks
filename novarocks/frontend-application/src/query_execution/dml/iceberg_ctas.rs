@@ -23,6 +23,48 @@
 use novarocks_sql::literal::arrow_data_type_to_sql_type;
 use novarocks_sql::semantic::TableColumnDef;
 
+/// The physical Arrow inverse cannot establish or erase private producer domains.
+/// Refuse unsupported persistence before constructing the target's public types.
+pub(crate) fn validate_source_domains(
+    columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
+) -> Result<(), String> {
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_physical_plan::ResultValueDomain;
+    use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
+
+    fn private_field(field: &Field) -> bool {
+        field
+            .metadata()
+            .get(NR_LOGICAL_TYPE_KEY)
+            .is_some_and(|marker| {
+                let marker = marker.trim();
+                marker.eq_ignore_ascii_case("object") || marker.eq_ignore_ascii_case("percentile")
+            })
+            || private_type(field.data_type())
+    }
+    fn private_type(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => private_field(field),
+            DataType::Struct(fields) => fields.iter().any(|field| private_field(field)),
+            _ => false,
+        }
+    }
+    if columns.iter().any(|column| {
+        !column.domain.matches_storage(&column.data_type)
+            || matches!(
+                column.domain,
+                ResultValueDomain::Object | ResultValueDomain::Percentile
+            )
+            || private_type(&column.data_type)
+    }) {
+        return Err("CTAS source contains an unsupported internal opaque value domain".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn arrow_schema_to_table_column_defs(
     schema: &arrow::datatypes::Schema,
 ) -> Result<Vec<TableColumnDef>, String> {
@@ -54,6 +96,78 @@ mod tests {
 
     use super::arrow_schema_to_table_column_defs;
     use novarocks_types::schema::SqlType;
+
+    #[test]
+    fn m07_ctas_refuses_private_domains_before_the_arrow_inverse_can_erase_them() {
+        use novarocks_physical_plan::ResultValueDomain as Domain;
+        use novarocks_sql::planning::dml::DmlSourceColumn;
+        use novarocks_types::logical::{LogicalType, field_with_logical_type};
+        for (domain, logical) in [
+            (Domain::Object, LogicalType::Object),
+            (Domain::Percentile, LogicalType::Percentile),
+        ] {
+            for data_type in [
+                DataType::Binary,
+                DataType::List(Arc::new(field_with_logical_type(
+                    Field::new("item", DataType::Binary, true),
+                    logical,
+                ))),
+                DataType::Struct(
+                    vec![Arc::new(field_with_logical_type(
+                        Field::new("v", DataType::Binary, false),
+                        logical,
+                    ))]
+                    .into(),
+                ),
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("key", DataType::Utf8, false)),
+                                Arc::new(field_with_logical_type(
+                                    Field::new("value", DataType::Binary, true),
+                                    logical,
+                                )),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+            ] {
+                let top_domain = if data_type == DataType::Binary {
+                    domain
+                } else {
+                    Domain::Plain
+                };
+                let source = DmlSourceColumn {
+                    name: "v".into(),
+                    data_type: data_type.clone(),
+                    nullable: true,
+                    domain: top_domain,
+                };
+                // This old physical conversion is exactly why the preceding guard is required.
+                assert!(
+                    arrow_schema_to_table_column_defs(&Schema::new(vec![Field::new(
+                        "v", data_type, true
+                    )]))
+                    .is_ok()
+                );
+                assert!(super::validate_source_domains(&[source]).is_err());
+            }
+        }
+        assert!(
+            super::validate_source_domains(&[DmlSourceColumn {
+                name: "plain".into(),
+                data_type: DataType::Binary,
+                nullable: true,
+                domain: Domain::Plain,
+            }])
+            .is_ok()
+        );
+    }
 
     // ---------- basic scalar types ----------
 

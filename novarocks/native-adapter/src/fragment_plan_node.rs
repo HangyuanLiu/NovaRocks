@@ -400,19 +400,13 @@ fn int64_chunk_schema(
     slots: &[(SlotId, &str)],
     source_path: FieldPath,
 ) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
-    let slots = slots
+    let columns = slots
         .iter()
-        .map(|(slot_id, name)| {
-            ChunkSlotSchema::try_new_with_field(
-                *slot_id,
-                Field::new(*name, DataType::Int64, false),
-                None,
-                None,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>();
-    let slots = NativeFragmentDecodeError::map_invalid(source_path.clone(), slots)?;
-    NativeFragmentDecodeError::map_invalid(source_path, ChunkSchema::try_new(slots)).map(Arc::new)
+        .map(|(slot, name)| bigint_output_column(slot.as_u32(), name, false))
+        .collect::<Vec<_>>();
+    decode_output_layout(&columns, source_path)
+        .map(|layout| layout.chunk_schema())
+        .map_err(NativeFragmentDecodeError::from)
 }
 
 fn generate_series_param_slots(output_column_id: u32) -> Result<[SlotId; 3], String> {
@@ -787,7 +781,7 @@ fn normalize_set_op_inputs(
             let data_type = NativeFragmentDecodeError::map_invalid(child_path.clone().index(col_idx).field("type"), decode_type(data_type))?;
             Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
         }).collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
+        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, validate_final_result_input: false, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
     }).collect()
 }
 
@@ -815,7 +809,7 @@ fn normalize_set_op_inputs_by_position(
             let data_type = child.output_schema.slot(slot).ok_or_else(|| NativeFragmentDecodeError::inconsistent(path.clone().field("child_output_columns").index(idx), format!("SetOpNode child {idx} slot {} missing from child output schema", slot)))?.data_type().clone();
             Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
         }).collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
+        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, validate_final_result_input: false, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
     }).collect()
 }
 
@@ -918,11 +912,11 @@ pub fn lower_sort_node(
     let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
     let output_schema = output_layout.chunk_schema();
     if layout.order() == child.layout.order() {
-        return Ok(NativeLoweredPlanNode {
-            node: sorted.node,
-            layout,
-            output_schema,
-        });
+        validate_passthrough_output(&sorted.output_schema, &output_schema, output_columns_path)?;
+        // Sort changes row order, not fields. The final result adapter owns
+        // publication of exact root labels and domains; do not claim a field
+        // change that the actual Sort input never materializes.
+        return Ok(sorted);
     }
 
     build_slot_projection(
@@ -986,6 +980,7 @@ pub fn build_slot_projection(
                 input: Box::new(input.node),
                 node_id,
                 is_subordinate: true,
+                validate_final_result_input: false,
                 exprs,
                 expr_slot_ids: layout.order().to_vec(),
                 expr_slot_schemas: Some(expr_slot_schemas),
@@ -1171,6 +1166,7 @@ fn project_join_scope_to_declared_output(
                 input: Box::new(joined.node),
                 node_id,
                 is_subordinate: true,
+                validate_final_result_input: false,
                 exprs,
                 expr_slot_ids: layout.order().to_vec(),
                 expr_slot_schemas: Some(declared.slot_schemas().to_vec()),
@@ -1511,14 +1507,17 @@ fn decode_unpivot_output_schema(
         .copied()
         .map(SlotId::new)
         .collect::<Vec<_>>();
-    ChunkSchema::try_ref_from_schema_and_slot_ids(decoded.schema().as_ref(), &slot_ids).map_err(
-        |error| {
-            NativeFragmentDecodeError::invalid_value(
-                path.clone().field("columns"),
-                format!("UnpivotNode output schema: {error}"),
-            )
-        },
+    ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+        decoded.schema_metadata_origin(),
+        decoded.field_metadata_origins(),
+        &slot_ids,
     )
+    .map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            path.clone().field("columns"),
+            format!("UnpivotNode output schema: {error}"),
+        )
+    })
 }
 
 pub fn decode_unpivot_constant(
@@ -1829,6 +1828,7 @@ pub fn lower_table_function_node(
                         input: Box::new(child.node),
                         node_id: node.node_id,
                         is_subordinate: true,
+                        validate_final_result_input: false,
                         exprs: project_exprs,
                         expr_slot_ids: project_slot_ids,
                         expr_slot_schemas: Some(project_output_schema.slots().to_vec()),
@@ -2179,6 +2179,7 @@ pub fn lower_project_node(
                 input: Box::new(child.node),
                 node_id: node.node_id,
                 is_subordinate: false,
+                validate_final_result_input: false,
                 exprs,
                 expr_slot_ids,
                 expr_slot_schemas: Some(expr_slot_schemas),
@@ -2206,6 +2207,17 @@ fn project_output_plan(
     path: FieldPath,
 ) -> Result<ProjectOutputPlan, NativeFragmentDecodeError> {
     let decoded = (|| -> Result<ProjectOutputPlan, NativeFragmentLeafDecodeError> {
+        novarocks_plan_codec::native_type::preflight_native_field_types(project.items.iter().map(
+            |item| {
+                (
+                    item.output_name.as_str(),
+                    item.expr.as_ref().and_then(|expr| expr.r#type.as_ref()),
+                )
+            },
+        ))
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::Capacity, "items", error)
+        })?;
         let item_outputs = project
             .items
             .iter()
@@ -2272,12 +2284,16 @@ fn project_output_plan(
                 computed_item_indices.push(item.item_index);
                 let compute_slot_id = SlotId::new(compute_column_id);
                 computed_slot_ids.push(compute_slot_id);
-                computed_slot_schemas.push(ChunkSlotSchema::new_with_field(
-                    compute_slot_id,
-                    item.field.clone(),
-                    Some(item.field_schema.clone()),
-                    None,
-                ));
+                computed_slot_schemas.push(
+                    ChunkSlotSchema::try_new_with_metadata_origins(
+                        compute_slot_id,
+                        Arc::clone(item.field.field()),
+                        item.field.metadata_origins().clone(),
+                        Some(item.field_schema.clone()),
+                        None,
+                    )
+                    .map_err(project_synthetic_id_error)?,
+                );
                 (computed_idx, false)
             };
 
@@ -2291,12 +2307,16 @@ fn project_output_plan(
                 )
                 .map_err(project_synthetic_id_error)?
             };
-            output_slot_schemas.push(ChunkSlotSchema::new_with_field(
-                SlotId::new(output_column_id),
-                item.field,
-                Some(item.field_schema),
-                None,
-            ));
+            output_slot_schemas.push(
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    SlotId::new(output_column_id),
+                    Arc::clone(item.field.field()),
+                    item.field.metadata_origins().clone(),
+                    Some(item.field_schema),
+                    None,
+                )
+                .map_err(project_synthetic_id_error)?,
+            );
             if is_duplicate_compute
                 || computed_idx != output_indices.len()
                 || compute_column_id != output_column_id
@@ -2359,7 +2379,7 @@ struct ProjectItemOutput {
     preferred_compute_column_id: u32,
     output_column_id: u32,
     can_reuse_input_slot: bool,
-    field: Field,
+    field: novarocks_plan_codec::native_type::OwnedNativeField,
     field_schema: ChunkFieldSchema,
 }
 
@@ -2375,7 +2395,7 @@ fn project_item_output(
         .append_index(idx)
         .append_field("expr")
     })?;
-    let r#type = expr.r#type.clone().ok_or_else(|| {
+    let r#type = expr.r#type.as_ref().ok_or_else(|| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::MissingField,
             "items",
@@ -2391,13 +2411,13 @@ fn project_item_output(
             .append_field("expr")
             .append_field("type")
     };
-    let field = novarocks_plan_codec::native_type::decode_field_type(
+    let field = novarocks_plan_codec::native_type::decode_field_type_owned(
         &item.output_name,
         expr.nullable,
-        &r#type,
+        r#type,
     )
     .map_err(type_error)?;
-    let field_schema = ChunkFieldSchema::from_field(&field).map_err(type_error)?;
+    let field_schema = ChunkFieldSchema::from_field(field.field()).map_err(type_error)?;
     let (preferred_compute_column_id, can_reuse_input_slot) = match expr.kind.as_ref() {
         Some(expr::expr::Kind::ColumnRef(column)) => (column.column_id, true),
         _ => (item.output_column_id, false),
@@ -2818,11 +2838,45 @@ pub fn lower_redistribute_node(
             ),
         ));
     }
-    Ok(NativeLoweredPlanNode {
-        node: child.node,
-        layout,
-        output_schema: output_layout.chunk_schema(),
-    })
+    validate_passthrough_output(
+        &child.output_schema,
+        &output_layout.chunk_schema(),
+        output_path,
+    )?;
+    // Redistribute preserves the original program and its actual field owners.
+    Ok(child)
+}
+
+fn validate_passthrough_output(
+    actual: &ChunkSchemaRef,
+    declared: &ChunkSchemaRef,
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    if actual.slot_ids() != declared.slot_ids() {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path,
+            "pass-through output slots differ from the actual input",
+        ));
+    }
+    for (index, (source, target)) in actual.slots().iter().zip(declared.slots()).enumerate() {
+        if source.data_type() != target.data_type() || (source.nullable() && !target.nullable()) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().index(index),
+                "pass-through output cannot cast a carrier or narrow nullability",
+            ));
+        }
+        if let (Some(source), Some(target)) = (
+            source.field_schema().logical_type(),
+            target.field_schema().logical_type(),
+        ) && source != target
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().index(index),
+                "pass-through output cannot reinterpret a known logical domain",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One fully lowered physical node and its immutable output contract.
@@ -3172,6 +3226,99 @@ mod tests {
     use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
     use novarocks_proto_models::plan;
     use novarocks_types::SlotId;
+
+    #[test]
+    fn unpivot_physical_decode_retains_nested_metadata_origins_through_local_program() {
+        use novarocks_execution::exec::chunk::{
+            RootArrayStorageLimits, borrowed_root_chunk_schema_storage, borrowed_root_chunk_storage,
+        };
+        use novarocks_execution::exec::expr::ExprArena;
+        use novarocks_execution::exec::node::ExecPlan;
+        use novarocks_local_program::StaticSinkProgram;
+        use novarocks_proto_codec::arrow_physical;
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let schema = arrow::datatypes::Schema::new(vec![
+            Field::new(
+                "input_fields",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+                false,
+            ),
+            Field::new("blob_type", DataType::Utf8, false),
+            Field::new("body", DataType::Binary, false),
+            Field::new("properties", DataType::Map(entries, false), false),
+        ]);
+        let (columns, schema_metadata) =
+            arrow_physical::encode_schema(&schema, &[1, 2, 3, 4], false, FieldPath::root("schema"))
+                .unwrap();
+        let wire = plan::ArrowPhysicalSchema {
+            columns,
+            schema_metadata,
+        };
+        let source =
+            super::decode_unpivot_output_schema(Some(&wire), FieldPath::root("unpivot")).unwrap();
+        let limits = RootArrayStorageLimits {
+            bytes: 32 << 20,
+            nodes: 8192,
+            depth: 64,
+        };
+        assert!(borrowed_root_chunk_schema_storage(&source, limits).is_ok());
+        let batch = arrow::record_batch::RecordBatch::new_empty(source.arrow_schema_ref());
+        let chunk = Chunk::try_new_with_chunk_schema(batch, source.clone()).unwrap();
+        assert!(borrowed_root_chunk_storage(&chunk, limits).is_ok());
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 7 }),
+            },
+        };
+        let profile = plan
+            .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
+            .unwrap();
+        let (program, _) = plan
+            .into_local_program_and_bindings(
+                profile,
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+                StaticSinkProgram::Noop,
+            )
+            .unwrap();
+        let layout = program.nodes()[program.root().index()].output_layout();
+        let thawed = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+            layout.schema_metadata_origin().unwrap(),
+            layout.field_metadata_origins().unwrap(),
+            layout.slots(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &source.arrow_schema_ref(),
+            &thawed.arrow_schema_ref()
+        ));
+        assert!(borrowed_root_chunk_schema_storage(&thawed, limits).is_ok());
+        for slot in thawed.slots() {
+            assert!(
+                slot.metadata_origins()
+                    .unwrap()
+                    .metadata_bytes_for(slot.field_ref())
+                    .is_some()
+            );
+            assert!(
+                slot.metadata_origins()
+                    .unwrap()
+                    .metadata_bytes_for(&Arc::new(slot.field().clone()))
+                    .is_none()
+            );
+        }
+    }
 
     fn child() -> NativeLoweredPlanNode {
         let output_schema = Arc::new(ChunkSchema::empty());
@@ -3911,5 +4058,203 @@ mod redistribute_projection_tests {
             protocol.path().to_string(),
             "plan_fragment.redistribute.mode.hash.cols"
         );
+    }
+}
+
+#[cfg(test)]
+mod passthrough_schema_tests {
+    use super::*;
+    use arrow::array::BinaryArray;
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
+
+    fn child(domain: Option<LogicalType>, nullable: bool) -> NativeLoweredPlanNode {
+        let mut field = Field::new("original", DataType::Binary, nullable);
+        if let Some(domain) = domain {
+            field = field_with_logical_type(field, domain);
+        }
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                field,
+                None,
+                None,
+            )])
+            .unwrap(),
+        );
+        NativeLoweredPlanNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: Chunk::try_new_with_columns(
+                        Arc::clone(&schema),
+                        vec![Arc::new(BinaryArray::from(vec![Some(b"state".as_slice())]))],
+                    )
+                    .unwrap(),
+                    node_id: 1,
+                }),
+            },
+            layout: SlotLayout::for_slots([SlotId::new(1)]),
+            output_schema: schema,
+        }
+    }
+
+    fn column(
+        primitive: proto_common::PrimitiveType,
+        nullable: bool,
+    ) -> proto_common::OutputColumn {
+        proto_common::OutputColumn {
+            column_id: 1,
+            name: "final_alias".into(),
+            r#type: Some(proto_common::TypeDesc {
+                kind: Some(proto_common::type_desc::Kind::Scalar(
+                    proto_common::ScalarType {
+                        r#type: primitive as i32,
+                        ..Default::default()
+                    },
+                )),
+            }),
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn lower(
+        sort: bool,
+        child: NativeLoweredPlanNode,
+        column: proto_common::OutputColumn,
+        arena: &mut ExprArena,
+    ) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+        let physical = plan::PlanNode {
+            output_columns: vec![column],
+            ..Default::default()
+        };
+        let path = FieldPath::root("plan_fragment").field("passthrough");
+        if sort {
+            lower_sort_node(
+                &plan::DistributedNode {
+                    node_id: 2,
+                    limit: -1,
+                    ..Default::default()
+                },
+                &physical,
+                &plan::SortNode::default(),
+                path.clone(),
+                path.field("output_columns"),
+                vec![child],
+                arena,
+            )
+        } else {
+            lower_redistribute_node(
+                &physical,
+                &plan::RedistributeNode {
+                    mode: Some(plan::RedistributeMode {
+                        mode: Some(plan::redistribute_mode::Mode::Gather(true)),
+                    }),
+                    ..Default::default()
+                },
+                path.clone(),
+                path.field("output_columns"),
+                vec![child],
+                arena,
+            )
+        }
+    }
+
+    #[test]
+    fn m07_passthrough_keeps_actual_fields_until_final_domain_publication() {
+        for sort in [false, true] {
+            let source = child(None, false);
+            let original = Arc::clone(&source.output_schema);
+            let declared = column(proto_common::PrimitiveType::Bitmap, true);
+            let mut arena = ExprArena::default();
+            let decoded = lower(sort, source, declared.clone(), &mut arena).unwrap();
+            assert!(Arc::ptr_eq(&decoded.output_schema, &original));
+            let actual =
+                novarocks_execution::exec::pipeline::builder::output_chunk_schema_for_node(
+                    &decoded.node,
+                )
+                .unwrap();
+            assert_eq!(actual.as_ref(), decoded.output_schema.as_ref());
+            assert_eq!(decoded.output_schema.slots()[0].field().name(), "original");
+            assert_eq!(
+                decoded.output_schema.slots()[0]
+                    .field_schema()
+                    .logical_type(),
+                None
+            );
+            let published = crate::final_result_layout::apply_final_root_output_layout(
+                decoded,
+                &[declared],
+                &mut arena,
+                2,
+            )
+            .unwrap();
+            let ExecNodeKind::Project(project) = &published.node.kind else {
+                panic!("final semantic field publication requires a real projection");
+            };
+            assert!(project.validate_final_result_input);
+            assert_eq!(
+                published.output_schema.slots()[0].field().name(),
+                "final_alias"
+            );
+            assert_eq!(
+                published.output_schema.slots()[0]
+                    .field_schema()
+                    .logical_type(),
+                Some(LogicalType::Bitmap)
+            );
+            assert!(published.output_schema.slots()[0].nullable());
+        }
+    }
+
+    #[test]
+    fn m07_passthrough_refuses_carrier_narrowing_and_known_domain_conflicts() {
+        for sort in [false, true] {
+            for (source, declared) in [
+                (
+                    child(None, true),
+                    column(proto_common::PrimitiveType::Bigint, true),
+                ),
+                (
+                    child(None, true),
+                    column(proto_common::PrimitiveType::Varbinary, false),
+                ),
+                (
+                    child(Some(LogicalType::Hll), true),
+                    column(proto_common::PrimitiveType::Bitmap, true),
+                ),
+            ] {
+                assert!(lower(sort, source, declared, &mut ExprArena::default()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn m07_passthrough_missing_declaration_cannot_erase_known_source_domain() {
+        for sort in [false, true] {
+            let mut arena = ExprArena::default();
+            let declared = column(proto_common::PrimitiveType::Varbinary, true);
+            let decoded = lower(
+                sort,
+                child(Some(LogicalType::Hll), true),
+                declared.clone(),
+                &mut arena,
+            )
+            .unwrap();
+            assert_eq!(
+                decoded.output_schema.slots()[0]
+                    .field_schema()
+                    .logical_type(),
+                Some(LogicalType::Hll)
+            );
+            assert!(
+                crate::final_result_layout::apply_final_root_output_layout(
+                    decoded,
+                    &[declared],
+                    &mut arena,
+                    2,
+                )
+                .is_err()
+            );
+        }
     }
 }

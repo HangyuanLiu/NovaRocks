@@ -29,8 +29,9 @@ use std::time::{Duration, Instant};
 use super::application;
 use super::model::StatisticsJobTarget;
 use novarocks_statistics_application::{
-    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobCreate,
-    StatisticsJobId, StatisticsJobRuntime, StatisticsJobService, StatisticsTarget,
+    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobAdmission,
+    StatisticsJobCreate, StatisticsJobId, StatisticsJobRuntime, StatisticsJobService,
+    StatisticsTarget,
 };
 use novarocks_workload_control::{PendingQueryRoot, RootAdmissionHandle, WorkClass, WorkRequest};
 
@@ -186,23 +187,12 @@ impl FrontendStatisticsApplicationPort {
                 })?;
                 let capture = self
                     .target_resolver
-                    .capture_table_object(&target, context)?;
+                    .capture_table_object(&target, context.clone())?;
                 let root = self
                     .root_scope
                     .begin_statistics_job()
                     .map_err(application::StatisticsApplicationError::new)?;
-                let permit = root
-                    .owner
-                    .scope()
-                    .admit_query()
-                    .map_err(|error| {
-                        application::StatisticsApplicationError::new(error.to_string())
-                    })?
-                    .await
-                    .map_err(|error| {
-                        application::StatisticsApplicationError::new(error.to_string())
-                    })?;
-                let owner = root.owner;
+                let admission = admit_statistics_job_root(root, &context).await?;
                 let columns = match columns {
                     application::StatisticsColumnIntent::AllColumns => StatisticsColumns::All,
                     application::StatisticsColumnIntent::Explicit(columns) => {
@@ -211,7 +201,8 @@ impl FrontendStatisticsApplicationPort {
                         )
                     }
                 };
-                self.job_runtime
+                let submitted = self
+                    .job_runtime
                     .submit_admitted(
                         StatisticsJobCreate {
                             target: StatisticsTarget {
@@ -223,14 +214,20 @@ impl FrontendStatisticsApplicationPort {
                             columns,
                             submitted_at_ms,
                         },
-                        owner,
-                        permit,
+                        admission,
                     )
                     .await
-                    .map(StatisticsStatementResult::JobSubmitted)
                     .map_err(|error| {
                         application::StatisticsApplicationError::new(error.to_string())
-                    })
+                    })?;
+                if capture.job_admission
+                    == novarocks_spi::connector::ConnectorTableJobAdmission::Detached
+                {
+                    return Ok(StatisticsStatementResult::JobSubmitted(submitted));
+                }
+                let terminal =
+                    await_statistics_conclusion(&self.job_runtime, submitted.id, &context).await?;
+                Ok(StatisticsStatementResult::JobSubmitted(terminal))
             }
             application::StatisticsApplicationCommand::ShowAnalyzeJobs => self
                 .job_runtime
@@ -408,4 +405,495 @@ fn now_ms() -> Result<i64, String> {
         .as_millis()
         .try_into()
         .map_err(|_| "statistics time exceeds i64 milliseconds".into())
+}
+
+// Design: ADR-0169 (docs/adr/ADR-0169-read-only-hms-and-single-writer-admission.md)
+async fn await_statistics_conclusion(
+    runtime: &StatisticsJobRuntime,
+    id: StatisticsJobId,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatisticsJob, application::StatisticsApplicationError> {
+    await_statistics_conclusion_with_clock(runtime, id, context, now_ms).await
+}
+
+async fn await_statistics_conclusion_with_clock(
+    runtime: &StatisticsJobRuntime,
+    id: StatisticsJobId,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    clock: impl Fn() -> Result<i64, String>,
+) -> Result<StatisticsJob, application::StatisticsApplicationError> {
+    use novarocks_statistics_application::{StatisticsJobConclusion, StatisticsJobState};
+    let wait = runtime.wait_for_conclusion(id);
+    tokio::pin!(wait);
+    let stopped = context.stop().stopped();
+    tokio::pin!(stopped);
+    let deadline = tokio::time::sleep_until(context.deadline().into());
+    tokio::pin!(deadline);
+    let mut cancelled = false;
+    let mut cancellation_error = None;
+    let terminal = tokio::select! {
+        terminal = &mut wait => terminal,
+        _ = &mut stopped => {
+            cancelled = true;
+            cancellation_error = request_statistics_cancellation(runtime, id, &clock).await;
+            wait.await
+        },
+        _ = &mut deadline => {
+            cancelled = true;
+            cancellation_error = request_statistics_cancellation(runtime, id, &clock).await;
+            wait.await
+        },
+    }
+    .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))?;
+    if let Some(error) = cancellation_error {
+        return Err(application::StatisticsApplicationError::new(error));
+    }
+    if cancelled {
+        return Err(application::StatisticsApplicationError::new(
+            "ANALYZE statement cancelled; statistics job has actually converged",
+        ));
+    }
+    if terminal.state != StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded) {
+        return Err(application::StatisticsApplicationError::new(
+            terminal
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.to_string())
+                .unwrap_or_else(|| format!("statistics job completed with {:?}", terminal.state)),
+        ));
+    }
+    Ok(terminal)
+}
+
+/// Stop-aware query admission for a job root that has not been submitted yet.
+/// Dropping the admission releases its queue/grant before the root completes.
+async fn admit_statistics_job_root(
+    root: PendingQueryRoot,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatisticsJobAdmission, application::StatisticsApplicationError> {
+    use novarocks_workload_control::CancellationReason;
+    let admission = match root
+        .owner
+        .scope()
+        .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            root.owner.complete();
+            return Err(application::StatisticsApplicationError::new(
+                error.to_string(),
+            ));
+        }
+    };
+    let permit = {
+        tokio::pin!(admission);
+        tokio::select! {
+            biased;
+            _ = context.stop().stopped() => {
+                root.owner.cancel(CancellationReason::Requested);
+                Err(application::StatisticsApplicationError::new("ANALYZE cancelled before job submission"))
+            },
+            _ = tokio::time::sleep_until(context.deadline().into()) => {
+                root.owner.cancel(CancellationReason::DeadlineExceeded);
+                Err(application::StatisticsApplicationError::new("ANALYZE deadline elapsed before job submission"))
+            },
+            permit = &mut admission => permit.map_err(|error| application::StatisticsApplicationError::new(error.to_string())),
+        }
+    };
+    match permit {
+        Ok((permit, window)) => {
+            if let Err(error) =
+                novarocks_spi::connector::ConnectorOperationControl::check_active(context)
+            {
+                root.owner.cancel(if context.is_cancelled() {
+                    CancellationReason::Requested
+                } else {
+                    CancellationReason::DeadlineExceeded
+                });
+                drop(window);
+                drop(permit);
+                root.owner.complete_after_terminal_cancel_settled();
+                return Err(application::StatisticsApplicationError::new(
+                    error.to_string(),
+                ));
+            }
+            StatisticsJobAdmission::try_new(root.owner, permit, window)
+                .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))
+        }
+        Err(error) => {
+            root.owner.complete_after_terminal_cancel_settled();
+            Err(error)
+        }
+    }
+}
+
+/// Clock failure cannot prevent cancellation or bypass actual convergence.
+/// Without a new observation time, preserve the repository's existing times.
+async fn request_statistics_cancellation(
+    runtime: &StatisticsJobRuntime,
+    id: StatisticsJobId,
+    clock: &impl Fn() -> Result<i64, String>,
+) -> Option<String> {
+    use novarocks_statistics_application::StatisticsRepositoryErrorKind;
+    let (result, clock_error) = match clock() {
+        Ok(at_ms) => (runtime.request_cancel(id, at_ms).await, None),
+        Err(error) => (runtime.request_cancel_without_time(id).await, Some(error)),
+    };
+    match result {
+        Ok(_) => clock_error,
+        Err(error) if error.kind() == StatisticsRepositoryErrorKind::NotFound => clock_error,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod admission_and_conclusion_tests {
+    use std::future::Future;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    use novarocks_statistics_application::{
+        StatisticsAttemptContext, StatisticsAttemptError, StatisticsFailure,
+        StatisticsJobConclusion, StatisticsJobState, StatisticsPublicationFact,
+        StatisticsPublicationOutcome,
+    };
+    use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
+
+    use super::*;
+
+    fn control() -> WorkloadControl {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 16 * 1024 * 1024,
+                control_bytes: 1024 * 1024,
+                per_scope_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .expect("control");
+        control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .expect("result capacity");
+        control.mark_ready().expect("ready");
+        control
+    }
+
+    fn context(
+        stop: &novarocks_spi::connector::ConnectorStopOwner,
+        deadline: Instant,
+    ) -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            deadline,
+            stop.view(),
+            64 * 1024,
+            1024 * 1024,
+        )
+        .expect("context")
+    }
+
+    async fn is_pending<T>(future: std::pin::Pin<&mut impl Future<Output = T>>) -> bool {
+        let mut future = future;
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx).is_pending()))
+            .await
+    }
+
+    #[tokio::test]
+    async fn statement_stop_releases_the_unsubmitted_root_and_admission_record() {
+        assert_unsubmitted_root_control(false).await;
+    }
+
+    #[tokio::test]
+    async fn statement_deadline_releases_the_unsubmitted_root_and_admission_record() {
+        assert_unsubmitted_root_control(true).await;
+    }
+
+    async fn assert_unsubmitted_root_control(deadline_expired: bool) {
+        let control = control();
+        let held = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .expect("held root");
+        let held_permit = held.owner.scope().admit_query().unwrap().await.unwrap();
+        let pending = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .expect("pending root");
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = context(&stop, Instant::now() + Duration::from_secs(30));
+        let result = if deadline_expired {
+            let expired = context(&stop, Instant::now());
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                admit_statistics_job_root(pending, &expired),
+            )
+            .await
+            .expect("deadline interrupts admission")
+        } else {
+            let wait = admit_statistics_job_root(pending, &request);
+            tokio::pin!(wait);
+            assert!(is_pending(wait.as_mut()).await);
+            assert_eq!(control.observation().snapshot().waiting_records, 1);
+            stop.request_stop();
+            tokio::time::timeout(Duration::from_secs(1), &mut wait)
+                .await
+                .expect("statement stop interrupts admission")
+        };
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an interrupted statement must not submit a root"),
+        };
+        assert!(error.to_string().contains(if deadline_expired {
+            "deadline elapsed"
+        } else {
+            "cancelled"
+        }));
+        let snapshot = control.observation().snapshot();
+        assert_eq!(snapshot.admitted_queries, 1, "only the held query remains");
+        assert_eq!(snapshot.root_responsibilities, 1, "pending root completed");
+        assert_eq!(snapshot.waiting_records, 0);
+        assert_eq!(snapshot.admission_records, 0);
+        drop(held_permit);
+        held.owner.complete();
+    }
+
+    struct ControlledExecutor {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+        exited: Arc<AtomicBool>,
+        fail: bool,
+    }
+
+    impl StatisticsAttemptExecutor for ControlledExecutor {
+        fn prepare(
+            &self,
+            _job: &StatisticsJob,
+            scope: &StatisticsAttemptContext,
+        ) -> Result<(), StatisticsAttemptError> {
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test releases the actual executor");
+            self.exited.store(true, Ordering::SeqCst);
+            scope.stage_scope().check().map_err(|error| {
+                StatisticsAttemptError::Cancelled(StatisticsFailure {
+                    message: Arc::from(error.to_string()),
+                    compile_control: None,
+                })
+            })?;
+            if self.fail {
+                Err(StatisticsAttemptError::Failed(StatisticsFailure {
+                    message: Arc::from("controlled statistics failure"),
+                    compile_control: None,
+                }))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn collect(
+            &self,
+            _job: &StatisticsJob,
+            _scope: &StatisticsAttemptContext,
+        ) -> Result<(), StatisticsAttemptError> {
+            Ok(())
+        }
+
+        fn publish(
+            &self,
+            _job: &StatisticsJob,
+            _scope: &StatisticsAttemptContext,
+        ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
+            Ok(StatisticsPublicationOutcome {
+                fact: StatisticsPublicationFact::KnownCommitted,
+                finalization_failure: None,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Success,
+        Failure,
+        StatementStop,
+        StatementDeadline,
+        CancellationClockFailure,
+    }
+
+    #[tokio::test]
+    async fn successful_analyze_wait_returns_after_actual_executor_exit() {
+        assert_statement_wait(Outcome::Success).await;
+    }
+
+    #[tokio::test]
+    async fn failed_analyze_wait_reports_failure_after_actual_executor_exit() {
+        assert_statement_wait(Outcome::Failure).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_analyze_wait_holds_the_statement_until_actual_executor_exit() {
+        assert_statement_wait(Outcome::StatementStop).await;
+    }
+
+    #[tokio::test]
+    async fn expired_analyze_wait_holds_the_statement_until_actual_executor_exit() {
+        assert_statement_wait(Outcome::StatementDeadline).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_clock_error_cannot_bypass_actual_executor_exit() {
+        assert_statement_wait(Outcome::CancellationClockFailure).await;
+    }
+
+    async fn assert_statement_wait(outcome: Outcome) {
+        let control = control();
+        let service = StatisticsJobService::new();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = mpsc::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let runtime = StatisticsJobRuntime::start(
+            service.clone(),
+            Arc::new(ControlledExecutor {
+                started: Mutex::new(Some(started)),
+                release: Mutex::new(release_rx),
+                exited: Arc::clone(&exited),
+                fail: matches!(outcome, Outcome::Failure),
+            }),
+            tokio::runtime::Handle::current(),
+        );
+        let root = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .expect("job root");
+        let (permit, window) = root
+            .owner
+            .scope()
+            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
+            .expect("atomic job admission")
+            .await
+            .expect("admitted job root");
+        let admission = StatisticsJobAdmission::try_new(root.owner, permit, window)
+            .expect("same-root Internal admission");
+        let submitted = runtime
+            .submit_admitted(
+                StatisticsJobCreate {
+                    target: StatisticsTarget {
+                        catalog: Arc::from("ice"),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("t"),
+                        object_id: Arc::from(&b"object"[..]),
+                    },
+                    columns: StatisticsColumns::All,
+                    submitted_at_ms: 1,
+                },
+                admission,
+            )
+            .await
+            .expect("submit");
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("executor starts")
+            .expect("started message");
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let deadline = if matches!(outcome, Outcome::StatementDeadline) {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_secs(30)
+        };
+        let context = context(&stop, deadline);
+        if matches!(
+            outcome,
+            Outcome::StatementStop | Outcome::CancellationClockFailure
+        ) {
+            stop.request_stop();
+        }
+        let clock = || {
+            if matches!(outcome, Outcome::CancellationClockFailure) {
+                Err("controlled wall-clock failure".to_string())
+            } else {
+                now_ms()
+            }
+        };
+        let wait = await_statistics_conclusion_with_clock(&runtime, submitted.id, &context, clock);
+        tokio::pin!(wait);
+        assert!(is_pending(wait.as_mut()).await);
+        if matches!(outcome, Outcome::StatementDeadline) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    assert!(is_pending(wait.as_mut()).await);
+                    if service.list().await.unwrap().remove(0).cancel_requested {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("elapsed statement deadline requests job cancellation");
+        }
+        assert!(!exited.load(Ordering::SeqCst));
+        let before = service.list().await.unwrap().remove(0);
+        assert!(!before.convergence.is_complete());
+        if matches!(
+            outcome,
+            Outcome::StatementStop | Outcome::CancellationClockFailure
+        ) {
+            assert!(before.cancel_requested);
+        }
+        release.send(()).expect("release actual executor");
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut wait)
+            .await
+            .expect("statement converges");
+        assert!(exited.load(Ordering::SeqCst));
+        let terminal = service.list().await.unwrap().remove(0);
+        assert!(terminal.convergence.is_complete());
+        if matches!(
+            outcome,
+            Outcome::StatementStop | Outcome::StatementDeadline | Outcome::CancellationClockFailure
+        ) {
+            assert_eq!(
+                terminal.state,
+                StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+            );
+        }
+        assert_eq!(control.observation().snapshot().admitted_queries, 0);
+        match outcome {
+            Outcome::Success => {
+                assert_eq!(result.unwrap(), terminal);
+                assert_eq!(
+                    terminal.state,
+                    StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+                );
+            }
+            Outcome::Failure => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("controlled statistics failure")
+            ),
+            Outcome::CancellationClockFailure => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("controlled wall-clock failure")
+            ),
+            Outcome::StatementStop | Outcome::StatementDeadline => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("actually converged")
+            ),
+        }
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
 }

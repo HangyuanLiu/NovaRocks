@@ -181,6 +181,7 @@ fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
         assignments.push((expr, value));
         output.push(value);
         fields.push(ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: format!("result-{ordinal}").into(),
             alias: None,
             value,
@@ -246,6 +247,7 @@ fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
         .unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control::good()).unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: fragment.nodes()[&fragment.root()].output.clone(),
         fields: fields.into_boxed_slice(),

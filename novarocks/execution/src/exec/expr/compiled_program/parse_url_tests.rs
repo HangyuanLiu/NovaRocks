@@ -163,9 +163,11 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&output].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&ty),
             name: "url part".into(),
             alias: None,
             value: result_value,

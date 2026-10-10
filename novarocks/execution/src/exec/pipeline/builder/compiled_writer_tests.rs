@@ -431,6 +431,7 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FragmentId::new(2),
         output: OutputPort {
             node: finish,
@@ -439,6 +440,7 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
         fields: outputs
             .iter()
             .map(|field| ResultField {
+                domain: crate::test_result_domain::result_value_domain(&field.ty),
                 name: field.name.clone(),
                 alias: None,
                 value: field.value,
@@ -1671,6 +1673,7 @@ mod statistics {
         })
         .unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: FragmentId::new(2),
             output: OutputPort {
                 node: finish,
@@ -1679,6 +1682,7 @@ mod statistics {
             fields: outputs
                 .iter()
                 .map(|field| ResultField {
+                    domain: crate::test_result_domain::result_value_domain(&field.ty),
                     name: field.name.clone(),
                     alias: None,
                     value: field.value,
@@ -2746,4 +2750,7 @@ mod statistics {
         assert_eq!(estimate_compact_theta(&bodies[0].2).unwrap(), 2.0);
         assert_eq!(estimate_compact_theta(&bodies[1].2).unwrap(), 2.0);
     }
+    // Reuse the actual checked Physical writer/finish fixture, immutable pools,
+    // canonical call requests, LocalCompiler and original writer/finish bodies.
+    include!("compiled_writer_root_positive_statistics_tests.rs");
 }

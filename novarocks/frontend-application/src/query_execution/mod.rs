@@ -34,6 +34,7 @@ mod dependency_artifact_storage;
 pub mod distributed_rewrite;
 pub mod dml;
 pub mod fragment_scheduling;
+pub(crate) mod internal_result_cpu;
 pub mod kernels;
 pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;

@@ -85,11 +85,13 @@ fn program(two_phase: bool) -> Arc<LocalProgram> {
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([117; 16]).unwrap());
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment,
         fields: output
             .columns
             .iter()
             .map(|value| ResultField {
+                domain: crate::test_result_domain::result_value_domain(&bound.result_type()),
                 name: "estimate".into(),
                 alias: None,
                 value: *value,

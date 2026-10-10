@@ -37,6 +37,7 @@ bytes.workspace = true
 chrono.workspace = true
 hex.workspace = true
 novarocks-parser.workspace = true
+novarocks-result-contract.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-functions.workspace = true
 novarocks-connector-contract.workspace = true

@@ -61,6 +61,7 @@ use crate::connector_write_data_plane::{
 
 /// The Task facts every compiled writer and finish of one task binds with.
 pub(crate) struct CompiledWriteTask<'a> {
+    pub(crate) backend_process_id: novarocks_types::BackendProcessId,
     pub(crate) runtime: &'a TypedScanRuntime,
     pub(crate) fragment_instance_id: UniqueId,
     pub(crate) query_options: &'a QueryOptions,
@@ -212,7 +213,7 @@ pub(crate) fn bind_compiled_writer(
         binding.execution(),
         execution_id,
         node_id,
-        Arc::new(NativeConnectorWriteObservationPort),
+        Arc::new(NativeConnectorWriteObservationPort::new(task.backend_process_id)),
         crate::debug_environment::debug_emit_connector_writer_marker(),
     ));
     let fragment_encoder = Arc::new(RoleBoundCommitFragmentEncoder::new(

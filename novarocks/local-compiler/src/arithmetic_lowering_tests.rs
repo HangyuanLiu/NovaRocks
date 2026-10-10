@@ -395,6 +395,7 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
     }
     let root = &fixture.fragment.nodes()[&fixture.fragment.root()];
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fixture.fragment.id(),
         output: root.output.clone(),
         fields: root
@@ -402,6 +403,7 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
             .columns
             .iter()
             .map(|value| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "arithmetic".into(),
                 alias: None,
                 value: *value,

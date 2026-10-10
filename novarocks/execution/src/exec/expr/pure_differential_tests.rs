@@ -18,10 +18,7 @@
 //! The harness proved on owners that already exist, and the to-do inventory
 //! of owners that do not.
 
-use super::aggregate::{
-    AggregateDiffSpec, AggregateDiffSummary, aggregate_pure_owner_status,
-    assert_aggregate_matches_v1,
-};
+use super::aggregate::{AggregateDiffSpec, AggregateDiffSummary, assert_aggregate_matches_v1};
 use super::generate::{InputGenerator, InputProfile, TextProfile, sql_date_range};
 use super::*;
 use arrow::array::{
@@ -813,6 +810,18 @@ fn column_argument(data_type: DataType) -> DiffArgument {
 }
 
 #[test]
+fn pure_differential_census_implemented_approx_count_distinct_matches_v1() {
+    let mut spec = AggregateDiffSpec::new("approx_count_distinct");
+    spec.arguments = vec![column_argument(DataType::Int64)];
+    let summary = aggregate_ledger(assert_aggregate_matches_v1(spec));
+    assert_eq!(
+        summary.overload.as_str(),
+        "builtin.aggregate/approx_count_distinct/derived-v1"
+    );
+    assert_eq!(summary.matched_failures, 0, "{summary:?}");
+}
+
+#[test]
 fn pure_differential_reports_missing_owners_for_the_census() {
     let scalar_census: Vec<(&str, Vec<DiffArgument>)> = vec![
         ("to_datetime", vec![column_argument(DataType::Int64)]),
@@ -828,23 +837,6 @@ fn pure_differential_reports_missing_owners_for_the_census() {
         };
         assert_eq!(
             scalar_pure_owner_status(name, &spec.arguments)
-                .unwrap_err()
-                .missing_overload(),
-            Some(overload)
-        );
-        inventory.push(failure.to_string());
-    }
-    let aggregate_census: Vec<(&str, Vec<DataType>)> =
-        vec![("approx_count_distinct", vec![DataType::Int64])];
-    for (name, types) in aggregate_census {
-        let mut spec = AggregateDiffSpec::new(name);
-        spec.arguments = types.into_iter().map(column_argument).collect();
-        let failure = super::aggregate::run_aggregate_differential(&spec).expect_err(name);
-        let Some(overload) = failure.missing_overload() else {
-            panic!("{name}: expected MissingPureImplementation, got {failure}");
-        };
-        assert_eq!(
-            aggregate_pure_owner_status(&spec)
                 .unwrap_err()
                 .missing_overload(),
             Some(overload)

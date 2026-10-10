@@ -60,6 +60,61 @@ use novarocks_sql::compiler::{
 };
 use novarocks_sql::planning::catalog::TableLookupMode;
 
+/// Application intent is supplied by the caller, never inferred from a
+/// physical plan's column count. Wire installation remains a separate cut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrontendQueryPurpose {
+    ClientRows,
+    LocalRows,
+    ScalarValue,
+    ProfileCountOnly,
+}
+
+impl FrontendQueryPurpose {
+    pub(crate) fn client_query(query: &Query) -> Self {
+        if information_schema::is_local_materialized_views_query(query) {
+            Self::LocalRows
+        } else {
+            Self::ClientRows
+        }
+    }
+
+    pub(crate) fn window_class(self) -> novarocks_workload_control::ResultWindowClass {
+        use novarocks_workload_control::ResultWindowClass;
+        match self {
+            Self::ClientRows => ResultWindowClass::Client,
+            Self::LocalRows => ResultWindowClass::Local,
+            Self::ScalarValue | Self::ProfileCountOnly => ResultWindowClass::Internal,
+        }
+    }
+
+    fn validate(self, statement: &Statement) -> Result<(), FrontendQueryCompilerError> {
+        let valid = match (self, statement) {
+            (Self::ClientRows, Statement::Query(query)) => {
+                !information_schema::is_local_materialized_views_query(query)
+            }
+            (Self::LocalRows, Statement::Query(query)) => {
+                information_schema::is_local_materialized_views_query(query)
+            }
+            (Self::LocalRows, Statement::ExplainQuery(explain)) => {
+                explain.format != ExplainFormat::Analyze
+            }
+            (Self::ScalarValue, Statement::Query(_)) => true,
+            (Self::ProfileCountOnly, Statement::ExplainQuery(explain)) => {
+                explain.format == ExplainFormat::Analyze
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(FrontendQueryCompilerError::Engine(
+                "query preparation purpose does not match the admitted statement".to_owned(),
+            ))
+        }
+    }
+}
+
 /// Preserves SQL analyze-domain facts until the session still has the original
 /// SQL source required to render a user location.
 #[derive(Debug)]
@@ -204,8 +259,11 @@ struct FrontendDistributedAttemptFactory {
     /// Catalog observation, scan negotiation, or native template encoder.
     logical_execution: Arc<crate::query_execution::contract::RestartableReadExecution>,
     statement: StatementAdmissionContext,
+    result_capacity:
+        Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
     profile_plan: Arc<novarocks_physical_plan::PhysicalPlan>,
     profile_annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
+    profile_control: novarocks_sql::compiler::SqlCompileControl,
     planning_started_at: std::time::Instant,
     effect_tracker: StatementEffectTracker,
 }
@@ -215,7 +273,17 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
         &mut self,
         topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
-        let execution = self.statement.for_topology(topology);
+        let mut execution = self.statement.for_topology(topology);
+        if let Some(binding) = &self.result_capacity {
+            execution = execution
+                .with_result_capacity(binding.clone())
+                .map_err(|error| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        error.to_string(),
+                    )
+                })?;
+        }
         let request = self
             .logical_execution
             .instantiate_attempt(execution.execution());
@@ -226,6 +294,7 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
                 Arc::clone(&self.profile_annotations),
                 self.planning_started_at.elapsed(),
                 std::time::Instant::now(),
+                self.profile_control.clone(),
             ),
         ))
     }
@@ -289,10 +358,12 @@ impl FrontendQueryCompiler {
     pub(crate) fn prepare_statement(
         &self,
         statement: &Statement,
+        purpose: FrontendQueryPurpose,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
+        purpose.validate(statement)?;
         let connector_planning_context = connector_planning_context_for_query_on_runtime(
             self.connector_blocking_io.runtime(),
             query_options.as_ref(),
@@ -428,6 +499,7 @@ impl FrontendQueryCompiler {
                     context.execution().sql_semantics(),
                 )?;
                 self.complete_distributed_read(
+                    purpose,
                     &query,
                     current_catalog,
                     current_database,
@@ -580,6 +652,7 @@ impl FrontendQueryCompiler {
     #[allow(clippy::too_many_arguments)]
     fn complete_distributed_read(
         &self,
+        purpose: FrontendQueryPurpose,
         query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
@@ -648,8 +721,42 @@ impl FrontendQueryCompiler {
             },
         )
         .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
-        // What this statement delivers is a property of the plan, read before
-        // the plan is consumed by encoding.
+        // Resolve application purpose before the plan is shared with Native
+        // projection. Presentation uses one FE offset, never the BE clock.
+        let root_output = match purpose {
+            FrontendQueryPurpose::ClientRows => {
+                novarocks_result_contract::FrozenRootOutput::ClientRows(
+                    novarocks_sql::compiler::client_render_schema_from_port(
+                        completed.candidate().original_public_result_port(),
+                        chrono::Local::now().offset().local_minus_utc(),
+                    )
+                    .map_err(FrontendQueryCompilerError::Engine)?,
+                )
+            }
+            FrontendQueryPurpose::ScalarValue => {
+                novarocks_result_contract::FrozenRootOutput::ScalarValue(
+                    completed
+                        .candidate()
+                        .original_public_result_port()
+                        .and_then(|port| port.scalar_schema.clone())
+                        .ok_or_else(|| {
+                            FrontendQueryCompilerError::Engine(
+                                "completed scalar query has no frozen SQL scalar schema".into(),
+                            )
+                        })?,
+                )
+            }
+            FrontendQueryPurpose::LocalRows | FrontendQueryPurpose::ProfileCountOnly => {
+                return Err(FrontendQueryCompilerError::Engine(
+                    "distributed read received a different application output purpose".into(),
+                ));
+            }
+        };
+        let completed = completed
+            .freeze_root_output(root_output)
+            .map_err(|(error, _returned)| FrontendQueryCompilerError::Engine(error.to_string()))?;
+        // What this statement delivers is a property of the frozen plan, read
+        // before the plan is consumed by encoding.
         let output =
             novarocks_query_application::preparation::OutputContract::from_completed_candidate(
                 novarocks_query_application::api::QueryExecutionKind::Read,
@@ -779,6 +886,9 @@ impl FrontendQueryCompiler {
             .runtime()
             .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
             .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
+        let completed = completed
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
+            .map_err(|(error, _returned)| FrontendQueryCompilerError::Engine(error.to_string()))?;
         let plan = Arc::clone(completed.candidate().plan());
         let annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]> =
             completed.candidate().display_annotations().to_vec().into();
@@ -840,11 +950,13 @@ impl FrontendQueryCompiler {
                 Arc::clone(&annotations),
                 planning_started_at.elapsed(),
                 std::time::Instant::now(),
+                encoding_control.clone(),
             );
         let operation =
             PreparedQueryDistributedOperation::new(request, completion, logical_reservation)
                 .with_attempt_factory(Box::new(FrontendDistributedAttemptFactory {
                     logical_execution,
+                    result_capacity: execution.result_capacity().cloned(),
                     statement: StatementAdmissionContext::new(
                         current_catalog.map(str::to_string),
                         current_database.to_string(),
@@ -859,6 +971,7 @@ impl FrontendQueryCompiler {
                     ),
                     profile_plan: plan,
                     profile_annotations: annotations,
+                    profile_control: encoding_control,
                     planning_started_at,
                     effect_tracker: StatementEffectTracker::read_only(),
                 }));
@@ -1078,5 +1191,88 @@ mod compile_control_tests {
                 FrontendQueryCompilerError::Engine(_)
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    use super::*;
+
+    fn statement(sql: &str) -> Statement {
+        novarocks_query_application::sql::parse_single_statement(sql).unwrap()
+    }
+
+    #[test]
+    fn client_admission_uses_only_the_exact_local_immediate_shape() {
+        for sql in [
+            "SELECT * FROM information_schema.materialized_views",
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.MATERIALIZED_VIEWS WHERE IS_ACTIVE = true ORDER BY TABLE_NAME",
+        ] {
+            let parsed = statement(sql);
+            let Statement::Query(query) = &parsed else {
+                panic!("expected query")
+            };
+            assert_eq!(
+                FrontendQueryPurpose::client_query(query),
+                FrontendQueryPurpose::LocalRows,
+                "{sql}"
+            );
+            assert!(FrontendQueryPurpose::LocalRows.validate(&parsed).is_ok());
+            assert!(FrontendQueryPurpose::ClientRows.validate(&parsed).is_err());
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT TABLE_NAME FROM information_schema.tables",
+            "SELECT * FROM catalog.information_schema.materialized_views",
+            "SELECT * FROM information_schema.materialized_views m JOIN t ON m.TABLE_NAME = t.name",
+            "SELECT * FROM information_schema.materialized_views UNION ALL SELECT * FROM information_schema.materialized_views",
+            "SELECT * FROM (SELECT * FROM information_schema.materialized_views) m",
+        ] {
+            let parsed = statement(sql);
+            let Statement::Query(query) = &parsed else {
+                panic!("expected query")
+            };
+            assert_eq!(
+                FrontendQueryPurpose::client_query(query),
+                FrontendQueryPurpose::ClientRows,
+                "{sql}"
+            );
+            assert!(FrontendQueryPurpose::ClientRows.validate(&parsed).is_ok());
+            assert!(FrontendQueryPurpose::LocalRows.validate(&parsed).is_err());
+        }
+    }
+
+    #[test]
+    fn scalar_and_profile_intent_cannot_be_guessed_from_output_shape() {
+        let select = statement("SELECT 1");
+        assert!(FrontendQueryPurpose::ClientRows.validate(&select).is_ok());
+        assert!(FrontendQueryPurpose::ScalarValue.validate(&select).is_ok());
+        assert!(
+            FrontendQueryPurpose::ProfileCountOnly
+                .validate(&select)
+                .is_err()
+        );
+        let explain = statement("EXPLAIN SELECT 1");
+        assert!(FrontendQueryPurpose::LocalRows.validate(&explain).is_ok());
+        assert!(
+            FrontendQueryPurpose::ScalarValue
+                .validate(&explain)
+                .is_err()
+        );
+        assert!(
+            FrontendQueryPurpose::ProfileCountOnly
+                .validate(&explain)
+                .is_err()
+        );
+        let profile = statement("EXPLAIN ANALYZE SELECT 1");
+        assert!(
+            FrontendQueryPurpose::ProfileCountOnly
+                .validate(&profile)
+                .is_ok()
+        );
+        assert!(FrontendQueryPurpose::LocalRows.validate(&profile).is_err());
+        assert!(FrontendQueryPurpose::ClientRows.validate(&profile).is_err());
+        let local = statement("SELECT TABLE_NAME FROM information_schema.materialized_views");
+        assert!(FrontendQueryPurpose::ScalarValue.validate(&local).is_ok());
     }
 }

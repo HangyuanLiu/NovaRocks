@@ -27,11 +27,14 @@ mod deployment;
 mod error;
 mod transport;
 
-pub use adapter::{BoxedNativeIo, NativeEndpointConnector, NativeIncomingAdapter, NativeIo};
+pub use adapter::{
+    BoxedNativeIo, NATIVE_DNS_RESOLUTION_POSITIONS, NativeConnectFailure, NativeDnsResolver,
+    NativeEndpointConnector, NativeIncomingAdapter, NativeIo, OwnedNativeIo,
+};
 pub use auth::{
     AuthenticatedNativeCaller, ManualClock, NativeCallerSubject, NativeClientAuthInterceptor,
-    NativeListenerAuthLayer, NativeListenerAuthService, NativeServerAdmission, NativeTrust,
-    NativeTrustClock, SystemClock, TOKEN_LIFETIME_SECONDS,
+    NativeListenerAuthLayer, NativeListenerAuthService, NativeProcessIdentity,
+    NativeServerAdmission, NativeTrust, NativeTrustClock, SystemClock, TOKEN_LIFETIME_SECONDS,
 };
 pub use deployment::{DeploymentId, ValidatedSharedSecret};
 pub use error::NativeTrustFailureKind;

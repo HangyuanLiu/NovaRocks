@@ -182,14 +182,29 @@ impl QueryViewService {
                 })?;
                 engine.list_external_views(&catalog, &normalized_database, connector_context)?
             }
-            None => self
-                .registry
-                .read()
-                .map_err(|error| format!("view registry read lock: {error}"))?
-                .keys()
-                .filter(|key| key.catalog == DEFAULT_CATALOG && key.database == normalized_database)
-                .map(|key| key.view.clone())
-                .collect(),
+            None => {
+                // Each name is counted against the local result bound before
+                // it is cloned out of the registry.
+                let bound = crate::api::LocalResultBound::V1;
+                let registry = self
+                    .registry
+                    .read()
+                    .map_err(|error| format!("view registry read lock: {error}"))?;
+                let mut names = Vec::new();
+                let mut bytes = 0_usize;
+                for key in registry.keys().filter(|key| {
+                    key.catalog == DEFAULT_CATALOG && key.database == normalized_database
+                }) {
+                    bytes = bytes
+                        .checked_add(crate::api::LocalResultBound::cell_bytes(key.view.len()))
+                        .unwrap_or(usize::MAX);
+                    bound
+                        .admit(names.len() + 1, bytes)
+                        .map_err(|error| format!("SHOW VIEWS: {error}"))?;
+                    names.push(key.view.clone());
+                }
+                names
+            }
         };
         names.sort();
         Ok(ViewStatementResult::Query(build_string_result(

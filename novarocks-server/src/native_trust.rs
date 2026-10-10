@@ -53,6 +53,7 @@ impl NativeTrustTransport {
 #[derive(Clone)]
 pub struct NativeTrustSnapshot {
     advertised_endpoint: NativeEndpoint,
+    control_advertised_endpoint: Option<NativeEndpoint>,
     trust: Arc<NativeTrust>,
     transport: NativeTrustTransport,
 }
@@ -60,6 +61,10 @@ pub struct NativeTrustSnapshot {
 impl NativeTrustSnapshot {
     pub fn advertised_endpoint(&self) -> &NativeEndpoint {
         &self.advertised_endpoint
+    }
+
+    pub fn control_advertised_endpoint(&self) -> Option<&NativeEndpoint> {
+        self.control_advertised_endpoint.as_ref()
     }
 
     pub fn trust(&self) -> &Arc<NativeTrust> {
@@ -75,6 +80,13 @@ pub fn build_role_native_trust_snapshot(
     role: ClusterRole,
     config: &NovaRocksConfig,
 ) -> Result<NativeTrustSnapshot> {
+    config
+        .server
+        .validate_for_role(role)
+        .map_err(anyhow::Error::msg)?;
+    if config.cluster.advertise_control_port == Some(0) {
+        bail!("[cluster].advertise_control_port must be nonzero");
+    }
     let source = config
         .native_trust
         .as_ref()
@@ -88,6 +100,32 @@ pub fn build_role_native_trust_snapshot(
     )
     .map_err(anyhow::Error::msg)
     .context("resolve native advertised endpoint")?;
+    let control_advertised_endpoint = match role {
+        ClusterRole::Fe => None,
+        ClusterRole::Be => {
+            let control_port = config.server.control_grpc_port.ok_or_else(|| {
+                anyhow::anyhow!("role=be requires explicit [server].control_grpc_port")
+            })?;
+            let endpoint = network::standalone_native_control_advertise_endpoint(
+                &config.server.host,
+                &config.server.priority_networks,
+                &config.cluster.advertise_host,
+                config.cluster.advertise_control_port,
+                control_port,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("resolve native Control advertised endpoint")?;
+            if endpoint.reference_host() != advertised_endpoint.reference_host() {
+                bail!("native Data and Control reference hosts must match for shared TLS material");
+            }
+            if endpoint == advertised_endpoint {
+                bail!("native Data and Control advertised endpoints must differ");
+            }
+            // Automatic and PEM listeners share one certificate. Remote TLS verification
+            // uses this exact reference host independently of the listener's port.
+            Some(endpoint)
+        }
+    };
     let deployment_id = DeploymentId::parse(source.deployment_id.clone())
         .map_err(anyhow::Error::msg)
         .context("validate native trust deployment id")?;
@@ -110,6 +148,7 @@ pub fn build_role_native_trust_snapshot(
     let transport = transport_from_source(source, trust.as_ref(), &advertised_endpoint)?;
     Ok(NativeTrustSnapshot {
         advertised_endpoint,
+        control_advertised_endpoint,
         trust,
         transport,
     })
@@ -177,4 +216,72 @@ fn read_pem(path: Option<&std::path::Path>, label: &str) -> Result<Vec<u8>> {
         bail!("native TLS {label} file exceeds {MAX_PEM_FILE_BYTES} byte limit");
     }
     fs::read(path).with_context(|| format!("read native TLS {label}: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NativeTrustTransport, build_role_native_trust_snapshot};
+    use crate::app_config::NovaRocksConfig;
+    use novarocks_types::ClusterRole;
+
+    fn be_config(mode: &str) -> NovaRocksConfig {
+        toml::from_str(&format!(
+            "[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n[native_trust.transport]\nmode = \"{mode}\"\n[server]\ngrpc_port = 19081\ncontrol_grpc_port = 19082\nhttp_port = 18041\n[cluster]\nrole = \"be\"\nfrontend_endpoint = \"127.0.0.1:19080\"\nadvertise_host = \"BE.Example.Internal\"\nadvertise_port = 29081\nadvertise_control_port = 29082\n"
+        ))
+        .expect("parse BE trust configuration")
+    }
+
+    #[test]
+    fn be_snapshot_keeps_independent_nat_endpoints_and_exact_tls_reference_host() {
+        for mode in ["disabled", "automatic"] {
+            let config = be_config(mode);
+            let snapshot = build_role_native_trust_snapshot(ClusterRole::Be, &config)
+                .expect("build BE trust snapshot");
+            let control = snapshot
+                .control_advertised_endpoint()
+                .expect("Control endpoint");
+            assert_eq!(
+                snapshot.advertised_endpoint().as_host_port(),
+                "be.example.internal:29081"
+            );
+            assert_eq!(control.as_host_port(), "be.example.internal:29082");
+            assert_eq!(
+                control.reference_host(),
+                snapshot.advertised_endpoint().reference_host()
+            );
+            if let NativeTrustTransport::Automatic(material) = snapshot.transport() {
+                assert_eq!(
+                    material.local_endpoint().reference_host(),
+                    control.reference_host()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn be_snapshot_requires_control_and_rejects_colliding_advertised_ports() {
+        let mut config = be_config("disabled");
+        config.server.control_grpc_port = None;
+        assert!(build_role_native_trust_snapshot(ClusterRole::Be, &config).is_err());
+        config.server.control_grpc_port = Some(19082);
+        config.cluster.advertise_control_port = Some(29081);
+        assert!(build_role_native_trust_snapshot(ClusterRole::Be, &config).is_err());
+        config.cluster.advertise_control_port = None;
+        let snapshot = build_role_native_trust_snapshot(ClusterRole::Be, &config).unwrap();
+        assert_eq!(
+            snapshot.control_advertised_endpoint().unwrap().port(),
+            19082
+        );
+    }
+
+    #[test]
+    fn fe_snapshot_has_no_control_endpoint() {
+        let mut config = be_config("disabled");
+        config.cluster.role = ClusterRole::Fe;
+        config.cluster.frontend_endpoint = None;
+        config.cluster.advertise_control_port = None;
+        config.server.control_grpc_port = None;
+        let snapshot = build_role_native_trust_snapshot(ClusterRole::Fe, &config).unwrap();
+        assert!(snapshot.control_advertised_endpoint().is_none());
+    }
 }

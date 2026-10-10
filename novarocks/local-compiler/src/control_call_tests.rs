@@ -521,9 +521,11 @@ fn package(
         &Control,
     )?;
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&project_node].output.clone(),
         fields: Box::from([ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: "controlled_sample".into(),
             alias: None,
             value,

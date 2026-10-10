@@ -49,6 +49,9 @@ use crate::persistence::validation::PersistenceDecodeBudget;
 use super::catalog::schema_catalog;
 use super::key::{MvKeyKind, expected_record_kind};
 
+#[path = "codec_preflight.rs"]
+mod preflight;
+
 const MAGIC: &[u8; 4] = b"NRMA";
 /// Record version of the MV accelerator family.
 ///
@@ -310,13 +313,22 @@ impl TryFrom<&StoredMvProjection> for StoredMvProjectionAvro {
 impl TryFrom<StoredMvProjectionAvro> for StoredMvProjection {
     type Error = String;
     fn try_from(value: StoredMvProjectionAvro) -> Result<Self, String> {
+        value.into_projection(PersistenceDecodeBudget::default())
+    }
+}
+
+impl StoredMvProjectionAvro {
+    fn into_projection(
+        self,
+        budget: PersistenceDecodeBudget,
+    ) -> Result<StoredMvProjection, String> {
+        let value = self;
         if value.mv_id <= 0 {
             return Err("MV projection ID must be positive".into());
         }
         if value.publication.is_some() != value.output_version.is_some() {
             return Err("MV cache publication/output presence differ".into());
         }
-        let budget = PersistenceDecodeBudget::default();
         preflight_current_document_set(
             &value.definition,
             &value.interpretation,
@@ -348,7 +360,7 @@ impl TryFrom<StoredMvProjectionAvro> for StoredMvProjection {
                 .transpose()
                 .map_err(|_| "negative MV storage row count")?,
         )?;
-        Ok(Self {
+        Ok(StoredMvProjection {
             mv_id: value.mv_id,
             facts,
         })
@@ -395,10 +407,44 @@ pub fn decode_projection(
     key: &Key,
     value: &Value,
 ) -> Result<DecodedMvRecord<StoredMvProjection>, String> {
-    let decoded: DecodedMvRecord<StoredMvProjectionAvro> = decode_record(key, value)?;
+    decode_projection_with_budget(key, value, PersistenceDecodeBudget::default())
+}
+
+/// Checks the complete borrowed Avro/document structure against one budget
+/// before materializing any owned Avro value or Current document model.
+pub fn decode_projection_with_budget(
+    key: &Key,
+    value: &Value,
+    budget: PersistenceDecodeBudget,
+) -> Result<DecodedMvRecord<StoredMvProjection>, String> {
+    let mut documents = budget;
+    let decoded: DecodedMvRecord<StoredMvProjectionAvro> =
+        decode_record_checked(key, value, |kind, schema_id, payload| {
+            if kind != MvRecordKind::Projection || schema_id != 3 {
+                return Err(
+                    "bounded MV projection decode requires the registered V3 schema".into(),
+                );
+            }
+            documents = preflight::projection_v3(payload, budget)?;
+            Ok(())
+        })?;
     Ok(DecodedMvRecord {
         operation_id: decoded.operation_id,
-        value: decoded.value.try_into()?,
+        value: decoded.value.into_projection(documents)?,
+    })
+}
+
+/// Bounded structural check precedes the owned Avro/serde dependency datum.
+pub(crate) fn decode_dependency_with_budget(
+    key: &Key,
+    value: &Value,
+    working_set_bytes: usize,
+) -> Result<DecodedMvRecord<crate::persistence::dependency::StoredMvDependency>, String> {
+    decode_record_checked(key, value, |kind, schema_id, payload| {
+        if kind != MvRecordKind::Dependency || schema_id != 3 {
+            return Err("bounded MV dependency decode requires the registered V3 schema".into());
+        }
+        preflight::dependency_v3(payload, working_set_bytes)
     })
 }
 
@@ -443,6 +489,25 @@ where
 }
 
 pub fn decode_record<T>(key: &Key, value: &Value) -> Result<DecodedMvRecord<T>, String>
+where
+    T: DeserializeOwned,
+{
+    decode_record_checked(key, value, |kind, schema_id, payload| {
+        if kind == MvRecordKind::Projection {
+            if schema_id != 3 {
+                return Err("MV projection preflight requires the registered V3 schema".into());
+            }
+            preflight::projection_v3(payload, PersistenceDecodeBudget::default())?;
+        }
+        Ok(())
+    })
+}
+
+fn decode_record_checked<T>(
+    key: &Key,
+    value: &Value,
+    preflight: impl FnOnce(MvRecordKind, i32, &[u8]) -> Result<(), String>,
+) -> Result<DecodedMvRecord<T>, String>
 where
     T: DeserializeOwned,
 {
@@ -514,6 +579,7 @@ where
     }
     let reader = catalog.latest(kind.subject())?;
     let payload = &bytes[payload_length_end..payload_end];
+    preflight(kind, schema_id, payload)?;
     let mut cursor = Cursor::new(payload);
     let datum =
         from_avro_datum(writer.schema(), &mut cursor, Some(reader.schema())).map_err(|error| {

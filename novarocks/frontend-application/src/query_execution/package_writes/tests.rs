@@ -471,6 +471,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
     })
     .expect("edge");
     plan.set_result_port(p::ResultPort {
+        scalar_schema: None,
         fragment: finish_fragment,
         output: p::OutputPort {
             node: finish,
@@ -479,6 +480,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
         fields: outputs
             .iter()
             .map(|field| p::ResultField {
+                domain: p::ResultValueDomain::Plain,
                 name: field.name.clone(),
                 alias: None,
                 value: field.value,

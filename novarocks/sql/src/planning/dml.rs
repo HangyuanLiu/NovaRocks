@@ -888,6 +888,7 @@ pub struct DmlReadCompletion {
     constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    root_semantics: crate::compiler::root_output::RootOutputSemantics,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
 }
@@ -923,6 +924,7 @@ pub fn begin_final_dml_read_plan(
             constant_policy,
             root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
+            root_semantics: compiled.root_semantics,
             physical,
             query_statistics: compiled.statistics.snapshot,
         },
@@ -938,32 +940,20 @@ impl DmlReadCompletion {
         reads: DmlFinalizedProviderReadSet,
         control: &crate::compiler::SqlCompileControl,
     ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
-        let mut draft = match reads.into_optional() {
-            Some(reads) => {
-                crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
-                    &self.physical,
-                    version,
-                    dop_domain,
-                    reads,
-                    self.functions,
-                    self.root_allow_throw_exception,
-                    self.constant_policy,
-                    self.emission_mode,
-                    control,
-                )
-            }
-            None => crate::planner::distributed::build::lower_final_physical_plan(
+        let mut draft =
+            crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
                 &self.physical,
                 version,
                 dop_domain,
+                reads.into_optional(),
+                self.root_semantics,
                 self.functions,
                 self.root_allow_throw_exception,
                 self.constant_policy,
                 self.emission_mode,
                 control,
-            ),
-        }
-        .map_err(final_lowering_error)?;
+            )
+            .map_err(final_lowering_error)?;
         self.query_statistics.annotate_final_plan(&mut draft);
         draft
             .finish_with_dependency_observer_observed(control)
@@ -979,6 +969,8 @@ pub struct DmlCtasSourcePlan {
     emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
+    private_output_domain: bool,
+    output_domains: Box<[novarocks_physical_plan::ResultValueDomain]>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     optimized: crate::optimizer::OptimizedOperatorNode,
     function_catalog: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -987,17 +979,25 @@ pub struct DmlCtasSourcePlan {
 /// One source output field exposed to CTAS target admission.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DmlSourceColumn {
+    pub domain: novarocks_physical_plan::ResultValueDomain,
     pub name: String,
     pub data_type: arrow::datatypes::DataType,
     pub nullable: bool,
 }
 
 impl DmlCtasSourcePlan {
+    /// Complete declared private domains survive even when Arrow fields omit markers.
+    pub fn has_private_output_domain(&self) -> bool {
+        self.private_output_domain
+    }
+
     pub fn output_columns(&self) -> Vec<DmlSourceColumn> {
         self.optimized
             .output_columns
             .iter()
-            .map(|column| DmlSourceColumn {
+            .zip(self.output_domains.iter().copied())
+            .map(|(column, domain)| DmlSourceColumn {
+                domain,
                 name: column.name.clone(),
                 data_type: column.value_type.data_type.clone(),
                 nullable: column.value_type.nullable,
@@ -1010,7 +1010,10 @@ impl DmlCtasSourcePlan {
     pub fn capture_fingerprint(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
-        let material = format!("{:#?}", self.optimized);
+        let material = format!(
+            "{:#?}\n{:#?}\n{}",
+            self.optimized, self.output_domains, self.private_output_domain
+        );
         let root_allow = [u8::from(self.root_allow_throw_exception)];
         let mut digest = Sha256::new();
         for part in [
@@ -1036,10 +1039,17 @@ pub fn compile_ctas_source(
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
+    let output_domains = compiled
+        .root_semantics
+        .domains(&compiled.optimized_tree.output_columns)?
+        .into_boxed_slice();
+    let private_output_domain = compiled.root_semantics.has_private_persistence_domain();
     Ok(DmlCtasSourcePlan {
         emission_mode,
         constant_policy,
         root_allow_throw_exception: compiled.root_allow_throw_exception,
+        private_output_domain,
+        output_domains,
         query_statistics: compiled.statistics.snapshot,
         optimized: compiled.optimized_tree,
         function_catalog: compiled.function_catalog,
@@ -2807,53 +2817,23 @@ fn build_statistics_connector_physical(
             },
         )
         .collect::<Vec<_>>();
-    let unpivot_columns = vec![
-        root_columns[2].clone(),
-        root_columns[0].clone(),
-        root_columns[1].clone(),
-        root_columns[3].clone(),
-    ];
+    // Emit the domain's frozen four-column order directly. A reorder Project
+    // would put the allocation-producing Unpivot before the root's last edge.
     let unpivot = crate::planner::payload::PlanUnpivotNode::try_new(
         &final_columns,
         Vec::new(),
         body,
         vec![input_fields, blob_type, properties],
         value_mappings,
-        unpivot_columns.clone(),
+        root_columns.clone(),
         4096,
         novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
         constant_policy,
         control,
     )?;
-    let unpivot = crate::planner::physical::PhysicalPlanNode {
+    let physical = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Unpivot(unpivot),
         children: vec![global],
-        output_columns: unpivot_columns,
-        stats: stats.clone(),
-        probe_runtime_filters: Vec::new(),
-    };
-    let physical = crate::planner::physical::PhysicalPlanNode {
-        kind: crate::planner::physical::PhysicalPlanKind::Project(
-            crate::planner::payload::PlanProjectNode {
-                items: root_columns
-                    .iter()
-                    .map(|column| crate::analysis::ProjectItem {
-                        expr: crate::analysis::TypedExpr {
-                            kind: crate::analysis::ExprKind::ColumnRef {
-                                column_id: column.column_id,
-                                qualifier: None,
-                                column: column.name.clone(),
-                            },
-                            value_type: column.value_type.clone(),
-                        },
-                        output_name: column.name.clone(),
-                        output_column_id: column.column_id,
-                    })
-                    .collect(),
-                output_qualifier: None,
-            },
-        ),
-        children: vec![unpivot],
         output_columns: root_columns,
         stats,
         probe_runtime_filters: Vec::new(),
@@ -3258,6 +3238,21 @@ mod tests {
         let mut exchange = 0;
         let mut global = 0;
         let mut unpivot = 0;
+        let result_fragment = plan
+            .fragments()
+            .get(&plan.result_port().expect("result port").fragment)
+            .expect("result fragment");
+        assert!(
+            matches!(
+                result_fragment
+                    .nodes()
+                    .get(&result_fragment.root())
+                    .expect("result root")
+                    .kind,
+                NodeKind::Unpivot { .. }
+            ),
+            "the materializer must be the direct root upstream"
+        );
         for fragment in plan.fragments().values() {
             for node in fragment.nodes().values() {
                 if let NodeKind::Aggregate { calls, .. } = &node.kind {
@@ -4181,6 +4176,133 @@ mod tests {
                 source.capture_fingerprint(),
                 source.clone().capture_fingerprint()
             );
+        }
+    }
+
+    #[test]
+    fn m07_ctas_source_keeps_exact_producer_domains_until_target_admission() {
+        use crate::compiler::*;
+        use novarocks_physical_plan::ResultValueDomain as Domain;
+        for (sql, expected) in [
+            (
+                "select percentile_hash(cast(1 as double)) as v",
+                Domain::Percentile,
+            ),
+            ("select to_bitmap(1) as v", Domain::Bitmap),
+            ("select bitmap_to_binary(to_bitmap(1)) as v", Domain::Plain),
+        ] {
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let control = SqlCompileControl::unbounded();
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::IcebergWrite {
+                    root_distribution: RootDistributionRequirement::Any,
+                },
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &snapshot,
+                builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            let source = super::compile_ctas_source(SqlOptimizeRequest::new(
+                analyzed,
+                &DmlStatisticsSnapshot::empty(),
+                control,
+            ), crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1)
+            .unwrap();
+            let columns = source.output_columns();
+            assert_eq!(columns.len(), 1, "{sql}");
+            assert_eq!(columns[0].domain, expected, "{sql}");
+            assert_eq!(
+                source.has_private_output_domain(),
+                expected == Domain::Percentile
+            );
+            if expected != Domain::Plain {
+                let mut erased = source.clone();
+                erased.output_domains[0] = Domain::Plain;
+                assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
+            }
+        }
+    }
+
+    #[test]
+    fn m07_ctas_complete_private_declaration_survives_unmarked_multi_column_source() {
+        use crate::compiler::*;
+        use arrow::datatypes::{DataType as D, Field};
+        use novarocks_types::schema::{ColumnDef, SqlType as T};
+        use std::sync::Arc;
+        for logical in [T::Object, T::Percentile] {
+            let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            crate::planning::catalog::register_test_connector_read_table(
+                &mut catalog,
+                "default",
+                "t",
+                vec![ColumnDef {
+                    name: "state".into(),
+                    data_type: D::List(Arc::new(Field::new("item", D::Binary, true))),
+                    nullable: true,
+                    write_default: None,
+                    logical_type: Some(T::Array(Box::new(logical))),
+                }],
+            )
+            .unwrap();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let control = SqlCompileControl::unbounded();
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql("select state, 1 as plain from t"),
+                SqlCompileIntent::IcebergWrite {
+                    root_distribution: RootDistributionRequirement::Any,
+                },
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &snapshot,
+                builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            let source = super::compile_ctas_source(SqlOptimizeRequest::new(
+                analyzed,
+                &DmlStatisticsSnapshot::from_evidence([super::DmlStatisticsEvidence::Missing {
+                    binding: crate::binding::SqlTableBindingId::new_for_test(1),
+                    label: "test_catalog.test_db.test_table".into(),
+                    reason: "fixture has no published statistics".into(),
+                }]),
+                control,
+            ), crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1)
+            .unwrap();
+            assert_eq!(source.output_columns().len(), 2);
+            assert_eq!(
+                source.output_columns()[0].domain,
+                novarocks_physical_plan::ResultValueDomain::Plain
+            );
+            assert!(source.has_private_output_domain());
+            let mut erased = source.clone();
+            erased.private_output_domain = false;
+            assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
         }
     }
 }

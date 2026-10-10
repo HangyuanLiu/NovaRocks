@@ -43,7 +43,7 @@ impl LogicalType {
         }
     }
 
-    pub(crate) fn metadata_value(self) -> &'static str {
+    pub fn metadata_value(self) -> &'static str {
         self.semantic_identity()
             .metadata_value()
             .expect("legacy logical types are explicit")

@@ -30,8 +30,11 @@ use novarocks_query_application::serving_admission::FrontendServingState;
 pub(crate) mod dml_publication;
 mod http;
 mod management;
+pub(crate) mod native_transport;
+mod process_memory;
 pub(crate) mod task_creation;
 pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
+pub use process_memory::FrontendProcessMemoryObservation;
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::with_opts(Opts::new(
@@ -330,10 +333,19 @@ static FRONTEND_SERVING_METRICS_PUBLISH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mut
 /// both Frontend and Backend application hosts.
 pub(crate) struct FrontendMetricsRegistry {
     registry: Registry,
+    process_memory: Option<(Mutex<()>, process_memory::ProcessMemoryGauges)>,
 }
 
 impl FrontendMetricsRegistry {
     pub(crate) fn new() -> Result<Arc<Self>, String> {
+        Self::with_process_memory(None)
+    }
+
+    /// The registry, plus this process's memory readings when the Server
+    /// supplies a sampler. Readings are refreshed on every scrape.
+    pub(crate) fn with_process_memory(
+        observation: Option<FrontendProcessMemoryObservation>,
+    ) -> Result<Arc<Self>, String> {
         refresh_frontend_gauges();
         let registry = Registry::new();
         for collector in [
@@ -375,11 +387,27 @@ impl FrontendMetricsRegistry {
         crate::catalog_projection_metrics::register_collectors(&registry)?;
         dml_publication::register_collectors(&registry)?;
         task_creation::register_collectors(&registry)?;
+        native_transport::register_collectors(&registry)?;
         crate::native::task_transport::register_metric_collectors(&registry)?;
-        Ok(Arc::new(Self { registry }))
+        let process_memory = observation
+            .map(|observation| {
+                process_memory::ProcessMemoryGauges::register(&registry, observation)
+            })
+            .transpose()?
+            .map(|gauges| (Mutex::new(()), gauges));
+        Ok(Arc::new(Self {
+            registry,
+            process_memory,
+        }))
     }
 
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+        // Sampling and collection happen in one scrape order.
+        let _scrape = self.process_memory.as_ref().map(|(lock, gauges)| {
+            let guard = lock.lock().expect("frontend process memory scrape lock");
+            gauges.publish();
+            guard
+        });
         self.registry.gather()
     }
 }
@@ -703,6 +731,52 @@ mod tests {
 
     fn frontend_registry() -> Arc<FrontendMetricsRegistry> {
         FrontendMetricsRegistry::new().expect("create frontend metrics registry")
+    }
+
+    #[test]
+    fn process_memory_readings_refresh_on_every_scrape() {
+        use novarocks_memory::observe::{AllocatorInternalsReading, PhysicalMemoryReading};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let resident = Arc::new(AtomicU64::new(4096));
+        let sampled = Arc::clone(&resident);
+        let registry =
+            FrontendMetricsRegistry::with_process_memory(Some(FrontendProcessMemoryObservation {
+                allocator: "jemalloc",
+                sample: Arc::new(move || PhysicalMemoryReading {
+                    cgroup_anonymous_bytes: None,
+                    process_resident_bytes: Some(sampled.load(Ordering::SeqCst)),
+                    allocator_internals: Some(AllocatorInternalsReading {
+                        allocated_bytes: 100,
+                        active_bytes: 200,
+                        resident_bytes: 300,
+                    }),
+                }),
+            }))
+            .expect("create frontend metrics registry");
+        let body = render_metrics(registry.as_ref()).expect("render metrics");
+        assert!(
+            body.contains(r#"novarocks_frontend_process_allocator_info{allocator="jemalloc"} 1"#)
+        );
+        assert!(body.contains(
+            r#"novarocks_frontend_process_allocator_memory_bytes{statistic="allocated"} 100"#
+        ));
+        assert!(body.contains(
+            r#"novarocks_frontend_process_allocator_memory_bytes{statistic="resident"} 300"#
+        ));
+        assert!(body.contains(
+            r#"novarocks_frontend_process_physical_memory_bytes{source="process_resident"} 4096"#
+        ));
+        assert!(!body.contains(r#"source="cgroup_anonymous""#));
+        resident.store(8192, Ordering::SeqCst);
+        let body = render_metrics(registry.as_ref()).expect("render metrics");
+        assert!(body.contains(
+            r#"novarocks_frontend_process_physical_memory_bytes{source="process_resident"} 8192"#
+        ));
+        assert!(
+            !render_metrics(frontend_registry().as_ref())
+                .expect("render metrics")
+                .contains("novarocks_frontend_process_allocator_info")
+        );
     }
 
     #[test]

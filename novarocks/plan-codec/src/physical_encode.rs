@@ -1626,6 +1626,7 @@ fn preflight_encoder(
                     }
                 }
                 FragmentSink::Result
+                | FragmentSink::RootResult(_)
                 | FragmentSink::Stream { .. }
                 | FragmentSink::Multicast { .. } => {}
                 FragmentSink::Noop => {
@@ -3144,7 +3145,7 @@ fn encode_node_payload(
                 .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             max_output_rows: spec.max_output_rows,
             max_output_bytes: spec.max_output_bytes,
-            output_schema: Some(encode_unpivot_schema(fragment, layout, node)?),
+            output_schema: Some(encode_unpivot_schema(fragment, layout, node, &outputs)?),
         }),
         NodeKind::GenerateSeries { start, stop, step } => {
             Kind::GenerateSeries(plan::GenerateSeriesNode {
@@ -3801,14 +3802,19 @@ fn encode_unpivot_schema(
     fragment: &Fragment,
     layout: &WireLayout,
     node: &PhysicalNode,
+    outputs: &[common::OutputColumn],
 ) -> Result<plan::ArrowPhysicalSchema, String> {
+    if outputs.len() != node.output.columns.len() {
+        return Err("Unpivot output names differ from its exact output port count".into());
+    }
     let schema = arrow::datatypes::Schema::new(
         node.output
             .columns
             .iter()
-            .map(|value| {
+            .zip(outputs)
+            .map(|(value, output)| {
                 let ty = &fragment.values()[value].ty;
-                arrow::datatypes::Field::new(value_name(*value), ty.data_type.clone(), ty.nullable)
+                arrow::datatypes::Field::new(&output.name, ty.data_type.clone(), ty.nullable)
             })
             .collect::<Vec<_>>(),
     );
@@ -4080,6 +4086,27 @@ fn encode_sink(
 
     let kind = match fragment.sink() {
         FragmentSink::Result => Kind::Result(true),
+        FragmentSink::RootResult(contract) => {
+            let root = &fragment.nodes()[&fragment.root()];
+            let slots = (0..root.output.columns.len())
+                .map(|ordinal| {
+                    let ordinal = u32::try_from(ordinal)
+                        .map_err(|_| "root result ordinal exceeds u32".to_string())?;
+                    let slot = layout
+                        .output_slot(root.id, ordinal)
+                        .map_err(|error| error.to_string())?;
+                    u32::try_from(slot.get())
+                        .map_err(|_| "root result slot must be nonnegative".to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let bound = contract
+                .clone()
+                .bind_native_slots(&slots)
+                .map_err(|error| error.to_string())?;
+            Kind::RootResult(novarocks_proto_codec::root_result::encode_root_contract(
+                &bound,
+            ))
+        }
         FragmentSink::Stream { edge } => {
             Kind::DataStream(encode_stream_sink(physical, fragment, layout, *edge)?)
         }
@@ -4475,7 +4502,15 @@ fn output_columns(
                 fragment.values()[value].origin,
                 ValueOrigin::WriterDerived { .. }
             );
-            output_column(slot, name, ty, internal)
+            output_column_with_domain(
+                slot,
+                name,
+                ty,
+                internal,
+                result_field.map_or(novarocks_physical_plan::ResultValueDomain::Plain, |field| {
+                    field.domain
+                }),
+            )
         })
         .collect()
 }
@@ -4509,14 +4544,73 @@ fn output_column(
     ty: &ValueType,
     internal: bool,
 ) -> Result<common::OutputColumn, String> {
+    output_column_with_domain(
+        slot,
+        name,
+        ty,
+        internal,
+        novarocks_physical_plan::ResultValueDomain::Plain,
+    )
+}
+
+/// Only the exact root occurrence supplies a top-level logical domain. Names,
+/// aliases, other values and intermediate outputs never establish this fact.
+fn output_column_with_domain(
+    slot: WireSlotId,
+    name: &str,
+    ty: &ValueType,
+    internal: bool,
+    domain: novarocks_physical_plan::ResultValueDomain,
+) -> Result<common::OutputColumn, String> {
+    use novarocks_physical_plan::ResultValueDomain as D;
+    if !domain.matches_storage(&ty.data_type) {
+        return Err("native root output domain differs from its exact storage".into());
+    }
+    if internal && domain != D::Plain {
+        return Err("native internal writer output cannot own a scalar root domain".into());
+    }
     let wire_type = if internal {
         // Writer relation values are paired with the mandatory exact
         // ArrowPhysicalSchema on TableWriter/TableFinish. That schema owns
         // execution type identity; this legacy descriptor is only its SQL
         // compatibility projection.
         encode_arrow_authoritative_compatibility_type(&ty.data_type)?
-    } else {
+    } else if domain == D::Plain {
         encode_physical_type(&ty.data_type)?
+    } else {
+        // The ordinary exact-carrier check still rejects offset adaptation,
+        // dictionaries and unsupported primitives before constructing a DTO.
+        validate_physical_type(&ty.data_type)?;
+        let exact = match domain {
+            D::Json => matches!(ty.data_type, arrow::datatypes::DataType::Utf8),
+            D::Variant => matches!(ty.data_type, arrow::datatypes::DataType::LargeBinary),
+            D::Hll | D::Bitmap | D::Object | D::Percentile => {
+                matches!(ty.data_type, arrow::datatypes::DataType::Binary)
+            }
+            D::Plain => unreachable!("plain output used the ordinary encoder"),
+        };
+        if !exact {
+            return Err("native root output domain cannot preserve its exact carrier".into());
+        }
+        let primitive = match domain {
+            D::Json => common::PrimitiveType::Json,
+            D::Variant => common::PrimitiveType::Variant,
+            D::Hll => common::PrimitiveType::Hll,
+            D::Bitmap => common::PrimitiveType::Bitmap,
+            D::Object => common::PrimitiveType::Object,
+            D::Percentile => common::PrimitiveType::Percentile,
+            D::Plain => unreachable!("plain output used the ordinary encoder"),
+        };
+        common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                r#type: primitive as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+                time_zone: None,
+            })),
+        }
     };
     Ok(common::OutputColumn {
         column_id: slot.get_u32(),
@@ -4638,11 +4732,20 @@ fn output_column_at(
     expected: ValueId,
     names: &OutputValueNames<'_>,
 ) -> Result<common::OutputColumn, String> {
-    output_column(
+    let domain = names
+        .result
+        .filter(|result| result.fragment == fragment.id() && result.output.node == node.id)
+        .and_then(|result| result.fields.get(ordinal))
+        .filter(|field| field.value == expected)
+        .map_or(novarocks_physical_plan::ResultValueDomain::Plain, |field| {
+            field.domain
+        });
+    output_column_with_domain(
         output_slot_at(layout, node, ordinal, expected)?,
         &names.output_name(fragment.id(), expected),
         &fragment.values()[&expected].ty,
         false,
+        domain,
     )
 }
 
@@ -5365,9 +5468,11 @@ pub(crate) mod tests {
         builder.add_fragment(fragment).unwrap();
         builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(31),
                 output,
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "value".into(),
                     alias: None,
                     value: result_value,
@@ -5502,7 +5607,9 @@ pub(crate) mod tests {
     use super::*;
 
     fn unpivot_collection_pools(list_items: usize) -> novarocks_physical_plan::ConstantPools {
-        use arrow::array::{Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray};
+        use arrow::array::{
+            Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray,
+        };
         use arrow::buffer::OffsetBuffer;
         use arrow::datatypes::Field;
         use novarocks_constant_contract::ConstantPool;
@@ -5683,6 +5790,7 @@ pub(crate) mod tests {
             PlanBuilder::new(PlanVersionId::try_new([37; 16]).unwrap()).with_constant_pools(pools);
         plan.add_fragment(fragment).unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: FragmentId::new(31),
             output,
             fields: outputs
@@ -5690,6 +5798,7 @@ pub(crate) mod tests {
                 .zip(output_types)
                 .enumerate()
                 .map(|(index, (value, ty))| ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: format!("field{index}").into(),
                     alias: None,
                     value,
@@ -6351,7 +6460,9 @@ pub(crate) mod tests {
             DataRelation, ExactInputVersion, ProviderReadOccurrenceId, Relation,
         };
         use novarocks_proto_models::connector_read as wire;
-        use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadRelationKind};
+        use novarocks_spi::connector::read_stack::{
+            ConnectorReadBinding, ConnectorReadRelationKind,
+        };
         use novarocks_spi::connector::{
             CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
             ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
@@ -6469,7 +6580,9 @@ pub(crate) mod tests {
     #[test]
     fn maximum_width_scan_index_resolves_exact_identities() {
         use novarocks_physical_plan::{ExactInputVersion, ProviderReadOccurrenceId};
-        use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadRelationKind};
+        use novarocks_spi::connector::read_stack::{
+            ConnectorReadBinding, ConnectorReadRelationKind,
+        };
         use novarocks_spi::connector::{
             CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
             ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
@@ -6860,12 +6973,14 @@ pub(crate) mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(20),
                 output: OutputPort {
                     node: join,
                     columns: Box::from([right_value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "right".into(),
                     alias: None,
                     value: right_value,
@@ -6940,12 +7055,14 @@ pub(crate) mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(22),
                 output: OutputPort {
                     node: join,
                     columns: Box::from([left_value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "left".into(),
                     alias: None,
                     value: left_value,
@@ -6963,6 +7080,265 @@ pub(crate) mod tests {
         )
         .expect("the v1 backend projects cropped HashJoin output columns");
         assert_eq!(encoded.fragments.len(), 1);
+    }
+
+    #[test]
+    fn direct_statistics_unpivot_wire_uses_exact_result_names_types_and_port_order() {
+        use arrow::array::{
+            Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field;
+        use novarocks_constant_contract::ConstantPool;
+        use novarocks_physical_plan::{
+            ConstantPoolId, ConstantPools, ConstantReference, LiteralValue, UnpivotSpec,
+            UnpivotValueMapping,
+        };
+        use novarocks_type_contract::CompilePhase;
+        let mut builder = FragmentBuilder::new(FragmentId::new(24));
+        let source = builder.reserve_node_id().unwrap();
+        let body_ty = ValueType::new(DataType::Binary, false);
+        let body_expr = builder
+            .add_expression(
+                source,
+                body_ty.clone(),
+                ExprKind::Literal(LiteralValue::Binary(Box::from([0xffu8]))),
+            )
+            .unwrap();
+        let body_input = builder
+            .add_value(
+                body_ty.clone(),
+                ValueOrigin::NodeOutput {
+                    node: source,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: source,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: source,
+                    columns: Box::from([body_input]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([body_expr])]),
+                },
+            })
+            .unwrap();
+        let root = builder.reserve_node_id().unwrap();
+        let types = [
+            ValueType::new(
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+                false,
+            ),
+            ValueType::new(DataType::Utf8, false),
+            body_ty,
+            ValueType::new(
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("key", DataType::Utf8, false)),
+                                Arc::new(Field::new("value", DataType::Utf8, false)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+        ];
+        let DataType::List(list_item) = &types[0].data_type else {
+            panic!("statistics list fixture has its declared List type");
+        };
+        let list: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::clone(list_item),
+                OffsetBuffer::new(vec![0_i32, 1].into()),
+                Arc::new(Int32Array::from(vec![1])),
+                None,
+            )
+            .unwrap(),
+        );
+        let DataType::Map(map_entries, map_sorted) = &types[3].data_type else {
+            panic!("statistics properties fixture has its declared Map type");
+        };
+        let DataType::Struct(map_fields) = map_entries.data_type() else {
+            panic!("statistics Map fixture has its declared entry fields");
+        };
+        let entries = StructArray::new(
+            map_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+            ],
+            None,
+        );
+        let map: ArrayRef = Arc::new(
+            MapArray::try_new(
+                Arc::clone(map_entries),
+                OffsetBuffer::new(vec![0_i32, 0].into()),
+                entries,
+                None,
+                *map_sorted,
+            )
+            .unwrap(),
+        );
+        let list_id = ConstantPoolId::new(0);
+        let map_id = ConstantPoolId::new(1);
+        let mut pools = ConstantPools::empty();
+        for (id, ty, values) in [(list_id, &types[0], list), (map_id, &types[3], map)] {
+            let pool = ConstantPool::try_new(
+                Arc::new(ty.try_to_field("statistics_constant").unwrap()),
+                ty.clone(),
+                values.to_data(),
+                codec_constant_policy(),
+                CompilePhase::Encode,
+                &CodecTestControl,
+            )
+            .unwrap();
+            pools.insert(id, pool).unwrap();
+        }
+        let outputs = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                builder
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::NodeOutput {
+                            node: root,
+                            output_ordinal: i as u32,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let label = builder
+            .add_expression(
+                root,
+                types[1].clone(),
+                ExprKind::Literal(LiteralValue::Utf8("theta".into())),
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: root,
+                inputs: Box::from([source]),
+                required_inputs: Box::from([properties()]),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: root,
+                    columns: outputs.clone().into(),
+                },
+                kind: NodeKind::Unpivot {
+                    spec: UnpivotSpec {
+                        passthrough: Box::default(),
+                        value_output: outputs[2],
+                        literal_outputs: Box::from([outputs[0], outputs[1], outputs[3]]),
+                        mappings: Box::from([UnpivotValueMapping {
+                            input: body_input,
+                            constants: Box::from([
+                                UnpivotConstant::Int32List(ConstantReference {
+                                    pool: list_id,
+                                    ordinal: 0,
+                                }),
+                                UnpivotConstant::Scalar(label),
+                                UnpivotConstant::Utf8Map(ConstantReference {
+                                    pool: map_id,
+                                    ordinal: 0,
+                                }),
+                            ]),
+                        }]),
+                        max_output_rows: 4096,
+                        max_output_bytes: 32 << 20,
+                    },
+                },
+            })
+            .unwrap();
+        let fragment = builder
+            .finish_definition(
+                root,
+                FragmentSink::Result,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let mut plan_builder =
+            PlanBuilder::new(PlanVersionId::try_new([24; 16]).unwrap()).with_constant_pools(pools);
+        plan_builder.add_fragment(fragment).unwrap();
+        let names = ["input_fields", "blob_type", "body", "properties"];
+        plan_builder
+            .set_result_port(ResultPort {
+                scalar_schema: None,
+                fragment: FragmentId::new(24),
+                output: OutputPort {
+                    node: root,
+                    columns: outputs.clone().into(),
+                },
+                fields: names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                        name: (*name).into(),
+                        alias: None,
+                        value: outputs[i],
+                        ty: types[i].clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            })
+            .unwrap();
+        let physical = plan_builder.finish_observed(&CodecTestControl).unwrap();
+        let (catalog, _) = exact_scalar_catalog();
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            false,
+            &CodecTestControl,
+        )
+        .unwrap();
+        let root = encoded.fragments[0].root.as_ref().unwrap();
+        let Some(plan::distributed_node::Payload::Physical(node)) = &root.payload else {
+            panic!("physical root");
+        };
+        let Some(plan::plan_node::Kind::Unpivot(unpivot)) = &node.kind else {
+            panic!("direct unpivot root");
+        };
+        assert!(node.output_columns.is_empty());
+        let wire = unpivot.output_schema.as_ref().unwrap();
+        let decoded = arrow_physical::decode_schema(
+            &wire.columns,
+            &wire.schema_metadata,
+            FieldPath::root("unpivot"),
+        )
+        .unwrap();
+        for (i, field) in decoded.schema().fields().iter().enumerate() {
+            assert_eq!(field.name(), names[i]);
+            assert_eq!(field.data_type(), &types[i].data_type);
+            assert_eq!(field.is_nullable(), types[i].nullable);
+        }
+        assert_eq!(decoded.slot_ids()[2], unpivot.value_output_column_id);
+        assert_eq!(
+            [
+                decoded.slot_ids()[0],
+                decoded.slot_ids()[1],
+                decoded.slot_ids()[3]
+            ],
+            unpivot.literal_output_column_ids.as_slice()
+        );
     }
 
     fn properties() -> PhysicalProperties {
@@ -7044,12 +7420,14 @@ pub(crate) mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: fragment_id,
                 output: OutputPort {
                     node: root,
                     columns: Box::from([value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "value".into(),
                     alias: None,
                     value,
@@ -7222,12 +7600,14 @@ pub(crate) mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: fragment_id,
                 output: OutputPort {
                     node: project,
                     columns: Box::from([output]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "value".into(),
                     alias: None,
                     value: output,
@@ -7917,12 +8297,14 @@ pub(crate) mod tests {
         })
         .unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: final_fragment,
             output: OutputPort {
                 node: final_topn,
                 columns: Box::from([final_value]),
             },
             fields: Box::from([ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "value".into(),
                 alias: None,
                 value: final_value,
@@ -8258,6 +8640,7 @@ pub(crate) mod tests {
         .unwrap();
         plan.add_runtime_filter(filter).unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: join_fragment,
             output: OutputPort {
                 node: join,
@@ -8265,12 +8648,14 @@ pub(crate) mod tests {
             },
             fields: Box::from([
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "left".into(),
                     alias: None,
                     value: left_value,
                     ty: ty.clone(),
                 },
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "right".into(),
                     alias: None,
                     value: right_value,
@@ -8421,6 +8806,7 @@ pub(crate) mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(19),
                 output: OutputPort {
                     node: project,
@@ -8428,12 +8814,14 @@ pub(crate) mod tests {
                 },
                 fields: Box::from([
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "first".into(),
                         alias: None,
                         value,
                         ty: ty.clone(),
                     },
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "second".into(),
                         alias: None,
                         value,
@@ -8501,12 +8889,14 @@ pub(crate) mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(21),
                 output: OutputPort {
                     node: limit,
                     columns: Box::from([value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "value".into(),
                     alias: None,
                     value,
@@ -8715,6 +9105,7 @@ pub(crate) mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(18),
                 output: OutputPort {
                     node: repeat,
@@ -8722,18 +9113,21 @@ pub(crate) mod tests {
                 },
                 fields: Box::from([
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "left".into(),
                         alias: None,
                         value: nullable_left,
                         ty: ValueType::new(DataType::Int64, true),
                     },
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "right".into(),
                         alias: None,
                         value: nullable_right,
                         ty: ValueType::new(DataType::Int64, true),
                     },
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "grouping".into(),
                         alias: None,
                         value: grouping,

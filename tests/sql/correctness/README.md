@@ -46,7 +46,7 @@ authoritative current list.
 | `iceberg-compatibility` / `spark_rest_delete_applicability` | 同提交 position/DV/equality 的序号边界与独立 Java 行袋 | `novarocks/connector/iceberg/src/delete_semantics/**`、`typed_read/**` | 真实 Java writer + manifest 闭包；native 1FE+3BE |
 | `iceberg-ddl` | Iceberg DDL, schema evolution, CREATE TABLE LIKE | `novarocks/connector/iceberg/**`, `novarocks/sql/src/planning/**` | — |
 | `iceberg-dml` | INSERT / DELETE / UPDATE / MERGE against Iceberg, type round-trips | `novarocks/connector/iceberg/**`, `novarocks/execution/src/exec/operators/table_writer.rs` | — |
-| `iceberg-hms` | Native Hive Metastore catalog admission for document-managed MVs | `novarocks/connector/iceberg/src/document_storage/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; start the separate `docker/iceberg-hive/` fixture |
+| `iceberg-hms` | Spark-written HMS read compatibility and refusal integrity for every reachable mutation family | `novarocks/connector/iceberg/src/{catalog,catalog_control,commit}/**`, table-job admission | `explicit_only`; cross-process, 3 BE, `-j 1`; start `docker/iceberg-hive/`; Spark owns writes/cleanup and paginated inventory evidence |
 | `iceberg-ivm` | Incremental MV maintenance over Iceberg (COW / MOR, projections, PK) | `novarocks/mv-application/**`, `novarocks/execution/src/exec/mv/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
@@ -97,17 +97,21 @@ A suite that restarts a frontend and lets it rediscover its own materialized
 views adopts the other worktrees' views too. Even without a restart, a suite's
 `DROP CATALOG` guard sees those foreign MV references and refuses cleanup.
 Those suites are listed in `ISOLATED_REST_CATALOG_SUITES`
-(`tests/sql/runner/src/lib.rs`). The runner starts a private REST Catalog and
+(`tests/sql/runner/src/lib.rs`). The runner starts private `rest` and `rest-mv` catalogs and
 MinIO for them
 (`tests/cluster-harness/src/isolated_iceberg_rest.rs`), overriding
-`iceberg_rest_uri`, `iceberg_rest_warehouse` and the object-store placeholders
+`iceberg_rest_uri`, `iceberg_rest_warehouse`, `iceberg_rest_mv_uri`,
+`iceberg_rest_mv_warehouse` and the object-store placeholders
 and environment for the whole run.  Such a suite cannot share a run with an
 ordinary one, and the runner says so rather than silently redirecting it.
 
 隔离 fixture 由 runner 启停，需要已 provision 的 BOM 与本机 Docker；不回退固定端点。端点统一投影到 runner 配置及受控子进程环境。它有自己的唯一项目，并设置 `NOVA_ENV_UPDATE_CURRENT=false`，不会占用共享 current。
-`mv-publication-v11` 在创建前从本机 provisioned base 构建 checked-in hook image，以 publication-hook profile 启动私有 REST，并发布 loopback control URI；不会在 stock 就绪后替换容器。runner 记录 profile、实际镜像身份与 control URI，结束后删除其私有项目。hook 镜像的供给快照统一仍属于后续工作。
+七项必需端点由同一 publication 投影：`iceberg_rest_uri`、`iceberg_rest_warehouse`、`iceberg_rest_mv_uri`、`iceberg_rest_mv_warehouse`、`oss_ak`、`oss_sk`、`oss_endpoint`。MV 两项同时导出为 `NOVAROCKS_ICEBERG_REST_MV_URI` 和 `NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE`，供受控子进程使用。`rest-mv` 保存 view version 的 `storage-table`，stock `rest` 保留为不支持该字段的对照；具体套件按自身契约选择端点。
+`mv-publication-v11` 在创建前从本机 provisioned base 构建 checked-in hook image，以 publication-hook profile 启动私有 REST，并发布 loopback control URI；不会在 stock 就绪后替换容器。hook 只修改 `rest`，同栈的 `rest-mv` 保持普通服务定义。runner 记录 profile、实际镜像身份与 control URI，结束后删除其私有项目。hook 镜像的供给快照统一仍属于后续工作。
 
 共享套件使用 publication 中的实际端点和 `[env].fixture_env_file`；stable runtime 目录只用于运行数据。共享 catalog 删除前先退出 HMS 等外部 endpoint；force 不豁免该检查。新对象存储需要重建 benchmark READY 数据，旧 REST/Hive 不自动迁移或删除。
+
+引入 `rest-mv` 后，每台机器按新 lock provision 一次，各 worktree rebase 并重新 `up.sh`；旧 lock 在 verify 处 BLOCKED，旧绑定的 offline prepare 不补造 MV 端点。缺少 `iceberg_rest_mv_*` 时按 runner 提示重新 `up.sh`。CI 准备阶段运行 `python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"`；失败为 VERIFY FAILED，且不会重启共享服务。完整切换、隔离生命周期检查与配方维护见 [fixture README](../../../docker/iceberg-rest/README.md) 和 [rest-mv README](../../../docker/iceberg-rest/rest-mv/README.md)。
 
 ## Taxonomy
 
@@ -170,6 +174,15 @@ DDL, DML, or a session command without a rowset. The runner uses the same SQL
 statement splitter as execution: `USE db; SELECT ...` requires a recorded
 result and comparison, while `USE db; SET ...` remains implicitly skipped.
 An explicit `@skip_result_check=true` still skips comparison for the whole step.
+
+`@result_contains` searches the whole output, so it cannot say which row
+matched. When the output lists state shared by the whole server, such as
+`SHOW ANALYZE JOBS`, bind the assertion to the rows the case owns instead:
+`@result_rows_where=<column>=<value>` (repeatable, exact cells by header name)
+selects them, `@result_rows_count=<n>` requires exactly that many, and
+`@result_rows_expect=<column>=<value>` (repeatable) must hold on every selected
+row. The count is mandatory, so a selector that matches nothing, or also
+matches another case's row, fails instead of passing.
 
 UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-applicability`，属于显式阶段。`NOVAROCKS_UEA4G_NATIVE_MANIFEST` 指向已冻结输入清单，清单以 SHA-256 绑定独立 Java corpus 和规模收据；S3 凭证从现有 fixture 环境注入，清单不保存密钥。场景重放准确 snapshot 的行袋，并以真实多文件输入检查三个 BE 的 split/page-source/退出事实，保存对象范围与资源收敛收据。性能对照及 provider 内闭包、union、完成屏障和物理范围测试分别验收，不能由 SQL 行数或空闲 BE 数代替。
 

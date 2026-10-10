@@ -48,8 +48,8 @@ use novarocks_cluster_harness::LaunchProfile;
 use novarocks_cluster_harness::process_resources::ProcessResourceSampler;
 
 use super::native_compatibility::{
-    RawUnaryResponse, authorization_header, raw_acquire_admission_ticket, raw_establish,
-    raw_operation_envelope, raw_query_context, raw_unary_response, raw_unary_response_with_hold,
+    RawUnaryConnection, RawUnaryResponse, authorization_header, raw_acquire_admission_ticket,
+    raw_establish, raw_operation_envelope, raw_query_context, raw_unary_response,
 };
 
 const REQUIRED_BACKENDS: usize = 3;
@@ -104,9 +104,9 @@ impl Scenario for OuterPreflightRejection {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let (connector, authorization, _, _) = probe(context)?;
+        let (connector, control_connector, authorization, _, _) = probe(context)?;
         let bad_timeout = header_rejection(
-            &connector,
+            &control_connector,
             HEARTBEAT_PATH,
             &authorization,
             "grpc-timeout",
@@ -119,7 +119,7 @@ impl Scenario for OuterPreflightRejection {
         context.action("malformed grpc-timeout rejected without sending a request body");
 
         let over_control = header_rejection(
-            &connector,
+            &control_connector,
             CONTROL_PATH,
             &authorization,
             "content-length",
@@ -209,9 +209,10 @@ impl Scenario for QueryMessageBounds {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let (connector, authorization, backend, compatibility_id) = probe(context)?;
+        let (connector, control_connector, authorization, backend, compatibility_id) =
+            probe(context)?;
         let heartbeat: RawUnaryResponse<proto::HeartbeatResponse> = raw_unary_response(
-            &connector,
+            &control_connector,
             HEARTBEAT_PATH,
             &authorization,
             proto::HeartbeatRequest {
@@ -279,7 +280,7 @@ impl Scenario for QueryMessageBounds {
         for (size, accepted) in [(CONTROL_FRAME_MAX, true), (CONTROL_FRAME_MAX + 1, false)] {
             let request = pad_control(control.clone(), size)?;
             let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> =
-                raw_unary_response(&connector, CONTROL_PATH, &authorization, request)?;
+                raw_unary_response(&control_connector, CONTROL_PATH, &authorization, request)?;
             if accepted {
                 ensure!(
                     response.grpc_status == 0
@@ -304,7 +305,7 @@ impl Scenario for QueryMessageBounds {
                 response.grpc_status
             ));
         }
-        let streamed_status = streamed_control_over_limit(&connector, &authorization)?;
+        let streamed_status = streamed_control_over_limit(&control_connector, &authorization)?;
         ensure!(
             streamed_status.code() == tonic::Code::ResourceExhausted
                 && streamed_status
@@ -423,8 +424,14 @@ impl Scenario for CurrentGateObservation {
             }
             context.action(format!("BE[{index}] current Native slots and Worker reservations exposed at rest; future Exchange/MEM readouts explicitly unavailable"));
         }
-        let (connector, authorization, backend, compatibility_id) = probe(context)?;
-        let operation = ticket_operation(&connector, &authorization, backend, compatibility_id)?;
+        let (connector, control_connector, authorization, backend, compatibility_id) =
+            probe(context)?;
+        let operation = ticket_operation(
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+        )?;
         let mut held = HeldOrdinary::start(&connector, &authorization, operation, backend, 1)?;
         held.await_entered(context.deadline())?;
         wait_ingress_slot(context, "ordinary", "running", 1.0)?;
@@ -467,10 +474,21 @@ impl Scenario for BlockingSaturationControl {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let (connector, authorization, backend, compatibility_id) = probe(context)?;
-        let releasable =
-            establish_releasable_context(&connector, &authorization, backend, compatibility_id)?;
-        let operation = ticket_operation(&connector, &authorization, backend, compatibility_id)?;
+        let (connector, control_connector, authorization, backend, compatibility_id) =
+            probe(context)?;
+        let releasable = establish_releasable_context(
+            &connector,
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+        )?;
+        let operation = ticket_operation(
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+        )?;
         let running_limit = metric(
             &read_backend_metrics(context, 0)?,
             "novarocks_backend_native_ingress_slots",
@@ -490,19 +508,7 @@ impl Scenario for BlockingSaturationControl {
         wait_ingress_slot(context, "ordinary", "running", 8.0)?;
         context.action("BE[0] eight real ordinary Worker closures held; ordinary blocking pool and running gate full");
 
-        let queued_connector = connector.clone();
-        let queued_authorization = authorization.clone();
-        let queued_operation = operation.clone();
-        let queued = thread::spawn(move || {
-            raw_unary_response::<_, proto::ApplyTaskOperationsResponse>(
-                &queued_connector,
-                ORDINARY_PATH,
-                &queued_authorization,
-                proto::ApplyTaskOperationsRequest {
-                    operations: vec![queued_operation],
-                },
-            )
-        });
+        held.start_waiter(&authorization, operation.clone())?;
         wait_ingress_slot(context, "ordinary", "waiting", 1.0)?;
         context.action("ninth ordinary request visibly waited at Native gate");
 
@@ -514,7 +520,12 @@ impl Scenario for BlockingSaturationControl {
             .as_ref()
             .and_then(|envelope| envelope.operation_id.clone())
             .context("Cancel probe omitted operation id")?;
-        let control = raw_unary_response(&connector, CONTROL_PATH, &authorization, cancel_request)?;
+        let control = raw_unary_response(
+            &control_connector,
+            CONTROL_PATH,
+            &authorization,
+            cancel_request,
+        )?;
         let receipt = exact_probe_receipt(
             control,
             &cancel_id,
@@ -537,8 +548,12 @@ impl Scenario for BlockingSaturationControl {
             .as_ref()
             .and_then(|envelope| envelope.operation_id.clone())
             .context("Quiesce probe omitted operation id")?;
-        let quiesce =
-            raw_unary_response(&connector, CONTROL_PATH, &authorization, quiesce_request)?;
+        let quiesce = raw_unary_response(
+            &control_connector,
+            CONTROL_PATH,
+            &authorization,
+            quiesce_request,
+        )?;
         let receipt = exact_probe_receipt(
             quiesce,
             &quiesce_id,
@@ -565,8 +580,12 @@ impl Scenario for BlockingSaturationControl {
             .as_ref()
             .and_then(|envelope| envelope.operation_id.clone())
             .context("Release probe omitted operation id")?;
-        let release =
-            raw_unary_response(&connector, CONTROL_PATH, &authorization, release_request)?;
+        let release = raw_unary_response(
+            &control_connector,
+            CONTROL_PATH,
+            &authorization,
+            release_request,
+        )?;
         let receipt = exact_probe_receipt(
             release,
             &release_id,
@@ -591,9 +610,7 @@ impl Scenario for BlockingSaturationControl {
         );
 
         held.release_and_join()?;
-        let queued = queued
-            .join()
-            .map_err(|_| anyhow::anyhow!("queued ordinary probe panicked"))??;
+        let queued = held.join_waiter()?;
         ensure!(
             queued.grpc_status == 0,
             "queued ordinary probe failed after release: {:?}",
@@ -628,8 +645,14 @@ impl Scenario for ResidentEnvelopeCalibration {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let (connector, authorization, backend, compatibility_id) = probe(context)?;
-        let operation = ticket_operation(&connector, &authorization, backend, compatibility_id)?;
+        let (connector, control_connector, authorization, backend, compatibility_id) =
+            probe(context)?;
+        let operation = ticket_operation(
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+        )?;
         let mut sampler = ProcessResourceSampler::from_identities(
             context.process_resource_identities()?,
             context.name(),
@@ -675,7 +698,7 @@ impl Scenario for AsyncSchedulingPressure {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let (connector, authorization, backend, _) = probe(context)?;
+        let (_connector, control_connector, authorization, backend, _) = probe(context)?;
         let before = total_shuffle_bytes(context)?;
         let user = context.mysql_user().to_owned();
         let port = context.mysql_port();
@@ -754,7 +777,7 @@ impl Scenario for AsyncSchedulingPressure {
             "distributed query active before control: shuffle_bytes={active_shuffle}, ordinary_running={ordinary_running}, ordinary_waiting={ordinary_waiting}"
         ));
         let control: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
-            &connector,
+            &control_connector,
             CONTROL_PATH,
             &authorization,
             control_cancel(backend),
@@ -800,7 +823,7 @@ impl Scenario for PartialBodyDeadline {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let (connector, authorization, backend, _) = probe(context)?;
+        let (connector, control_connector, authorization, backend, _) = probe(context)?;
         let (outcome, elapsed) = partial_body_deadline(&connector, &authorization)?;
         ensure!(
             elapsed < Duration::from_secs(3),
@@ -827,7 +850,7 @@ impl Scenario for PartialBodyDeadline {
         context.action(format!("ordinary half-open DATA ended after {:?} with {:?}; running_deadline count advanced (RST has no readable gRPC status)", elapsed, outcome));
         wait_ingress_slot(context, "ordinary", "running", 0.0)?;
         let control: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
-            &connector,
+            &control_connector,
             CONTROL_PATH,
             &authorization,
             control_cancel(backend),
@@ -887,8 +910,14 @@ impl Scenario for RegistryContentionControl {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let token = fs::read_to_string(context.scenario_root().join("registry-hold-token"))?;
         let mut rendezvous = RegistryRendezvous::bind(&token)?;
-        let (connector, authorization, backend, compatibility_id) = probe(context)?;
-        let operation = ticket_operation(&connector, &authorization, backend, compatibility_id)?;
+        let (connector, control_connector, authorization, backend, compatibility_id) =
+            probe(context)?;
+        let operation = ticket_operation(
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+        )?;
         let before = read_backend_metrics(context, 0)?;
         let control_started_before = metric_or_zero(
             &before,
@@ -915,7 +944,7 @@ impl Scenario for RegistryContentionControl {
         rendezvous.await_entered(backend, context.deadline())?;
         context.action("BE[0] first Acquire held the real Worker registry mutex before mutation");
 
-        let control_connector = connector.clone();
+        let control_connector = control_connector.clone();
         let control_authorization = authorization.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let control_thread = thread::spawn(move || {
@@ -1230,13 +1259,13 @@ fn wait_ingress_slot(
 }
 
 fn ticket_operation(
-    connector: &NativeEndpointConnector,
+    control_connector: &NativeEndpointConnector,
     authorization: &str,
     backend: BackendProcessId,
     compatibility_id: [u8; 32],
 ) -> Result<proto::TaskOperation> {
     let heartbeat: RawUnaryResponse<proto::HeartbeatResponse> = raw_unary_response(
-        connector,
+        control_connector,
         HEARTBEAT_PATH,
         authorization,
         proto::HeartbeatRequest {
@@ -1263,11 +1292,13 @@ fn ticket_operation(
 
 fn establish_releasable_context(
     connector: &NativeEndpointConnector,
+    control_connector: &NativeEndpointConnector,
     authorization: &str,
     backend: BackendProcessId,
     compatibility_id: [u8; 32],
 ) -> Result<proto::QueryContextRef> {
-    let acquisition = ticket_operation(connector, authorization, backend, compatibility_id)?;
+    let acquisition =
+        ticket_operation(control_connector, authorization, backend, compatibility_id)?;
     let context = match acquisition.operation.as_ref() {
         Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(request)) => {
             request
@@ -1437,6 +1468,9 @@ struct HeldCall {
 struct HeldOrdinary {
     calls: Vec<HeldCall>,
     backend: BackendProcessId,
+    connection: RawUnaryConnection,
+    waiter:
+        Option<thread::JoinHandle<Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>>>>,
 }
 
 impl HeldOrdinary {
@@ -1469,7 +1503,12 @@ impl HeldOrdinary {
         near_limit_first: bool,
     ) -> Result<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let mut calls = Vec::with_capacity(count);
+        let mut held = Self {
+            calls: Vec::with_capacity(count),
+            backend,
+            connection: RawUnaryConnection::connect(connector)?,
+            waiter: None,
+        };
         for index in 0..count {
             let token = format!("{}-{nonce}-{index}", std::process::id());
             let path = novarocks_failpoint::native_ingress_hold_socket_path(&token)
@@ -1477,7 +1516,7 @@ impl HeldOrdinary {
             let listener = UnixListener::bind(&path)
                 .with_context(|| format!("bind Native hold rendezvous {}", path.display()))?;
             listener.set_nonblocking(true)?;
-            let connector = connector.clone();
+            let client = held.connection.client();
             let authorization = authorization.to_owned();
             let request = if near_limit_first && index == 0 {
                 Some(pad_ordinary(operation.clone(), ORDINARY_BATCH_MAX)?)
@@ -1490,16 +1529,14 @@ impl HeldOrdinary {
             let token_for_request = token.clone();
             let response = thread::spawn(move || {
                 if let Some(request) = request {
-                    raw_unary_response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
-                        &connector,
+                    client.response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
                         ORDINARY_PATH,
                         &authorization,
                         request,
                         Some(&token_for_request),
                     )
                 } else {
-                    raw_unary_response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
-                        &connector,
+                    client.response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
                         ORDINARY_PATH,
                         &authorization,
                         small_request,
@@ -1507,7 +1544,7 @@ impl HeldOrdinary {
                     )
                 }
             });
-            calls.push(HeldCall {
+            held.calls.push(HeldCall {
                 token,
                 path,
                 listener,
@@ -1515,7 +1552,32 @@ impl HeldOrdinary {
                 response: Some(response),
             });
         }
-        Ok(Self { calls, backend })
+        Ok(held)
+    }
+
+    fn start_waiter(&mut self, authorization: &str, operation: proto::TaskOperation) -> Result<()> {
+        ensure!(self.waiter.is_none(), "ordinary waiter already started");
+        let client = self.connection.client();
+        let authorization = authorization.to_owned();
+        self.waiter = Some(thread::spawn(move || {
+            client.response_with_hold(
+                ORDINARY_PATH,
+                &authorization,
+                proto::ApplyTaskOperationsRequest {
+                    operations: vec![operation],
+                },
+                None,
+            )
+        }));
+        Ok(())
+    }
+
+    fn join_waiter(&mut self) -> Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>> {
+        self.waiter
+            .take()
+            .context("ordinary waiter not started")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("queued ordinary probe panicked"))?
     }
 
     fn await_entered(&mut self, scenario_deadline: Instant) -> Result<()> {
@@ -1582,7 +1644,23 @@ impl Drop for HeldOrdinary {
             if let Some(stream) = &mut call.stream {
                 let _ = stream.write_all(b"R");
             }
+            // Failure may leave a rendezvous accepted by BE but not yet
+            // accepted by the runner. Release its pending socket as well.
+            while let Ok((mut stream, _)) = call.listener.accept() {
+                let _ = stream.write_all(b"R");
+            }
             let _ = fs::remove_file(&call.path);
+        }
+        // On an early assertion failure, cancellation wakes every pending H2
+        // response before joining its actor. No fixture thread is detached.
+        self.connection.close();
+        for call in &mut self.calls {
+            if let Some(response) = call.response.take() {
+                let _ = response.join();
+            }
+        }
+        if let Some(waiter) = self.waiter.take() {
+            let _ = waiter.join();
         }
     }
 }
@@ -1608,13 +1686,25 @@ fn metric(rows: &[Value], name: &str, labels: &[(&str, &str)]) -> Result<f64> {
 
 fn probe(
     context: &mut ScenarioContext,
-) -> Result<(NativeEndpointConnector, String, BackendProcessId, [u8; 32])> {
+) -> Result<(
+    NativeEndpointConnector,
+    NativeEndpointConnector,
+    String,
+    BackendProcessId,
+    [u8; 32],
+)> {
     ensure!(
         context.handle().be_count() == REQUIRED_BACKENDS,
         "{} requires a real 1FE+3BE cluster",
         context.name()
     );
-    let port = context.handle().runtime().be[0].grpc;
+    let endpoint = context.handle().native_be_endpoint(0)?;
+    let control_endpoint = context.handle().native_be_control_endpoint(0)?;
+    ensure!(
+        endpoint != control_endpoint,
+        "Native Data and Control endpoints must be distinct"
+    );
+    let port = endpoint.port();
     let rows = context.handle().frontend_backend_topology()?;
     let row = rows
         .iter()
@@ -1626,13 +1716,21 @@ fn probe(
     );
     let backend = row.process_id.parse::<BackendProcessId>()?;
     let compatibility_id = hex_32(&row.native_compatibility_id)?;
-    let endpoint = context.handle().native_be_endpoint(0)?;
     let trust_mode = context.handle().native_trust_mode();
     let connector = context
         .handle()
         .native_probe_connector(endpoint, trust_mode)?;
+    let control_connector = context
+        .handle()
+        .native_probe_connector(control_endpoint, trust_mode)?;
     let authorization = authorization_header(&context.handle().native_probe_trust()?)?;
-    Ok((connector, authorization, backend, compatibility_id))
+    Ok((
+        connector,
+        control_connector,
+        authorization,
+        backend,
+        compatibility_id,
+    ))
 }
 
 fn hex_32(value: &str) -> Result<[u8; 32]> {

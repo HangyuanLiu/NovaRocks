@@ -16,6 +16,10 @@ pub struct Cli {
     pub timeout_secs: u64,
     pub launch_profile: LaunchProfile,
     pub uea1_workload_manifest: Option<PathBuf>,
+    /// Exact private binding for the optional small HMS correctness preflight.
+    pub hms_classification_binding: Option<PathBuf>,
+    /// Frozen provenance admission for the explicit original exact MySQL matrix.
+    pub exact_mysql_execution_binding: Option<PathBuf>,
 }
 impl Cli {
     pub fn parse_env() -> Result<Self> {
@@ -36,6 +40,8 @@ impl Cli {
             timeout_secs: 300,
             launch_profile: LaunchProfile::FaultScenario,
             uea1_workload_manifest: None,
+            hms_classification_binding: None,
+            exact_mysql_execution_binding: None,
         };
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -74,6 +80,20 @@ impl Cli {
                         .parse()
                         .map_err(anyhow::Error::msg)?;
                 }
+                "--exact-mysql-execution-binding" => {
+                    if cli.exact_mysql_execution_binding.is_some() {
+                        bail!("--exact-mysql-execution-binding must appear exactly once");
+                    }
+                    cli.exact_mysql_execution_binding =
+                        Some(PathBuf::from(value("--exact-mysql-execution-binding")?));
+                }
+                "--hms-classification-binding" => {
+                    if cli.hms_classification_binding.is_some() {
+                        bail!("--hms-classification-binding must appear exactly once");
+                    }
+                    cli.hms_classification_binding =
+                        Some(PathBuf::from(value("--hms-classification-binding")?));
+                }
                 "--uea1-workload-manifest" => {
                     cli.uea1_workload_manifest =
                         Some(PathBuf::from(value("--uea1-workload-manifest")?));
@@ -81,6 +101,30 @@ impl Cli {
                 "--help" | "-h" => bail!(Self::usage()),
                 _ => bail!("unknown option {argument}\n{}", Self::usage()),
             }
+        }
+        if cli.hms_classification_binding.is_some()
+            && (cli.list
+                || cli.list_default
+                || !cli.only.is_empty()
+                || cli.compatible_binary.is_some()
+                || cli.other_island_binary.is_some()
+                || cli.uea1_workload_manifest.is_some()
+                || cli.exact_mysql_execution_binding.is_some())
+        {
+            bail!("--hms-classification-binding is an exclusive preflight run mode");
+        }
+        if cli.exact_mysql_execution_binding.is_some()
+            && (cli.list
+                || cli.list_default
+                || cli.compatible_binary.is_some()
+                || cli.other_island_binary.is_some()
+                || cli.uea1_workload_manifest.is_some()
+                || cli.launch_profile != LaunchProfile::FaultScenario
+                || cli.cluster_size != 3)
+        {
+            bail!(
+                "--exact-mysql-execution-binding requires explicit fault-scenario 1FE+3BE without alternate modes"
+            );
         }
         if cli.list && cli.list_default {
             bail!("--list and --list-default are mutually exclusive");
@@ -101,7 +145,7 @@ impl Cli {
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
             "[--launch-profile <fault-scenario|performance>] ",
-            "[--uea1-workload-manifest <path>]"
+            "[--uea1-workload-manifest <path>] [--hms-classification-binding <path>] [--exact-mysql-execution-binding <path>]"
         )
     }
 }
@@ -109,6 +153,34 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_execution_binding_is_explicit_unique_and_topology_fixed() {
+        let flag = "--exact-mysql-execution-binding".to_string();
+        let args = vec![
+            flag.clone(),
+            "frozen.json".to_string(),
+            "--only".into(),
+            "exact-native-resident-cut-1".into(),
+        ];
+        let cli = Cli::parse(args).unwrap();
+        assert_eq!(
+            cli.exact_mysql_execution_binding,
+            Some(PathBuf::from("frozen.json"))
+        );
+        for extra in [
+            vec![flag.clone(), "duplicate.json".into()],
+            vec!["--list".into()],
+            vec!["--cluster-size".into(), "1".into()],
+            vec!["--launch-profile".into(), "performance".into()],
+            vec!["--hms-classification-binding".into(), "hms.json".into()],
+            vec!["--uea1-workload-manifest".into(), "perf.json".into()],
+        ] {
+            let mut args = vec![flag.clone(), "frozen.json".to_string()];
+            args.extend(extra);
+            assert!(Cli::parse(args).is_err());
+        }
+    }
 
     #[test]
     fn defaults_to_three_backends() {
@@ -171,6 +243,53 @@ mod tests {
         assert_eq!(
             cli.uea1_workload_manifest,
             Some(PathBuf::from("/tmp/workloads.json"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod hms_preflight_cli_tests {
+    use super::*;
+
+    fn parse(values: &[&str]) -> Result<Cli> {
+        Cli::parse(values.iter().map(|value| (*value).to_string()))
+    }
+
+    #[test]
+    fn hms_binding_is_exclusive_and_cannot_be_repeated() {
+        assert!(parse(&["--hms-classification-binding", "/private/input.json"]).is_ok());
+        assert!(
+            parse(&[
+                "--hms-classification-binding",
+                "/private/input.json",
+                "--hms-classification-binding",
+                "/other.json"
+            ])
+            .is_err()
+        );
+        for option in [
+            "--only",
+            "--compatible-binary",
+            "--other-island-binary",
+            "--uea1-workload-manifest",
+        ] {
+            assert!(
+                parse(&[
+                    "--hms-classification-binding",
+                    "/private/input.json",
+                    option,
+                    "value"
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            parse(&[
+                "--hms-classification-binding",
+                "/private/input.json",
+                "--list"
+            ])
+            .is_err()
         );
     }
 }

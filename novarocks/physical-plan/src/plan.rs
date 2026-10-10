@@ -98,8 +98,52 @@ pub struct OutputPort {
     pub columns: Box<[ValueId]>,
 }
 
+/// Proven identity of one physically ambiguous result value. `Plain` says
+/// that the result is the ordinary storage type, never an inferred JSON or
+/// opaque value. SQL freezes this fact from the resolved value owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultValueDomain {
+    Plain,
+    Json,
+    Variant,
+    Hll,
+    Bitmap,
+    Object,
+    Percentile,
+}
+
+impl ResultValueDomain {
+    pub fn matches_storage(self, data_type: &arrow_schema::DataType) -> bool {
+        use arrow_schema::DataType as D;
+        match self {
+            Self::Plain => true,
+            Self::Json => matches!(data_type, D::Utf8 | D::LargeUtf8),
+            Self::Variant => matches!(data_type, D::LargeBinary),
+            Self::Hll | Self::Bitmap | Self::Object | Self::Percentile => {
+                matches!(data_type, D::Binary | D::LargeBinary)
+            }
+        }
+    }
+
+    pub fn matches_scalar(self, value_type: &novarocks_result_contract::ScalarValueType) -> bool {
+        use novarocks_result_contract::{ScalarOpaqueType as O, ScalarValueType as S};
+        match (self, value_type) {
+            (Self::Json, S::Json)
+            | (Self::Variant, S::Variant)
+            | (Self::Hll, S::Opaque(O::Hll))
+            | (Self::Bitmap, S::Opaque(O::Bitmap))
+            | (Self::Object, S::Opaque(O::Object))
+            | (Self::Percentile, S::Opaque(O::Percentile)) => true,
+            (Self::Plain, S::Json | S::Variant | S::Opaque(_)) => false,
+            (Self::Plain, _) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResultField {
+    pub domain: ResultValueDomain,
     pub name: Box<str>,
     pub alias: Option<Box<str>>,
     pub value: ValueId,
@@ -108,6 +152,10 @@ pub struct ResultField {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResultPort {
+    /// Exact one-column scalar projection, when the SQL owner has proved the
+    /// complete declared identity against the final root carrier. Absence
+    /// means that typed scalar preparation must fail; it is never inferred.
+    pub scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
     pub fragment: FragmentId,
     pub output: OutputPort,
     pub fields: Box<[ResultField]>,
@@ -994,6 +1042,7 @@ pub struct PipelineDopDomain {
 #[derive(Clone, Debug, PartialEq)]
 pub enum FragmentSink {
     Result,
+    RootResult(Box<novarocks_result_contract::RootOutputContract>),
     Stream {
         edge: EdgeId,
     },
@@ -1565,6 +1614,33 @@ impl PhysicalPlan {
     /// The sole immutable parameter-value authority for this plan.
     pub const fn parameters(&self) -> &SemanticParameters {
         &self.parameters
+    }
+
+    /// Freeze the final root purpose once the application has resolved the
+    /// ordered render or domain facts. The complete plan is revalidated.
+    pub fn with_root_output(
+        mut self,
+        contract: novarocks_result_contract::RootOutputContract,
+    ) -> Result<Self, crate::ValidationErrors> {
+        let mut errors = crate::validation::ValidationContext::new();
+        let fragment = self
+            .result_port
+            .as_ref()
+            .and_then(|port| self.fragments.get_mut(&port.fragment));
+        match fragment {
+            Some(fragment) if matches!(fragment.sink, FragmentSink::Result) => {
+                fragment.sink = FragmentSink::RootResult(Box::new(contract));
+            }
+            _ => errors.push(crate::ValidationError::new(
+                "result_port",
+                "root purpose requires exactly one unfrozen result sink",
+            )),
+        }
+        if !errors.is_empty() {
+            return Err(crate::ValidationErrors::from_collector(errors));
+        }
+        crate::validate_plan(&self)?;
+        Ok(self)
     }
 
     pub const fn version(&self) -> PlanVersionId {

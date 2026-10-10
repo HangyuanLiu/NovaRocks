@@ -854,6 +854,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         .unwrap();
     let root = &fixture.fragment.nodes()[&fixture.fragment.root()];
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fixture.fragment.id(),
         output: root.output.clone(),
         fields: root
@@ -862,6 +863,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("case_{ordinal}").into(),
                 alias: None,
                 value: *value,

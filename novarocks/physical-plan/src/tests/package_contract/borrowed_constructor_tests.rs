@@ -578,9 +578,11 @@ fn borrowed_result_package_counts_both_original_type_walks_in_existing_decode_sc
     let (fragment, value) = literal_fragment(id, FragmentSink::Result, false);
     let mut input = package_input(fragment.clone());
     input.result = Some(ResultPort {
+        scalar_schema: None,
         fragment: id,
         output: fragment.nodes()[&fragment.root()].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::ResultValueDomain::Plain,
             name: "actual_result".into(),
             alias: None,
             value,

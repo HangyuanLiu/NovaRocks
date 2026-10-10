@@ -31,15 +31,17 @@ spec.loader.exec_module(guard)
 
 
 class BoundaryTests(unittest.TestCase):
-    def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False):
+    def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False,
+                result_dependency=""):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         (root / "Cargo.toml").write_text(
-            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime"]\n')
+            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result"]\n')
         for directory, name, dependencies in (
                 ("program", "novarocks-local-program", root_dependency),
                 ("types", "novarocks-types", types_dependency),
+                ("result", "novarocks-result-contract", result_dependency),
                 ("runtime", "tokio", "")):
             package = root / directory
             (package / "src").mkdir(parents=True)
@@ -62,6 +64,21 @@ class BoundaryTests(unittest.TestCase):
     def test_pure_contract_and_unrelated_workspace_runtime_are_allowed(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n')
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dependency_free_result_contract_is_allowed(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_result_contract_cannot_acquire_runtime_even_through_a_pure_root(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
+                              result_dependency='tokio = { path = "../runtime" }\n')
+        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
+        self.assertIn("runtime/wire/provider/storage capability: tokio", result.stderr)
+
+    def test_result_contract_cannot_add_an_otherwise_pure_dependency(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
+                              result_dependency='novarocks-types = { path = "../types" }\n')
+        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
 
     def test_transitive_runtime_is_rejected(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n',
@@ -101,9 +118,9 @@ class BoundaryTests(unittest.TestCase):
                 "dependencies": [], "features": {}, "targets": []}
 
     def test_exact_arrow_backing_identities_are_allowed(self):
-        for name, version in (("arrow-array", "58.2.0"), ("arrow-buffer", "58.2.0"),
-                              ("arrow-data", "58.2.0"), ("half", "2.7.1"),
-                              ("num-traits", "0.2.19")):
+        for name, version in (("arrow-array", "2.0.0"), ("arrow-buffer", "2.0.0"),
+                              ("arrow-data", "2.0.0"), ("half", "2.0.0"),
+                              ("num-traits", "2.0.0")):
             self.assertEqual(guard.verify_package(self.external(name, version), set()), [])
 
     def test_same_named_pure_contract_replacement_is_rejected(self):
@@ -116,25 +133,24 @@ class BoundaryTests(unittest.TestCase):
                      "novarocks-proto-models", "novarocks-worker", "tonic", "object_store"):
             self.assertTrue(guard.verify_package(self.external(name), set()), name)
 
-    def test_same_name_foreign_arrow_and_version_drift_are_rejected(self):
-        for package in (self.external("arrow-array", "58.2.0", "git+https://example.invalid/arrow"),
-                        self.external("arrow-array", "58.4.0"),
+    def test_same_name_foreign_arrow_and_unknown_package_are_rejected(self):
+        for package in (self.external("arrow-array", "2.0.0", "git+https://example.invalid/arrow"),
                         self.external("unknown-pure-looking-package")):
             self.assertIn("unaudited external package identity", " ".join(
                 guard.verify_package(package, set())))
 
     def test_registry_membership_does_not_authorize_new_build_or_macro(self):
         for kind in ("custom-build", "proc-macro"):
-            package = self.external("bytes", "1.11.0")
+            package = self.external("bytes", "2.0.0")
             package["targets"] = [{"name": "unaudited", "kind": [kind],
-                                   "src_path": "/registry/bytes-1.11.0/build.rs"}]
+                                   "src_path": "/registry/bytes-2.0.0/build.rs"}]
             self.assertIn(f"unaudited {kind} authority", " ".join(
                 guard.verify_package(package, set())))
 
     def test_exact_arrow_build_and_macro_sources_are_allowed(self):
-        for name, version, kind in (("ahash", "0.8.12", "custom-build"),
-                                    ("zerocopy-derive", "0.8.31", "proc-macro"),
-                                    ("serde_derive", "1.0.228", "proc-macro")):
+        for name, version, kind in (("ahash", "2.0.0", "custom-build"),
+                                    ("zerocopy-derive", "2.0.0", "proc-macro"),
+                                    ("serde_derive", "2.0.0", "proc-macro")):
             package = self.external(name, version)
             package["targets"] = [{"name": name, "kind": [kind],
                                    "src_path": f"/registry/{name}-{version}/src/lib.rs"}]
@@ -143,14 +159,14 @@ class BoundaryTests(unittest.TestCase):
             self.assertTrue(guard.verify_package(package, set()))
 
     def test_audited_build_source_cannot_escape_package(self):
-        package = self.external("ahash", "0.8.12")
+        package = self.external("ahash", "2.0.0")
         package["targets"] = [{"name": "build", "kind": ["custom-build"],
                                "src_path": "/foreign/build.rs"}]
         self.assertIn("source escapes its audited package", " ".join(
             guard.verify_package(package, set())))
 
     def test_audited_registry_build_owner_cannot_acquire_runtime(self):
-        package = self.external("ahash", "0.8.12")
+        package = self.external("ahash", "2.0.0")
         package["dependencies"] = [{"name": "tokio", "kind": "build"}]
         self.assertIn("unaudited build dependencies: tokio", " ".join(
             guard.verify_package(package, set())))

@@ -39,6 +39,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::table_finish::TableFinishNode;
 use novarocks_execution::exec::node::table_write_aggregate::{
@@ -226,7 +227,19 @@ fn decode_root_result_schema(
             "root write result column ids do not match the fixed relation",
         ));
     }
-    RootWriteResultRelationSchema::try_new(contract)
+    let slot_ids = decoded
+        .slot_ids()
+        .iter()
+        .copied()
+        .map(SlotId::new)
+        .collect::<Vec<_>>();
+    let chunk_schema = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+        decoded.schema_metadata_origin(),
+        decoded.field_metadata_origins(),
+        &slot_ids,
+    )
+    .map_err(|error| NativeFragmentDecodeError::invalid_value(path.clone(), error))?;
+    RootWriteResultRelationSchema::try_new_with_chunk_schema(contract, chunk_schema)
         .map_err(|error| NativeFragmentDecodeError::invalid_value(path, error))
 }
 
@@ -865,7 +878,10 @@ pub(super) fn lower_table_writer_node(
         binding.execution(),
         execution_id,
         node_id,
-        Arc::new(NativeConnectorWriteObservationPort),
+        Arc::new(NativeConnectorWriteObservationPort::new(
+            ctx.backend_process_id()
+                .map_err(|error| error.into_native(path.clone()))?,
+        )),
         crate::debug_environment::debug_emit_connector_writer_marker(),
     ));
     let fragment_encoder = Arc::new(RoleBoundCommitFragmentEncoder::new(
@@ -1244,6 +1260,7 @@ mod tests {
 
     fn write_decode_context(execution: Arc<RecordingWriteExecution>) -> NativePlanDecodeContext {
         NativePlanDecodeContext::default()
+            .with_backend_process_id(novarocks_types::BackendProcessId::new_v7())
             .with_typed_scan_runtime(Some(test_write_scan_runtime(
                 execution_id(),
                 fragment_instance_id(),
@@ -1523,6 +1540,27 @@ mod tests {
             panic!("expected a table finish, got {:?}", decoded.node.kind);
         };
         assert_eq!(finish.inputs.len(), 2);
+        let output_schema = finish.root_result_schema().chunk_schema();
+        assert!(output_schema.field_metadata_origins().is_some());
+        assert!(output_schema.schema_metadata_origin().is_some());
+        let batch = arrow::record_batch::RecordBatch::new_empty(output_schema.arrow_schema_ref());
+        let chunk = novarocks_execution::exec::chunk::Chunk::try_new_with_chunk_schema(
+            batch,
+            Arc::clone(output_schema),
+        )
+        .unwrap();
+        assert!(
+            novarocks_execution::exec::chunk::borrowed_root_chunk_storage(
+                &chunk,
+                novarocks_execution::exec::chunk::RootArrayStorageLimits {
+                    bytes: 96 * 1024 * 1024,
+                    nodes: 65536,
+                    depth: 64,
+                },
+            )
+            .is_ok(),
+            "the actual decoded Root relation retains all nested metadata owners"
+        );
         assert_eq!(finish.expected_targets().len(), 1);
         assert!(finish.accepts_target(WriteTargetOrdinal::try_new(0).expect("bounded ordinal")));
         assert!(!finish.accepts_target(WriteTargetOrdinal::try_new(1).expect("bounded ordinal")));

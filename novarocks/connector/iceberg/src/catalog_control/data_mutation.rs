@@ -44,6 +44,8 @@ use super::add_files::{
     AddFilesManifest, plan_manifest_for_table, preflight_caller_managed_source_domain,
     revalidate_manifest_for_table,
 };
+use crate::catalog::CatalogTableName;
+use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
 use crate::commit::{
     CleanupAttempt, CleanupPathMapper, CommitServiceError, IcebergCommitCollector,
     RecoveryEvidence, RunInput, run_iceberg_commit,
@@ -161,6 +163,8 @@ struct TerminalRecord {
 }
 
 trait IcebergDataMutationBackend: Send + Sync {
+    fn admit(&self, request: &ConnectorDataMutationPlanningRequest) -> Result<(), ConnectorError>;
+
     fn plan(
         &self,
         request: &ConnectorDataMutationPlanningRequest,
@@ -229,6 +233,30 @@ impl RegisteredIcebergDataMutationBackend {
 }
 
 impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
+    fn admit(&self, request: &ConnectorDataMutationPlanningRequest) -> Result<(), ConnectorError> {
+        let target = self.provider.table_payload(request.operation().table())?;
+        if target.metadata_table_type.is_some() {
+            return Err(invalid(
+                "Iceberg data mutation requires a base table handle",
+            ));
+        }
+        let operation = match request.operation() {
+            ConnectorDataMutationOperation::Truncate { .. } => CatalogOperation::Truncate,
+            ConnectorDataMutationOperation::RegisterExistingFiles { .. } => {
+                CatalogOperation::RegisterFiles
+            }
+        };
+        self.runtime
+            .novarocks_catalog()
+            .admit(&CatalogAdmissionRequest::new(
+                operation,
+                CatalogTableName::new(target.namespace, target.table),
+                request.context.initiation(),
+            ))
+            .map_err(connector_unsupported)?;
+        Ok(())
+    }
+
     fn plan(
         &self,
         request: &ConnectorDataMutationPlanningRequest,
@@ -276,8 +304,8 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     source_location,
                     &binding,
                     self.runtime.resources().catalog_runtime(),
-                )
-                .map_err(map_provider_error)?;
+                    self.runtime.novarocks_catalog().listing_admission(),
+                )?;
                 let mapping_digest = manifest
                     .canonical_name_mapping
                     .as_deref()
@@ -442,6 +470,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                         .for_request(request_context.clone()),
                     &expected_manifest,
                     runtime.resources().catalog_runtime(),
+                    runtime.novarocks_catalog().listing_admission(),
                 )
                 .map_err(|error| format!("ADD FILES frozen manifest changed: {error}"))?;
                 validate_no_duplicate_data_files(&runtime, current, &expected_manifest, None)
@@ -787,6 +816,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
     ) -> Result<ConnectorDataMutationPlan, ConnectorError> {
         request.validate()?;
         self.ensure_owner(request.owner())?;
+        self.backend.admit(&request)?;
         let mut plans = self
             .plans
             .lock()
@@ -1355,7 +1385,7 @@ fn failure(
     ConnectorMutationFailure::new(kind, message)
 }
 
-fn map_provider_error(message: impl ToString) -> ConnectorError {
+pub(super) fn map_provider_error(message: impl ToString) -> ConnectorError {
     let message = message.to_string();
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("not found") || lower.contains("unknown table") {
@@ -1434,6 +1464,14 @@ mod tests {
     }
 
     impl IcebergDataMutationBackend for FakeBackend {
+        // This backend tests mutation protocol replay independently of catalog policy.
+        fn admit(
+            &self,
+            _request: &ConnectorDataMutationPlanningRequest,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
         fn plan(
             &self,
             _request: &ConnectorDataMutationPlanningRequest,
@@ -2008,5 +2046,176 @@ mod tests {
             ExternalMutationOutcome::KnownCommitted { .. }
         ));
         assert_eq!(backend.execute_count.load(Ordering::SeqCst), 1);
+    }
+
+    fn admission_runtime(
+        catalog_type: &str,
+    ) -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        Arc<IcebergMetadataContext>,
+        std::net::TcpListener,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("HMS probe listener");
+        listener.set_nonblocking(true).expect("nonblocking probe");
+        let mut properties = vec![
+            ("iceberg.catalog.type".to_string(), catalog_type.to_string()),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            ),
+        ];
+        if catalog_type == "hive" {
+            properties.push((
+                "hive.metastore.uris".to_string(),
+                format!(
+                    "thrift://{}",
+                    listener.local_addr().expect("listener address")
+                ),
+            ));
+        }
+        let configuration = crate::catalog_config::parse_catalog_configuration("ice", &properties)
+            .expect("configuration");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let runtime = Arc::new(
+            IcebergMetadataContext::try_new(
+                crate::catalog_control::IcebergCatalogControlState::new(configuration),
+                crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone()),
+            )
+            .expect("control runtime"),
+        );
+        (executor, warehouse, runtime, listener)
+    }
+
+    fn admission_context(catalog_type: &str) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            1024,
+            4096,
+        )
+        .expect("context")
+        .with_initiation(if catalog_type == "hive" {
+            novarocks_spi::connector::ConnectorRequestInitiation::Statement
+        } else {
+            novarocks_spi::connector::ConnectorRequestInitiation::Background
+        })
+    }
+
+    fn admission_table(
+        instance: novarocks_spi::connector::ConnectorInstanceId,
+    ) -> ConnectorTableHandle {
+        ConnectorTableHandle::try_new(instance, Bytes::from_static(br#"{"namespace":"db","table":"absent","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#)).expect("table handle")
+    }
+
+    fn assert_admission_left_no_io(
+        warehouse: &tempfile::TempDir,
+        listener: &std::net::TcpListener,
+    ) {
+        assert_eq!(
+            std::fs::read_dir(warehouse.path())
+                .expect("warehouse inventory")
+                .count(),
+            0
+        );
+        let error = listener
+            .accept()
+            .expect_err("admission must not connect to HMS");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn planning_refuses_hms_and_background_hadoop_before_backend_io() {
+        for catalog_type in ["hive", "hadoop"] {
+            let (_executor, warehouse, runtime, listener) = admission_runtime(catalog_type);
+            let descriptor = ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            };
+            let provider = Arc::new(IcebergMetadata::new(
+                descriptor,
+                ProviderBindingEpoch::from_bytes([8; 16]),
+                runtime,
+            ));
+            let adapter = IcebergDataMutationAdapter::try_new(provider).expect("adapter");
+            for operation in [
+                ConnectorDataMutationOperation::truncate(
+                    admission_table(adapter.key.instance_id.clone()),
+                    "main",
+                )
+                .expect("truncate"),
+                ConnectorDataMutationOperation::register_existing_files(
+                    admission_table(adapter.key.instance_id.clone()),
+                    warehouse.path().join("source").display().to_string(),
+                )
+                .expect("register files"),
+            ] {
+                let request = ConnectorDataMutationPlanningRequest::try_new(
+                    ConnectorMutationOperationId::new(),
+                    adapter.key.clone(),
+                    operation,
+                    admission_context(catalog_type),
+                )
+                .expect("request");
+                let error = adapter
+                    .plan_mutation(request)
+                    .expect_err("catalog admission must refuse planning");
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                assert!(error.to_string().contains(if catalog_type == "hive" {
+                    "read-only compatibility entry"
+                } else {
+                    "background"
+                }));
+                assert!(adapter.plans.lock().expect("plans").is_empty());
+                assert_admission_left_no_io(&warehouse, &listener);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_plan_cannot_bypass_background_hadoop_admission() {
+        let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
+        let adapter = IcebergDataMutationAdapter::try_new(Arc::clone(&provider)).expect("adapter");
+        let metadata = provider
+            .load_table(ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("t"),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: table_context(),
+            })
+            .expect("table");
+        let mut request = ConnectorDataMutationPlanningRequest::try_new(
+            ConnectorMutationOperationId::new(),
+            adapter.key.clone(),
+            ConnectorDataMutationOperation::truncate(metadata.table, "main").expect("truncate"),
+            table_context(),
+        )
+        .expect("request");
+        adapter
+            .plan_mutation(request.clone())
+            .expect("statement admission");
+        request.context = request
+            .context
+            .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background);
+        let error = adapter
+            .plan_mutation(request)
+            .expect_err("cached plan must not authorize a background request");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(error.to_string().contains("background"));
+        assert_eq!(adapter.plans.lock().expect("plans").len(), 1);
     }
 }

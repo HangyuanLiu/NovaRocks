@@ -950,6 +950,7 @@ fn actual_publication_observes_structure_success_and_ordinary_error_completion()
             // contradicts its Noop sink, so refusal comes from structure validation.
             builder
                 .set_result_port(crate::ResultPort {
+                    scalar_schema: None,
                     fragment: fragment.id(),
                     output: fragment.nodes()[&fragment.root()].output.clone(),
                     fields: Box::default(),

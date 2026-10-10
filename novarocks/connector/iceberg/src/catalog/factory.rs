@@ -100,7 +100,7 @@ mod tests {
     use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
-    use novarocks_spi::connector::ConnectorErrorKind;
+    use novarocks_spi::connector::{ConnectorErrorKind, ConnectorListingBound};
 
     /// Build a catalog for a test the way production does.
     ///
@@ -189,7 +189,10 @@ mod tests {
         assert_eq!(exists.kind(), ConnectorErrorKind::Unsupported);
 
         let listed = catalog
-            .list_views(CatalogNamespaceName::new("db"))
+            .list_views(
+                CatalogNamespaceName::new("db"),
+                novarocks_spi::connector::ConnectorListingBound::V1,
+            )
             .await
             .expect_err("list_views must not answer with an empty list");
         assert_eq!(listed.kind(), ConnectorErrorKind::Unsupported);
@@ -199,6 +202,71 @@ mod tests {
             .await
             .expect_err("load_view must not answer not-found");
         assert_eq!(loaded.kind(), ConnectorErrorKind::Unsupported);
+    }
+
+    /// Hadoop enumeration has no paging, so its directory listing is bounded
+    /// as a whole: an over-bound namespace is refused with its typed bound on
+    /// both the generation path and the admitted-read path, never truncated.
+    #[tokio::test]
+    async fn hadoop_table_listing_over_its_bound_is_refused_not_truncated() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        for table in ["a", "b", "c"] {
+            let metadata = warehouse.path().join("db").join(table).join("metadata");
+            std::fs::create_dir_all(&metadata).expect("metadata directory");
+            std::fs::write(metadata.join("version-hint.text"), b"1\n").expect("version hint");
+        }
+        let catalog = adopted(&hadoop_configuration(warehouse.path()))
+            .await
+            .expect("catalog");
+        let runtime = tokio::runtime::Handle::current();
+        let binding = || {
+            crate::access_binding::IcebergReadBinding::new(
+                None,
+                FsAccessResolver::new(),
+                Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+                Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+            )
+            .for_request(
+                novarocks_spi::connector::ConnectorRequestContext::try_new(
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                    1024,
+                    4096,
+                )
+                .unwrap(),
+            )
+        };
+        let namespace = || CatalogNamespaceName::new("db");
+        let exact = ConnectorListingBound {
+            entries: 3,
+            ..ConnectorListingBound::V1
+        };
+        let over = ConnectorListingBound {
+            entries: 2,
+            ..exact
+        };
+
+        assert_eq!(
+            catalog.list_tables(namespace(), exact).await.unwrap(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            catalog
+                .list_tables_for_read(namespace(), binding(), exact)
+                .await
+                .unwrap(),
+            ["a", "b", "c"]
+        );
+        for error in [
+            catalog.list_tables(namespace(), over).await.unwrap_err(),
+            catalog
+                .list_tables_for_read(namespace(), binding(), over)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+            assert!(error.message().contains("entries bound"), "{error}");
+        }
     }
 
     /// Absence must be readable from the error's kind alone.
@@ -327,5 +395,188 @@ mod tests {
             })
             .await;
         assert!(matches!(start, CatalogTransactionStart::Ready(_)));
+    }
+    #[tokio::test]
+    async fn operation_admission_matrix_is_owned_by_each_catalog_before_io() {
+        use crate::catalog::admission::*;
+        use CatalogOperation::*;
+        let operations = [
+            CreateNamespace,
+            DropNamespace,
+            CreateTable(CatalogCreateIntent::EmptyTable),
+            CreateTable(CatalogCreateIntent::CreateTableAsSelect),
+            DropTable,
+            BootstrapSnapshot,
+            AlterSchema,
+            AlterProperties,
+            AlterPartitionSpec,
+            CreateBranch,
+            DropBranch,
+            CreateTag,
+            DropTag,
+            FastForwardBranch,
+            CreateView,
+            ReplaceView,
+            DropView,
+            Append,
+            Overwrite,
+            RowDelta,
+            RowMutation,
+            CopyOnWrite,
+            Truncate,
+            RegisterFiles,
+            ExpireSnapshots,
+            RewriteManifests,
+            RemoveOrphanFiles,
+            RewriteDataFiles,
+            RewritePositionDeletes,
+            Statistics,
+            CreateDocuments,
+            UpdateDocuments,
+            PublishDocuments,
+            DropDocuments,
+        ];
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        endpoint.set_nonblocking(true).unwrap();
+        for kind in ["hive", "hadoop", "rest"] {
+            let warehouse = tempfile::tempdir().unwrap();
+            let properties = vec![
+                ("iceberg.catalog.type".into(), kind.into()),
+                (
+                    "iceberg.catalog.warehouse".into(),
+                    warehouse.path().display().to_string(),
+                ),
+                (
+                    "hive.metastore.uris".into(),
+                    format!("thrift://{}", endpoint.local_addr().unwrap()),
+                ),
+                (
+                    "iceberg.catalog.uri".into(),
+                    format!("http://{}", endpoint.local_addr().unwrap()),
+                ),
+            ];
+            let configuration =
+                crate::catalog_config::parse_catalog_configuration("ice", &properties).unwrap();
+            let catalog = adopted(&configuration).await.unwrap();
+            for operation in operations {
+                let target = if matches!(operation, CreateNamespace | DropNamespace) {
+                    CatalogAdmissionTarget::Namespace(CatalogNamespaceName::new("db"))
+                } else {
+                    CatalogTableName::new("db", "t").into()
+                };
+                for initiation in [
+                    CatalogInitiation::Statement,
+                    CatalogInitiation::StatementJob,
+                    CatalogInitiation::JobAttempt,
+                    CatalogInitiation::Background,
+                ] {
+                    let result = catalog.admit(&CatalogAdmissionRequest::new(
+                        operation,
+                        target.clone(),
+                        initiation,
+                    ));
+                    let unsupported_hadoop = matches!(
+                        operation,
+                        CreateTable(CatalogCreateIntent::CreateTableAsSelect)
+                            | CreateView
+                            | ReplaceView
+                            | DropView
+                            | CreateDocuments
+                            | UpdateDocuments
+                            | PublishDocuments
+                            | DropDocuments
+                    );
+                    if kind == "hive"
+                        || kind == "hadoop"
+                            && (unsupported_hadoop || initiation == CatalogInitiation::Background)
+                    {
+                        let refused = result.unwrap_err();
+                        if kind == "hive" {
+                            assert!(refused.message().contains("read-only compatibility entry"));
+                            assert!(refused.message().contains(operation.name()));
+                        }
+                    } else {
+                        assert_eq!(
+                            result.unwrap(),
+                            if kind == "hadoop" && initiation == CatalogInitiation::StatementJob {
+                                CatalogAdmission::AdmittedAwaitingCompletion
+                            } else {
+                                CatalogAdmission::Admitted
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            endpoint.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn hms_direct_mutations_and_constructors_refuse_before_metastore_io() {
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        endpoint.set_nonblocking(true).unwrap();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".into(), "hive".into()),
+                (
+                    "iceberg.catalog.warehouse".into(),
+                    "s3://unused/warehouse".into(),
+                ),
+                (
+                    "hive.metastore.uris".into(),
+                    format!("thrift://{}", endpoint.local_addr().unwrap()),
+                ),
+            ],
+        )
+        .unwrap();
+        let owner = adopted(&configuration).await.unwrap();
+        assert!(matches!(
+            owner
+                .create_namespace(CatalogNamespaceName::new("db"))
+                .await,
+            CatalogOutcome::Unsupported(_)
+        ));
+        assert!(matches!(
+            owner.drop_namespace(CatalogNamespaceName::new("db")).await,
+            CatalogOutcome::Unsupported(_)
+        ));
+        assert!(matches!(
+            owner.drop_table(CatalogTableName::new("db", "t")).await,
+            CatalogOutcome::Unsupported(_)
+        ));
+        assert!(matches!(
+            owner
+                .anchor_written_metadata(
+                    CatalogTableName::new("db", "t"),
+                    Arc::from("s3://unused/metadata.json")
+                )
+                .await,
+            CatalogOutcome::Unsupported(_)
+        ));
+        for intent in [
+            CatalogCreateIntent::EmptyTable,
+            CatalogCreateIntent::CreateTableAsSelect,
+        ] {
+            assert!(matches!(
+                owner
+                    .new_create_table_transaction(create_request("db", "t", intent))
+                    .await,
+                CatalogTransactionStart::Unsupported(_)
+            ));
+            assert!(matches!(
+                owner
+                    .new_create_or_replace_table_transaction(create_request("db", "t", intent))
+                    .await,
+                CatalogTransactionStart::Unsupported(_)
+            ));
+        }
+        assert_eq!(
+            endpoint.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

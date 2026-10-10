@@ -37,6 +37,7 @@ mod credential_slot;
 mod deadline;
 mod domain;
 mod drain;
+pub mod guarded_bytes;
 mod host;
 mod inbound_capability;
 mod ingress;
@@ -51,6 +52,7 @@ mod receipt;
 mod reliable_transport;
 pub mod result_batch;
 pub mod result_buffer;
+pub mod root_result_channel;
 mod runtime_filter_error;
 pub mod sink_commit;
 mod status;
@@ -110,8 +112,8 @@ pub use domain::{
 };
 pub use drain::WorkerDrainState;
 pub use host::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskExecutionHost,
+    HostRejection, PreparedTaskInstallation, QueryContextHost, ReleasedContextEvidence,
+    RunnableTask, SharedFactsRequest, TaskExecutionHost,
 };
 pub use inbound_capability::{
     InboundFrameAdmission, InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities,
@@ -160,7 +162,7 @@ pub use task_execution_ports::{
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{
     DeadlineSweep, RegistryCounters, RegistryLockObservation, RegistryLockSnapshot,
-    TaskExecutionRegistry, TaskPreparationSnapshot,
+    TaskExecutionRegistry, TaskPreparationSnapshot, TaskPreparationSnapshotError,
 };
 pub use task_registry_config::{TaskExecutionRegistryConfig, TaskPreparationLimits};
 pub use typed_preparation_flow::ScanPreparationTimer;

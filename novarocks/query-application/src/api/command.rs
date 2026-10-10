@@ -20,7 +20,7 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 use novarocks_parser::ast::MaterializedViewStatement;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
-use novarocks_workload_control::WorkScope;
+use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
 
 use crate::admitted_query_context::RequestContext;
 use crate::protocol_delivery::QuerySessionOutput;
@@ -51,6 +51,7 @@ pub struct CommandContext {
     connector_context: ConnectorRequestContext,
     statement_token: StatementToken,
     principal: Arc<str>,
+    result_window: Option<ResultWindowAlias>,
 }
 
 impl CommandContext {
@@ -65,7 +66,39 @@ impl CommandContext {
             connector_context,
             statement_token,
             principal: principal.into(),
+            result_window: None,
         }
+    }
+
+    /// Retain the already admitted position through this command's actual
+    /// asynchronous and blocking owners. This never requests another window.
+    pub fn with_result_window(mut self, window: ResultWindowAlias) -> Result<Self, CommandError> {
+        if self.result_window.is_some()
+            || !window.is_for_scope(&self.scope)
+            || window.class() == ResultWindowClass::Closing
+        {
+            return Err(CommandError::new(
+                CommandErrorKind::Conflict,
+                "command result window is duplicated, foreign or closing",
+            ));
+        }
+        self.scope.check().map_err(|error| {
+            CommandError::new(
+                match error {
+                    WorkError::Cancelled(_) => CommandErrorKind::Cancelled,
+                    _ => CommandErrorKind::Rejected,
+                },
+                format!("bind command result window: {error}"),
+            )
+        })?;
+        self.result_window = Some(window);
+        Ok(self)
+    }
+
+    /// A child producer must delegate this alias to its exact child scope;
+    /// cloning it preserves the original position and all-objects envelope.
+    pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
+        self.result_window.clone()
     }
 
     pub fn scope(&self) -> &WorkScope {
@@ -257,6 +290,116 @@ mod tests {
         assert!(context.scope().check().is_ok());
         assert!(!context.connector_context().is_cancelled());
         assert_eq!(context.statement_token(), statement_token);
+    }
+
+    #[test]
+    fn command_window_is_exact_and_survives_until_the_last_consumer_exit() {
+        use novarocks_workload_control::{ResultCapacityConfig, ResultClosingCut};
+        let control = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        control.mark_ready().unwrap();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let other = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let context_for = |scope| {
+            CommandContext::new(
+                scope,
+                ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(1),
+                    ConnectorStopOwner::new().view(),
+                    4096,
+                    4096,
+                )
+                .unwrap(),
+                StatementToken::new(SessionToken::new(7, 11), 13),
+                "test-principal",
+            )
+        };
+        assert_eq!(
+            context_for(other.owner.scope())
+                .with_result_window(window.retain_alias())
+                .err()
+                .unwrap()
+                .kind(),
+            CommandErrorKind::Conflict
+        );
+        let closing = capacity
+            .try_acquire_closing(&root.owner.scope(), ResultClosingCut::OriginatingFailure)
+            .unwrap();
+        assert_eq!(
+            context_for(root.owner.scope())
+                .with_result_window(closing.retain_alias())
+                .err()
+                .unwrap()
+                .kind(),
+            CommandErrorKind::Conflict
+        );
+        drop(closing);
+        let context = context_for(root.owner.scope())
+            .with_result_window(window.retain_alias())
+            .unwrap();
+        assert_eq!(
+            context.result_window_alias().unwrap().class(),
+            ResultWindowClass::Local
+        );
+        assert_eq!(
+            context
+                .clone()
+                .with_result_window(window.retain_alias())
+                .err()
+                .unwrap()
+                .kind(),
+            CommandErrorKind::Conflict
+        );
+        let consumer = context.clone();
+        let late_context = context_for(root.owner.scope());
+        let late_alias = window.retain_alias();
+        root.owner.complete();
+        assert_eq!(
+            late_context
+                .with_result_window(late_alias)
+                .err()
+                .unwrap()
+                .kind(),
+            CommandErrorKind::Rejected
+        );
+        root.business.release();
+        other.owner.complete();
+        other.business.release();
+        drop(window);
+        drop(context);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        drop(consumer);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(control.snapshot().root_responsibilities, 0);
     }
 
     #[test]

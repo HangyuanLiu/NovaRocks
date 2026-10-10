@@ -35,16 +35,25 @@ use novarocks_spi::connector::write_stack::{
     MAX_WRITE_RELATION_METADATA_VALUE_BYTES, MAX_WRITE_RELATION_TYPE_DEPTH,
     MAX_WRITER_AUXILIARY_CHANNELS, WRITE_RELATION_COLUMN_COUNT,
 };
+use novarocks_types::arrow_metadata_owner::{
+    ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedField, MetadataOwnedSchema,
+    MetadataOwnerLimits,
+};
 
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 const FIELD_CHARGE: usize = 128;
 const TYPE_CHARGE: usize = 64;
 const MAX_COLUMNS: usize = WRITE_RELATION_COLUMN_COUNT + MAX_WRITER_AUXILIARY_CHANNELS;
+// Every decoded field already consumes FIELD_CHARGE in the unchanged semantic
+// budget. This receipt limit therefore rejects no previously legal schema.
+const MAX_METADATA_OWNERS: usize = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES / FIELD_CHARGE;
 
 #[derive(Clone, Debug)]
 pub struct DecodedArrowPhysicalSchema {
     schema: SchemaRef,
+    schema_origin: MetadataOwnedSchema,
+    field_origins: FieldMetadataOrigins,
     slot_ids: Vec<u32>,
     internal: Vec<bool>,
 }
@@ -52,6 +61,14 @@ pub struct DecodedArrowPhysicalSchema {
 impl DecodedArrowPhysicalSchema {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    pub fn schema_metadata_origin(&self) -> &MetadataOwnedSchema {
+        &self.schema_origin
+    }
+
+    pub fn field_metadata_origins(&self) -> &FieldMetadataOrigins {
+        &self.field_origins
     }
 
     pub fn slot_ids(&self) -> &[u32] {
@@ -213,17 +230,28 @@ pub fn decode_schema(
                 "Arrow physical column field is required",
             )
         })?;
-        fields.push(Arc::new(decode_field(
+        fields.push(decode_field(
             field,
             column_path.clone().field("field"),
             1,
             &mut budget,
-        )?));
+        )?);
         slot_ids.push(column.slot_id);
         internal.push(column.is_internal);
     }
+    let schema_origin = metadata.into_schema(fields.into());
+    let field_origins =
+        FieldMetadataOrigins::try_new(budget.owners, MAX_METADATA_OWNERS).map_err(|_| {
+            error(
+                path,
+                ProtocolErrorKind::Capacity,
+                "Arrow field metadata origins exceed their node limit",
+            )
+        })?;
     Ok(DecodedArrowPhysicalSchema {
-        schema: Arc::new(Schema::new_with_metadata(fields, metadata)),
+        schema: Arc::clone(schema_origin.schema()),
+        schema_origin,
+        field_origins,
         slot_ids,
         internal,
     })
@@ -529,7 +557,7 @@ fn decode_field(
     path: FieldPath,
     depth: usize,
     budget: &mut DecodeBudget,
-) -> Result<Field, ProtocolError> {
+) -> Result<Arc<Field>, ProtocolError> {
     check_depth(depth, path.clone())?;
     check_string(
         &field.name,
@@ -580,7 +608,17 @@ fn decode_field(
         }
         Field::new(&field.name, data_type, field.nullable)
     };
-    Ok(decoded.with_metadata(metadata))
+    if budget.owners.len() >= MAX_METADATA_OWNERS {
+        return Err(error(
+            path,
+            ProtocolErrorKind::Capacity,
+            "Arrow field metadata origins exceed their node limit",
+        ));
+    }
+    let owner = metadata.into_field_definition(decoded);
+    let field = Arc::clone(owner.field());
+    budget.owners.push(owner);
+    Ok(field)
 }
 
 fn decode_type(
@@ -645,18 +683,18 @@ fn decode_type(
         Kind::Decimal256(value) => {
             decode_decimal(value, path.field("decimal256"), DataType::Decimal256)
         }
-        Kind::List(field) => Ok(DataType::List(Arc::new(decode_field(
+        Kind::List(field) => Ok(DataType::List(decode_field(
             field,
             path.field("list"),
             depth + 1,
             budget,
-        )?))),
-        Kind::ListView(field) => Ok(DataType::ListView(Arc::new(decode_field(
+        )?)),
+        Kind::ListView(field) => Ok(DataType::ListView(decode_field(
             field,
             path.field("list_view"),
             depth + 1,
             budget,
-        )?))),
+        )?)),
         Kind::FixedSizeList(value) => {
             let item = value.item.as_ref().ok_or_else(|| {
                 error(
@@ -666,27 +704,27 @@ fn decode_type(
                 )
             })?;
             Ok(DataType::FixedSizeList(
-                Arc::new(decode_field(
+                decode_field(
                     item,
                     path.field("fixed_size_list").field("item"),
                     depth + 1,
                     budget,
-                )?),
+                )?,
                 value.length,
             ))
         }
-        Kind::LargeList(field) => Ok(DataType::LargeList(Arc::new(decode_field(
+        Kind::LargeList(field) => Ok(DataType::LargeList(decode_field(
             field,
             path.field("large_list"),
             depth + 1,
             budget,
-        )?))),
-        Kind::LargeListView(field) => Ok(DataType::LargeListView(Arc::new(decode_field(
+        )?)),
+        Kind::LargeListView(field) => Ok(DataType::LargeListView(decode_field(
             field,
             path.field("large_list_view"),
             depth + 1,
             budget,
-        )?))),
+        )?)),
         Kind::StructType(value) => {
             check_repeated_len(
                 value.fields.len(),
@@ -706,7 +744,6 @@ fn decode_type(
                         depth + 1,
                         budget,
                     )
-                    .map(Arc::new)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(DataType::Struct(Fields::from(fields)))
@@ -750,12 +787,12 @@ fn decode_type(
                     )
                 })?;
                 type_ids.push(type_id);
-                fields.push(Arc::new(decode_field(
+                fields.push(decode_field(
                     field,
                     field_path.field("field"),
                     depth + 1,
                     budget,
-                )?));
+                )?);
             }
             let fields = UnionFields::try_new(type_ids, fields).map_err(|err| {
                 error(
@@ -805,12 +842,12 @@ fn decode_type(
                 )
             })?;
             Ok(DataType::Map(
-                Arc::new(decode_field(
+                decode_field(
                     entries,
                     path.field("map").field("entries"),
                     depth + 1,
                     budget,
-                )?),
+                )?,
                 value.ordered,
             ))
         }
@@ -830,18 +867,18 @@ fn decode_type(
                 )
             })?;
             Ok(DataType::RunEndEncoded(
-                Arc::new(decode_field(
+                decode_field(
                     run_ends,
                     path.clone().field("run_end_encoded").field("run_ends"),
                     depth + 1,
                     budget,
-                )?),
-                Arc::new(decode_field(
+                )?,
+                decode_field(
                     values,
                     path.field("run_end_encoded").field("values"),
                     depth + 1,
                     budget,
-                )?),
+                )?,
             ))
         }
     }
@@ -931,7 +968,7 @@ fn decode_metadata(
     entries: &[plan::ArrowFieldMetadataEntry],
     path: FieldPath,
     budget: &mut DecodeBudget,
-) -> Result<HashMap<String, String>, ProtocolError> {
+) -> Result<ArrowMetadataOwner, ProtocolError> {
     if entries.len() > MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD {
         return Err(error(
             path,
@@ -971,10 +1008,46 @@ fn decode_metadata(
         )?;
         previous = Some(&entry.key);
     }
-    Ok(entries
+    let entries = entries
         .iter()
         .map(|entry| (entry.key.clone(), entry.value.clone()))
-        .collect())
+        .collect::<Vec<_>>();
+    let limits = MetadataOwnerLimits {
+        entries: MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD,
+        construction_bytes: MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES,
+    };
+    let peak = ArrowMetadataOwner::preflight(&entries, limits).map_err(|_| {
+        error(
+            path.clone(),
+            ProtocolErrorKind::Capacity,
+            "Arrow metadata construction exceeds its allocation limit",
+        )
+    })?;
+    // Strings and the source entry Vec were charged above. Charge the fresh
+    // table before reserving it; no borrowed HashMap is assigned a receipt.
+    let source = entries.capacity() * size_of::<(String, String)>()
+        + entries
+            .iter()
+            .map(|(k, v)| k.capacity() + v.capacity())
+            .sum::<usize>();
+    budget.metadata_tables = budget
+        .metadata_tables
+        .checked_add(peak.saturating_sub(source))
+        .filter(|n| *n <= 3 * MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES + 8192)
+        .ok_or_else(|| {
+            error(
+                path.clone(),
+                ProtocolErrorKind::Capacity,
+                "Arrow owned metadata tables exceed their construction bound",
+            )
+        })?;
+    ArrowMetadataOwner::try_new(entries, limits).map_err(|_| {
+        error(
+            path,
+            ProtocolErrorKind::Capacity,
+            "Arrow metadata construction failed",
+        )
+    })
 }
 
 fn check_repeated_len(length: usize, path: FieldPath) -> Result<(), ProtocolError> {
@@ -1021,6 +1094,12 @@ fn check_string(
 #[derive(Default)]
 struct DecodeBudget {
     bytes: usize,
+    // Fresh hash tables are separately bounded without changing the frozen
+    // semantic schema geometry accepted by the existing wire decoder. Fresh
+    // tables fit three times the old field/entry charges, plus one top-level
+    // metadata table (at most 128 buckets under the 64-entry geometry).
+    metadata_tables: usize,
+    owners: Vec<MetadataOwnedField>,
 }
 
 impl DecodeBudget {
@@ -1050,6 +1129,102 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_origins(field: &Arc<Field>, origins: &FieldMetadataOrigins) {
+        assert!(origins.metadata_bytes_for(field).is_some());
+        assert!(
+            origins
+                .metadata_bytes_for(&Arc::new(field.as_ref().clone()))
+                .is_none()
+        );
+        match field.data_type() {
+            DataType::List(f) | DataType::Map(f, _) => assert_origins(f, origins),
+            DataType::Struct(fields) => {
+                for f in fields {
+                    assert_origins(f, origins);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[test]
+    fn owned_decoder_keeps_all_physical_fields_and_does_not_shrink_generic_geometry() {
+        let child = plan::ArrowPhysicalField {
+            name: String::new(),
+            r#type: Some(Box::new(plan::ArrowPhysicalType {
+                kind: Some(primitive(plan::ArrowPrimitiveType::Int32)),
+            })),
+            ..Default::default()
+        };
+        let top = plan::ArrowPhysicalField {
+            name: String::new(),
+            r#type: Some(Box::new(plan::ArrowPhysicalType {
+                kind: Some(plan::arrow_physical_type::Kind::StructType(
+                    plan::ArrowStructType {
+                        fields: vec![child; 4096],
+                    },
+                )),
+            })),
+            ..Default::default()
+        };
+        let columns = (0..16)
+            .map(|slot_id| plan::ArrowPhysicalColumn {
+                slot_id,
+                field: Some(top.clone()),
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        let decoded = decode_schema(&columns, &[], FieldPath::root("schema")).unwrap();
+        assert_eq!(decoded.field_metadata_origins().owners().len(), 65552);
+        assert!(Arc::ptr_eq(
+            decoded.schema(),
+            decoded.schema_metadata_origin().schema()
+        ));
+        for field in decoded.schema().fields() {
+            assert_origins(field, decoded.field_metadata_origins());
+        }
+    }
+
+    #[test]
+    fn owned_metadata_tables_preserve_the_old_dense_metadata_geometry() {
+        let metadata = (32..89u8)
+            .map(|key| plan::ArrowFieldMetadataEntry {
+                key: String::from_utf8(vec![key]).unwrap(),
+                value: String::new(),
+            })
+            .collect();
+        let child = plan::ArrowPhysicalField {
+            name: String::new(),
+            metadata,
+            r#type: Some(Box::new(plan::ArrowPhysicalType {
+                kind: Some(primitive(plan::ArrowPrimitiveType::Int32)),
+            })),
+            ..Default::default()
+        };
+        let top = plan::ArrowPhysicalField {
+            name: String::new(),
+            r#type: Some(Box::new(plan::ArrowPhysicalType {
+                kind: Some(plan::arrow_physical_type::Kind::StructType(
+                    plan::ArrowStructType {
+                        fields: vec![child; 2800],
+                    },
+                )),
+            })),
+            ..Default::default()
+        };
+        let columns = (0..2)
+            .map(|slot_id| plan::ArrowPhysicalColumn {
+                slot_id,
+                field: Some(top.clone()),
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        let decoded = decode_schema(&columns, &[], FieldPath::root("schema")).unwrap();
+        assert_eq!(decoded.field_metadata_origins().owners().len(), 5602);
+        for field in decoded.schema().fields() {
+            assert_origins(field, decoded.field_metadata_origins());
+        }
+    }
 
     fn nested_field(name: &str, data_type: DataType, nullable: bool) -> Arc<Field> {
         Arc::new(

@@ -765,6 +765,8 @@ impl TableCompletionRetainedBytes {
             | SqlType::Binary
             | SqlType::Bitmap
             | SqlType::Hll
+            | SqlType::Object
+            | SqlType::Percentile
             | SqlType::Boolean
             | SqlType::Date
             | SqlType::DateTime

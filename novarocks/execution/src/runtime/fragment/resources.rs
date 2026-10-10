@@ -187,6 +187,32 @@ impl Drop for ResultRegistration {
     }
 }
 
+struct RootResultRegistration {
+    session: Arc<dyn crate::runtime::fragment::io::RootResultSession>,
+    active: bool,
+    cleanup_should_fail: bool,
+}
+impl RootResultRegistration {
+    fn abort(&mut self, reason: ResultAbort) {
+        if self.active {
+            self.active = false;
+            self.session.abort(reason);
+        }
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        self.abort(ResultAbort::PrepareRollback);
+        if std::mem::take(&mut self.cleanup_should_fail) {
+            return Err(ResourceKind::Result.cleanup_failure_detail().to_string());
+        }
+        Ok(())
+    }
+}
+impl Drop for RootResultRegistration {
+    fn drop(&mut self) {
+        let _ = self.rollback();
+    }
+}
+
 pub(crate) struct ExchangeRegistration {
     port: Arc<dyn ExchangeReceiverPort>,
     keys: Vec<ExchangeReceiverKey>,
@@ -307,6 +333,7 @@ pub(crate) struct FragmentResources {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     sink_commit: Option<SinkCommitLease>,
     result: Option<ResultRegistration>,
+    root_result: Option<RootResultRegistration>,
     exchange: Option<ExchangeRegistration>,
     cleanup_faults: ResourceCleanupFaults,
 }
@@ -322,6 +349,7 @@ impl FragmentResources {
             exchange_receiver_port,
             sink_commit: None,
             result: None,
+            root_result: None,
             exchange: None,
             cleanup_faults,
         }
@@ -345,17 +373,19 @@ impl FragmentResources {
         writer: &Arc<dyn FragmentResultWriter>,
         spec: ResultWriteSpec,
     ) -> Result<(), FragmentLaunchError> {
-        self.acquire_result_for(program.sink_kind(), writer, spec)
+        self.acquire_result_for_static(program.local_program().sink(), writer, spec)
     }
 
-    /// Open the result session exactly when the static sink is a result sink.
-    pub(crate) fn acquire_result_for(
+    pub(crate) fn acquire_result_for_static(
         &mut self,
-        sink_kind: FragmentSinkKind,
+        sink: Option<&novarocks_local_program::StaticSinkProgram>,
         writer: &Arc<dyn FragmentResultWriter>,
         spec: ResultWriteSpec,
     ) -> Result<(), FragmentLaunchError> {
-        if sink_kind != FragmentSinkKind::Result {
+        if !matches!(
+            sink,
+            Some(novarocks_local_program::StaticSinkProgram::Result)
+        ) {
             return Ok(());
         }
         self.result = Some(ResultRegistration::acquire(
@@ -364,6 +394,56 @@ impl FragmentResources {
             self.cleanup_faults.should_fail(ResourceKind::Result),
         )?);
         Ok(())
+    }
+
+    pub(crate) fn acquire_root_result(
+        &mut self,
+        program: &FragmentProgram,
+        session: Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>>,
+        identity: Option<novarocks_execution_contract::TaskIdentity>,
+    ) -> Result<(), FragmentLaunchError> {
+        self.acquire_root_result_for_static(program.local_program().sink(), session, identity)
+    }
+
+    pub(crate) fn acquire_root_result_for_static(
+        &mut self,
+        sink: Option<&novarocks_local_program::StaticSinkProgram>,
+        session: Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>>,
+        identity: Option<novarocks_execution_contract::TaskIdentity>,
+    ) -> Result<(), FragmentLaunchError> {
+        let Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) = sink else {
+            if let Some(session) = session {
+                session.abort(ResultAbort::PrepareRollback);
+                return Err(registration_error(
+                    "bounded root session supplied for a different sink",
+                ));
+            }
+            return Ok(());
+        };
+        let session = session.ok_or_else(|| {
+            registration_error("frozen bounded root requires its host-owned session")
+        })?;
+        if Some(session.spec().task) != identity
+            || session.spec().contract.as_ref() != contract.as_ref()
+        {
+            session.abort(ResultAbort::PrepareRollback);
+            return Err(registration_error(
+                "bounded root session disagrees with exact task or frozen contract",
+            ));
+        }
+        self.root_result = Some(RootResultRegistration {
+            session,
+            active: true,
+            cleanup_should_fail: self.cleanup_faults.should_fail(ResourceKind::Result),
+        });
+        Ok(())
+    }
+    pub(crate) fn root_result_session(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>> {
+        self.root_result
+            .as_ref()
+            .map(|root| Arc::clone(&root.session))
     }
 
     pub(crate) fn result_session(&self) -> Option<Arc<dyn FragmentResultSession>> {
@@ -377,6 +457,9 @@ impl FragmentResources {
     /// This does not release the registration or establish a terminal fact;
     /// those remain owned by the actual driver-stop path.
     pub(crate) fn abort_result_for_cancellation(&mut self, reason: &str) {
+        if let Some(root) = self.root_result.as_mut() {
+            root.abort(ResultAbort::Cancelled(reason.to_string()));
+        }
         if let Some(result) = self.result.as_mut() {
             result.abort_for_cancellation(reason.to_string());
         }
@@ -410,6 +493,11 @@ impl FragmentResources {
 
     pub(crate) fn rollback(&mut self) -> Vec<String> {
         let mut diagnostics = Vec::new();
+        if let Some(mut root) = self.root_result.take()
+            && let Err(error) = root.rollback()
+        {
+            diagnostics.push(error);
+        }
         if let Some(mut exchange) = self.exchange.take()
             && let Err(error) = exchange.rollback()
         {
@@ -429,6 +517,10 @@ impl FragmentResources {
     }
 
     pub(crate) fn finish_success(&mut self) {
+        if let Some(mut root) = self.root_result.take() {
+            root.active = false;
+            root.cleanup_should_fail = false;
+        }
         if let Some(mut exchange) = self.exchange.take() {
             exchange.finish_success();
         }
@@ -444,6 +536,10 @@ impl FragmentResources {
     }
 
     pub(crate) fn finish_failure(&mut self, error: String) {
+        if let Some(mut root) = self.root_result.take() {
+            root.abort(ResultAbort::Failed(error.clone()));
+            root.cleanup_should_fail = false;
+        }
         if let Some(mut exchange) = self.exchange.take() {
             exchange.finish_cancelled();
         }
@@ -453,6 +549,10 @@ impl FragmentResources {
     }
 
     pub(crate) fn finish_cancelled(&mut self, reason: String) {
+        if let Some(mut root) = self.root_result.take() {
+            root.abort(ResultAbort::Cancelled(reason.clone()));
+            root.cleanup_should_fail = false;
+        }
         if let Some(mut exchange) = self.exchange.take() {
             exchange.finish_cancelled();
         }

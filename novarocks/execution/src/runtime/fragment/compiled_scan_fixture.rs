@@ -272,6 +272,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FRAGMENT,
         output: OutputPort {
             node: PROJECT,
@@ -281,6 +282,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             .iter()
             .zip(["b", "a"])
             .map(|(value, label)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(&int64()),
                 name: label.into(),
                 alias: None,
                 value: *value,

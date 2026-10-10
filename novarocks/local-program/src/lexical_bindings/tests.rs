@@ -478,6 +478,7 @@ fn build_project(
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: roots
                         .iter()
                         .map(|(definition, _)| ProgramExprId::new(*definition))

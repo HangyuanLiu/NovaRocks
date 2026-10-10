@@ -643,6 +643,7 @@ fn fixture(spec: Spec) -> Fixture {
             })
             .unwrap();
             plan.set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: CONSUMER,
                 output: OutputPort {
                     node: RECEIVER,
@@ -652,6 +653,7 @@ fn fixture(spec: Spec) -> Fixture {
                     .iter()
                     .enumerate()
                     .map(|(ordinal, value)| ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: format!("c{ordinal}").into(),
                         alias: None,
                         value: *value,
@@ -664,6 +666,7 @@ fn fixture(spec: Spec) -> Fixture {
         Sink::Result(labels) => {
             assert!(!spec.derived, "the labeled fixture has two columns");
             plan.set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: PRODUCER,
                 output: OutputPort {
                     node: root,
@@ -673,6 +676,7 @@ fn fixture(spec: Spec) -> Fixture {
                     .iter()
                     .zip(labels)
                     .map(|(value, label)| ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: label.into(),
                         alias: None,
                         value: *value,

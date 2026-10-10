@@ -535,6 +535,13 @@ fn compile_dml_change_stream_write(
             plan,
             &completion_control,
         )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
         .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
@@ -901,6 +908,7 @@ fn cow_selection_layout(
     Ok((Arc::new(Schema::new(fields)), roles))
 }
 
+#[cfg(test)]
 fn cow_selection_from_query_result(
     result: QueryResult,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -915,27 +923,8 @@ fn cow_selection_from_query_result(
         )
         .map_err(|error| format!("create bounded COW match collector: {error}"))?;
     for batch in result.batches {
-        if batch.num_columns() != schema.fields().len() {
-            return Err(
-                "COW match query output width differs from its signed contract".to_string(),
-            );
-        }
-        let columns = batch
-            .columns()
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| {
-                novarocks_execution::exec::expr::cast_array_to_target(column, field.data_type())
-                    .map_err(|error| {
-                        format!(
-                            "cast COW match ordinal to its signed type {:?}: {error}",
-                            field.data_type()
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-            .map_err(|error| format!("assemble signed COW match batch: {error}"))?;
+        let batch =
+            crate::query_execution::row_mutation::cast_to_signed_selection(&schema, &batch)?;
         collector
             .push(batch)
             .map_err(|error| format!("collect bounded COW match batch: {error}"))?;
@@ -1320,17 +1309,13 @@ pub(crate) fn stage_prepared_update_mutation(
                 source_sql.as_deref(),
                 &cow_preparations.preparation,
             )?;
-            let matched = execute_exact_cow_match_query(
+            let selection = execute_exact_cow_match_query(
                 state,
                 &target,
                 &query,
                 &execution,
                 &connector_context,
-            )?;
-            let selection = cow_selection_from_query_result(
-                matched,
                 &cow_preparations.preparation,
-                connector_context.clone(),
             )?;
             if selection.row_count() == 0 {
                 return Ok(MutationStagedWrite::NoOp);
@@ -3010,7 +2995,30 @@ fn execute_exact_cow_match_query(
     query: &novarocks_parser::ast::Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<QueryResult, crate::dml::error::DmlExecutionError> {
+    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+) -> Result<
+    novarocks_spi::connector::ConnectorRowMutationSelection,
+    crate::dml::error::DmlExecutionError,
+> {
+    let capacity = execution.result_capacity().ok_or_else(|| {
+        crate::dml::error::DmlExecutionError::from(
+            "COW match has no admitted Internal result window".to_string(),
+        )
+    })?;
+    crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+        capacity.scope(),
+        &capacity.window_alias(),
+    )?;
+    let (schema, _) = cow_selection_layout(preparation)?;
+    let consumer =
+        crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_with_capacity(
+            connector_context.clone(),
+            schema,
+            preparation.match_contract().clone(),
+            preparation.intent().clone(),
+            capacity,
+        )
+        .map_err(|error| error.to_string())?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);
@@ -3103,6 +3111,13 @@ fn execute_exact_cow_match_query(
             plan,
             &completion_control,
         )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
+                ),
+            )
+        })
         .map_err(|error| error.to_string())?;
     let output =
         novarocks_query_application::preparation::OutputContract::from_completed_candidate(
@@ -3149,17 +3164,17 @@ fn execute_exact_cow_match_query(
             description,
             template,
         ),
-        Some(crate::query_execution::contract::synthetic_statement_query_options(execution)),
-        crate::query_execution::contract::DistributedQueryIntent::Result,
+        None,
+        crate::query_execution::contract::DistributedQueryIntent::CowMatch,
         execution,
         None,
     )
+    .and_then(|request| request.with_cow_match_consumer(consumer))
     .map_err(|error| error.to_string())?;
     Ok(state
         .query_execution()
         .execute(request)
-        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_result)
-        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_cow_match)
         .map_err(|error| error.to_string())?)
 }
 
@@ -3662,12 +3677,13 @@ pub(crate) fn stage_prepared_merge_mutation(
         insert_columns_resolved.as_deref(),
         &cow_preparations.preparation,
     )?;
-    let matched =
-        execute_exact_cow_match_query(state, &target, &query, &execution, &connector_context)?;
-    let selection = cow_selection_from_query_result(
-        matched,
+    let selection = execute_exact_cow_match_query(
+        state,
+        &target,
+        &query,
+        &execution,
+        &connector_context,
         &cow_preparations.preparation,
-        connector_context.clone(),
     )?;
     if selection.row_count() == 0 {
         return Ok(MutationStagedWrite::NoOp);

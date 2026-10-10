@@ -153,6 +153,39 @@ impl MetadataTableCloneRequest {
     }
 }
 
+// Live backing is distinct from a clone request: the original immutable table
+// construction proves bucket history, while actual strings retain capacity.
+fn original_map_backing_observed<E: From<MetadataMaterializationError>>(
+    origin: MetadataCloneOrigin,
+    values: &HashMap<String, String>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut bytes = origin
+        .table_request()
+        .map_err(E::from)?
+        .layout
+        .map_or(0, |v| v.size());
+    observe()?;
+    for (key, value) in values {
+        bytes = bytes
+            .checked_add(key.capacity())
+            .and_then(|v| v.checked_add(value.capacity()))
+            .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
+        observe()?;
+    }
+    Ok(bytes)
+}
+
+// Sort the existing freshly published loan buffer in place. No allocation,
+// map, payload clone, deduplication or metadata receipt conversion occurs.
+// Shared tables are immutable; a previously published sorted table stays so.
+fn index_original_loans(mut fields: Arc<[MetadataFieldLoan]>) -> Arc<[MetadataFieldLoan]> {
+    if let Some(unique) = Arc::get_mut(&mut fields) {
+        unique.sort_unstable_by_key(MetadataFieldLoan::original_address);
+    }
+    fields
+}
+
 // Only an already-paired owner calls this private arithmetic. An arbitrary
 // HashMap plus a copied numerical origin cannot mint a source pairing.
 fn original_map_clone_request<E: From<MetadataMaterializationError>>(
@@ -460,6 +493,16 @@ impl SharedMaterializedSchema {
     pub fn lends(&self, actual: &SchemaRef) -> bool {
         Arc::ptr_eq(&self.schema, actual)
     }
+    /// Actual live text capacities and the original table construction history.
+    /// The supplied Schema must be this same immutable Arc, not equal content.
+    pub fn original_backing_observed<E: From<MetadataMaterializationError>>(
+        &self,
+        actual: &SchemaRef,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Option<Result<usize, E>> {
+        self.lends(actual)
+            .then(|| original_map_backing_observed(self.metadata, actual.metadata(), observe))
+    }
 }
 
 /// Call the ONE original FVT materializer, then record its explicit root-map
@@ -506,13 +549,36 @@ impl SchemaMetadataMaterializations {
         schema: SharedMaterializedSchema,
         fields: Arc<[MetadataFieldLoan]>,
     ) -> Self {
-        Self { schema, fields }
+        Self {
+            schema,
+            fields: index_original_loans(fields),
+        }
     }
     pub fn schema_owner(&self) -> &SharedMaterializedSchema {
         &self.schema
     }
+    /// Clone only the positively paired root metadata table. The supplied
+    /// FieldRefs remain the original immutable owners, so inherited exact
+    /// field loans keep their identity without a second field clone.
+    pub fn project_shared_fields_original(&self, fields: impl Into<Fields>) -> Self {
+        Self {
+            schema: self
+                .schema
+                .clone_metadata_original()
+                .into_schema(fields)
+                .into_shared(),
+            fields: Arc::clone(&self.fields),
+        }
+    }
     pub fn fields(&self) -> &[MetadataFieldLoan] {
         &self.fields
+    }
+    /// Borrow the exact source buffer only after its immutable ordering check.
+    /// An externally shared, unsorted table is not a checked lookup index.
+    pub fn checked_field_index(&self) -> Option<&[MetadataFieldLoan]> {
+        self.fields
+            .is_sorted_by_key(MetadataFieldLoan::original_address)
+            .then_some(&self.fields)
     }
     pub fn field_namespace(&self) -> MaterializedFieldNamespace {
         MaterializedFieldNamespace {
@@ -608,6 +674,23 @@ pub struct MetadataFieldLoan {
     metadata: MetadataCloneOrigin,
 }
 impl MetadataFieldLoan {
+    /// Exact allocation address pinned by this Weak, never an access grant.
+    pub fn original_address(&self) -> usize {
+        self.field.as_ptr() as usize
+    }
+    /// A temporary strong loan is available only while the original payload
+    /// lives. Expired Weak receipts cannot expose destroyed name/map heaps.
+    pub fn borrow_original_field(&self) -> Option<FieldRef> {
+        self.field.upgrade()
+    }
+    pub fn original_backing_observed<E: From<MetadataMaterializationError>>(
+        &self,
+        actual: &FieldRef,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Option<Result<usize, E>> {
+        self.lends(actual)
+            .then(|| original_map_backing_observed(self.metadata, actual.metadata(), observe))
+    }
     pub fn lends_borrowed_field(&self, actual: &Field) -> bool {
         self.field.as_ptr() == actual as *const Field
     }
@@ -743,7 +826,7 @@ impl SchemaMetadataMaterializations {
                 schema,
                 metadata: self.schema.metadata,
             },
-            fields: loans.into(),
+            fields: index_original_loans(loans.into()),
         }
     }
 }
@@ -762,6 +845,97 @@ impl OriginalMetadataClone {
             schema: Schema::new_with_metadata(fields, self.values),
             metadata: self.metadata,
         }
+    }
+}
+
+/// A published original Field and its optional positive construction loan.
+/// Both are produced together; foreign sharing never invents a metadata fact.
+#[derive(Clone, Debug)]
+pub struct OriginalSharedField {
+    field: FieldRef,
+    loan: Option<MetadataFieldLoan>,
+    shared_reference: bool,
+}
+impl PartialEq for OriginalSharedField {
+    fn eq(&self, other: &Self) -> bool {
+        self.field == other.field
+    }
+}
+impl Eq for OriginalSharedField {}
+impl OriginalSharedField {
+    pub fn from_original(original: OriginalFieldMaterialization) -> Self {
+        let (field, loan) = original.into_shared();
+        Self {
+            field,
+            loan,
+            shared_reference: false,
+        }
+    }
+    pub fn from_shared(field: FieldRef, source: Option<&SchemaMetadataMaterializations>) -> Self {
+        let loan = source
+            .and_then(|source| source.fields().iter().find(|loan| loan.lends(&field)))
+            .cloned();
+        Self {
+            field,
+            loan,
+            shared_reference: true,
+        }
+    }
+    pub fn shares_original_reference(&self) -> bool {
+        self.shared_reference
+    }
+    pub fn field(&self) -> &Field {
+        &self.field
+    }
+    pub fn field_ref(&self) -> &FieldRef {
+        &self.field
+    }
+    pub fn loan(&self) -> Option<&MetadataFieldLoan> {
+        self.loan.as_ref()
+    }
+    pub fn rebuild_original(
+        &self,
+        data_type: arrow_schema::DataType,
+        nullable: bool,
+    ) -> OriginalFieldMaterialization {
+        match &self.loan {
+            Some(loan) => OriginalFieldMaterialization::Materialized(MaterializedField {
+                field: rebuild_original_field(&self.field, data_type, nullable),
+                metadata: loan.metadata,
+            }),
+            None => OriginalFieldMaterialization::Plain(rebuild_original_field(
+                &self.field,
+                data_type,
+                nullable,
+            )),
+        }
+    }
+    pub fn clone_original(&self) -> OriginalFieldMaterialization {
+        match &self.loan {
+            Some(loan) => OriginalFieldMaterialization::Materialized(
+                loan.clone_original(&self.field)
+                    .expect("paired original shared Field loan"),
+            ),
+            None => OriginalFieldMaterialization::Plain(self.field.as_ref().clone()),
+        }
+    }
+    pub fn original_field_clone_allocation_requests_observed<
+        'a,
+        E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+    >(
+        &'a self,
+        scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+        observe: &mut impl FnMut() -> Result<(), E>,
+        allocations: &mut Option<MetadataAllocationLoan<'_, E>>,
+    ) -> Option<Result<OriginalFieldCloneRequest, E>> {
+        self.loan.as_ref().and_then(|loan| {
+            loan.original_borrowed_field_clone_allocation_requests_observed(
+                self.field(),
+                scratch,
+                observe,
+                allocations,
+            )
+        })
     }
 }
 
@@ -918,7 +1092,7 @@ impl SchemaMetadataMaterializations {
         fields.extend(additional);
         Self {
             schema: self.schema.clone(),
-            fields: fields.into(),
+            fields: index_original_loans(fields.into()),
         }
     }
 }
@@ -1063,7 +1237,9 @@ impl MaterializedFieldNamespace {
         Ok(result)
     }
     pub fn from_original_loans(fields: Arc<[MetadataFieldLoan]>) -> Self {
-        Self { fields }
+        Self {
+            fields: index_original_loans(fields),
+        }
     }
     pub fn fields(&self) -> &[MetadataFieldLoan] {
         &self.fields

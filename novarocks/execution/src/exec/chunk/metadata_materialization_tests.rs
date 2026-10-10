@@ -19,12 +19,12 @@
 use super::*;
 use arrow::array::{ArrayRef, Int64Array, StructArray};
 use novarocks_local_program::StaticLayout;
-use novarocks_type_contract::{
-    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-};
 use novarocks_type_contract::owned_resources::metadata_materialization::{
     MaterializedFieldNamespace, MaterializedMetadataMap, OriginalFieldMaterialization,
     TypedSchemaMaterializations, materialize_value_field,
+};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -653,3 +653,84 @@ fn by_schema_origin_reconcile_invoice_every_callback_preserves_seven_causes() {
 
 #[path = "metadata_allocation_tests.rs"]
 mod metadata_allocation_tests;
+
+#[test]
+fn m07_dual_origin_projection_keeps_actual_field_arc_and_new_root_receipt() {
+    use novarocks_types::arrow_metadata_owner::{
+        ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+    };
+    let control = Control::default();
+    let field = ArrowMetadataOwner::try_new(
+        vec![("m07.field".into(), "original".into())],
+        MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        },
+    )
+    .unwrap()
+    .into_field("payload".into(), DataType::Utf8, true);
+    let actual = Arc::clone(field.field());
+    let mut root = MaterializedMetadataMap::with_capacity(3);
+    root.insert("uea.schema".into(), "original".into());
+    let source = SchemaMetadataMaterializations::from_materialized_owners(
+        root.into_schema(vec![Arc::clone(&actual)]).into_shared(),
+        Arc::from([]),
+    );
+    let original_schema = Arc::clone(source.schema_owner().schema());
+    let bound = layout(source, &control)
+        .with_metadata_origins(FieldMetadataOrigins::try_new(vec![field], 1).unwrap(), None)
+        .unwrap();
+    let projected = bound
+        .project_by_slots_for_compile(&[SlotId::new(7)], &control)
+        .unwrap();
+    assert!(Arc::ptr_eq(&projected.schema().fields()[0], &actual));
+    assert!(!Arc::ptr_eq(projected.schema(), &original_schema));
+    let materialized = projected.metadata_materializations().unwrap();
+    assert!(materialized.schema_owner().lends(projected.schema()));
+    assert_eq!(projected.schema().metadata(), original_schema.metadata());
+    assert!(
+        projected
+            .field_metadata_origins()
+            .unwrap()
+            .metadata_bytes_for(&actual)
+            .is_some()
+    );
+    assert!(projected.schema_metadata_origin().is_none());
+    let chunk = ChunkSchema::from_compiled_layout(&projected).unwrap();
+    assert!(Arc::ptr_eq(&chunk.arrow_schema_ref().fields()[0], &actual));
+    assert_eq!(
+        chunk.arrow_schema_ref().metadata(),
+        projected.schema().metadata()
+    );
+    assert!(chunk.metadata_materializations().is_some());
+    assert!(
+        chunk
+            .field_metadata_origins()
+            .unwrap()
+            .metadata_bytes_for(&actual)
+            .is_some()
+    );
+}
+
+#[test]
+fn m07_shared_field_projection_retains_original_uea_namespace_without_cloning_field() {
+    let (source, child) = source();
+    let root = Arc::clone(&source.schema_owner().schema().fields()[0]);
+    let projected = source.project_shared_fields_original(vec![Arc::clone(&root)]);
+    assert!(Arc::ptr_eq(
+        &projected.schema_owner().schema().fields()[0],
+        &root
+    ));
+    assert!(projected.field_origin(&child).is_some());
+    let foreign = Arc::new(child.as_ref().clone());
+    assert!(projected.field_origin(&foreign).is_none());
+    assert!(
+        projected
+            .schema_owner()
+            .lends(projected.schema_owner().schema())
+    );
+    assert!(!Arc::ptr_eq(
+        projected.schema_owner().schema(),
+        source.schema_owner().schema()
+    ));
+}

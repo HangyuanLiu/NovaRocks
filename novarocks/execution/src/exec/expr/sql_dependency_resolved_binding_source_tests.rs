@@ -75,13 +75,13 @@ impl Probe {
         let foreign = owner();
         let raw = if mode == 2 {
             actual
-                .resources()
+                .resources().expect("test workload resource authority")
                 .reserve(&task.scope(), u64::MAX, ResourceClass::Data)
                 .err()
                 .unwrap()
         } else {
             foreign
-                .resources()
+                .resources().expect("test workload resource authority")
                 .reserve(&task.scope(), 1, ResourceClass::Data)
                 .err()
                 .unwrap()
@@ -149,7 +149,7 @@ impl SqlFoldDependencyObserver for Probe {
             result: ResultTypeIds::Scalar(result_id),
         }];
         let mut held: Option<Reservation> = None;
-        let resources = self.actual.resources();
+        let resources = self.actual.resources().expect("test workload resource authority");
         let scope = self.task.scope();
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
         let sent = encode_function_bindings_with_host_in(
@@ -222,7 +222,7 @@ impl SqlFoldDependencyObserver for Probe {
         };
         drop(held);
         assert_eq!(resources.snapshot().held_bytes(), 0);
-        assert_eq!(self.foreign.resources().snapshot().held_bytes(), 0);
+        assert_eq!(self.foreign.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
         outcome
     }
     fn after_fold_dependency_observed(

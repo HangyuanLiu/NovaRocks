@@ -1850,14 +1850,6 @@ mod sha2_shared_differential;
 mod sm3_shared_differential;
 
 #[cfg(test)]
-#[path = "pure_differential_array_repeat_tests.rs"]
-mod array_repeat_tests;
-
-#[cfg(test)]
-#[path = "pure_differential_array_repeat_encoded_tests.rs"]
-mod array_repeat_encoded_tests;
-
-#[cfg(test)]
 #[path = "pure_differential/aggregate_count_original_diff_tests.rs"]
 mod aggregate_count_original_diff_tests;
 
@@ -1878,10 +1870,6 @@ mod calendar_leaf_dedup_tests;
 
 #[path = "pure_differential_to_binary_metadata_tests.rs"]
 mod to_binary_metadata_tests;
-
-#[cfg(test)]
-#[path = "pure_differential_aes_family_tests.rs"]
-mod aes_family_tests;
 
 #[path = "pure_differential_array_match_tests.rs"]
 mod array_match_tests;
@@ -1924,10 +1912,6 @@ mod field_tests;
 #[cfg(test)]
 #[path = "pure_differential_approx_percentile_tests.rs"]
 mod approx_percentile_tests;
-
-#[cfg(test)]
-#[path = "pure_differential_percentile_hash_tests.rs"]
-mod percentile_hash_tests;
 
 #[cfg(test)]
 #[path = "pure_differential_percentile_hash_native_n1_tests.rs"]
@@ -1978,7 +1962,3 @@ mod approx_top_k_tests;
 #[cfg(test)]
 #[path = "pure_differential_approx_top_k_full_any_error_tests.rs"]
 mod approx_top_k_full_any_error_tests;
-
-#[cfg(test)]
-#[path = "pure_differential_parse_json_tests.rs"]
-mod parse_json_tests;

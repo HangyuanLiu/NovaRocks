@@ -1,0 +1,72 @@
+{
+  "schema_version": 3,
+  "task": "MEM-1-M07",
+  "spec_revision": 7,
+  "purpose": "P09 CL SDK listing high-water and native SQL conformance; no new byte pass gate",
+  "frozen_before_execution": true,
+  "native_topology": {
+    "frontend_processes": 1,
+    "backend_processes": 3
+  },
+  "normal": {
+    "namespaces": 32,
+    "tables_per_namespace": 512,
+    "views_per_namespace": 512,
+    "page_size": 256,
+    "namespace_pattern": "cl_ns_%04d",
+    "table_pattern": "cl_table_%06d",
+    "view_pattern": "cl_view_%06d",
+    "concurrency": [
+      1,
+      8,
+      16
+    ]
+  },
+  "boundaries": {
+    "entries_exact": 65536,
+    "entries_overflow": 65537,
+    "cumulative_names_overflow_bytes": 16777217,
+    "token_overflow_bytes": 4097,
+    "token_cycle": [
+      "a",
+      "b",
+      "a"
+    ],
+    "pages_overflow": 1025,
+    "opendal_list_body_overflow_bytes": 16777217,
+    "listing_positions": 8,
+    "entries_exact_surface": "SHOW VIEWS"
+  },
+  "queries": [
+    "information_schema.tables",
+    "SHOW VIEWS",
+    "DROP DATABASE FORCE",
+    "catalog-admission MV lake discovery"
+  ],
+  "ownership": "Native process lifecycle uses cluster-harness. Controlled HTTP/REST endpoints provide protocol-valid SDK facts and deterministic boundary faults; their allocations are excluded from FE allocator samples. Real REST/HMS/Paimon fixtures must be identified separately; protocol fixtures alone do not establish cross-provider CL acceptance.",
+  "observations": [
+    "actual FE PID/start token/build identity",
+    "jemalloc allocated/active/resident before, sampled peak, and after",
+    "provider calls/pages/names/emitted bytes and concurrent listing requests",
+    "whole failure, mutation count before refusal, cancellation/deadline and subsequent eight-position reuse"
+  ],
+  "remaining": "Cancellation extension frozen before execution. Normal and boundary protocol matrix passed in v7; OpenDAL and real cross-provider CL remain pending.",
+  "correction_of": {
+    "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v1.json",
+    "sha256": "b161c0ec87caf7eacb72fe2da7bd6d4fb3da2e7e1cb965ab87407cc1714185a2",
+    "reason": "v6 reached an unsupported SHOW TABLES parser surface. Exact 65536 listing acceptance uses the existing supported SHOW VIEWS surface; normal N/M/concurrency, all numeric boundaries, and refusal gates remain identical."
+  },
+  "cancellation_extension_of": {
+    "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v2.json",
+    "sha256": "0f289a3f4f650507f7196be524b769cd246ba3f7b9d318265336bc3c15ec7419"
+  },
+  "cancellation": {
+    "provider_page_delay_seconds": 2,
+    "session_query_timeout_seconds": 1,
+    "control": "public MySQL KILL QUERY after one active provider request is observed",
+    "reuse_clients": 8,
+    "reuse_view_pages": 16,
+    "native_scenario": "catalog/mem-1-m07-sdk-listing-cancellation",
+    "scope": "Observe deadline error, ER_QUERY_INTERRUPTED, same-session next-statement usability, and simultaneous reuse of all eight catalog-generation SDK positions. The remote handler is drained separately before resetting fixture observations."
+  }
+}

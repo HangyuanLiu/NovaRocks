@@ -72,9 +72,16 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_MISSING_PARENT_OK"
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0};
 
 -- query 8
+-- Wait for this case's own job, not any SUCCEEDED job on the shared
+-- frontend. Every ANALYZE of this case-unique table is this case's own, so
+-- the count names the one just submitted and requires all of them to succeed.
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=SUCCEEDED
+-- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
+-- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=table=cow_missing_parent_${uuid0}
+-- @result_rows_count=1
+-- @result_rows_expect=state=SUCCEEDED
 -- @skip_result_check=true
 SHOW ANALYZE JOBS;
 
@@ -173,9 +180,14 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_INCREMENTAL_OK"
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0};
 
 -- query 13
+-- The second ANALYZE of this table: both of its jobs must have succeeded.
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=SUCCEEDED
+-- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
+-- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=table=cow_missing_parent_${uuid0}
+-- @result_rows_count=2
+-- @result_rows_expect=state=SUCCEEDED
 -- @skip_result_check=true
 SHOW ANALYZE JOBS;
 
@@ -240,9 +252,14 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_DELETE_BASIS_OK"
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0};
 
 -- query 19
+-- The third ANALYZE of this table: all three of its jobs must have succeeded.
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=SUCCEEDED
+-- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
+-- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=table=cow_missing_parent_${uuid0}
+-- @result_rows_count=3
+-- @result_rows_expect=state=SUCCEEDED
 -- @skip_result_check=true
 SHOW ANALYZE JOBS;
 

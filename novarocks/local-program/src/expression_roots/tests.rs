@@ -264,6 +264,7 @@ fn scoped_program(shared: bool) -> LocalProgramGraph {
             ProgramNodeKind::Project {
                 input: ProgramNodeId::new(0),
                 is_subordinate: false,
+                validate_final_result_input: false,
                 exprs: vec![ProgramExprId::new(0); 2],
                 expr_slot_ids: vec![SlotId::new(1), SlotId::new(2)],
                 expr_slot_schemas: None,
@@ -533,6 +534,7 @@ fn sink_budget_program(extra_partition: bool, main_root: bool) -> LocalProgramGr
             ProgramNodeKind::Project {
                 input: ProgramNodeId::new(0),
                 is_subordinate: false,
+                validate_final_result_input: false,
                 exprs: vec![ProgramExprId::new(0)],
                 expr_slot_ids: vec![SlotId::new(1)],
                 expr_slot_schemas: None,

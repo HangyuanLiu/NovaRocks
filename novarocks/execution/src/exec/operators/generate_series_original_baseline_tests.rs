@@ -17,7 +17,7 @@
 //! Immutable original GenerateSeries dispatcher and processor lifecycle witnesses.
 use super::*;
 use arrow::array::{StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 pub(super) fn columns(values: &[Option<i128>], ty: &DataType) -> ArrayRef {

@@ -953,6 +953,7 @@ pub(super) fn package_typed(
         .unwrap_or_else(|error| panic!("frozen window calls validate: {error}"));
     let output = fragment.nodes()[&WINDOW].output.clone();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: output.clone(),
         fields: output
@@ -960,6 +961,9 @@ pub(super) fn package_typed(
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(
+                    &fragment.values()[value].ty,
+                ),
                 name: format!("c{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,

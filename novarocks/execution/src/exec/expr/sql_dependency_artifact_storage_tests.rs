@@ -86,7 +86,7 @@ fn sql_dependency_artifact_storage_actual_data_charge_and_release_match_request(
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let scope = work.owner.scope();
-    let resources = owner.resources();
+    let resources = owner.resources().expect("test workload resource authority");
     let mut buffer = AdmittedCaptureBytes::try_new(&resources, &scope, 4096).unwrap();
     assert_eq!(buffer.capacity(), 4096);
     assert_eq!(resources.snapshot().data_reserved_bytes, 0);
@@ -103,7 +103,7 @@ fn sql_dependency_artifact_storage_refuses_real_capacity_before_allocation() {
     let work = owner
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
-    let resources = owner.resources();
+    let resources = owner.resources().expect("test workload resource authority");
     assert!(matches!(
         AdmittedCaptureBytes::try_new(&resources, &work.owner.scope(), 193),
         Err(CaptureStorageError::Work(WorkError::Capacity(_)))
@@ -119,11 +119,11 @@ fn sql_dependency_artifact_storage_foreign_authority_retains_exact_nominal_error
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     assert!(matches!(
-        AdmittedCaptureBytes::try_new(&b.resources(), &work.owner.scope(), 128),
+        AdmittedCaptureBytes::try_new(&b.resources().expect("test workload resource authority"), &work.owner.scope(), 128),
         Err(CaptureStorageError::Work(WorkError::ForeignAuthority))
     ));
-    assert_eq!(a.resources().snapshot().held_bytes(), 0);
-    assert_eq!(b.resources().snapshot().held_bytes(), 0);
+    assert_eq!(a.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
+    assert_eq!(b.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
 }
 #[test]
 fn sql_dependency_artifact_storage_backing_release_is_not_terminal_owner_publication() {
@@ -131,7 +131,7 @@ fn sql_dependency_artifact_storage_backing_release_is_not_terminal_owner_publica
     let work = owner
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
-    let resources = owner.resources();
+    let resources = owner.resources().expect("test workload resource authority");
     let buffer = AdmittedCaptureBytes::try_new(&resources, &work.owner.scope(), 512).unwrap();
     drop(work);
     assert_eq!(resources.snapshot().data_used_bytes, 512);
@@ -142,7 +142,7 @@ fn sql_dependency_artifact_storage_backing_release_is_not_terminal_owner_publica
 fn sql_dependency_artifact_storage_distinct_tokens_and_create_new_preserve_original_file() {
     let dir = PrivateDirectory::new();
     let owner = authority(8192);
-    let resources = owner.resources();
+    let resources = owner.resources().expect("test workload resource authority");
     let work = owner
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
@@ -176,7 +176,7 @@ fn sql_dependency_artifact_storage_distinct_tokens_and_create_new_preserve_origi
 fn sql_dependency_artifact_storage_encoder_primary_is_preserved_and_prefix_cannot_replay() {
     let dir = PrivateDirectory::new();
     let owner = authority(8192);
-    let resources = owner.resources();
+    let resources = owner.resources().expect("test workload resource authority");
     let work = owner
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
@@ -212,7 +212,7 @@ fn sql_dependency_artifact_storage_encoder_primary_is_preserved_and_prefix_canno
 fn sql_dependency_artifact_storage_policy_limit_is_not_a_fake_host_or_control_error() {
     let dir = PrivateDirectory::new();
     let owner = authority(8192);
-    let resources = owner.resources();
+    let resources = owner.resources().expect("test workload resource authority");
     let work = owner
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
@@ -247,7 +247,7 @@ fn sql_dependency_artifact_storage_zero_and_unrepresentable_requests_are_not_gra
     let work = owner
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
-    let resources = owner.resources();
+    let resources = owner.resources().expect("test workload resource authority");
     for bytes in [0, usize::MAX] {
         assert!(matches!(
             AdmittedCaptureBytes::try_new(&resources, &work.owner.scope(), bytes),

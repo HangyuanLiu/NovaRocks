@@ -896,26 +896,25 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),
         SqlType::String | SqlType::Json => Ok(DataType::Utf8),
-        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => Ok(DataType::Binary),
+        SqlType::Binary
+        | SqlType::Bitmap
+        | SqlType::Hll
+        | SqlType::Object
+        | SqlType::Percentile => Ok(DataType::Binary),
         SqlType::Boolean => Ok(DataType::Boolean),
         SqlType::Date => Ok(DataType::Date32),
         SqlType::DateTime => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         SqlType::DateTimeNs => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         SqlType::Time => Ok(DataType::Time64(TimeUnit::Microsecond)),
         SqlType::Decimal { precision, scale } => Ok(DataType::Decimal128(*precision, *scale)),
-        SqlType::Array(inner) => {
-            let inner_type = sql_type_to_arrow_type(inner)?;
-            Ok(DataType::List(Arc::new(Field::new(
-                "item", inner_type, true,
-            ))))
-        }
+        SqlType::Array(inner) => Ok(DataType::List(Arc::new(sql_type_to_arrow_field(
+            "item", inner, true,
+        )?))),
         SqlType::Map(key, value) => {
-            let key_type = sql_type_to_arrow_type(key)?;
-            let value_type = sql_type_to_arrow_type(value)?;
             let entries = DataType::Struct(
                 vec![
-                    Arc::new(Field::new("key", key_type, true)),
-                    Arc::new(Field::new("value", value_type, true)),
+                    Arc::new(sql_type_to_arrow_field("key", key, true)?),
+                    Arc::new(sql_type_to_arrow_field("value", value, true)?),
                 ]
                 .into(),
             );
@@ -928,11 +927,7 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
             fields
                 .iter()
                 .map(|(name, data_type)| {
-                    Ok(Arc::new(Field::new(
-                        name,
-                        sql_type_to_arrow_type(data_type)?,
-                        true,
-                    )))
+                    Ok(Arc::new(sql_type_to_arrow_field(name, data_type, true)?))
                 })
                 .collect::<Result<Vec<_>, String>>()?
                 .into(),
@@ -940,6 +935,27 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
         SqlType::Variant => Ok(DataType::LargeBinary),
         SqlType::Uuid => Ok(DataType::FixedSizeBinary(16)),
     }
+}
+
+fn sql_type_to_arrow_field(
+    name: &str,
+    sql_type: &SqlType,
+    nullable: bool,
+) -> Result<Field, String> {
+    use novarocks_types::logical::{LogicalType as L, field_with_logical_type};
+    let field = Field::new(name, sql_type_to_arrow_type(sql_type)?, nullable);
+    let logical = match sql_type {
+        SqlType::Json => Some(L::Json),
+        SqlType::Hll => Some(L::Hll),
+        SqlType::Bitmap => Some(L::Bitmap),
+        SqlType::Object => Some(L::Object),
+        SqlType::Percentile => Some(L::Percentile),
+        _ => None,
+    };
+    Ok(match logical {
+        Some(logical) => field_with_logical_type(field, logical),
+        None => field,
+    })
 }
 
 // Ownership: this is the exact inverse of `sql_type_to_arrow_type` above and is
@@ -1377,6 +1393,31 @@ pub fn column_default_to_ast_literal(
 mod tests {
     use super::*;
     use crate::semantic::Literal;
+
+    #[test]
+    fn m07_internal_opaque_facts_do_not_admit_public_casts_or_defaults() {
+        use novarocks_types::logical::{LogicalType, logical_type_of_field};
+        for (sql_type, logical, spelling) in [
+            (SqlType::Object, LogicalType::Object, "OBJECT"),
+            (SqlType::Percentile, LogicalType::Percentile, "PERCENTILE"),
+        ] {
+            assert_eq!(sql_type_to_arrow_type(&sql_type).unwrap(), DataType::Binary);
+            let nested =
+                sql_type_to_arrow_type(&SqlType::Array(Box::new(sql_type.clone()))).unwrap();
+            let DataType::List(item) = nested else {
+                panic!("expected List")
+            };
+            assert_eq!(logical_type_of_field(&item), Some(logical));
+            assert!(
+                column_default_to_ast_literal(&ColumnDefault::Binary(vec![1]), &sql_type).is_err()
+            );
+            assert!(cast_literal(Literal::Int(1), &sql_type).is_err());
+            let ast::Expr::Cast(cast) = parse_expr(&format!("CAST(1 AS {spelling})")) else {
+                panic!("expected Cast")
+            };
+            assert!(type_name_to_sql_type(&cast.data_type).is_err());
+        }
+    }
 
     fn parse_expr(sql: &str) -> novarocks_parser::ast::Expr {
         let statements =

@@ -383,7 +383,9 @@ fn decode_sink_kind(
         .as_ref()
         .ok_or_else(|| missing(path, "data sink requires a kind"))?;
     Ok(match kind {
-        plan::data_sink::Kind::Result(_) => FragmentSinkKind::Result,
+        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::RootResult(_) => {
+            FragmentSinkKind::Result
+        }
         plan::data_sink::Kind::Noop(_) => FragmentSinkKind::Noop,
         plan::data_sink::Kind::DataStream(_) => FragmentSinkKind::DataStream,
         plan::data_sink::Kind::MultiCastDataStream(_) => FragmentSinkKind::MultiCastDataStream,

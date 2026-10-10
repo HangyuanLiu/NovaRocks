@@ -332,6 +332,7 @@ fn invocation_program(count: usize, guard: Guard) -> Arc<LocalProgram> {
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: id,
         output: fragment.nodes()[&output].output.clone(),
         fields: if matches!(guard, Guard::Filter) {
@@ -340,6 +341,7 @@ fn invocation_program(count: usize, guard: Guard) -> Arc<LocalProgram> {
                 .iter()
                 .enumerate()
                 .map(|(ordinal, (value, ty))| ResultField {
+                    domain: crate::test_result_domain::result_value_domain(&ty),
                     name: format!("original_input_{ordinal}").into(),
                     alias: None,
                     value: *value,
@@ -349,6 +351,7 @@ fn invocation_program(count: usize, guard: Guard) -> Arc<LocalProgram> {
                 .into_boxed_slice()
         } else {
             Box::from([ResultField {
+                domain: crate::test_result_domain::result_value_domain(&ty),
                 name: "original_array_failure".into(),
                 alias: None,
                 value,

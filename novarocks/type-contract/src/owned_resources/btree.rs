@@ -84,7 +84,7 @@ pub fn node_layout_typed<K, V>() -> Result<Layout, BTreeResourceError> {
         a.checked_mul(b)
             .ok_or(BTreeResourceError::Arithmetic("BTree node size overflow"))
     };
-    // Rust 1.92 alloc/btree/node.rs: B=6, eleven keys/values, twelve
+    // Rust 1.98.1 alloc/btree/node.rs: B=6, eleven keys/values, twelve
     // edges. LeafNode contains five members: parent pointer, two u16,
     // key array and value array. Each member can add at most align-1
     // padding for any private field order. InternalNode appends edges.

@@ -46,55 +46,17 @@ PURE_OWNERS = frozenset({
     "novarocks-constant-contract",
     "novarocks-execution-contract",
     "novarocks-functions",
+    "novarocks-function-contract",
+    "novarocks-result-contract",
     "novarocks-type-contract",
     "novarocks-types",
 })
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 # Additional immutable Arrow arithmetic/signature dependencies of LocalProgram.
 # Constant backing and its exact build authorities are shared with the physical guard.
-EXTRA_EXTERNAL_VERSIONS = frozenset({
-    ('arrow-cast', '58.2.0'),
-    ('arrow-ord', '58.2.0'),
-    ('arrow-select', '58.2.0'),
-    ('atoi', '2.0.0'),
-    ('base64', '0.22.1'),
-    ('block-buffer', '0.10.4'),
-    ('bytemuck', '1.25.0'),
-    ('byteorder', '1.5.0'),
-    ('cpufeatures', '0.2.17'),
-    ('crypto-common', '0.1.7'),
-    ('digest', '0.10.7'),
-    ('generic-array', '0.14.7'),
-    ('getrandom', '0.4.3'),
-    ('itoa', '1.0.15'),
-    ('lexical-core', '1.0.6'),
-    ('lexical-parse-float', '1.0.6'),
-    ('lexical-parse-integer', '1.0.6'),
-    ('lexical-util', '1.0.7'),
-    ('lexical-write-float', '1.0.6'),
-    ('lexical-write-integer', '1.0.6'),
-    ('memchr', '2.8.3'),
-    ('r-efi', '6.0.0'),
-    ('roaring', '0.10.12'),
-    ('ryu', '1.0.20'),
-    ('serde', '1.0.228'),
-    ('serde_core', '1.0.228'),
-    ('serde_derive', '1.0.228'),
-    ('serde_json', '1.0.150'),
-    ('sha2', '0.10.9'),
-    ('typenum', '1.20.1'),
-    ('uuid', '1.24.0'),
-    ('zmij', '1.0.23'),
-})
-EXTRA_BUILD_TARGETS = frozenset({
-    ('generic-array', '0.14.7'),
-    ('getrandom', '0.4.3'),
-    ('serde', '1.0.228'),
-    ('serde_core', '1.0.228'),
-    ('serde_json', '1.0.150'),
-    ('zmij', '1.0.23'),
-})
-EXTRA_PROC_MACROS = frozenset({("serde_derive", "1.0.228")})
+EXTRA_EXTERNAL_NAMES = frozenset(['aho-corasick', 'allocator-api2', 'arrow-arith', 'arrow-cast', 'arrow-ord', 'arrow-select', 'atoi', 'base64', 'bitflags', 'block-buffer', 'bytemuck', 'byteorder', 'chrono-tz', 'cpufeatures', 'crypto-common', 'datasketches', 'digest', 'displaydoc', 'foreign-types', 'foreign-types-shared', 'form_urlencoded', 'generic-array', 'getrandom', 'hex', 'icu_collections', 'icu_locale_core', 'icu_normalizer', 'icu_normalizer_data', 'icu_properties', 'icu_properties_data', 'icu_provider', 'idna', 'idna_adapter', 'itoa', 'lexical-core', 'lexical-parse-float', 'lexical-parse-integer', 'lexical-util', 'lexical-write-float', 'lexical-write-integer', 'litemap', 'md-5', 'memchr', 'openssl', 'openssl-macros', 'openssl-sys', 'percent-encoding', 'phf', 'phf_shared', 'pkg-config', 'potential_utf', 'ppv-lite86', 'r-efi', 'rand', 'rand_chacha', 'rand_core', 'regex', 'regex-automata', 'regex-syntax', 'roaring', 'ryu', 'serde', 'serde_core', 'serde_derive', 'serde_json', 'sha2', 'siphasher', 'sm3', 'smallvec', 'stable_deref_trait', 'synstructure', 'tinystr', 'twox-hash', 'typenum', 'url', 'utf8_iter', 'uuid', 'vcpkg', 'writeable', 'yoke', 'yoke-derive', 'zerofrom', 'zerofrom-derive', 'zerotrie', 'zerovec', 'zerovec-derive', 'zmij'])
+EXTRA_BUILD_TARGETS = frozenset(['chrono-tz', 'generic-array', 'getrandom', 'icu_normalizer_data', 'icu_properties_data', 'openssl', 'openssl-sys', 'serde', 'serde_core', 'serde_json', 'zmij'])
+EXTRA_PROC_MACROS = frozenset(['displaydoc', 'openssl-macros', 'serde_derive', 'yoke-derive', 'zerofrom-derive', 'zerovec-derive'])
 
 
 # These categories name capabilities, not every package currently in the tree.
@@ -125,9 +87,12 @@ def verify_package(package, workspace_ids):
     if internal:
         if package["id"] not in workspace_ids or package["source"] is not None:
             violations.append(f"{name} is not the workspace-owned pure package")
+        if name == "novarocks-result-contract" and package["dependencies"]:
+            violations.append(f"{name} must remain dependency-free")
         # A feature/target variant of a repository-owned contract requires a new
         # audit. Optional dependencies cannot hide outside the selected tree.
-        if package.get("features"):
+        allowed_features = {"test-support"} if name == "novarocks-functions" else set()
+        if set(package.get("features", {})) - allowed_features:
             violations.append(f"{name} exposes unaudited Cargo feature variants")
         for dependency in package["dependencies"]:
             violations.extend(capability_violations(
@@ -138,7 +103,9 @@ def verify_package(package, workspace_ids):
                     dependency["optional"] or dependency["target"] is not None):
                 violations.append(f"{name} hides a normal edge behind a feature/target: "
                                   + dependency["name"])
-        if any("custom-build" in target["kind"] for target in package["targets"]):
+        if name == "novarocks-type-contract":
+            violations.extend(metadata_support().verify_package_targets(package, name))
+        elif any("custom-build" in target["kind"] for target in package["targets"]):
             violations.append(f"{name} executes a custom build script")
         if any("proc-macro" in target["kind"] for target in package["targets"]):
             violations.append(f"{name} executes a proc-macro target")
@@ -152,9 +119,12 @@ def verify_package(package, workspace_ids):
     else:
         support = metadata_support()
         build_edges = dict(support.EXTERNAL_BUILD_EDGES)
-        build_edges[("generic-array", "0.14.7")] = frozenset({"version_check"})
+        build_edges["generic-array"] = frozenset({"version_check"})
+        build_edges["openssl"] = frozenset({"cc"})
+        build_edges["openssl-sys"] = frozenset({"cc", "pkg-config", "vcpkg", "bindgen", "openssl-src"})
+        build_edges["chrono-tz"] = frozenset({"chrono-tz-build"})
         violations.extend(support.verify_external_authority(
-            package, support.EXTERNAL_PACKAGE_VERSIONS | EXTRA_EXTERNAL_VERSIONS,
+            package, support.EXTERNAL_PACKAGE_NAMES | EXTRA_EXTERNAL_NAMES,
             support.EXTERNAL_BUILD_TARGETS | EXTRA_BUILD_TARGETS,
             support.EXTERNAL_PROC_MACROS | EXTRA_PROC_MACROS, build_edges))
         if package["source"] != REGISTRY_SOURCE:

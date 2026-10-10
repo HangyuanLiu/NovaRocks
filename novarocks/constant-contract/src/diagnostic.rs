@@ -55,19 +55,131 @@ fn format_value(
     value: &ConstantValue,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<String, ConstantError> {
+    format_value_with(value, work, &mut StringRenderer)
+}
+trait DiagnosticRenderer {
+    type Output;
+    fn render(
+        &mut self,
+        work: &mut CompileCheckpoints<'_>,
+        write: impl Fn(&mut dyn Write) -> Result<(), ArrowError>,
+    ) -> Result<Self::Output, ConstantError>;
+}
+struct StringRenderer;
+impl DiagnosticRenderer for StringRenderer {
+    type Output = String;
+    fn render(
+        &mut self,
+        work: &mut CompileCheckpoints<'_>,
+        write: impl Fn(&mut dyn Write) -> Result<(), ArrowError>,
+    ) -> Result<String, ConstantError> {
+        render(work, write)
+    }
+}
+/// Stream the same selected representation to a caller-owned bounded writer.
+/// Writer refusal remains separate so its budget journal is not replaced.
+pub(super) fn write(
+    value: &ConstantValue,
+    phase: CompilePhase,
+    control: &dyn PureCompileControl,
+    output: &mut dyn Write,
+) -> Result<fmt::Result, ConstantError> {
+    let mut work = CompileCheckpoints::try_new(control, phase)?;
+    let result = format_value_with(value, &mut work, &mut BorrowedRenderer { output });
+    if matches!(
+        result,
+        Err(ConstantError::Control(_) | ConstantError::Limit(_)) | Ok(Err(_))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+struct BorrowedRenderer<'a> {
+    output: &'a mut dyn Write,
+}
+impl DiagnosticRenderer for BorrowedRenderer<'_> {
+    type Output = fmt::Result;
+    fn render(
+        &mut self,
+        work: &mut CompileCheckpoints<'_>,
+        write: impl Fn(&mut dyn Write) -> Result<(), ArrowError>,
+    ) -> Result<fmt::Result, ConstantError> {
+        work.flush()?;
+        let mut writer = BorrowedObservedWriter {
+            work,
+            output: self.output,
+            error: None,
+            refused: false,
+        };
+        let result = write(&mut writer);
+        if let Some(primary) = writer.error.take() {
+            return Err(primary);
+        }
+        if writer.refused {
+            return Ok(Err(fmt::Error));
+        }
+        result.map_err(|error| ConstantError::Arrow(error.to_string()))?;
+        writer.work.flush()?;
+        Ok(Ok(()))
+    }
+}
+struct BorrowedObservedWriter<'w, 'c> {
+    work: &'w mut CompileCheckpoints<'c>,
+    output: &'w mut dyn Write,
+    error: Option<ConstantError>,
+    refused: bool,
+}
+impl Write for BorrowedObservedWriter<'_, '_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if self.refused || self.error.is_some() {
+            return Err(fmt::Error);
+        }
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(256);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            let chunk = &remaining[..end];
+            if let Err(error) = self.work.flush() {
+                self.error = Some(error.into());
+                return Err(fmt::Error);
+            }
+            if self.output.write_str(chunk).is_err() {
+                self.refused = true;
+                return Err(fmt::Error);
+            }
+            for _ in chunk.as_bytes() {
+                if let Err(error) = self.work.step() {
+                    self.error = Some(error.into());
+                    return Err(fmt::Error);
+                }
+            }
+            remaining = &remaining[end..];
+        }
+        Ok(())
+    }
+}
+
+fn format_value_with<R: DiagnosticRenderer>(
+    value: &ConstantValue,
+    work: &mut CompileCheckpoints<'_>,
+    renderer: &mut R,
+) -> Result<R::Output, ConstantError> {
     let source = Row {
         data: value.pool.data(),
         index: value.ordinal() as usize,
     };
     if logical_null(source.data, source.index, work)? {
-        return render(work, |writer| write_text(writer, format_args!("NULL")));
+        return renderer.render(work, |writer| write_text(writer, format_args!("NULL")));
     }
     if value.value_type().logical_type == ValueLogicalType::LargeInt {
         let selected = value.try_largeint()?.ok_or(ConstantError::Invalid(
             "non-NULL LARGEINT diagnostic lacks a value",
         ))?;
         work.step()?;
-        return render(work, |writer| {
+        return renderer.render(work, |writer| {
             write_text(writer, format_args!("{selected}"))
         });
     }
@@ -82,12 +194,12 @@ fn format_value(
                 let bits = u32::from_ne_bytes(bytes);
                 work.step()?;
                 if f32::from_bits(bits).is_nan() {
-                    return render(work, |writer| {
+                    return renderer.render(work, |writer| {
                         write_text(writer, format_args!("NaN(Float32,0x{bits:08x})"))
                     });
                 }
                 if bits & 0x7fff_ffff == 0 {
-                    return render(work, |writer| {
+                    return renderer.render(work, |writer| {
                         write_text(
                             writer,
                             format_args!("{}0.0", if bits == 0 { "" } else { "-" }),
@@ -102,12 +214,12 @@ fn format_value(
                 let bits = u64::from_ne_bytes(bytes);
                 work.step()?;
                 if f64::from_bits(bits).is_nan() {
-                    return render(work, |writer| {
+                    return renderer.render(work, |writer| {
                         write_text(writer, format_args!("NaN(Float64,0x{bits:016x})"))
                     });
                 }
                 if bits & 0x7fff_ffff_ffff_ffff == 0 {
-                    return render(work, |writer| {
+                    return renderer.render(work, |writer| {
                         write_text(
                             writer,
                             format_args!("{}0.0", if bits == 0 { "" } else { "-" }),
@@ -125,7 +237,7 @@ fn format_value(
     let formatter = ArrayFormatter::try_new(value.pool.array().as_ref(), &options);
     work.flush()?;
     let formatter = formatter.map_err(|error| ConstantError::Arrow(error.to_string()))?;
-    render(work, |writer| {
+    renderer.render(work, |writer| {
         formatter.value(value.ordinal() as usize).write(writer)
     })
 }

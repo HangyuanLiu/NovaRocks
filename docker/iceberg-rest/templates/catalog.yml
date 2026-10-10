@@ -27,6 +27,22 @@ services:
     ports: ['${NOVA_ENV_REST_PORT}:8181']
     volumes: [rest-catalog:/tmp]
     networks: [iceberg_net]
+  rest-mv:
+    image: ${REST_MV_IMAGE:?provisioned image required}
+    pull_policy: never
+    labels: *owner-labels
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: ${NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: 'true'
+      CATALOG_URI: jdbc:sqlite:/tmp/iceberg-rest-catalog.db
+    ports: ['${NOVA_ENV_REST_MV_PORT}:8181']
+    volumes: [rest-mv-catalog:/tmp]
+    networks: [iceberg_net]
   spark:
     image: ${SPARK_IMAGE:?provisioned image required}
     pull_policy: never
@@ -52,6 +68,8 @@ services:
     networks: [iceberg_net]
 volumes:
   rest-catalog:
+    labels: *owner-labels
+  rest-mv-catalog:
     labels: *owner-labels
 networks:
   iceberg_net:

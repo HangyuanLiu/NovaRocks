@@ -53,6 +53,55 @@ pub fn decode_fragment_sink_program(
         )
     })?;
     match kind {
+        plan::data_sink::Kind::RootResult(contract) => {
+            if !fragment.output_exprs.is_empty() {
+                return Err(NativeFragmentDecodeError::unsupported(
+                    path.field("root_result"),
+                    "native root result requires an already materialized output layout",
+                ));
+            }
+            let contract = novarocks_proto_codec::root_result::decode_root_contract(
+                contract,
+                layout.order().len(),
+                path.clone().field("root_result"),
+            )?;
+            if let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
+                contract.output()
+            {
+                let slots = layout
+                    .order()
+                    .iter()
+                    .map(|slot| slot.as_u32())
+                    .collect::<Vec<_>>();
+                schema.validate_native_slots(&slots).map_err(|error| {
+                    NativeFragmentDecodeError::invalid_value(
+                        path.clone().field("root_result").field("client_schema"),
+                        error,
+                    )
+                })?;
+            }
+            if let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) =
+                contract.output()
+            {
+                let [slot] = layout.order() else {
+                    return Err(NativeFragmentDecodeError::invalid_value(
+                        path.clone().field("root_result").field("scalar_schema"),
+                        "scalar root requires exactly one source slot",
+                    ));
+                };
+                schema
+                    .validate_native_slots(&[slot.as_u32()])
+                    .map_err(|error| {
+                        NativeFragmentDecodeError::invalid_value(
+                            path.clone().field("root_result").field("scalar_schema"),
+                            error,
+                        )
+                    })?;
+            }
+            Ok(FragmentSinkProgram::RootResult(std::sync::Arc::new(
+                contract,
+            )))
+        }
         plan::data_sink::Kind::Result(true) => {
             if !fragment.output_exprs.is_empty() {
                 return Err(NativeFragmentDecodeError::unsupported(

@@ -35,6 +35,7 @@ DATASKETCHES = "datasketches"
 EXECUTION = "novarocks-execution"
 FUNCTIONS = "novarocks-functions"
 TYPE_CONTRACT = "novarocks-type-contract"
+RESULT_CONTRACT = "novarocks-result-contract"
 ICEBERG_FUNCTIONS = "novarocks-connector-iceberg-functions"
 ICEBERG_PROVIDER = "novarocks-connector-iceberg"
 NATIVE_ADAPTER = "novarocks-native-adapter"
@@ -201,6 +202,12 @@ def verify_dependency_boundary(metadata, repo_root):
     execution = package_by_name(metadata, EXECUTION)
     iceberg_functions = package_by_name(metadata, ICEBERG_FUNCTIONS)
     functions = package_by_name(metadata, FUNCTIONS)
+    result_contract = package_by_name(metadata, RESULT_CONTRACT)
+
+    # This vocabulary is dependency-free, including optional, target-specific,
+    # build, and test dependencies that a normal resolved closure could omit.
+    if result_contract["dependencies"]:
+        fail(f"{RESULT_CONTRACT} must not declare dependencies")
 
     require_exact_dependency(execution, DATASKETCHES, kind=None, features={"hll"})
     require_exact_dependency(
@@ -234,12 +241,12 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, ICEBERG_FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    # novarocks-functions carries the shared type vocabulary through
-    # novarocks-type-contract. That is a contract crate, not an application or
-    # provider owner, so it belongs in the allowed closure; the forbidden set
+    # novarocks-functions carries shared type/result vocabulary through
+    # novarocks-type-contract and dependency-free novarocks-result-contract.
+    # These are contract crates, not application or provider owners; the forbidden set
     # below still fences execution, the native adapter, the server, and the
     # Iceberg provider.
-    expected_internal = {ICEBERG_FUNCTIONS, FUNCTIONS, TYPE_CONTRACT}
+    expected_internal = {ICEBERG_FUNCTIONS, FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT}
     if iceberg_internal != expected_internal:
         fail(
             f"{ICEBERG_FUNCTIONS} internal normal closure must be exactly "
@@ -260,13 +267,12 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    # Same reasoning as the Iceberg closure above: the shared type vocabulary
-    # lives in novarocks-type-contract, which is a contract crate rather than an
-    # application or provider owner.
-    if functions_internal != {FUNCTIONS, TYPE_CONTRACT}:
+    # Keep the same exact pure vocabulary closure for the scalar owner.
+    expected_functions_internal = {FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT}
+    if functions_internal != expected_functions_internal:
         fail(
             f"{FUNCTIONS} internal normal closure must be exactly "
-            f"{sorted({FUNCTIONS, TYPE_CONTRACT})}, got "
+            f"{sorted(expected_functions_internal)}, got "
             + ", ".join(sorted(functions_internal))
         )
     if DATASKETCHES in normal_closure(metadata, FUNCTIONS):

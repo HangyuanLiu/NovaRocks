@@ -328,15 +328,7 @@ pub fn list_mvs_with_backend(
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
     };
-    let mut rows = mv_backend.list_mvs(req)?;
-    rows.sort_by(|left, right| {
-        left.database
-            .cmp(&right.database)
-            .then(left.name.cmp(&right.name))
-    });
-    Ok(StatementResult::Query(
-        crate::mv::domain::analysis_adapter::build_mv_rows_result(&rows)?,
-    ))
+    Ok(StatementResult::Query(mv_backend.list_mvs(req)?))
 }
 
 /// Analyze the output column types of a MV SELECT SQL without executing it.

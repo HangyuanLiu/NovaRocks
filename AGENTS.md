@@ -189,7 +189,8 @@ SQL client
 
 - `novarocks/mysql-adapter/src/**`
   MySQL protocol: `listener.rs` (connection serving and drain),
-  `result_encoding.rs` and `row_encoding.rs` (result-set and row encoding),
+  `result_encoding.rs` (metadata projection), `relay_result_writer.rs` and
+  `local_result_writer.rs` (governed bounded result delivery),
   `error_mapping/**`.
 
 ### 4.3 Native Plan Wire and BE-Side Fragment Decode
@@ -566,14 +567,17 @@ Important environment variables after sourcing `env.sh`:
 - `NOVA_ENV_OBJECT_STORE_RUNTIME`, `NOVA_ENV_CATALOG_RUNTIME`, `NOVA_ENV_OBJECT_STORE_CONTAINER`
 - `NOVA_ENV_REST_ENV_FILE`（本次 publication 的不可变 `env.sh` 路径）
 - `NOVA_ENV_MINIO_PORT`, `NOVA_ENV_REST_PORT`, `NOVA_ENV_MYSQL_PORT`
+- `NOVA_ENV_REST_MV_PORT`, `NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI`
 - `NOVA_ENV_SPARK_UI_PORT`
 - `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
 - `NOVAROCKS_ICEBERG_REST_URI`
 - `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
+- `NOVAROCKS_ICEBERG_REST_MV_URI`, `NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE`
 - `NOVAROCKS_FE_CONFIG`, `NOVAROCKS_BE_CONFIG`
 - `NOVAROCKS_SQL_TEST_CONFIG`
 - `NOVAROCKS_ICE_REST_CATALOG_SQL`
 - `NOVAROCKS_SPARK_DEFAULTS`
+- `NOVAROCKS_SPARK_REST_MV_URI`
 - `NOVAROCKS_SPARK_V3_SMOKE_SQL`
 - `NOVAROCKS_SPARK_SQL`
 
@@ -856,7 +860,7 @@ suspected case against a clean server before attributing it to the change.
   separation is in `fragment_plan_decode_submission.rs` and Execution
   `exec/node/lowering.rs`. The wire vocabulary lives in `novarocks/plan-codec/src/**`.
 - **MySQL protocol behavior**: inspect `novarocks/mysql-adapter/src/listener.rs`,
-  `result_encoding.rs` and `row_encoding.rs`.
+  `result_encoding.rs`, `relay_result_writer.rs` and `local_result_writer.rs`.
 - **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for
   admission and routing, then the specific flow under
   `novarocks/frontend-application/src/query_execution/dml/**` (`insert.rs`,

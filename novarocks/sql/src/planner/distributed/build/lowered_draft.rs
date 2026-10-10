@@ -182,6 +182,23 @@ impl SqlAuthoredPhysicalPlan {
         &self.plan
     }
 
+    /// Freeze only the final application's output purpose while consuming this
+    /// same SQL source. Aliases, journal and original public declaration stay paired.
+    pub fn with_root_output(
+        mut self,
+        output: novarocks_result_contract::RootOutputContract,
+    ) -> Result<Self, String> {
+        let plan = Arc::try_unwrap(self.plan).map_err(|_| {
+            "root purpose must be frozen before plan aliases are published".to_string()
+        })?;
+        self.plan = Arc::new(
+            plan.with_root_output(output)
+                .map_err(|error| error.to_string())?,
+        );
+
+        Ok(self)
+    }
+
     /// Loan an ordinary SQL call's original request from its exact emission.
     /// A physical expression's constant shape does not reconstruct presence.
     /// This does not provide late typed projection, use/domain scope or effects.

@@ -755,7 +755,7 @@ pub fn analyze_view_query(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<Vec<ViewOutputColumn>, crate::compiler::SqlCompileError> {
-    let (resolved, _ctes, _factory) = crate::analyzer::analyze_with_function_catalog(
+    let (resolved, _ctes, factory) = crate::analyzer::analyze_with_function_catalog(
         query,
         provider,
         database,
@@ -764,6 +764,8 @@ pub fn analyze_view_query(
         control,
     )
     .map_err(crate::compiler::SqlCompileError::from)?;
+    super::mv::validate_persistable_output(&resolved, &factory)
+        .map_err(crate::compiler::SqlCompileError::Compilation)?;
     Ok(resolved
         .output_columns
         .into_iter()
@@ -783,6 +785,71 @@ mod tests {
 
     use super::*;
     use crate::planner::table::{ScanSource, SqlScanKind};
+
+    #[test]
+    fn m07_external_view_rejects_private_producer_before_schema_projection() {
+        let catalog = PlannerMemoryCatalog::default();
+        let functions = crate::functions::builtin_sql_function_catalog();
+        for sql in [
+            "SELECT percentile_empty() AS state",
+            "SELECT percentile_hash(CAST(1 AS DOUBLE)) AS state",
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [Statement::Query(query)] = statements.as_slice() else {
+                panic!("expected query")
+            };
+            let error = analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string())
+                .expect_err("private producer must not become VARBINARY");
+            assert_eq!(
+                error,
+                "Object and Percentile result domains are unsupported for persisted schemas"
+            );
+        }
+        let statements =
+            novarocks_parser::parse("SELECT bitmap_to_binary(to_bitmap(1)) AS ordinary").unwrap();
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query")
+        };
+        let columns = analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string())
+            .expect("ordinary Binary view remains admitted");
+        assert_eq!(columns[0].data_type, arrow::datatypes::DataType::Binary);
+    }
+
+    #[test]
+    fn m07_external_view_rejects_actual_nested_private_marker_without_top_fact() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_types::logical::{LogicalType, field_with_logical_type};
+        use std::sync::Arc;
+
+        let mut catalog = PlannerMemoryCatalog::default();
+        register_test_connector_read_table(
+            &mut catalog,
+            "default",
+            "nested",
+            vec![ColumnDef {
+                name: "state".into(),
+                data_type: DataType::List(Arc::new(field_with_logical_type(
+                    Field::new("item", DataType::Binary, true),
+                    LogicalType::Percentile,
+                ))),
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            }],
+        )
+        .unwrap();
+        let statements = novarocks_parser::parse("SELECT state FROM nested").unwrap();
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query")
+        };
+        let functions = crate::functions::builtin_sql_function_catalog();
+        assert_eq!(
+            analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string()),
+            Err(
+                "Object and Percentile result domains are unsupported for persisted schemas".into()
+            )
+        );
+    }
 
     fn test_binding_allocator() -> crate::binding::SqlTableBindingAllocator {
         crate::binding::SqlTableBindingAllocator::try_new_for_test(

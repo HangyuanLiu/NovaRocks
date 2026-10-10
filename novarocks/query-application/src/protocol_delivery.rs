@@ -18,184 +18,38 @@
 //! Move-only protocol settlement for governed query application output.
 
 use crate::api::{
-    ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, QueryResult,
-    QueryResultStream, ResultDelivery, ResultFailureView, SchemaDelivery,
-    decoded_result_batch_governance_charge,
+    ExecutionHandle, ExecutionOutput, LocalResultProducer, OwnedLocalResult, QueryExecutionError,
+    QueryExecutionErrorKind, QueryResult, QueryResultStream, ResultDelivery, ResultFailureView,
+    SchemaDelivery,
 };
 use crate::cancellation::QueryCancellationView;
 use crate::session_control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
-    GovernedStatementVisibilitySealOutcome,
+    GovernedStatementVisibilitySealOutcome, StatementToken,
 };
 use crate::session_error::QueryServiceError;
-use arrow::record_batch::RecordBatch;
-use novarocks_workload_control::{
-    LocalResourceAuthority, ResultCredit, ResultCreditStage, WorkError, WorkScope,
-};
-
-/// A move-only decoded Arrow batch for an immediate statement result.
-///
-/// Immediate statements have no execution identity or actor receipt, but the
-/// Arrow backing and its protocol bytes still require the same result-credit
-/// transitions as a streamed delivery.
-pub struct ImmediateResultBatch {
-    batch: Option<RecordBatch>,
-    decoded_bytes: u64,
-    credit: Option<ResultCredit>,
-}
-
-pub struct ImmediateResultBatchReservationError {
-    error: WorkError,
-    batch: ImmediateResultBatch,
-}
-
-impl ImmediateResultBatchReservationError {
-    pub const fn error(&self) -> &WorkError {
-        &self.error
-    }
-
-    pub fn into_parts(self) -> (WorkError, ImmediateResultBatch) {
-        (self.error, self.batch)
-    }
-}
-
-impl std::fmt::Debug for ImmediateResultBatchReservationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ImmediateResultBatchReservationError")
-            .field("error", &self.error)
-            .field("decoded_bytes", &self.batch.decoded_bytes)
-            .finish()
-    }
-}
-
-impl ImmediateResultBatch {
-    pub fn try_new(batch: RecordBatch, credit: ResultCredit) -> Result<Self, QueryExecutionError> {
-        let decoded_bytes = decoded_result_batch_governance_charge(&batch)?;
-        if credit.stage() != ResultCreditStage::DecodedQueued {
-            return Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
-                format!(
-                    "immediate result batch credit must be DecodedQueued, got {:?}",
-                    credit.stage()
-                ),
-            ));
-        }
-        if credit.held_bytes() != decoded_bytes {
-            return Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
-                format!(
-                    "immediate result batch holds {decoded_bytes} bytes but its credit holds {}",
-                    credit.held_bytes()
-                ),
-            ));
-        }
-        Ok(Self {
-            batch: Some(batch),
-            decoded_bytes,
-            credit: Some(credit),
-        })
-    }
-
-    pub fn batch(&self) -> &RecordBatch {
-        self.batch
-            .as_ref()
-            .expect("immediate result batch retains its Arrow backing before completion")
-    }
-
-    pub const fn decoded_bytes(&self) -> u64 {
-        self.decoded_bytes
-    }
-
-    pub async fn reserve_protocol_when_available(
-        mut self,
-        authority: &LocalResourceAuthority,
-        bytes: u64,
-    ) -> Result<Self, ImmediateResultBatchReservationError> {
-        let credit = self
-            .credit
-            .take()
-            .expect("immediate result batch owns credit while awaiting protocol capacity");
-        match credit
-            .reserve_protocol_when_available(authority, bytes)
-            .await
-        {
-            Ok(credit) => {
-                self.credit = Some(credit);
-                Ok(self)
-            }
-            Err(rejection) => {
-                let (error, credit) = rejection.into_parts();
-                self.credit = Some(credit);
-                Err(ImmediateResultBatchReservationError { error, batch: self })
-            }
-        }
-    }
-
-    pub fn begin_protocol_write(mut self, bytes: u64) -> Result<Self, QueryExecutionError> {
-        let credit = self
-            .credit
-            .take()
-            .expect("immediate result batch owns credit before protocol write");
-        match credit.begin_protocol_write(bytes) {
-            Ok(credit) => {
-                self.credit = Some(credit);
-                Ok(self)
-            }
-            Err(rejection) => {
-                let (error, credit) = rejection.into_parts();
-                drop(self.batch.take());
-                drop(credit);
-                Err(QueryExecutionError::new(
-                    QueryExecutionErrorKind::Failed,
-                    format!("begin immediate result protocol write: {error}"),
-                ))
-            }
-        }
-    }
-
-    pub fn complete(mut self) -> Result<(), QueryExecutionError> {
-        drop(self.batch.take());
-        let credit = self
-            .credit
-            .take()
-            .expect("immediate result batch owns credit before completion");
-        credit.consume().map_err(|error| {
-            QueryExecutionError::new(
-                QueryExecutionErrorKind::Failed,
-                format!("consume immediate result protocol credit: {error}"),
-            )
-        })
-    }
-
-    pub fn fail(mut self) {
-        drop(self.batch.take());
-        drop(self.credit.take());
-    }
-}
-
-impl Drop for ImmediateResultBatch {
-    fn drop(&mut self) {
-        drop(self.batch.take());
-        drop(self.credit.take());
-    }
-}
+use novarocks_workload_control::{ResultWindowClass, ResultWindowGrant, WorkError};
 
 /// Shared move-only owner for any governed query result presented to a client.
 #[must_use = "the governed protocol owner must be settled by its protocol adapter"]
 pub struct GovernedProtocolOwner {
     statement: Option<GovernedQueryStatementOwner>,
-    resources: LocalResourceAuthority,
     settled: bool,
 }
 
 impl GovernedProtocolOwner {
-    pub fn new(statement: GovernedQueryStatementOwner, resources: LocalResourceAuthority) -> Self {
+    pub fn new(statement: GovernedQueryStatementOwner) -> Self {
         Self {
             statement: Some(statement),
-            resources,
             settled: false,
         }
+    }
+
+    /// Project the original live statement identity without retaining its owner.
+    pub fn statement_token(&self) -> Option<StatementToken> {
+        self.statement
+            .as_ref()
+            .map(GovernedQueryStatementOwner::token)
     }
 
     pub fn cancellation(&self) -> QueryCancellationView {
@@ -206,19 +60,75 @@ impl GovernedProtocolOwner {
         QueryCancellationView::governed(statement.cancellation().clone(), statement.timeout_ms())
     }
 
-    pub fn reservation_inputs(&self) -> (LocalResourceAuthority, WorkScope) {
-        let statement = self
-            .statement
-            .as_ref()
-            .expect("protocol result retains its governed owner");
-        (self.resources.clone(), statement.scope().clone())
-    }
-
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
         self.statement
             .as_mut()
             .expect("protocol result retains its governed owner")
             .seal_success_visibility()
+    }
+
+    pub fn accept_cancel_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        self.statement
+            .as_mut()
+            .ok_or(WorkError::Released)?
+            .accept_cancel_delivery_cut()
+    }
+    pub fn accept_failed_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        self.statement
+            .as_mut()
+            .ok_or(WorkError::Released)?
+            .accept_failed_delivery_cut()
+    }
+
+    fn closing_capacity(
+        &self,
+        cut: novarocks_workload_control::ResultClosingCut,
+    ) -> Result<ResultWindowGrant, WorkError> {
+        let statement = self.statement.as_ref().ok_or(WorkError::Released)?;
+        statement
+            .scope()
+            .result_capacity()?
+            .try_acquire_closing(statement.scope(), cut)
+    }
+
+    pub fn try_closing_capacity(
+        &mut self,
+        cancelled: bool,
+    ) -> Result<ResultWindowGrant, WorkError> {
+        let cut = if cancelled {
+            self.accept_cancel_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::AcceptedCancellation
+        } else {
+            self.accept_failed_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::OriginatingFailure
+        };
+        self.closing_capacity(cut)
+    }
+
+    /// A Local caller destroys its renderer/source and transfers only the
+    /// bounded writer tail. Any still-live ordinary backing keeps its alias.
+    #[allow(clippy::result_large_err)]
+    pub fn into_closing_delivery<W>(
+        self,
+        writer: W,
+        capacity: ResultWindowGrant,
+        simultaneously_live_backing_bytes: u64,
+    ) -> Result<ClosingDelivery<W>, (Self, W, ResultWindowGrant)> {
+        match ClosingDelivery::try_new(writer, self, capacity, simultaneously_live_backing_bytes) {
+            Ok(mut closing) => {
+                std::sync::Arc::get_mut(closing.tail.as_mut().expect("new closing tail"))
+                    .expect("new closing has no aliases")
+                    .protocol
+                    .as_mut()
+                    .expect("closing protocol")
+                    .statement
+                    .as_mut()
+                    .expect("closing statement")
+                    .release_transferred_result_window();
+                Ok(closing)
+            }
+            Err((writer, protocol, capacity)) => Err((protocol, writer, capacity)),
+        }
     }
 
     pub fn complete(&mut self) -> GovernedStatementFinishOutcome {
@@ -265,11 +175,143 @@ impl Drop for GovernedProtocolOwner {
     }
 }
 
+/// Move-only protocol tail with its own complete capacity position. `W` owns
+/// the detached socket writer, frozen metadata, packet cursor and validated
+/// resident current-row tail; it has no root fetch/render capability. Any
+/// physical writer alias must retain `retained_guard()` through actual exit.
+#[must_use = "a closing delivery retains its statement generation and writer until actual exit"]
+pub struct ClosingDelivery<W> {
+    writer: Option<W>,
+    tail: Option<std::sync::Arc<ClosingTailOwner>>,
+    completion: Option<tokio::sync::oneshot::Receiver<GovernedStatementFinishOutcome>>,
+}
+struct ClosingTailOwner {
+    protocol: Option<GovernedProtocolOwner>,
+    capacity: ResultWindowGrant,
+    writer_exited: std::sync::atomic::AtomicBool,
+    completion: Option<tokio::sync::oneshot::Sender<GovernedStatementFinishOutcome>>,
+}
+impl Drop for ClosingTailOwner {
+    fn drop(&mut self) {
+        let mut protocol = self
+            .protocol
+            .take()
+            .expect("closing retains its protocol owner");
+        let outcome = if !self
+            .writer_exited
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            protocol.client_disconnected()
+        } else {
+            match self
+                .capacity
+                .closing_cut()
+                .expect("closing requires an accepted cut")
+            {
+                novarocks_workload_control::ResultClosingCut::AcceptedCancellation => {
+                    protocol.settle_cancellation()
+                }
+                novarocks_workload_control::ResultClosingCut::OriginatingFailure => protocol.fail(),
+            }
+        };
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(outcome);
+        }
+    }
+}
+/// Every physical writer/backing alias retains BOTH the statement generation
+/// and the independent closing position. Its last drop is the actual exit cut.
+#[derive(Clone)]
+pub struct ClosingDeliveryAlias {
+    tail: std::sync::Arc<ClosingTailOwner>,
+}
+impl ClosingDeliveryAlias {
+    pub fn scope_id(&self) -> novarocks_workload_control::WorkId {
+        self.tail.capacity.scope_id()
+    }
+}
+impl<W> ClosingDelivery<W> {
+    /// The caller checks full simultaneous backing capacity before moving the
+    /// writer. A closing grant with preexisting raw aliases cannot transfer:
+    /// all subsequent physical aliases must retain the protocol owner as well.
+    /// Rejection returns every owner intact for immediate disconnect.
+    pub fn try_new(
+        writer: W,
+        protocol: GovernedProtocolOwner,
+        capacity: ResultWindowGrant,
+        simultaneously_live_backing_bytes: u64,
+    ) -> Result<Self, (W, GovernedProtocolOwner, ResultWindowGrant)> {
+        let valid_scope = protocol.statement.as_ref().is_some_and(|owner| {
+            capacity.is_for_scope(owner.scope())
+                && owner.accepted_delivery_cut().is_some()
+                && owner.accepted_delivery_cut() == capacity.closing_cut()
+        });
+        if capacity.class() != ResultWindowClass::Closing
+            || !valid_scope
+            || capacity.has_retained_aliases()
+            || capacity
+                .check_backing_total(simultaneously_live_backing_bytes)
+                .is_err()
+        {
+            return Err((writer, protocol, capacity));
+        }
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        Ok(Self {
+            writer: Some(writer),
+            tail: Some(std::sync::Arc::new(ClosingTailOwner {
+                protocol: Some(protocol),
+                capacity,
+                writer_exited: std::sync::atomic::AtomicBool::new(false),
+                completion: Some(completion),
+            })),
+            completion: Some(receiver),
+        })
+    }
+    pub fn writer_mut(&mut self) -> &mut W {
+        self.writer
+            .as_mut()
+            .expect("closing owns its detached writer")
+    }
+    pub fn retained_guard(&self) -> ClosingDeliveryAlias {
+        ClosingDeliveryAlias {
+            tail: std::sync::Arc::clone(
+                self.tail.as_ref().expect("closing retains its tail owner"),
+            ),
+        }
+    }
+    /// Invoke after ERR/flush completes or disconnect. Generation settlement
+    /// still waits for every physical alias. Cancelling this wait cannot settle
+    /// or release a still-live alias; its owner retains the protocol authority.
+    pub async fn settle_after_writer_exit(mut self) -> GovernedStatementFinishOutcome {
+        drop(self.writer.take());
+        self.tail
+            .as_ref()
+            .expect("closing owns tail")
+            .writer_exited
+            .store(true, std::sync::atomic::Ordering::Release);
+        let completion = self.completion.take().expect("closing owns completion");
+        drop(self.tail.take());
+        completion
+            .await
+            .expect("last closing holder publishes settlement")
+    }
+}
+impl<W> Drop for ClosingDelivery<W> {
+    fn drop(&mut self) {
+        // Writer destruction precedes its tail owner. Last-alias destruction
+        // settles cancellation/disconnect; dropping a waiter never proves exit.
+        drop(self.writer.take());
+        drop(self.tail.take());
+    }
+}
+
 /// Query-application output delivered to a client-session protocol adapter.
 ///
 /// The adapter owns wire framing, while these values retain every application
 /// lifetime that must remain live until the terminal protocol outcome.
 pub enum QuerySessionOutput {
+    /// Application-local command output. Protocol adapters must refuse this
+    /// until the application wraps it with the original governed owner.
     Query(QueryResult),
     GovernedQuery(GovernedImmediateStatementResult),
     StreamingQuery(StreamingStatementResult),
@@ -295,23 +337,36 @@ impl std::fmt::Debug for QuerySessionOutput {
 /// final protocol outcome.
 #[must_use = "the governed query result must be settled by its protocol owner"]
 pub struct GovernedImmediateStatementResult {
-    result: QueryResult,
+    result: OwnedLocalResult,
     protocol: GovernedProtocolOwner,
 }
 
 impl GovernedImmediateStatementResult {
-    pub fn new(
+    /// Transfer a freshly produced, closed Local graph while the admitted
+    /// statement still retains the exact producer window. The application
+    /// source audit, not the graph's runtime shape, establishes exclusivity.
+    #[allow(clippy::result_large_err)]
+    pub fn try_new(
         result: QueryResult,
-        resources: LocalResourceAuthority,
         statement: GovernedQueryStatementOwner,
-    ) -> Self {
-        Self {
-            result,
-            protocol: GovernedProtocolOwner::new(statement, resources),
+    ) -> Result<Self, (String, GovernedQueryStatementOwner)> {
+        let sealed = (|| {
+            let window = statement
+                .result_window_alias()
+                .ok_or("Local result has no admitted producer window")?;
+            let producer = LocalResultProducer::try_new(statement.scope(), window)?;
+            producer.produce(|| Ok(result))
+        })();
+        match sealed {
+            Ok(result) => Ok(Self {
+                result,
+                protocol: GovernedProtocolOwner::new(statement),
+            }),
+            Err(error) => Err((error, statement)),
         }
     }
 
-    pub fn into_parts(self) -> (QueryResult, GovernedProtocolOwner) {
+    pub fn into_parts(self) -> (OwnedLocalResult, GovernedProtocolOwner) {
         (self.result, self.protocol)
     }
 }
@@ -324,9 +379,9 @@ pub struct GovernedCompletionStatementResult {
 }
 
 impl GovernedCompletionStatementResult {
-    pub fn new(resources: LocalResourceAuthority, statement: GovernedQueryStatementOwner) -> Self {
+    pub fn new(statement: GovernedQueryStatementOwner) -> Self {
         Self {
-            protocol: GovernedProtocolOwner::new(statement, resources),
+            protocol: GovernedProtocolOwner::new(statement),
         }
     }
 
@@ -344,14 +399,10 @@ pub struct GovernedErrorStatementResult {
 }
 
 impl GovernedErrorStatementResult {
-    pub fn new(
-        error: QueryServiceError,
-        resources: LocalResourceAuthority,
-        statement: GovernedQueryStatementOwner,
-    ) -> Self {
+    pub fn new(error: QueryServiceError, statement: GovernedQueryStatementOwner) -> Self {
         Self {
             error,
-            protocol: GovernedProtocolOwner::new(statement, resources),
+            protocol: GovernedProtocolOwner::new(statement),
         }
     }
 
@@ -369,7 +420,6 @@ impl GovernedErrorStatementResult {
 pub struct StreamingStatementResult {
     execution: ExecutionHandle,
     stream: QueryResultStream,
-    resources: LocalResourceAuthority,
     protocol: GovernedProtocolOwner,
     settled: bool,
 }
@@ -377,7 +427,6 @@ pub struct StreamingStatementResult {
 impl StreamingStatementResult {
     pub fn try_from_execution(
         mut execution: ExecutionHandle,
-        resources: LocalResourceAuthority,
         statement: GovernedQueryStatementOwner,
     ) -> Result<Self, QueryExecutionError> {
         let stream = match execution.take_output() {
@@ -400,10 +449,14 @@ impl StreamingStatementResult {
         Ok(Self {
             execution,
             stream,
-            resources: resources.clone(),
-            protocol: GovernedProtocolOwner::new(statement, resources),
+            protocol: GovernedProtocolOwner::new(statement),
             settled: false,
         })
+    }
+
+    /// Project the protocol owner's exact identity; observation grants no control.
+    pub fn statement_token(&self) -> Option<StatementToken> {
+        self.protocol.statement_token()
     }
 
     pub fn begin_schema(&mut self) -> Option<SchemaDelivery> {
@@ -418,14 +471,6 @@ impl StreamingStatementResult {
         self.stream.failure_view()
     }
 
-    pub const fn resources(&self) -> &LocalResourceAuthority {
-        &self.resources
-    }
-
-    pub fn reservation_inputs(&self) -> (LocalResourceAuthority, WorkScope) {
-        self.protocol.reservation_inputs()
-    }
-
     pub fn request_cancel(&self) -> Result<(), QueryExecutionError> {
         self.execution.request_cancel()
     }
@@ -436,6 +481,69 @@ impl StreamingStatementResult {
 
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
         self.protocol.seal_success_visibility()
+    }
+
+    /// Fix the delivery verdict and return computation capacity before a
+    /// possibly slow protocol tail. Closing admission is a single try.
+    pub fn try_closing_capacity(
+        &mut self,
+        cancelled: bool,
+    ) -> Result<ResultWindowGrant, WorkError> {
+        let _ = self.execution.request_cancel();
+        let cut = if cancelled {
+            self.protocol.accept_cancel_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::AcceptedCancellation
+        } else {
+            self.protocol.accept_failed_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::OriginatingFailure
+        };
+        self.protocol.closing_capacity(cut)
+    }
+
+    /// Transfer only after the independent capacity proves the complete tail.
+    /// A rejected handoff returns every original owner intact.
+    #[allow(clippy::result_large_err)]
+    pub fn into_closing_delivery<W>(
+        mut self,
+        writer: W,
+        capacity: ResultWindowGrant,
+        simultaneously_live_backing_bytes: u64,
+    ) -> Result<ClosingDelivery<W>, (Self, W, ResultWindowGrant)> {
+        let _ = self.execution.request_cancel();
+        self.settled = true;
+        let protocol = std::mem::replace(
+            &mut self.protocol,
+            GovernedProtocolOwner {
+                statement: None,
+                settled: true,
+            },
+        );
+        match ClosingDelivery::try_new(
+            writer,
+            protocol,
+            capacity,
+            simultaneously_live_backing_bytes,
+        ) {
+            Ok(mut closing) => {
+                let tail = std::sync::Arc::get_mut(
+                    closing.tail.as_mut().expect("new closing retains tail"),
+                )
+                .expect("new closing has no aliases");
+                tail.protocol
+                    .as_mut()
+                    .expect("new closing retains protocol")
+                    .statement
+                    .as_mut()
+                    .expect("closing protocol retains statement")
+                    .release_transferred_result_window();
+                Ok(closing)
+            }
+            Err((writer, protocol, capacity)) => {
+                self.protocol = protocol;
+                self.settled = false;
+                Err((self, writer, capacity))
+            }
+        }
     }
 
     pub fn complete(mut self) -> GovernedStatementFinishOutcome {
@@ -467,74 +575,5 @@ impl Drop for StreamingStatementResult {
         if !self.settled {
             let _ = self.execution.request_cancel();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{ArrayRef, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use novarocks_workload_control::{
-        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
-    };
-
-    use super::*;
-
-    #[tokio::test]
-    async fn immediate_batch_keeps_result_credit_through_protocol_write() {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1024 * 1024,
-                control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
-            },
-        )
-        .expect("workload control");
-        control.mark_ready().expect("workload ready");
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .expect("query root");
-        let authority = control.resources();
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
-        )
-        .expect("record batch");
-        let decoded_bytes = decoded_result_batch_governance_charge(&batch).expect("charge");
-        let credit = authority
-            .reserve_result_credit(&root.owner.scope(), decoded_bytes)
-            .expect("fetch credit")
-            .begin_fetch()
-            .expect("begin fetch")
-            .retain_raw(decoded_bytes)
-            .expect("retain raw")
-            .reserve_decode(&authority, decoded_bytes)
-            .expect("reserve decode")
-            .queue_decoded(decoded_bytes)
-            .expect("queue decoded");
-
-        let batch = ImmediateResultBatch::try_new(batch, credit).expect("immediate batch");
-        assert_eq!(
-            authority.snapshot().result_credit.held_bytes(),
-            decoded_bytes
-        );
-        let batch = batch
-            .reserve_protocol_when_available(&authority, 64)
-            .await
-            .expect("reserve protocol")
-            .begin_protocol_write(64)
-            .expect("begin protocol write");
-        assert!(authority.snapshot().result_credit.protocol_writing_bytes > 0);
-
-        batch.complete().expect("consume immediate batch");
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop(root);
     }
 }

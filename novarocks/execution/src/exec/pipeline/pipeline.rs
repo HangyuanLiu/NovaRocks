@@ -66,6 +66,9 @@ impl Pipeline {
         &self,
         ctx: &Arc<FragmentContext>,
     ) -> ExecutionResult<Vec<PipelineDriver>> {
+        for factory in &self.op_factories {
+            factory.bind_pipeline_dop(self.dop)?;
+        }
         let mut drivers = Vec::new();
         let pipeline_profiler = ctx
             .profiler()

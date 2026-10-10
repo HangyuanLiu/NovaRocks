@@ -35,6 +35,45 @@ pub enum OutputContract {
 }
 
 impl OutputContract {
+    /// The completed root sink is the authority for the row carrier. Keep the
+    /// legacy carrier only for plans whose sink has not yet been migrated.
+    fn row_carrier_from_plan(
+        plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Result<Option<crate::api::ResultRowCarrier>, String> {
+        use novarocks_physical_plan::FragmentSink;
+        use novarocks_result_contract::{ClientRowProfile, RootOutputKind, RootProfileV1};
+        let sink = plan
+            .result_port()
+            .and_then(|port| plan.fragments().get(&port.fragment))
+            .map(|fragment| fragment.sink());
+        match sink {
+            Some(FragmentSink::RootResult(contract)) => {
+                contract
+                    .validate_purpose()
+                    .map_err(|error| error.to_string())?;
+                let profile = if contract.kind() == RootOutputKind::ClientRows {
+                    Some(
+                        ClientRowProfile::try_new(
+                            RootProfileV1::SEGMENT_BYTES,
+                            RootProfileV1::ROW_PAYLOAD_BYTES,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    )
+                } else {
+                    None
+                };
+                crate::api::ResultRowCarrier::relayed(contract.kind(), profile)
+                    .map(Some)
+                    .map_err(|error| error.to_string())
+            }
+            Some(FragmentSink::Result) => {
+                Err("completed result sink has no frozen root purpose".into())
+            }
+            None => Ok(None),
+            _ => Err("completed result port does not name a result sink".into()),
+        }
+    }
+
     /// The same contract, from a completed plan's own result port.
     ///
     /// A completed plan states what it delivers as part of being complete:
@@ -66,20 +105,49 @@ impl OutputContract {
             return Ok(Self::CompletionOnly);
         }
         match port {
-            Some(result) if !result.fields.is_empty() => Ok(Self::Rows(
-                result
+            Some(result) if !result.fields.is_empty() => {
+                if result
                     .fields
                     .iter()
-                    .map(|field| {
-                        crate::api::ResultField::new(
-                            field.alias.as_deref().unwrap_or(&field.name).to_string(),
-                            field.ty.data_type.clone(),
-                            field.ty.nullable,
-                            None,
-                        )
-                    })
-                    .collect(),
-            )),
+                    .any(|field| !field.domain.matches_storage(&field.ty.data_type))
+                {
+                    return Err("completed result domain differs from its physical carrier".into());
+                }
+                Ok(Self::Rows(
+                    result
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            crate::api::ResultField::new(
+                                field.alias.as_deref().unwrap_or(&field.name).to_string(),
+                                field.ty.data_type.clone(),
+                                field.ty.nullable,
+                                match field.domain {
+                                    novarocks_physical_plan::ResultValueDomain::Plain => None,
+                                    novarocks_physical_plan::ResultValueDomain::Json => {
+                                        Some(novarocks_types::schema::SqlType::Json)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Variant => {
+                                        Some(novarocks_types::schema::SqlType::Variant)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Hll => {
+                                        Some(novarocks_types::schema::SqlType::Hll)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Bitmap => {
+                                        Some(novarocks_types::schema::SqlType::Bitmap)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Object => {
+                                        Some(novarocks_types::schema::SqlType::Object)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Percentile => {
+                                        Some(novarocks_types::schema::SqlType::Percentile)
+                                    }
+                                },
+                            )
+                        })
+                        .collect(),
+                ))
+            }
             _ if kind == QueryExecutionKind::Read => {
                 Err("completed read plan has no row output contract".to_string())
             }
@@ -208,33 +276,21 @@ impl FrozenResourceValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionResourceRequirements {
     minimum_memory_bytes: FrozenResourceValue,
-    result_credit_bytes: FrozenResourceValue,
 }
 
 impl ExecutionResourceRequirements {
-    pub const fn new(
-        minimum_memory_bytes: FrozenResourceValue,
-        result_credit_bytes: FrozenResourceValue,
-    ) -> Self {
+    pub const fn new(minimum_memory_bytes: FrozenResourceValue) -> Self {
         Self {
             minimum_memory_bytes,
-            result_credit_bytes,
         }
     }
 
     pub const fn unknown(reason: FrozenEstimateUnknownReason) -> Self {
-        Self::new(
-            FrozenResourceValue::Unknown(reason),
-            FrozenResourceValue::Unknown(reason),
-        )
+        Self::new(FrozenResourceValue::Unknown(reason))
     }
 
     pub const fn minimum_memory_bytes(self) -> FrozenResourceValue {
         self.minimum_memory_bytes
-    }
-
-    pub const fn result_credit_bytes(self) -> FrozenResourceValue {
-        self.result_credit_bytes
     }
 }
 
@@ -246,6 +302,7 @@ pub struct FrozenExecutionDescription {
     kind: QueryExecutionKind,
     scan_identities: Arc<[crate::api::PlanScanIdentity]>,
     output: OutputContract,
+    row_carrier: Option<crate::api::ResultRowCarrier>,
     effect: ExecutionEffect,
     recovery: RecoveryMode,
     residuals: Arc<[ResidualResponsibility]>,
@@ -270,6 +327,10 @@ impl FrozenExecutionDescription {
         validate_effect_recovery(effect, recovery)?;
         let plan = candidate.plan().version();
         let expected_output = OutputContract::from_completed_candidate(kind, &candidate)?;
+        let row_carrier = OutputContract::row_carrier_from_plan(candidate.plan())?;
+        if matches!(output, OutputContract::Rows(_)) && row_carrier.is_none() {
+            return Err("row output requires a frozen root result sink".into());
+        }
         if output.fields() != expected_output.fields()
             || matches!(output, OutputContract::CompletionOnly)
                 != matches!(expected_output, OutputContract::CompletionOnly)
@@ -315,6 +376,7 @@ impl FrozenExecutionDescription {
             kind,
             scan_identities: scan_identities.into(),
             output,
+            row_carrier,
             effect,
             recovery,
             residuals: residuals.into(),
@@ -395,6 +457,24 @@ impl FrozenExecutionDescription {
     pub const fn output(&self) -> &OutputContract {
         &self.output
     }
+    /// The exact frozen typed scalar contract, without exposing the plan owner.
+    pub fn scalar_schema(&self) -> Option<&novarocks_result_contract::ScalarSchema> {
+        use novarocks_physical_plan::FragmentSink;
+        use novarocks_result_contract::FrozenRootOutput;
+        let plan = self.candidate.plan();
+        let fragment = plan.fragments().get(&plan.result_port()?.fragment)?;
+        match fragment.sink() {
+            FragmentSink::RootResult(contract) => match contract.output() {
+                FrozenRootOutput::ScalarValue(schema) => Some(schema),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    pub fn row_carrier(&self) -> Result<crate::api::ResultRowCarrier, String> {
+        self.row_carrier
+            .ok_or_else(|| "execution has no root row carrier".into())
+    }
     pub const fn effect(&self) -> ExecutionEffect {
         self.effect
     }
@@ -446,11 +526,94 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn row_carrier_is_frozen_from_the_completed_root_sink() {
+        use novarocks_result_contract::{
+            FrozenRootOutput, InternalResultDomain, RootOutputContract, RootProfileId,
+        };
+        let completed = crate::completed_plan_fixture::completed_values_plan([42; 16]).await;
+        let plan = completed.candidate().plan();
+        assert!(
+            OutputContract::row_carrier_from_plan(plan)
+                .unwrap_err()
+                .contains("frozen root purpose")
+        );
+        let completion = crate::completed_plan_fixture::completed_noop_plan([43; 16]);
+        assert_eq!(
+            OutputContract::row_carrier_from_plan(completion.candidate().plan()).unwrap(),
+            None
+        );
+        for output in [
+            FrozenRootOutput::CountOnly,
+            FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
+        ] {
+            let kind = output.kind();
+            let plan = plan
+                .as_ref()
+                .clone()
+                .with_root_output(RootOutputContract::new(RootProfileId::V1, output))
+                .unwrap();
+            assert_eq!(
+                OutputContract::row_carrier_from_plan(&plan).unwrap(),
+                Some(crate::api::ResultRowCarrier::relayed(kind, None).unwrap())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn m07_completed_output_preserves_exact_producer_domains() {
+        use novarocks_types::schema::SqlType as T;
+        for (sql, domain) in [
+            ("select json_object('k', 1) as value", Some(T::Json)),
+            ("select to_bitmap(1) as value", Some(T::Bitmap)),
+            ("select hll_hash(cast(1 as bigint)) as value", Some(T::Hll)),
+            (
+                "select percentile_hash(cast(1 as double)) as value",
+                Some(T::Percentile),
+            ),
+            ("select bitmap_to_binary(to_bitmap(1)) as value", None),
+            ("select cast(json_object('k', 1) as varchar) as value", None),
+        ] {
+            let completed =
+                crate::completed_plan_fixture::completed_literal_query([41; 16], sql).await;
+            let output = OutputContract::from_completed_plan(
+                QueryExecutionKind::Read,
+                completed.candidate().plan(),
+            )
+            .unwrap();
+            assert_eq!(output.fields().len(), 1, "{sql}");
+            assert_eq!(output.fields()[0].name(), "value", "{sql}");
+            assert_eq!(output.fields()[0].logical_type(), domain.as_ref(), "{sql}");
+        }
+    }
+
+    #[tokio::test]
     async fn completed_description_rejects_a_substituted_output_or_scan() {
         let candidate = crate::completed_plan_fixture::completed_values_plan([13; 16])
             .await
             .candidate()
             .clone();
+        let raw_output =
+            OutputContract::from_completed_plan(QueryExecutionKind::Read, candidate.plan())
+                .unwrap();
+        let raw_error = FrozenExecutionDescription::for_completed_plan(
+            QueryExecutionKind::Read,
+            candidate.clone(),
+            Vec::new(),
+            raw_output,
+            ExecutionEffect::None,
+            RecoveryMode::NoRecovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .unwrap_err();
+        assert!(raw_error.contains("frozen root purpose"), "{raw_error}");
+        let render = novarocks_sql::compiler::client_render_schema(candidate.plan(), 0).unwrap();
+        let candidate = candidate
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
+                render,
+            ))
+            .unwrap();
         let output =
             OutputContract::from_completed_plan(QueryExecutionKind::Read, candidate.plan())
                 .expect("values plan has a row result");

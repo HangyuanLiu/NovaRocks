@@ -46,7 +46,8 @@ use novarocks_query_application::coordination::{
     QualifiedWorkerAdmission, RecoveryMode, ReplacementQualificationEffectAdmission,
     ReplacementQualificationEffectPort, ReplacementQualificationEffectReservation,
     ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
-    ReplacementQualificationIdentity, ReplacementQualificationRequest, RootResultPumpBinding,
+    ReplacementQualificationIdentity, ReplacementQualificationRequest, RootRelayBinding,
+    RootRelayFrontier,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeCompatibilityId;
@@ -58,7 +59,7 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::fragment_transport::{
-    NativeTaskResultTransport, TaskReadGrace, native_root_result_pump_binding,
+    NativeBoundedRootReadPort, NativeTaskResultTransport, TaskReadGrace,
 };
 use crate::native::task_transport::{
     AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskOperationIntakeEvent,
@@ -617,12 +618,10 @@ async fn acquire_replacement_admissions(
             .targets
             .get(&context.backend_process_id())
             .ok_or(ReplacementQualificationFailure::InvalidReservation)?;
-        backends.push((
-            context.backend_process_id(),
-            target
-                .endpoint()
-                .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?,
-        ));
+        if target.descriptor().process_id() != context.backend_process_id() {
+            return Err(ReplacementQualificationFailure::InvalidReservation);
+        }
+        backends.push(target.descriptor().clone());
     }
     let notify = Arc::new(tokio::sync::Notify::new());
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
@@ -825,7 +824,6 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     topology: BackendTopologyService,
     process_observation: BackendProcessObservationService,
     data_runtime: FrontendDataRuntime,
-    decode_runtime: novarocks_query_application::coordination::RootResultDecodeRuntime,
     native_compatibility_id: NativeCompatibilityId,
     runtime_filter_worker_count: NonZeroUsize,
     task_update_retry_policy: TaskUpdateRetryPolicy,
@@ -862,7 +860,6 @@ impl FrontendNativeLogicalExecutionRuntime {
         topology: BackendTopologyService,
         process_observation: BackendProcessObservationService,
         data_runtime: FrontendDataRuntime,
-        decode_runtime: novarocks_query_application::coordination::RootResultDecodeRuntime,
         native_compatibility_id: NativeCompatibilityId,
         runtime_filter_worker_count: NonZeroUsize,
         task_update_retry_policy: TaskUpdateRetryPolicy,
@@ -878,7 +875,6 @@ impl FrontendNativeLogicalExecutionRuntime {
             topology,
             process_observation,
             data_runtime,
-            decode_runtime,
             native_compatibility_id,
             runtime_filter_worker_count,
             task_update_retry_policy,
@@ -907,8 +903,24 @@ impl FrontendNativeLogicalReadLauncher {
 }
 
 impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
-    fn start(&self, read: PreparedLogicalRead, owner: WorkOwner) -> QueryExecutionFuture {
+    fn start(
+        &self,
+        read: PreparedLogicalRead,
+        owner: WorkOwner,
+        result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+    ) -> QueryExecutionFuture {
         let (description, template, options) = read.into_parts();
+        if result_window
+            .as_ref()
+            .is_some_and(|window| !window.is_for_scope(&owner.scope()))
+        {
+            return Box::pin(async {
+                Err(QueryExecutionError::new(
+                    QueryExecutionErrorKind::InvalidRequest,
+                    "logical read result window belongs to a foreign scope",
+                ))
+            });
+        }
         if !description.matches_plan_seal(template.native_manifest_template().plan()) {
             return Box::pin(async {
                 Err(QueryExecutionError::new(
@@ -917,6 +929,16 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
                 ))
             });
         }
+        let delivery = match description
+            .row_carrier()
+            .map_err(|error| {
+                QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, error)
+            })
+            .and_then(|carrier| ProductionRootDelivery::bind(carrier, result_window))
+        {
+            Ok(delivery) => delivery,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
         let aborts = LogicalAbortRouter::new();
         let replacements = LogicalReplacementQualificationPort::new(
             self.runtime.clone(),
@@ -928,6 +950,7 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
                 runtime: self.runtime.clone(),
                 options,
                 aborts: Arc::clone(&aborts),
+                delivery,
             },
             replacements: replacements.clone(),
         };
@@ -957,6 +980,7 @@ struct ProductionManifestAttemptProjection {
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
     aborts: Arc<LogicalAbortRouter>,
+    delivery: ProductionRootDelivery,
 }
 
 impl std::fmt::Debug for ProductionManifestAttemptProjection {
@@ -968,6 +992,55 @@ impl std::fmt::Debug for ProductionManifestAttemptProjection {
     }
 }
 
+/// The frozen carrier and its already-admitted window travel together. A
+/// relayed root cannot fall back to Arrow when its class has no capacity.
+#[derive(Clone)]
+pub(crate) enum ProductionRootDelivery {
+    Relayed {
+        kind: novarocks_result_contract::RootOutputKind,
+        client_rows: Option<novarocks_result_contract::ClientRowProfile>,
+        window: novarocks_workload_control::ResultWindowAlias,
+    },
+}
+impl ProductionRootDelivery {
+    pub(crate) fn bind(
+        carrier: novarocks_query_application::api::ResultRowCarrier,
+        window: Option<novarocks_workload_control::ResultWindowAlias>,
+    ) -> Result<Self, QueryExecutionError> {
+        use novarocks_query_application::api::ResultRowCarrier as C;
+        use novarocks_result_contract::RootOutputKind as K;
+        use novarocks_workload_control::ResultWindowClass as W;
+        match carrier {
+            C::Relayed { kind, client_rows } => {
+                C::relayed(kind, client_rows)?;
+                let window = window.ok_or_else(|| {
+                    QueryExecutionError::new(
+                        QueryExecutionErrorKind::InvalidRequest,
+                        "relayed logical read requires its admitted result window",
+                    )
+                })?;
+                let expected = match kind {
+                    K::ClientRows => W::Client,
+                    _ => W::Internal,
+                };
+                if window.class() != expected {
+                    return Err(QueryExecutionError::new(
+                        QueryExecutionErrorKind::InvalidRequest,
+                        "relayed logical read window differs from its frozen output class",
+                    ));
+                }
+                Ok(Self::Relayed {
+                    kind,
+                    client_rows,
+                    window,
+                })
+            }
+        }
+    }
+}
+
+pub(crate) type FrontendRootRowsRuntime = RootRelayBinding;
+
 /// Frontend-local Task protocol and transport behavior used by the fixed
 /// snapshot-owning dormant adapter.
 ///
@@ -978,7 +1051,7 @@ impl std::fmt::Debug for ProductionManifestAttemptProjection {
 pub(crate) trait FrontendActiveAttemptBehavior<M = ManifestBoundNativeAttemptInputs>:
     std::fmt::Debug + Send + 'static
 {
-    fn take_rows_runtime(&mut self) -> Option<(RootResultPumpBinding, AcceptedRootStatusSource)> {
+    fn take_rows_runtime(&mut self) -> Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)> {
         None
     }
 
@@ -1078,30 +1151,16 @@ pub(crate) trait FrontendManifestAttemptProjection:
 /// One exact Task round and its move-only root result owners.
 pub(crate) struct ProjectedManifestAttempt {
     round: ManifestAssembledRound,
-    rows: Option<(RootResultPumpBinding, AcceptedRootStatusSource)>,
+    rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
     _prepared: Option<TaskExecutionPreparedQuery>,
     _split_assignment: Option<SplitAssignmentRoundGuard>,
     _abort_route: Option<LogicalAbortRoute>,
 }
 
 impl ProjectedManifestAttempt {
-    pub(crate) fn rows(
-        round: ManifestAssembledRound,
-        binding: RootResultPumpBinding,
-        statuses: AcceptedRootStatusSource,
-    ) -> Self {
-        Self {
-            round,
-            rows: Some((binding, statuses)),
-            _prepared: None,
-            _split_assignment: None,
-            _abort_route: None,
-        }
-    }
-
     fn production_rows(
         round: ManifestAssembledRound,
-        binding: RootResultPumpBinding,
+        binding: FrontendRootRowsRuntime,
         statuses: AcceptedRootStatusSource,
         prepared: TaskExecutionPreparedQuery,
         split_assignment: Option<SplitAssignmentRoundGuard>,
@@ -1290,7 +1349,7 @@ impl ProductionManifestAttemptProjection {
                 .map_err(projection_failure)?,
         )
         .map_err(projection_message)?;
-        let (submissions, root_fetch, expected_output) = task_prepared
+        let (submissions, root_fetch) = task_prepared
             .seal_task_submission(submission)
             .map_err(projection_failure)?
             .into_parts();
@@ -1331,12 +1390,7 @@ impl ProductionManifestAttemptProjection {
         let backends = manifest
             .contexts()
             .iter()
-            .map(|context| {
-                (
-                    context.backend().process_id(),
-                    context.backend().endpoint().clone(),
-                )
-            })
+            .map(|context| context.backend().target().descriptor().clone())
             .collect::<Vec<_>>();
         let mut round = crate::task_execution::manifest_round::assemble_manifest_round(
             manifest,
@@ -1385,11 +1439,27 @@ impl ProductionManifestAttemptProjection {
         let root_status = round.take_root_status_source().ok_or_else(|| {
             projection_message("logical read Task round has no accepted root status source")
         })?;
-        let root_binding = native_root_result_pump_binding(
-            self.runtime.decode_runtime.clone(),
-            result_transport,
-            Arc::clone(expected_output.fetch_view().chunk_schema()),
-        );
+        let root_binding = match &self.delivery {
+            ProductionRootDelivery::Relayed {
+                kind,
+                client_rows,
+                window,
+            } => {
+                let frontier = RootRelayFrontier::new(
+                    round.round.root_task(),
+                    novarocks_result_contract::RootProfileId::V1,
+                    *kind,
+                    *client_rows,
+                )
+                .map_err(|error| projection_message(error.to_string()))?;
+                RootRelayBinding {
+                    port: Arc::new(NativeBoundedRootReadPort::new(result_transport)),
+                    frontier,
+                    window: window.clone(),
+                    max_wait: Duration::from_millis(250),
+                }
+            }
+        };
         Ok(ProjectedManifestAttempt::production_rows(
             round,
             root_binding,
@@ -1511,7 +1581,7 @@ where
 pub(crate) struct FrontendTaskProtocolActiveBehavior {
     attempt: ManifestAssembledRound,
     completion: ManifestAttemptCompletion,
-    rows: Option<(RootResultPumpBinding, AcceptedRootStatusSource)>,
+    rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
     prepared: Option<TaskExecutionPreparedQuery>,
     split_assignment: Option<SplitAssignmentRoundGuard>,
     abort_route: Option<LogicalAbortRoute>,
@@ -1556,7 +1626,7 @@ impl FrontendTaskProtocolActiveBehavior {
 }
 
 impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
-    fn take_rows_runtime(&mut self) -> Option<(RootResultPumpBinding, AcceptedRootStatusSource)> {
+    fn take_rows_runtime(&mut self) -> Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)> {
         self.rows.take()
     }
 
@@ -1719,7 +1789,7 @@ where
                     Output = Result<
                         (
                             SnapshotBoundActiveAttemptOwner<I::Manifest, B::ActiveBehavior>,
-                            Option<(RootResultPumpBinding, AcceptedRootStatusSource)>,
+                            Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
                         ),
                         NativeAttemptActivationFailure,
                     >,
@@ -1770,7 +1840,9 @@ where
         Box::pin(async move {
             let (owner, rows) = activation.await?;
             Ok(match rows {
-                Some((binding, statuses)) => ActivatedNativeAttempt::rows(owner, binding, statuses),
+                Some((binding, statuses)) => {
+                    ActivatedNativeAttempt::relayed_rows(owner, binding, statuses)
+                }
                 None => ActivatedNativeAttempt::completion(owner),
             })
         })
@@ -2207,6 +2279,7 @@ mod tests {
                 BackendProcessDescriptor::try_new(
                     process,
                     RuntimeEndpoint::new("127.0.0.1", 19100 + index as i32).unwrap(),
+                    RuntimeEndpoint::new(format!("control-{index}.test.invalid"), 19061).unwrap(),
                     "test-deployment",
                     "test-build",
                     NativeCompatibilityId::new([0x71; 32]),
@@ -2322,6 +2395,8 @@ mod tests {
                 let descriptor = BackendProcessDescriptor::try_new(
                     *process,
                     RuntimeEndpoint::new("127.0.0.1", 19050 + index as i32).expect("test endpoint"),
+                    RuntimeEndpoint::new(format!("control-{index}.test.invalid"), 19061)
+                        .expect("test control endpoint"),
                     "test-deployment",
                     "test-build",
                     NativeCompatibilityId::new([0x71; 32]),
@@ -2795,6 +2870,67 @@ mod tests {
             Box::pin(async move {
                 observed.store(true, Ordering::SeqCst);
             })
+        }
+    }
+
+    #[test]
+    fn frozen_root_carrier_requires_its_exact_admitted_window_class() {
+        use super::ProductionRootDelivery;
+        use novarocks_query_application::api::ResultRowCarrier as C;
+        use novarocks_result_contract::{
+            ClientRowProfile, InternalResultDomain, RootOutputKind as K, RootProfileV1 as P,
+        };
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass as W};
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: 1 << 18,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        let profile = ClientRowProfile::try_new(P::SEGMENT_BYTES, P::ROW_PAYLOAD_BYTES).unwrap();
+        for kind in [
+            K::ClientRows,
+            K::InternalFacts(InternalResultDomain::ScalarValueV1),
+            K::CountOnly,
+        ] {
+            let carrier = C::relayed(kind, (kind == K::ClientRows).then_some(profile)).unwrap();
+            assert!(ProductionRootDelivery::bind(carrier, None).is_err());
+            for class in [W::Client, W::Local, W::Internal, W::Closing] {
+                let grant = if class == W::Closing {
+                    capacity
+                        .try_acquire_closing(
+                            &scope,
+                            novarocks_workload_control::ResultClosingCut::OriginatingFailure,
+                        )
+                        .unwrap()
+                } else {
+                    capacity.try_acquire(&scope, class).unwrap()
+                };
+                let expected = if kind == K::ClientRows {
+                    W::Client
+                } else {
+                    W::Internal
+                };
+                let bound = ProductionRootDelivery::bind(carrier, Some(grant.retain_alias()));
+                assert_eq!(bound.is_ok(), class == expected);
+                if let Ok(bound) = bound {
+                    drop(grant);
+                    assert_eq!(capacity.snapshot().held_positions.iter().sum::<usize>(), 1);
+                    drop(bound);
+                    assert_eq!(capacity.snapshot().held_positions.iter().sum::<usize>(), 0);
+                }
+            }
         }
     }
 

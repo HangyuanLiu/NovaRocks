@@ -133,14 +133,14 @@ impl ChunkSchema {
                     E::from(MetadataMaterializationError::MissingOriginalFieldOrigin)
                 })??;
             drop(repeated);
-            allocation(allocations, arc_request::<Field, E>()?, 2)?;
+            allocation(allocations, arc_request::<Field, E>()?, 3)?;
             result.field_clone_requests_bytes = add::<E>(
                 result.field_clone_requests_bytes,
                 times::<E>(root.request_bytes, 3)?,
             )?;
             result.field_arc_requests_bytes = add::<E>(
                 result.field_arc_requests_bytes,
-                times::<E>(arc::<Field, E>()?, 2)?,
+                times::<E>(arc::<Field, E>()?, 3)?,
             )?;
             result.semantic_clone_requests_bytes = add::<E>(
                 result.semantic_clone_requests_bytes,
@@ -174,7 +174,7 @@ impl ChunkSchema {
                                     )
                                 })?;
                             drop(repeated);
-                            allocation(allocations, arc_request::<Field, E>()?, 2)?;
+                            allocation(allocations, arc_request::<Field, E>()?, 3)?;
                             result.nested_field_occurrences =
                                 add::<E>(result.nested_field_occurrences, 1)?;
                             result.field_clone_requests_bytes = add::<E>(
@@ -183,7 +183,7 @@ impl ChunkSchema {
                             )?;
                             result.field_arc_requests_bytes = add::<E>(
                                 result.field_arc_requests_bytes,
-                                times::<E>(arc::<Field, E>()?, 2)?,
+                                times::<E>(arc::<Field, E>()?, 3)?,
                             )?;
                         }
                         ValueTypeVisit::TypeNode(DataType::Struct(fields)) => {

@@ -373,6 +373,7 @@ fn package_with_calls(
         .get(&fixture.fragment.root())
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fixture.fragment.id(),
         output: root.output.clone(),
         fields: root
@@ -381,6 +382,9 @@ fn package_with_calls(
             .iter()
             .enumerate()
             .map(|(ordinal, &value)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(
+                    &fixture.fragment.values()[&value].ty,
+                ),
                 name: format!("result_{ordinal}").into_boxed_str(),
                 alias: None,
                 value,

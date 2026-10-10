@@ -702,6 +702,7 @@ pub(crate) fn scan_producer_package() -> (Vec<u8>, u32) {
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: CONSUMER,
         output: OutputPort {
             node: RECEIVER,
@@ -711,6 +712,7 @@ pub(crate) fn scan_producer_package() -> (Vec<u8>, u32) {
             .iter()
             .zip(["v0", "v1"])
             .map(|(value, name)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: name.into(),
                 alias: None,
                 value: *value,

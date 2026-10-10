@@ -31,7 +31,7 @@ use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_execution_contract::{
     BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
 };
-use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
+use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
@@ -289,7 +289,7 @@ pub(crate) struct ClusterBackendService {
     heartbeat_interval: Duration,
     announce_lease_ttl: Duration,
     heartbeat_probe: Arc<HeartbeatProbe>,
-    channel_invalidator: Arc<dyn Fn(&NativeEndpoint) + Send + Sync>,
+    channel_invalidator: Arc<dyn Fn(BackendProcessId) + Send + Sync>,
     heartbeat_thread: Mutex<Option<JoinHandle<()>>>,
     heartbeat_round: Mutex<()>,
     heartbeat_signal: Mutex<HeartbeatSignal>,
@@ -323,7 +323,7 @@ impl ClusterBackendService {
             move |endpoint, process_id| {
                 native_heartbeat(&heartbeat_runtime, process_id, endpoint, heartbeat_timeout)
             },
-            move |endpoint| data_runtime.invalidate_channel(endpoint),
+            move |process_id| data_runtime.invalidate_peer(process_id),
         ));
         let _ = runtime;
         // Only a BE can create its immutable ProcessId descriptor through
@@ -335,7 +335,7 @@ impl ClusterBackendService {
     fn new<F, I>(config: &ClusterBackendOpenConfig, probe: F, invalidate_channel: I) -> Self
     where
         F: Fn(RuntimeEndpoint, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static,
-        I: Fn(&NativeEndpoint) + Send + Sync + 'static,
+        I: Fn(BackendProcessId) + Send + Sync + 'static,
     {
         let (process_epoch, _) = watch::channel(0);
         Self {
@@ -658,16 +658,8 @@ impl ClusterBackendService {
         state
             .processes
             .iter()
-            .filter_map(|(id, facts)| {
-                facts
-                    .announce_lease_valid
-                    .then(|| {
-                        descriptor_runtime_endpoint(&facts.descriptor)
-                            .ok()
-                            .map(|endpoint| (*id, endpoint))
-                    })
-                    .flatten()
-            })
+            .filter(|(_, facts)| facts.announce_lease_valid)
+            .map(|(id, facts)| (*id, facts.descriptor.control_endpoint().clone()))
             .collect()
     }
     fn heartbeat_is_stopping(&self) -> bool {
@@ -753,7 +745,7 @@ impl ClusterBackendService {
         let changed = advance_if_membership_changed(&mut state, before).unwrap_or(false);
         drop(state);
         if replaced {
-            (self.channel_invalidator)(endpoint.native_endpoint());
+            (self.channel_invalidator)(old_owner.expect("replaced process has an old owner"));
         }
         if changed {
             self.publish_snapshot();
@@ -1273,9 +1265,11 @@ mod tests {
         build_identity: impl Into<String>,
         native_compatibility_id: novarocks_types::NativeCompatibilityId,
     ) -> BackendProcessDescriptor {
+        let process = BackendProcessId::new_v7();
         BackendProcessDescriptor::try_new(
-            BackendProcessId::new_v7(),
+            process,
             RuntimeEndpoint::new(endpoint.ip().to_string(), i32::from(endpoint.port())).unwrap(),
+            RuntimeEndpoint::new(format!("control-{process}.test.invalid"), 19061).unwrap(),
             "test",
             build_identity,
             native_compatibility_id,
@@ -1291,6 +1285,66 @@ mod tests {
             2,
             AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch"),
             1,
+        );
+    }
+
+    #[test]
+    fn heartbeat_rows_use_control_without_changing_data_endpoint_ownership() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let announced = descriptor("127.0.0.1:9070".parse().unwrap());
+        service
+            .record_announce(announced.clone(), BackendReportedState::Running)
+            .unwrap();
+        assert_eq!(
+            service.heartbeat_rows(),
+            vec![(announced.process_id(), announced.control_endpoint().clone())]
+        );
+        assert_eq!(
+            super::descriptor_runtime_endpoint(&announced).unwrap(),
+            *announced.endpoint()
+        );
+        verify(&service, &announced);
+        let snapshot = service.snapshot().unwrap();
+        assert_eq!(
+            snapshot.targets()[0].endpoint().unwrap(),
+            *announced.endpoint()
+        );
+        assert_eq!(snapshot.targets()[0].descriptor(), &announced);
+    }
+
+    #[test]
+    fn changed_control_endpoint_conflicts_with_announce_and_cannot_verify_eligibility() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let announced = descriptor("127.0.0.1:9070".parse().unwrap());
+        service
+            .record_announce(announced.clone(), BackendReportedState::Running)
+            .unwrap();
+        let changed = BackendProcessDescriptor::try_new(
+            announced.process_id(),
+            announced.endpoint().clone(),
+            RuntimeEndpoint::new("changed-control.test.invalid", 19062).unwrap(),
+            announced.deployment_id(),
+            announced.build_identity(),
+            announced.native_compatibility_id(),
+            announced.preparing_positions(),
+        )
+        .unwrap();
+        assert!(
+            service
+                .record_announce(changed.clone(), BackendReportedState::Running)
+                .unwrap_err()
+                .contains("immutable descriptor")
+        );
+        verify(&service, &changed);
+        assert!(service.snapshot().unwrap().targets().is_empty());
+        assert_eq!(
+            service.heartbeat_rows(),
+            vec![(announced.process_id(), announced.control_endpoint().clone())]
+        );
+        verify(&service, &announced);
+        assert_eq!(
+            service.snapshot().unwrap().targets()[0].descriptor(),
+            &announced
         );
     }
 

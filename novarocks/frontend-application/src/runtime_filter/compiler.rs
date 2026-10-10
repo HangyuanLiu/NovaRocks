@@ -1443,6 +1443,7 @@ fn routing_edge(
                 filter::RuntimeFilterRemotePeer {
                     participant_id: remote,
                     endpoint: endpoint.endpoint.clone(),
+                    backend_process_id: endpoint.process_id.to_bytes().to_vec(),
                 },
             )),
         }
@@ -2065,6 +2066,59 @@ mod tests {
             required_capabilities: BTreeSet::new(),
             policy: filter::RuntimeFilterPolicyRequirement::default(),
         }
+    }
+
+    #[test]
+    fn remote_route_uses_the_exact_process_from_its_frozen_topology() {
+        let source = BackendProcessId::new_v7();
+        let target = BackendProcessId::new_v7();
+        let mut topology = BTreeMap::from([
+            (
+                0,
+                ParticipantTopology {
+                    endpoint: "same-host:9070".to_owned(),
+                    process_id: source,
+                },
+            ),
+            (
+                1,
+                ParticipantTopology {
+                    endpoint: "same-host:9070".to_owned(),
+                    process_id: target,
+                },
+            ),
+        ]);
+        let route = Route {
+            edge_id: 1,
+            kind: RouteKind::Direct,
+            from_participant: 1,
+            from_binding: 7,
+            to_participant: 2,
+            to_binding: 8,
+        };
+        let remote = |outbound| {
+            let edge = routing_edge(&route, outbound, &topology).unwrap();
+            let Some(filter::runtime_filter_route_peer::Peer::Remote(peer)) =
+                edge.peer.unwrap().peer
+            else {
+                panic!("two distinct participants must retain a remote route");
+            };
+            peer
+        };
+        let saved = remote(true);
+        assert_eq!(saved.backend_process_id, target.to_bytes());
+        assert_eq!(remote(false).backend_process_id, source.to_bytes());
+        // Reusing an endpoint in a later snapshot must not rewrite the saved
+        // route of the current attempt.
+        topology.get_mut(&1).unwrap().process_id = BackendProcessId::new_v7();
+        assert_eq!(saved.backend_process_id, target.to_bytes());
+        let next = routing_edge(&route, true, &topology).unwrap();
+        let Some(filter::runtime_filter_route_peer::Peer::Remote(next)) = next.peer.unwrap().peer
+        else {
+            panic!("replacement backend remains remote");
+        };
+        assert_eq!(next.endpoint, saved.endpoint);
+        assert_ne!(next.backend_process_id, saved.backend_process_id);
     }
 
     #[test]

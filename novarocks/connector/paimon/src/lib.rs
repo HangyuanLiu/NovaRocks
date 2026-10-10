@@ -19,6 +19,12 @@
 
 pub const PROVIDER_ID: &str = "paimon";
 
+/// Read the fixed catalog-generation listing admission limit.
+/// This is an observation of the original owner, not a configurable allowance.
+pub const fn frozen_catalog_listing_concurrency() -> usize {
+    crate::catalog::listing_admission::LISTING_CONCURRENCY
+}
+
 pub mod catalog;
 pub mod definition;
 pub mod domain;

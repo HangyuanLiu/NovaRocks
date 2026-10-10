@@ -49,6 +49,7 @@
 #![deny(missing_docs)]
 
 mod catalog;
+mod table_projection;
 pub use catalog::*;
 
 mod error;

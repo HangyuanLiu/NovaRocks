@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::actors::mysql as mysql_actor;
 use crate::actors::mysql_stream::{MysqlPacket, MysqlStream};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
+use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(SchemaOnce),
         Box::new(NonNegotiatedMultiStatement),
         Box::new(NegotiatedMultiResult),
+        Box::new(ScalarSession),
     ]
 }
 
@@ -47,6 +50,70 @@ struct NegotiatedMultiResult;
 /// A client that did not negotiate both multi-statement and multi-result
 /// capabilities remains on the strict single-statement protocol path.
 struct NonNegotiatedMultiStatement;
+
+/// Query-valued SET must publish its session value only after the native
+/// Scalar record and terminal success, including empty and rejected input.
+struct ScalarSession;
+
+impl Scenario for ScalarSession {
+    fn name(&self) -> &'static str {
+        "query-output/scalar-session"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = context
+            .handle()
+            .query_execution_resource_snapshot()?
+            .context("cross-process harness did not expose the query-resource oracle")?;
+        let timeout = context
+            .remaining("open Scalar session client")?
+            .min(IO_TIMEOUT_CAP);
+        let mut client = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+        client.query_drop("SET @m07_scalar = (SELECT 4)")?;
+        ensure!(
+            client.query_first::<i64, _>("SELECT @m07_scalar")? == Some(4),
+            "Scalar session lost its numeric value"
+        );
+        client.query_drop(
+            "SET @m07_scalar = (SELECT SUM(generate_series) FROM generate_series(1, 100))",
+        )?;
+        ensure!(
+            client.query_first::<i64, _>("SELECT @m07_scalar")? == Some(5050),
+            "Scalar session lost its aggregate value"
+        );
+        client.query_drop("SET @m07_scalar = (SELECT 4 WHERE FALSE)")?;
+        ensure!(
+            client.query_first::<Option<i64>, _>("SELECT @m07_scalar")? == Some(None),
+            "empty Scalar input must publish NULL"
+        );
+        client.query_drop("SET @m07_scalar = (SELECT 'retained')")?;
+        ensure!(
+            client
+                .query_drop("SET @m07_scalar = (SELECT generate_series FROM generate_series(1, 2))")
+                .is_err(),
+            "multirow Scalar input must fail"
+        );
+        ensure!(
+            client
+                .query_first::<String, _>("SELECT @m07_scalar")?
+                .as_deref()
+                == Some("retained"),
+            "failed Scalar input must preserve the previously committed session value"
+        );
+        context.action(
+            "verified native Scalar numeric, aggregate, empty, and failed session publication",
+        );
+        drop(client);
+        let deadline = context.deadline();
+        context
+            .handle()
+            .await_query_execution_resource_convergence(&baseline, deadline)
+            .context("await Scalar session resource convergence")?;
+        context.action("verified Scalar session resources converged after success and failure");
+        Ok(())
+    }
+}
 
 impl Scenario for NonNegotiatedMultiStatement {
     fn name(&self) -> &'static str {

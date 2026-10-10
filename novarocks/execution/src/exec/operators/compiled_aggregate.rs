@@ -967,6 +967,7 @@ mod failure_latch_tests {
         let mut plan = PlanBuilder::new(PlanVersionId::try_new([101; 16]).unwrap());
         plan.add_fragment(definition).unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment,
             fields: output
                 .columns
@@ -974,6 +975,7 @@ mod failure_latch_tests {
                 .zip([int64(false), count.result_type()])
                 .enumerate()
                 .map(|(ordinal, (value, ty))| ResultField {
+                    domain: crate::test_result_domain::result_value_domain(&ty),
                     name: format!("c{ordinal}").into_boxed_str(),
                     alias: None,
                     value: *value,

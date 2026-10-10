@@ -249,16 +249,19 @@ fn plan_with_key_order(
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: consumer_id,
         output,
         fields: Box::from([
             ResultField {
+                domain: crate::test_result_domain::result_value_domain(&int64()),
                 name: "b".into(),
                 alias: None,
                 value: b_import,
                 ty: int64(),
             },
             ResultField {
+                domain: crate::test_result_domain::result_value_domain(&int64()),
                 name: "a".into(),
                 alias: None,
                 value: a_import,
@@ -1141,9 +1144,11 @@ fn drop_distribution_key_project_plan(
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: consumer_id,
         output,
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&int64()),
             name: "b".into(),
             alias: None,
             value: b_import,

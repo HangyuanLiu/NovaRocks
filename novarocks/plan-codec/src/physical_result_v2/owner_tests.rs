@@ -152,6 +152,7 @@ fn caller_result_none_empty_and_nominal_dictionary_roots_keep_distinct_values() 
                 .is_none()
         );
         let empty = p::ResultPort {
+            scalar_schema: None,
             fragment: p::FragmentId::new(0),
             output: p::OutputPort {
                 node: p::NodeId::new(0),

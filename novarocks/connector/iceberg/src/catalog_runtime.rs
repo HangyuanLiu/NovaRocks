@@ -85,6 +85,27 @@ pub fn build_hadoop_catalog(
     )
 }
 
+pub(crate) const REST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const REST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read the fixed parameters used by catalog admission and the REST client.
+/// This projection grants no capacity and does not make them configurable.
+pub const fn frozen_sdk_listing_parameters() -> (usize, std::time::Duration, std::time::Duration) {
+    (
+        crate::catalog::listing_admission::LISTING_CONCURRENCY,
+        REST_CONNECT_TIMEOUT,
+        REST_READ_TIMEOUT,
+    )
+}
+
+fn rest_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(REST_CONNECT_TIMEOUT)
+        .read_timeout(REST_READ_TIMEOUT)
+        .build()
+        .map_err(|error| format!("build REST Iceberg HTTP client: {error}"))
+}
+
 pub async fn build_rest_catalog(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
@@ -137,7 +158,7 @@ async fn build_rest_catalog_with_access_delegation(
             configuration.warehouse_uri.clone(),
         );
     }
-    let builder = RestCatalogBuilder::default();
+    let builder = RestCatalogBuilder::default().with_client(rest_http_client()?);
     let builder = match rest_access_delegation {
         RestAccessDelegationMode::Static => {
             builder.with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
@@ -172,6 +193,7 @@ pub(crate) async fn build_rest_catalog_from_properties(
         );
     }
     RestCatalogBuilder::default()
+        .with_client(rest_http_client()?)
         .load("rest".to_string(), properties)
         .await
         .map_err(|error| format!("build REST iceberg catalog: {error}"))

@@ -47,6 +47,238 @@ pub fn decode_field_type(
     })
 }
 
+/// Fresh Native field construction keeps exact immutable metadata owners.
+/// This does not infer origins from arbitrary Arrow fields or schemas.
+#[derive(Clone, Debug)]
+pub struct OwnedNativeField {
+    field: arrow::datatypes::FieldRef,
+    metadata_origins: novarocks_types::arrow_metadata_owner::FieldMetadataOrigins,
+}
+impl OwnedNativeField {
+    pub fn field(&self) -> &arrow::datatypes::FieldRef {
+        &self.field
+    }
+    pub fn metadata_origins(&self) -> &novarocks_types::arrow_metadata_owner::FieldMetadataOrigins {
+        &self.metadata_origins
+    }
+}
+
+pub fn decode_field_type_owned(
+    name: &str,
+    nullable: bool,
+    desc: &common::TypeDesc,
+) -> Result<OwnedNativeField, String> {
+    // Preflight the sealed Vec/strings before allocating any Arrow field,
+    // name, metadata table or receipt collection.
+    let mut preflight = NativeFieldPreflight { nodes: 0, bytes: 0 };
+    preflight.field(name, desc, 0)?;
+    let mut owners = Vec::with_capacity(preflight.nodes);
+    let field = decode_owned_field(name, nullable, desc, &mut owners)?;
+    let metadata_origins =
+        novarocks_types::arrow_metadata_owner::FieldMetadataOrigins::try_new(owners, 65_536)
+            .map_err(|_| "native field metadata origins exceed the bounded profile".to_string())?;
+    Ok(OwnedNativeField {
+        field,
+        metadata_origins,
+    })
+}
+
+/// Check the whole output layout before constructing any field or provenance
+/// vector. Per-field checks alone cannot bound a wide combined tree.
+pub fn preflight_native_output_fields(columns: &[common::OutputColumn]) -> Result<(), String> {
+    preflight_native_field_types(
+        columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.r#type.as_ref())),
+    )
+}
+
+/// Borrowed whole-source preflight for output columns or project occurrences.
+/// Malformed absent types retain the owning adapter's precise error path.
+pub fn preflight_native_field_types<'a>(
+    fields: impl IntoIterator<Item = (&'a str, Option<&'a common::TypeDesc>)>,
+) -> Result<(), String> {
+    let mut preflight = NativeFieldPreflight { nodes: 0, bytes: 0 };
+    for (name, desc) in fields {
+        if let Some(desc) = desc {
+            preflight.field(name, desc, 0)?;
+        } else {
+            preflight.charge_field(name)?;
+        }
+    }
+    Ok(())
+}
+
+struct NativeFieldPreflight {
+    nodes: usize,
+    bytes: usize,
+}
+impl NativeFieldPreflight {
+    fn charge_field(&mut self, name: &str) -> Result<(), String> {
+        use novarocks_result_contract::RootProfileV1;
+        if name.len() > RootProfileV1::MAX_NAME_BYTES {
+            return Err("native field name exceeds the bounded profile".to_string());
+        }
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .filter(|nodes| *nodes <= 65_536)
+            .ok_or("native field tree exceeds the bounded node profile")?;
+        // Includes the field/Arc, slot facts, provenance index and one small
+        // logical metadata pair. Data buffers remain separate source owners.
+        self.bytes = self
+            .bytes
+            .checked_add(name.len())
+            .and_then(|v| v.checked_add(512))
+            .filter(|bytes| *bytes <= 96 * 1024 * 1024)
+            .ok_or("native field construction exceeds the source profile")?;
+        Ok(())
+    }
+    fn field(&mut self, name: &str, desc: &common::TypeDesc, depth: usize) -> Result<(), String> {
+        use common::type_desc::Kind;
+        use novarocks_result_contract::RootProfileV1;
+        if depth > RootProfileV1::MAX_DEPTH {
+            return Err("native field tree exceeds the bounded depth profile".to_string());
+        }
+        self.charge_field(name)?;
+        let Some(kind) = desc.kind.as_ref() else {
+            return Ok(());
+        };
+        match kind {
+            Kind::Scalar(scalar) => {
+                if let Some(zone) = &scalar.time_zone {
+                    if zone.len() > RootProfileV1::MAX_NAME_BYTES {
+                        return Err(
+                            "native timestamp timezone exceeds the source profile".to_string()
+                        );
+                    }
+                    self.bytes = self
+                        .bytes
+                        .checked_add(zone.len())
+                        .filter(|bytes| *bytes <= 96 * 1024 * 1024)
+                        .ok_or("native field construction exceeds the source profile")?;
+                }
+            }
+            Kind::List(list) => {
+                if let Some(element) = &list.element {
+                    self.field("item", element, depth + 1)?;
+                }
+            }
+            Kind::Map(map) => {
+                self.charge_field("entries")?;
+                if let Some(key) = &map.key {
+                    self.field("key", key, depth + 1)?;
+                }
+                if let Some(value) = &map.value {
+                    self.field("value", value, depth + 1)?;
+                }
+            }
+            Kind::Strct(strct) => {
+                if strct.fields.len() > 65_536 {
+                    return Err("native struct exceeds the bounded field profile".to_string());
+                }
+                for field in &strct.fields {
+                    if let Some(desc) = &field.r#type {
+                        self.field(&field.name, desc, depth + 1)?;
+                    } else {
+                        self.charge_field(&field.name)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn owned_metadata_field(
+    name: &str,
+    nullable: bool,
+    data_type: DataType,
+    logical_type: Option<LogicalType>,
+    owners: &mut Vec<novarocks_types::arrow_metadata_owner::MetadataOwnedField>,
+) -> Result<arrow::datatypes::FieldRef, String> {
+    use novarocks_types::arrow_metadata_owner::{ArrowMetadataOwner, MetadataOwnerLimits};
+    let entries = logical_type
+        .map(|logical_type| {
+            vec![(
+                novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_string(),
+                logical_type.metadata_value().to_string(),
+            )]
+        })
+        .unwrap_or_default();
+    let owner = ArrowMetadataOwner::try_new(
+        entries,
+        MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        },
+    )
+    .map_err(|_| "native logical metadata construction exceeds its bounded profile".to_string())?
+    .into_field(name.to_string(), data_type, nullable);
+    let field = Arc::clone(owner.field());
+    owners.push(owner);
+    Ok(field)
+}
+
+fn decode_owned_field(
+    name: &str,
+    nullable: bool,
+    desc: &common::TypeDesc,
+    owners: &mut Vec<novarocks_types::arrow_metadata_owner::MetadataOwnedField>,
+) -> Result<arrow::datatypes::FieldRef, String> {
+    use common::type_desc::Kind;
+    let data_type = match desc.kind.as_ref().ok_or("TypeDesc.kind missing")? {
+        Kind::Scalar(scalar) => decode_scalar_type(scalar)?,
+        Kind::List(list) => DataType::List(decode_owned_field(
+            "item",
+            true,
+            list.element.as_ref().ok_or("ListType.element missing")?,
+            owners,
+        )?),
+        Kind::Map(map) => {
+            let key = decode_owned_field(
+                "key",
+                true,
+                map.key.as_ref().ok_or("MapType.key missing")?,
+                owners,
+            )?;
+            let value = decode_owned_field(
+                "value",
+                true,
+                map.value.as_ref().ok_or("MapType.value missing")?,
+                owners,
+            )?;
+            let entries = owned_metadata_field(
+                "entries",
+                false,
+                DataType::Struct(vec![key, value].into()),
+                None,
+                owners,
+            )?;
+            DataType::Map(entries, false)
+        }
+        Kind::Strct(strct) => {
+            let mut fields = Vec::with_capacity(strct.fields.len());
+            for field in &strct.fields {
+                fields.push(decode_owned_field(
+                    &field.name,
+                    true,
+                    field.r#type.as_ref().ok_or("StructField.type missing")?,
+                    owners,
+                )?);
+            }
+            DataType::Struct(fields.into())
+        }
+    };
+    owned_metadata_field(
+        name,
+        nullable,
+        data_type,
+        logical_type_from_desc(desc),
+        owners,
+    )
+}
+
 fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     use common::type_desc::Kind;
 
@@ -202,6 +434,84 @@ mod tests {
 
     use super::decode_type;
     use novarocks_proto_models::common;
+
+    fn scalar(kind: common::PrimitiveType) -> common::TypeDesc {
+        common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                r#type: kind as i32,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn owned_nested_native_fields_preserve_wire_semantics_and_exact_map_owners() {
+        let desc = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Map(Box::new(common::MapType {
+                key: Some(Box::new(scalar(common::PrimitiveType::Int))),
+                value: Some(Box::new(common::TypeDesc {
+                    kind: Some(common::type_desc::Kind::List(Box::new(common::ListType {
+                        element: Some(Box::new(scalar(common::PrimitiveType::Json))),
+                    }))),
+                })),
+            }))),
+        };
+        let source = super::decode_field_type_owned("payload", false, &desc).unwrap();
+        assert_eq!(
+            source.field().as_ref(),
+            &super::decode_field_type("payload", false, &desc).unwrap()
+        );
+        let origins = source.metadata_origins();
+        assert_eq!(origins.owners().len(), 5);
+        assert_eq!(
+            origins
+                .for_field_tree(source.field(), 5, 2)
+                .unwrap()
+                .owners()
+                .len(),
+            5
+        );
+        assert!(origins.for_field_tree(source.field(), 4, 2).is_err());
+        assert!(origins.for_field_tree(source.field(), 5, 1).is_err());
+        for owner in origins.owners() {
+            assert!(origins.metadata_bytes_for(owner.field()).is_some());
+            let independent = Arc::new(owner.field().as_ref().clone());
+            assert_eq!(independent.as_ref(), owner.field().as_ref());
+            assert_eq!(origins.metadata_bytes_for(&independent), None);
+        }
+    }
+
+    #[test]
+    fn owned_native_preflight_bounds_whole_layout_before_construction() {
+        let desc = scalar(common::PrimitiveType::Int);
+        let name = "n".repeat(novarocks_result_contract::RootProfileV1::MAX_NAME_BYTES);
+        assert!(super::decode_field_type_owned(&name, true, &desc).is_ok());
+        assert!(super::decode_field_type_owned(&(name.clone() + "n"), true, &desc).is_err());
+        let column = common::OutputColumn {
+            column_id: 1,
+            name,
+            nullable: false,
+            r#type: Some(desc),
+            ..Default::default()
+        };
+        // Each individual field fits, but the combined names exceed 96 MiB.
+        assert!(super::preflight_native_output_fields(&vec![column; 1536]).is_err());
+        let mut nested = scalar(common::PrimitiveType::Int);
+        for _ in 0..novarocks_result_contract::RootProfileV1::MAX_DEPTH {
+            nested = common::TypeDesc {
+                kind: Some(common::type_desc::Kind::List(Box::new(common::ListType {
+                    element: Some(Box::new(nested)),
+                }))),
+            };
+        }
+        assert!(super::decode_field_type_owned("depth", true, &nested).is_ok());
+        let too_deep = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::List(Box::new(common::ListType {
+                element: Some(Box::new(nested)),
+            }))),
+        };
+        assert!(super::decode_field_type_owned("depth", true, &too_deep).is_err());
+    }
 
     #[test]
     fn decodes_nested_and_decimal_types_without_a_role_codec() {

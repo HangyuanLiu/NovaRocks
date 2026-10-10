@@ -35,7 +35,7 @@ use novarocks_functions::EngineFunctionCatalog;
 use novarocks_local_program::StaticConnectorScan;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_spi::connector::ConnectorStopView;
-use novarocks_types::QueryId;
+use novarocks_types::{BackendProcessId, QueryId};
 use novarocks_worker::TypedScanRuntime;
 
 use crate::fragment_error::NativeFragmentLeafDecodeError;
@@ -57,6 +57,7 @@ pub struct NativePlanDecodeContext {
     query_options: Option<QueryOptions>,
     connector_stop: Option<ConnectorStopView>,
     query_id: Option<QueryId>,
+    backend_process_id: Option<BackendProcessId>,
     fragment_instance_id: FragmentInstanceId,
     /// Exchange-source wait resolved from `[runtime]` at Backend startup.
     exchange_wait: Duration,
@@ -76,6 +77,7 @@ impl Default for NativePlanDecodeContext {
             query_options: None,
             connector_stop: None,
             query_id: None,
+            backend_process_id: None,
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
             exchange_wait: Duration::from_millis(120_000),
             typed_scan_runtime: None,
@@ -107,11 +109,27 @@ impl NativePlanDecodeContext {
             query_options: Some(query_options),
             connector_stop: Some(connector_stop),
             query_id: Some(query_id),
+            backend_process_id: None,
             fragment_instance_id,
             exchange_wait,
             typed_scan_runtime: None,
             function_catalog: None,
         }
+    }
+
+    pub fn with_backend_process_id(mut self, process_id: BackendProcessId) -> Self {
+        self.backend_process_id = Some(process_id);
+        self
+    }
+
+    pub fn backend_process_id(&self) -> Result<BackendProcessId, NativeFragmentLeafDecodeError> {
+        self.backend_process_id.ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                novarocks_proto_codec::ProtocolErrorKind::MissingField,
+                "backend_process_id",
+                "native writer observation requires the admitted task's backend process identity",
+            )
+        })
     }
 
     pub fn with_typed_scan_runtime(mut self, runtime: Option<TypedScanRuntime>) -> Self {

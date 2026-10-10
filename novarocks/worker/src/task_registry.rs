@@ -49,7 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -209,6 +209,26 @@ impl<T> ObservedRegistryMutex<T> {
         }
     }
 
+    fn try_lock(
+        &self,
+    ) -> Result<Option<ObservedRegistryGuard<'_, T>>, TaskPreparationSnapshotError> {
+        let started = Instant::now();
+        let inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(TaskPreparationSnapshotError::Poisoned);
+            }
+        };
+        // Only an actual acquisition contributes a wait/hold observation.
+        self.observation.record_wait(started.elapsed());
+        Ok(Some(ObservedRegistryGuard {
+            inner: Some(inner),
+            observation: &self.observation,
+            acquired: Instant::now(),
+        }))
+    }
+
     fn lock(&self) -> Result<ObservedRegistryGuard<'_, T>, ()> {
         let started = Instant::now();
         let inner = self.inner.lock().map_err(|_| ())?;
@@ -313,6 +333,26 @@ pub struct TaskPreparationSnapshot {
     pub byte_limit: usize,
 }
 
+/// Failure to observe preparation ownership without waiting for its mutex.
+/// A busy mutex is reported as an unavailable snapshot, never as this error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskPreparationSnapshotError {
+    /// The actual registry mutex was poisoned; no trustworthy snapshot exists.
+    Poisoned,
+}
+
+impl std::fmt::Display for TaskPreparationSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Poisoned => {
+                formatter.write_str("task preparation snapshot registry mutex poisoned")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskPreparationSnapshotError {}
+
 #[derive(Debug, Default)]
 struct AtomicCounters {
     contexts_established: AtomicU64,
@@ -365,6 +405,7 @@ struct RegistryState {
     in_flight: BTreeMap<QueryContextRef, InFlight>,
     pending_termination: BTreeSet<QueryContextRef>,
     pending_quiesce: BTreeSet<QueryContextRef>,
+    released_root_owners: Vec<ContextRootOwners>,
     retired_task_order: VecDeque<(QueryContextRef, TaskIdentity)>,
     gone_task_order: VecDeque<(QueryContextRef, TaskIdentity)>,
     retired_context_order: VecDeque<QueryContextRef>,
@@ -379,6 +420,7 @@ struct RegistryState {
     retained_tasks: usize,
     retained_bytes: usize,
 }
+type ContextRootOwners = BTreeMap<TaskIdentity, Arc<crate::root_result_channel::RootResultChannel>>;
 
 struct QueuedPreparation {
     request: CreateTask,
@@ -427,9 +469,80 @@ pub struct TaskExecutionRegistry {
 }
 
 impl TaskExecutionRegistry {
+    /// Bounded, nonblocking census of existing context-owned roots. Each
+    /// context and channel costs one scan position, including empty retained
+    /// contexts. Exceeding the observation bound invalidates the whole scrape;
+    /// it changes no admission, lifecycle or configured ownership limit.
+    /// Physical counters are independent atomic samples within each channel.
+    pub fn try_root_ownership_snapshot(
+        &self,
+    ) -> Result<
+        Option<crate::root_result_channel::RootOwnershipSnapshot>,
+        crate::root_result_channel::RootOwnershipSnapshotError,
+    > {
+        use crate::root_result_channel::{RootOwnershipSnapshot, RootOwnershipSnapshotError};
+        const SCAN_POSITIONS: usize = 1024;
+        let Some(state) = self
+            .state
+            .try_lock()
+            .map_err(|_| RootOwnershipSnapshotError::RegistryPoisoned)?
+        else {
+            return Ok(None);
+        };
+        let mut remaining = SCAN_POSITIONS;
+        let mut snapshot = RootOwnershipSnapshot::default();
+        for entry in state.contexts.values() {
+            let Some(next) = remaining.checked_sub(1) else {
+                return Ok(None);
+            };
+            remaining = next;
+            for (identity, root) in &entry.roots {
+                let Some(next) = remaining.checked_sub(1) else {
+                    return Ok(None);
+                };
+                remaining = next;
+                let Some(mut channel) = root.try_ownership_snapshot()? else {
+                    return Ok(None);
+                };
+                channel.terminal_task_records = usize::from(
+                    entry
+                        .tasks
+                        .get(identity)
+                        .is_some_and(TaskEntry::is_terminal_record),
+                );
+                if snapshot.try_add(channel).is_none() {
+                    return Ok(None);
+                }
+            }
+        }
+        // Released roots have already passed physical_idle under this fence;
+        // they contain no producer, segment, read/send or metadata subreservation.
+        // Their fixed core backing and any unrelated Arc tail can still live
+        // after removal. A zero census is not their last-owner exit receipt.
+        Ok(Some(snapshot))
+    }
+
     /// Reports the existing charge ledger, including canceled jobs until their exit.
     pub fn preparation_snapshot(&self) -> TaskPreparationSnapshot {
         let state = self.state.lock().expect(REGISTRY_LOCK);
+        self.project_preparation_snapshot(&state)
+    }
+
+    /// Observe the same lock-consistent preparation ledger without waiting.
+    /// `Ok(None)` means the actual mutex is busy: callers must not substitute
+    /// zero ownership or republish a stale snapshot as a fresh measurement.
+    /// Poisoning remains a distinct error. Failed attempts do not contribute
+    /// wait/hold samples to the actual registry lock observation.
+    pub fn try_preparation_snapshot(
+        &self,
+    ) -> Result<Option<TaskPreparationSnapshot>, TaskPreparationSnapshotError> {
+        let Some(state) = self.state.try_lock()? else {
+            return Ok(None);
+        };
+        Ok(Some(self.project_preparation_snapshot(&state)))
+    }
+
+    fn project_preparation_snapshot(&self, state: &RegistryState) -> TaskPreparationSnapshot {
         TaskPreparationSnapshot {
             positions: state.prepare_charges.len(),
             position_limit: self.config.max_preparing_tasks,
@@ -695,6 +808,59 @@ impl TaskExecutionRegistry {
             .and_then(|context| state.contexts.get(context))
             .and_then(|entry| entry.tasks.get(&identity))
             .is_some_and(|entry| matches!(entry, TaskEntry::Live(_)))
+    }
+
+    /// Resolve an exact root from its original context, independent of the
+    /// task record/tombstone horizon. Read admission is minted under this
+    /// fence, so release cannot race between lookup and handler entry.
+    pub fn context_root_result_route(
+        &self,
+        read: &novarocks_execution_contract::root_result::RootResultRead,
+    ) -> crate::root_result_channel::ContextRootRoute {
+        use crate::root_result_channel::{ContextRootRoute as Route, RootChannelError};
+        let identity = read.root_task();
+        if identity.backend_process_id() != self.config.backend_process_id {
+            return Route::Mismatch;
+        }
+        let state = self.state.lock().expect(REGISTRY_LOCK);
+        let Some(context) = state
+            .context_by_execution
+            .get(&identity.query_execution_id())
+        else {
+            return Route::UnknownRoot;
+        };
+        let Some(entry) = state.contexts.get(context) else {
+            return Route::UnknownRoot;
+        };
+        let Some(root) = entry.roots.get(&identity) else {
+            return if matches!(entry.tasks.get(&identity), Some(TaskEntry::Creating(_))) {
+                Route::Preparing
+            } else {
+                Route::UnknownRoot
+            };
+        };
+        if root.spec().task != identity
+            || root.spec().contract.profile() != read.profile()
+            || root.spec().contract.kind() != read.kind()
+        {
+            return Route::Mismatch;
+        }
+        if !matches!(
+            entry.state,
+            QueryContextState::Active | QueryContextState::Quiescing
+        ) {
+            return Route::AwaitTerminalControl {
+                accepted_consumed: root.snapshot().consumed_through,
+            };
+        }
+        match root.begin_read(read) {
+            Ok(admitted) => Route::Read(admitted),
+            Err(RootChannelError::Capacity) => Route::Busy,
+            Err(RootChannelError::Closed) => Route::AwaitTerminalControl {
+                accepted_consumed: root.snapshot().consumed_through,
+            },
+            Err(_) => Route::Mismatch,
+        }
     }
 
     // ---------------------------------------------------- admission tickets
@@ -1137,7 +1303,6 @@ impl TaskExecutionRegistry {
             receiver_installed: false,
             capability_installed: false,
             failure: None,
-            stop: None,
             committed: false,
         };
         let _ = transaction.abandon(
@@ -1272,12 +1437,10 @@ impl TaskExecutionRegistry {
             receiver_installed: false,
             capability_installed: false,
             failure: None,
-            stop: None,
             committed: false,
         };
 
-        if let Some(stop) = transaction.cell.stop() {
-            transaction.stop = Some(stop);
+        if transaction.cell.stop().is_some() {
             return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
@@ -1322,8 +1485,15 @@ impl TaskExecutionRegistry {
             }
         };
         transaction.receiver_installed = true;
-        if let Some(stop) = transaction.cell.stop() {
-            transaction.stop = Some(stop);
+        if let Err(rejection) = prepared.validate_task(&transaction.descriptor) {
+            return transaction.abandon(
+                operation,
+                OperationOutcome::InvalidStateOrRequest,
+                rejection.category(),
+                rejection.detail().as_str(),
+            );
+        }
+        if transaction.cell.stop().is_some() {
             return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
@@ -1358,8 +1528,7 @@ impl TaskExecutionRegistry {
             }
         };
 
-        if let Some(stop) = transaction.cell.stop() {
-            transaction.stop = Some(stop);
+        if transaction.cell.stop().is_some() {
             return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
@@ -1391,17 +1560,21 @@ impl TaskExecutionRegistry {
         };
 
         let receipt = CreateTaskReceipt::new(identity, receipts, status.current());
-        if let Some((runnable, status)) = transaction.commit(LiveTask {
-            descriptor: Arc::clone(&transaction.descriptor),
-            prepared,
-            receipt: receipt.clone(),
-            creation_failure: None,
-            status,
-            runnable,
-            domains: task_domains,
-            receiver_installed: true,
-            capability_installed: true,
-        }) {
+        let (prepared, root) = prepared.into_parts();
+        if let Some((runnable, status)) = transaction.commit(
+            LiveTask {
+                descriptor: Arc::clone(&transaction.descriptor),
+                prepared,
+                receipt: receipt.clone(),
+                creation_failure: None,
+                status,
+                runnable,
+                domains: task_domains,
+                receiver_installed: true,
+                capability_installed: true,
+            },
+            root,
+        ) {
             // The context closed while this task was being built. Stand the
             // committed worker down. The closing context retained the Live
             // entry, so its eventual stop and resource convergence remain
@@ -2704,6 +2877,9 @@ impl TaskExecutionRegistry {
                 if self.release_ready_locked(&state, context) {
                     let entry = state.contexts.get_mut(&context).expect("quiescing context");
                     let lease = entry.lease;
+                    for root in entry.roots.values() {
+                        root.seal_reads(novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextReleased);
+                    }
                     entry.state = QueryContextState::Releasing;
                     if let Some(lease) = lease {
                         let removed = state.lease_expiry.remove(context, lease);
@@ -2912,7 +3088,7 @@ impl TaskExecutionRegistry {
     fn settle(&self) -> DeadlineSweep {
         let mut sweep = DeadlineSweep::default();
         for _ in 0..MAX_SETTLE_PASSES {
-            let (normal_fanouts, fanouts) = {
+            let (normal_fanouts, fanouts, sealed_roots) = {
                 let mut state = self.state.lock().expect(REGISTRY_LOCK);
                 let now = self.clock.now();
                 sweep.leases_expired += self.expire_leases_locked(&mut state, now);
@@ -2920,15 +3096,29 @@ impl TaskExecutionRegistry {
                 (
                     std::mem::take(&mut state.pending_quiesce),
                     std::mem::take(&mut state.pending_termination),
+                    state
+                        .contexts
+                        .values()
+                        .filter(|entry| {
+                            matches!(
+                                entry.state,
+                                QueryContextState::Aborting | QueryContextState::Releasing
+                            )
+                        })
+                        .flat_map(|entry| entry.roots.values().cloned())
+                        .collect::<Vec<_>>(),
                 )
             };
+            for root in sealed_roots {
+                root.finish_seal();
+            }
             for context in &normal_fanouts {
                 self.stand_down_quiescing_tasks(*context);
             }
             for context in &fanouts {
                 self.stand_down_tasks(*context);
             }
-            {
+            let released_root_owners = {
                 let mut state = self.state.lock().expect(REGISTRY_LOCK);
                 let now = self.clock.now();
                 sweep.tasks_retired += self.retire_locked(&mut state, now);
@@ -2938,7 +3128,9 @@ impl TaskExecutionRegistry {
                 sweep.tasks_reaped += tasks;
                 sweep.contexts_reaped += contexts;
                 self.enforce_capacity_locked(&mut state);
-            }
+                std::mem::take(&mut state.released_root_owners)
+            };
+            drop(released_root_owners);
             self.gate.notify_all();
             if fanouts.is_empty() && normal_fanouts.is_empty() {
                 break;
@@ -3082,6 +3274,36 @@ impl TaskExecutionRegistry {
             }
             self.task_host.abort_context_admission(context);
             entry.state = QueryContextState::Aborting;
+            let root_close = if matches!(
+                entry.latch.cause(),
+                Some(TerminationDetail::Aborted(AbortCause::LeaseExpired))
+            ) {
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::LeaseExpired
+            } else {
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted
+            };
+            // Fix each live bounded root's exact lifecycle cause before its
+            // seal becomes visible to producer/driver threads. Runnable abort
+            // remains outside the registry fence; until that fan-out arrives,
+            // completion reads this Worker-owned cause rather than treating
+            // the closed channel as an originating execution failure.
+            let cause = entry
+                .termination_cause()
+                .expect("a latched context has an abort cause");
+            for identity in entry.roots.keys() {
+                if let Some(TaskEntry::Live(live)) = entry.tasks.get(identity)
+                    && !live.status.is_terminal()
+                {
+                    live.status.advance(
+                        TaskState::Aborting,
+                        Some(TerminationDetail::Aborted(cause)),
+                        TaskOutputFacts::default(),
+                    );
+                }
+            }
+            for root in entry.roots.values() {
+                root.seal_reads(root_close);
+            }
             entry.terminating_since = Some(now);
             let installed_lease = entry.lease.take();
             // Capability revocation belongs to the winner and happens once,
@@ -3361,6 +3583,7 @@ impl TaskExecutionRegistry {
                     continue;
                 };
                 let ready = entry.tasks.values().all(TaskEntry::is_terminal_record)
+                    && entry.roots.values().all(|root| root.physical_idle())
                     && state
                         .prepare_context_counts
                         .get(&context)
@@ -3444,6 +3667,10 @@ impl TaskExecutionRegistry {
             entry.tasks.values().all(TaskEntry::is_terminal_record),
             "query context convergence requires every task to have physically converged"
         );
+        assert!(
+            entry.roots.values().all(|root| root.physical_idle()),
+            "context convergence requires root read/send/producer owners to exit"
+        );
 
         assert_eq!(
             state
@@ -3458,7 +3685,7 @@ impl TaskExecutionRegistry {
         if let Some(lease) = entry.lease {
             state.lease_expiry.remove(context, lease);
         }
-        let (task_identities, source) = {
+        let (task_identities, source, roots) = {
             let entry = state
                 .contexts
                 .get_mut(&context)
@@ -3473,8 +3700,12 @@ impl TaskExecutionRegistry {
             (
                 entry.tasks.keys().copied().collect::<Vec<_>>(),
                 Arc::clone(&entry.source),
+                std::mem::take(&mut entry.roots),
             )
         };
+        if !roots.is_empty() {
+            state.released_root_owners.push(roots);
+        }
         for identity in task_identities {
             self.ports.discard_task(identity);
         }
@@ -3937,7 +4168,6 @@ struct CreationTransaction<'a> {
     receiver_installed: bool,
     capability_installed: bool,
     failure: Option<CreationFailure>,
-    stop: Option<PreparationStop>,
     committed: bool,
 }
 
@@ -3957,7 +4187,7 @@ impl CreationTransaction<'_> {
             detail: detail.clone(),
         };
         if self.cell.accepted_status().is_some() {
-            self.stop = self.cell.claim_failure(failure.clone());
+            self.cell.claim_failure(failure.clone());
         }
         self.failure = Some(failure);
         OperationReceipt::rejected(operation, outcome, detail)
@@ -3974,10 +4204,12 @@ impl CreationTransaction<'_> {
     fn commit(
         &mut self,
         mut live: LiveTask,
+        root: Option<Arc<crate::root_result_channel::RootResultChannel>>,
     ) -> Option<(Arc<dyn RunnableTask>, Arc<TaskStatusOwner>)> {
         let status = Arc::clone(&live.status);
         let runnable = Arc::clone(&live.runnable);
         let closed;
+        let mut sealed_root = None;
         {
             let mut state = self.registry.state.lock().expect(REGISTRY_LOCK);
             closed = state.context_state(self.context) != QueryContextState::Active;
@@ -3994,6 +4226,29 @@ impl CreationTransaction<'_> {
                 .contexts
                 .get_mut(&self.context)
                 .expect("a reserved creation retains its query context");
+            if let Some(root) = root {
+                root.bind_context_progress(&entry.source)
+                    .expect("exact root preparation binds its one context source");
+                if closed {
+                    let reason = if matches!(
+                        entry.latch.cause(),
+                        Some(TerminationDetail::Aborted(AbortCause::LeaseExpired))
+                    ) {
+                        novarocks_execution_contract::root_lifetime::RootRetentionClose::LeaseExpired
+                    } else {
+                        novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted
+                    };
+                    root.seal_reads(reason);
+                    sealed_root = Some(Arc::clone(&root));
+                } else {
+                    root.mark_context_owned()
+                        .expect("active context takes its provisional root");
+                }
+                assert!(
+                    entry.roots.insert(self.identity, root).is_none(),
+                    "one root channel per exact creation"
+                );
+            }
             entry.mark_spent(self.identity);
             entry
                 .tasks
@@ -4011,6 +4266,9 @@ impl CreationTransaction<'_> {
                 // the Live record and before any runnable may start.
                 status.release_to_observers();
             }
+        }
+        if let Some(root) = sealed_root {
+            root.finish_seal();
         }
         // Completion can race ahead of the creation transaction. It may run
         // only after the task is findable as Live, so an immediate terminal
@@ -4073,26 +4331,17 @@ impl Drop for CreationTransaction<'_> {
         });
         let accepted = self.cell.accepted_status();
         if let Some(status) = &accepted {
-            if self.failure.is_none() && self.stop.is_none() {
-                self.stop = self.cell.claim_failure(failure.clone());
+            if self.failure.is_none() {
+                self.cell.claim_failure(failure.clone());
             }
-            let reporter = TaskStatusReporter::new(Arc::clone(status));
-            let stop = self.stop.or_else(|| {
-                if self.failure.is_some() {
-                    None
-                } else {
-                    self.cell.stop()
-                }
-            });
-            match stop {
-                Some(PreparationStop::Cancel(reason)) => {
-                    reporter.canceling(reason);
-                    reporter.canceled(reason);
-                }
-                Some(PreparationStop::Abort(cause)) => {
-                    reporter.aborting(cause);
-                    reporter.aborted(cause);
-                }
+            // The cell orders this creation's own failure against every stop
+            // request, so it is read here rather than from whatever an earlier
+            // preparation checkpoint saw: a cancel may have escalated to an
+            // abort since. The status owner then arbitrates that proposal
+            // against the stand-down it already published, in one step.
+            let proposal = match self.cell.stop() {
+                Some(PreparationStop::Cancel(reason)) => TerminationDetail::Canceled(reason),
+                Some(PreparationStop::Abort(cause)) => TerminationDetail::Aborted(cause),
                 None => {
                     let detail =
                         novarocks_execution_contract::SafeDetail::new(failure.detail.clone())
@@ -4102,15 +4351,17 @@ impl Drop for CreationTransaction<'_> {
                                 )
                                 .expect("fixed preparation detail is bounded")
                             });
-                    let failure = novarocks_execution_contract::TaskFailure::new_in_phase(
-                        failure.category,
-                        detail,
-                        novarocks_execution_contract::TaskFailurePhase::Preparation,
-                    );
-                    reporter.failing(failure.clone());
-                    reporter.failed(failure);
+                    TerminationDetail::Failed(
+                        novarocks_execution_contract::TaskFailure::new_in_phase(
+                            failure.category,
+                            detail,
+                            novarocks_execution_contract::TaskFailurePhase::Preparation,
+                        ),
+                    )
                 }
-            }
+            };
+            status.conclude_termination(proposal, TaskOutputFacts::default());
+            let reporter = TaskStatusReporter::new(Arc::clone(status));
             reporter.release_output();
             reporter.note_actual_stopped();
             reporter.note_resources_converged();
@@ -4295,6 +4546,234 @@ mod registry_lock_observation_tests {
         let snapshot = mutex.observation.snapshot();
         assert_eq!(snapshot.wait_samples, 1);
         assert_eq!(snapshot.hold_samples, 2);
+    }
+}
+
+#[cfg(test)]
+mod preparation_snapshot_tests {
+    use super::*;
+    use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
+    use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc;
+
+    // Sampling must never invoke an execution port. These hosts deliberately
+    // panic instead of supplying lifecycle behavior to the observation tests.
+    struct UncalledPorts;
+
+    impl QueryContextHost for UncalledPorts {
+        fn materialize(&self, _: SharedFactsRequest<'_>) -> Result<(), crate::HostRejection> {
+            panic!("preparation observation called materialize")
+        }
+        fn release(&self, _: QueryContextRef) -> ReleasedContextEvidence {
+            panic!("preparation observation called release")
+        }
+        fn advance_shared_domain(
+            &self,
+            _: QueryContextRef,
+            _: &QueryContextDomainUpdate,
+        ) -> Result<(), crate::HostRejection> {
+            panic!("preparation observation advanced shared domain")
+        }
+    }
+
+    impl TaskExecutionHost for UncalledPorts {
+        fn close_context_admission(&self, _: QueryContextRef) {
+            panic!("preparation observation closed admission")
+        }
+        fn retire_context_execution(&self, _: QueryContextRef) {
+            panic!("preparation observation retired context")
+        }
+        fn forget_context_admission(&self, _: QueryContextRef) {
+            panic!("preparation observation forgot context")
+        }
+        fn install_receiver(
+            &self,
+            _: &TaskDescriptor,
+            _: TaskCreationInput,
+        ) -> Result<crate::PreparedTaskInstallation, crate::HostRejection> {
+            panic!("preparation observation installed receiver")
+        }
+        fn remove_receiver(&self, _: &TaskDescriptor) {
+            panic!("preparation observation removed receiver")
+        }
+        fn install_inbound_capability(
+            &self,
+            _: &TaskDescriptor,
+        ) -> Result<(), crate::HostRejection> {
+            panic!("preparation observation installed inbound capability")
+        }
+        fn remove_inbound_capability(&self, _: &TaskDescriptor) {
+            panic!("preparation observation removed inbound capability")
+        }
+        fn submit_runnable(
+            &self,
+            _: &TaskDescriptor,
+            _: TaskStatusReporter,
+        ) -> Result<Arc<dyn RunnableTask>, crate::HostRejection> {
+            panic!("preparation observation submitted runnable")
+        }
+        fn apply_task_domain(
+            &self,
+            _: &TaskDescriptor,
+            _: &TaskDomainUpdate,
+        ) -> Result<Option<u64>, crate::HostRejection> {
+            panic!("preparation observation applied task domain")
+        }
+    }
+
+    impl crate::TaskProtocolObserver for UncalledPorts {
+        fn observe(&self, _: TaskProtocolEvent) {
+            panic!("preparation observation emitted protocol event")
+        }
+    }
+    impl crate::TaskResultLifecycle for UncalledPorts {
+        fn discard_task(&self, _: TaskIdentity) {
+            panic!("preparation observation discarded result")
+        }
+        fn retire_task_result(&self, _: TaskIdentity) {
+            panic!("preparation observation retired result")
+        }
+    }
+    impl crate::TaskExecutionMetrics for UncalledPorts {
+        fn record_task_created(&self) {
+            panic!("preparation observation created task")
+        }
+    }
+
+    fn registry() -> Arc<TaskExecutionRegistry> {
+        let config = TaskExecutionRegistryConfig::for_process(BackendProcessId::new_v7(), 17, 9);
+        TaskExecutionRegistry::new(
+            config,
+            Arc::new(crate::ManualClock::new()),
+            Arc::new(UncalledPorts),
+            Arc::new(UncalledPorts),
+            crate::TaskExecutionPorts::new(
+                Arc::new(UncalledPorts),
+                Arc::new(UncalledPorts),
+                Arc::new(UncalledPorts),
+            ),
+        )
+    }
+
+    fn assert_same_samples(before: RegistryLockSnapshot, after: RegistryLockSnapshot) {
+        assert_eq!(before.wait_samples, after.wait_samples);
+        assert_eq!(before.wait_nanoseconds, after.wait_nanoseconds);
+        assert_eq!(before.wait_max_nanoseconds, after.wait_max_nanoseconds);
+        assert_eq!(before.hold_samples, after.hold_samples);
+        assert_eq!(before.hold_nanoseconds, after.hold_nanoseconds);
+        assert_eq!(before.hold_max_nanoseconds, after.hold_max_nanoseconds);
+    }
+
+    #[test]
+    fn busy_actual_registry_returns_without_waiting_or_fabricating_samples() {
+        let registry = registry();
+        let guard = registry.state.lock().expect("hold actual registry");
+        let before = registry.registry_lock_observation().snapshot();
+        let sampling = Arc::clone(&registry);
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let attempts = (0..16)
+                .map(|_| sampling.try_preparation_snapshot())
+                .collect::<Vec<_>>();
+            sent.send((attempts, sampling.registry_lock_observation().snapshot()))
+                .expect("send observation results");
+        });
+        let result = received.recv_timeout(Duration::from_secs(2));
+        // Always release and join before reporting a regression. A blocking
+        // implementation must fail the oracle without hanging the test suite.
+        drop(guard);
+        worker.join().expect("join observation worker");
+        let (attempts, during) = result.expect("sampling must finish while registry is held");
+        assert!(attempts.iter().all(|result| *result == Ok(None)));
+        assert_same_samples(before, during);
+        assert!(registry.try_preparation_snapshot().unwrap().is_some());
+    }
+
+    #[test]
+    fn successful_try_snapshot_matches_the_same_nonempty_owned_ledger_and_observation() {
+        let registry = registry();
+        let execution =
+            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(1).unwrap()).unwrap();
+        let backend = registry.config.backend_process_id;
+        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        {
+            // Seed the real owner's ledger under its mutex. This verifies
+            // measurement, not task-admission or preparation-job lifecycle.
+            let mut state = registry.state.lock().unwrap();
+            for (id, bytes) in [(1, 17), (2, 36)] {
+                let task = TaskIdentity::new(
+                    execution,
+                    StageId::new(1).unwrap(),
+                    TaskId::new(id).unwrap(),
+                    backend,
+                );
+                state.prepare_charges.insert(task, bytes);
+            }
+            state.prepare_context_counts.insert(context, 2);
+            state.prepare_workers = 1;
+            state.prepare_bytes = 53;
+        }
+        let expected = TaskPreparationSnapshot {
+            positions: 2,
+            position_limit: registry.config.max_preparing_tasks,
+            context_positions: 2,
+            context_position_limit: registry.config.max_preparing_tasks_per_context,
+            queued_positions: 0,
+            workers: 1,
+            worker_limit: registry.config.max_prepare_workers,
+            bytes: 53,
+            byte_limit: registry.config.max_preparing_bytes,
+        };
+        let before = registry.registry_lock_observation().snapshot();
+        assert_eq!(registry.try_preparation_snapshot(), Ok(Some(expected)));
+        let after = registry.registry_lock_observation().snapshot();
+        assert_eq!(after.wait_samples, before.wait_samples + 1);
+        assert_eq!(after.hold_samples, before.hold_samples + 1);
+        assert!(after.sample_age_nanoseconds.is_some());
+        assert_eq!(registry.preparation_snapshot(), expected);
+        {
+            let mut state = registry.state.lock().unwrap();
+            state.prepare_charges.clear();
+            state.prepare_context_counts.clear();
+            state.prepare_workers = 0;
+            state.prepare_bytes = 0;
+        }
+        let released = registry.try_preparation_snapshot().unwrap().unwrap();
+        assert_eq!(
+            (
+                released.positions,
+                released.context_positions,
+                released.workers,
+                released.bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(released, registry.preparation_snapshot());
+    }
+
+    #[test]
+    fn poisoned_actual_registry_is_an_explicit_error_not_an_unavailable_snapshot() {
+        let registry = registry();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _guard = registry.state.lock().unwrap();
+                panic!("poison actual registry for observation test");
+            }))
+            .is_err()
+        );
+        let before = registry.registry_lock_observation().snapshot();
+        assert_eq!(
+            registry.try_preparation_snapshot(),
+            Err(TaskPreparationSnapshotError::Poisoned)
+        );
+        assert_same_samples(before, registry.registry_lock_observation().snapshot());
+        assert_eq!(
+            TaskPreparationSnapshotError::Poisoned.to_string(),
+            "task preparation snapshot registry mutex poisoned"
+        );
+        // The pre-existing blocking API keeps its original poison failure.
+        assert!(catch_unwind(AssertUnwindSafe(|| registry.preparation_snapshot())).is_err());
     }
 }
 

@@ -1,0 +1,11 @@
+-- query 1
+bitmap_state	hll_state	percentile_state
+NULL	NULL	NULL
+
+-- query 2
+bitmap_members	hll_members
+1	1
+
+-- query 3
+bitmap_values	percentile_values
+[null,null]	[null,null]

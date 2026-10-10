@@ -16,12 +16,15 @@
 // under the License.
 
 use super::*;
+use crate::analysis::{BinOp, ExprKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
+use crate::compiler::SqlCompileError;
+use crate::planner::logical::LogicalPlanKind;
 use arrow::{
     array::{Array, Int64Array, StringArray},
     datatypes::DataType,
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool, ConstantValue};
-use novarocks_type_contract::{CompileControlError, FunctionValueType};
+use novarocks_type_contract::{CompileControlError, CompilePhase, FunctionValueType, PureCompileControl};
 use std::sync::{Arc, Mutex};
 
 struct Control {
@@ -96,6 +99,28 @@ fn literal(value: LiteralValue, carrier: DataType) -> TypedExpr {
         value_type: FunctionValueType::new(carrier, false),
     }
 }
+fn format_sort_items(
+    items: &[SortItem],
+    control: &dyn PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    let diagnostic = super::completed::RenderDiagnostic::new(control);
+    let mut output = super::completed::ExplainRenderOutput::new_observed(
+        super::completed::ExplainRenderBudget::default(),
+        control,
+    )?;
+    for item in items {
+        let result = output.push(format_args!(
+            "{}",
+            super::logical::SortItems(std::slice::from_ref(item), Some(&diagnostic))
+        ));
+        if let Some(error) = diagnostic.take_error() {
+            return Err(error);
+        }
+        result?;
+    }
+    output.finish_observed()
+}
+
 fn assert_original_refusals<T>(format: impl Fn(&Control) -> Result<T, SqlCompileError>) {
     let baseline = Control::new(None);
     assert!(format(&baseline).is_ok());

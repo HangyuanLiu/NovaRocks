@@ -23,6 +23,7 @@
 //! boundaries.
 
 pub mod activity;
+mod bounded_dependencies;
 pub mod candidate;
 pub mod dependency;
 pub mod maintenance;

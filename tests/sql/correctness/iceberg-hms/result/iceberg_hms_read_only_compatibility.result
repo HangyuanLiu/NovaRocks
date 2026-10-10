@@ -1,0 +1,53 @@
+-- query 3
+id	p
+1	1
+2	2
+3	1
+
+-- query 4
+id	p
+2	2
+3	1
+
+-- query 5
+id	p
+2	2
+3	1
+
+-- query 6
+snapshots
+2
+
+-- query 7
+content	files
+0	1
+1	1
+
+-- query 8
+content	files
+0	2
+1	1
+
+-- query 9
+id	p
+2	2
+3	1
+
+-- query 10
+id	p
+2	2
+3	1
+
+-- query 12
+id	p
+1	1
+2	2
+3	1
+
+-- query 56
+id	p
+2	2
+3	1
+
+-- query 57
+TABLE_NAME

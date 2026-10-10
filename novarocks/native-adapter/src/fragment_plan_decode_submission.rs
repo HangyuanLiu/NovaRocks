@@ -116,6 +116,7 @@ pub(crate) fn decode_fragment_submission(
         instance.fragment_instance_id,
         exchange_wait,
     )
+    .with_backend_process_id(instance.backend_process_id)
     .with_typed_scan_runtime(typed_scan_runtime)
     .with_function_catalog(function_catalog);
     let mut ledger = NativeRuntimeFilterDecodeLedger::decode(
@@ -133,8 +134,37 @@ pub(crate) fn decode_fragment_submission(
             error,
         )
     })?;
+    let carries_result_fields = match &static_sink {
+        StaticSinkProgram::Result => {
+            crate::final_result_layout::legacy_result_uses_declared_fields(
+                &decoded_root,
+                &fragment.output_columns,
+            )?
+        }
+        StaticSinkProgram::RootResult(contract) => matches!(
+            contract.output(),
+            novarocks_result_contract::FrozenRootOutput::ClientRows(_)
+                | novarocks_result_contract::FrozenRootOutput::ScalarValue(_)
+        ),
+        _ => false,
+    };
+    // The final occurrence layout is independent of every function's carrier
+    // signature. Apply its owned fields to the real output before LocalProgram
+    // freezes the graph and before either result carrier observes the schema.
+    let decoded_root = if carries_result_fields {
+        crate::final_result_layout::apply_final_root_output_layout(
+            decoded_root,
+            &fragment.output_columns,
+            &mut arena,
+            root.node_id,
+        )?
+    } else {
+        decoded_root
+    };
     let sink_requirements = match &static_sink {
-        StaticSinkProgram::Result => vec![ExternalSinkRequirement::Result],
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) => {
+            vec![ExternalSinkRequirement::Result]
+        }
         StaticSinkProgram::Noop => Vec::new(),
         StaticSinkProgram::DataStream { .. }
         | StaticSinkProgram::MultiCastDataStream { .. }
@@ -300,6 +330,7 @@ mod tests {
     fn instance(query: UniqueId, finst: UniqueId) -> NativeFragmentInstanceInput {
         NativeFragmentInstanceInput {
             query_id: QueryId::new(query.high(), query.low()),
+            backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             fragment_instance_id: FragmentInstanceId::new(finst),
             backend_num: BackendNum::try_new(3).expect("backend num"),
             query_options: QueryOptions {

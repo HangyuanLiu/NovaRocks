@@ -34,6 +34,7 @@ pub(crate) mod prune_scan;
 pub(crate) mod prune_sort;
 pub(crate) mod prune_table_function;
 pub(crate) mod prune_union;
+pub(crate) mod prune_values;
 pub(crate) mod prune_window;
 
 use std::collections::HashSet;
@@ -42,7 +43,7 @@ use crate::column_id::{ColumnId, ColumnRefFactory};
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 
-/// Returns all 16 per-operator Phase-2 column pruning rules.
+/// Returns all per-operator Phase-2 column pruning rules.
 ///
 /// These rules consume the `required_output_columns` tags written by the
 /// Phase-1 `TagRequiredColumns` pass and prune each operator's output columns
@@ -50,6 +51,7 @@ use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 pub(crate) fn all_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
         Box::new(prune_scan::PruneScanColumns),
+        Box::new(prune_values::PruneValuesColumns),
         Box::new(prune_project::PruneProjectColumns),
         Box::new(prune_filter::PruneFilterColumns),
         Box::new(prune_aggregate::PruneAggregateColumns),

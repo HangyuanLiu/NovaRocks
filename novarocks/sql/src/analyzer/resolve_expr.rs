@@ -199,8 +199,9 @@ impl<'a> super::AnalyzerContext<'a> {
         // Borrow only this root's original authored binding. Child analysis has
         // already used this same recursion; do not rescan or rebind its graph.
         let binding = match &resolved.kind {
-            ExprKind::FunctionCall { binding, .. }
-            | ExprKind::WindowCall { binding, .. } => Some(binding),
+            ExprKind::FunctionCall { binding, .. } | ExprKind::WindowCall { binding, .. } => {
+                Some(binding)
+            }
             ExprKind::AggregateCall { resolved, .. } => Some(resolved),
             _ => None,
         };
@@ -3278,7 +3279,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
         let mut key_expr = array_expr.clone();
         for field_name in field_chain {
-            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name, span)?;
+            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name, scope, span)?;
         }
 
         let arg_types = vec![
@@ -3292,6 +3293,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         base: TypedExpr,
         field_name: String,
+        scope: &AnalyzerScope,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
         let DataType::List(item_field) = &base.value_type.data_type else {
@@ -3346,7 +3348,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 "item", field_type, true,
             )))
         );
-        Ok(result)
+        self.adapt_bound_output_domains(result, None, scope, span)
     }
 
     fn try_analyze_higher_order_function(
@@ -7388,6 +7390,37 @@ mod tests {
         )
     }
 
+    #[test]
+    fn mixed_decimal_array_literal_freezes_precision_for_every_integer() {
+        for sql in [
+            "SELECT [123, NULL, 1.0]",
+            "SELECT [1.0, NULL, 123]",
+            "SELECT [NULL, 123, 1.0]",
+        ] {
+            let expression = analyze_projection_expr(sql).expect("analyze mixed array literal");
+            let DataType::List(element) = &expression.value_type.data_type else {
+                panic!("mixed array literal must produce a list");
+            };
+            assert_eq!(element.data_type(), &DataType::Decimal128(4, 1), "{sql}");
+            assert!(element.is_nullable(), "{sql}");
+            let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
+                panic!("array literal must retain its exact function binding");
+            };
+            for (arg, selected) in args.iter().zip(&binding.selected.argument_types) {
+                let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
+                    panic!("array literal arguments are values");
+                };
+                assert_eq!(selected.data_type, arg.value_type.data_type, "{sql}");
+            }
+            let novarocks_functions::FunctionResultType::Scalar(selected) =
+                &binding.selected.result_type
+            else {
+                panic!("array literal produces one scalar container value");
+            };
+            assert_eq!(selected.data_type, expression.value_type.data_type, "{sql}");
+        }
+    }
+
     fn analyze_projection_expr_with_function_catalog(
         sql: &str,
         function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
@@ -9138,7 +9171,9 @@ mod tests {
             .argument_types
             .iter()
             .map(|argument| match argument {
-                novarocks_functions::FunctionArgumentType::Value(value) => value.data_type.clone(),
+                novarocks_functions::FunctionArgumentType::Value(value) => {
+                    value.data_type.clone()
+                }
                 novarocks_functions::FunctionArgumentType::Lambda { .. } => {
                     panic!("aggregate update arguments cannot be lambdas")
                 }
@@ -10320,9 +10355,19 @@ mod tests {
                     .iter()
                     .all(|arg| matches!(arg,
                 novarocks_functions::FunctionArgumentType::Value(value)
-                    if value.data_type == DataType::Decimal128(3, 0)))
+                    if value.data_type == DataType::Decimal128(19, 0)))
             );
-            assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
+            let ExprKind::Cast {
+                expr,
+                target,
+                decimal_overflow_policy,
+            } = &args[0].kind
+            else {
+                panic!("expected widening decimal cast: {sql}")
+            };
+            assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
+            assert_eq!(*target, DataType::Decimal128(19, 0));
+            assert_eq!(*decimal_overflow_policy, expected);
             let ExprKind::Cast {
                 expr,
                 target,

@@ -1293,6 +1293,7 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
     let id = FragmentId::new(81);
     let (fragment, value) = literal_fragment(id, FragmentSink::Result, false);
     let field = ResultField {
+        domain: crate::ResultValueDomain::Plain,
         name: "v".into(),
         alias: None,
         value,
@@ -1301,6 +1302,7 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
     let mut input = package_input(fragment.clone());
     assert!(FragmentPackage::try_new(input.clone(), package_admission(), &Control).is_err());
     input.result = Some(ResultPort {
+        scalar_schema: None,
         fragment: id,
         output: fragment.nodes()[&fragment.root()].output.clone(),
         fields: Box::from([field]),

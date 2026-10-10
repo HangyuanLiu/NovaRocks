@@ -150,11 +150,17 @@ publication_b="$tmpdir/publications/b"
 mkdir -p "$publication_a" "$publication_b" "$tmpdir/entry"
 cat >"$publication_a/env.sh" <<EOF
 export NOVA_ENV_REST_ENV_FILE='$publication_a/env.sh'
+export NOVA_ENV_MANIFEST='$publication_a/manifest.json'
 export NOVA_ENV_RUNTIME_DIR='$tmpdir/stable-runtime'
+export NOVAROCKS_FE_CONFIG='$publication_a/fe.toml'
+export NOVAROCKS_BE_CONFIG='$publication_a/be.toml'
+export NOVAROCKS_SQL_TEST_CONFIG='$publication_a/sql-test.toml'
+export NOVA_ENV_MYSQL_PORT='9030'
 export NOVA_ENV_OBJECT_STORE_RUNTIME='os-test'
 export NOVA_ENV_CATALOG_RUNTIME='cat-test'
 export AWS_S3_ENDPOINT='http://127.0.0.1:28000'
 export NOVAROCKS_ICEBERG_REST_URI='http://127.0.0.1:28002'
+export NOVAROCKS_ICEBERG_REST_MV_URI='http://127.0.0.1:28003'
 EOF
 printf '%s\n' 'return 96' >"$publication_b/env.sh"
 ln -s "$publication_a" "$tmpdir/entry/published"
@@ -172,8 +178,80 @@ for receipt in \
   'NOVA_ENV_CATALOG_RUNTIME=cat-test' \
   "NOVA_ENV_PUBLICATION_DIR=$publication_a" \
   'AWS_S3_ENDPOINT=http://127.0.0.1:28000' \
-  'NOVAROCKS_ICEBERG_REST_URI=http://127.0.0.1:28002'; do
+  'NOVAROCKS_ICEBERG_REST_URI=http://127.0.0.1:28002' \
+  'NOVAROCKS_ICEBERG_REST_MV_URI=http://127.0.0.1:28003'; do
   grep -Fx "$receipt" "$tmpdir/runtime-receipt.log" >/dev/null
+done
+
+for mv_failure in contract environment missing-uri missing-manifest; do
+  mv_failed_run="$tmpdir/mv-failed-$mv_failure"
+  mv_failed_code=0
+  mv_expected_code=1
+  if [ "$mv_failure" = "environment" ]; then
+    mv_expected_code=2
+  fi
+  (
+    init_run_dir() {
+      CI_RUN_DIR="$mv_failed_run"
+      CI_SUMMARY="$CI_RUN_DIR/summary.md"
+      mkdir -p "$CI_RUN_DIR"
+      ci_init_summary_state
+      ci_set_repo_context "$REPO_ROOT" test test
+      ci_render_summary "RUNNING"
+    }
+    verify_fixture_inputs() { return 0; }
+    function docker/iceberg-rest/up.sh { return 0; }
+    load_fixture_publication() {
+      source "$publication_a/env.sh"
+      case "$mv_failure" in
+        missing-uri) unset NOVAROCKS_ICEBERG_REST_MV_URI ;;
+        missing-manifest) unset NOVA_ENV_MANIFEST ;;
+      esac
+      return 0
+    }
+    python3() {
+      if [ "$1" = "docker/iceberg-rest/rest-mv/probe.py" ]; then
+        printf '%s\n' "$@" >"$mv_failed_run/probe.args"
+        echo "rest-mv: synthetic $mv_failure failure" >&2
+        return "$mv_expected_code"
+      fi
+      command python3 "$@"
+    }
+    function docker/paimon-read/prepare.sh {
+      touch "$mv_failed_run/paimon-called"
+      return 0
+    }
+    run_cargo_gates() { touch "$mv_failed_run/cargo-called"; }
+
+    main --tier smoke >/dev/null
+  ) || mv_failed_code=$?
+  if [ "$mv_failed_code" -ne "$mv_expected_code" ]; then
+    echo "rest-mv preparation must preserve its failure exit code" >&2
+    exit 1
+  fi
+  grep -Fx -- '- Status: VERIFY FAILED' "$mv_failed_run/summary.md" >/dev/null
+  grep -F '| prepare runtime | VERIFY FAILED |' "$mv_failed_run/summary.md" >/dev/null
+  if [[ -e "$mv_failed_run/paimon-called" || -e "$mv_failed_run/cargo-called" ]]; then
+    echo "rest-mv preparation failure must stop before Paimon and Cargo" >&2
+    exit 1
+  fi
+  case "$mv_failure" in
+    contract|environment)
+      grep -Fx 'NOVAROCKS_ICEBERG_REST_MV_URI=http://127.0.0.1:28003' "$mv_failed_run/env.log" >/dev/null
+      expected_probe_args="$(printf '%s\n' docker/iceberg-rest/rest-mv/probe.py contract --manifest "$publication_a/manifest.json")"
+      if [ "$(cat "$mv_failed_run/probe.args")" != "$expected_probe_args" ]; then
+        echo "rest-mv probe must use the selected publication manifest" >&2
+        exit 1
+      fi
+      ;;
+    missing-uri|missing-manifest)
+      grep -F 'missing required runtime variable:' "$mv_failed_run/env.log" >/dev/null
+      if [[ -e "$mv_failed_run/probe.args" ]]; then
+        echo "incomplete publication must fail before the rest-mv probe" >&2
+        exit 1
+      fi
+      ;;
+  esac
 done
 
 stage_capture="$tmpdir/cargo-gates"

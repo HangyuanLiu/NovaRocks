@@ -9,12 +9,15 @@ workspace = true
 
 [features]
 test-support = []
+mem-1-m07-exact-mysql-write = []
 
 [dependencies]
 novarocks-type-contract.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 novarocks-execution-contract.workspace = true
+novarocks-result-contract.workspace = true
+novarocks-result-render.workspace = true
 novarocks-parser.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-spi.workspace = true

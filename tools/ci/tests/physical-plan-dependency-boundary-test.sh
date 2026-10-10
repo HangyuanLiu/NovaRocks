@@ -57,11 +57,13 @@ members = [
   "crates/connector-contract",
   "crates/constant-contract",
   "crates/fixture-pins",
+  "crates/function-contract",
   "crates/execution",
   "crates/feature-user",
   "crates/hyper",
   "crates/physical-plan",
   "crates/proto-models",
+  "crates/result-contract",
   "crates/serde",
   "crates/sql",
   "crates/tonic",
@@ -72,35 +74,41 @@ EOF
   write_package "$fixture_root" arrow-array arrow-array
   write_package "$fixture_root" arrow-schema-v2 arrow-schema
   replace_text "$fixture_root/crates/arrow-schema-v2/Cargo.toml" \
-    'version = "0.1.0"' 'version = "58.2.0"'
+    'version = "0.1.0"' "version = \"${ARROW_SCHEMA_VERSION}\""
   append_dependency_section "$fixture_root" arrow-schema-v2 features \
     'serde = []'
   write_package "$fixture_root" bytes-v2 bytes
   replace_text "$fixture_root/crates/bytes-v2/Cargo.toml" \
-    'version = "0.1.0"' 'version = "1.11.0"'
+    'version = "0.1.0"' "version = \"${BYTES_VERSION}\""
   write_package "$fixture_root" constant-contract novarocks-constant-contract
   write_package "$fixture_root" fixture-pins fixture-pins
+  write_package "$fixture_root" function-contract novarocks-function-contract
   write_package "$fixture_root" connector-contract novarocks-connector-contract
   write_package "$fixture_root" execution novarocks-execution
   write_package "$fixture_root" feature-user feature-user
   write_package "$fixture_root" hyper hyper
   write_package "$fixture_root" physical-plan novarocks-physical-plan
   write_package "$fixture_root" proto-models novarocks-proto-models
+  write_package "$fixture_root" result-contract novarocks-result-contract
   write_package "$fixture_root" serde serde
   write_package "$fixture_root" sql novarocks-sql
   write_package "$fixture_root" tonic tonic
   write_package "$fixture_root" type-contract novarocks-type-contract
 
   append_dependency "$fixture_root" physical-plan \
-    'arrow-schema = "=58.2.0"'
+    "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
   append_dependency "$fixture_root" physical-plan \
     'novarocks-connector-contract = { path = "../connector-contract" }'
   append_dependency "$fixture_root" physical-plan \
     'novarocks-type-contract = { path = "../type-contract" }'
+  append_dependency "$fixture_root" physical-plan \
+    'novarocks-result-contract = { path = "../result-contract" }'
   append_dependency "$fixture_root" connector-contract \
-    'bytes = "=1.11.0"'
+    "bytes = \"=${BYTES_VERSION}\""
   append_dependency "$fixture_root" type-contract \
-    'arrow-schema = "=58.2.0"'
+    "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
+  append_dependency "$fixture_root" type-contract \
+    'novarocks-result-contract = { path = "../result-contract" }'
 
   append_dependency "$fixture_root" physical-plan \
     'novarocks-constant-contract = { path = "../constant-contract" }'
@@ -108,19 +116,22 @@ EOF
     'novarocks-type-contract = { path = "../type-contract" }'
   local arrow_package
   for arrow_package in arrow-array arrow-buffer arrow-data arrow-schema; do
-    append_dependency "$fixture_root" constant-contract "$arrow_package = \"=58.2.0\""
+    append_dependency "$fixture_root" constant-contract "$arrow_package = \"=${ARROW_SCHEMA_VERSION}\""
   done
   # Lock the independently selected real registry closure without activating
   # unrelated fixture-pins features in physical-plan's own Cargo tree.
-  python3 - "$CHECKER" "$fixture_root/crates/fixture-pins/Cargo.toml" <<'PY_PINS'
+  python3 - "$CHECKER" "$fixture_root/crates/fixture-pins/Cargo.toml" "$REPO_ROOT/Cargo.lock" <<'PY_PINS'
 import importlib.util
 from pathlib import Path
 import sys
+import tomllib
 spec = importlib.util.spec_from_file_location("guard", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 with Path(sys.argv[2]).open("a") as out:
-    for index, (name, version) in enumerate(sorted(module.EXTERNAL_PACKAGE_VERSIONS)):
+    locked = tomllib.loads(Path(sys.argv[3]).read_text())
+    releases = sorted((p["name"], p["version"]) for p in locked["package"] if p["name"] in module.EXTERNAL_PACKAGE_NAMES and p.get("source") == module.CRATES_IO_SOURCE)
+    for index, (name, version) in enumerate(releases):
         out.write(f'pin_{index} = {{ package = "{name}", version = "={version}", default-features = false }}\n')
 PY_PINS
 
@@ -128,7 +139,7 @@ PY_PINS
   # metadata's workspace resolve graph sees serde, while physical-plan's own
   # package-selected tree must remain serde-free.
   append_dependency "$fixture_root" feature-user \
-    'arrow-schema = { version = "=58.2.0", features = ["serde"] }'
+    "arrow-schema = { version = \"=${ARROW_SCHEMA_VERSION}\", features = [\"serde\"] }"
   append_dependency "$fixture_root" feature-user \
     'bytes_alt = { package = "bytes", path = "../bytes-v2" }'
 }
@@ -220,6 +231,91 @@ assert_rejected() {
 python3 "$CHECKER" --manifest-path "$REPO_ROOT/Cargo.toml" >"$tmpdir/repo-stdout"
 grep -Fq "physical-plan dependency boundary: PASS" "$tmpdir/repo-stdout"
 
+# Read the exact package-selected production closure. Missing or ambiguous
+# dependencies are errors; fixtures never guess a version or use a fallback.
+read -r ARROW_SCHEMA_VERSION BYTES_VERSION AUTOCFG_VERSION ZEROCOPY_DERIVE_VERSION < <(python3 - "$CHECKER" "$REPO_ROOT/Cargo.toml" <<'PY_VERSION'
+import importlib.util
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("physical_boundary", sys.argv[1])
+checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(checker)
+manifest = Path(sys.argv[2])
+graph = checker.Graph(checker.cargo_metadata(manifest))
+closure = checker.resolved_normal_packages(manifest, graph)
+versions = []
+for name in ("arrow-schema", "bytes"):
+    packages = [package for package in closure.values() if package["name"] == name]
+    if len(packages) != 1:
+        raise SystemExit(f"production closure must resolve exactly one {name} identity")
+    versions.append(packages[0]["version"])
+for name in ("autocfg", "zerocopy-derive"):
+    packages = graph.packages_by_name.get(name, [])
+    if len(packages) != 1 or packages[0].get("source") != checker.CRATES_IO_SOURCE:
+        raise SystemExit(f"production build closure must resolve exactly one registry {name} identity")
+    versions.append(packages[0]["version"])
+print(*versions)
+PY_VERSION
+)
+[[ -n "$ARROW_SCHEMA_VERSION" && -n "$BYTES_VERSION" && -n "$AUTOCFG_VERSION" && -n "$ZEROCOPY_DERIVE_VERSION" ]]
+
+# Duplicate registry versions need no second locally cached crate. Exercise the
+# same pure closure check with synthetic identities, including missing and
+# repeated traversal of one identity as legal shapes.
+python3 - "$CHECKER" <<'PY_IDENTITIES'
+import importlib.util
+from pathlib import Path
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("physical_boundary", sys.argv[1])
+checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(checker)
+
+def package(name, version, source=checker.CRATES_IO_SOURCE):
+    return {
+        "name": name,
+        "version": version,
+        "source": source,
+        "id": f"{source}#{name}@{version}",
+        "manifest_path": f"/synthetic/registry/src/index/{name}-{version}/Cargo.toml",
+    }
+
+assert checker.verify_external_identity_uniqueness({}) == []
+for name in checker.EXTERNAL_IDENTITY_UNIQUE_NAMES:
+    first = package(name, "2.0.0")
+    second = package(name, "2.1.0")
+    assert checker.verify_external_identity_uniqueness({"one": first}) == []
+    assert checker.verify_external_identity_uniqueness({"one": first, "again": dict(first)}) == []
+    violations = checker.verify_external_identity_uniqueness({"one": first, "two": second})
+    assert len(violations) == 1, violations
+    assert f"contains more than one identity for {name}:" in violations[0], violations
+    assert first["id"] in violations[0] and second["id"] in violations[0], violations
+    # Same version from another authority is a duplicate identity too.
+    alternate = package(name, first["version"], "git+https://example.invalid/fork")
+    violations = checker.verify_external_identity_uniqueness({"one": first, "two": alternate})
+    assert len(violations) == 1, violations
+    assert alternate["id"] in violations[0], violations
+
+# Source/ID labels alone cannot admit a manifest outside the registry source
+# tree. A real registry authority is admitted using its own synthetic version.
+with tempfile.TemporaryDirectory() as directory:
+    for name in checker.EXTERNAL_PACKAGE_SOURCES:
+        registry = package(name, "2.0.0")
+        outside = dict(registry)
+        registry["manifest_path"] = str(Path(directory) / "registry/src/index" / f"{name}-2.0.0" / "Cargo.toml")
+        outside["manifest_path"] = str(Path(directory) / "outside" / f"{name}-2.0.0" / "Cargo.toml")
+        for candidate in (registry, outside):
+            manifest = Path(candidate["manifest_path"])
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("")
+        graph = checker.Graph({"packages": [registry, outside], "workspace_members": []})
+        assert graph.external_packages(name, checker.CRATES_IO_SOURCE) == [registry]
+PY_IDENTITIES
+
 # The minimal legal graph proves the direct contract allow-list and the neutral
 # Connector contract's bytes carrier edge.
 baseline_root="$tmpdir/baseline"
@@ -230,7 +326,7 @@ cargo tree --package feature-user --edges normal --locked --offline \
   --prefix none --format '{p}' --manifest-path "$baseline_root/Cargo.toml" \
   >"$baseline_root/feature-user-tree"
 grep -Fq "serde v" "$baseline_root/feature-user-tree"
-grep -Fq "bytes v1.11.0 ($baseline_root/crates/bytes-v2)" \
+grep -Fq "bytes v${BYTES_VERSION} ($baseline_root/crates/bytes-v2)" \
   "$baseline_root/feature-user-tree"
 assert_accepted "$baseline_root"
 
@@ -245,7 +341,7 @@ assert_accepted "$connector_to_type_root"
 # enter solely through the constant owner; runtime capabilities remain excluded.
 connector_schema_root="$(new_mutation connector-public-schema)"
 append_dependency "$connector_schema_root" connector-contract \
-  'arrow-schema = "=58.2.0"'
+  "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
 assert_accepted "$connector_schema_root"
 
 # A forbidden application owner declared directly must be rejected.
@@ -263,6 +359,14 @@ append_dependency "$transitive_root" type-contract \
 assert_rejected "$transitive_root" \
   "resolved normal/build dependency closure contains forbidden application/execution owner" \
   "novarocks-execution"
+
+result_runtime_root="$(new_mutation result-runtime)"
+append_dependency "$result_runtime_root" result-contract \
+  'tonic = { path = "../tonic" }'
+assert_rejected "$result_runtime_root" \
+  "novarocks-result-contract declares normal dependencies outside its exact owner allow-list" \
+  "resolved normal/build dependency closure contains forbidden wire/RPC capability" \
+  "tonic"
 
 # The foundational type vocabulary cannot depend upward on Connector identity.
 reverse_contract_root="$(new_mutation reverse-contract-direction)"
@@ -293,7 +397,7 @@ assert_rejected "$optional_root" \
 # Even an allow-listed package cannot be hidden behind a physical-plan feature.
 physical_optional_root="$(new_mutation physical-plan-optional)"
 append_dependency "$physical_optional_root" physical-plan \
-  'optional_arrow = { package = "arrow-schema", version = "=58.2.0", optional = true }'
+  "optional_arrow = { package = \"arrow-schema\", version = \"=${ARROW_SCHEMA_VERSION}\", optional = true }"
 assert_rejected "$physical_optional_root" \
   "declares optional dependencies, but the physical-plan contract requires one closed dependency surface" \
   "arrow-schema"
@@ -301,7 +405,7 @@ assert_rejected "$physical_optional_root" \
 physical_target_root="$(new_mutation physical-plan-target)"
 append_dependency_section "$physical_target_root" physical-plan \
   'target.'"'"'cfg(unix)'"'"'.dependencies' \
-  'bytes = "=1.11.0"'
+  "bytes = \"=${BYTES_VERSION}\""
 assert_rejected "$physical_target_root" \
   "declares target-specific dependencies, but the physical-plan contract must be target invariant" \
   "bytes"
@@ -315,16 +419,16 @@ assert_rejected "$physical_feature_root" \
 
 dependency_feature_root="$(new_mutation physical-plan-dependency-feature)"
 replace_text "$dependency_feature_root/crates/physical-plan/Cargo.toml" \
-  'arrow-schema = "=58.2.0"' \
-  'arrow-schema = { version = "=58.2.0", features = ["canonical_extension_types"] }'
+  "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\"" \
+  "arrow-schema = { version = \"=${ARROW_SCHEMA_VERSION}\", features = [\"canonical_extension_types\"] }"
 assert_rejected "$dependency_feature_root" \
   "novarocks-physical-plan enables dependency features, but its dependency semantics must be invariant" \
   "arrow-schema=[canonical_extension_types]"
 
 dependency_default_root="$(new_mutation physical-plan-dependency-default-features)"
 replace_text "$dependency_default_root/crates/physical-plan/Cargo.toml" \
-  'arrow-schema = "=58.2.0"' \
-  'arrow-schema = { version = "=58.2.0", default-features = false }'
+  "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\"" \
+  "arrow-schema = { version = \"=${ARROW_SCHEMA_VERSION}\", default-features = false }"
 assert_rejected "$dependency_default_root" \
   "novarocks-physical-plan disables dependency default features" \
   "arrow-schema"
@@ -334,7 +438,7 @@ assert_rejected "$dependency_default_root" \
 build_dependency_root="$(new_mutation build-dependency)"
 append_dependency_section "$build_dependency_root" physical-plan \
   build-dependencies \
-  'bytes = "=1.11.0"'
+  "bytes = \"=${BYTES_VERSION}\""
 assert_rejected "$build_dependency_root" \
   "declares build dependencies, but the physical-plan contract permits none" \
   "bytes"
@@ -344,7 +448,7 @@ assert_rejected "$build_dependency_root" \
 dev_dependency_root="$(new_mutation dev-dependency)"
 append_dependency_section "$dev_dependency_root" physical-plan \
   dev-dependencies \
-  'bytes = "=1.11.0"'
+  "bytes = \"=${BYTES_VERSION}\""
 assert_rejected "$dev_dependency_root" \
   "declares dev dependencies, but the physical-plan contract permits none" \
   "bytes"
@@ -370,7 +474,7 @@ assert_rejected "$transitive_custom_build_root" \
 transitive_build_dependency_root="$(new_mutation transitive-build-dependency)"
 append_dependency_section "$transitive_build_dependency_root" type-contract \
   build-dependencies \
-  'bytes = "=1.11.0"'
+  "bytes = \"=${BYTES_VERSION}\""
 assert_rejected "$transitive_build_dependency_root" \
   "novarocks-type-contract declares build dependencies" \
   "bytes"
@@ -398,7 +502,7 @@ assert_rejected "$transitive_optional_root" \
 transitive_target_root="$(new_mutation transitive-target)"
 append_dependency_section "$transitive_target_root" type-contract \
   'target.'"'"'cfg(unix)'"'"'.dependencies' \
-  'bytes = "=1.11.0"'
+  "bytes = \"=${BYTES_VERSION}\""
 assert_rejected "$transitive_target_root" \
   "novarocks-type-contract declares target-specific normal dependencies" \
   "bytes"
@@ -459,11 +563,11 @@ assert_rejected "$unknown_transitive_root" \
 # must fail even though it has no build script, dependencies, or forbidden name.
 same_name_identity_root="$(new_mutation selected-same-name-bytes)"
 replace_text "$same_name_identity_root/crates/connector-contract/Cargo.toml" \
-  'bytes = "=1.11.0"' \
+  "bytes = \"=${BYTES_VERSION}\"" \
   'bytes = { path = "../bytes-v2" }'
 assert_rejected "$same_name_identity_root" \
   "resolved normal/build dependency closure contains package identities outside the exact audited allow-list" \
-  "bytes v1.11.0" \
+  "bytes v${BYTES_VERSION}" \
   "crates/bytes-v2/Cargo.toml"
 
 # Direct backing bypasses the constant owner and is still rejected. A foreign
@@ -493,7 +597,7 @@ assert_rejected "$constant_target_root" \
 
 constant_build_root="$(new_mutation constant-build)"
 append_dependency_section "$constant_build_root" constant-contract build-dependencies \
-  'arrow-schema = "=58.2.0"'
+  "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
 assert_rejected "$constant_build_root" \
   "novarocks-constant-contract declares build dependencies"
 
@@ -504,12 +608,12 @@ assert_rejected "$constant_macro_root" \
 
 foreign_arrow_root="$(new_mutation foreign-arrow-backing)"
 replace_text "$foreign_arrow_root/crates/arrow-array/Cargo.toml" \
-  'version = "0.1.0"' 'version = "58.2.0"'
+  'version = "0.1.0"' "version = \"${ARROW_SCHEMA_VERSION}\""
 replace_text "$foreign_arrow_root/crates/constant-contract/Cargo.toml" \
-  'arrow-array = "=58.2.0"' 'arrow-array = { path = "../arrow-array" }'
+  "arrow-array = \"=${ARROW_SCHEMA_VERSION}\"" 'arrow-array = { path = "../arrow-array" }'
 assert_rejected "$foreign_arrow_root" \
   "package identities outside the exact audited allow-list" \
-  "arrow-array v58.2.0" \
+  "arrow-array v${ARROW_SCHEMA_VERSION}" \
   "crates/arrow-array/Cargo.toml"
 
 # Build-only source replacements must be inspected, even though absent from
@@ -517,20 +621,20 @@ assert_rejected "$foreign_arrow_root" \
 foreign_build_root="$(new_mutation foreign-build-helper)"
 write_package "$foreign_build_root" autocfg-v2 autocfg
 replace_text "$foreign_build_root/crates/autocfg-v2/Cargo.toml" \
-  'version = "0.1.0"' 'version = "1.5.0"'
+  'version = "0.1.0"' "version = \"${AUTOCFG_VERSION}\""
 cat >>"$foreign_build_root/Cargo.toml" <<'EOF_BUILD'
 [patch.crates-io]
 autocfg = { path = "crates/autocfg-v2" }
 EOF_BUILD
 assert_rejected "$foreign_build_root" \
   "package identities outside the exact audited allow-list" \
-  "autocfg v1.5.0" \
+  "autocfg v${AUTOCFG_VERSION}" \
   "crates/autocfg-v2/Cargo.toml"
 
 foreign_macro_root="$(new_mutation foreign-proc-macro)"
 write_package "$foreign_macro_root" zerocopy-derive-v2 zerocopy-derive
 replace_text "$foreign_macro_root/crates/zerocopy-derive-v2/Cargo.toml" \
-  'version = "0.1.0"' 'version = "0.8.31"'
+  'version = "0.1.0"' "version = \"${ZEROCOPY_DERIVE_VERSION}\""
 append_dependency_section "$foreign_macro_root" zerocopy-derive-v2 lib 'proc-macro = true'
 cat >>"$foreign_macro_root/Cargo.toml" <<'EOF_MACRO'
 [patch.crates-io]
@@ -538,7 +642,7 @@ zerocopy-derive = { path = "crates/zerocopy-derive-v2" }
 EOF_MACRO
 assert_rejected "$foreign_macro_root" \
   "package identities outside the exact audited allow-list" \
-  "zerocopy-derive v0.8.31" \
+  "zerocopy-derive v${ZEROCOPY_DERIVE_VERSION}" \
   "zerocopy-derive declares a proc-macro target"
 
 echo "physical-plan-dependency-boundary-test: PASS"

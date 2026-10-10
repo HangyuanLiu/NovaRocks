@@ -171,6 +171,8 @@ pub struct ClusterConfig {
     pub frontend_endpoint: Option<String>,
     pub advertise_host: String,
     pub advertise_port: u16,
+    /// Explicit external Control port; absent means the explicit Control bind port.
+    pub advertise_control_port: Option<u16>,
     pub heartbeat_interval_ms: Option<u64>,
     pub heartbeat_timeout_retries: Option<u32>,
     pub backend_announce_lease_ttl_ms: Option<u64>,
@@ -210,6 +212,7 @@ impl Default for ClusterConfig {
             frontend_endpoint: None,
             advertise_host: String::new(),
             advertise_port: 0,
+            advertise_control_port: None,
             heartbeat_interval_ms: None,
             heartbeat_timeout_retries: None,
             backend_announce_lease_ttl_ms: None,
@@ -223,6 +226,9 @@ impl Default for ClusterConfig {
 impl ClusterConfig {
     /// Validate cluster config consistency. Called at startup after parsing.
     pub fn validate(&self) -> Result<(), String> {
+        if self.advertise_control_port == Some(0) {
+            return Err("[cluster].advertise_control_port must be nonzero".to_string());
+        }
         match self.role {
             ClusterRole::Fe if self.frontend_endpoint.is_some() => {
                 return Err("role=fe must not configure [cluster].frontend_endpoint".to_string());
@@ -579,6 +585,10 @@ impl NovaRocksConfig {
             .validate()
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("validate [cluster]: {}", path.display()))?;
+        cfg.server
+            .validate_for_role(cfg.cluster.role)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("validate [server]: {}", path.display()))?;
         if cfg.native_trust.is_none() {
             bail!(
                 "config {}: missing required [native_trust] table",
@@ -708,6 +718,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
     validate_result_retained_config(&cfg.runtime)?;
+    validate_root_producer_config(&cfg.runtime)?;
     validate_scan_io_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
@@ -783,6 +794,7 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 /// read by more than the startup path, and a value that can never be honoured
 /// should be refused where it is written, not where it is first used.
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
+    crate::sdk_listing_profile::validate_current()?;
     config.application.state_store_policy.resolve()?;
     Ok(())
 }
@@ -805,6 +817,9 @@ pub struct ServerConfig {
     pub http_port: u16,
     #[serde(default = "default_grpc_port")]
     pub grpc_port: u16,
+    /// Required explicit BE Control listener port. No port is inferred from Data.
+    #[serde(default)]
+    pub control_grpc_port: Option<u16>,
     #[serde(default = "default_frontend_drain_timeout_ms")]
     pub frontend_drain_timeout_ms: u64,
     #[serde(default = "default_frontend_cleanup_timeout_ms")]
@@ -834,9 +849,33 @@ impl Default for ServerConfig {
             priority_networks: String::new(),
             http_port: default_http_port(),
             grpc_port: default_grpc_port(),
+            control_grpc_port: None,
             frontend_drain_timeout_ms: default_frontend_drain_timeout_ms(),
             frontend_cleanup_timeout_ms: default_frontend_cleanup_timeout_ms(),
         }
+    }
+}
+
+impl ServerConfig {
+    pub fn validate_for_role(&self, role: ClusterRole) -> std::result::Result<(), String> {
+        if self.grpc_port == self.http_port {
+            return Err("server.grpc_port and server.http_port must differ".to_string());
+        }
+        let control_port = match self.control_grpc_port {
+            Some(0) => return Err("[server].control_grpc_port must be nonzero".to_string()),
+            Some(port) => port,
+            None if role == ClusterRole::Be => {
+                return Err("role=be requires explicit [server].control_grpc_port".to_string());
+            }
+            None => return Ok(()),
+        };
+        if control_port == self.grpc_port || control_port == self.http_port {
+            return Err(
+                "server.control_grpc_port must differ from server.grpc_port and server.http_port"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1155,18 +1194,13 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub obligation_records_limit: usize,
     pub control_inflight_limit: usize,
     pub control_ready_limit: usize,
-    pub control_bytes: u64,
-    pub per_scope_bytes: u64,
     pub logical_actor_mailbox_capacity: usize,
     pub logical_context_admission_issue_capacity: usize,
     pub logical_context_establish_capacity: usize,
     pub logical_abort_effect_capacity: usize,
-    pub result_decode_worker_count: usize,
-    pub result_decode_queue_capacity: usize,
     pub logical_rows_delivery_capacity: usize,
     pub logical_replacement_reservation_ms: u64,
     pub logical_remote_cleanup_timeout_ms: u64,
-    pub logical_result_fetch_wait_ms: u64,
     /// How long an idle elastic planning worker remains reusable before it
     /// exits. This affects worker reuse only; it is not an admission bound.
     pub planning_idle_keepalive_ms: u64,
@@ -1186,18 +1220,13 @@ impl Default for FrontendWorkloadRuntimeConfig {
             obligation_records_limit: 8192,
             control_inflight_limit: 16,
             control_ready_limit: 256,
-            control_bytes: 64 * 1024 * 1024,
-            per_scope_bytes: 2 * 1024 * 1024 * 1024,
             logical_actor_mailbox_capacity: 64,
             logical_context_admission_issue_capacity: 16,
             logical_context_establish_capacity: 16,
             logical_abort_effect_capacity: 16,
-            result_decode_worker_count: 2,
-            result_decode_queue_capacity: 32,
             logical_rows_delivery_capacity: 32,
             logical_replacement_reservation_ms: 30_000,
             logical_remote_cleanup_timeout_ms: 5_000,
-            logical_result_fetch_wait_ms: 200,
             planning_idle_keepalive_ms: 60_000,
         }
     }
@@ -1342,7 +1371,8 @@ pub struct RuntimeConfig {
     /// Joint Arrow-input plus encoded-output memory allowed per root stream.
     #[serde(default = "default_result_retained_bytes_per_root")]
     pub result_retained_bytes_per_root: usize,
-    /// Joint Arrow-input plus encoded-output memory allowed across the BE.
+    /// Joint root input/output and producer capacity across the BE. Native
+    /// connections are bounded by transport admission positions, not by this budget.
     #[serde(default = "default_result_retained_bytes_per_process")]
     pub result_retained_bytes_per_process: usize,
     #[serde(default = "default_lake_publication_max_attempt_duration_ms")]
@@ -1391,6 +1421,15 @@ pub struct RuntimeConfig {
     pub io_coalesce_read_max_distance_size: u64,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
     pub pipeline_exec_thread_pool_thread_num: usize,
+    /// Fixed CPU workers for bounded BE root result production.
+    #[serde(default = "default_root_result_producer_threads")]
+    pub root_result_producer_threads: usize,
+    /// Finite root registrations, including dormant and active producers.
+    #[serde(default = "default_root_result_producer_positions")]
+    pub root_result_producer_positions: usize,
+    /// Requested stack bytes for each root CPU worker; zero is rejected.
+    #[serde(default = "default_root_result_producer_stack_bytes")]
+    pub root_result_producer_stack_bytes: usize,
     #[serde(default = "default_data_runtime_worker_threads")]
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
@@ -1455,6 +1494,22 @@ pub struct RuntimeConfig {
     pub path_rewrite: PathRewriteConfig,
     #[serde(default)]
     pub execution_services: ExecutionServicesConfig,
+}
+
+/// Validates a Native transport geometry before any role runtime starts.
+///
+/// Connection, stream, queue and handshake counts and the per-item HTTP/2
+/// sizes must be consistent, multiply without overflow, carry the supported
+/// root peak on the result lane and fit the role descriptor baselines. The
+/// returned report carries the count part of `E_native_transport`; its
+/// per-object coefficients are `None` until P00b freezes them.
+pub fn validate_native_transport_geometry(
+    geometry: &novarocks_execution_contract::native_result_support::NativeResultSupportGeometry,
+) -> Result<novarocks_native_adapter::native_transport_geometry::NativeTransportGeometryReport> {
+    novarocks_native_adapter::native_transport_geometry::validate_native_transport_geometry(
+        geometry,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// `[runtime.native_ingress]` is shared by FE and BE role configuration.
@@ -1683,8 +1738,12 @@ fn default_native_control_request_max_bytes() -> usize {
 /// Both keys default, and both can be set explicitly. `B + H <= P` is an
 /// invariant of the authority, not a preference, so a configuration that
 /// breaks it is refused at startup rather than discovered later.
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeMemoryConfig {
+    /// Protected process control floor. This is independent of FE result windows.
+    #[serde(default = "default_process_control_bytes")]
+    pub control_bytes: u64,
     /// `B`: hard-governed capacity. Absent derives `P - H`.
     #[serde(default)]
     pub capacity_bytes: Option<u64>,
@@ -1694,6 +1753,20 @@ pub struct RuntimeMemoryConfig {
     /// allocation paths come under hard governance.
     #[serde(default)]
     pub headroom_bytes: Option<u64>,
+}
+
+fn default_process_control_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+impl Default for RuntimeMemoryConfig {
+    fn default() -> Self {
+        Self {
+            capacity_bytes: None,
+            headroom_bytes: None,
+            control_bytes: default_process_control_bytes(),
+        }
+    }
 }
 
 /// The fraction of `P` reserved as headroom when `headroom_bytes` is absent.
@@ -2166,6 +2239,17 @@ fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_root_producer_config(runtime: &RuntimeConfig) -> Result<()> {
+    novarocks_native_adapter::root_result_session::RootProducerLimits::try_new(
+        runtime.root_result_producer_threads,
+        runtime.root_result_producer_positions,
+        runtime.root_result_producer_stack_bytes,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("validate runtime root result producer limits")?;
+    Ok(())
+}
+
 fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     let nonzero_durations = [
         (
@@ -2359,7 +2443,11 @@ fn default_result_retained_bytes_per_root() -> usize {
 }
 
 fn default_result_retained_bytes_per_process() -> usize {
-    256 * 1024 * 1024
+    usize::try_from(
+        novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+            .root_joint_retained_bytes_per_process,
+    )
+    .expect("the frozen Native process capacity requires a 64-bit target")
 }
 
 fn default_lake_publication_max_attempt_duration_ms() -> u64 {
@@ -2384,6 +2472,19 @@ fn default_lake_publication_scheduler_margin_ms() -> u64 {
 
 fn default_pipeline_exec_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores
+}
+
+fn default_root_result_producer_threads() -> usize {
+    1
+}
+
+fn default_root_result_producer_positions() -> usize {
+    // Both active and overlapping registrations for 320 client and 4 internal roots.
+    648
+}
+
+fn default_root_result_producer_stack_bytes() -> usize {
+    1024 * 1024
 }
 
 fn default_data_runtime_worker_threads() -> usize {
@@ -2599,6 +2700,9 @@ impl Default for RuntimeConfig {
             io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),
             io_coalesce_read_max_distance_size: default_io_coalesce_read_max_distance_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
+            root_result_producer_threads: default_root_result_producer_threads(),
+            root_result_producer_positions: default_root_result_producer_positions(),
+            root_result_producer_stack_bytes: default_root_result_producer_stack_bytes(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
             scan_io_worker_threads: default_scan_io_worker_threads(),
@@ -2924,7 +3028,7 @@ mod tests {
         NativeIngressRuntimeConfig, NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig,
         RuntimeMemoryConfig, StandaloneServerConfig, validate_query_blocking_config,
         validate_query_control_config, validate_result_retained_config,
-        validate_task_execution_config,
+        validate_root_producer_config, validate_task_execution_config,
     };
 
     /// One gibibyte, used as a readable stand-in for `P` throughout these
@@ -2952,6 +3056,7 @@ mod tests {
         let explicit_headroom = RuntimeMemoryConfig {
             capacity_bytes: None,
             headroom_bytes: Some(P / 10),
+            ..RuntimeMemoryConfig::default()
         }
         .authority_config(P)
         .expect("an explicit headroom must derive the capacity");
@@ -2964,6 +3069,7 @@ mod tests {
         let explicit_capacity = RuntimeMemoryConfig {
             capacity_bytes: Some(P / 2),
             headroom_bytes: None,
+            ..RuntimeMemoryConfig::default()
         }
         .authority_config(P)
         .expect("an explicit capacity must keep the default headroom");
@@ -2976,6 +3082,7 @@ mod tests {
         let error = RuntimeMemoryConfig {
             capacity_bytes: Some(P),
             headroom_bytes: Some(P / 4),
+            ..RuntimeMemoryConfig::default()
         }
         .authority_config(P)
         .expect_err("B + H > P must be refused at startup, not discovered later");
@@ -3017,11 +3124,17 @@ mod tests {
             [memory]
             capacity_bytes = 1024
             headroom_bytes = 512
+            control_bytes = 128
             "#,
         )
         .expect("[runtime.memory] must parse");
         assert_eq!(parsed.memory.capacity_bytes, Some(1024));
         assert_eq!(parsed.memory.headroom_bytes, Some(512));
+        assert_eq!(parsed.memory.control_bytes, 128);
+        assert_eq!(
+            RuntimeMemoryConfig::default().control_bytes,
+            64 * 1024 * 1024
+        );
     }
     use novarocks_native_adapter::{
         FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
@@ -3041,6 +3154,79 @@ mod tests {
     }
 
     #[test]
+    fn root_producer_defaults_are_explicit_and_independent_of_other_pools() {
+        for runtime in [
+            RuntimeConfig::default(),
+            toml::from_str::<RuntimeConfig>("").expect("omitted root settings use defaults"),
+            toml::from_str::<RuntimeConfig>(
+                "pipeline_exec_thread_pool_thread_num = 96\ndata_runtime_worker_threads = 32\n",
+            )
+            .expect("unrelated pool settings parse"),
+        ] {
+            assert_eq!(runtime.root_result_producer_threads, 1);
+            assert_eq!(runtime.root_result_producer_positions, 648);
+            assert_eq!(runtime.root_result_producer_stack_bytes, 1_048_576);
+            validate_root_producer_config(&runtime).expect("finite root defaults are valid");
+        }
+    }
+
+    #[test]
+    fn root_producer_settings_preserve_explicit_values() {
+        let runtime = toml::from_str::<RuntimeConfig>(
+            "root_result_producer_threads = 3\n\
+             root_result_producer_positions = 128\n\
+             root_result_producer_stack_bytes = 2097152\n",
+        )
+        .expect("explicit root producer settings parse");
+        assert_eq!(runtime.root_result_producer_threads, 3);
+        assert_eq!(runtime.root_result_producer_positions, 128);
+        assert_eq!(runtime.root_result_producer_stack_bytes, 2_097_152);
+        validate_root_producer_config(&runtime).expect("explicit finite settings are valid");
+    }
+
+    #[test]
+    fn root_producer_settings_reject_zero_and_values_outside_local_bounds() {
+        for (threads, positions, stack_bytes) in [
+            (0, 648, 1_048_576),
+            (65, 648, 1_048_576),
+            (usize::MAX, 648, 1_048_576),
+            (1, 0, 1_048_576),
+            (1, 4097, 1_048_576),
+            (1, usize::MAX, 1_048_576),
+            (1, 648, 0),
+            (1, 648, 1_048_575),
+            (1, 648, 8_388_609),
+            (1, 648, usize::MAX),
+        ] {
+            let runtime = RuntimeConfig {
+                root_result_producer_threads: threads,
+                root_result_producer_positions: positions,
+                root_result_producer_stack_bytes: stack_bytes,
+                ..Default::default()
+            };
+            let error = validate_root_producer_config(&runtime)
+                .expect_err("invalid root pool settings must fail before composition");
+            assert!(
+                error.to_string().contains("root result producer"),
+                "{threads}/{positions}/{stack_bytes}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_producer_settings_accept_exact_local_bounds() {
+        for (threads, positions, stack_bytes) in [(1, 1, 1_048_576), (64, 4096, 8_388_608)] {
+            let runtime = RuntimeConfig {
+                root_result_producer_threads: threads,
+                root_result_producer_positions: positions,
+                root_result_producer_stack_bytes: stack_bytes,
+                ..Default::default()
+            };
+            validate_root_producer_config(&runtime).expect("exact local bounds are valid");
+        }
+    }
+
+    #[test]
     fn frontend_workload_rejects_retired_capacity_switches() {
         for field in [
             "root_limit",
@@ -3050,6 +3236,11 @@ mod tests {
             "executions_per_root",
             "waiting_bytes",
             "logical_start_capacity",
+            "result_decode_worker_count",
+            "result_decode_queue_capacity",
+            "logical_result_fetch_wait_ms",
+            "control_bytes",
+            "per_scope_bytes",
         ] {
             let document = format!("[runtime.frontend_workload]\n{field} = 1\n",);
             let error = match toml::from_str::<NovaRocksConfig>(&document) {
@@ -3936,6 +4127,39 @@ grpc_port = 19080
     }
 
     #[test]
+    fn control_listener_requires_an_explicit_disjoint_be_port() {
+        let mut server = super::ServerConfig::default();
+        assert_eq!(server.control_grpc_port, None);
+        assert!(server.validate_for_role(ClusterRole::Fe).is_ok());
+        assert!(server.validate_for_role(ClusterRole::Be).is_err());
+        for port in [0, server.grpc_port, server.http_port] {
+            server.control_grpc_port = Some(port);
+            assert!(server.validate_for_role(ClusterRole::Be).is_err());
+        }
+        server.control_grpc_port = Some(19082);
+        assert!(server.validate_for_role(ClusterRole::Be).is_ok());
+        let parsed: NovaRocksConfig = toml::from_str(
+            "[server]\ncontrol_grpc_port = 19082\n[cluster]\nadvertise_control_port = 29082\n",
+        )
+        .expect("parse explicit Control ports");
+        assert_eq!(parsed.server.control_grpc_port, Some(19082));
+        assert_eq!(parsed.cluster.advertise_control_port, Some(29082));
+    }
+
+    #[test]
+    fn control_advertise_port_rejects_zero_instead_of_inferring_a_port() {
+        let mut cluster = super::ClusterConfig::default();
+        assert_eq!(cluster.advertise_control_port, None);
+        cluster.advertise_control_port = Some(0);
+        assert!(
+            cluster
+                .validate()
+                .unwrap_err()
+                .contains("advertise_control_port")
+        );
+    }
+
+    #[test]
     fn test_standalone_server_defaults() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
@@ -4469,6 +4693,40 @@ role = "leader"
         // 0 means "derive from cores"; resolved value must be >= 1.
         assert!(cfg.execution_services.actual_sink_io_worker_threads() >= 1);
         assert!(cfg.execution_services.actual_sink_io_worker_threads() <= 4);
+    }
+
+    #[test]
+    fn frozen_native_transport_geometry_is_accepted_with_its_count_envelope() {
+        let geometry =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        let report = super::validate_native_transport_geometry(&geometry).unwrap();
+        assert!(report.backend.structural_bytes > 0);
+        assert!(report.frontend.structural_bytes > 0);
+        assert_eq!(report.backend.coefficients, None);
+        assert_eq!(report.frontend.total_bytes().unwrap(), None);
+    }
+
+    #[test]
+    fn native_transport_geometry_overflow_and_inconsistency_are_refused_at_startup() {
+        let mut overflow =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        overflow.transport_maximum_live_backends = u64::MAX;
+        let mut windows =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        windows.transport_h2_stream_receive_window_bytes =
+            windows.transport_h2_connection_receive_window_bytes + 1;
+        let mut carrying =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        carrying.transport_streams_per_connection = 64;
+        for geometry in [overflow, windows, carrying] {
+            let error = super::validate_native_transport_geometry(&geometry)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("inconsistent Native transport geometry"),
+                "{error}"
+            );
+        }
     }
 }
 

@@ -499,6 +499,7 @@ fn run_pass(
         preview_lines: 3,
         cluster_mode: ClusterMode::CrossProcess,
         cluster_size: Some(benchmark.backend_count),
+        cluster_launch_profile: None,
         target_session_sql: Vec::new(),
         rewrite_explain_contains_as_not_contains: Vec::new(),
         dry_run: false,

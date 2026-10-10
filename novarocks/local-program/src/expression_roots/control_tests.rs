@@ -174,6 +174,7 @@ pub(super) fn project_program(
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: definitions.into_iter().map(ProgramExprId::new).collect(),
                     expr_slot_ids: slots,
                     expr_slot_schemas: None,
@@ -207,6 +208,7 @@ fn mixed_program(arena: Arc<ImmutableExpressions>, predicate: usize) -> LocalPro
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(1),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: vec![ProgramExprId::new(0)],
                     expr_slot_ids: vec![SlotId::new(1)],
                     expr_slot_schemas: None,
@@ -810,6 +812,7 @@ fn three_scope_program(
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: vec![ProgramExprId::new(definition)],
                     expr_slot_ids: vec![SlotId::new(1)],
                     expr_slot_schemas: None,

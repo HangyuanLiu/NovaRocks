@@ -150,10 +150,8 @@ pub struct FrontendWorkloadGovernanceSnapshot {
     pub peak_waiting_bytes: u64,
     pub control_ready: usize,
     pub control_inflight: usize,
-    pub resource_limit_bytes: u64,
-    pub held_bytes: u64,
-    pub peak_held_bytes: u64,
-    pub result_credit_held_bytes: u64,
+    /// Client, Local, Internal and Closing positions held by actual result owners.
+    pub result_window_positions: [usize; 4],
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -296,10 +294,7 @@ fn frontend_workload_snapshot(
             peak_waiting_bytes: workload.peak_waiting_bytes,
             control_ready: workload.control_ready,
             control_inflight: workload.control_inflight,
-            resource_limit_bytes: workload.resource_limit_bytes,
-            held_bytes: workload.held_bytes,
-            peak_held_bytes: workload.peak_held_bytes,
-            result_credit_held_bytes: workload.result_credit_held_bytes,
+            result_window_positions: workload.result_windows.held_positions,
         },
         rejected_admissions,
         completed_during_drain: frontend_totals_from_root(
@@ -469,7 +464,7 @@ mod tests {
     use std::time::Duration;
 
     use novarocks_workload_control::{
-        CancellationReason, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        CancellationReason, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
 
     use super::*;
@@ -478,16 +473,12 @@ mod tests {
     fn serving_state_and_governed_workload_observation_share_one_drain_boundary() {
         let lifecycle = Arc::new(FrontendServingLifecycle::new());
         lifecycle.mark_ready().expect("mark ready");
-        let control = WorkloadControl::try_new_split(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 128,
-                control_bytes: 16,
-                per_scope_bytes: 112,
-            },
-        )
-        .expect("valid workload control")
-        .owner;
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .expect("valid workload control")
+            .owner;
+        let capacity = control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .unwrap();
         control.mark_ready().expect("workload ready");
         let reader = FrontendServingWorkloadSnapshotReader::new(
             Arc::clone(&lifecycle),
@@ -496,15 +487,20 @@ mod tests {
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .expect("admit query root");
+        let window = capacity
+            .try_acquire(
+                &work.owner.scope(),
+                novarocks_workload_control::ResultWindowClass::Client,
+            )
+            .unwrap();
+        let tail = window.retain_alias();
+        drop(window);
         assert_eq!(
             reader.frontend_serving_snapshot().workload.active.statement,
             1
         );
-        let initial_governance = &reader.frontend_serving_snapshot().workload.governance;
-        assert_eq!(initial_governance.resource_limit_bytes, 128);
-        assert_eq!(initial_governance.held_bytes, 0);
-        assert_eq!(initial_governance.peak_held_bytes, 0);
-        assert_eq!(initial_governance.result_credit_held_bytes, 0);
+        assert!(control.resources().is_err());
+        assert_eq!(control.snapshot().resource_limit_bytes, None);
 
         assert_eq!(
             lifecycle.begin_drain(Duration::from_secs(1)),
@@ -530,6 +526,19 @@ mod tests {
         assert_eq!(snapshot.workload.rejected_admissions.statement, 1);
         assert_eq!(snapshot.workload.completed_during_drain.statement, 1);
         assert_eq!(snapshot.workload.deadline_cancelled.statement, 1);
+        assert_eq!(
+            snapshot.workload.governance.result_window_positions,
+            [1, 0, 0, 0]
+        );
+        drop(tail);
+        assert_eq!(
+            reader
+                .frontend_serving_snapshot()
+                .workload
+                .governance
+                .result_window_positions,
+            [0; 4]
+        );
     }
 
     #[test]

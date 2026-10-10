@@ -1314,6 +1314,7 @@ fn lower_core(
             ProgramNodeKind::Project {
                 input: join,
                 is_subordinate: true,
+                validate_final_result_input: false,
                 exprs: definitions.to_vec(),
                 expr_slot_ids: published.to_vec(),
                 expr_slot_schemas: None,

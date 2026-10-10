@@ -59,8 +59,8 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
--- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0}
   ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';

@@ -40,6 +40,7 @@ use crate::{
 pub struct CapturedOptimizeTarget {
     pub object_id: Vec<u8>,
     pub base_snapshot_id: i64,
+    pub completion: crate::OptimizeCompletionMode,
 }
 
 /// Role-local adapter that captures the current provider binding for an
@@ -145,7 +146,10 @@ impl OptimizeJobService {
             )
             .await
         {
-            Ok(job) => Ok(OptimizeSubmission::Submitted { job_id: job.job_id }),
+            Ok(job) => Ok(OptimizeSubmission::Submitted {
+                job_id: job.job_id,
+                completion: captured.completion,
+            }),
             Err(error) if error.kind() == RuntimeErrorKind::AlreadyActive => {
                 Ok(OptimizeSubmission::AlreadyActive)
             }
@@ -158,6 +162,13 @@ impl OptimizeJobService {
             .list()
             .await
             .map_err(|error| format!("list optimize jobs failed: {error}"))
+    }
+
+    pub async fn request_cancel(&self, handle: JobHandle) -> Result<(), String> {
+        self.runtime
+            .request_cancel(handle.job_id())
+            .await
+            .map_err(|error| format!("cancel optimize job failed: {error}"))
     }
 
     pub async fn wait_for_completion(
@@ -262,6 +273,10 @@ impl OptimizeJobRuntime {
         self.service.list().await
     }
 
+    pub async fn request_cancel(&self, handle: JobHandle) -> Result<(), String> {
+        self.service.request_cancel(handle).await
+    }
+
     pub async fn wait_for_completion(
         &self,
         handle: JobHandle,
@@ -342,7 +357,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::worker::{OptimizeJobAdmission, OptimizeJobExecution, OptimizeJobScope};
+    use crate::worker::{OptimizeJobAdmission, OptimizeJobExecution};
     use crate::{AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceTargetRebind};
 
     struct FixedCapture;
@@ -352,16 +367,35 @@ mod tests {
             Ok(CapturedOptimizeTarget {
                 object_id: vec![7],
                 base_snapshot_id: 11,
+                completion: crate::OptimizeCompletionMode::Detached,
             })
         }
     }
 
-    struct ActiveScope;
-
-    impl OptimizeJobScope for ActiveScope {
-        fn is_cancelled(&self) -> Result<bool, String> {
-            Ok(false)
+    #[tokio::test]
+    async fn optimize_submission_preserves_the_captured_completion_rule() {
+        struct AwaitCapture;
+        impl OptimizeTargetCapturePort for AwaitCapture {
+            fn capture(&self, _: &MaintenanceTarget) -> Result<CapturedOptimizeTarget, String> {
+                Ok(CapturedOptimizeTarget {
+                    object_id: vec![8],
+                    base_snapshot_id: 12,
+                    completion: crate::OptimizeCompletionMode::AwaitTerminal,
+                })
+            }
         }
+        let service = OptimizeJobService::new();
+        let submitted = service
+            .submit_optimize(target(), &AwaitCapture)
+            .await
+            .unwrap();
+        let OptimizeSubmission::Submitted { job_id, completion } = submitted else {
+            panic!("expected own submission");
+        };
+        assert_eq!(completion, crate::OptimizeCompletionMode::AwaitTerminal);
+        let job = service.runtime.get(job_id).await.unwrap().unwrap();
+        assert_eq!(job.object_id, vec![8]);
+        assert_eq!(job.base_snapshot_id, 12);
     }
 
     struct ReadyAdmission;
@@ -369,7 +403,9 @@ mod tests {
     #[async_trait::async_trait]
     impl OptimizeJobAdmissionPort for ReadyAdmission {
         async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
-            Ok(OptimizeJobAdmission::Acquired(Box::new(ActiveScope)))
+            Ok(OptimizeJobAdmission::Acquired(
+                crate::worker::tests::admitted_scope_fixture().await,
+            ))
         }
     }
 
@@ -380,8 +416,15 @@ mod tests {
             true
         }
 
-        fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
-            Some(Box::new(Self))
+        fn acquire(
+            &self,
+            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
+            capacity
+                .scope()
+                .check()
+                .map_err(|error| error.to_string())?;
+            Ok(Some(Box::new(Self)))
         }
     }
 
@@ -393,7 +436,9 @@ mod tests {
         fn execute(
             &self,
             _job: &OptimizeJob,
+            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         ) -> Result<MaintenanceActionOutcome, crate::runtime::TerminalError> {
+            capacity.scope().check().unwrap();
             Ok(MaintenanceActionOutcome::RewriteDataFiles {
                 target_snapshot_id: Some(1),
                 rewritten_data_files_count: 1,
@@ -525,8 +570,15 @@ mod tests {
                 true
             }
 
-            fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
-                Some(Box::new(Self))
+            fn acquire(
+                &self,
+                capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
+                capacity
+                    .scope()
+                    .check()
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Box::new(Self)))
             }
         }
 
@@ -538,6 +590,7 @@ mod tests {
             fn execute(
                 &self,
                 _job: &OptimizeJob,
+                _capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
             ) -> Result<MaintenanceActionOutcome, crate::runtime::TerminalError> {
                 panic!("automatic job must not use the user optimize path")
             }
@@ -546,7 +599,9 @@ mod tests {
                 &self,
                 job: &OptimizeJob,
                 effect_id: MaintenanceEffectId,
+                capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
             ) -> Result<AutomaticMaintenanceOutcome, crate::runtime::TerminalError> {
+                capacity.scope().check().unwrap();
                 assert_eq!(job.effect_id, Some(effect_id));
                 assert_eq!(effect_id.to_bytes(), [7; 16]);
                 Ok(AutomaticMaintenanceOutcome::NoOpWithoutCommit(

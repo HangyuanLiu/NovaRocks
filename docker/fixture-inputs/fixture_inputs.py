@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping
@@ -58,6 +59,24 @@ def load_lock(path: Path) -> tuple[dict[str, Any], str]:
     for key in ("images", "artifacts", "derived_images"):
         if not isinstance(lock.get(key), dict):
             raise FixtureInputError(f"fixture input lock has no {key} object")
+    for name, item in lock["derived_images"].items():
+        if not isinstance(item, dict):
+            raise FixtureInputError(f"fixture derived image must be an object: {name}")
+        if "base" in item:
+            raise FixtureInputError(f"fixture derived image uses unsupported base field; use bases: {name}")
+        bases = item.get("bases")
+        if not isinstance(bases, dict) or not bases:
+            raise FixtureInputError(f"fixture derived image bases must be a non-empty mapping: {name}")
+        for argument, base in bases.items():
+            if not isinstance(argument, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argument):
+                raise FixtureInputError(f"invalid fixture base build argument: {name}/{argument}")
+            if not isinstance(base, str) or not isinstance(lock["images"].get(base), dict):
+                raise FixtureInputError(f"fixture derived image base is missing: {name}/{base}")
+        if "context" in item:
+            context = item["context"]
+            if not isinstance(context, str) or not context:
+                raise FixtureInputError(f"fixture build context must be a repository-relative directory: {name}")
+            require_relative(context)
     return lock, sha256_bytes(canonical_bytes(lock))
 
 
@@ -68,6 +87,7 @@ CONSUMER_INPUT_ROOTS = {
         ("images", "minio-mc"),
         ("images", "iceberg-rest"),
         ("derived_images", "iceberg-spark"),
+        ("derived_images", "rest-mv"),
     ),
 }
 
@@ -93,8 +113,12 @@ def required_input_names(
         selected[kind].add(name)
         if kind == "derived_images":
             item = lock[kind][name]
-            # The provisioner defines a base as an image, not another derived image.
-            visit("images", item.get("base"))
+            # Every named base is an image, not another derived image.
+            bases = item.get("bases")
+            if not isinstance(bases, dict) or not bases:
+                raise FixtureInputError(f"fixture consumer base dependencies are missing: {name}")
+            for base in bases.values():
+                visit("images", base)
             dependencies = item.get("artifacts")
             if not isinstance(dependencies, list):
                 raise FixtureInputError(f"fixture consumer artifact dependencies are missing: {name}")

@@ -258,6 +258,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: vec![ProgramExprId::new(1)],
                     expr_slot_ids: output_layout.slots().to_vec(),
                     expr_slot_schemas: None,

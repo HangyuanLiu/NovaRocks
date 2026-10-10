@@ -36,6 +36,7 @@ fn zero_program() -> Arc<LocalProgram> {
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([121; 16]).unwrap());
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment,
         fields: Box::default(),
         output,

@@ -47,6 +47,7 @@ impl std::fmt::Debug for QueryExecutionResult {
 
 pub enum DistributedQueryOutcome {
     Result(ResultExecutionOutcome),
+    CowMatch(novarocks_spi::connector::ConnectorRowMutationSelection),
     Write(WriteExecutionOutcome),
     Profile(ProfileExecutionOutcome),
     Statistics(StatisticsExecutionOutcome),
@@ -161,7 +162,7 @@ impl FragmentProfileSet {
 }
 
 pub struct ProfileExecutionOutcome {
-    result: QueryResult,
+    output_rows: u64,
     profiles: FragmentProfileSet,
 }
 
@@ -179,8 +180,8 @@ impl StatisticsExecutionOutcome {
 }
 
 impl ProfileExecutionOutcome {
-    pub(crate) fn into_parts(self) -> (QueryResult, FragmentProfileSet) {
-        (self.result, self.profiles)
+    pub(crate) fn into_parts(self) -> (u64, FragmentProfileSet) {
+        (self.output_rows, self.profiles)
     }
 }
 
@@ -188,6 +189,7 @@ impl DistributedQueryOutcome {
     pub fn intent(&self) -> DistributedQueryIntent {
         match self {
             Self::Result(_) => DistributedQueryIntent::Result,
+            Self::CowMatch(_) => DistributedQueryIntent::CowMatch,
             Self::Write(_) => DistributedQueryIntent::Write,
             Self::Profile(_) => DistributedQueryIntent::Profile,
             Self::Statistics(_) => DistributedQueryIntent::Statistics,
@@ -214,6 +216,19 @@ impl DistributedQueryOutcome {
             Self::Result(outcome) => Ok(outcome),
             other => Err(outcome_variant_mismatch(
                 DistributedQueryIntent::Result,
+                other.intent(),
+            )),
+        }
+    }
+
+    pub(crate) fn into_cow_match(
+        self,
+    ) -> Result<novarocks_spi::connector::ConnectorRowMutationSelection, DistributedQueryError>
+    {
+        match self {
+            Self::CowMatch(selection) => Ok(selection),
+            other => Err(outcome_variant_mismatch(
+                DistributedQueryIntent::CowMatch,
                 other.intent(),
             )),
         }
@@ -307,7 +322,10 @@ impl QueryOutcomeFactory {
                         "Profile outcome cannot contain a write session completion",
                     ));
                 }
-                self.profile(query_result, FragmentProfileSet::new(fragment_profiles))
+                self.profile(
+                    query_result.row_count() as u64,
+                    FragmentProfileSet::new(fragment_profiles),
+                )
             }
             DistributedQueryIntent::Result => {
                 if write_session.is_some() || !fragment_profiles.is_empty() {
@@ -318,11 +336,23 @@ impl QueryOutcomeFactory {
                 }
                 self.result(query_result)
             }
+            DistributedQueryIntent::CowMatch => Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "COW match outcome requires the validated bounded selection",
+            )),
             DistributedQueryIntent::Statistics => Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "Statistics outcome must be completed from the validated Root artifact stream",
             )),
         }
+    }
+
+    pub(crate) fn cow_match(
+        self,
+        selection: novarocks_spi::connector::ConnectorRowMutationSelection,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.require_intent(DistributedQueryIntent::CowMatch)?;
+        Ok(DistributedQueryOutcome::CowMatch(selection))
     }
 
     pub fn result(
@@ -337,12 +367,12 @@ impl QueryOutcomeFactory {
 
     pub fn profile(
         self,
-        result: QueryResult,
+        output_rows: u64,
         profiles: FragmentProfileSet,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.require_intent(DistributedQueryIntent::Profile)?;
         Ok(DistributedQueryOutcome::Profile(ProfileExecutionOutcome {
-            result,
+            output_rows,
             profiles,
         }))
     }

@@ -15,6 +15,7 @@ pub struct RunnerConfig {
     pub timeout: Duration,
     pub launch_profile: LaunchProfile,
     pub uea1_workload_manifest: Option<PathBuf>,
+    pub exact_mysql_execution_binding: Option<PathBuf>,
 }
 
 impl RunnerConfig {
@@ -54,6 +55,7 @@ impl RunnerConfig {
             timeout: Duration::from_secs(cli.timeout_secs),
             launch_profile: cli.launch_profile,
             uea1_workload_manifest: cli.uea1_workload_manifest.clone(),
+            exact_mysql_execution_binding: cli.exact_mysql_execution_binding.clone(),
         })
     }
 }

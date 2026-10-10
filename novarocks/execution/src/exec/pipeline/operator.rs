@@ -32,7 +32,7 @@ use crate::runtime::fragment::ExecutionResult;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::io::FragmentEventSink;
+use crate::runtime::fragment::io::{FragmentEventSink, RootInputPermit};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
@@ -216,8 +216,86 @@ impl FinishingWait {
 }
 
 /// Extended operator contract for processor stages with push/pull semantics.
+pub enum RootPreparedPull {
+    Chunk(Chunk),
+    /// A bounded CPU quantum completed. Workspace and its original grant
+    /// remain on the same driver edge while the driver yields Ready for its
+    /// next turn. No external readiness event is required to resume.
+    Yielded,
+    /// No root-covered workspace remains after this pull.
+    Empty,
+}
+
 pub trait ProcessorOperator: Operator {
     fn need_input(&self) -> bool;
+
+    /// Admission before the upstream owner can materialize its next output.
+    /// Ordinary operators use readiness; bounded root sinks retain one exact
+    /// input/hydration overlap position through the final edge and producer.
+    fn prepare_upstream_pull(&self) -> ExecutionResult<bool> {
+        Ok(self.need_input())
+    }
+
+    /// An empty or failed pull must return an unused root position. A
+    /// successful pull keeps it while the chunk is retained on this edge.
+    fn finish_upstream_pull(&self, _produced_chunk: bool) {}
+
+    /// Move the original terminal admission onto its exact driver edge.
+    /// No upstream allocation may run while a sink's permit lock is held.
+    fn take_prepared_root_input(&mut self) -> Option<RootInputPermit> {
+        None
+    }
+
+    /// Borrow the unique original grant while producing the final batch.
+    /// Only a root-owned materializer constructs its output under this grant
+    /// and can yield without returning the coverage. An ordinary upstream
+    /// operator's output belongs to that operator's own admitted memory owner;
+    /// the root permit is never extended to cover it. The root boundary
+    /// instead reserves one input allowance before this pull and checks the
+    /// actual backing against it after the pull, refusing the input explicitly
+    /// when it does not fit.
+    fn pull_chunk_with_root_input(
+        &mut self,
+        state: &RuntimeState,
+        _input: &RootInputPermit,
+    ) -> ExecutionResult<RootPreparedPull> {
+        self.pull_chunk(state).map(|chunk| match chunk {
+            Some(chunk) => RootPreparedPull::Chunk(chunk),
+            None => RootPreparedPull::Empty,
+        })
+    }
+
+    /// Synchronously destroy only root-covered unpublished workspace before
+    /// its driver edge can return the permit. This API starts no async work.
+    fn release_root_pull_workspace(&mut self) {}
+
+    fn can_accept_root_input(
+        &self,
+        chunk: &Chunk,
+        _input: &RootInputPermit,
+    ) -> ExecutionResult<bool> {
+        self.can_accept_input(chunk)
+    }
+
+    fn push_chunk_with_root_input(
+        &mut self,
+        _state: &RuntimeState,
+        chunk: Chunk,
+        input: RootInputPermit,
+    ) -> ExecutionResult<()> {
+        drop(chunk);
+        drop(input);
+        Err("processor cannot consume an original root input grant"
+            .to_string()
+            .into())
+    }
+
+    /// A host-owned asynchronous terminal processor can fail while its source is
+    /// parked. The driver observes that failure before deciding completion;
+    /// the processor also supplies its stable early-finish wake observable.
+    fn execution_error(&self) -> Option<crate::runtime::fragment::ExecutionFailure> {
+        None
+    }
 
     /// Non-blocking admission for the exact chunk currently retained on the
     /// upstream edge.
@@ -227,6 +305,14 @@ pub trait ProcessorOperator: Operator {
     /// ownership to `push_chunk`.
     fn can_accept_input(&self, _chunk: &Chunk) -> ExecutionResult<bool> {
         Ok(self.need_input())
+    }
+
+    /// Transfers the exact original Chunk to a precovered host input owner.
+    /// Such a processor owns finite carrier validation, hydration and memory
+    /// accounting itself; the driver must not inspect or copy its schema,
+    /// expand dictionaries, or create another accounting charge on this edge.
+    fn takes_original_input(&self) -> bool {
+        false
     }
 
     fn has_output(&self) -> bool;

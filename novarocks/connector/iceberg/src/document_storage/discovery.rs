@@ -104,13 +104,19 @@ pub(crate) fn discover(
         let catalog = Arc::clone(storage.runtime().novarocks_catalog());
         let page_namespace = namespace_name.clone();
         let page_cursor = cursor.clone();
+        let page_context = request.context().clone();
         let page = storage
             .runtime()
             .resources()
             .catalog_runtime()
             .block_on(async move {
                 catalog
-                    .list_tables_page(page_namespace, page_cursor, page_size)
+                    .list_tables_page_for_request(
+                        page_namespace,
+                        page_cursor,
+                        page_size,
+                        page_context,
+                    )
                     .await
             })
             .map_err(|error| {

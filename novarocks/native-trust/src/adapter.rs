@@ -3,20 +3,23 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 use std::{
+    any::Any,
     fmt,
     future::Future,
     io,
+    net::{SocketAddr, ToSocketAddrs},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
 
 use hyper_util::rt::TokioIo;
-use novarocks_types::NativeEndpoint;
+use novarocks_types::{NativeEndpoint, NativeReferenceHost};
 use rustls::{ClientConfig, ServerConfig, pki_types::ServerName};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
+    sync::Semaphore,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
@@ -29,6 +32,200 @@ use crate::{AutomaticTlsMaterial, NativeTlsMaterial, NativeTransportMode, Native
 pub trait NativeIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> NativeIo for T {}
 pub type BoxedNativeIo = Box<dyn NativeIo>;
+
+/// Native IO that keeps a caller-supplied guard alive until the transport
+/// itself has been destroyed.
+///
+/// The guard drops after the boxed transport, even when the transport
+/// destructor unwinds, so an admission position carried by the guard is never
+/// returned while its connection's socket is still open. There is deliberately
+/// no IO or guard extraction API.
+pub struct OwnedNativeIo {
+    io: Option<BoxedNativeIo>,
+    guard: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl OwnedNativeIo {
+    pub fn new(io: BoxedNativeIo) -> Self {
+        Self {
+            io: Some(io),
+            guard: None,
+        }
+    }
+
+    pub fn with_guard<G: Send + Sync + 'static>(io: BoxedNativeIo, guard: G) -> Self {
+        Self {
+            io: Some(io),
+            guard: Some(Box::new(guard)),
+        }
+    }
+
+    fn io_mut(&mut self) -> &mut (dyn NativeIo + 'static) {
+        self.io.as_deref_mut().expect("owned Native IO is live")
+    }
+}
+
+impl fmt::Debug for OwnedNativeIo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedNativeIo")
+            .field("guarded", &self.guard.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OwnedNativeIo {
+    fn drop(&mut self) {
+        // The local guard unwinds after drop(io), even if the boxed
+        // destructor panics.
+        let guard = self.guard.take();
+        drop(self.io.take());
+        drop(guard);
+    }
+}
+
+impl AsyncRead for OwnedNativeIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().io_mut()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for OwnedNativeIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().io_mut()).poll_write(cx, bytes)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().io_mut()).poll_write_vectored(cx, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io
+            .as_deref()
+            .expect("owned Native IO is live")
+            .is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().io_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().io_mut()).poll_shutdown(cx)
+    }
+}
+
+/// How many Native DNS resolutions may run at once in one process.
+///
+/// Each position is one blocking `getaddrinfo` call in a NovaRocks-owned
+/// `spawn_blocking` closure, holding at most one resolver descriptor. The
+/// count is process-local: it is not advertised and does not size any peer.
+/// The resolver library's own memory is outside this bound (spec v6 §5.4.4).
+pub const NATIVE_DNS_RESOLUTION_POSITIONS: usize = 4;
+
+static PROCESS_DNS_RESOLVER: LazyLock<NativeDnsResolver> =
+    LazyLock::new(|| NativeDnsResolver::new(NATIVE_DNS_RESOLUTION_POSITIONS));
+
+/// Bounded resolution of a Native endpoint's reference host.
+///
+/// An IP-literal endpoint is used as is. A DNS endpoint is resolved with the
+/// standard library resolver inside a closure NovaRocks hands to
+/// `spawn_blocking`; the concurrency position is moved into that closure, so
+/// it is returned only when the blocking call itself has returned, even if
+/// the future that awaited it was cancelled first. Resolved addresses are only
+/// dial targets: the reference host stays the TLS and cache identity.
+#[derive(Clone)]
+pub struct NativeDnsResolver {
+    positions: Arc<Semaphore>,
+    limit: usize,
+}
+
+impl fmt::Debug for NativeDnsResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeDnsResolver")
+            .field("limit", &self.limit)
+            .field("available", &self.positions.available_permits())
+            .finish()
+    }
+}
+
+impl NativeDnsResolver {
+    pub fn new(positions: usize) -> Self {
+        Self {
+            positions: Arc::new(Semaphore::new(positions)),
+            limit: positions,
+        }
+    }
+
+    /// The one resolver every Native connector in this process uses.
+    pub fn process() -> &'static Self {
+        &PROCESS_DNS_RESOLVER
+    }
+
+    pub fn positions(&self) -> usize {
+        self.limit
+    }
+
+    pub fn available_positions(&self) -> usize {
+        self.positions.available_permits()
+    }
+
+    pub async fn resolve(&self, endpoint: &NativeEndpoint) -> io::Result<Vec<SocketAddr>> {
+        self.resolve_with(endpoint, |host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect())
+        })
+        .await
+    }
+
+    /// `lookup` is the blocking resolver call; production passes the
+    /// standard library resolver. It runs only for DNS reference hosts.
+    pub(crate) async fn resolve_with<F>(
+        &self,
+        endpoint: &NativeEndpoint,
+        lookup: F,
+    ) -> io::Result<Vec<SocketAddr>>
+    where
+        F: FnOnce(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 'static,
+    {
+        let port = endpoint.port();
+        let host = match endpoint.reference_host() {
+            NativeReferenceHost::Ip(address) => return Ok(vec![SocketAddr::new(*address, port)]),
+            NativeReferenceHost::Dns(name) => name.as_str().to_owned(),
+        };
+        let position = Arc::clone(&self.positions)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("native DNS resolver is closed"))?;
+        let resolved = tokio::task::spawn_blocking(move || {
+            // Returned when this closure returns, not when its awaiting
+            // future is dropped.
+            let _position = position;
+            lookup(&host, port)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("native DNS resolution panicked: {error}")))??;
+        if resolved.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "native DNS resolution returned no address",
+            ));
+        }
+        Ok(resolved)
+    }
+}
 
 #[derive(Clone)]
 pub struct NativeEndpointConnector {
@@ -66,9 +263,22 @@ impl NativeEndpointConnector {
     }
 
     pub async fn connect(&self) -> Result<BoxedNativeIo, NativeConnectFailure> {
+        self.connect_with(NativeDnsResolver::process()).await
+    }
+
+    /// Resolve through `resolver`, then connect only to the resolved
+    /// addresses. TLS still verifies the endpoint's reference host.
+    pub async fn connect_with(
+        &self,
+        resolver: &NativeDnsResolver,
+    ) -> Result<BoxedNativeIo, NativeConnectFailure> {
+        let addresses = resolver
+            .resolve(&self.endpoint)
+            .await
+            .map_err(NativeConnectFailure::Resolution)?;
         // A refused or timed-out connect is the peer being gone, not this
         // deployment being misconfigured.
-        let stream = TcpStream::connect(self.endpoint.as_host_port())
+        let stream = TcpStream::connect(addresses.as_slice())
             .await
             .map_err(NativeConnectFailure::Unreachable)?;
         match &self.client_tls {
@@ -99,6 +309,8 @@ impl NativeEndpointConnector {
 /// widen what a failure discloses.
 #[derive(Debug)]
 pub enum NativeConnectFailure {
+    /// The endpoint's DNS reference host did not resolve to an address.
+    Resolution(io::Error),
     /// The TCP connection could not be established.
     Unreachable(io::Error),
     /// The endpoint's reference host is not a name TLS can verify against.
@@ -112,7 +324,9 @@ impl NativeConnectFailure {
     /// The redacted trust vocabulary this failure answers to.
     pub fn kind(&self) -> NativeTrustFailureKind {
         match self {
-            Self::Unreachable(_) => NativeTrustFailureKind::TransportUnreachable,
+            Self::Resolution(_) | Self::Unreachable(_) => {
+                NativeTrustFailureKind::TransportUnreachable
+            }
             Self::UnverifiableServerName => NativeTrustFailureKind::TransportConfiguration,
             Self::Handshake(_) => NativeTrustFailureKind::TransportHandshake,
         }
@@ -122,6 +336,9 @@ impl NativeConnectFailure {
 impl fmt::Display for NativeConnectFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Resolution(error) => {
+                write!(formatter, "{}: name resolution: {error}", self.kind())
+            }
             Self::Unreachable(error) => write!(formatter, "{}: {error}", self.kind()),
             Self::UnverifiableServerName => write!(formatter, "{}", self.kind()),
             Self::Handshake(error) => write!(formatter, "{}: {error}", self.kind()),
@@ -132,7 +349,9 @@ impl fmt::Display for NativeConnectFailure {
 impl std::error::Error for NativeConnectFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Unreachable(error) | Self::Handshake(error) => Some(error),
+            Self::Resolution(error) | Self::Unreachable(error) | Self::Handshake(error) => {
+                Some(error)
+            }
             Self::UnverifiableServerName => None,
         }
     }
@@ -199,5 +418,158 @@ impl NativeIncomingAdapter {
                 .map(|stream| Box::new(stream) as BoxedNativeIo)
                 .map_err(|_| NativeTrustFailureKind::TransportConfiguration),
         }
+    }
+}
+
+#[cfg(test)]
+mod dns_tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::{Arc, Mutex, mpsc},
+        time::Duration,
+    };
+
+    use novarocks_types::NativeEndpoint;
+
+    use super::NativeDnsResolver;
+
+    const WATCHDOG: Duration = Duration::from_secs(5);
+
+    async fn available_becomes(resolver: &NativeDnsResolver, expected: usize) {
+        tokio::time::timeout(WATCHDOG, async {
+            while resolver.available_positions() != expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("DNS positions reach the expected count");
+    }
+
+    type Lookup = Box<dyn FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send>;
+
+    /// A blocking lookup that reports entry and returns only when released.
+    fn held_lookup() -> (Lookup, mpsc::Receiver<String>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let lookup = move |host: &str, port: u16| {
+            entered_tx.send(host.to_owned()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9)),
+                port,
+            )])
+        };
+        (Box::new(lookup), entered_rx, release_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dns_closure_keeps_its_position_until_the_blocking_lookup_returns() {
+        let resolver = NativeDnsResolver::new(1);
+        let endpoint: NativeEndpoint = "be-0.resolver.test:9070".parse().unwrap();
+        let (lookup, entered, release) = held_lookup();
+        let waiting = {
+            let resolver = resolver.clone();
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move { resolver.resolve_with(&endpoint, lookup).await })
+        };
+        let host = tokio::task::spawn_blocking(move || entered.recv_timeout(WATCHDOG))
+            .await
+            .unwrap()
+            .expect("the blocking lookup started");
+        assert_eq!(host, "be-0.resolver.test");
+        assert_eq!(resolver.available_positions(), 0);
+        // Cancel the future that awaited the closure: the closure is still
+        // running, so its position must not come back yet.
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            resolver.available_positions(),
+            0,
+            "a cancelled awaiter cannot return the position of a running lookup"
+        );
+        release.send(()).unwrap();
+        available_becomes(&resolver, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dns_positions_bound_concurrent_lookups_and_release_on_return() {
+        let resolver = NativeDnsResolver::new(1);
+        let endpoint: NativeEndpoint = "be-1.resolver.test:9070".parse().unwrap();
+        let (lookup, entered, release) = held_lookup();
+        let first = {
+            let resolver = resolver.clone();
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move { resolver.resolve_with(&endpoint, lookup).await })
+        };
+        tokio::task::spawn_blocking(move || entered.recv_timeout(WATCHDOG))
+            .await
+            .unwrap()
+            .unwrap();
+        let second_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&second_entered);
+        let mut second = {
+            let resolver = resolver.clone();
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                resolver
+                    .resolve_with(&endpoint, move |_, port| {
+                        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(vec![SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 10)),
+                            port,
+                        )])
+                    })
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut second)
+                .await
+                .is_err(),
+            "the second lookup waits for a position"
+        );
+        assert!(!second_entered.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first[0].ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9)));
+        let second = tokio::time::timeout(WATCHDOG, second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second[0].port(), 9070);
+        available_becomes(&resolver, 1).await;
+    }
+
+    #[tokio::test]
+    async fn ip_literal_endpoints_skip_resolution_and_take_no_position() {
+        let resolver = NativeDnsResolver::new(0);
+        for (text, expected) in [
+            ("127.0.0.1:9070", "127.0.0.1:9070"),
+            ("[::1]:9071", "[::1]:9071"),
+        ] {
+            let endpoint: NativeEndpoint = text.parse().unwrap();
+            let resolved = resolver
+                .resolve_with(&endpoint, |_, _| -> std::io::Result<Vec<SocketAddr>> {
+                    panic!("an IP literal must not reach the resolver")
+                })
+                .await
+                .unwrap();
+            assert_eq!(resolved, vec![expected.parse::<SocketAddr>().unwrap()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_resolution_is_an_error_not_an_empty_dial() {
+        let resolver = NativeDnsResolver::new(1);
+        let endpoint: NativeEndpoint = "nothing.resolver.test:9070".parse().unwrap();
+        let error = resolver
+            .resolve_with(&endpoint, |_, _| Ok(Vec::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        available_becomes(&resolver, 1).await;
     }
 }

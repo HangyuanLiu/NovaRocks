@@ -295,6 +295,22 @@ fn visit(
 }
 
 fn package(fragment: Fragment, constants: ConstantPools) -> Arc<FragmentPackage> {
+    package_with_parameters(
+        fragment,
+        constants,
+        SemanticParameters::try_new([(
+            ALLOW.id,
+            SemanticParameterValue::AllowThrowException(true),
+        )])
+        .unwrap(),
+    )
+}
+
+fn package_with_parameters(
+    fragment: Fragment,
+    constants: ConstantPools,
+    parameters: SemanticParameters,
+) -> Arc<FragmentPackage> {
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
     let mut next = 0;
     let mut uses = Vec::new();
@@ -321,6 +337,7 @@ fn package(fragment: Fragment, constants: ConstantPools) -> Arc<FragmentPackage>
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
     let output = fragment.nodes()[&fragment.root()].output.clone();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: output.clone(),
         fields: output
@@ -328,6 +345,9 @@ fn package(fragment: Fragment, constants: ConstantPools) -> Arc<FragmentPackage>
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(
+                    &fragment.values()[value].ty,
+                ),
                 name: format!("c{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,
@@ -349,11 +369,7 @@ fn package(fragment: Fragment, constants: ConstantPools) -> Arc<FragmentPackage>
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
-                parameters: SemanticParameters::try_new([(
-                    ALLOW.id,
-                    SemanticParameterValue::AllowThrowException(true),
-                )])
-                .unwrap(),
+                parameters,
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
@@ -538,3 +554,6 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
             .is_err()
     );
 }
+
+#[path = "compiled_root_result_boundary_tests.rs"]
+mod root_result_boundary_tests;

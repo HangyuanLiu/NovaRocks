@@ -26,6 +26,7 @@ import "physical_type_v2.proto";
 import "physical_control_v2.proto";
 import "physical_semantics_v2.proto";
 import "plan.proto";
+import "result.proto";
 
 // One immutable, task-independent local package. This does not carry remote
 // execution graphs, prepared handles, live providers, placement or capabilities.
@@ -948,6 +949,7 @@ message FragmentSink {
     MulticastSink multicast = 3;
     RouterSink router = 4;
     novarocks.physical_control_v2.Empty noop = 5;
+    novarocks.result.RootOutputContract root_result = 6;
   }
 }
 message MulticastSink { repeated uint32 edge_ids = 1; }
@@ -971,12 +973,23 @@ message ResultPort {
   optional uint32 fragment_id = 1;
   OutputPort output = 2;
   repeated ResultField fields = 3;
+  novarocks.result.ScalarSchema scalar_schema = 4;
 }
 message ResultField {
   string name = 1;
   optional string alias = 2;
   optional uint32 value_id = 3;
   optional uint32 value_type_id = 4;
+  optional ResultValueDomain domain = 5;
+}
+enum ResultValueDomain {
+  RESULT_VALUE_DOMAIN_PLAIN = 0;
+  RESULT_VALUE_DOMAIN_JSON = 1;
+  RESULT_VALUE_DOMAIN_VARIANT = 2;
+  RESULT_VALUE_DOMAIN_HLL = 3;
+  RESULT_VALUE_DOMAIN_BITMAP = 4;
+  RESULT_VALUE_DOMAIN_OBJECT = 5;
+  RESULT_VALUE_DOMAIN_PERCENTILE = 6;
 }
 message PlanAnnotation {
   AnnotationSubject subject = 1;

@@ -186,6 +186,10 @@ fn encode_sink_requests(
     admission: &EnvelopeAdmission<'_, '_>,
 ) -> Result<(), Error> {
     match sink {
+        p::FragmentSink::RootResult(_) => {
+            admission.request::<u8>(model, root_projection_request_bytes()?, 1)?;
+            model.delegated_work = admission.sum(model.delegated_work, root_projection_work()?)?;
+        }
         p::FragmentSink::Multicast { edges } => admission.request::<u32>(model, edges.len(), 1)?,
         p::FragmentSink::Router { routes, .. } => {
             model.refs = 1;
@@ -201,6 +205,10 @@ fn decode_sink_requests(
     admission: &EnvelopeAdmission<'_, '_>,
 ) -> Result<(), Error> {
     match kind {
+        Some(wire::fragment_sink::Kind::RootResult(_)) => {
+            admission.request::<u8>(model, root_projection_request_bytes()?, 2)?;
+            model.delegated_work = admission.sum(model.delegated_work, root_projection_work()?)?;
+        }
         Some(wire::fragment_sink::Kind::Multicast(v)) => {
             admission.request::<p::EdgeId>(model, v.edge_ids.len(), 2)?;
         }
@@ -372,6 +380,11 @@ fn preflight_decode(
     }
     admission.facts(&model, source, l, w)?;
     match kind {
+        wire::fragment_sink::Kind::RootResult(_) => {
+            if !admission.observed() {
+                decode_sink_requests(Some(kind), &mut model, admission)?;
+            }
+        }
         wire::fragment_sink::Kind::Multicast(_) => {
             if !admission.observed() {
                 decode_sink_requests(Some(kind), &mut model, admission)?;
@@ -456,6 +469,12 @@ fn emit_encode(
     use wire::fragment_sink::Kind;
     let kind = match input.sink() {
         p::FragmentSink::Result => Kind::Result(Empty {}),
+        p::FragmentSink::RootResult(contract) => {
+            w.flush()?;
+            let value = novarocks_proto_codec::root_result::encode_root_contract(contract);
+            w.flush()?;
+            Kind::RootResult(value)
+        }
         p::FragmentSink::Noop => Kind::Noop(Empty {}),
         p::FragmentSink::Stream { edge } => Kind::StreamEdgeId(edge.get()),
         p::FragmentSink::Multicast { edges } => Kind::Multicast(wire::MulticastSink {
@@ -505,6 +524,30 @@ fn emit_decode(
     let kind = raw_kind(input, w)?;
     let sink = match kind {
         Kind::Result(_) => p::FragmentSink::Result,
+        Kind::RootResult(contract) => {
+            let root = required(input.root_node_id, "fragment root ID is absent", w)?;
+            let mut columns = None;
+            for node in &input.nodes {
+                if node.id == root {
+                    columns = Some(
+                        required(node.output.as_ref(), "root output port is absent", w)?
+                            .value_ids
+                            .len(),
+                    );
+                }
+                w.step()?;
+            }
+            let columns = required(columns, "root result node is absent", w)?;
+            w.flush()?;
+            let value = novarocks_proto_codec::root_result::decode_root_contract(
+                contract,
+                columns,
+                novarocks_proto_codec::FieldPath::root("fragment.sink.root_result"),
+            )
+            .map_err(Error::Root)?;
+            w.flush()?;
+            p::FragmentSink::RootResult(Box::new(value))
+        }
         Kind::Noop(_) => p::FragmentSink::Noop,
         Kind::StreamEdgeId(id) => p::FragmentSink::Stream {
             edge: p::EdgeId::new(*id),
@@ -750,3 +793,35 @@ pub(crate) fn prepare_fragment_envelope_decode_in<'a, 'control: 'a>(
 #[cfg(test)]
 #[path = "physical_fragment_envelope_v2/tests.rs"]
 mod tests;
+
+// The original M07 codec owns schema shape/validation. This conservative
+// request envelope covers its flat field tables, all named-child tables,
+// root tree, seen state and temporary vectors together. Every schema field
+// uses one validated profile node; Vec push growth needs at most twice that
+// count. All text backing is bounded by the original profile itself.
+pub(crate) fn root_projection_request_bytes() -> Result<usize, Error> {
+    use novarocks_proto_models::result as wire;
+    use novarocks_result_contract::RootProfileV1 as P;
+    let nodes = mul(P::SCHEMA_TYPE_NODES, 2)?;
+    let per_node = add(
+        size_of::<wire::RenderField>(),
+        add(
+            size_of::<wire::ScalarField>(),
+            add(
+                size_of::<wire::NamedRenderField>(),
+                add(size_of::<wire::NamedScalarField>(), size_of::<usize>() * 4)?,
+            )?,
+        )?,
+    )?;
+    add(
+        mul(P::SCHEMA_BACKING_BYTES, 2)?,
+        add(
+            mul(nodes, per_node)?,
+            mul(P::MAX_COLUMNS, size_of::<wire::RenderColumn>() * 2)?,
+        )?,
+    )
+}
+fn root_projection_work() -> Result<usize, Error> {
+    use novarocks_result_contract::RootProfileV1 as P;
+    mul(P::SCHEMA_TYPE_NODES, P::MAX_DEPTH)
+}

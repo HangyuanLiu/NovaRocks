@@ -302,6 +302,11 @@ fn retag_data(
 /// non-nullable, is where that shows up first. The null count is the fact.
 fn runtime_field(target: &FieldRef, _source: &FieldRef, child: &ArrayData) -> FieldRef {
     let nullable = target.is_nullable() || child.null_count() > 0;
+    if target.data_type() == child.data_type() && target.is_nullable() == nullable {
+        // Preserve the exact immutable source field and its metadata owner.
+        // Equal properties require no new table, name or Field allocation.
+        return Arc::clone(target);
+    }
     Arc::new(
         Field::new(target.name(), child.data_type().clone(), nullable)
             .with_metadata(target.metadata().clone()),

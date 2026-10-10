@@ -528,9 +528,12 @@ fn normalized_theta_artifact(
     identity: StatisticsArtifactIdentity,
     body: Bytes,
 ) -> Result<novarocks_spi::connector::StatisticsArtifactDraft, ConnectorError> {
+    // Identity retains the original admitted holder across unions. The new
+    // body and metadata keep that holder through their own clone/async exits.
+    let retention = novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(identity.clone());
     let estimate = novarocks_connector_iceberg_functions::estimate_compact_theta(&body)
         .map_err(|error| corrupt(error.to_string()))?;
-    novarocks_spi::connector::StatisticsArtifactDraft::try_new(
+    novarocks_spi::connector::StatisticsArtifactDraft::try_new_with_guard(
         identity.input_fields().to_vec(),
         identity.blob_type(),
         body,
@@ -538,6 +541,7 @@ fn normalized_theta_artifact(
             crate::stats_loader::NDV_PROPERTY.to_string(),
             estimate.to_string(),
         )]),
+        retention,
     )
 }
 
@@ -2870,6 +2874,46 @@ impl IcebergWriteSessionControl {
         let (namespace, table_name) = request.table.rsplit_once('.').ok_or_else(|| {
             invalid("Iceberg write target must be a namespace-qualified table name")
         })?;
+        use crate::catalog::admission::{
+            CatalogAdmissionRequest, CatalogOperation, connector_unsupported,
+        };
+        let operation = match &request.flavor {
+            ConnectorWriteSessionFlavor::Ordinary => match request.intent {
+                novarocks_spi::connector::ConnectorWriteIntent::Append => CatalogOperation::Append,
+                novarocks_spi::connector::ConnectorWriteIntent::Overwrite
+                | novarocks_spi::connector::ConnectorWriteIntent::PartitionOverwrite => {
+                    CatalogOperation::Overwrite
+                }
+                novarocks_spi::connector::ConnectorWriteIntent::RowDelta => {
+                    CatalogOperation::RowDelta
+                }
+            },
+            ConnectorWriteSessionFlavor::StagedCreate(_) => CatalogOperation::CreateTable(
+                crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+            ),
+            ConnectorWriteSessionFlavor::ManagedPublication { .. }
+            | ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
+                CatalogOperation::PublishDocuments
+            }
+            ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
+            ConnectorWriteSessionFlavor::CopyOnWrite { .. } => CatalogOperation::CopyOnWrite,
+            ConnectorWriteSessionFlavor::DistributedRewrite(shape) => match shape {
+                ConnectorDistributedRewriteShape::DataFiles { .. } => {
+                    CatalogOperation::RewriteDataFiles
+                }
+                ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
+                    CatalogOperation::RewritePositionDeletes
+                }
+            },
+        };
+        self.runtime
+            .novarocks_catalog()
+            .admit(&CatalogAdmissionRequest::new(
+                operation,
+                crate::catalog::CatalogTableName::new(namespace, table_name),
+                request.context.initiation(),
+            ))
+            .map_err(connector_unsupported)?;
         // A staged target is the one target that cannot be looked up: the
         // catalog will not know it until the publication that owns it commits.
         // So its frozen facts arrive with the request, and this branch reads

@@ -122,42 +122,82 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
 }
 
 /// List materialized views from the readiness-filtered Accelerator projection.
-pub(crate) fn list_mv_rows_with_ports(
+pub(crate) fn list_mv_result_with_ports(
     readiness: &MvReadinessPort,
     entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
     current_catalog: Option<&str>,
     stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
-) -> Result<Vec<MvListRow>, String> {
-    let projections = readiness
-        .list_listable_projections()
-        .map_err(|e| format!("load materialized view Accelerator projections failed: {e}"))?;
-
-    let mut rows = Vec::new();
-    for listed in &projections {
+) -> Result<QueryResult, String> {
+    let mut inventory = readiness
+        .local_projection_inventory()
+        .map_err(|e| format!("load materialized view Accelerator inventory failed: {e}"))?;
+    inventory.order_by_namespace_and_name();
+    let mut table = mv_table_builder()?;
+    while let Some(listed) = inventory
+        .next_listable()
+        .map_err(|e| format!("load materialized view Accelerator projection failed: {e}"))?
+    {
         let loaded = &listed.loaded;
         let projection = &loaded.projection;
         if !matches_show_filter(projection, current_catalog, stmt, storage_filter) {
             continue;
         }
-        // A read-only target's dependency index is not a live management fact
-        // and reading it would refuse. Its row reports the dependencies the
-        // projection itself records, which is what SHOW is displaying anyway.
+        let manageability = manageability_parts(&listed.manageability, entrance, projection);
+        let row_prefix = mv_row_bytes(
+            projection,
+            0,
+            manageability.0.len().saturating_add(manageability.1.len()),
+        );
+        let bound = novarocks_query_application::api::LocalResultBound::V1;
+        bound
+            .admit(
+                table.rows().saturating_add(1),
+                table.bytes().saturating_add(row_prefix),
+            )
+            .map_err(|e| format!("SHOW MATERIALIZED VIEWS: {e}"))?;
+        admit_mv_row(
+            projection,
+            0,
+            manageability.0.len().saturating_add(manageability.1.len()),
+            table.rows(),
+            table.bytes(),
+            bound,
+            bound.bytes,
+        )?;
+        let row_workspace_overhead = std::mem::size_of::<MvListRow>() + 16 * 64;
+        let dependency_budget = (bound.bytes - table.bytes() - row_prefix).min(
+            bound
+                .bytes
+                .saturating_sub(row_prefix.saturating_add(row_workspace_overhead)),
+        );
         let dependencies = match &listed.manageability {
             MvListedManageability::Manageable => {
-                dependency_display_for_mv_with_readiness(readiness, loaded)?
+                dependency_display_for_mv_with_readiness(readiness, loaded, dependency_budget)?
             }
             MvListedManageability::ReadOnly(_) | MvListedManageability::Unavailable(_) => {
                 String::new()
             }
         };
-        rows.push(list_row_from_projection(
+        // Refuse all variable-size copies before SQL/name/join construction.
+        admit_mv_row(
             projection,
-            dependencies,
-            manageability_display(&listed.manageability, entrance, projection),
-        ));
+            dependencies.len(),
+            manageability.0.len().saturating_add(manageability.1.len()),
+            table.rows(),
+            table.bytes(),
+            bound,
+            bound.bytes,
+        )?;
+        let mut display = String::with_capacity(manageability.0.len() + manageability.1.len());
+        display.push_str(manageability.0);
+        display.push_str(manageability.1);
+        let row = list_row_from_projection(projection, dependencies, display);
+        append_mv_row(&mut table, &row)?;
     }
-    Ok(rows)
+    table
+        .finish()
+        .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))
 }
 
 /// What SHOW prints for one target's manageability.
@@ -165,16 +205,16 @@ pub(crate) fn list_mv_rows_with_ports(
 /// The reason is carried through rather than summarised: an operator seeing
 /// READ_ONLY has to know whether it is a restart barrier they can retire or
 /// another deployment's target they cannot.
-fn manageability_display(
-    manageability: &MvListedManageability,
+fn manageability_parts<'a>(
+    manageability: &'a MvListedManageability,
     entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
     projection: &StoredMvProjection,
-) -> String {
+) -> (&'static str, &'a str) {
     use novarocks_mv_application::management::MvManagementPhase;
 
     match manageability {
-        MvListedManageability::ReadOnly(reason) => return format!("READ_ONLY: {reason}"),
-        MvListedManageability::Unavailable(reason) => return format!("UNAVAILABLE: {reason}"),
+        MvListedManageability::ReadOnly(reason) => return ("READ_ONLY: ", reason),
+        MvListedManageability::Unavailable(reason) => return ("UNAVAILABLE: ", reason),
         MvListedManageability::Manageable => {}
     }
     // Readiness says this process may read the target. Whether it may write
@@ -182,16 +222,141 @@ fn manageability_display(
     // matters: a target whose owner was just handed away is still a sound
     // query candidate while it is no longer this process's to refresh.
     let Some(entrance) = entrance else {
-        return "MANAGEABLE".to_string();
+        return ("", "MANAGEABLE");
     };
     match entrance.management_phase(&projection.facts.source_revision().target) {
-        MvManagementPhase::Manageable => "MANAGEABLE".to_string(),
-        MvManagementPhase::Managing => "MANAGING".to_string(),
+        MvManagementPhase::Manageable => ("", "MANAGEABLE"),
+        MvManagementPhase::Managing => ("", "MANAGING"),
         // A target this entrance has never observed is not one it has closed:
         // the projection is installed and nothing here holds it.
-        MvManagementPhase::NotObserved => "MANAGEABLE".to_string(),
-        other => format!("READ_ONLY: {}", other.as_str()),
+        MvManagementPhase::NotObserved => ("", "MANAGEABLE"),
+        other => ("READ_ONLY: ", other.as_str()),
     }
+}
+
+#[cfg(test)]
+fn manageability_display(
+    manageability: &MvListedManageability,
+    entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
+    projection: &StoredMvProjection,
+) -> String {
+    let (prefix, reason) = manageability_parts(manageability, entrance, projection);
+    format!("{prefix}{reason}")
+}
+
+fn base_tables_bytes(projection: &StoredMvProjection) -> usize {
+    let occurrences = &projection.facts.definition().relation_occurrences;
+    occurrences.iter().fold(
+        occurrences.len().saturating_sub(1).saturating_mul(2),
+        |total, relation| {
+            total
+                .saturating_add(relation.catalog_at_binding.len())
+                .saturating_add(relation.namespace_at_binding.len())
+                .saturating_add(relation.relation_at_binding.len())
+                .saturating_add(2)
+        },
+    )
+}
+
+fn base_tables_display(projection: &StoredMvProjection) -> String {
+    let mut output = String::with_capacity(base_tables_bytes(projection));
+    for (index, relation) in projection
+        .facts
+        .definition()
+        .relation_occurrences
+        .iter()
+        .enumerate()
+    {
+        if index > 0 {
+            output.push_str(", ");
+        }
+        output.push_str(&relation.catalog_at_binding);
+        output.push('.');
+        output.push_str(&relation.namespace_at_binding);
+        output.push('.');
+        output.push_str(&relation.relation_at_binding);
+    }
+    output
+}
+
+fn mv_row_bytes(
+    projection: &StoredMvProjection,
+    dependency_bytes: usize,
+    manageability_bytes: usize,
+) -> usize {
+    use novarocks_query_application::api::LocalResultBound;
+    let facts = &projection.facts;
+    let configuration = facts.configuration();
+    let (refresh_time, refresh_rows) = match facts.publication() {
+        MvPublicationState::NeverPublished => (0, 0),
+        MvPublicationState::Published(published) => (
+            published
+                .document()
+                .publication_prepared_at_ms
+                .to_string()
+                .len(),
+            published
+                .document()
+                .statistics
+                .logical_result_rows
+                .map_or(0, |n| n.to_string().len()),
+        ),
+    };
+    // Numeric text here has a fixed <=20-byte bound; variable-size strings
+    // and joined names remain borrowed until the whole row is admitted.
+    [
+        facts.target().name().len(),
+        facts.target().namespace().len(),
+        MvStorageEngine::Iceberg.as_sql_str().len(),
+        match configuration.refresh_policy {
+            RefreshPolicy::Manual => "DEFERRED_MANUAL".len(),
+            RefreshPolicy::AsyncOnChange => "ASYNC_ON_CHANGE".len(),
+            RefreshPolicy::AsyncInterval => "ASYNC_INTERVAL".len(),
+        },
+        refresh_time,
+        refresh_rows,
+        base_tables_bytes(projection),
+        facts.definition().query.effective_sql.len(),
+        dependency_bytes,
+        if configuration.paused { 4 } else { 5 },
+        0,
+        0,
+        configuration
+            .max_staleness_ms
+            .map_or(0, |n| n.to_string().len()),
+        refresh_status_for_configuration(configuration).len(),
+        0,
+        manageability_bytes,
+    ]
+    .into_iter()
+    .fold(0usize, |sum, n| {
+        sum.saturating_add(LocalResultBound::cell_bytes(n))
+    })
+}
+
+fn admit_mv_row(
+    projection: &StoredMvProjection,
+    dependency_bytes: usize,
+    manageability_bytes: usize,
+    rows: usize,
+    bytes: usize,
+    bound: novarocks_query_application::api::LocalResultBound,
+    workspace_bytes: usize,
+) -> Result<(), String> {
+    let row_bytes = mv_row_bytes(projection, dependency_bytes, manageability_bytes);
+    bound
+        .admit(rows.saturating_add(1), bytes.saturating_add(row_bytes))
+        .map_err(|e| format!("SHOW MATERIALIZED VIEWS: {e}"))?;
+    // One owned domain row is the temporary conversion workspace, not a
+    // second retained result list. Include its headers/allocation allowance.
+    if row_bytes
+        .saturating_add(std::mem::size_of::<MvListRow>())
+        .saturating_add(16 * 64)
+        > workspace_bytes
+    {
+        return Err("SHOW MATERIALIZED VIEWS exceeds its row workspace bound".into());
+    }
+    Ok(())
 }
 
 fn matches_show_filter(
@@ -258,19 +423,7 @@ fn list_row_from_projection(
         .to_string(),
         last_refresh_time,
         last_refresh_rows,
-        base_tables: definition
-            .relation_occurrences
-            .iter()
-            .map(|occurrence| {
-                format!(
-                    "{}.{}.{}",
-                    occurrence.catalog_at_binding,
-                    occurrence.namespace_at_binding,
-                    occurrence.relation_at_binding,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
+        base_tables: base_tables_display(projection),
         select_text: definition.query.effective_sql.clone(),
         dependencies,
         refresh_paused: configuration.paused.to_string(),
@@ -300,15 +453,63 @@ fn refresh_status_for_configuration(configuration: &ConfigurationDocument) -> St
 fn dependency_display_for_mv_with_readiness(
     readiness: &MvReadinessPort,
     projection: &novarocks_mv_application::repository::LoadedMvProjection,
+    maximum: usize,
 ) -> Result<String, String> {
     let dependencies = readiness
-        .list_ready_dependencies_by_downstream(projection)
+        .list_local_dependencies_by_downstream(projection)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
-    Ok(dependencies
-        .iter()
-        .map(|dep| dep.upstream.display_name())
-        .collect::<Vec<_>>()
-        .join(", "))
+    render_dependency_display(&dependencies, maximum)
+}
+
+fn render_dependency_display(
+    dependencies: &[novarocks_mv_application::persistence::dependency::StoredMvDependency],
+    maximum: usize,
+) -> Result<String, String> {
+    use novarocks_mv_application::dependency::MvDependencyObjectType;
+    let bytes = dependencies.iter().fold(
+        dependencies.len().saturating_sub(1).saturating_mul(2),
+        |total, dependency| {
+            let object = &dependency.upstream;
+            total
+                .saturating_add(
+                    object
+                        .catalog
+                        .as_ref()
+                        .map_or(0, |c| c.len().saturating_add(1)),
+                )
+                .saturating_add(object.database_or_namespace.len())
+                .saturating_add(1)
+                .saturating_add(object.name.len())
+                .saturating_add(
+                    if object.object_type == MvDependencyObjectType::MaterializedView {
+                        3
+                    } else {
+                        0
+                    },
+                )
+        },
+    );
+    if bytes > maximum {
+        return Err("SHOW MATERIALIZED VIEWS dependency display exceeds its row byte bound".into());
+    }
+    let mut output = String::with_capacity(bytes);
+    for (index, dependency) in dependencies.iter().enumerate() {
+        if index > 0 {
+            output.push_str(", ");
+        }
+        let object = &dependency.upstream;
+        if object.object_type == MvDependencyObjectType::MaterializedView {
+            output.push_str("mv:");
+        }
+        if let Some(catalog) = &object.catalog {
+            output.push_str(catalog);
+            output.push('.');
+        }
+        output.push_str(&object.database_or_namespace);
+        output.push('.');
+        output.push_str(&object.name);
+    }
+    Ok(output)
 }
 
 /// Analyze an MV SELECT against an already-admitted query-local table provider.
@@ -350,7 +551,7 @@ pub fn analyze_mv_select_with_provider(
     })
 }
 
-pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {
+fn mv_table_builder() -> Result<novarocks_query_application::api::LocalTableBuilder, String> {
     const COLUMNS: &[(&str, bool)] = &[
         ("Name", false),
         ("Database", false),
@@ -369,31 +570,48 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         ("RetryAfterTime", true),
         ("Manageability", false),
     ];
-    let rows = rows
-        .iter()
-        .map(|row| {
-            vec![
-                Some(row.name.clone()),
-                Some(row.database.clone()),
-                Some(row.storage_engine.clone()),
-                Some(row.refresh_mode.clone()),
-                row.last_refresh_time.clone(),
-                row.last_refresh_rows.clone(),
-                Some(row.base_tables.clone()),
-                Some(row.select_text.clone()),
-                Some(row.dependencies.clone()),
-                Some(row.refresh_paused.clone()),
-                row.next_refresh_time.clone(),
-                row.last_scheduler_error.clone(),
-                row.max_staleness_ms.clone(),
-                Some(row.refresh_state.clone()),
-                row.retry_after_time.clone(),
-                Some(row.manageability.clone()),
-            ]
-        })
-        .collect();
-    build_utf8_table_query_result(COLUMNS, rows)
-        .map_err(|error| format!("build SHOW MATERIALIZED VIEWS batch failed: {error}"))
+    novarocks_query_application::api::LocalTableBuilder::try_new(
+        COLUMNS,
+        novarocks_query_application::api::LocalResultBound::V1,
+    )
+    .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))
+}
+
+fn append_mv_row(
+    table: &mut novarocks_query_application::api::LocalTableBuilder,
+    row: &MvListRow,
+) -> Result<(), String> {
+    table
+        .push_row(&[
+            Some(row.name.as_str()),
+            Some(row.database.as_str()),
+            Some(row.storage_engine.as_str()),
+            Some(row.refresh_mode.as_str()),
+            row.last_refresh_time.as_deref(),
+            row.last_refresh_rows.as_deref(),
+            Some(row.base_tables.as_str()),
+            Some(row.select_text.as_str()),
+            Some(row.dependencies.as_str()),
+            Some(row.refresh_paused.as_str()),
+            row.next_refresh_time.as_deref(),
+            row.last_scheduler_error.as_deref(),
+            row.max_staleness_ms.as_deref(),
+            Some(row.refresh_state.as_str()),
+            row.retry_after_time.as_deref(),
+            Some(row.manageability.as_str()),
+        ])
+        .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))
+}
+
+#[cfg(test)]
+pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {
+    let mut table = mv_table_builder()?;
+    for row in rows {
+        append_mv_row(&mut table, row)?;
+    }
+    table
+        .finish()
+        .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))
 }
 
 #[cfg(test)]
@@ -749,5 +967,106 @@ mod compile_control_tests {
                     | (true, Err(SqlCompileError::DeadlineExceeded))
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_mv_row_tests {
+    use super::*;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
+    use novarocks_query_application::api::LocalResultBound;
+
+    fn projection() -> StoredMvProjection {
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(1));
+        fixture.definition.query.effective_sql = "select a deliberately long SQL text".into();
+        fixture.configuration.max_staleness_ms = Some(1234);
+        StoredMvProjection {
+            mv_id: 7,
+            facts: fixture.build().unwrap(),
+        }
+    }
+
+    #[test]
+    fn borrowed_mv_row_size_matches_all_cells_before_copying() {
+        let projection = projection();
+        let reason = MvListedManageability::ReadOnly("readmission is pending".into());
+        let (prefix, text) = manageability_parts(&reason, None, &projection);
+        let dependencies = "ice.sales.base, mv:ice.sales.upstream";
+        let expected = mv_row_bytes(&projection, dependencies.len(), prefix.len() + text.len());
+        let row =
+            list_row_from_projection(&projection, dependencies.into(), format!("{prefix}{text}"));
+        let mut builder = mv_table_builder().unwrap();
+        append_mv_row(&mut builder, &row).unwrap();
+        assert_eq!(builder.bytes(), expected);
+        assert_eq!(base_tables_bytes(&projection), row.base_tables.len());
+    }
+
+    #[test]
+    fn mv_row_refuses_whole_and_cumulative_limits_before_owned_row_construction() {
+        let projection = projection();
+        let bytes = mv_row_bytes(&projection, 3, 10);
+        let bound = LocalResultBound {
+            rows: 2,
+            bytes,
+            columns: 16,
+        };
+        admit_mv_row(&projection, 3, 10, 0, 0, bound, 128 * 1024).unwrap();
+        assert!(admit_mv_row(&projection, 3, 10, 0, 1, bound, 128 * 1024).is_err());
+        assert!(admit_mv_row(&projection, 3, 10, 2, 0, bound, 128 * 1024).is_err());
+        assert!(
+            admit_mv_row(&projection, 3, 10, 0, 0, bound, 1)
+                .unwrap_err()
+                .contains("workspace")
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_dependency_display_tests {
+    use super::render_dependency_display;
+    use novarocks_mv_application::dependency::{
+        MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+    };
+    use novarocks_mv_application::persistence::dependency::StoredMvDependency;
+
+    #[test]
+    fn display_preserves_mv_prefixes_and_separators_under_the_exact_join_bound() {
+        let rows = [
+            MvDependencyObjectType::Table,
+            MvDependencyObjectType::MaterializedView,
+            MvDependencyObjectType::Unclassified,
+        ]
+        .into_iter()
+        .map(|object_type| StoredMvDependency {
+            downstream_mv_id: 1,
+            occurrence_id: 0,
+            upstream_object_id: Default::default(),
+            created_at_ms: 0,
+            upstream: MvDependencyObjectRef {
+                catalog: Some("ice".into()),
+                database_or_namespace: "sales".into(),
+                name: "base".into(),
+                object_type,
+                storage_engine: MvDependencyStorageEngine::Unclassified,
+            },
+        })
+        .collect::<Vec<_>>();
+        let expected = rows
+            .iter()
+            .map(|row| row.upstream.display_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            render_dependency_display(&rows, expected.len()).unwrap(),
+            expected
+        );
+        assert!(
+            render_dependency_display(&rows, expected.len() - 1)
+                .unwrap_err()
+                .contains("row byte bound")
+        );
+        assert_eq!(render_dependency_display(&[], 0).unwrap(), "");
     }
 }

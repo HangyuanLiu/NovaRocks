@@ -1040,6 +1040,7 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                 });
             }
             FragmentSink::Result
+            | FragmentSink::RootResult(_)
             | FragmentSink::Stream { .. }
             | FragmentSink::Multicast { .. }
             | FragmentSink::Router { .. } => {}

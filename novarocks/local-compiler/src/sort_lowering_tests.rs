@@ -193,6 +193,7 @@ pub(super) fn package(
         .columns
         .iter()
         .map(|&value| ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: "result".into(),
             alias: Some("original-label".into()),
             value,
@@ -200,6 +201,7 @@ pub(super) fn package(
         })
         .collect();
     input.result = Some(ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output,
         fields,

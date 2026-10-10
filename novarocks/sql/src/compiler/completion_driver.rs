@@ -325,6 +325,7 @@ pub(crate) struct SqlStatisticsCompletionState {
 pub(crate) struct SqlProviderReadCompletionState {
     root_allow_throw_exception: bool,
     common: FinalPlanCommon,
+    root_semantics: super::root_output::RootOutputSemantics,
     physical: PhysicalPlanNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     needs: Box<[ProviderReadNeed]>,
@@ -738,6 +739,7 @@ struct OptimizedPhysicalPlan {
     functions: Arc<dyn SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     physical: PhysicalPlanNode,
+    root_semantics: super::root_output::RootOutputSemantics,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
 }
 
@@ -760,6 +762,12 @@ fn optimize_to_physical(
         constant_policy,
     } = analyzed;
     control.check()?;
+    let root_semantics = super::root_output::RootOutputSemantics::capture(
+        &crate::planner::plan_output_columns(&logical_plan)
+            .map_err(SqlCompileError::Compilation)?,
+        &factory,
+    )
+    .map_err(SqlCompileError::Compilation)?;
     let mut scalar_arena =
         crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
     let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
@@ -820,9 +828,13 @@ fn optimize_to_physical(
     control.check()?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized)
         .map_err(SqlCompileError::Compilation)?;
+    root_semantics
+        .domains(&physical.output_columns)
+        .map_err(SqlCompileError::Compilation)?;
     Ok(OptimizedPhysicalPlan {
         functions: function_catalog,
         root_allow_throw_exception,
+        root_semantics,
         physical,
         query_statistics: statistics.snapshot,
     })
@@ -838,6 +850,7 @@ fn provider_or_ready_step(
         functions,
         root_allow_throw_exception,
         mut physical,
+        root_semantics,
         query_statistics,
     } = optimized;
     // Retain the exact catalogue snapshot that authored optimizer bindings,
@@ -860,22 +873,26 @@ fn provider_or_ready_step(
                 root_allow_throw_exception,
                 common,
                 physical,
+                root_semantics,
                 query_statistics,
                 needs,
             }),
         ));
     }
-    let mut draft = crate::planner::distributed::build::lower_final_physical_plan(
-        &physical,
-        common.version,
-        common.dop_domain,
-        common.functions,
-        root_allow_throw_exception,
-        common.constant_policy,
-        common.emission_mode,
-        control,
-    )
-    .map_err(SqlCompileError::from)?;
+    let mut draft =
+        crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
+            &physical,
+            common.version,
+            common.dop_domain,
+            None,
+            root_semantics,
+            common.functions,
+            root_allow_throw_exception,
+            common.constant_policy,
+            common.emission_mode,
+            control,
+        )
+        .map_err(SqlCompileError::from)?;
     query_statistics.annotate_final_plan(&mut draft);
     Ok(CompilerStep::ready(
         common.version,
@@ -1219,11 +1236,12 @@ pub(super) fn resume_provider_read(
             .map(|fact| (fact, state.common.scan_read_budget)),
     )?;
     let mut draft =
-        crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
+        crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
             &state.physical,
             state.common.version,
             state.common.dop_domain,
-            reads,
+            Some(reads),
+            state.root_semantics,
             state.common.functions,
             state.root_allow_throw_exception,
             state.common.constant_policy,
@@ -2902,6 +2920,7 @@ mod tests {
                     crate::explain::ExplainLevel::Contract,
                     None,
                     crate::explain::completed::ExplainRenderBudget::default(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .expect("contract text");
                 assert!(contract.iter().any(|line| line.contains(&expected)));
@@ -3325,6 +3344,93 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn m07_scalar_root_identity_survives_owned_final_completion() {
+        use novarocks_physical_plan::ResultValueDomain as D;
+        use novarocks_result_contract::ScalarValueType as V;
+        for (sql, domain, value) in [
+            ("select json_object('k', 1) as j", D::Json, V::Json),
+            (
+                "select coalesce(json_object('k', 1), null) as j",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select if(true, json_object('k', 1), null) as j",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select case when true then json_object('k', 1) else null end as j",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "with q as (select json_object('k', 1) as j) select j from q",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select cast(json_object('k', 1) as varchar) as j",
+                D::Plain,
+                V::String,
+            ),
+            (
+                "select coalesce(json_object('k', 1), 'plain') as j",
+                D::Plain,
+                V::String,
+            ),
+            (
+                "select json_object('k', 1) as j union all select null",
+                D::Json,
+                V::Json,
+            ),
+        ] {
+            let progress = SqlCompiler::start(
+                request(sql, SqlCompileIntent::Query)
+                    .try_into_completion()
+                    .unwrap(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let SqlCompileProgress::Complete(completed) = progress else {
+                panic!("source-free scalar unexpectedly needs observations: {sql}");
+            };
+            let result = completed.plan().result_port().unwrap();
+            assert_eq!(result.fields[0].domain, domain, "{sql}");
+            let schema = completed.scalar_schema().unwrap();
+            assert_eq!(schema.field().value_type, value, "{sql}");
+            assert_eq!(
+                schema.field().nullable,
+                result.fields[0].ty.nullable,
+                "{sql}"
+            );
+            assert_eq!(schema.source_slot(), None);
+            let plan = completed
+                .into_plan()
+                .with_root_output(novarocks_result_contract::RootOutputContract::new(
+                    novarocks_result_contract::RootProfileId::V1,
+                    novarocks_result_contract::FrozenRootOutput::ScalarValue(schema),
+                ))
+                .unwrap();
+            novarocks_physical_plan::validate_plan(plan.plan()).unwrap();
+        }
+    }
+
+    #[test]
+    fn m07_scalar_schema_refuses_multiple_root_occurrences() {
+        let SqlCompileProgress::Complete(completed) = SqlCompiler::start(
+            request("select 1, 2", SqlCompileIntent::Query)
+                .try_into_completion()
+                .unwrap(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap() else {
+            panic!("unexpected observation");
+        };
+        assert!(completed.scalar_schema().is_err());
     }
 }
 

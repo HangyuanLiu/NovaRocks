@@ -458,6 +458,7 @@ fn publish(fragment: Fragment) -> Arc<FragmentPackage> {
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let root = &fragment.nodes()[&fragment.root()];
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: root.output.clone(),
         fields: root
@@ -466,6 +467,7 @@ fn publish(fragment: Fragment) -> Arc<FragmentPackage> {
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("join_{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,

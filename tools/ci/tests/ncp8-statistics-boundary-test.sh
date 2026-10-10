@@ -39,6 +39,7 @@ write_fixture() {
     "$root/idl/novarocks"
   write_package "$root" "novarocks/execution" "novarocks-execution"
   write_package "$root" "novarocks/type-contract" "novarocks-type-contract"
+  write_package "$root" "novarocks/result-contract" "novarocks-result-contract"
   write_package "$root" "novarocks/functions" "novarocks-functions"
   write_package "$root" "novarocks/connector/iceberg-functions" "novarocks-connector-iceberg-functions"
   write_package "$root" "novarocks/connector/iceberg" "novarocks-connector-iceberg"
@@ -54,6 +55,8 @@ write_fixture() {
 resolver = "2"
 members = [
   "novarocks/execution",
+  "novarocks/type-contract",
+  "novarocks/result-contract",
   "novarocks/functions",
   "novarocks/connector/iceberg-functions",
   "novarocks/connector/iceberg",
@@ -79,6 +82,11 @@ EOF
 
 [dependencies]
 novarocks-type-contract = { path = "../type-contract" }
+EOF
+  cat >>"$root/novarocks/type-contract/Cargo.toml" <<'EOF'
+
+[dependencies]
+novarocks-result-contract = { path = "../result-contract" }
 EOF
   cat >>"$root/novarocks/connector/iceberg-functions/Cargo.toml" <<'EOF'
 
@@ -199,6 +207,34 @@ replace_once "$reverse/novarocks/connector/iceberg/Cargo.toml" \
 printf 'novarocks-connector-iceberg = { path = "../iceberg" }\n' \
   >>"$reverse/novarocks/connector/iceberg-functions/Cargo.toml"
 assert_rejected "$reverse" "internal normal closure must be exactly"
+
+extra_owner="$fixture_root/extra-owner"
+cp -R "$valid" "$extra_owner"
+write_package "$extra_owner" "novarocks/unexpected-owner" "novarocks-unexpected-owner"
+printf 'novarocks-unexpected-owner = { path = "../unexpected-owner" }\n' \
+  >>"$extra_owner/novarocks/type-contract/Cargo.toml"
+assert_rejected "$extra_owner" "internal normal closure must be exactly"
+
+# Use a non-NovaRocks helper to prove dependency freedom independently of the
+# exact internal closure, including edges omitted by a normal resolved graph.
+for dependency_kind in dependencies build-dependencies dev-dependencies; do
+  result_dependency="$fixture_root/result-$dependency_kind"
+  cp -R "$valid" "$result_dependency"
+  write_package "$result_dependency" "helper" "result-helper"
+  printf '\n[%s]\nresult-helper = { path = "../../helper" }\n' "$dependency_kind" \
+    >>"$result_dependency/novarocks/result-contract/Cargo.toml"
+  assert_rejected "$result_dependency" "novarocks-result-contract must not declare dependencies"
+done
+
+result_optional="$fixture_root/result-optional"
+cp -R "$valid" "$result_optional"
+write_package "$result_optional" "helper" "result-helper"
+cat >>"$result_optional/novarocks/result-contract/Cargo.toml" <<'EOF'
+
+[target.'cfg(target_os = "none")'.dependencies]
+result-helper = { path = "../../helper", optional = true }
+EOF
+assert_rejected "$result_optional" "novarocks-result-contract must not declare dependencies"
 
 execution_normal="$fixture_root/execution-normal"
 cp -R "$valid" "$execution_normal"

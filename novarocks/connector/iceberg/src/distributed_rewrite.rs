@@ -45,6 +45,8 @@ use novarocks_spi::connector::{
     ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
 
+use crate::catalog::CatalogTableName;
+use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
 use crate::manifest::{DataFileWithStats, data_file_with_stats_to_iceberg_data_file_info};
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
@@ -287,6 +289,28 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
                 "Iceberg distributed rewrite request has a foreign generation",
             ));
         }
+        let target = self.provider.table_payload(request.operation().table())?;
+        if target.metadata_table_type.is_some() {
+            return Err(invalid(
+                "Iceberg distributed rewrite requires a base table handle",
+            ));
+        }
+        let operation = match request.operation() {
+            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
+                CatalogOperation::RewriteDataFiles
+            }
+            ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
+                CatalogOperation::RewritePositionDeletes
+            }
+        };
+        self.runtime
+            .novarocks_catalog()
+            .admit(&CatalogAdmissionRequest::new(
+                operation,
+                CatalogTableName::new(target.namespace, target.table),
+                request.context.initiation(),
+            ))
+            .map_err(connector_unsupported)?;
         if let Some(existing) = self
             .plans
             .lock()
@@ -1714,6 +1738,145 @@ mod tests {
         );
         assert_eq!(artifact_digest(b"same"), artifact_digest(b"same"));
         assert_ne!(artifact_digest(b"same"), artifact_digest(b"different"));
+    }
+    fn admission_runtime(
+        catalog_type: &str,
+    ) -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        Arc<IcebergMetadataContext>,
+        std::net::TcpListener,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("HMS probe listener");
+        listener.set_nonblocking(true).expect("nonblocking probe");
+        let mut properties = vec![
+            ("iceberg.catalog.type".to_string(), catalog_type.to_string()),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            ),
+        ];
+        if catalog_type == "hive" {
+            properties.push((
+                "hive.metastore.uris".to_string(),
+                format!(
+                    "thrift://{}",
+                    listener.local_addr().expect("listener address")
+                ),
+            ));
+        }
+        let configuration = crate::catalog_config::parse_catalog_configuration("ice", &properties)
+            .expect("configuration");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let runtime = Arc::new(
+            IcebergMetadataContext::try_new(
+                crate::catalog_control::IcebergCatalogControlState::new(configuration),
+                crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone()),
+            )
+            .expect("control runtime"),
+        );
+        (executor, warehouse, runtime, listener)
+    }
+
+    fn admission_context(catalog_type: &str) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            1024,
+            4096,
+        )
+        .expect("context")
+        .with_initiation(if catalog_type == "hive" {
+            novarocks_spi::connector::ConnectorRequestInitiation::Statement
+        } else {
+            novarocks_spi::connector::ConnectorRequestInitiation::Background
+        })
+    }
+
+    fn admission_table(
+        instance: novarocks_spi::connector::ConnectorInstanceId,
+    ) -> ConnectorTableHandle {
+        ConnectorTableHandle::try_new(instance, Bytes::from_static(br#"{"namespace":"db","table":"absent","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#)).expect("table handle")
+    }
+
+    fn assert_admission_left_no_io(
+        warehouse: &tempfile::TempDir,
+        listener: &std::net::TcpListener,
+    ) {
+        assert_eq!(
+            std::fs::read_dir(warehouse.path())
+                .expect("warehouse inventory")
+                .count(),
+            0
+        );
+        let error = listener
+            .accept()
+            .expect_err("admission must not connect to HMS");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn planning_refuses_hms_and_background_hadoop_before_rewrite_artifacts() {
+        use novarocks_spi::connector::{
+            ConnectorInstanceId, ConnectorProviderId, ConnectorWriteOperationId,
+        };
+        for catalog_type in ["hive", "hadoop"] {
+            let (_executor, warehouse, runtime, listener) = admission_runtime(catalog_type);
+            let descriptor = ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            };
+            let incarnation = ProviderBindingEpoch::from_bytes([8; 16]);
+            let provider = Arc::new(IcebergMetadata::new(
+                descriptor.clone(),
+                incarnation,
+                runtime.clone(),
+            ));
+            let adapter =
+                IcebergDistributedRewriteControl::new(descriptor, incarnation, runtime, provider)
+                    .expect("adapter");
+            for operation in [
+                ConnectorDistributedRewriteOperation::RewriteDataFiles {
+                    table: admission_table(adapter.key.instance_id.clone()),
+                    rewrite_all: true,
+                },
+                ConnectorDistributedRewriteOperation::RewritePositionDeletes {
+                    table: admission_table(adapter.key.instance_id.clone()),
+                    rewrite_all: true,
+                    min_input_files: None,
+                },
+            ] {
+                let request = ConnectorDistributedRewritePlanningRequest::try_new(
+                    ConnectorWriteOperationId::new(),
+                    adapter.key.clone(),
+                    operation,
+                    admission_context(catalog_type),
+                )
+                .expect("request");
+                let error = adapter
+                    .plan_rewrite(request)
+                    .expect_err("catalog admission must refuse planning");
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                assert!(error.to_string().contains(if catalog_type == "hive" {
+                    "read-only compatibility entry"
+                } else {
+                    "background"
+                }));
+                assert!(adapter.plans.lock().expect("plans").is_empty());
+                assert_admission_left_no_io(&warehouse, &listener);
+            }
+        }
     }
 }
 

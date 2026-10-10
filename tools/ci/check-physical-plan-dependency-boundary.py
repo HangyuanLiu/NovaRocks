@@ -34,12 +34,16 @@ dependency tree:
   members cannot create false dependencies;
 * every normal/build package is admitted by exact Cargo identity. Audited
   Arrow build scripts and proc macros have separate exact authority lists;
-  repository-owned contracts may execute neither;
+  repository-owned contracts may execute neither, except the type contract
+  build receipt that rejects unsupported compiler/allocation source profiles;
 * the repository-owned neutral contracts expose no Cargo feature or target
   variation, so optional and target-specific edges cannot hide an unaudited
   closure behind a different build configuration.
 
-Neither source is sufficient on its own.
+Neither source is sufficient on its own. Dependency versions belong to the
+root manifest and Cargo.lock; this checker owns package authority and the
+closed dependency surface, not a second version policy.
+Design: ADR-0168 (docs/adr/ADR-0168-ci-dependency-guards-never-restate-versions.md)
 """
 
 import argparse
@@ -54,21 +58,25 @@ PACKAGE_NAME = "novarocks-physical-plan"
 TYPE_CONTRACT = "novarocks-type-contract"
 CONNECTOR_CONTRACT = "novarocks-connector-contract"
 CONSTANT_CONTRACT = "novarocks-constant-contract"
+RESULT_CONTRACT = "novarocks-result-contract"
+FUNCTION_CONTRACT = "novarocks-function-contract"
 
 # These are allowed direct internal dependencies, not required dependencies.
 # Removing one as the contract gets smaller remains legal.
-DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT})
+DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT})
 DIRECT_PACKAGE_ALLOW_LIST = frozenset(
-    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT}
+    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT}
 )
 
 # Dependency direction is part of the architecture. The type contract is the
 # lower-level vocabulary; the Connector contract may consume it, but neither
 # contract may acquire physical-plan or application authority.
 INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
-    TYPE_CONTRACT: frozenset({"arrow-schema"}),
+    TYPE_CONTRACT: frozenset({"arrow-schema", RESULT_CONTRACT}),
+    RESULT_CONTRACT: frozenset(),
+    FUNCTION_CONTRACT: frozenset({TYPE_CONTRACT, CONSTANT_CONTRACT}),
     CONSTANT_CONTRACT: frozenset({"arrow-array", "arrow-buffer", "arrow-data",
-                                  "arrow-schema", TYPE_CONTRACT}),
+                                  "arrow-schema", "arrow-cast", TYPE_CONTRACT}),
     # Complete public read/write recipes freeze exact Arrow schemas, while
     # arrays, decoding, storage and executable capabilities stay outside.
     CONNECTOR_CONTRACT: frozenset({"arrow-schema", "bytes", TYPE_CONTRACT}),
@@ -80,106 +88,18 @@ INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 # Audited immutable Arrow backing closure, including all target and build edges.
 # Membership is permission, not a requirement that every package be selected.
-EXTERNAL_PACKAGE_VERSIONS = frozenset({
-    ('ahash', '0.8.12'),
-    ('android_system_properties', '0.1.5'),
-    ('arrow-array', '58.2.0'),
-    ('arrow-buffer', '58.2.0'),
-    ('arrow-data', '58.2.0'),
-    ('arrow-schema', '58.2.0'),
-    ('autocfg', '1.5.0'),
-    ('bumpalo', '3.19.1'),
-    ('bytes', '1.11.0'),
-    ('cc', '1.2.49'),
-    ('cfg-if', '1.0.4'),
-    ('chrono', '0.4.42'),
-    ('const-random', '0.1.18'),
-    ('const-random-macro', '0.1.16'),
-    ('core-foundation-sys', '0.8.7'),
-    ('crunchy', '0.2.4'),
-    ('find-msvc-tools', '0.1.5'),
-    ('getrandom', '0.2.16'),
-    ('getrandom', '0.3.4'),
-    ('half', '2.7.1'),
-    ('hashbrown', '0.17.0'),
-    ('iana-time-zone', '0.1.64'),
-    ('iana-time-zone-haiku', '0.1.2'),
-    ('js-sys', '0.3.83'),
-    ('libc', '0.2.186'),
-    ('libm', '0.2.15'),
-    ('log', '0.4.34'),
-    ('num-bigint', '0.4.6'),
-    ('num-complex', '0.4.6'),
-    ('num-integer', '0.1.46'),
-    ('num-traits', '0.2.19'),
-    ('once_cell', '1.21.4'),
-    ('proc-macro2', '1.0.106'),
-    ('quote', '1.0.46'),
-    ('r-efi', '5.3.0'),
-    ('rustversion', '1.0.22'),
-    ('shlex', '1.3.0'),
-    ('syn', '2.0.119'),
-    ('tiny-keccak', '2.0.2'),
-    ('unicode-ident', '1.0.22'),
-    ('version_check', '0.9.5'),
-    ('wasi', '0.11.1+wasi-snapshot-preview1'),
-    ('wasip2', '1.0.1+wasi-0.2.4'),
-    ('wasm-bindgen', '0.2.106'),
-    ('wasm-bindgen-macro', '0.2.106'),
-    ('wasm-bindgen-macro-support', '0.2.106'),
-    ('wasm-bindgen-shared', '0.2.106'),
-    ('windows-core', '0.62.2'),
-    ('windows-implement', '0.60.2'),
-    ('windows-interface', '0.59.3'),
-    ('windows-link', '0.2.1'),
-    ('windows-result', '0.4.1'),
-    ('windows-strings', '0.5.1'),
-    ('wit-bindgen', '0.46.0'),
-    ('zerocopy', '0.8.31'),
-    ('zerocopy-derive', '0.8.31'),
-})
-EXTERNAL_PACKAGE_ALLOW_LIST = {
-    (name, version): {
-        "id": f"{CRATES_IO_SOURCE}#{name}@{version}",
-        "source": CRATES_IO_SOURCE,
-        "version": version,
-    }
-    for name, version in EXTERNAL_PACKAGE_VERSIONS
-}
-EXTERNAL_BUILD_TARGETS = frozenset({
-    ('ahash', '0.8.12'),
-    ('crunchy', '0.2.4'),
-    ('getrandom', '0.3.4'),
-    ('iana-time-zone-haiku', '0.1.2'),
-    ('libc', '0.2.186'),
-    ('libm', '0.2.15'),
-    ('num-traits', '0.2.19'),
-    ('proc-macro2', '1.0.106'),
-    ('quote', '1.0.46'),
-    ('rustversion', '1.0.22'),
-    ('tiny-keccak', '2.0.2'),
-    ('wasm-bindgen', '0.2.106'),
-    ('wasm-bindgen-shared', '0.2.106'),
-    ('wit-bindgen', '0.46.0'),
-    ('zerocopy', '0.8.31'),
-})
-EXTERNAL_PROC_MACROS = frozenset({
-    ('const-random-macro', '0.1.16'),
-    ('rustversion', '1.0.22'),
-    ('wasm-bindgen-macro', '0.2.106'),
-    ('windows-implement', '0.60.2'),
-    ('windows-interface', '0.59.3'),
-    ('zerocopy-derive', '0.8.31'),
-})
+EXTERNAL_PACKAGE_NAMES = frozenset(['ahash', 'android_system_properties', 'arrow-array', 'arrow-buffer', 'arrow-cast', 'arrow-data', 'arrow-ord', 'arrow-schema', 'arrow-select', 'atoi', 'base64', 'lexical-core', 'lexical-parse-float', 'lexical-parse-integer', 'lexical-util', 'lexical-write-float', 'lexical-write-integer', 'ryu', 'autocfg', 'bumpalo', 'bytes', 'cc', 'cfg-if', 'chrono', 'const-random', 'const-random-macro', 'core-foundation-sys', 'crunchy', 'find-msvc-tools', 'getrandom', 'half', 'hashbrown', 'iana-time-zone', 'iana-time-zone-haiku', 'js-sys', 'libc', 'libm', 'log', 'num-bigint', 'num-complex', 'num-integer', 'num-traits', 'once_cell', 'proc-macro2', 'quote', 'r-efi', 'rustversion', 'shlex', 'syn', 'tiny-keccak', 'unicode-ident', 'version_check', 'wasi', 'wasip2', 'wasm-bindgen', 'wasm-bindgen-macro', 'wasm-bindgen-macro-support', 'wasm-bindgen-shared', 'windows-core', 'windows-implement', 'windows-interface', 'windows-link', 'windows-result', 'windows-strings', 'wit-bindgen', 'zerocopy', 'zerocopy-derive'])
+EXTERNAL_PACKAGE_SOURCES = {name: CRATES_IO_SOURCE for name in EXTERNAL_PACKAGE_NAMES}
+EXTERNAL_IDENTITY_UNIQUE_NAMES = frozenset({"arrow-array", "arrow-buffer", "arrow-cast", "arrow-data", "arrow-ord", "arrow-schema", "arrow-select", "bytes"})
+EXTERNAL_BUILD_TARGETS = frozenset(['ahash', 'crunchy', 'getrandom', 'iana-time-zone-haiku', 'libc', 'libm', 'num-traits', 'proc-macro2', 'quote', 'rustversion', 'tiny-keccak', 'wasm-bindgen', 'wasm-bindgen-shared', 'wit-bindgen', 'zerocopy'])
+EXTERNAL_PROC_MACROS = frozenset(['const-random-macro', 'rustversion', 'wasm-bindgen-macro', 'windows-implement', 'windows-interface', 'zerocopy-derive'])
 EXTERNAL_BUILD_EDGES = {
-    ("ahash", "0.8.12"): frozenset({"version_check"}),
-    ("iana-time-zone-haiku", "0.1.2"): frozenset({"cc"}),
-    ("num-traits", "0.2.19"): frozenset({"autocfg"}),
-    ("wasm-bindgen", "0.2.106"): frozenset({"rustversion"}),
+    "ahash": frozenset({"version_check"}),
+    "iana-time-zone-haiku": frozenset({"cc"}),
+    "num-traits": frozenset({"autocfg"}),
+    "wasm-bindgen": frozenset({"rustversion"}),
 }
-RESOLVED_PACKAGE_ALLOW_LIST = frozenset(
-    {name for name, _ in EXTERNAL_PACKAGE_VERSIONS} | set(DIRECT_INTERNAL_ALLOW_LIST)
-)
+RESOLVED_PACKAGE_ALLOW_LIST = EXTERNAL_PACKAGE_NAMES | DIRECT_INTERNAL_ALLOW_LIST
 
 NORMAL = None
 
@@ -419,25 +339,25 @@ class Graph:
             fail([f"Cargo tree package identity is ambiguous: {label}"])
         return matches[0]
 
-    def external_package(self, name, expected):
-        matches = [
-            package
-            for package in self.packages_by_name.get(name, [])
-            if package["id"] == expected["id"]
-            and package["source"] == expected["source"]
-            and package["version"] == expected["version"]
-            and Path(package["manifest_path"]).name == "Cargo.toml"
-            and Path(package["manifest_path"]).parent.name
-            == f"{name}-{expected['version']}"
-        ]
-        if len(matches) > 1:
-            fail(
-                [
-                    "Cargo metadata contains more than one audited external "
-                    f"package identity for {name}: {expected['id']}"
-                ]
-            )
-        return matches[0] if matches else None
+    def external_packages(self, name, source):
+        """Resolve registry authorities using each package's own version."""
+
+        matches = []
+        for package in self.packages_by_name.get(name, []):
+            manifest = Path(package["manifest_path"]).resolve()
+            version = package["version"]
+            if (
+                package["id"] == f"{source}#{name}@{version}"
+                and package["source"] == source
+                and manifest.name == "Cargo.toml"
+                and manifest.parent.name == f"{name}-{version}"
+                and len(manifest.parents) >= 4
+                and manifest.parents[2].name == "src"
+                and manifest.parents[3].name == "registry"
+                and manifest.is_file()
+            ):
+                matches.append(package)
+        return matches
 
 
 def package_identity(package):
@@ -460,15 +380,37 @@ def describe_package_identity(package):
 
 
 def resolved_package_allow_list(graph):
-    """Resolve the audited identities without trusting a dependency's name."""
-
+    """Resolve the audited authorities from Cargo's actual package identities."""
     packages = [graph.workspace_package(name) for name in DIRECT_INTERNAL_ALLOW_LIST]
     packages.extend(
         package
-        for (name, _), expected in sorted(EXTERNAL_PACKAGE_ALLOW_LIST.items())
-        if (package := graph.external_package(name, expected)) is not None
+        for name, source in sorted(EXTERNAL_PACKAGE_SOURCES.items())
+        for package in graph.external_packages(name, source)
     )
     return frozenset(package_identity(package) for package in packages)
+
+
+def verify_external_identity_uniqueness(closure):
+    """Allow removal, but never multiple authorities for one external name."""
+
+    violations = []
+    for name in sorted(EXTERNAL_IDENTITY_UNIQUE_NAMES):
+        identities = {
+            package_identity(package): package
+            for package in closure.values()
+            if package["name"] == name
+        }
+        if len(identities) > 1:
+            violations.append(
+                "resolved normal dependency closure contains more than one "
+                f"identity for {name}: "
+                + "; ".join(
+                    describe_package_identity(package)
+                    for _, package in sorted(identities.items(), key=lambda item: str(item[0]))
+                )
+            )
+    return violations
+
 
 def declared_dependencies_by_kind(package):
     """Return canonical package names, including optional and renamed edges."""
@@ -553,7 +495,7 @@ def verify_declared_dependencies(package):
             "declares build dependencies, but the physical-plan contract permits none: "
             + ", ".join(sorted(build))
         )
-    if dev:
+    if dev - {"arrow-array"}:
         violations.extend(capability_violations(dev, "declared dev dependencies"))
         violations.append(
             "declares dev dependencies, but the physical-plan contract permits none: "
@@ -599,6 +541,11 @@ def verify_package_targets(package, owner=PACKAGE_NAME):
                         ("proc-macro", "proc-macro target")):
         targets = sorted(target["name"] for target in package.get("targets", [])
                          if kind in target.get("kind", []))
+        if kind == "custom-build" and owner == TYPE_CONTRACT:
+            audited = Path(package["manifest_path"]).parent / "build.rs"
+            targets = [target["name"] for target in package.get("targets", [])
+                       if kind in target.get("kind", [])
+                       and Path(target["src_path"]).resolve() != audited.resolve()]
         if targets:
             violations.append(
                 f"{owner} declares a {label}, but repository-owned pure contracts "
@@ -606,15 +553,14 @@ def verify_package_targets(package, owner=PACKAGE_NAME):
     return violations
 
 
-def verify_external_authority(package, versions=EXTERNAL_PACKAGE_VERSIONS,
+def verify_external_authority(package, names=EXTERNAL_PACKAGE_NAMES,
                               build_targets=EXTERNAL_BUILD_TARGETS,
                               proc_macros=EXTERNAL_PROC_MACROS,
                               build_edges=EXTERNAL_BUILD_EDGES):
     """Admit exact registry authorities, never a same-name source replacement."""
     name, version = package["name"], package["version"]
-    key = (name, version)
     manifest = Path(package["manifest_path"])
-    identity_ok = (key in versions
+    identity_ok = (name in names
                    and package["source"] == CRATES_IO_SOURCE
                    and package["id"] == f"{CRATES_IO_SOURCE}#{name}@{version}"
                    and manifest.name == "Cargo.toml"
@@ -626,14 +572,14 @@ def verify_external_authority(package, versions=EXTERNAL_PACKAGE_VERSIONS,
     dependencies, unknown = declared_dependencies_by_kind(package)
     if unknown:
         violations.append(f"{name} has unknown dependency kinds: {sorted(unknown)}")
-    unexpected_build = dependencies["build"] - build_edges.get(key, frozenset())
+    unexpected_build = dependencies["build"] - build_edges.get(name, frozenset())
     if unexpected_build:
         violations.append(f"{name} declares unaudited build dependencies: "
                           + ", ".join(sorted(unexpected_build)))
     for target in package.get("targets", []):
         for kind, allow in (("custom-build", build_targets), ("proc-macro", proc_macros)):
             if kind in target.get("kind", []):
-                if not identity_ok or key not in allow:
+                if not identity_ok or name not in allow:
                     violations.append(f"{name} declares unaudited {kind} authority: "
                                       + target["name"])
                 source = target.get("src_path")
@@ -694,7 +640,8 @@ def verify_internal_contract_surface(graph):
                 "permits none: " + ", ".join(sorted(build_dependencies))
             )
         dev_dependencies = dependencies["dev"]
-        if dev_dependencies:
+        dev_allow = {"arrow-array", "arrow-schema"} if name == FUNCTION_CONTRACT else set()
+        if dev_dependencies - dev_allow:
             violations.extend(
                 capability_violations(
                     dev_dependencies, f"{name} declared dev dependencies"
@@ -776,6 +723,7 @@ def verify_resolved_closure(manifest_path, graph):
             "the exact audited allow-list: "
             + "; ".join(describe_package_identity(package) for package in unexpected)
         )
+    violations.extend(verify_external_identity_uniqueness(closure))
     return closure, violations
 
 

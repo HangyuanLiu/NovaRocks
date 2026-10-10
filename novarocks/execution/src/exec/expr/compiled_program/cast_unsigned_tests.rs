@@ -413,9 +413,11 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
             )
             .unwrap();
         let port = ResultPort {
+            scalar_schema: None,
             fragment: fid,
             output: fragment.nodes()[&node].output.clone(),
             fields: Box::from([ResultField {
+                domain: crate::test_result_domain::result_value_domain(&output),
                 name: "narrow_source".into(),
                 alias: None,
                 value,

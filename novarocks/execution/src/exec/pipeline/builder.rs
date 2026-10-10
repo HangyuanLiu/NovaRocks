@@ -1119,6 +1119,7 @@ fn build_pipeline_for_node(
             input,
             node_id,
             is_subordinate,
+            validate_final_result_input,
             exprs,
             expr_slot_ids,
             expr_slot_schemas,
@@ -1126,10 +1127,8 @@ fn build_pipeline_for_node(
             output_chunk_schema,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
-            build
-                .pipeline
-                .factories
-                .push(Box::new(ProjectProcessorFactory::new(
+            build.pipeline.factories.push(Box::new(
+                ProjectProcessorFactory::new(
                     *node_id,
                     *is_subordinate,
                     Arc::clone(&ctx.arena),
@@ -1138,7 +1137,9 @@ fn build_pipeline_for_node(
                     expr_slot_schemas.clone(),
                     output_indices.clone(),
                     output_chunk_schema.clone(),
-                )));
+                )
+                .with_final_result_input_validation(*validate_final_result_input),
+            ));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }

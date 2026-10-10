@@ -21,6 +21,16 @@ use arrow::datatypes::DataType;
 use novarocks_query_application::api::ResultField;
 use novarocks_types::schema::SqlType;
 use opensrv_mysql::{Column, ColumnFlags, ColumnType};
+use std::io;
+
+/// Project the already-bounded immutable schema for a governed row stream.
+pub fn mysql_columns_for_result_fields(fields: &[ResultField]) -> io::Result<Vec<Column>> {
+    fields
+        .iter()
+        .map(mysql_column_for_result_field)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
 
 /// Converts a Query Application result field into one MySQL column definition.
 ///

@@ -756,12 +756,16 @@ fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
 fn result_port(fragment: &Fragment, root: NodeId) -> ResultPort {
     let output = fragment.nodes()[&root].output.clone();
     ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         fields: output
             .columns
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(
+                    &fragment.values()[value].ty,
+                ),
                 name: format!("c{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,

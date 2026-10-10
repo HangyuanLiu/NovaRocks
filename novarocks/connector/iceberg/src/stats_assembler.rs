@@ -52,7 +52,11 @@ pub async fn write_puffin_artifacts(
         .map_err(|error| format!("create Puffin writer: {error}"))?;
     let mut metadata = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
-        let (identity, body, properties) = artifact.clone().into_parts();
+        // Keep the original carrier borrowed through every async writer exit.
+        // Copies made for Puffin coexist under its admission holder.
+        let identity = artifact.identity();
+        let body = artifact.body();
+        let properties = artifact.properties();
         let blob = Blob::builder()
             .r#type(identity.blob_type().to_string())
             .fields(identity.input_fields().to_vec())
@@ -70,7 +74,7 @@ pub async fn write_puffin_artifacts(
             snapshot_id,
             sequence_number,
             fields: identity.input_fields().to_vec(),
-            properties: properties.into_iter().collect(),
+            properties: properties.clone().into_iter().collect(),
         });
     }
     writer

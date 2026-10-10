@@ -278,9 +278,11 @@ fn nullsafe_fixture(
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: FragmentId::new(307),
         output: fragment.nodes()[&output].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "null_safe_result".into(),
             alias: None,
             value: result,

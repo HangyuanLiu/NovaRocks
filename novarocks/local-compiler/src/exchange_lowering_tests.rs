@@ -19,7 +19,9 @@
 //! package extraction: a Values producer streaming over one edge and an
 //! ExchangeSource consumer. Both sides compile independently.
 
-use crate::{FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers};
+use crate::{
+    FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers,
+};
 use arrow_schema::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
@@ -222,6 +224,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     .unwrap();
     if gather {
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: CONSUMER,
             output: OutputPort {
                 node: RECEIVER,
@@ -229,12 +232,14 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             },
             fields: Box::from([
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "b".into(),
                     alias: Some("bee".into()),
                     value: ib,
                     ty: ty.clone(),
                 },
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "a".into(),
                     alias: None,
                     value: ia,

@@ -27,7 +27,7 @@ use super::{
     StatisticsPublicationOutcome, StatisticsTarget, StatisticsWorker,
 };
 use novarocks_workload_control::{
-    ResourceConfig, WorkClass, WorkOwner, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
+    ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
 };
 
 fn create(at_ms: i64) -> StatisticsJobCreate {
@@ -43,7 +43,7 @@ fn create(at_ms: i64) -> StatisticsJobCreate {
     }
 }
 
-fn root() -> WorkOwner {
+async fn root() -> crate::StatisticsJobAdmission {
     let control = WorkloadControl::try_new(
         WorkloadConfig::default(),
         ResourceConfig {
@@ -52,12 +52,23 @@ fn root() -> WorkOwner {
             per_scope_bytes: 8 * 1024 * 1024,
         },
     )
-    .expect("workload control");
-    control.mark_ready().expect("ready");
+    .unwrap();
     control
-        .try_begin_root(WorkRequest::new(WorkClass::Statistics))
-        .expect("root")
+        .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+        .unwrap();
+    control.mark_ready().unwrap();
+    let root = control
+        .root_admission()
+        .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+        .unwrap();
+    let (permit, window) = root
         .owner
+        .scope()
+        .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
+        .unwrap()
+        .await
+        .unwrap();
+    crate::StatisticsJobAdmission::try_new(root.owner, permit, window).unwrap()
 }
 
 struct PublishExecutor {
@@ -69,23 +80,23 @@ impl StatisticsAttemptExecutor for PublishExecutor {
     fn prepare(
         &self,
         _job: &StatisticsJob,
-        scope: &WorkScope,
+        context: &crate::StatisticsAttemptContext,
     ) -> Result<(), StatisticsAttemptError> {
-        scope.check().map_err(failed)
+        context.stage_scope().check().map_err(failed)
     }
     fn collect(
         &self,
         _job: &StatisticsJob,
-        scope: &WorkScope,
+        context: &crate::StatisticsAttemptContext,
     ) -> Result<(), StatisticsAttemptError> {
-        scope.check().map_err(failed)
+        context.stage_scope().check().map_err(failed)
     }
     fn publish(
         &self,
         _job: &StatisticsJob,
-        scope: &WorkScope,
+        context: &crate::StatisticsAttemptContext,
     ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
-        scope.check().map_err(failed)?;
+        context.stage_scope().check().map_err(failed)?;
         self.publications.fetch_add(1, Ordering::SeqCst);
         Ok(StatisticsPublicationOutcome {
             fact: self.outcome,
@@ -106,7 +117,10 @@ fn failed(error: novarocks_workload_control::WorkError) -> StatisticsAttemptErro
 #[tokio::test]
 async fn process_runtime_exposes_distinct_process_local_identities() {
     let repository = StatisticsJobRepository::new();
-    let submitted = repository.create(create(1), root()).await.expect("create");
+    let submitted = repository
+        .create_admitted(create(1), root().await)
+        .await
+        .expect("create");
     let claimed = repository.claim_next(2).await.expect("claim").expect("job");
     assert_eq!(submitted.id.as_uuid().get_version_num(), 7);
     assert_eq!(submitted.publication_id.as_uuid().get_version_num(), 7);
@@ -140,7 +154,10 @@ async fn commit_unknown_is_terminal_and_not_redispatched() {
         finalization_failure: false,
     });
     let worker = StatisticsWorker::new(repository.clone(), executor.clone());
-    let job = repository.create(create(1), root()).await.expect("create");
+    let job = repository
+        .create_admitted(create(1), root().await)
+        .await
+        .expect("create");
     let terminal = worker.run_one(2).await.expect("run").expect("terminal");
     assert_eq!(
         terminal.state,
@@ -168,7 +185,10 @@ async fn known_commit_finalization_failure_retains_the_provider_fact() {
         finalization_failure: true,
     });
     let worker = StatisticsWorker::new(repository.clone(), executor);
-    repository.create(create(1), root()).await.expect("create");
+    repository
+        .create_admitted(create(1), root().await)
+        .await
+        .expect("create");
     let terminal = worker.run_one(2).await.expect("run").expect("terminal");
     assert_eq!(
         terminal.state,
@@ -192,7 +212,10 @@ async fn known_commit_finalization_failure_retains_the_provider_fact() {
 #[tokio::test]
 async fn submitted_is_a_phase_not_a_success_conclusion() {
     let repository = StatisticsJobRepository::new();
-    let job = repository.create(create(1), root()).await.expect("create");
+    let job = repository
+        .create_admitted(create(1), root().await)
+        .await
+        .expect("create");
     assert_eq!(
         job.state,
         StatisticsJobState::Active(StatisticsJobPhase::Submitted)

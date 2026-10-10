@@ -121,6 +121,7 @@ fn assembled(
             ProgramNodeKind::Project {
                 input: ProgramNodeId::new(0),
                 is_subordinate: false,
+                validate_final_result_input: false,
                 exprs: vec![root],
                 expr_slot_ids: vec![SlotId::new(2)],
                 expr_slot_schemas: None,

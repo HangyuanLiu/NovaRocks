@@ -28,14 +28,64 @@ use super::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts;
 /// One column a fragment delivers, as everything downstream of the plan reads
 /// it.
 ///
-/// A name, a type and whether it admits null is the whole of it. Both plan
-/// representations name their outputs this way, so this is where the two
-/// meet.
+/// The completed result owner supplies the logical domain independently of
+/// its Arrow carrier. It cannot be reconstructed from a wire name or type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlanOutputColumn {
     pub(crate) name: String,
     pub(crate) data_type: arrow::datatypes::DataType,
     pub(crate) nullable: bool,
+    pub(crate) domain: novarocks_physical_plan::ResultValueDomain,
+}
+
+impl PlanOutputColumn {
+    pub(crate) fn validate_domain(&self) -> Result<(), String> {
+        if !self.domain.matches_storage(&self.data_type) {
+            return Err("typed root result domain does not match output carrier".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn logical_type(&self) -> Result<Option<novarocks_types::schema::SqlType>, String> {
+        use novarocks_physical_plan::ResultValueDomain as D;
+        use novarocks_types::schema::SqlType as T;
+        self.validate_domain()?;
+        Ok(match self.domain {
+            D::Plain => None,
+            D::Json => Some(T::Json),
+            D::Variant => Some(T::Variant),
+            D::Hll => Some(T::Hll),
+            D::Bitmap => Some(T::Bitmap),
+            D::Object => Some(T::Object),
+            D::Percentile => Some(T::Percentile),
+        })
+    }
+
+    pub(crate) fn canonical_field(
+        &self,
+        nullable: bool,
+    ) -> Result<arrow::datatypes::Field, String> {
+        use novarocks_types::logical::field_with_logical_type;
+        self.validate_domain()?;
+        let field = arrow::datatypes::Field::new(&self.name, self.data_type.clone(), nullable);
+        Ok(match self.logical_marker() {
+            Some(marker) => field_with_logical_type(field, marker),
+            None => field,
+        })
+    }
+
+    pub(crate) fn logical_marker(&self) -> Option<novarocks_types::logical::LogicalType> {
+        use novarocks_physical_plan::ResultValueDomain as D;
+        use novarocks_types::logical::LogicalType as L;
+        match self.domain {
+            D::Plain | D::Variant => None,
+            D::Json => Some(L::Json),
+            D::Hll => Some(L::Hll),
+            D::Bitmap => Some(L::Bitmap),
+            D::Object => Some(L::Object),
+            D::Percentile => Some(L::Percentile),
+        }
+    }
 }
 
 /// What an attempt reads about its plan after preparation has finished with

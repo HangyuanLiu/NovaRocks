@@ -603,6 +603,18 @@ impl ConstantValue {
         diagnostic::format(self, phase, control)
     }
 
+    /// Stream selected text without retaining an intermediate String.
+    /// An inner fmt::Error is the caller writer's refusal; its journal remains
+    /// authoritative and receives no completion callback after refusal.
+    pub fn write_diagnostic_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+        output: &mut dyn std::fmt::Write,
+    ) -> Result<std::fmt::Result, ConstantError> {
+        diagnostic::write(self, phase, control, output)
+    }
+
     pub fn pool(&self) -> &ConstantPool {
         &self.pool
     }

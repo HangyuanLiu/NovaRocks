@@ -33,10 +33,12 @@ mod error;
 mod execution;
 mod handle;
 mod identity;
+mod listing;
 mod metadata;
 mod metadata_maintenance;
 mod mutation;
 mod mv_storage_observation;
+mod payload_retention;
 mod predicate;
 pub mod provider;
 mod provider_binding;
@@ -98,8 +100,9 @@ pub use codec::{
 };
 pub use context::{
     ConnectorAttemptContext, ConnectorOperationControl, ConnectorPlanningContext,
-    ConnectorRangeScope, ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
-    ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
+    ConnectorRangeScope, ConnectorRequestContext, ConnectorRequestInitiation,
+    ConnectorRequestScope, ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
+    VendedS3SeedMaterial,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -166,6 +169,7 @@ pub use handle::{
 pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };
+pub use listing::{ConnectorListingBound, ConnectorListingBudget, ConnectorListingCollector};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorListNamespacesRequest,
@@ -175,7 +179,8 @@ pub use metadata::{
     ConnectorTableColumnPlanningFact, ConnectorTableColumnRole, ConnectorTableColumnSemanticKind,
     ConnectorTableColumnVisibility, ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
     ConnectorTableDefinitionStructField, ConnectorTableDefinitionType,
-    ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableJobAdmission,
+    ConnectorTableJobAdmissionRequest, ConnectorTableJobKind, ConnectorTableMetadata,
     ConnectorTableObjectBinding, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
     ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTablePlanningFacts,
     ConnectorTableRequest, ConnectorTableResolution, ConnectorTableUniqueConstraint,
@@ -227,6 +232,7 @@ pub use mv_storage_observation::{
     MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
     UnavailableMvStorageObservationPort,
 };
+pub use payload_retention::ConnectorPayloadRetentionGuard;
 pub use predicate::{
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
@@ -272,14 +278,18 @@ pub use row_mutation::{
     ConnectorMutationMatchContract, ConnectorMutationRouteInput,
     ConnectorMutationSelectionFieldRef, ConnectorMutationSelectionFieldRole,
     ConnectorMutationSourceField, ConnectorMutationTargetField,
+    ConnectorRowConversionBatchFootprint, ConnectorRowConversionFootprint,
     ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
     ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationEffect,
     ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorRowMutationRoute, ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
     ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationSelectionView,
-    ConnectorRowMutationStrategy, ConnectorWriteRouteId, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
-    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,
+    ConnectorRowMutationSourceArray, ConnectorRowMutationSourceBatch,
+    ConnectorRowMutationSourceBuffer, ConnectorRowMutationSourceBuilder,
+    ConnectorRowMutationSourceChildren, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
+    MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
+    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use semantic_revision::{
@@ -307,14 +317,15 @@ pub use statistics::{
     MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
     MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
     MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
-    StatisticsArtifactIdentity, StatisticsBasisRelation, StatisticsCollection,
-    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
-    StatisticsColumnSelection, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric, StatisticsMetricError,
-    StatisticsMetricErrorKind, StatisticsMetricObservation, StatisticsMetricRequest,
-    StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
-    StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest, StatisticsReader,
-    StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
+    StatisticsArtifactIdentity, StatisticsArtifactParts, StatisticsBasisRelation,
+    StatisticsCollection, StatisticsCollectionSession, StatisticsCollectionStart,
+    StatisticsCollectionStartRequest, StatisticsColumnSelection, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric,
+    StatisticsMetricError, StatisticsMetricErrorKind, StatisticsMetricObservation,
+    StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest,
+    StatisticsReader, StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage,
+    StatisticsScanColumn,
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,

@@ -242,7 +242,7 @@ fn lower(
     // A Result sink publishes the result port; a Stream sink publishes its
     // one exact outbound cut. Every other sink family remains explicit.
     let stream_cut = match physical.sink() {
-        FragmentSink::Result => {
+        FragmentSink::Result | FragmentSink::RootResult(_) => {
             if !outbound.is_empty() {
                 return Err(FragmentCompileError::Invalid(
                     "result sink has an outbound exchange cut",
@@ -1412,6 +1412,9 @@ fn lower(
                     ProgramNodeKind::Project {
                         input: child,
                         is_subordinate: false,
+                        // The expression Project computes its original roots. The
+                        // terminal RootResult boundary validates the actual output.
+                        validate_final_result_input: false,
                         exprs,
                         expr_slot_ids: layout.slots().to_vec(),
                         expr_slot_schemas: None,
@@ -1620,7 +1623,34 @@ fn lower(
             requirement_entries.push(BindingRequirement::ResultSink {
                 layout: root_layout.clone(),
             });
-            (StaticSinkProgram::Result, None)
+            let sink = match physical.sink() {
+                FragmentSink::RootResult(contract) => {
+                    let mut slots = Vec::with_capacity(root_layout.slots().len());
+                    for slot in root_layout.slots() {
+                        slots.push(slot.as_u32());
+                        work.step()?;
+                    }
+                    work.flush()?;
+                    let bound = contract
+                        .as_ref()
+                        .clone()
+                        .bind_native_slots(&slots)
+                        .map_err(|_| {
+                            FragmentCompileError::Invalid(
+                                "root result slots differ from its actual local output",
+                            )
+                        })?;
+                    work.flush()?;
+                    StaticSinkProgram::RootResult(Arc::new(bound))
+                }
+                FragmentSink::Result => StaticSinkProgram::Result,
+                _ => {
+                    return Err(FragmentCompileError::Invalid(
+                        "terminal result sink changed during lowering",
+                    ));
+                }
+            };
+            (sink, None)
         }
     };
     work.flush()?;

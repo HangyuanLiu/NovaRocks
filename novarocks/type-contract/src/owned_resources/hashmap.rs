@@ -44,7 +44,7 @@ fn mul(a: usize, b: usize) -> Result<usize, HashMapResourceError> {
         .ok_or(Arithmetic("HashMap resource product overflow"))
 }
 
-/// Rust 1.92 std Cargo.lock selects hashbrown 0.15.5 with
+/// Rust 1.98.1 std Cargo.lock selects hashbrown 0.17.1 with
 /// rustc-dep-of-std/nightly. control/group/mod.rs selects these public
 /// intrinsic carriers, or the actual generic u64 word on the proven targets.
 /// No private Group repr is recreated. Other targets need a source review.
@@ -105,7 +105,7 @@ fn group_layout() -> Result<Layout, HashMapResourceError> {
 
 /// Only an empty HashMap followed by one reserve/try_reserve(unique_count),
 /// or with_capacity(unique_count), and at most that many insertion occurrences.
-/// Rust 1.92 std's ONE-entry array From route uses empty + extend + reserve(1).
+/// Rust 1.98.1 std's ONE-entry array From route uses empty + extend + reserve(1).
 /// These constructors share RawTable capacity_to_buckets/TableLayout below.
 /// No removals, prior allocation, mutable escape, or second growth are covered.
 /// raw/mod.rs capacity_to_buckets/TableLayout are the sole source formula.
@@ -226,7 +226,7 @@ pub fn fresh_string_table_work_upper_bound(
 /// SipHasher13, including transparent carriers delegating exactly that body.
 /// This excludes arbitrary user Hash/Eq/BuildHasher or value processing.
 ///
-/// Rust 1.92 core array/mod.rs delegates Hash to its slice; hash/mod.rs writes
+/// Rust 1.98.1 core array/mod.rs delegates Hash to its slice; hash/mod.rs writes
 /// a length prefix with the VALUE 32 through write_usize, then u8::hash_slice
 /// writes the actual 32 bytes once. DefaultHasher forwards to SipHasher13.
 /// On the locked 64-bit target this admits 8 prefix bytes plus 32 data bytes,

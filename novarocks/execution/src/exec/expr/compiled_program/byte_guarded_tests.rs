@@ -182,9 +182,11 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: FragmentId::new(201),
         output: fragment.nodes()[&output].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&bytes),
             name: "byte_result".into(),
             alias: None,
             value: result_value,

@@ -136,12 +136,15 @@ impl CreationCell {
     }
 
     /// Orders a post-Accept preparation failure against a concurrent stop.
-    pub(super) fn claim_failure(&self, failure: CreationFailure) -> Option<PreparationStop> {
+    ///
+    /// The failure is this creation's own cause only when no stop was
+    /// requested first; once it is claimed, no later stop is accepted. The
+    /// resulting decision is read back through [`Self::stop`].
+    pub(super) fn claim_failure(&self, failure: CreationFailure) {
         let mut decision = self.decision.lock().expect("creation cell lock");
         if decision.stop.is_none() {
             decision.failure = Some(failure);
         }
-        decision.stop
     }
 
     pub(super) fn accept(&self, status: Arc<TaskStatusOwner>) {
@@ -301,6 +304,9 @@ pub(super) struct ContextEntry {
     pub(super) domains: QueryContextDomains,
     pub(super) source: Arc<TaskStatusSource>,
     pub(super) tasks: BTreeMap<TaskIdentity, TaskEntry>,
+    /// Result visibility belongs to the context, independent of task records
+    /// and their retained tombstone horizon.
+    pub(super) roots: BTreeMap<TaskIdentity, Arc<crate::root_result_channel::RootResultChannel>>,
     pub(super) quiesce: Option<QuiesceQueryContextReceipt>,
     /// Compact, context-lifetime anti-replay fence for every task identity
     /// that reached an installed worker. Detailed terminal records may be
@@ -339,6 +345,7 @@ impl ContextEntry {
             domains: QueryContextDomains::empty(),
             source,
             tasks: BTreeMap::new(),
+            roots: BTreeMap::new(),
             quiesce: None,
             spent_tasks: BTreeSet::new(),
             retired_at: None,

@@ -34,25 +34,22 @@ mod aggregate_call;
 mod aggregate_erasure;
 pub mod aggregate_format;
 mod aggregate_host_allocator;
-pub mod opaque_memory;
 mod aggregate_invocation_backing;
 mod aggregate_kernel;
 pub mod aggregate_scalar;
 pub mod aggregate_scalar_fingerprint;
 mod aggregate_state_column;
 pub mod aggregate_types;
-pub mod approx_percentile_core;
-pub mod percentile_hash_core;
 pub mod approx_percentile_aggregate_core;
+pub mod approx_percentile_core;
 mod arithmetic;
 mod binding;
 pub mod bit_array;
-pub mod bitmap_value;
-pub mod bitmap_to_string_core;
 pub mod bit_numeric;
+pub mod bitmap_to_string_core;
+pub mod bitmap_value;
 pub mod builtin;
 pub mod calendar_julian;
-pub mod invocation_arity;
 pub mod calendar_numeric;
 pub mod calendar_period_numeric;
 mod call_contract;
@@ -62,40 +59,43 @@ pub mod carrier_text;
 mod cast;
 mod comparison;
 pub mod control_values;
+pub mod datasketches_hll;
+pub mod datasketches_hll_failure;
 pub mod datetime_value;
 pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
 mod evaluation_failure;
-pub mod exact_percentile_core;
-pub mod exact_percentile_failure;
 #[cfg(test)]
 mod exact_installed_owner_selection_tests;
 #[cfg(test)]
 mod exact_overload_selection_tests;
+pub mod exact_percentile_core;
+pub mod exact_percentile_failure;
 pub mod generate_series_core;
 mod higher_order_call;
 mod higher_order_kernel;
 pub mod hll;
-pub mod datasketches_hll;
-pub mod datasketches_hll_failure;
-pub mod sketch_hash;
+pub mod invocation_arity;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
 pub mod largeint;
 pub mod largeint_text;
 pub mod math_numeric;
+pub mod opaque_memory;
 pub mod pattern_memo;
+pub mod percentile_hash_core;
 pub mod percentile_input;
 mod pure_catalogue;
 mod scalar_kernel;
 pub mod selected_copy;
+pub mod sketch_hash;
 mod specialization;
-mod temporal_call;
 mod table_call;
 mod table_kernel;
+mod temporal_call;
 pub mod temporal_carrier;
 mod window_call;
 mod window_kernel;
@@ -2659,9 +2659,9 @@ mod tests {
 
 pub mod date_float_cast;
 
+pub mod append_trailing_core;
 pub mod float_date_cast;
 pub mod string_reverse_shared;
-pub mod append_trailing_core;
 
 pub mod legacy_arithmetic;
 pub mod legacy_decimal;
@@ -2717,11 +2717,11 @@ pub mod percentile_approx_raw_core;
 pub mod approx_percentile_failure;
 
 mod arrow_result_custody;
-mod scalar_output_resources;
 mod scalar_output_operation;
+mod scalar_output_resources;
+pub mod window_format;
 mod window_invocation_data;
 mod window_output_scalars;
-pub mod window_format;
 pub use window_invocation_data::{
     WindowEvaluationFailure, WindowInvocationContext, WindowInvocationData, WindowInvocationPhase,
 };
@@ -2730,7 +2730,9 @@ mod window_result_carrier;
 pub use window_result_carrier::WindowResultCarrier;
 
 mod window_invocation_input;
-pub use window_invocation_input::{FullWindowInvocationInput, WindowFrameOrigin, WindowInvocationInput};
+pub use window_invocation_input::{
+    FullWindowInvocationInput, WindowFrameOrigin, WindowInvocationInput,
+};
 mod window_evaluation_invocation;
 pub use window_evaluation_invocation::WindowEvaluationInvocation;
 mod window_invocation_scratch;
@@ -2751,3 +2753,6 @@ pub mod string_left_right_core;
 pub mod string_split_part_core;
 
 pub mod approx_top_k_core;
+
+#[cfg(test)]
+mod common_type_m07_contract_tests;

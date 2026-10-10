@@ -602,6 +602,13 @@ impl NovaRocksGrpc for FrontendReportService {
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
         Err(Self::rejected("FetchTaskResult"))
     }
+
+    async fn fetch_root_result(
+        &self,
+        _request: tonic::Request<proto::FetchRootResultRequest>,
+    ) -> Result<tonic::Response<proto::FetchRootResultResponse>, tonic::Status> {
+        Err(Self::rejected("FetchRootResult"))
+    }
 }
 
 fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
@@ -887,6 +894,7 @@ mod tests {
             Arc::clone(&trust),
             FrontendNativeTransport::plaintext(),
             novarocks_native_adapter::native_server::NativeIngressConfig::default(),
+            novarocks_native_adapter::native_transport_admission::NativeTransportAdmission::frontend(None).unwrap(),
         )
         .expect("start frontend report server");
 
@@ -936,6 +944,7 @@ mod tests {
             trust,
             FrontendNativeTransport::plaintext(),
             novarocks_native_adapter::native_server::NativeIngressConfig::default(),
+            novarocks_native_adapter::native_transport_admission::NativeTransportAdmission::frontend(None).unwrap(),
         )
         .expect("start frontend report server");
 
@@ -970,6 +979,7 @@ impl FrontendReportServerHandle {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
+        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
     ) -> Result<Self, String> {
         Self::start_at_host(
             &address.ip().to_string(),
@@ -978,6 +988,7 @@ impl FrontendReportServerHandle {
             native_trust,
             native_transport,
             native_ingress,
+            transport_admission,
         )
     }
 
@@ -989,6 +1000,7 @@ impl FrontendReportServerHandle {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
+        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
     ) -> Result<Self, String> {
         Self::start_at_host(
             host,
@@ -997,6 +1009,7 @@ impl FrontendReportServerHandle {
             native_trust,
             native_transport,
             native_ingress,
+            transport_admission,
         )
     }
 
@@ -1007,9 +1020,10 @@ impl FrontendReportServerHandle {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
+        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
     ) -> Result<Self, String> {
         let deployment_id = native_trust.deployment_id().as_str().to_string();
-        let inner = NativeRpcServerHandle::start(
+        let inner = NativeRpcServerHandle::start_frontend_membership(
             host,
             port,
             FrontendReportService {
@@ -1023,6 +1037,7 @@ impl FrontendReportServerHandle {
             || {},
             || crate::metrics::observe_native_trust_transport_rejection("report_listener"),
             native_ingress,
+            transport_admission,
         )?;
         Ok(Self { inner })
     }

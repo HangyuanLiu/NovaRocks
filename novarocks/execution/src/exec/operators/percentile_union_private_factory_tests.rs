@@ -117,11 +117,13 @@ fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment,
         fields: output
             .columns
             .iter()
             .map(|value| ResultField {
+                domain: crate::test_result_domain::result_value_domain(&bound.result_type()),
                 name: "state".into(),
                 alias: None,
                 value: *value,

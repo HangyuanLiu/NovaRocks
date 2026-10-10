@@ -731,6 +731,10 @@ fn plan_usage_core<P: TypeValidationPolicy>(
         ]);
     }
     if let Some(result) = plan.result_port() {
+        if let Some(schema) = &result.scalar_schema {
+            usage.add_item_counts([schema.type_nodes()]);
+            usage.add_byte_counts([schema.backing_bytes()]);
+        }
         usage.add_item_counts([result.output.columns.len(), result.fields.len()]);
         for (index, field) in result.fields.iter().enumerate() {
             if usage.exhausted() {
@@ -1527,6 +1531,17 @@ fn add_sink_usage(sink: &FragmentSink, usage: &mut ResourceUsage) {
                 ]);
             }
         }
+        FragmentSink::RootResult(contract) => match contract.output() {
+            novarocks_result_contract::FrozenRootOutput::ClientRows(schema) => {
+                usage.add_items(schema.columns().len());
+                usage.add_bytes(schema.backing_bytes());
+            }
+            novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) => {
+                usage.add_items(schema.type_nodes());
+                usage.add_bytes(schema.backing_bytes());
+            }
+            _ => {}
+        },
         FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Noop => {}
     }
 }

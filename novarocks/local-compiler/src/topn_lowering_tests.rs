@@ -109,6 +109,7 @@ fn complete(
         .iter()
         .enumerate()
         .map(|(index, &value)| ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: format!("result-{index}").into(),
             alias: Some(format!("original-{index}").into()),
             value,
@@ -116,6 +117,7 @@ fn complete(
         })
         .collect();
     input.result = Some(ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output,
         fields,
@@ -1222,6 +1224,7 @@ mod scan_split {
         })
         .unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: CONSUMER,
             output: OutputPort {
                 node: FINAL,
@@ -1231,6 +1234,7 @@ mod scan_split {
                 .iter()
                 .zip(received.iter())
                 .map(|(name, value)| ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: (*name).into(),
                     alias: None,
                     value: *value,

@@ -262,9 +262,10 @@ impl BackendRuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryC
         envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
         deadline: Duration,
     ) -> Result<BackendRuntimeFilterUnaryAck, BackendRuntimeFilterUnaryError> {
-        let client = NativeRpcClient::new_native_endpoint(
+        let client = NativeRpcClient::new_backend_endpoint(
             self.runtime.clone(),
             route.endpoint().native_endpoint().clone(),
+            route.backend_process_id(),
         );
         let response = client
             .transmit_runtime_filter_envelope_async(

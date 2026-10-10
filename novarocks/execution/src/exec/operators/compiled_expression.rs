@@ -226,10 +226,46 @@ pub struct CompiledProjectProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
     sites: Vec<ProgramExpressionRootSite>,
+    final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
     output: ChunkSchemaRef,
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledProjectProcessorFactory {
+    /// The actual bounded root boundary follows the original computing node.
+    /// It borrows that node's published slots and does not author expressions,
+    /// uses, bindings, or a second computation of any Project output.
+    pub(crate) fn try_new_final_result_boundary(
+        program: Arc<LocalProgram>,
+        error: Arc<RuntimeErrorState>,
+    ) -> Result<Self, String> {
+        if !matches!(
+            program.graph().sink(),
+            Some(novarocks_local_program::StaticSinkProgram::RootResult(_))
+        ) {
+            return Err("final result boundary requires its actual RootResult sink".into());
+        }
+        let root = program.graph().root();
+        let node = program
+            .graph()
+            .nodes()
+            .get(root.index())
+            .ok_or("compiled final result root is absent")?;
+        let output = ChunkSchema::from_compiled_layout(node.output_layout())?;
+        let pairs = output
+            .slot_ids()
+            .iter()
+            .map(|slot| (*slot, *slot))
+            .collect();
+        Ok(Self {
+            name: format!("COMPILED_FINAL_RESULT (root={})", root.index()),
+            program,
+            sites: Vec::new(),
+            final_identity_slots: Some(pairs),
+            output,
+            error,
+        })
+    }
+
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
@@ -240,7 +276,14 @@ impl CompiledProjectProcessorFactory {
             .nodes()
             .get(node.index())
             .ok_or("compiled Project node is absent")?;
-        let ProgramNodeKind::Project { exprs, .. } = graph_node.kind() else {
+        let ProgramNodeKind::Project {
+            exprs,
+            expr_slot_ids,
+            validate_final_result_input,
+            output_indices,
+            ..
+        } = graph_node.kind()
+        else {
             return Err("compiled node is not a Project".to_string());
         };
         let mut sites = Vec::with_capacity(exprs.len());
@@ -251,11 +294,43 @@ impl CompiledProjectProcessorFactory {
                 ProgramNodeExpressionRole::ProjectOutput { expression },
             ));
         }
+        let final_identity_slots = if *validate_final_result_input {
+            if output_indices.is_some() || exprs.len() != expr_slot_ids.len() {
+                return Err(
+                    "final result input validation requires an identity output layout".into(),
+                );
+            }
+            Some(
+                exprs
+                    .iter()
+                    .zip(expr_slot_ids)
+                    .map(|(expr, output)| {
+                        match program
+                            .graph()
+                            .expressions()
+                            .node(*expr)
+                            .map(|node| node.kind())
+                        {
+                            Some(novarocks_local_program::StaticExprKind::SlotId(source)) => {
+                                Ok((*source, *output))
+                            }
+                            _ => Err(
+                                "final result input validation requires identity expressions"
+                                    .to_string(),
+                            ),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+        } else {
+            None
+        };
         let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
         Ok(Self {
             name: format!("COMPILED_PROJECT (node={})", node.index()),
             program,
             sites,
+            final_identity_slots,
             output,
             error,
         })
@@ -270,6 +345,7 @@ impl OperatorFactory for CompiledProjectProcessorFactory {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
+            final_identity_slots: self.final_identity_slots.clone(),
             output: Arc::clone(&self.output),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
@@ -283,6 +359,7 @@ struct CompiledProjectProcessor {
     name: String,
     program: Arc<LocalProgram>,
     sites: Vec<ProgramExpressionRootSite>,
+    final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
     output: ChunkSchemaRef,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
@@ -321,6 +398,50 @@ impl ProcessorOperator for CompiledProjectProcessor {
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.pending.is_some() {
             return Err("compiled Project received input while output is pending".into());
+        }
+        if let Some(pairs) = &self.final_identity_slots {
+            super::project_processor::validate_final_result_identity_input_source(
+                &chunk,
+                &self.output,
+                true,
+                pairs.len(),
+                pairs.iter().copied().map(Ok),
+            )?;
+            // No column requires projection. Keep the actual row-count-bearing
+            // source and its genuine schema owners after the same validation.
+            if pairs.is_empty() {
+                self.pending = Some(chunk);
+                return Ok(());
+            }
+            let columns = if chunk.is_empty() {
+                self.output
+                    .slots()
+                    .iter()
+                    .map(|slot| arrow::array::new_empty_array(slot.data_type()))
+                    .collect()
+            } else {
+                pairs
+                    .iter()
+                    .map(|(source, _)| {
+                        let ordinal = chunk
+                            .slot_id_to_index()
+                            .get(source)
+                            .copied()
+                            .ok_or("final result input source slot is missing")?;
+                        chunk
+                            .columns()
+                            .get(ordinal)
+                            .map(Arc::clone)
+                            .ok_or_else(|| "final result input array is missing".to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            };
+            self.pending = Some(super::project_processor::materialize_project_output(
+                columns,
+                &self.output,
+                true,
+            )?);
+            return Ok(());
         }
         instances(
             &mut self.instances,

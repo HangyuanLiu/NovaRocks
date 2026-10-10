@@ -38,8 +38,8 @@ fn main() {
     // resource model are derived from this exact standard-library source.
     // A +toolchain override must not silently compile an unreviewed model.
     assert!(
-        result.status.success() && result.stdout.starts_with(b"rustc 1.92.0 "),
-        "owned-resource allocation model requires the audited Rust 1.92.0 compiler"
+        result.status.success() && result.stdout.starts_with(b"rustc 1.98.1 "),
+        "owned-resource allocation model requires the audited Rust 1.98.1 compiler"
     );
-    println!("cargo:rustc-env=NOVAROCKS_OWNED_RESOURCE_RUST=1.92.0");
+    println!("cargo:rustc-env=NOVAROCKS_OWNED_RESOURCE_RUST=1.98.1");
 }

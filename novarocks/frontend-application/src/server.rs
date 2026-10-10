@@ -24,6 +24,11 @@ use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
 use tracing::info;
 
+#[cfg(feature = "mem-1-m07-exact-mysql-write")]
+mod exact_mysql_write_fixture;
+#[cfg(feature = "mem-1-m07-root-observation")]
+mod root_observation_identity;
+
 use crate::capabilities as core_capabilities;
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
@@ -65,12 +70,18 @@ struct FrontendBackgroundMaintenanceAttemptFactory {
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
-    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
+    fn begin_automatic_maintenance_attempt(
+        &self,
+        capacity: Option<
+            &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        >,
+    ) -> Result<BackgroundMaintenanceAttempt, String> {
         core_capabilities::background_maintenance_attempt(
             self.role,
             self.topology.clone(),
             self.runtime_policy.max_attempt_duration(),
             &self.runtime,
+            capacity,
         )
     }
 }
@@ -107,6 +118,9 @@ pub struct FrontendManagementConfig {
     /// The one memory capacity authority this OS process was given, so the
     /// management surface can report its facts without owning any of them.
     pub memory_authority: Arc<novarocks_memory::MemoryAuthority>,
+    /// This process's allocator and physical memory readings for `/metrics`;
+    /// `None` exports no process memory series.
+    pub process_memory: Option<crate::metrics::FrontendProcessMemoryObservation>,
 }
 
 /// Inputs for serving one ready Frontend application through native and MySQL
@@ -660,7 +674,6 @@ fn build_frontend_query_session_factory_from_role_products(
         query_execution,
         Arc::clone(&products.logical_read_launcher),
         host.workload_root_admission(),
-        host.workload_resources(),
         role,
         topology,
         Arc::clone(&products.dml_service),
@@ -790,7 +803,8 @@ pub fn start_frontend_management_server(
     config: &FrontendManagementConfig,
 ) -> Result<FrontendManagementServer, FrontendApplicationError> {
     let metrics_registry =
-        crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
+        crate::metrics::FrontendMetricsRegistry::with_process_memory(config.process_memory.clone())
+            .map_err(FrontendApplicationError::server)?;
     let serving_reader = Arc::new(LateBoundFrontendServingSnapshotReader::default());
     let island_reader = Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
         config.native_compatibility_id,
@@ -929,6 +943,11 @@ where
         }
     };
     let server_result = run_mysql_with_listener_supervision(
+        #[cfg(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-root-observation"
+        ))]
+        Arc::clone(&config.native_trust),
         config.mysql_listener,
         session_factory,
         client_connections,
@@ -955,6 +974,11 @@ where
 }
 
 async fn run_mysql_with_listener_supervision<F>(
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-root-observation"
+    ))]
+    native_trust: Arc<NativeTrust>,
     mysql_listener: ResolvedMysqlListenerSettings,
     session_factory: Arc<dyn QuerySessionFactory>,
     client_connections: Arc<MysqlClientConnectionRegistry>,
@@ -968,6 +992,24 @@ async fn run_mysql_with_listener_supervision<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    root_observation_identity::emit(&native_trust)?;
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    if let Some(fixture) = exact_mysql_write_fixture::bind_from_environment(&native_trust)? {
+        return exact_mysql_write_fixture::serve(
+            fixture,
+            mysql_listener,
+            session_factory,
+            client_connections,
+            shutdown,
+            report_server,
+            management_server,
+            host,
+            drain_timeout,
+            cleanup_timeout,
+        )
+        .await;
+    }
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let (finalize_tx, finalize_rx) = tokio::sync::watch::channel(false);
     let wait_for_signal = |mut receiver: tokio::sync::watch::Receiver<bool>| async move {
@@ -1168,6 +1210,15 @@ fn combine_server_and_shutdown(
         (Err(server_error), Ok(())) => Err(server_error),
         (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
         (Err(server_error), Err(shutdown_error)) => {
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-root-observation"
+            ))]
+            return Err(server_error.with_role_cleanup(shutdown_error));
+            #[cfg(not(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-root-observation"
+            )))]
             Err(server_error.with_cleanup_context(shutdown_error))
         }
     }
@@ -1299,7 +1350,8 @@ mod tests {
         let StatementResult::GovernedQuery(result) = result else {
             panic!("query result must retain its owner through terminal EOF");
         };
-        let (_result, mut protocol) = result.into_parts();
+        let (result, mut protocol) = result.into_parts();
+        drop(result);
         let _ = protocol.seal_success_visibility();
         let _ = protocol.complete();
         terminal.complete();

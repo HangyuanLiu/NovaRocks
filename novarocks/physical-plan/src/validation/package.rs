@@ -215,13 +215,12 @@ fn validate_package_core(
     validate_fragment_cuts_into(fragment, &input.cuts, &mut errors);
     validate_fragment_partition_identities(fragment, &input.cuts, &mut errors);
     match (fragment.sink(), &input.result) {
-        (FragmentSink::Result, Some(result)) => {
+        (FragmentSink::Result | FragmentSink::RootResult(_), Some(result)) => {
             validate_result_port_fields(fragment, result, &mut errors)
         }
-        (FragmentSink::Result, None) => errors.push(ValidationError::new(
-            "package.result",
-            "result sink has no result port",
-        )),
+        (FragmentSink::Result | FragmentSink::RootResult(_), None) => errors.push(
+            ValidationError::new("package.result", "result sink has no result port"),
+        ),
         (_, Some(_)) => errors.push(ValidationError::new(
             "package.result",
             "result port has no result sink",

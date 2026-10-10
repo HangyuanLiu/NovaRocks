@@ -290,6 +290,25 @@ impl<A> CompletedPlanWithAccess<A> {
         Ok(Self { candidate, access })
     }
 
+    /// Freeze the final root purpose while retaining the exact read sidecar.
+    /// Refusal returns every capability for the application to release.
+    pub fn freeze_root_output(
+        self,
+        output: novarocks_result_contract::FrozenRootOutput,
+    ) -> Result<
+        Self,
+        (
+            super::final_plan::FinalPlanCompletionError,
+            FinalPlanRuntimeAccess<A>,
+        ),
+    > {
+        let Self { candidate, access } = self;
+        match candidate.freeze_root_output(output) {
+            Ok(candidate) => Ok(Self { candidate, access }),
+            Err(error) => Err((error, access)),
+        }
+    }
+
     pub const fn candidate(&self) -> &CompletedPhysicalPlanCandidate {
         &self.candidate
     }

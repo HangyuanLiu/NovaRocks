@@ -34,7 +34,7 @@ pub(super) fn build_window_and_project(
     project_items: Vec<ProjectItem>,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
-    let project_items = dedup_project_item_output_ids(project_items, factory);
+    let project_items = dedup_project_item_output_ids(project_items, factory)?;
     let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
     if has_window {
         let mut output_columns = plan_output_columns(&input)?;
@@ -115,17 +115,23 @@ pub(super) fn build_window_and_project(
 fn dedup_project_item_output_ids(
     mut project_items: Vec<ProjectItem>,
     factory: &mut ColumnRefFactory,
-) -> Vec<ProjectItem> {
+) -> Result<Vec<ProjectItem>, String> {
     let mut seen = std::collections::HashSet::new();
     for item in &mut project_items {
         if item.output_column_id != ColumnId::UNSET && seen.insert(item.output_column_id) {
             continue;
         }
+        let original_id = item.output_column_id;
         item.output_column_id =
             factory.create(None, item.output_name.clone(), item.expr.value_type.clone());
+        if original_id != ColumnId::UNSET {
+            factory
+                .transfer_value_provenance(original_id, item.output_column_id)
+                .map_err(str::to_owned)?;
+        }
         seen.insert(item.output_column_id);
     }
-    project_items
+    Ok(project_items)
 }
 
 fn logical_plan_satisfies_window_ordering(

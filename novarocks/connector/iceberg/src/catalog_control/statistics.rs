@@ -989,7 +989,8 @@ fn validate_artifacts(
         validate_compact_theta(artifact.body()).map_err(|error| corrupt(error.to_string()))?;
         let estimate =
             estimate_compact_theta(artifact.body()).map_err(|error| corrupt(error.to_string()))?;
-        let (identity, body, mut properties) = artifact.into_parts();
+        let mut parts = artifact.into_guarded_parts();
+        let properties = parts.properties_mut();
         if properties
             .keys()
             .any(|property| property != crate::stats_loader::NDV_PROPERTY)
@@ -1013,12 +1014,7 @@ fn validate_artifacts(
                 estimate.to_string(),
             );
         }
-        normalized.push(StatisticsArtifactDraft::try_new(
-            identity.input_fields().to_vec(),
-            identity.blob_type(),
-            body,
-            properties,
-        )?);
+        normalized.push(parts.try_into_draft()?);
     }
     if observed != expected {
         return Err(invalid(

@@ -373,6 +373,20 @@ pub(crate) fn build_compiled_pipeline_graph(
         precomputed_keyed_assert_keys: std::collections::HashMap::new(),
     };
     let mut build = build_node(program, graph.root(), &mut ctx, &error)?;
+    // Statistics owns its specific original bounded materializer. Other root
+    // purposes validate the actual computing root output at one final boundary.
+    if let Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) = graph.sink()
+        && contract.kind()
+            != novarocks_result_contract::RootOutputKind::InternalFacts(
+                novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+            )
+    {
+        let factory = CompiledProjectProcessorFactory::try_new_final_result_boundary(
+            Arc::clone(program),
+            Arc::clone(&error),
+        )?;
+        build.pipeline.factories.push(Box::new(factory));
+    }
     match root_sink_dop {
         None => {}
         // The frozen profile places the root sink on one driver.
@@ -682,14 +696,85 @@ fn build_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
-        ProgramNodeKind::Unpivot { input, .. } => {
-            let factory = CompiledUnpivotProcessorFactory::try_new(
-                Arc::clone(program),
-                id,
-                Arc::clone(error),
-            )?;
+        ProgramNodeKind::Unpivot {
+            input,
+            passthrough_columns,
+            value_output_slot_id,
+            literal_output_slot_ids,
+            value_mappings,
+            max_output_rows,
+            max_output_bytes,
+        } => {
             let mut build = build_node(program, *input, ctx, error)?;
-            build.pipeline.factories.push(Box::new(factory));
+            let statistics_root = id == program.graph().root()
+                && matches!(program.graph().sink(),
+                Some(novarocks_local_program::StaticSinkProgram::RootResult(contract))
+                    if contract.kind()==novarocks_result_contract::RootOutputKind::InternalFacts(novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1));
+            if statistics_root {
+                let mappings = value_mappings
+                    .iter()
+                    .map(|mapping| {
+                        Ok(crate::exec::node::unpivot::UnpivotValueMapping {
+                            input_value_slot_id: mapping.input_value_slot_id,
+                            constants: mapping
+                                .constants
+                                .iter()
+                                .map(|value| match value {
+                                    novarocks_local_program::UnpivotConstant::Scalar {
+                                        expr_id,
+                                        nullable,
+                                    } => Ok(crate::exec::node::unpivot::UnpivotConstant::Scalar {
+                                        expr_id: crate::exec::expr::ExprId(
+                                            expr_id.index(),
+                                        ),
+                                        nullable: *nullable,
+                                    }),
+                                    novarocks_local_program::UnpivotConstant::Int32List(values) => {
+                                        Ok(crate::exec::node::unpivot::UnpivotConstant::Int32List(
+                                            values.clone(),
+                                        ))
+                                    }
+                                    novarocks_local_program::UnpivotConstant::Utf8Map(values) => {
+                                        Ok(crate::exec::node::unpivot::UnpivotConstant::Utf8Map(
+                                            values
+                                                .iter()
+                                                .map(|(k, v)| (k.to_string(), v.to_string()))
+                                                .collect(),
+                                        ))
+                                    }
+                                })
+                                .collect::<Result<Vec<_>, String>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let node = &program.graph().nodes()[id.index()];
+                build.pipeline.factories.push(Box::new(
+                    crate::exec::operators::StatisticsMaterializerFactory::try_new_compiled(
+                        Arc::clone(program),
+                        *value_output_slot_id,
+                        literal_output_slot_ids.clone(),
+                        mappings,
+                        program.graph().nodes()[input.index()]
+                            .output_layout()
+                            .slots(),
+                        crate::exec::chunk::ChunkSchema::from_compiled_layout(
+                            node.output_layout(),
+                        )?,
+                        passthrough_columns.len(),
+                        *max_output_rows,
+                        *max_output_bytes,
+                    )?,
+                ));
+            } else {
+                build
+                    .pipeline
+                    .factories
+                    .push(Box::new(CompiledUnpivotProcessorFactory::try_new(
+                        Arc::clone(program),
+                        id,
+                        Arc::clone(error),
+                    )?));
+            }
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }

@@ -258,7 +258,7 @@ fn sql_dependency_binding_host_abort_original_full_emission_and_real_data_grant(
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let scope = task.owner.scope();
-    let authority = actual.resources();
+    let authority = actual.resources().expect("test workload resource authority");
     let mut held = None;
     let mut callbacks = 0;
     let selected = workflow(&Control::new(None), false, false, &mut |facts| {
@@ -309,9 +309,9 @@ fn sql_dependency_binding_host_abort_every_real_admission_keeps_nominal_cause_an
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let scope = task.owner.scope();
-    let authority = actual.resources();
+    let authority = actual.resources().expect("test workload resource authority");
     let cause = foreign
-        .resources()
+        .resources().expect("test workload resource authority")
         .reserve(&scope, 1, ResourceClass::Data)
         .err()
         .unwrap();
@@ -347,7 +347,7 @@ fn sql_dependency_binding_host_abort_every_real_admission_keeps_nominal_cause_an
         assert_eq!(calls, refused);
         drop(held);
         assert_eq!(authority.snapshot().held_bytes(), 0);
-        assert_eq!(foreign.resources().snapshot().held_bytes(), 0);
+        assert_eq!(foreign.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
     }
 }
 #[test]
@@ -384,7 +384,7 @@ fn sql_dependency_binding_host_abort_only_actual_capacity_uses_original_control_
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let scope = task.owner.scope();
-    let authority = actual.resources();
+    let authority = actual.resources().expect("test workload resource authority");
     let mut original_cause = None;
     let mut calls = 0;
     let error = workflow(&Control::new(None), false, false, &mut |_| {

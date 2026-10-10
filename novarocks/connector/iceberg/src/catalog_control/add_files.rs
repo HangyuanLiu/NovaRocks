@@ -29,16 +29,19 @@ use crate::iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Str
 use crate::iceberg::table::Table;
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use bytes::Bytes;
+use futures::StreamExt;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::access_binding::IcebergReadBinding;
+use crate::catalog::listing_admission::ListingAdmission;
 use crate::fs_io;
 use crate::resources::IcebergCatalogRuntime;
 use novarocks_spi::connector::{
-    ConnectorDataMutationAddFilesDomain, ConnectorDataMutationSourceScope,
+    ConnectorDataMutationAddFilesDomain, ConnectorDataMutationSourceScope, ConnectorError,
+    ConnectorErrorKind, ConnectorListingBound, ConnectorListingBudget,
     MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
     MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
@@ -102,22 +105,48 @@ pub(crate) fn plan_manifest_for_table(
     source_directory: &str,
     binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
-) -> Result<AddFilesManifest, String> {
+    listing_admission: Arc<ListingAdmission>,
+) -> Result<AddFilesManifest, ConnectorError> {
     if !table.metadata().default_partition_spec().is_unpartitioned() {
-        return Err("ADD FILES supports only unpartitioned Iceberg tables".to_string());
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "ADD FILES supports only unpartitioned Iceberg tables",
+        ));
     }
     let target_schema = Arc::new(
-        crate::iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-            .map_err(|error| format!("convert ADD FILES target schema: {error}"))?,
+        crate::iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+            |error| {
+                super::data_mutation::map_provider_error(format!(
+                    "convert ADD FILES target schema: {error}"
+                ))
+            },
+        )?,
     );
     let canonical_name_mapping = table
         .metadata()
         .properties()
         .get(crate::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
         .map(|mapping| crate::schema_mapping::canonical_name_mapping(mapping))
-        .transpose()?;
+        .transpose()
+        .map_err(super::data_mutation::map_provider_error)?;
     let default_ids = initial_default_ids(table.metadata().current_schema().as_struct());
+    let context = binding.request_context().cloned().ok_or_else(|| {
+        add_files_invalid("ADD FILES listing requires an admitted request context")
+    })?;
+    let owned_binding = binding.clone();
+    let directory = source_directory.to_owned();
+    let files = runtime
+        .block_on(async move {
+            listing_admission
+                .run(&context, async move {
+                    list_direct_files_async(&directory, &owned_binding, ConnectorListingBound::V1)
+                        .await
+                })
+                .await
+        })
+        .map_err(add_files_invalid)??;
     plan_manifest(
+        files,
         source_directory,
         binding,
         &target_schema,
@@ -125,6 +154,7 @@ pub(crate) fn plan_manifest_for_table(
         canonical_name_mapping,
         runtime,
     )
+    .map_err(super::data_mutation::map_provider_error)
 }
 
 pub(crate) fn revalidate_manifest_for_table(
@@ -133,8 +163,11 @@ pub(crate) fn revalidate_manifest_for_table(
     binding: &IcebergReadBinding,
     expected: &AddFilesManifest,
     runtime: &IcebergCatalogRuntime,
+    listing_admission: Arc<ListingAdmission>,
 ) -> Result<AddFilesManifest, String> {
-    let actual = plan_manifest_for_table(table, source_directory, binding, runtime)?;
+    let actual =
+        plan_manifest_for_table(table, source_directory, binding, runtime, listing_admission)
+            .map_err(|error| error.to_string())?;
     if actual.digest != expected.digest || actual.source_scope != expected.source_scope {
         return Err(
             "ADD FILES source manifest or physical scope changed after planning".to_string(),
@@ -144,6 +177,7 @@ pub(crate) fn revalidate_manifest_for_table(
 }
 
 fn plan_manifest(
+    files: Vec<ListedFile>,
     source_directory: &str,
     binding: &IcebergReadBinding,
     target_schema: &SchemaRef,
@@ -160,7 +194,6 @@ fn plan_manifest(
         validate_name_mapping_for_target(mapping, target_schema)?;
     }
     let source_scope = canonical_directory_source_scope(source_directory, binding)?;
-    let files = list_direct_files(source_directory, binding, runtime)?;
     if files.is_empty() {
         return Err(format!(
             "ADD FILES: no visible Parquet files found under {source_directory}"
@@ -495,96 +528,153 @@ struct ListedFile {
     object_identity: Option<String>,
 }
 
+#[cfg(test)]
 fn list_direct_files(
     directory: &str,
     binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
-) -> Result<Vec<ListedFile>, String> {
-    let access = fs_io::resolve_access_for_location(directory, binding)
-        .map_err(|error| format!("resolve ADD FILES directory {directory}: {error}"))?;
-    let relative_directory = access.single_relative_path()?;
+) -> Result<Vec<ListedFile>, ConnectorError> {
+    list_direct_files_bounded(directory, binding, runtime, ConnectorListingBound::V1)
+}
+
+#[cfg(test)]
+fn list_direct_files_bounded(
+    directory: &str,
+    binding: &IcebergReadBinding,
+    runtime: &IcebergCatalogRuntime,
+    bound: ConnectorListingBound,
+) -> Result<Vec<ListedFile>, ConnectorError> {
+    let directory = directory.to_owned();
+    let binding = binding.clone();
+    runtime
+        .block_on(async move { list_direct_files_async(&directory, &binding, bound).await })
+        .map_err(add_files_invalid)?
+}
+
+async fn list_direct_files_async(
+    directory: &str,
+    binding: &IcebergReadBinding,
+    bound: ConnectorListingBound,
+) -> Result<Vec<ListedFile>, ConnectorError> {
+    let mut source_budget = ConnectorListingBudget::new(bound)?;
+    let mut retained_budget = ConnectorListingBudget::new(bound)?;
+    let access = fs_io::resolve_access_for_location(directory, binding).map_err(|error| {
+        add_files_invalid(format!("resolve ADD FILES directory {directory}: {error}"))
+    })?;
+    let relative_directory = access.single_relative_path().map_err(add_files_invalid)?;
     let prefix = if relative_directory.ends_with('/') {
         relative_directory.to_string()
     } else {
         format!("{relative_directory}/")
     };
     let operator = access.operator();
-    let directory = directory.to_string();
-    runtime
-        .block_on(async move {
-            let entries = operator
-                .list(&prefix)
-                .await
-                .map_err(|error| format!("list ADD FILES directory {directory}: {error}"))?;
-            let mut files = Vec::new();
-            for entry in entries {
-                let entry_path = entry.path().trim_end_matches('/');
-                let relative = entry_path
-                    .strip_prefix(&prefix)
-                    .or_else(|| entry_path.strip_prefix(prefix.trim_start_matches('/')))
-                    .unwrap_or(entry_path);
-                let name = relative.rsplit('/').next().unwrap_or(relative);
-                if name.starts_with('.') || name.starts_with('_') {
-                    continue;
-                }
-                if relative.contains('/') {
-                    return Err(format!(
-                        "ADD FILES does not allow recursive visible entry {}",
-                        entry.path()
-                    ));
-                }
-                let metadata = operator
-                    .stat(entry.path())
-                    .await
-                    .map_err(|error| format!("stat ADD FILES entry {}: {error}", entry.path()))?;
-                if metadata.mode().is_dir() {
-                    return Err(format!(
-                        "ADD FILES visible child {} is a directory",
-                        entry.path()
-                    ));
-                }
-                if !metadata.mode().is_file() {
-                    return Err(format!(
-                        "ADD FILES visible child {} is not a regular file",
-                        entry.path()
-                    ));
-                }
-                if !name.to_ascii_lowercase().ends_with(".parquet") {
-                    return Err(format!(
-                        "ADD FILES visible child {} is not a Parquet file",
-                        entry.path()
-                    ));
-                }
-                let location = fs_io::format_resolved_location(access.handle(), entry.path())?;
-                if location.len() > MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES {
-                    return Err("ADD FILES canonical file location exceeds 16 KiB".to_string());
-                }
-                let object_identity = metadata
-                    .version()
-                    .map(|value| format!("version:{value}"))
-                    .or_else(|| metadata.etag().map(|value| format!("etag:{value}")))
-                    .or_else(|| metadata.content_md5().map(|value| format!("md5:{value}")))
-                    .or_else(|| {
-                        metadata
-                            .last_modified()
-                            .map(|value| format!("mtime:{value}"))
-                    });
-                files.push(ListedFile {
-                    location,
-                    size: metadata.content_length(),
-                    object_identity,
-                });
-                if files.len()
-                    > usize::try_from(MAX_CONNECTOR_DATA_MUTATION_FILES)
-                        .expect("file bound fits usize")
-                {
-                    return Err("ADD FILES file count exceeds 4096".to_string());
-                }
-            }
-            files.sort_by(|left, right| left.location.cmp(&right.location));
-            Ok(files)
-        })
-        .map_err(|error| format!("ADD FILES list runtime: {error}"))?
+    let location_prefix =
+        fs_io::format_resolved_location(access.handle(), "").map_err(add_files_invalid)?;
+    let mut entries = operator
+        .lister_with(&prefix)
+        .limit(bound.page_entries)
+        .await
+        .map_err(|error| {
+            ConnectorError::from(novarocks_fs::map_object_store_listing_error(error))
+        })?;
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next().await {
+        let entry = entry.map_err(|error| {
+            ConnectorError::from(novarocks_fs::map_object_store_listing_error(error))
+        })?;
+        if entry.path().trim_end_matches('/') == prefix.trim_end_matches('/') {
+            continue;
+        }
+        // Include ignored entries: a directory of hidden files is still
+        // a finite source enumeration, and consumes the same SDK work.
+        source_budget.admit_names(std::iter::once(entry.path()))?;
+        let entry_path = entry.path().trim_end_matches('/');
+        let relative = entry_path
+            .strip_prefix(&prefix)
+            .or_else(|| entry_path.strip_prefix(prefix.trim_start_matches('/')))
+            .unwrap_or(entry_path);
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        if name.starts_with('.') || name.starts_with('_') {
+            continue;
+        }
+        if relative.contains('/') {
+            return Err(add_files_invalid(format!(
+                "ADD FILES does not allow recursive visible entry {}",
+                entry.path()
+            )));
+        }
+        let metadata = operator.stat(entry.path()).await.map_err(|error| {
+            add_files_unavailable(format!("stat ADD FILES entry {}: {error}", entry.path()))
+        })?;
+        if metadata.mode().is_dir() {
+            return Err(add_files_invalid(format!(
+                "ADD FILES visible child {} is a directory",
+                entry.path()
+            )));
+        }
+        if !metadata.mode().is_file() {
+            return Err(add_files_invalid(format!(
+                "ADD FILES visible child {} is not a regular file",
+                entry.path()
+            )));
+        }
+        if !name.to_ascii_lowercase().ends_with(".parquet") {
+            return Err(add_files_invalid(format!(
+                "ADD FILES visible child {} is not a Parquet file",
+                entry.path()
+            )));
+        }
+        let relative_path = entry.path().trim_start_matches('/');
+        let location_bytes = location_prefix
+            .len()
+            .checked_add(relative_path.len())
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "ADD FILES canonical location size overflow",
+                )
+            })?;
+        if location_bytes > MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES {
+            return Err(add_files_invalid(
+                "ADD FILES canonical file location exceeds 16 KiB",
+            ));
+        }
+        retained_budget.admit_qualified_names(&location_prefix, std::iter::once(relative_path))?;
+        let location = fs_io::format_resolved_location(access.handle(), entry.path())
+            .map_err(add_files_invalid)?;
+        let object_identity = metadata
+            .version()
+            .map(|value| format!("version:{value}"))
+            .or_else(|| metadata.etag().map(|value| format!("etag:{value}")))
+            .or_else(|| metadata.content_md5().map(|value| format!("md5:{value}")))
+            .or_else(|| {
+                metadata
+                    .last_modified()
+                    .map(|value| format!("mtime:{value}"))
+            });
+        if files.len()
+            >= usize::try_from(MAX_CONNECTOR_DATA_MUTATION_FILES).expect("file bound fits usize")
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "ADD FILES file count exceeds 4096",
+            ));
+        }
+        files.push(ListedFile {
+            location,
+            size: metadata.content_length(),
+            object_identity,
+        });
+    }
+    files.sort_unstable_by(|left, right| left.location.cmp(&right.location));
+    Ok(files)
+}
+
+fn add_files_invalid(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+fn add_files_unavailable(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
 }
 
 struct ParquetFooterFacts {
@@ -964,8 +1054,51 @@ mod tests {
         assert!(
             list_direct_files(&directory, &binding, &runtime)
                 .expect_err("visible non-Parquet must fail")
+                .to_string()
                 .contains("not a Parquet")
         );
+    }
+
+    #[test]
+    fn direct_listing_refuses_whole_batch_including_hidden_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.parquet"), b"data").unwrap();
+        std::fs::write(dir.path().join("_ignored"), b"data").unwrap();
+        let directory = format!("file://{}", dir.path().display());
+        let (owner, runtime) = catalog_runtime();
+        let binding = binding(&owner, None);
+        let error = super::list_direct_files_bounded(
+            &directory,
+            &binding,
+            &runtime,
+            novarocks_spi::connector::ConnectorListingBound {
+                entries: 1,
+                ..novarocks_spi::connector::ConnectorListingBound::V1
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("entries bound"), "{error}");
+        assert!(dir.path().join("a.parquet").exists());
+    }
+
+    #[test]
+    fn direct_listing_checks_name_bytes_before_retaining() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("wide.parquet"), b"data").unwrap();
+        let directory = format!("file://{}", dir.path().display());
+        let (owner, runtime) = catalog_runtime();
+        let binding = binding(&owner, None);
+        let error = super::list_direct_files_bounded(
+            &directory,
+            &binding,
+            &runtime,
+            novarocks_spi::connector::ConnectorListingBound {
+                name_bytes: 1,
+                ..novarocks_spi::connector::ConnectorListingBound::V1
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("name_bytes bound"), "{error}");
     }
 
     #[test]

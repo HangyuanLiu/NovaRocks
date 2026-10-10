@@ -70,6 +70,7 @@ pub enum NodeCodecError {
     Payload(ConnectorPayloadCodecError),
     Constant(p::ConstantReferenceError),
     Identity(ConnectorIdentityError),
+    Root(novarocks_proto_codec::ProtocolError),
     InvalidShape(&'static str),
 }
 impl From<CompileControlError> for NodeCodecError {
@@ -161,6 +162,7 @@ impl fmt::Display for NodeCodecError {
             Self::Payload(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
             Self::Identity(e) => e.fmt(f),
+            Self::Root(error) => error.fmt(f),
             Self::InvalidShape(s) => f.write_str(s),
         }
     }
@@ -178,6 +180,7 @@ impl std::error::Error for NodeCodecError {
             Self::Payload(e) => Some(e),
             Self::Constant(e) => Some(e),
             Self::Identity(e) => Some(e),
+            Self::Root(error) => Some(error),
             Self::InvalidShape(_) => None,
         }
     }

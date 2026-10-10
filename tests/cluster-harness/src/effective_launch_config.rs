@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{CrossProcessNativeFaultProxyConfig, CrossProcessRuntime, LaunchProfile};
+use super::{
+    CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, CrossProcessRuntime,
+    LaunchProfile,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -27,6 +30,8 @@ use toml::Value;
 const ARTIFACT_SCHEMA_VERSION: u8 = 1;
 const FIXED_NO_PROXY: &str = "127.0.0.1,localhost";
 const FORMAL_SECRET_ENVIRONMENT: &[&str] = &[
+    "AWS_S3_ACCESS_KEY_ID",
+    "AWS_S3_SECRET_ACCESS_KEY",
     "NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET",
     "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET",
     "NOVAROCKS_UEA1_PERF_S3_ACCESS_KEY_ID",
@@ -79,7 +84,9 @@ pub(crate) struct EffectiveLaunchConfigInput<'a> {
     pub frontend_environment: &'a BTreeMap<String, String>,
     pub backend_environments: &'a [BTreeMap<String, String>],
     pub native_proxy_config: &'a CrossProcessNativeFaultProxyConfig,
+    pub native_root_reply_fault: Option<&'a CrossProcessRootReplyFaultConfig>,
     pub advertised_backend_grpc_ports: &'a [u16],
+    pub advertised_backend_control_grpc_ports: &'a [u16],
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +129,8 @@ enum EnvironmentClassification {
 #[derive(Debug, Serialize)]
 struct NativeProxyContract {
     backends: Vec<NativeProxyBackendContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_reply_message_fault: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +172,7 @@ pub(crate) fn build_effective_launch_config_evidence(
         input.backend_configs.len() == input.cluster_size
             && input.backend_environments.len() == input.cluster_size
             && input.advertised_backend_grpc_ports.len() == input.cluster_size
+            && input.advertised_backend_control_grpc_ports.len() == input.cluster_size
             && input.runtime.be.len() == input.cluster_size,
         "effective launch config requires one config, environment, runtime, and advertised endpoint per backend"
     );
@@ -187,6 +197,14 @@ pub(crate) fn build_effective_launch_config_evidence(
                 },
             )
             .collect(),
+        root_reply_message_fault: input.native_root_reply_fault.map(|root| {
+            serde_json::json!({
+                "backend_indices":root.backend_indices,
+                "controller":"shared-one-target-slot-global-connection-stream-owned-buffer-bounds",
+                "actor":root.bounds.semantics(),
+                "control_tcp_budget":"original_backend_retained_byte_limit_separate_from_actor"
+            })
+        }),
     };
 
     let mut roles = Vec::with_capacity(input.cluster_size + 1);
@@ -264,6 +282,14 @@ fn normalize_role_config(
 
     match role.backend_index {
         None => {
+            ensure!(
+                get_path(root, &["server", "control_grpc_port"]).is_none(),
+                "effective FE config must not contain server.control_grpc_port"
+            );
+            ensure!(
+                get_path(root, &["cluster", "advertise_control_port"]).is_none(),
+                "effective FE config must not contain cluster.advertise_control_port"
+            );
             replace_exact_integer(
                 root,
                 &["standalone_server", "mysql_port"],
@@ -286,6 +312,12 @@ fn normalize_role_config(
             )?;
         }
         Some(index) => {
+            replace_exact_integer(
+                root,
+                &["server", "control_grpc_port"],
+                input.runtime.be[index].control_grpc,
+                "$ROLE_CONTROL_GRPC",
+            )?;
             ensure!(
                 get_path(root, &["standalone_server", "mysql_port"]).is_none(),
                 "effective BE config must not contain standalone_server.mysql_port"
@@ -312,6 +344,20 @@ fn normalize_role_config(
                         && input.advertised_backend_grpc_ports[index]
                             == input.runtime.be[index].grpc,
                     "effective BE config unexpectedly changes its unproxied advertised endpoint"
+                ),
+            }
+            match proxy_limit {
+                Some(_) => replace_exact_integer(
+                    root,
+                    &["cluster", "advertise_control_port"],
+                    input.advertised_backend_control_grpc_ports[index],
+                    "$BE_ADVERTISE_CONTROL_GRPC",
+                )?,
+                None => ensure!(
+                    get_path(root, &["cluster", "advertise_control_port"]).is_none()
+                        && input.advertised_backend_control_grpc_ports[index]
+                            == input.runtime.be[index].control_grpc,
+                    "effective BE config unexpectedly changes its unproxied Control endpoint"
                 ),
             }
             ensure!(
@@ -550,17 +596,23 @@ mod tests {
     use crate::{BePorts, CrossProcessRuntime};
     use std::path::PathBuf;
 
+    #[allow(clippy::too_many_arguments)]
     fn config(
         role: &str,
         http: u16,
         grpc: u16,
+        control_grpc: Option<u16>,
         mysql: Option<u16>,
         fe_grpc: u16,
         runtime: &Path,
         extra: &str,
         transport_mode: &str,
         advertised_port: Option<u16>,
+        advertised_control_port: Option<u16>,
     ) -> String {
+        let control = control_grpc
+            .map(|port| format!("control_grpc_port = {port}\n"))
+            .unwrap_or_default();
         let mysql = mysql
             .map(|port| format!("mysql_port = {port}"))
             .unwrap_or_default();
@@ -573,10 +625,13 @@ mod tests {
             let advertise = advertised_port
                 .map(|port| format!("advertise_port = {port}\n"))
                 .unwrap_or_default();
-            format!("frontend_endpoint = \"127.0.0.1:{fe_grpc}\"\n{advertise}")
+            let advertise_control = advertised_control_port
+                .map(|port| format!("advertise_control_port = {port}\n"))
+                .unwrap_or_default();
+            format!("frontend_endpoint = \"127.0.0.1:{fe_grpc}\"\n{advertise}{advertise_control}")
         };
         format!(
-            "[server]\nhost = \"127.0.0.1\"\nhttp_port = {http}\ngrpc_port = {grpc}\n\
+            "[server]\nhost = \"127.0.0.1\"\nhttp_port = {http}\ngrpc_port = {grpc}\n{control}\
              [standalone_server]\n{mysql}\n\
              [cluster]\nrole = \"{role}\"\n{role_fields}\
              [runtime]\nexchange_wait_ms = 1000\n{extra}\n\
@@ -587,7 +642,7 @@ mod tests {
 
     fn evidence(
         root: &Path,
-        ports: (u16, u16, u16, u16, u16),
+        ports: (u16, u16, u16, u16, u16, u16),
         secret: &str,
         extra: &str,
         profile: LaunchProfile,
@@ -598,7 +653,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn evidence_with_options(
         root: &Path,
-        ports: (u16, u16, u16, u16, u16),
+        ports: (u16, u16, u16, u16, u16, u16),
         secret: &str,
         extra: &str,
         profile: LaunchProfile,
@@ -610,33 +665,39 @@ mod tests {
             be: vec![BePorts {
                 http: ports.3,
                 grpc: ports.4,
+                control_grpc: ports.5,
             }],
             fe_http_port: ports.0,
             fe_grpc_port: ports.1,
             fe_mysql_port: ports.2,
         };
         let advertised_port = proxy_limit.map(|_| ports.4 + 1);
+        let advertised_control_port = proxy_limit.map(|_| ports.5 + 1);
         let frontend = config(
             "fe",
             ports.0,
             ports.1,
+            None,
             Some(ports.2),
             ports.1,
             root,
             extra,
             transport_mode,
             None,
+            None,
         );
         let backend = config(
             "be",
             ports.3,
             ports.4,
+            Some(ports.5),
             None,
             ports.1,
             root,
             extra,
             transport_mode,
             advertised_port,
+            advertised_control_port,
         );
         let mut environments = BTreeMap::from([(
             "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET".to_string(),
@@ -662,7 +723,9 @@ mod tests {
             frontend_environment: &environments,
             backend_environments: &[environments.clone()],
             native_proxy_config: &native_proxy_config,
+            native_root_reply_fault: None,
             advertised_backend_grpc_ports: &[advertised_port.unwrap_or(ports.4)],
+            advertised_backend_control_grpc_ports: &[advertised_control_port.unwrap_or(ports.5)],
         })
     }
 
@@ -672,7 +735,7 @@ mod tests {
         let second_root = PathBuf::from("/tmp/effective-config-second");
         let first = evidence(
             &first_root,
-            (1101, 1102, 1103, 1104, 1105),
+            (1101, 1102, 1103, 1104, 1105, 1205),
             "secret-canary-first",
             "worker_threads = 4",
             LaunchProfile::Performance,
@@ -680,7 +743,7 @@ mod tests {
         .unwrap();
         let second = evidence(
             &second_root,
-            (2101, 2102, 2103, 2104, 2105),
+            (2101, 2102, 2103, 2104, 2105, 2205),
             "secret-canary-second",
             "worker_threads = 4",
             LaunchProfile::Performance,
@@ -693,6 +756,7 @@ mod tests {
         );
         assert_eq!(first.artifact_sha256(), first.semantics_sha256());
         let artifact = String::from_utf8(first.artifact_bytes().to_vec()).unwrap();
+        assert!(artifact.contains("$ROLE_CONTROL_GRPC"));
         assert!(!artifact.contains("secret-canary"));
         assert!(!artifact.contains(first_root.to_string_lossy().as_ref()));
     }
@@ -702,7 +766,7 @@ mod tests {
         let root = PathBuf::from("/tmp/effective-config-stable");
         let base = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105),
+            (1101, 1102, 1103, 1104, 1105, 1205),
             "secret-a",
             "worker_threads = 4",
             LaunchProfile::Performance,
@@ -710,7 +774,7 @@ mod tests {
         .unwrap();
         let runtime_changed = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105),
+            (1101, 1102, 1103, 1104, 1105, 1205),
             "secret-a",
             "worker_threads = 5",
             LaunchProfile::Performance,
@@ -718,7 +782,7 @@ mod tests {
         .unwrap();
         let profile_changed = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105),
+            (1101, 1102, 1103, 1104, 1105, 1205),
             "secret-a",
             "worker_threads = 4",
             LaunchProfile::FaultScenario,
@@ -726,7 +790,7 @@ mod tests {
         .unwrap();
         let timeout_changed = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105),
+            (1101, 1102, 1103, 1104, 1105, 1205),
             "secret-a",
             "worker_threads = 4\ncontrol_timeout_ms = 9000",
             LaunchProfile::Performance,
@@ -740,7 +804,7 @@ mod tests {
     #[test]
     fn tls_credential_environment_and_proxy_changes_change_semantics() {
         let root = PathBuf::from("/tmp/effective-config-contract");
-        let ports = (1101, 1102, 1103, 1104, 1105);
+        let ports = (1101, 1102, 1103, 1104, 1105, 1205);
         let base = evidence_with_options(
             &root,
             ports,
@@ -817,6 +881,14 @@ mod tests {
     fn delete_fixture_credentials_record_presence_without_values() {
         let environment = BTreeMap::from([
             (
+                "AWS_S3_ACCESS_KEY_ID".to_string(),
+                "access-canary".to_string(),
+            ),
+            (
+                "AWS_S3_SECRET_ACCESS_KEY".to_string(),
+                "secret-canary".to_string(),
+            ),
+            (
                 "NOVAROCKS_UEA4G_FIXTURE_ACCESS".to_string(),
                 "access-canary".to_string(),
             ),
@@ -843,6 +915,17 @@ mod tests {
         let error =
             replace_exact_integer(root, &["server", "http_port"], 1201, "$ROLE_HTTP").unwrap_err();
         assert!(error.to_string().contains("harness-owned port"));
+        let mut value = "[server]\ncontrol_grpc_port = 1205"
+            .parse::<Value>()
+            .unwrap();
+        let error = replace_exact_integer(
+            value.as_table_mut().unwrap(),
+            &["server", "control_grpc_port"],
+            1206,
+            "$ROLE_CONTROL_GRPC",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("harness-owned port"));
     }
 
     #[test]
@@ -858,6 +941,7 @@ mod tests {
             be: vec![BePorts {
                 http: 1104,
                 grpc: 1105,
+                control_grpc: 1205,
             }],
             fe_http_port: 1101,
             fe_grpc_port: 1102,
@@ -869,11 +953,13 @@ mod tests {
                 "fe",
                 1101,
                 1102,
+                None,
                 Some(1103),
                 1102,
                 &runtime_dir,
                 "worker_threads = 4",
                 "disabled",
+                None,
                 None,
             )
         );
@@ -885,11 +971,13 @@ mod tests {
             "be",
             1104,
             1105,
+            Some(1205),
             None,
             1102,
             &runtime_dir,
             "worker_threads = 4",
             "disabled",
+            None,
             None,
         )];
         let proxy = CrossProcessNativeFaultProxyConfig::default();
@@ -905,7 +993,9 @@ mod tests {
             frontend_environment: &environments,
             backend_environments: &[environments.clone()],
             native_proxy_config: &proxy,
+            native_root_reply_fault: None,
             advertised_backend_grpc_ports: &[1105],
+            advertised_backend_control_grpc_ports: &[1205],
         };
         let first = normalize_role_config(
             RoleConfigInput {

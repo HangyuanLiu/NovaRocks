@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "topology": "1FE+3BE",
+  "scope": "Native S+5 ordered two-row String result: Data1 is exactly S and completes row1; Data2 is an exact 5-byte new row, not a continuation. Context-held census and full normal MySQL literal oracle; excludes malformed reply/prefix-only refusal and physical last-alias exit.",
+  "sql": "SELECT payload FROM (SELECT 0 AS ordinal, REPEAT('x', 1048568) AS payload UNION ALL SELECT 1 AS ordinal, '' AS payload) ordered_rows ORDER BY ordinal ASC",
+  "segment_bytes": 1048576,
+  "native_row_bytes": 1048581,
+  "client_receive_buffer_bytes": 4096,
+  "max_applied_receive_buffer_bytes": 65536,
+  "mysql_client_max_packet_bytes": 67108864,
+  "query_observation_ms": 20000,
+  "metadata_wait_ms": 5000,
+  "held_phase_ms": 5000,
+  "phase_sample_interval_ms": 100,
+  "phase_max_samples": 51,
+  "expected_columns": 1,
+  "expected_rows": 2,
+  "expected_row_payload_bytes": 1048573,
+  "expected_packets": 6,
+  "expected_schema": [
+    {
+      "name": "payload",
+      "mysql_type": 253
+    }
+  ],
+  "expected_row_sha256": "a6884c6ae4c93d904c319ba5e87b9215745812b1b5be3edb1591762f820aea46",
+  "expected_packet_sequences": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ]
+}

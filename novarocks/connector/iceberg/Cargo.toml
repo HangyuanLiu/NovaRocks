@@ -27,6 +27,10 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+# Test fixture observation only; excluded from ordinary/release acceptance.
+mem-1-m07-hms-listing-observe = []
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
@@ -44,6 +48,7 @@ ordered-float = "4"
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 prost.workspace = true
 rand.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -63,7 +68,8 @@ novarocks-types.workspace = true
 novarocks-type-contract.workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["rustls-tls"] }
+faststr = "0.2"
+hive_metastore = "0.2"
 tempfile.workspace = true
 
 [build-dependencies]

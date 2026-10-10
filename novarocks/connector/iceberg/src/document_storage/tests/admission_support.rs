@@ -14,8 +14,8 @@ use novarocks_spi::connector::ConnectorError;
 use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
 use crate::catalog::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use crate::catalog::{
-    CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTablePage, CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
+    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
     ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
     StagedCommitResult, StagedCreateStart,
 };
@@ -65,12 +65,26 @@ impl AdmissionCatalogSpy {
 
 #[async_trait]
 impl NovaRocksCatalog for AdmissionCatalogSpy {
+    fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
+        Arc::new(Default::default())
+    }
+
     fn implementation_name(&self) -> &'static str {
         self.inner.implementation_name()
     }
 
-    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported> {
-        self.inner.admit_create(intent)
+    fn admit_operation(
+        &self,
+        operation: &crate::catalog::admission::CatalogOperation,
+        target: &crate::catalog::admission::CatalogAdmissionTarget,
+    ) -> Result<(), CatalogUnsupported> {
+        self.inner.admit_operation(operation, target)
+    }
+    fn admit_initiation(
+        &self,
+        request: &crate::catalog::admission::CatalogAdmissionRequest,
+    ) -> Result<crate::catalog::admission::CatalogAdmission, CatalogUnsupported> {
+        self.inner.admit_initiation(request)
     }
 
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
@@ -78,7 +92,10 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         panic!("unsupported document admission requested the catalog client");
     }
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
+    async fn list_namespaces(
+        &self,
+        _bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }
 
@@ -92,6 +109,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     async fn list_tables(
         &self,
         _namespace: CatalogNamespaceName,
+        _bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }
@@ -123,6 +141,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     async fn list_views(
         &self,
         _namespace: CatalogNamespaceName,
+        _bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }

@@ -226,7 +226,7 @@ fn sql_dependency_request_host_abort_actual_sql_requests_match_original_full_wir
         let original = token.emit_in(&mut |_| Ok(()), &mut work).unwrap();
         work.finish().unwrap();
         let actual = owner();
-        let resources = actual.resources();
+        let resources = actual.resources().expect("test workload resource authority");
         let task = actual
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
@@ -283,14 +283,14 @@ fn sql_dependency_request_host_abort_every_admission_preserves_borrowed_cause_an
     assert!(count > 1);
     for at in 1..=count {
         let actual = owner();
-        let resources = actual.resources();
+        let resources = actual.resources().expect("test workload resource authority");
         let task = actual
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = task.owner.scope();
         let foreign = owner();
         let cause = foreign
-            .resources()
+            .resources().expect("test workload resource authority")
             .reserve(&scope, 1, ResourceClass::Data)
             .err()
             .unwrap();
@@ -323,7 +323,7 @@ fn sql_dependency_request_host_abort_every_admission_preserves_borrowed_cause_an
         );
         drop(held);
         assert_eq!(resources.snapshot().held_bytes(), 0);
-        assert_eq!(foreign.resources().snapshot().held_bytes(), 0);
+        assert_eq!(foreign.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
     }
 }
 #[test]
@@ -348,7 +348,7 @@ fn sql_dependency_request_host_abort_emission_refuses_before_original_dto_work()
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let cause = foreign
-            .resources()
+            .resources().expect("test workload resource authority")
             .reserve(&task.owner.scope(), 1, ResourceClass::Data)
             .err()
             .unwrap();
@@ -400,7 +400,7 @@ fn sql_dependency_request_host_abort_three_control_causes_at_every_checkpoint_ha
 #[test]
 fn sql_dependency_request_host_abort_actual_capacity_projection_keeps_original_cause() {
     let actual = owner();
-    let resources = actual.resources();
+    let resources = actual.resources().expect("test workload resource authority");
     let task = actual
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();

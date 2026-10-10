@@ -170,7 +170,10 @@ pub(crate) fn admit_writer_family(
             crate::writer_statistics::admit_partial_calls(node, target, work)
         }
         NodeKind::TableFinish(spec) => {
-            if !matches!(fragment.sink(), FragmentSink::Result) {
+            if !matches!(
+                fragment.sink(),
+                FragmentSink::Result | FragmentSink::RootResult(_)
+            ) {
                 return Err(unsupported("table finish without a Result sink"));
             }
             let [input] = node.inputs.as_ref() else {

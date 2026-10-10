@@ -24,7 +24,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, FieldRef};
 use novarocks_connector_contract::{
     ConnectorEnvelopeHeader, ConnectorReadProgramRecipe, ConnectorRowMutationEffect,
     WriteTargetOrdinal,
@@ -77,7 +77,8 @@ pub enum AssertRowsMode {
 #[derive(Clone, Debug)]
 pub struct ProjectExpressionSlot {
     pub slot_id: SlotId,
-    pub field: Field,
+    pub field: FieldRef,
+    pub metadata_origins: Option<novarocks_types::arrow_metadata_owner::FieldMetadataOrigins>,
     pub field_schema: StaticFieldSchema,
     pub unique_id: Option<i32>,
 }
@@ -400,6 +401,8 @@ pub enum ProgramNodeKind {
     Project {
         input: ProgramNodeId,
         is_subordinate: bool,
+        /// Check runtime identity input domains at the final result boundary.
+        validate_final_result_input: bool,
         exprs: Vec<ProgramExprId>,
         expr_slot_ids: Vec<SlotId>,
         expr_slot_schemas: Option<Vec<ProjectExpressionSlot>>,
@@ -1313,7 +1316,9 @@ impl LocalProgramGraph {
                 work.step()?;
             }
             match sink {
-                StaticSinkProgram::Result if result_count != 1 || !outputs.is_empty() => {
+                StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)
+                    if result_count != 1 || !outputs.is_empty() =>
+                {
                     return Err(LocalProgramError::InvalidSink.into());
                 }
                 StaticSinkProgram::Noop if result_count != 0 || !outputs.is_empty() => {
@@ -1335,6 +1340,60 @@ impl LocalProgramGraph {
                     }
                 }
                 _ => {}
+            }
+            if let StaticSinkProgram::RootResult(contract) = sink {
+                contract
+                    .validate_purpose()
+                    .map_err(|_| LocalProgramError::InvalidSink)?;
+            }
+            if let StaticSinkProgram::RootResult(contract) = sink
+                && let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
+                    contract.output()
+            {
+                let slots = nodes[root.index()]
+                    .output_layout
+                    .slots()
+                    .iter()
+                    .map(|slot| slot.as_u32())
+                    .collect::<Vec<_>>();
+                schema
+                    .validate_native_slots(&slots)
+                    .map_err(|_| LocalProgramError::InvalidSink)?;
+                let fields = nodes[root.index()].output_layout.schema().fields();
+                for column in schema.columns() {
+                    let field = fields
+                        .get(column.source_ordinal as usize)
+                        .ok_or(LocalProgramError::InvalidSink)?;
+                    if !novarocks_type_contract::result_render_type::render_field_matches_storage(
+                        &column.field,
+                        field.data_type(),
+                        field.is_nullable(),
+                    ) {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
+                }
+            }
+            if let StaticSinkProgram::RootResult(contract) = sink
+                && let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) =
+                    contract.output()
+            {
+                let layout = &nodes[root.index()].output_layout;
+                let [slot] = layout.slots() else {
+                    return Err(LocalProgramError::InvalidSink.into());
+                };
+                schema
+                    .validate_native_slots(&[slot.as_u32()])
+                    .map_err(|_| LocalProgramError::InvalidSink)?;
+                let [field] = layout.schema().fields().as_ref() else {
+                    return Err(LocalProgramError::InvalidSink.into());
+                };
+                if !novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                    schema.field(),
+                    field.data_type(),
+                    field.is_nullable(),
+                ) {
+                    return Err(LocalProgramError::InvalidSink.into());
+                }
             }
             for requirement in requirements.entries() {
                 // Account the completed iteration before optional field work.
@@ -2512,6 +2571,7 @@ mod tests {
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: vec![ProgramExprId::new(0)],
                     expr_slot_ids: vec![],
                     expr_slot_schemas: None,

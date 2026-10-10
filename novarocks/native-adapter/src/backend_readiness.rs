@@ -23,28 +23,35 @@ use novarocks_types::NativeEndpoint;
 
 use crate::BackendDataRuntime;
 
-/// Confirms that this process's advertised Native endpoint is connectable.
+/// Confirms an HTTP/2 channel to this process's advertised Native endpoint.
 ///
 /// The role keeps ownership of listener startup and cleanup. This transport
-/// adapter owns only the authenticated channel acquisition and its timeout.
+/// adapter owns dial admission and its timeout. It does not submit an
+/// application RPC or attest its JWT authentication.
 pub fn wait_for_backend_native_endpoint_ready(
     runtime: &BackendDataRuntime,
     endpoint: NativeEndpoint,
+    class: crate::native_transport_admission::TransportClass,
     timeout: Duration,
 ) -> Result<(), String> {
-    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
+    let connector = crate::native_client::admitted_connector(runtime, &endpoint, class, None)?;
+    let channel_endpoint = crate::native_client::native_endpoint(runtime, &endpoint)?;
     runtime.block_on(async move {
-        tokio::time::timeout(timeout, connector.connect())
-            .await
-            .map_err(|_| {
-                format!(
-                    "advertised Native endpoint {endpoint} did not become ready within {}ms",
-                    timeout.as_millis()
-                )
-            })?
-            .map(|_| ())
-            .map_err(|error| {
-                format!("advertised Native endpoint {endpoint} readiness failed: {error}")
-            })
+        let channel =
+            tokio::time::timeout(timeout, channel_endpoint.connect_with_connector(connector))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "advertised Native endpoint {endpoint} did not become ready within {}ms",
+                        timeout.as_millis()
+                    )
+                })?
+                .map_err(|error| {
+                    format!("advertised Native endpoint {endpoint} readiness failed: {error}")
+                })?;
+        // Dropping the channel closes its connection; the admission positions
+        // follow that connection's IO until it is destroyed.
+        drop(channel);
+        Ok(())
     })
 }

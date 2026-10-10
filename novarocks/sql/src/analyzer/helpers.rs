@@ -32,7 +32,7 @@ pub(super) fn with_nullability(
 }
 
 /// A read-only SQL spelling projection of the sole value-domain identity.
-pub(super) fn sql_logical_projection(
+pub(crate) fn sql_logical_projection(
     logical: novarocks_type_contract::ValueLogicalType,
 ) -> Option<novarocks_types::schema::SqlType> {
     use novarocks_type_contract::ValueLogicalType as V;

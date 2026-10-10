@@ -312,6 +312,10 @@ impl PreparedLogicalRead {
         }
     }
 
+    pub(crate) fn scalar_schema(&self) -> Option<&novarocks_result_contract::ScalarSchema> {
+        self.description.scalar_schema()
+    }
+
     pub(super) fn into_parts(
         self,
     ) -> (
@@ -402,6 +406,7 @@ enum PreparedQueryFormatter {
 
 struct PreparedProfileFormatter {
     plan: ProfilePlan,
+    control: novarocks_sql::compiler::SqlCompileControl,
     planning_elapsed: std::time::Duration,
     execution_started_at: std::time::Instant,
 }
@@ -425,10 +430,12 @@ impl PreparedQueryCompletion {
         annotations: std::sync::Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
         planning_elapsed: std::time::Duration,
         execution_started_at: std::time::Instant,
+        control: novarocks_sql::compiler::SqlCompileControl,
     ) -> Self {
         Self {
             formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
                 plan: ProfilePlan::Completed { plan, annotations },
+                control,
                 planning_elapsed,
                 execution_started_at,
             }),
@@ -458,7 +465,7 @@ fn complete_profile(
         .into_profile()
         .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
         .map_err(|error| error.to_string())?;
-    let (query_result, fragment_profiles) = outcome;
+    let (output_rows, fragment_profiles) = outcome;
     let fragment_profiles = fragment_profiles.into_profiles();
     if fragment_profiles.is_empty() {
         return Err("EXPLAIN ANALYZE completed without fragment runtime profiles".into());
@@ -485,7 +492,7 @@ fn complete_profile(
         "Planning: {} / Execution: {} / Rows: {}",
         format_explain_analyze_duration(formatter.planning_elapsed),
         format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
-        query_result.row_count()
+        output_rows
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
     if let Some(apply) =
@@ -526,7 +533,7 @@ fn complete_profile(
     }
     lines.extend(match formatter.plan {
         ProfilePlan::Completed { plan, annotations } => {
-            render_completed_profile(&plan, &annotations, &actuals, &per_fragment)?
+            render_completed_profile(&plan, &annotations, &actuals, &per_fragment, &formatter.control)?
         }
     });
     build_string_query_result("Explain String", lines).map(StatementResult::Query)
@@ -540,6 +547,7 @@ fn render_completed_profile(
         i32,
         crate::query_execution::profile::DistributedProfileSummary,
     >,
+    control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<Vec<String>, String> {
     use novarocks_sql::compiler::{
         SqlCompletedExplainProfile, SqlExplainFragmentMetrics, SqlExplainNodeKey,
@@ -625,6 +633,7 @@ fn render_completed_profile(
         novarocks_sql::compiler::ExplainLevel::Analyze,
         Some(&profile),
         novarocks_sql::compiler::ExplainRenderBudget::default(),
+        control,
     )
     .map_err(|error| error.to_string())
 }

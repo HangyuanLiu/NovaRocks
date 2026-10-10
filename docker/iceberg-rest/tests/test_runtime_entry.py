@@ -112,6 +112,15 @@ class RendererTests(RendererCase):
         self.assertNotEqual(env['NOVA_ENV_REST_WAREHOUSE_URI'], env['NOVA_ENV_REST_SERVER_WAREHOUSE_URI'])
         self.assertEqual(runner['env']['fixture_env_file'], env['NOVA_ENV_REST_ENV_FILE'])
         self.assertEqual(runner['env']['iceberg_rest_uri'], manifest['iceberg_rest']['uri'])
+        self.assertEqual(env['NOVAROCKS_ICEBERG_REST_MV_URI'], manifest['iceberg_rest_mv']['uri'])
+        self.assertEqual(env['NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE'], manifest['iceberg_rest_mv']['warehouse'])
+        self.assertEqual(env['NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI'], manifest['iceberg_rest_mv']['server_default_warehouse'])
+        self.assertEqual(manifest['iceberg_rest_mv']['warehouse'], 's3://warehouse/test-worktree/rest-mv')
+        self.assertEqual(manifest['iceberg_rest_mv']['server_default_warehouse'],
+                         f"s3://warehouse/{result['records']['catalog']['id']}/rest-mv")
+        self.assertEqual(env['NOVA_ENV_REST_MV_PORT'], str(result['records']['catalog']['ports']['rest_mv']))
+        self.assertEqual(runner['env']['iceberg_rest_mv_uri'], env['NOVAROCKS_ICEBERG_REST_MV_URI'])
+        self.assertEqual(runner['env']['iceberg_rest_mv_warehouse'], env['NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE'])
         self.assertEqual(runner['env']['oss_endpoint'], manifest['minio']['endpoint'])
         self.assertEqual(runner['env']['oss_sk'], manifest['minio']['secret_access_key'])
         sql = (final / 'ice-rest-catalog.sql').read_text()
@@ -132,12 +141,45 @@ class RendererTests(RendererCase):
         self.assertNotIn(env['AWS_S3_ACCESS_KEY_ID'], sql)
         self.assertNotIn(env['AWS_S3_SECRET_ACCESS_KEY'], sql)
         self.assertIn('http://rest:8181', (final / 'spark-defaults.conf').read_text())
+        spark = dict(line.split(' ', 1) for line in (final / 'spark-defaults.conf').read_text().splitlines())
+        self.assertEqual(spark['spark.sql.catalog.ice_rest_mv.uri'], env['NOVAROCKS_SPARK_REST_MV_URI'])
+        self.assertEqual(spark['spark.sql.catalog.ice_rest_mv.uri'], 'http://rest-mv:8181')
+        self.assertEqual(spark['spark.sql.catalog.ice_rest_mv.warehouse'], env['NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE'])
+        self.assertEqual(spark['spark.sql.defaultCatalog'], 'ice_rest')
+        for suffix in ('io-impl', 's3.endpoint', 's3.path-style-access', 's3.access-key-id', 's3.secret-access-key', 's3.region'):
+            self.assertEqual(spark['spark.sql.catalog.ice_rest_mv.' + suffix], spark['spark.sql.catalog.ice_rest.' + suffix])
         self.assertNotIn('http://rest:8181', (final / 'ice-rest-catalog.sql').read_text())
         with (final / 'sql-test.toml').open('a') as stream:
             stream.write('paimon_catalog_warehouse = "s3://novarocks/paimon"\n')
         self.assertIn('paimon_catalog_warehouse', tomllib.loads((final / 'sql-test.toml').read_text())['env'])
         next_pub = Path(self.bind()['published_dir'])
         self.assertNotIn('paimon_catalog_warehouse', (next_pub / 'sql-test.toml').read_text())
+
+    def test_saved_catalog_without_mv_prepares_offline_and_clears_ambient_mv_endpoints(self):
+        first = self.bind()
+        catalog = first['records']['catalog']
+        del catalog['images']['rest-mv'], catalog['ports']['rest_mv'], catalog['service_ports']['rest-mv']
+        catalog['required_services'].remove('rest-mv')
+        catalog['volumes'].remove(catalog['project'] + '_rest-mv-catalog')
+        catalog['health_urls'] = [f"http://127.0.0.1:{catalog['ports']['rest']}/v1/config"]
+        self.owner.save_record(catalog)
+        del self.config['warehouses']['rest_mv_client']
+        self.backend.daemon_id = lambda: self.fail('prepare queried Docker')
+        self.backend.healthy = lambda *a: self.fail('prepare checked health')
+        prepared = self.owner.prepare_entry('test-worktree', self.entry, self.config)
+        self.assertTrue(prepared['ready'])
+        final = Path(prepared['published_dir'])
+        manifest = json.loads((final / 'manifest.json').read_text())
+        self.assertNotIn('iceberg_rest_mv', manifest)
+        mv_keys = ('NOVAROCKS_ICEBERG_REST_MV_URI', 'NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE',
+                   'NOVA_ENV_REST_MV_PORT', 'NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI', 'NOVAROCKS_SPARK_REST_MV_URI')
+        env = self.environment(final / 'env.sh', **{key: 'stale' for key in mv_keys})
+        for key in mv_keys:
+            self.assertNotIn(key, env)
+        runner = tomllib.loads((final / 'sql-test.toml').read_text())
+        self.assertNotIn('iceberg_rest_mv_uri', runner['env'])
+        self.assertNotIn('iceberg_rest_mv_warehouse', runner['env'])
+        self.assertNotIn('ice_rest_mv', (final / 'spark-defaults.conf').read_text())
 
     def test_prepare_is_offline_for_every_record_state(self):
         self.backend.daemon_id = lambda: self.fail('prepare queried Docker')
@@ -190,7 +232,8 @@ class SharedEnvironmentTests(RendererCase):
         other_entry = self.root / 'runtime' / 'other-worktree'
         other_config = copy.deepcopy(self.config)
         other_config.update(env_id='other-worktree', workspace_root=str(self.root / 'other'))
-        other_config['warehouses'] = {'catalog': 's3://novarocks/other-worktree/catalog', 'test': 's3://novarocks/other-worktree/test', 'rest_client': 's3://warehouse/other-worktree/rest'}
+        other_config['warehouses'] = {'catalog': 's3://novarocks/other-worktree/catalog', 'test': 's3://novarocks/other-worktree/test',
+                                      'rest_client': 's3://warehouse/other-worktree/rest', 'rest_mv_client': 's3://warehouse/other-worktree/rest-mv'}
         second = self.owner.bind('other-worktree', other_entry, other_config, bom())
         self.assertEqual(first['binding'], second['binding'])
         self.assertEqual(len([x for x in self.backend.calls if x[0] == 'ensure']), 2)
@@ -198,6 +241,7 @@ class SharedEnvironmentTests(RendererCase):
         self.assertEqual(a['NOVA_ENV_SHARED_BENCHMARK_ROOT'], b['NOVA_ENV_SHARED_BENCHMARK_ROOT'])
         self.assertEqual(a['AWS_S3_ENDPOINT'], b['AWS_S3_ENDPOINT'])
         self.assertNotEqual(a['NOVA_ENV_REST_WAREHOUSE_URI'], b['NOVA_ENV_REST_WAREHOUSE_URI'])
+        self.assertNotEqual(a['NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE'], b['NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE'])
 
     def test_two_declaration_checkouts_keep_one_worktree_entry_and_lock(self):
         import shutil
@@ -292,7 +336,7 @@ class IsolatedEntryTests(RendererCase):
         config = copy.deepcopy(self.config)
         config.update(shared_docker=False, update_current=False)
         inputs = bom(); inputs['derived_images']['iceberg-spark']['image_id'] = 'sha256:spark'
-        return entry.render_isolated_stack(inputs, 'nr-isolated-rest-test', {'minio': 19101, 'minio_console': 20101, 'rest': 21101, 'spark': 22101, 'control': 23101}, self.entry, config,
+        return entry.render_isolated_stack(inputs, 'nr-isolated-rest-test', {'minio': 19101, 'minio_console': 20101, 'rest': 21101, 'rest_mv': 24101, 'spark': 22101, 'control': 23101}, self.entry, config,
             profile=profile, hook_image='publication:exact' if profile != 'stock' else None)
 
     def test_stock_and_hook_are_initial_models_from_same_templates(self):
@@ -308,10 +352,20 @@ class IsolatedEntryTests(RendererCase):
         self.assertEqual(manifest['minio']['access_key_id'], self.config['credentials']['access_key'])
         self.assertIsNone(manifest['runtime']['control_uri'])
         model = (self.entry / 'compose.yml').read_text()
-        for service in ('minio', 'mc-init', 'mc', 'rest', 'spark'):
+        for service in ('minio', 'mc-init', 'mc', 'rest', 'rest-mv', 'spark'):
             self.assertIn('  ' + service + ':\n', model)
         self.assertIn('mc mb --ignore-existing store/warehouse', model)
         self.assertIn('rest-catalog:/tmp', model)
+        self.assertIn('rest-mv-catalog:/tmp', model)
+        record = result['record']
+        self.assertEqual(record['images']['rest-mv']['image_id'], 'sha256:rest-mv')
+        self.assertIn('rest-mv', record['required_services'])
+        self.assertIn('nr-isolated-rest-test_rest-mv-catalog', record['volumes'])
+        self.assertEqual(record['service_ports']['rest-mv'], {'8181/tcp': 24101})
+        self.assertIn('http://127.0.0.1:24101/v1/config', record['health_urls'])
+        self.assertEqual(manifest['iceberg_rest_mv'], {'uri': 'http://127.0.0.1:24101',
+            'warehouse': 's3://warehouse/test-worktree/rest-mv', 'server_default_warehouse': 's3://warehouse/test-worktree/rest-mv'})
+        self.assertIn("NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI='s3://warehouse/test-worktree/rest-mv'", (self.entry / 'compose.env').read_text())
         self.assertEqual(os.readlink(sentinel), 'existing-worktree')
         hook = self.isolated('publication-hook')
         entry.render_entry(hook['context'], self.entry)
@@ -321,6 +375,10 @@ class IsolatedEntryTests(RendererCase):
         self.assertIn('8182', (self.entry / 'compose.yml').read_text())
         self.assertIn('TracingFileIO', (self.entry / 'compose.yml').read_text())
         self.assertIn('REST_IMAGE=\'publication:exact\'', (self.entry / 'compose.env').read_text())
+        self.assertEqual(hook['record']['images']['rest-mv'], record['images']['rest-mv'])
+        self.assertEqual(entry.blocks(entry.sections(model)['services'])['rest-mv'],
+                         entry.blocks(entry.sections((self.entry / 'compose.yml').read_text())['services'])['rest-mv'])
+        self.assertEqual(hook['record']['service_ports']['rest-mv'], record['service_ports']['rest-mv'])
         self.assertEqual(os.readlink(sentinel), 'existing-worktree')
 
     def test_prepare_and_teardown_shells_leave_current_untouched_without_docker(self):

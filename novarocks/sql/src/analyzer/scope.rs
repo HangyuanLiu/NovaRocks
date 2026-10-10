@@ -84,7 +84,11 @@ impl AnalyzerScope {
         &self,
         expr: &crate::analysis::TypedExpr,
     ) -> Option<novarocks_types::schema::SqlType> {
-        super::helpers::sql_logical_projection(expr.value_type.logical_type)
+        if let crate::analysis::ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+            self.factory.borrow().logical_type(*column_id)
+        } else {
+            super::helpers::sql_logical_projection(expr.value_type.logical_type)
+        }
     }
 
     /// Return the canonical qualifier for an unqualified column name, if any.
@@ -185,6 +189,7 @@ impl AnalyzerScope {
         for (col, &id) in columns.iter().zip(column_ids) {
             let ty = super::helpers::column_value_type(col, control)?;
             self.add_column_with_id(qualifier, &col.name, id, ty);
+            self.retain_table_column_provenance(col, id);
         }
         Ok(())
     }
@@ -201,7 +206,19 @@ impl AnalyzerScope {
         control: &dyn PureCompileControl,
     ) -> Result<ColumnId, AnalyzeError> {
         let ty = super::helpers::column_value_type(col, control)?;
-        Ok(self.add_column(qualifier, &col.name, ty))
+        let id = self.add_column(qualifier, &col.name, ty);
+        self.retain_table_column_provenance(col, id);
+        Ok(id)
+    }
+
+    fn retain_table_column_provenance(&mut self, col: &ColumnDef, id: ColumnId) {
+        let json_list = matches!(&col.data_type, DataType::List(item)
+            if novarocks_types::logical::logical_type_of_field(item) == Some(novarocks_types::logical::LogicalType::Json))
+            || matches!(&col.logical_type, Some(novarocks_types::schema::SqlType::Array(item))
+                if **item == novarocks_types::schema::SqlType::Json);
+        let mut factory = self.factory.borrow_mut();
+        factory.set_logical_type(id, col.logical_type.clone());
+        factory.set_json_list_provenance(id, json_list);
     }
 
     /// Register a single column (used for subquery output columns, etc.).

@@ -22,59 +22,114 @@ use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
+use novarocks_proto_codec::native_rpc::{NativeRpcMethod, NativeTrafficClass};
 use novarocks_proto_models::{filter, novarocks as proto};
-use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::UniqueId;
+use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
-use tower::service_fn;
 
 use crate::BackendDataRuntime;
 use crate::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+use crate::native_lane::{NativeDial, NativeLane, NativeLaneChannel, admitted_connector_service};
+use crate::native_transport_admission::TransportClass;
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
+#[cfg(test)]
+#[path = "native_peer_key_tests.rs"]
+mod peer_key_tests;
+
+#[cfg(test)]
+#[path = "native_peer_key_capacity_tests.rs"]
+mod peer_key_capacity_tests;
+
 type AuthenticatedNovaRocksGrpcClient =
-    NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
+    NovaRocksGrpcClient<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
 
 pub struct NativeRpcClient {
     runtime: BackendDataRuntime,
     endpoint: NativeEndpoint,
+    backend_process_id: Option<BackendProcessId>,
+}
+
+/// Only the three BE-origin methods use this role-local cache. Their manifest
+/// classes are distinct physical lanes. Membership has no BE peer identity.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct NativeChannelKey {
+    backend_process_id: Option<BackendProcessId>,
+    endpoint: NativeEndpoint,
+    method: NativeRpcMethod,
+}
+
+impl NativeChannelKey {
+    pub(crate) fn inline_identity(
+        &self,
+    ) -> io::Result<crate::native_channel_identity::InlineNativeChannelIdentity> {
+        crate::native_channel_identity::InlineNativeChannelIdentity::from_parts(
+            self.backend_process_id,
+            &self.endpoint,
+            self.method,
+        )
+    }
+    fn new(
+        backend_process_id: Option<BackendProcessId>,
+        endpoint: NativeEndpoint,
+        method: NativeRpcMethod,
+    ) -> Result<Self, String> {
+        match (method.contract().traffic, backend_process_id) {
+            (NativeTrafficClass::Exchange | NativeTrafficClass::RuntimeFilter, Some(_))
+            | (NativeTrafficClass::Membership, None) => Ok(Self {
+                backend_process_id,
+                endpoint,
+                method,
+            }),
+            _ => Err("Native outbound method requires its exact frozen peer domain".to_owned()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn membership(endpoint: NativeEndpoint) -> Self {
+        Self::new(None, endpoint, NativeRpcMethod::AnnounceBackend)
+            .expect("the Native manifest assigns announcement to membership")
+    }
 }
 
 impl NativeRpcClient {
-    pub fn new_native_endpoint(runtime: BackendDataRuntime, endpoint: NativeEndpoint) -> Self {
-        Self { runtime, endpoint }
+    pub fn new_membership_endpoint(runtime: BackendDataRuntime, endpoint: NativeEndpoint) -> Self {
+        Self {
+            runtime,
+            endpoint,
+            backend_process_id: None,
+        }
     }
 
-    pub fn new_host_port(
+    pub fn new_backend_endpoint(
         runtime: BackendDataRuntime,
-        host: String,
-        port: u16,
-    ) -> Result<Self, String> {
-        let endpoint = NativeEndpoint::from_host_port(&host, port)
-            .map_err(|error| format!("invalid BE endpoint: {error}"))?;
-        channel_endpoint(&endpoint)
-            .map_err(|error| format!("invalid BE endpoint {endpoint}: {error}"))?;
-        Ok(Self { runtime, endpoint })
+        endpoint: NativeEndpoint,
+        backend_process_id: BackendProcessId,
+    ) -> Self {
+        Self {
+            runtime,
+            endpoint,
+            backend_process_id: Some(backend_process_id),
+        }
     }
 
     async fn make_deadline_async_client(
         &self,
         operation: &str,
+        method: NativeRpcMethod,
         deadline_at: tokio::time::Instant,
     ) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
-        tokio::time::timeout_at(
-            deadline_at,
-            get_or_create_channel(&self.runtime, self.endpoint.clone()),
-        )
-        .await
-        .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
-        .map(|channel| client_from_channel(channel, self.runtime.native_trust().as_ref()))
-        .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
+        let key = NativeChannelKey::new(self.backend_process_id, self.endpoint.clone(), method)?;
+        tokio::time::timeout_at(deadline_at, get_or_create_channel(&self.runtime, key))
+            .await
+            .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
+            .map(|channel| client_from_channel(channel, self.runtime.native_trust().as_ref()))
+            .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
     }
 
     pub async fn transmit_runtime_filter_envelope_async(
@@ -84,7 +139,11 @@ impl NativeRpcClient {
     ) -> Result<filter::RuntimeFilterEnvelopeResponse, String> {
         let deadline_at = tokio::time::Instant::now() + deadline;
         let mut client = self
-            .make_deadline_async_client("runtime filter envelope", deadline_at)
+            .make_deadline_async_client(
+                "runtime filter envelope",
+                NativeRpcMethod::TransmitRuntimeFilterEnvelope,
+                deadline_at,
+            )
             .await?;
         let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -112,7 +171,11 @@ impl NativeRpcClient {
         self.runtime.block_on(async {
             let deadline_at = tokio::time::Instant::now() + timeout;
             let mut client = self
-                .make_deadline_async_client("announce_backend", deadline_at)
+                .make_deadline_async_client(
+                    "announce_backend",
+                    NativeRpcMethod::AnnounceBackend,
+                    deadline_at,
+                )
                 .await?;
             let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -171,7 +234,7 @@ impl NativeRpcClient {
                 result = async {
             let deadline_at = tokio::time::Instant::now() + timeout;
             let mut client = self
-                .make_deadline_async_client("exchange", deadline_at)
+                .make_deadline_async_client("exchange", NativeRpcMethod::ExchangeUnary, deadline_at)
                 .await?;
             let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -212,7 +275,60 @@ fn channel_endpoint(
     format!("http://{endpoint}").parse()
 }
 
-fn client_from_channel(channel: Channel, trust: &NativeTrust) -> AuthenticatedNovaRocksGrpcClient {
+/// Endpoint settings for an outgoing Native connection. An admitted runtime
+/// applies the frozen public HTTP/2 limits; the counts and per-item sizes they
+/// set bound what Hyper/H2 allocate, and the transport measurement gate covers
+/// the rest (spec v6 §5.9).
+pub(crate) fn native_endpoint(
+    runtime: &BackendDataRuntime,
+    endpoint: &NativeEndpoint,
+) -> Result<tonic::transport::Endpoint, String> {
+    let endpoint =
+        channel_endpoint(endpoint).map_err(|error| format!("invalid endpoint: {error}"))?;
+    if runtime.transport_admission().is_some() {
+        Ok(crate::native_lane::configure_native_endpoint(endpoint))
+    } else {
+        Ok(endpoint
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .connect_timeout(Duration::from_secs(10))
+            .http2_adaptive_window(true)
+            .initial_stream_window_size(Some(32 * 1024 * 1024))
+            .initial_connection_window_size(Some(128 * 1024 * 1024)))
+    }
+}
+
+/// The transport connector, preceded by this runtime's dial admission. The
+/// admission is taken again on every attempt, including Tonic's internal
+/// reconnect; a refused attempt opens no socket, and the physical position of
+/// an established connection follows its IO until the IO is dropped.
+pub(crate) fn admitted_connector(
+    runtime: &BackendDataRuntime,
+    endpoint: &NativeEndpoint,
+    class: TransportClass,
+    key: Option<crate::native_channel_identity::InlineNativeChannelIdentity>,
+) -> Result<
+    impl tower::Service<
+        tonic::codegen::http::Uri,
+        Response = TokioIo<novarocks_native_trust::BoxedNativeIo>,
+        Error = io::Error,
+        Future = impl Send,
+    > + Clone
+    + Send
+    + 'static,
+    String,
+> {
+    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
+    Ok(admitted_connector_service(
+        connector,
+        runtime.transport_admission().cloned(),
+        NativeDial::Backend(class, key),
+    ))
+}
+
+fn client_from_channel(
+    channel: NativeLaneChannel,
+    trust: &NativeTrust,
+) -> AuthenticatedNovaRocksGrpcClient {
     NovaRocksGrpcClient::with_interceptor(channel, trust.client_interceptor())
         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES)
         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
@@ -220,46 +336,34 @@ fn client_from_channel(channel: Channel, trust: &NativeTrust) -> AuthenticatedNo
 
 async fn get_or_create_channel(
     runtime: &BackendDataRuntime,
-    endpoint: NativeEndpoint,
-) -> Result<Channel, String> {
-    if let Some(channel) = runtime
+    key: NativeChannelKey,
+) -> Result<NativeLaneChannel, String> {
+    let identity = key
+        .inline_identity()
+        .map_err(|error| format!("Native channel identity refused: {error}"))?;
+    let leader = match runtime
         .channels()
-        .lock()
-        .expect("native channel cache lock")
-        .get(&endpoint)
-        .cloned()
+        .acquire(identity)
+        .await
+        .map_err(|error| format!("Native channel election refused: {error}"))?
     {
-        return Ok(channel);
-    }
-    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
-    let connector = service_fn(move |_| {
-        let connector = connector.clone();
-        async move {
-            connector
-                .connect()
-                .await
-                .map(TokioIo::new)
-                .map_err(|failure| {
-                    io::Error::other(format!("native transport connector failed: {failure}"))
-                })
-        }
-    });
-    let channel = channel_endpoint(&endpoint)
-        .map_err(|error| format!("invalid endpoint: {error}"))?
-        .tcp_keepalive(Some(Duration::from_secs(60)))
+        crate::native_channel_cache::Election::Ready(channel) => return Ok(channel),
+        crate::native_channel_cache::Election::Leader(leader) => leader,
+    };
+    let connector =
+        admitted_connector(runtime, &key.endpoint, TransportClass::Data, Some(identity))?;
+    let channel = native_endpoint(runtime, &key.endpoint)?
         .timeout(Duration::from_secs(600))
-        .connect_timeout(Duration::from_secs(10))
-        .http2_adaptive_window(true)
-        .initial_stream_window_size(Some(32 * 1024 * 1024))
-        .initial_connection_window_size(Some(128 * 1024 * 1024))
         .connect_with_connector(connector)
         .await
         .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
-    runtime
-        .channels()
-        .lock()
-        .expect("native channel cache lock")
-        .insert(endpoint, channel.clone());
+    let lane = NativeLane::of(key.method.contract().traffic)
+        .ok_or_else(|| "retired Native method has no lane".to_owned())?;
+    // One Channel is one connection; its stream positions live with it.
+    let channel = NativeLaneChannel::new(channel, lane, runtime.transport_admission());
+    leader
+        .publish(channel.clone())
+        .map_err(|error| format!("Native channel publication refused: {error}"))?;
     Ok(channel)
 }
 
@@ -279,12 +383,11 @@ mod tests {
         timeout: Duration,
         stop: CancellationToken,
     ) -> Result<(), String> {
-        let client = NativeRpcClient::new_host_port(
+        let client = NativeRpcClient::new_backend_endpoint(
             crate::backend_test_support::test_backend_data_runtime(),
-            "127.0.0.1".to_string(),
-            port,
-        )
-        .expect("legal endpoint");
+            novarocks_types::NativeEndpoint::from_host_port("127.0.0.1", port).unwrap(),
+            novarocks_types::BackendProcessId::new_v7(),
+        );
         client
             .exchange_unary(
                 UniqueId::new(1, 2),

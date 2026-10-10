@@ -183,6 +183,7 @@ impl Fixture {
     }
     fn result(&self) -> p::ResultPort {
         p::ResultPort {
+            scalar_schema: None,
             fragment: p::FragmentId::new(0),
             output: p::OutputPort {
                 node: p::NodeId::new(u32::MAX),
@@ -190,18 +191,21 @@ impl Fixture {
             },
             fields: Box::from([
                 p::ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "中\0".into(),
                     alias: None,
                     value: p::ValueId::new(0),
                     ty: self.roots[0].1.clone(),
                 },
                 p::ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Json,
                     name: "b".into(),
                     alias: Some("".into()),
                     value: p::ValueId::new(7),
                     ty: self.roots[1].1.clone(),
                 },
                 p::ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "c".into(),
                     alias: Some("别\0".into()),
                     value: p::ValueId::new(0),
@@ -219,12 +223,18 @@ impl Fixture {
             .1
             .clone();
         p::ResultPort {
+            scalar_schema: None,
             fragment: p::FragmentId::new(u32::MAX),
             output: p::OutputPort {
                 node: p::NodeId::new(0),
                 columns: Box::from([p::ValueId::new(id)]),
             },
             fields: Box::from([p::ResultField {
+                domain: if id == 7 {
+                    p::ResultValueDomain::Json
+                } else {
+                    p::ResultValueDomain::Plain
+                },
                 name: "value".into(),
                 alias: None,
                 value: p::ValueId::new(id),
@@ -285,6 +295,7 @@ fn decode(
 }
 fn expected() -> wire::ResultPort {
     wire::ResultPort {
+        scalar_schema: None,
         fragment_id: Some(0),
         output: Some(wire::OutputPort {
             node_id: Some(u32::MAX),
@@ -292,18 +303,21 @@ fn expected() -> wire::ResultPort {
         }),
         fields: vec![
             wire::ResultField {
+                domain: Some(wire::ResultValueDomain::Plain as i32),
                 name: "中\0".into(),
                 alias: None,
                 value_id: Some(0),
                 value_type_id: Some(0),
             },
             wire::ResultField {
+                domain: Some(wire::ResultValueDomain::Json as i32),
                 name: "b".into(),
                 alias: Some("".into()),
                 value_id: Some(7),
                 value_type_id: Some(7),
             },
             wire::ResultField {
+                domain: Some(wire::ResultValueDomain::Plain as i32),
                 name: "c".into(),
                 alias: Some("别\0".into()),
                 value_id: Some(0),
@@ -358,6 +372,7 @@ fn result_none_and_present_empty_preserve_distinct_options() {
             Err(Error::InvalidShape(_))
         ));
         let empty = p::ResultPort {
+            scalar_schema: None,
             fragment: p::FragmentId::new(0),
             output: p::OutputPort {
                 node: p::NodeId::new(0),
@@ -372,6 +387,7 @@ fn result_none_and_present_empty_preserve_distinct_options() {
         assert_eq!(
             raw,
             wire::ResultPort {
+                scalar_schema: None,
                 fragment_id: Some(0),
                 output: Some(wire::OutputPort {
                     node_id: Some(0),
@@ -877,6 +893,7 @@ fn wide_result_actual_byte_copy_and_occurrences_expose_bounded_quantum() {
     input.output.columns = vec![p::ValueId::new(0); 320].into_boxed_slice();
     input.fields = (0..320)
         .map(|_| p::ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: "中".repeat(110).into_boxed_str(),
             alias: None,
             value: p::ValueId::new(0),

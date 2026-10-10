@@ -30,5 +30,7 @@ pub use exchange_receiver::{
 };
 pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,
-    ResultWriteAdmission, ResultWriteCredit, ResultWriteSpec,
+    ResultWriteAdmission, ResultWriteCredit, ResultWriteSpec, RootInputAdmission,
+    RootInputAuthority, RootInputPermit, RootProducerState, RootResultSession, RootResultWriteSpec,
+    RootResultWriter,
 };

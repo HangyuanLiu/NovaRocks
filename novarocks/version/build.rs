@@ -66,6 +66,10 @@ fn main() {
     let commit_time = git_output(&["log", "-1", "--format=%ci"]).unwrap_or_default();
 
     println!("cargo:rustc-env=NOVAROCKS_GIT_HASH={short_commit}");
+    println!(
+        "cargo:rustc-env=NOVAROCKS_GIT_COMMIT_FULL={}",
+        full_commit.as_deref().unwrap_or("")
+    );
     println!("cargo:rustc-env=NOVAROCKS_GIT_TIME={commit_time}");
     println!("cargo:rustc-env=NOVAROCKS_NATIVE_BUILD_IDENTITY={native_build_identity}");
 }

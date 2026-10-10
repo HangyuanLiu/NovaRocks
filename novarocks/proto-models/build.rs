@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 mod resource_layout;
 
 const IDL_DIR: &str = "../../idl/novarocks";
-const PROTO_FILES: [&str; 13] = [
+const PROTO_FILES: [&str; 14] = [
     "catalog.proto",
     "common.proto",
     "connector_common.proto",
@@ -19,6 +19,7 @@ const PROTO_FILES: [&str; 13] = [
     "physical_semantics_v2.proto",
     "physical_package_v2.proto",
     "service.proto",
+    "result.proto",
 ];
 
 fn main() {
@@ -49,6 +50,7 @@ fn main() {
     // cloning an untracked Vec for every poll.
     config.bytes([
         ".novarocks.FetchResultResponse.result_arrow_ipc",
+        ".novarocks.result.RootData.body",
         ".novarocks.CreateTaskRequest.frozen_fragment",
         ".novarocks.CreateTaskRequest.creation_metadata",
         ".novarocks.FrozenFragment.package",

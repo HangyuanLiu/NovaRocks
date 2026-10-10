@@ -340,12 +340,14 @@ fn package_with_case(
     let calls =
         FrozenFragmentCalls::try_new(&fragment, &expression_uses, calls, &FixtureControl).unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&limit_node].output.clone(),
         fields: output
             .into_iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("sample_{ordinal}").into_boxed_str(),
                 alias: None,
                 value,

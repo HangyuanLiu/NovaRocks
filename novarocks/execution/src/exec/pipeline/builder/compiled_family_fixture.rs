@@ -188,6 +188,7 @@ pub(super) fn package(
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
     let output = fragment.nodes()[&root].output.clone();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: output.clone(),
         fields: output
@@ -195,6 +196,9 @@ pub(super) fn package(
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: crate::test_result_domain::result_value_domain(
+                    &fragment.values()[value].ty,
+                ),
                 name: format!("c{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,

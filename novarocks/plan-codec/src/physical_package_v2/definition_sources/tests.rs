@@ -549,6 +549,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                 runtime_filter_bindings: Box::default(),
             },
             result: Some(p::ResultPort {
+                scalar_schema: None,
                 fragment: fragment.id(),
                 output: fragment.nodes()[&fragment.root()].output.clone(),
                 fields: fragment.nodes()[&fragment.root()]
@@ -557,6 +558,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                     .iter()
                     .enumerate()
                     .map(|(i, value)| p::ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: format!("out{i}\0").into(),
                         alias: Some(format!("alias{i}").into()),
                         value: *value,
@@ -806,12 +808,14 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,
             },
             result: Some(p::ResultPort {
+                scalar_schema: None,
                 fragment: fragment.id(),
                 output: fragment.nodes()[&source].output.clone(),
                 fields: values
                     .iter()
                     .enumerate()
                     .map(|(i, value)| p::ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: format!("original{i}\0").into(),
                         alias: None,
                         value: *value,
@@ -991,12 +995,14 @@ pub(in crate::physical_package_v2) fn values_package(
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,
             },
             result: Some(p::ResultPort {
+                scalar_schema: None,
                 fragment: fragment.id(),
                 output: fragment.nodes()[&source].output.clone(),
                 fields: values
                     .iter()
                     .enumerate()
                     .map(|(i, value)| p::ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: format!("c{i}").into(),
                         alias: None,
                         value: *value,

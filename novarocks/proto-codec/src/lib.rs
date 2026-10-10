@@ -29,3 +29,10 @@ pub mod lifecycle;
 
 /// Validated membership and backend process wire values.
 pub mod membership;
+
+pub mod native_rpc;
+
+pub mod root_result;
+
+/// Private ScalarValueV1 semantic schema codec.
+pub mod scalar_result;

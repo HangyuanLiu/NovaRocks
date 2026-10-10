@@ -438,16 +438,19 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
     ))
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FINAL,
         output,
         fields: Box::from([
             ResultField {
+                domain: crate::test_result_domain::result_value_domain(&int64(true)),
                 name: "a".into(),
                 alias: None,
                 value: final_columns[0],
                 ty: int64(true),
             },
             ResultField {
+                domain: crate::test_result_domain::result_value_domain(&int64(false)),
                 name: "b".into(),
                 alias: None,
                 value: final_columns[1],

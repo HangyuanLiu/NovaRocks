@@ -95,9 +95,11 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
     let calls =
         FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &FixtureControl).unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment.id(),
         output: fragment.nodes()[&fragment.root()].output.clone(),
         fields: Box::from([ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: "literal".into(),
             alias: None,
             value,

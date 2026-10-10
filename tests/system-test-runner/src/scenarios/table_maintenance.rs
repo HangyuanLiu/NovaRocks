@@ -1,11 +1,13 @@
+use super::mv_uea7::ManagedMvRestFixture;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail};
-use novarocks_cluster_harness::{CrossProcessChildEnvironment, ServerHandle};
+use novarocks_cluster_harness::ServerHandle;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -13,12 +15,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TEST_DIR_ENV: &str = "NOVAROCKS_STAT2F_MAINTENANCE_TEST_DIR";
 const MARKER_PREFIX: &str = "stat2f-maintenance-optimize-";
 const READY_SUFFIX: &str = ".before-rebind.ready";
+const CATALOG: &str = "system_stat2f_maintenance";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(OptimizeTargetReplacement)]
+    vec![Box::new(OptimizeTargetReplacement::default())]
 }
 
-struct OptimizeTargetReplacement;
+#[derive(Default)]
+struct OptimizeTargetReplacement {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for OptimizeTargetReplacement {
     fn name(&self) -> &'static str {
@@ -33,24 +39,40 @@ impl Scenario for OptimizeTargetReplacement {
                 test_dir.display()
             )
         })?;
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        child_environment.fe.insert(
+        // REST admits detached maintenance, allowing replacement while the
+        // worker is paused. Hadoop requires the submitting statement to await
+        // actual worker exit to preserve its single-writer contract.
+        let (rest, mut launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)
+            .context("start private REST fixture for optimize target replacement")?;
+        launch.child_environment.fe.insert(
             TEST_DIR_ENV.to_string(),
             test_dir.to_string_lossy().into_owned(),
         );
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            ..Default::default()
-        })
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance REST fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("maintenance REST fixture was initialized more than once");
+        }
+        *fixture = Some(rest);
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
-        let catalog = "system_stat2f_maintenance";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let catalog = CATALOG;
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance REST fixture lock poisoned"))?
+            .as_ref()
+            .context("maintenance REST fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let barrier_dir = context.scenario_root().join("stat2f-maintenance-barrier");
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse)?;
+        setup_orders_fixture(context, &mut conn, catalog, &create_catalog_sql)?;
 
         execute(
             context,
@@ -59,7 +81,7 @@ impl Scenario for OptimizeTargetReplacement {
             "ALTER TABLE orders OPTIMIZE",
         )?;
         let first = wait_for_ready_marker(context, &barrier_dir, None)?;
-        context.action("observed durable optimize claim before its first rebind");
+        context.action("observed process-local optimize claim before its first rebind");
 
         execute(
             context,
@@ -94,13 +116,13 @@ impl Scenario for OptimizeTargetReplacement {
         )?;
         let second = wait_for_ready_marker(context, &barrier_dir, Some(first.job_id))?;
         write_resume(&second)?;
-        context.action("a second durable optimize claim acquired the same table fence");
+        context.action("a second process-local optimize claim acquired the same table fence");
         wait_for_terminal_job(context, &mut conn, catalog, second.job_id)?;
 
         drop(conn);
         restart_frontend(
             context,
-            "restart FE after durable TARGET_REPLACED transition",
+            "restart FE after process-local TARGET_REPLACED transition",
         )?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
@@ -109,6 +131,18 @@ impl Scenario for OptimizeTargetReplacement {
             "verified the restarted FE discards process-local optimize history in native 1FE+3BE",
         );
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance REST fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -135,18 +169,13 @@ fn setup_orders_fixture(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     catalog: &str,
-    warehouse: &Path,
+    create_catalog_sql: &str,
 ) -> Result<()> {
-    fs::create_dir_all(warehouse)
-        .with_context(|| format!("create maintenance warehouse {}", warehouse.display()))?;
     execute(
         context,
         conn,
-        "create Hadoop Iceberg catalog",
-        &format!(
-            "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
-            warehouse.display()
-        ),
+        "create private REST Iceberg catalog",
+        create_catalog_sql,
     )?;
     execute(
         context,

@@ -567,6 +567,7 @@ pub struct ManagedProcess {
     process_group: ProcessGroupOwnership,
     log_path: PathBuf,
     log_file: SharedLogWriter,
+    original_log_generation: Option<FileGeneration>,
     output_io_error: SharedOutputIoError,
     stdout_buffer: Arc<Mutex<String>>,
     stderr_buffer: Arc<Mutex<String>>,
@@ -588,6 +589,7 @@ pub struct ManagedProcess {
 pub struct ManagedProcessLogSource {
     label: String,
     log_path: PathBuf,
+    original_log_generation: Option<FileGeneration>,
     output_io_error: SharedOutputIoError,
 }
 
@@ -602,6 +604,85 @@ pub struct ManagedProcessLogTail {
 }
 
 impl ManagedProcessLogSource {
+    /// Visits a complete point-in-time original durable log with bounded reads.
+    /// The callback gets one Take<File>, never a Vec/String or history concatenation.
+    pub fn with_bounded_snapshot_reader<T>(
+        &self,
+        max_bytes: u64,
+        visitor: impl FnOnce(&mut dyn Read, u64) -> Result<T>,
+    ) -> Result<T> {
+        let failure = self
+            .output_io_error
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process output I/O error state lock poisoned"))?
+            .clone();
+        if let Some(failure) = failure {
+            bail!("original process durable output failed: {failure}");
+        }
+        let original = self
+            .original_log_generation
+            .context("original durable log has no spawn-time file identity")?;
+        // Refuse an already replaced/special path before attempting to open it.
+        let path =
+            fs::symlink_metadata(&self.log_path).context("inspect original durable log path")?;
+        if !path.is_file() || !original.same_file_as(&FileGeneration::from_metadata(&path)) {
+            bail!("original process durable log path was replaced");
+        }
+        let file = File::open(&self.log_path).context("open original process durable log")?;
+        let metadata = file
+            .metadata()
+            .context("inspect original process durable log")?;
+        self.verify_original_log_file(&metadata, original, 0)?;
+        if metadata.len() > max_bytes {
+            bail!("original process durable log exceeds snapshot bound");
+        }
+        let length = metadata.len();
+        let mut reader = file.take(length);
+        let result = visitor(&mut reader, length);
+        let output_result = (|| -> Result<()> {
+            // Verify both the same open file and its original path after the callback.
+            // Concurrent append may grow it; a replaced path or shorter file cannot pass.
+            let metadata = reader
+                .get_ref()
+                .metadata()
+                .context("reinspect original durable log")?;
+            self.verify_original_log_file(&metadata, original, length)?;
+            if let Some(failure) = self
+                .output_io_error
+                .lock()
+                .map_err(|_| anyhow::anyhow!("process output I/O error state lock poisoned"))?
+                .clone()
+            {
+                bail!("original process durable output failed during snapshot: {failure}");
+            }
+            Ok(())
+        })();
+        match (result, output_result) {
+            (Err(primary), Err(secondary)) => Err(primary.context(secondary)),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(secondary)) => Err(secondary),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+    fn verify_original_log_file(
+        &self,
+        opened: &fs::Metadata,
+        original: FileGeneration,
+        minimum_length: u64,
+    ) -> Result<()> {
+        let path =
+            fs::symlink_metadata(&self.log_path).context("recheck original durable log path")?;
+        if !opened.is_file()
+            || !path.is_file()
+            || !original.same_file_as(&FileGeneration::from_metadata(opened))
+            || !original.same_file_as(&FileGeneration::from_metadata(&path))
+            || opened.len() < minimum_length
+            || path.len() < minimum_length
+        {
+            bail!("original process durable log was replaced or truncated");
+        }
+        Ok(())
+    }
     pub fn read_tail(&self, max_bytes: usize) -> Result<ManagedProcessLogTail> {
         let output_error = self
             .output_io_error
@@ -667,6 +748,7 @@ impl ManagedProcess {
         ManagedProcessLogSource {
             label: self.label.clone(),
             log_path: self.log_path.clone(),
+            original_log_generation: self.original_log_generation,
             output_io_error: Arc::clone(&self.output_io_error),
         }
     }
@@ -769,16 +851,24 @@ impl ManagedProcess {
             one_shot_deadline.unwrap_or_else(|| started.checked_add(timeout).unwrap_or(started));
         let one_shot = one_shot_deadline.is_some();
         let readiness_baseline = ReadinessBaseline::capture(&marker)?;
-        let log_file: Box<dyn Write + Send> = match log_writer {
-            Some(log_writer) => log_writer,
-            None => Box::new(
-                OpenOptions::new()
+        let (log_file, original_log_generation): (Box<dyn Write + Send>, _) = match log_writer {
+            // An arbitrary injected writer supplies no original durable-file authority.
+            Some(log_writer) => (log_writer, None),
+            None => {
+                let file = OpenOptions::new()
                     .create(true)
                     .truncate(true)
                     .write(true)
                     .open(&log_path)
-                    .with_context(|| format!("open durable process log {}", log_path.display()))?,
-            ),
+                    .with_context(|| format!("open durable process log {}", log_path.display()))?;
+                let metadata = file
+                    .metadata()
+                    .context("pin original durable log before spawn")?;
+                (
+                    Box::new(file),
+                    Some(FileGeneration::from_metadata(&metadata)),
+                )
+            }
         };
         let log_file = Arc::new(Mutex::new(log_file));
         let output_io_error = Arc::new(Mutex::new(None));
@@ -840,6 +930,7 @@ impl ManagedProcess {
             child,
             log_path,
             log_file,
+            original_log_generation,
             output_io_error,
             stdout_buffer,
             stderr_buffer,
@@ -2024,11 +2115,13 @@ fn read_tail(buffer: &Arc<Mutex<String>>, poisoned: &str) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        FileReadinessSnapshot, ManagedProcess, ManagedProcessLogSource, ProcessGroupOwnership,
-        ReadinessBaseline, ReadyMarker, SpawnRequest, WaitSiginfo, run_reader_with_panic_boundary,
-        spawn_reader, unsupported_runtime_exit_status, wait_siginfo_abi_supported,
+        FileGeneration, FileReadinessSnapshot, ManagedProcess, ManagedProcessLogSource,
+        ProcessGroupOwnership, ReadinessBaseline, ReadyMarker, SpawnRequest, WaitSiginfo,
+        run_reader_with_panic_boundary, spawn_reader, unsupported_runtime_exit_status,
+        wait_siginfo_abi_supported,
     };
-    use std::fs;
+    use anyhow::Result;
+    use std::fs::{self, File};
     use std::io::{self, Cursor, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -2097,6 +2190,107 @@ mod tests {
         assert!(!alive, "the leader must not survive a refused group signal");
     }
 
+    #[cfg(unix)]
+    fn original_file_source(path: PathBuf, actual_file: &File) -> ManagedProcessLogSource {
+        ManagedProcessLogSource {
+            label: "original-file component".into(),
+            log_path: path,
+            original_log_generation: Some(FileGeneration::from_metadata(
+                &actual_file.metadata().unwrap(),
+            )),
+            output_io_error: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn original_snapshot_rejects_replacement_before_first_read_and_unpinned_writer() {
+        let temp = TempDir::new("original-file-replacement-before");
+        let path = temp.path().join("fixture.log");
+        let mut actual = File::create(&path).unwrap();
+        actual.write_all(b"original\n").unwrap();
+        let source = original_file_source(path.clone(), &actual);
+        fs::rename(&path, temp.path().join("retained-original.log")).unwrap();
+        fs::write(&path, b"forged regular log\n").unwrap();
+        assert!(
+            source
+                .with_bounded_snapshot_reader(128, |_, _| -> Result<()> {
+                    panic!("replacement must refuse before visitor");
+                })
+                .is_err()
+        );
+        let mut unpinned = source;
+        unpinned.original_log_generation = None;
+        assert!(
+            unpinned
+                .with_bounded_snapshot_reader(128, |_, _| -> Result<()> {
+                    panic!("unknown writer identity must refuse before visitor");
+                })
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn original_snapshot_rejects_mid_read_path_replacement_and_same_file_truncation() {
+        let temp = TempDir::new("original-file-replacement-during");
+        for replacement in [true, false] {
+            let path = temp.path().join(if replacement {
+                "replace.log"
+            } else {
+                "truncate.log"
+            });
+            let mut actual = File::create(&path).unwrap();
+            actual.write_all(b"original\n").unwrap();
+            let source = original_file_source(path.clone(), &actual);
+            let result = source.with_bounded_snapshot_reader(128, |reader, length| {
+                let mut bytes = [0; 9];
+                reader.read_exact(&mut bytes)?;
+                assert_eq!(length, 9);
+                if replacement {
+                    fs::rename(&path, temp.path().join("retained.log"))?;
+                    fs::write(&path, b"forged regular log\n")?;
+                } else {
+                    actual.set_len(0)?;
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "replacement={replacement}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn original_snapshot_accepts_same_file_append_and_retains_actual_visitor_error() {
+        let temp = TempDir::new("original-file-append");
+        let path = temp.path().join("fixture.log");
+        let mut actual = File::create(&path).unwrap();
+        actual.write_all(b"original\n").unwrap();
+        let source = original_file_source(path.clone(), &actual);
+        let observed = source
+            .with_bounded_snapshot_reader(128, |reader, length| {
+                let mut bytes = [0; 9];
+                reader.read_exact(&mut bytes)?;
+                actual.write_all(b"append\n")?;
+                Ok((length, bytes))
+            })
+            .unwrap();
+        assert_eq!(observed, (9, *b"original\n"));
+        let result = source.with_bounded_snapshot_reader(128, |_, _| -> Result<()> {
+            fs::rename(&path, temp.path().join("retained.log"))?;
+            fs::write(&path, b"replacement")?;
+            Err(File::open(temp.path().join("absent-original-error"))
+                .unwrap_err()
+                .into())
+        });
+        let error = result.unwrap_err();
+        assert!(error.chain().any(|source| {
+            source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|actual| actual.kind() == std::io::ErrorKind::NotFound)
+        }));
+    }
+
     #[test]
     fn detached_log_source_reads_only_the_requested_tail() {
         let temp = TempDir::new("detached-log-tail");
@@ -2105,6 +2299,7 @@ mod tests {
         let source = ManagedProcessLogSource {
             label: "fixture".to_string(),
             log_path,
+            original_log_generation: None,
             output_io_error: Arc::new(Mutex::new(None)),
         };
 
@@ -2123,6 +2318,7 @@ mod tests {
         let source = ManagedProcessLogSource {
             label: "fixture".to_string(),
             log_path,
+            original_log_generation: None,
             output_io_error: Arc::new(Mutex::new(None)),
         };
 

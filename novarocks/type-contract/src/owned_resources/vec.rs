@@ -77,7 +77,7 @@ fn push_geometry<T>(
             requested_backing: None,
         });
     }
-    // Rust 1.92 RawVec::grow_amortized: both push and try_reserve(1)
+    // Rust 1.98.1 RawVec::grow_amortized: both push and try_reserve(1)
     // use this minimum and doubling. No private RawVec fields are borrowed.
     let minimum = if size == 1 {
         8
@@ -207,7 +207,7 @@ fn box_geometry<T>(len: usize, capacity: usize) -> Result<VecBoxFacts, ControlRe
     } else {
         Some(Layout::array::<T>(len).map_err(|_| resource())?)
     };
-    // Rust 1.92 Vec::shrink_to_fit calls RawVec only when cap>len.
+    // Rust 1.98.1 Vec::shrink_to_fit calls RawVec only when cap>len.
     // A zero target frees old backing; it requests no zero-byte allocation.
     let requested_backing = if capacity > len { result_backing } else { None };
     Ok(VecBoxFacts {

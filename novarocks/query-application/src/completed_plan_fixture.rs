@@ -70,9 +70,16 @@ impl SqlCompletionFactSource for NoFacts {
 
 /// A completed plan over literal rows, carrying the given version.
 pub(crate) async fn completed_values_plan(version: [u8; 16]) -> CompletedPlanWithAccess<()> {
+    completed_literal_query(version, "SELECT 1 AS a, CAST(NULL AS VARCHAR) AS b").await
+}
+
+pub(crate) async fn completed_literal_query(
+    version: [u8; 16],
+    sql: &str,
+) -> CompletedPlanWithAccess<()> {
     let (_root, scope) = query_scope();
     FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-        .complete(values_request(version), &scope)
+        .complete(literal_query_request(version, sql), &scope)
         .await
         .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"))
 }
@@ -252,10 +259,10 @@ pub(crate) fn test_constant_policy() -> novarocks_sql::compiler::ConstantPolicy 
     }
 }
 
-fn values_request(version: [u8; 16]) -> SqlFinalPlanCompileRequest {
+fn literal_query_request(version: [u8; 16], sql: &str) -> SqlFinalPlanCompileRequest {
     SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new(version).expect("plan version"),
-        SqlStatementInput::sql("SELECT 1 AS a, CAST(NULL AS VARCHAR) AS b"),
+        SqlStatementInput::sql(sql),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

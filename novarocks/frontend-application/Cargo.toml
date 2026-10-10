@@ -10,8 +10,14 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+mem-1-m07-root-observation = []
+mem-1-m07-exact-mysql-write = ["novarocks-mysql-adapter/mem-1-m07-exact-mysql-write"]
+
 [dependencies]
 novarocks-type-contract.workspace = true
+allocator-api2.workspace = true
+hashbrown.workspace = true
 anyhow.workspace = true
 apache-avro.workspace = true
 async-trait.workspace = true
@@ -38,6 +44,7 @@ novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-query-application.workspace = true
+novarocks-result-contract.workspace = true
 novarocks-parser.workspace = true
 novarocks-plan-codec.workspace = true
 novarocks-spi.workspace = true
@@ -75,6 +82,7 @@ novarocks-mv-application = { workspace = true, features = ["test-support"] }
 novarocks-catalog-application = { workspace = true, features = ["test-support"] }
 novarocks-connector-starrocks.workspace = true
 novarocks-query-application = { workspace = true, features = ["test-support"] }
+novarocks-result-render.workspace = true
 novarocks-secret.workspace = true
 novarocks-state-store-testkit.workspace = true
 novarocks-sql = { workspace = true, features = ["test-support"] }

@@ -199,9 +199,11 @@ fn conversion_program(
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: id,
         output: fragment.nodes()[&output].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "conversion_result".into(),
             alias: None,
             value,

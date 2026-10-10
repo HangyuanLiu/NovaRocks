@@ -31,8 +31,10 @@ use crate::persistence::dependency::{
 use crate::persistence::projection::StoredMvProjection;
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
-    MvRepository, MvRepositoryError, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvDependencyReadBound,
+    MvProjectionInventoryBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
+    MvProjectionRequest, MvProjectionVersion, MvRepository, MvRepositoryError,
+    MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
 
 #[derive(Default)]
@@ -198,6 +200,63 @@ impl MvRepository for InMemoryMvRepository {
             .collect())
     }
 
+    async fn list_projection_inventory(
+        &self,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
+        let state = self.state()?;
+        let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
+        for projection in state.projections.values() {
+            inventory.push(projection)?;
+        }
+        Ok(inventory.finish())
+    }
+
+    async fn find_by_target_bounded(
+        &self,
+        target: &MvTarget,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        let state = self.state()?;
+        MvProjectionInventoryBuilder::new(bound)?;
+        let Some((&id, projection)) = state
+            .projections
+            .iter()
+            .find(|(_, projection)| projection.facts.target() == target)
+        else {
+            return Ok(None);
+        };
+        // This test double owns already validated models. Exercise the same
+        // bounded durable decode without cloning a loaded model first.
+        let key = crate::state_store_repository::key::projection_by_id_key(id)
+            .map_err(|error| MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error))?;
+        let value =
+            crate::state_store_repository::codec::encode_projection(Uuid::nil(), projection)
+                .map_err(|error| {
+                    MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error)
+                })?;
+        if key.as_bytes().len().saturating_add(value.as_bytes().len()) > bound.raw_page_bytes {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::InvalidRequest,
+                "MV inventory exceeds its raw page byte bound",
+            ));
+        }
+        let decoded = crate::state_store_repository::codec::decode_projection_with_budget(
+            &key,
+            &value,
+            bound.decode,
+        )
+        .map_err(|error| MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error))?;
+        Ok(Some(LoadedMvProjection {
+            projection: decoded.value,
+            version: state
+                .versions
+                .get(&id)
+                .expect("test projection version")
+                .clone(),
+        }))
+    }
+
     async fn delete_projection(
         &self,
         _operation_id: Uuid,
@@ -256,6 +315,40 @@ impl MvRepository for InMemoryMvRepository {
             &mut dependencies,
             &state.projections.values().cloned().collect::<Vec<_>>(),
         );
+        Ok(dependencies)
+    }
+
+    async fn list_dependencies_by_downstream_bounded(
+        &self,
+        mv_id: i64,
+        expected_version: &MvProjectionVersion,
+        bound: MvDependencyReadBound,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        use crate::bounded_dependencies::{DependencyCollector, classify, validate_canonical};
+        let mut dependencies = DependencyCollector::new(bound)?;
+        let state = self.state()?;
+        if state.versions.get(&mv_id) != Some(expected_version) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "MV dependency root changed",
+            ));
+        }
+        let projection = state.projections.get(&mv_id).ok_or_else(|| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "MV dependency root disappeared",
+            )
+        })?;
+        for dependency in state.dependencies.get(&mv_id).into_iter().flatten() {
+            dependencies.push_clone(dependency)?;
+        }
+        let mut dependencies = dependencies.finish();
+        validate_canonical(projection, &dependencies)?;
+        let mut inventory = MvProjectionInventoryBuilder::new(bound.inventory)?;
+        for projection in state.projections.values() {
+            inventory.push(projection)?;
+        }
+        classify(&mut dependencies, &inventory.finish());
         Ok(dependencies)
     }
 

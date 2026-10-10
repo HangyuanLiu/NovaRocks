@@ -375,9 +375,11 @@ fn compile(
         assert_eq!(installed.effects().argument_control, ArgumentControl::Eager);
     }
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&output_node].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "temporal_result".into(),
             alias: None,
             value,

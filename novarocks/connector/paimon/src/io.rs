@@ -25,7 +25,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use novarocks_fs::{
     FileCancellation, FileError, FileErrorKind, FileIdentity, FileRangeBinding, FileReadRange,
-    FileResult, FsAccessHandle, FsLocation,
+    FileResult, FsAccessHandle, FsListingBound, FsLocation,
 };
 use novarocks_spi::connector::ConnectorError;
 use paimon::io::{
@@ -59,6 +59,22 @@ pub trait PaimonAuthorizedListing: std::fmt::Debug + Send + Sync {
         recursive: bool,
         cancellation: &FileCancellation,
     ) -> FileResult<PaimonListingStream>;
+
+    /// Explicit local-catalog source capability. Implementations must bound
+    /// growth before forming owned paths; an unbounded implementation cannot
+    /// serve this call through a fallback.
+    async fn list_bounded(
+        &self,
+        _access: &FsAccessHandle,
+        _prefix: &str,
+        _recursive: bool,
+        _cancellation: &FileCancellation,
+        _bound: FsListingBound,
+    ) -> FileResult<PaimonListingStream> {
+        Err(FileError::unsupported(
+            "Paimon listing backend has no bounded catalog listing capability",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -77,10 +93,28 @@ impl PaimonAuthorizedListing for PaimonFsAuthorizedListing {
             .list_location(prefix, recursive, cancellation)
             .await?;
         Ok(Box::pin(stream.map(|entry| {
-            entry.map(|entry| PaimonListedEntry {
-                path: entry.location().to_string(),
-                size: entry.size(),
-                is_dir: entry.is_dir(),
+            entry.map(|entry| {
+                let (path, size, is_dir) = entry.into_parts();
+                PaimonListedEntry { path, size, is_dir }
+            })
+        })))
+    }
+
+    async fn list_bounded(
+        &self,
+        access: &FsAccessHandle,
+        prefix: &str,
+        recursive: bool,
+        cancellation: &FileCancellation,
+        bound: FsListingBound,
+    ) -> FileResult<PaimonListingStream> {
+        let stream = access
+            .list_location_bounded(prefix, recursive, cancellation, bound)
+            .await?;
+        Ok(Box::pin(stream.map(|entry| {
+            entry.map(|entry| {
+                let (path, size, is_dir) = entry.into_parts();
+                PaimonListedEntry { path, size, is_dir }
             })
         })))
     }
@@ -88,10 +122,11 @@ impl PaimonAuthorizedListing for PaimonFsAuthorizedListing {
 
 #[derive(Clone)]
 pub struct PaimonHostFileIo {
-    access: FsAccessHandle,
-    warehouse: FsLocation,
+    access: Arc<FsAccessHandle>,
+    warehouse: Arc<FsLocation>,
     cancellation: FileCancellation,
     listing: Arc<dyn PaimonAuthorizedListing>,
+    listing_bound: Option<FsListingBound>,
     /// On an execution attempt, the shared scan I/O every HEAD and GET goes
     /// through, bound to the source the attempt reads for.
     range: Option<FileRangeBinding>,
@@ -121,13 +156,22 @@ impl PaimonHostFileIo {
             ));
         }
         Ok(Self {
-            access,
-            warehouse,
+            access: Arc::new(access),
+            warehouse: Arc::new(warehouse),
             cancellation,
             listing,
+            listing_bound: None,
             range: None,
             sizes: Arc::default(),
         })
+    }
+
+    /// Opt this host clone into an explicitly admitted local catalog listing.
+    /// Access and warehouse facts stay shared with the same role-local owner;
+    /// this does not clone an inventory or change its credential/renewal path.
+    pub fn with_listing_bound(mut self, bound: FsListingBound) -> Self {
+        self.listing_bound = Some(bound);
+        self
     }
 
     /// A clone whose reads are admitted to their own child of the attempt's
@@ -187,6 +231,22 @@ impl PaimonHostFileIo {
     /// The object's size: the registered one or the caller's, which must
     /// agree, and a managed HEAD only when neither is known.
     async fn object_size(&self, path: &str, known_size: Option<u64>) -> FileResult<u64> {
+        if let Some(bound) = self.bounded_catalog_path(path)? {
+            if known_size.is_some() {
+                return Err(FileError::invalid(
+                    "bounded catalog metadata probe cannot accept a frozen read size",
+                ));
+            }
+            self.validate_location(path)?;
+            self.cancellation.check()?;
+            self.sizes.probes.fetch_add(1, Ordering::AcqRel);
+            // Metadata existence is fresh per call, not a frozen scan fact.
+            // Neither lookup nor insertion touches the shared scan-size cache.
+            return self
+                .access
+                .stat_location_bounded(path, &self.cancellation, bound)
+                .await;
+        }
         self.validate_location(path)?;
         let size = match (self.remembered_size(path)?, known_size) {
             (Some(registered), Some(known)) if registered != known => {
@@ -208,6 +268,19 @@ impl PaimonHostFileIo {
     pub fn with_range_binding(mut self, range: FileRangeBinding) -> Self {
         self.range = Some(range);
         self
+    }
+
+    fn bounded_catalog_path(&self, path: &str) -> FileResult<Option<FsListingBound>> {
+        if let Some(bound) = self.listing_bound {
+            if self.range.is_some() {
+                return Err(FileError::invalid(
+                    "bounded catalog metadata cannot share a BE range-service binding",
+                ));
+            }
+            // Admit before validate_location/identity/path or metadata copies.
+            bound.check_path(path)?;
+        }
+        Ok(self.listing_bound)
     }
 
     fn validate_location(&self, path: &str) -> FileResult<FsLocation> {
@@ -354,6 +427,7 @@ impl std::fmt::Debug for PaimonHostFileIo {
 impl ReadOnlyFileIO for PaimonHostFileIo {
     async fn stat(&self, path: &str) -> paimon::Result<FileStatus> {
         let size = self.object_size(path, None).await.map_err(map_file_error)?;
+        self.bounded_catalog_path(path).map_err(map_file_error)?;
         Ok(FileStatus {
             size,
             is_dir: false,
@@ -380,13 +454,22 @@ impl ReadOnlyFileIO for PaimonHostFileIo {
     }
 
     async fn list(&self, path: &str, recursive: bool) -> paimon::Result<FileStatusStream> {
+        self.bounded_catalog_path(path).map_err(map_file_error)?;
         self.validate_location(path).map_err(map_file_error)?;
         self.cancellation.check().map_err(map_file_error)?;
-        let stream = self
-            .listing
-            .list(&self.access, path, recursive, &self.cancellation)
-            .await
-            .map_err(map_file_error)?;
+        let stream = match self.listing_bound {
+            Some(bound) => {
+                self.listing
+                    .list_bounded(&self.access, path, recursive, &self.cancellation, bound)
+                    .await
+            }
+            None => {
+                self.listing
+                    .list(&self.access, path, recursive, &self.cancellation)
+                    .await
+            }
+        }
+        .map_err(map_file_error)?;
         Ok(Box::pin(stream.map(|entry| {
             entry
                 .map(|entry| FileStatus {
@@ -569,6 +652,246 @@ mod tests {
         PaimonChargedHostFileIo, PaimonFsAuthorizedListing, PaimonHostFileIo,
         connector_error_from_file_error, map_file_error,
     };
+
+    #[derive(Debug, Default)]
+    struct GenericOnlyListing {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl super::PaimonAuthorizedListing for GenericOnlyListing {
+        async fn list(
+            &self,
+            _access: &novarocks_fs::FsAccessHandle,
+            _prefix: &str,
+            _recursive: bool,
+            _cancellation: &FileCancellation,
+        ) -> FileResult<super::PaimonListingStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+    fn listing_host(
+        listing: Arc<dyn super::PaimonAuthorizedListing>,
+    ) -> (tempfile::TempDir, PaimonHostFileIo, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let warehouse = directory.path().join("warehouse");
+        std::fs::create_dir_all(&warehouse).unwrap();
+        let warehouse = warehouse.to_string_lossy().into_owned();
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                StorageAccessDomainId::from_bytes([19; 32]),
+                &warehouse,
+                None,
+            )
+            .unwrap();
+        let host = PaimonHostFileIo::try_new(access, &warehouse, FileCancellation::new(), listing)
+            .unwrap();
+        (directory, host, warehouse)
+    }
+    fn bound(bytes: usize) -> novarocks_fs::FsListingBound {
+        novarocks_fs::FsListingBound::try_new(1, bytes, 32 * 1024 * 1024).unwrap()
+    }
+
+    #[test]
+    fn catalog_host_clone_shares_authorized_inventory_and_only_opts_in_its_clone() {
+        let (_directory, host, _warehouse) = listing_host(Arc::new(PaimonFsAuthorizedListing));
+        let bounded = host.clone().with_listing_bound(bound(256));
+        assert!(Arc::ptr_eq(&host.access, &bounded.access));
+        assert!(Arc::ptr_eq(&host.warehouse, &bounded.warehouse));
+        assert!(host.listing_bound.is_none());
+        assert!(bounded.listing_bound.is_some());
+    }
+
+    #[tokio::test]
+    async fn catalog_bounded_backend_never_falls_back_to_generic_listing() {
+        let listing = Arc::new(GenericOnlyListing::default());
+        let (_directory, host, warehouse) = listing_host(listing.clone());
+        let bounded = host.clone().with_listing_bound(bound(256));
+        let error = match bounded.list(&warehouse, false).await {
+            Ok(_) => panic!("unsupported bound accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            super::super::catalog::map_sdk_error(error).kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        assert_eq!(listing.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(host.list(&warehouse, false).await.unwrap());
+        assert_eq!(listing.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn catalog_host_admits_borrowed_prefix_before_location_copy_or_backend() {
+        let listing = Arc::new(GenericOnlyListing::default());
+        let (_directory, host, warehouse) = listing_host(listing.clone());
+        let path = format!("{warehouse}/{}", "x".repeat(128));
+        for (bound, prefix) in [
+            (bound(64), path.as_str()),
+            (
+                novarocks_fs::FsListingBound::try_new(1, 256, 64).unwrap(),
+                warehouse.as_str(),
+            ),
+        ] {
+            let bounded = host.clone().with_listing_bound(bound);
+            let error = match bounded.list(prefix, false).await {
+                Ok(_) => panic!("source copies accepted before their bound"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                super::super::catalog::map_sdk_error(error).kind(),
+                ConnectorErrorKind::ResourceExhausted
+            );
+        }
+        assert_eq!(listing.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_host_refuses_long_uri_without_tightening_generic_or_be_host() {
+        use futures::StreamExt;
+        let (_directory, host, warehouse) = listing_host(Arc::new(PaimonFsAuthorizedListing));
+        let file = std::path::Path::new(&warehouse).join("x".repeat(100));
+        std::fs::write(&file, b"data").unwrap();
+        let file = file.to_string_lossy().into_owned();
+        let generic = host
+            .list(&warehouse, false)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // Local OpenDAL may also yield the listed directory itself. Preserve
+        // that behavior and verify that the complete long file remains visible.
+        assert!(
+            generic
+                .iter()
+                .any(|entry| !entry.is_dir && entry.path == file)
+        );
+        let bounded = host.clone().with_listing_bound(bound(warehouse.len() + 8));
+        let mut stream = bounded.list(&warehouse, false).await.unwrap();
+        let error = loop {
+            match stream.next().await.expect("long file must cause a refusal") {
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            super::super::catalog::map_sdk_error(error).kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert!(stream.next().await.is_none());
+        assert!(host.listing_bound.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_catalog_probe_is_fresh_and_never_grows_scan_size_cache() {
+        let (_directory, host, warehouse) = listing_host(Arc::new(PaimonFsAuthorizedListing));
+        let path = format!("{warehouse}/schema-0");
+        std::fs::write(&path, b"old").unwrap();
+        // An existing frozen scan fact remains intact, but metadata probes do
+        // not consult it or add new keys to this shared scan cache.
+        host.know_object_size(&path, 3).unwrap();
+        let bounded = host.clone().with_listing_bound(bound(256));
+        assert_eq!(bounded.stat(&path).await.unwrap().size, 3);
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(bounded.stat(&path).await.unwrap().size, 11);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!bounded.exists(&path).await.unwrap());
+        let other = format!("{warehouse}/schema-7");
+        std::fs::write(&other, b"next").unwrap();
+        assert_eq!(bounded.stat(&other).await.unwrap().size, 4);
+        assert_eq!(host.sizes.known.lock().unwrap().len(), 1);
+        assert_eq!(host.remembered_size(&path).unwrap(), Some(3));
+        assert_eq!(host.remembered_size(&other).unwrap(), None);
+        assert_eq!(bounded.size_probes(), 4);
+    }
+
+    #[tokio::test]
+    async fn bounded_catalog_probe_refuses_long_schema_and_frozen_read_size_before_io() {
+        let (_directory, host, warehouse) = listing_host(Arc::new(PaimonFsAuthorizedListing));
+        let bounded = host.with_listing_bound(bound(warehouse.len() + 16));
+        let path = format!("{warehouse}/{}/schema-0", "x".repeat(128));
+        let error = bounded.stat(&path).await.unwrap_err();
+        assert_eq!(
+            super::super::catalog::map_sdk_error(error).kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        let path = format!("{warehouse}/schema-0");
+        assert_eq!(
+            bounded
+                .object_size(&path, Some(1))
+                .await
+                .unwrap_err()
+                .kind(),
+            FileErrorKind::Invalid
+        );
+        assert_eq!(bounded.size_probes(), 0);
+        assert!(bounded.sizes.known.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_catalog_probe_keeps_cancel_and_deadline_kinds() {
+        let (_directory, host, warehouse) = listing_host(Arc::new(PaimonFsAuthorizedListing));
+        let path = format!("{warehouse}/schema-0");
+        let mut cancelled = host.clone().with_listing_bound(bound(256));
+        cancelled.cancellation = FileCancellation::new();
+        cancelled.cancellation.cancel();
+        let mut expired = host.with_listing_bound(bound(256));
+        expired.cancellation = FileCancellation::new().with_deadline(Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ));
+        for (host, kind) in [
+            (cancelled, ConnectorErrorKind::Cancelled),
+            (expired, ConnectorErrorKind::DeadlineExceeded),
+        ] {
+            let error = host.exists(&path).await.unwrap_err();
+            assert_eq!(super::super::catalog::map_sdk_error(error).kind(), kind);
+            assert_eq!(host.size_probes(), 0);
+            assert!(host.sizes.known.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_catalog_probe_rejects_be_range_binding_in_either_order() {
+        let (_directory, host, warehouse) = listing_host(Arc::new(PaimonFsAuthorizedListing));
+        let handle = tokio::runtime::Handle::current();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            Arc::new(TokioFileTaskSpawner::new(handle.clone())),
+            handle,
+        );
+        let range = service.bind(
+            FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+            ConnectorSourceOperations::new(),
+        );
+        for bounded in [
+            host.clone()
+                .with_listing_bound(bound(256))
+                .with_range_binding(range.clone()),
+            host.with_range_binding(range)
+                .with_listing_bound(bound(256)),
+        ] {
+            let path = format!("{warehouse}/schema-0");
+            let error = bounded.exists(&path).await.unwrap_err();
+            assert_eq!(
+                super::super::catalog::map_sdk_error(error).kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+            let error = match bounded.list(&warehouse, false).await {
+                Ok(_) => panic!("BE range owner bypass accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                super::super::catalog::map_sdk_error(error).kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+            assert_eq!(bounded.size_probes(), 0);
+            assert!(bounded.sizes.known.lock().unwrap().is_empty());
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_attempt_heads_and_reads_through_its_source_scan_io() {

@@ -252,7 +252,9 @@ pub fn compiled_sink_kind(
     sink: Option<&StaticSinkProgram>,
 ) -> Result<FragmentSinkKind, FragmentBindingError> {
     match sink {
-        Some(StaticSinkProgram::Result) => Ok(FragmentSinkKind::Result),
+        Some(StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)) => {
+            Ok(FragmentSinkKind::Result)
+        }
         Some(StaticSinkProgram::Noop) => Ok(FragmentSinkKind::Noop),
         Some(StaticSinkProgram::DataStream { .. }) => Ok(FragmentSinkKind::DataStream),
         Some(StaticSinkProgram::MultiCastDataStream { .. }) => {
@@ -326,8 +328,13 @@ pub fn prepare_compiled_fragment(
         if let Some(identity) = context.result_identity {
             result_spec = result_spec.with_task_identity(identity);
         }
-        resources.acquire_result_for(
-            submission.sink_kind(),
+        resources.acquire_root_result_for_static(
+            program.graph().sink(),
+            context.root_result_session.clone(),
+            context.result_identity,
+        )?;
+        resources.acquire_result_for_static(
+            program.graph().sink(),
             &context.result_writer,
             result_spec,
         )?;
@@ -369,8 +376,35 @@ pub fn prepare_compiled_fragment(
                 error,
             )
         })?;
-        let result_sink = match submission.sink_kind() {
-            FragmentSinkKind::Result => {
+        let result_sink = match program.graph().sink() {
+            Some(StaticSinkProgram::RootResult(_)) => {
+                let session = resources.root_result_session().ok_or_else(|| {
+                    FragmentLaunchError::new(
+                        FragmentLaunchStage::Materialize,
+                        FragmentLaunchErrorKind::Materialization,
+                        "compiled bounded root requires an opened host-owned RootResult session",
+                    )
+                })?;
+                let dop = frozen_root_sink_dop.ok_or_else(|| {
+                    FragmentLaunchError::new(
+                        FragmentLaunchStage::Materialize,
+                        FragmentLaunchErrorKind::Materialization,
+                        "compiled bounded root requires its frozen sink DOP",
+                    )
+                })?;
+                Some(Box::new(
+                    crate::exec::operators::RootResultSinkFactory::try_new(session, dop).map_err(
+                        |error| {
+                            FragmentLaunchError::new(
+                                FragmentLaunchStage::Materialize,
+                                FragmentLaunchErrorKind::Materialization,
+                                error,
+                            )
+                        },
+                    )?,
+                ) as Box<dyn OperatorFactory>)
+            }
+            Some(StaticSinkProgram::Result) => {
                 let session = resources.result_session().ok_or_else(|| {
                     FragmentLaunchError::new(
                         FragmentLaunchStage::Materialize,

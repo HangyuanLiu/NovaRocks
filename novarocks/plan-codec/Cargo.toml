@@ -34,6 +34,7 @@ test-support = []
 [dependencies]
 flatbuffers.workspace = true
 novarocks-arrow-ipc-frame.workspace = true
+novarocks-result-contract.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-constant-contract.workspace = true
 arrow.workspace = true

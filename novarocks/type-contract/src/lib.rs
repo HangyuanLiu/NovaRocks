@@ -118,3 +118,6 @@ pub use to_base64_source::{
     NATIVE_V1_ENCRYPTION_FUNCTIONS, NonCanonicalNativeV1FunctionName, ToBase64ByteSource,
     native_v1_function_name,
 };
+
+pub mod result_render_type;
+pub mod result_scalar_type;

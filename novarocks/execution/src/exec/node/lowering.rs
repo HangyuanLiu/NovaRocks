@@ -376,7 +376,8 @@ impl Lowering<'_> {
                         .into_iter()
                         .map(|slot| lp::ProjectExpressionSlot {
                             slot_id: slot.slot_id(),
-                            field: slot.field().clone(),
+                            field: Arc::clone(slot.field_ref()),
+                            metadata_origins: slot.metadata_origins().cloned(),
                             field_schema: freeze_field_schema(slot.field_schema().clone()),
                             unique_id: slot.unique_id(),
                         })
@@ -387,6 +388,7 @@ impl Lowering<'_> {
                     P::Project {
                         input,
                         is_subordinate: n.is_subordinate,
+                        validate_final_result_input: n.validate_final_result_input,
                         exprs: n.exprs.into_iter().map(expr).collect(),
                         expr_slot_ids: n.expr_slot_ids,
                         expr_slot_schemas,
@@ -947,7 +949,7 @@ impl Lowering<'_> {
 }
 
 fn layout(schema: &ChunkSchemaRef) -> Result<lp::StaticLayout> {
-    lp::StaticLayout::try_new_exact(
+    let layout = lp::StaticLayout::try_new_exact(
         schema.arrow_schema_ref(),
         Arc::from(schema.slot_ids()),
         schema
@@ -961,7 +963,14 @@ fn layout(schema: &ChunkSchemaRef) -> Result<lp::StaticLayout> {
             })
             .collect(),
     )
-    .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
+    .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
+    if let Some(origins) = schema.field_metadata_origins() {
+        layout
+            .with_metadata_origins(origins.clone(), schema.schema_metadata_origin().cloned())
+            .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
+    } else {
+        Ok(layout)
+    }
 }
 
 fn expr(id: ExprId) -> lp::ProgramExprId {

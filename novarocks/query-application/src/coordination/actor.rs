@@ -29,18 +29,19 @@ use novarocks_execution_contract::{
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::QueryExecutionId;
 use novarocks_workload_control::{
-    CancellationReason, CancellationView, Obligation, ObligationKey, ObligationKind, ResultCredit,
-    Stage, StagePermit, WorkOwner, WorkScope,
+    CancellationReason, CancellationView, Obligation, ObligationKey, ObligationKind, Stage,
+    StagePermit, WorkOwner, WorkScope,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    BatchDelivery, DecodedResultBatch, EndDelivery, ExecutionOutput, QueryExecutionError,
-    QueryResultStream, QueryResultTransport, ResultDelivery, ResultDeliveryDisposition,
-    ResultDeliveryReceipt, ResultQueuePermit, ResultSchema,
+    EndDelivery, ExecutionOutput, QueryExecutionError, QueryResultStream, QueryResultTransport,
+    ResultDelivery, ResultDeliveryDisposition, ResultDeliveryReceipt, ResultQueuePermit,
+    ResultSchema, RetainedRootReply, RootSegmentDelivery,
 };
+use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor};
 
 use super::actor_state::{
     ActorStateError, AttemptCapability, LogicalExecutionState, ReplacementFact, ReplacementToken,
@@ -200,16 +201,31 @@ impl RootResultObserver {
         .await
     }
 
-    pub(crate) async fn observe_final_worker_eos_ack(
+    pub(crate) async fn observe_local_root_end(
+        &self,
+        root: TaskIdentity,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.observe_root_end(
+            root,
+            ResultPacketSequence::new(end.sequence.get() - 1),
+            Some(end.output_rows),
+        )
+        .await
+    }
+
+    async fn observe_root_end(
         &self,
         root: TaskIdentity,
         sequence: ResultPacketSequence,
+        root_output_rows: Option<u64>,
     ) -> Result<(), LogicalExecutionActorError> {
         request(&self.mailbox, |reply| ActorCommand::ObserveRootEosAck {
             activation: self.activation,
             root,
             expected_root: self.root,
             sequence,
+            root_output_rows,
             reply,
         })
         .await
@@ -541,22 +557,25 @@ impl RunningAttemptPermit {
         .await
     }
 
-    /// Transfers one decoded batch to the actor-owned delivery boundary. The
-    /// future resolves only after the protocol consumer completes or rejects
-    /// the batch, so a Native adapter can delay its Worker ACK until success.
-    /// If the waiter is cancelled after submission, `snapshot` retains the
-    /// delivered watermark and is the retryable ACK authority.
-    pub(crate) async fn deliver_result_batch(
+    /// Transfers one validated Backend-encoded root item to the actor-owned
+    /// delivery boundary. The future resolves only after
+    /// the protocol consumer completes or rejects it; that completion is the
+    /// in-order receipt the relay acknowledges to the Backend.
+    pub(crate) async fn deliver_root_segment(
         &self,
         sequence: ResultPacketSequence,
-        batch: DecodedResultBatch,
-        credit: ResultCredit,
+        segment: Arc<RetainedRootReply>,
+        client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
+        rows: u64,
+        resident_window: crate::api::RootRelayResidentWindow,
     ) -> Result<(), LogicalExecutionActorError> {
-        request(self.mailbox(), |reply| ActorCommand::DeliverResultBatch {
+        request(self.mailbox(), |reply| ActorCommand::DeliverRootSegment {
             activation: self.identity(),
             sequence,
-            batch,
-            credit,
+            segment,
+            client_rows,
+            rows,
+            resident_window,
             reply,
         })
         .await
@@ -788,6 +807,7 @@ pub struct LogicalExecutionActorConfig {
     execution_stage: Option<StagePermit>,
     result_schema: Option<ResultSchema>,
     result_delivery_capacity: Option<NonZeroUsize>,
+    result_row_carrier: Option<crate::api::ResultRowCarrier>,
 }
 
 impl fmt::Debug for LogicalExecutionActorConfig {
@@ -871,6 +891,7 @@ impl LogicalExecutionActorConfig {
             execution_stage: Some(initial_execution_stage),
             result_schema: None,
             result_delivery_capacity: None,
+            result_row_carrier: None,
         })
     }
 
@@ -922,6 +943,7 @@ impl LogicalExecutionActorConfig {
         initial_execution_stage: StagePermit,
         schema: ResultSchema,
         delivery_capacity: NonZeroUsize,
+        carrier: crate::api::ResultRowCarrier,
     ) -> Result<Self, LogicalExecutionActorError> {
         Ok(Self::single_attempt_completion(
             initial_execution,
@@ -933,7 +955,8 @@ impl LogicalExecutionActorConfig {
             work_owner,
             initial_execution_stage,
         )?
-        .with_result_stream(schema, delivery_capacity))
+        .with_result_stream(schema, delivery_capacity)
+        .with_result_row_carrier(carrier))
     }
 
     /// Constructs effect-free read execution recovery before any data packet
@@ -987,6 +1010,7 @@ impl LogicalExecutionActorConfig {
             execution_stage: Some(initial_execution_stage),
             result_schema: None,
             result_delivery_capacity: None,
+            result_row_carrier: None,
         })
     }
 
@@ -1006,6 +1030,7 @@ impl LogicalExecutionActorConfig {
         replacement_reservation_valid_for: Duration,
         schema: ResultSchema,
         delivery_capacity: NonZeroUsize,
+        carrier: crate::api::ResultRowCarrier,
     ) -> Result<Self, LogicalExecutionActorError> {
         Ok(Self::read_only_pre_visibility_recovery(
             initial_execution,
@@ -1019,7 +1044,8 @@ impl LogicalExecutionActorConfig {
             initial_execution_stage,
             replacement_reservation_valid_for,
         )?
-        .with_result_stream(schema, delivery_capacity))
+        .with_result_stream(schema, delivery_capacity)
+        .with_result_row_carrier(carrier))
     }
 
     /// Attaches the fixed logical schema and bounded protocol queue used by
@@ -1032,6 +1058,14 @@ impl LogicalExecutionActorConfig {
         self.output_mode = LogicalOutputMode::ResultStream;
         self.result_schema = Some(schema);
         self.result_delivery_capacity = Some(delivery_capacity);
+        self
+    }
+
+    /// Fixes how this execution's result rows arrive. A relayed carrier admits
+    /// only Backend-encoded root items of its exact kind and row profile.
+    /// Row-stream construction requires this explicit frozen contract.
+    pub(crate) fn with_result_row_carrier(mut self, carrier: crate::api::ResultRowCarrier) -> Self {
+        self.result_row_carrier = Some(carrier);
         self
     }
 
@@ -1283,7 +1317,9 @@ type ActorReply<T> = oneshot::Sender<Result<T, LogicalExecutionActorError>>;
 struct PendingResultBatch {
     activation: AttemptActivationIdentity,
     sequence: ResultPacketSequence,
-    delivery: BatchDelivery,
+    /// A decoded batch or a Backend-encoded root segment; both share the
+    /// same ordered delivery, receipt and success gate.
+    delivery: ResultDelivery,
     receipt: ResultDeliveryReceipt,
     reply: ActorReply<()>,
 }
@@ -1305,6 +1341,7 @@ struct RootSuccessGate {
     status: Option<TaskStatus>,
     terminal_failure: RootTerminalFailure,
     final_eos_ack: Option<ResultPacketSequence>,
+    root_output_rows: Option<u64>,
 }
 
 struct RootTerminalObservation {
@@ -1343,7 +1380,7 @@ enum InFlightResult {
 }
 
 struct ResultRuntime {
-    schema: ResultSchema,
+    carrier: crate::api::ResultRowCarrier,
     schema_receipt: Option<ResultDeliveryReceipt>,
     schema_writer_completed: bool,
     failure_sender: Option<watch::Sender<Option<QueryExecutionError>>>,
@@ -1393,11 +1430,13 @@ enum ActorCommand {
         error: Option<QueryExecutionError>,
         reply: ActorReply<LogicalConclusion>,
     },
-    DeliverResultBatch {
+    DeliverRootSegment {
         activation: AttemptActivationIdentity,
         sequence: ResultPacketSequence,
-        batch: DecodedResultBatch,
-        credit: ResultCredit,
+        segment: Arc<RetainedRootReply>,
+        client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
+        rows: u64,
+        resident_window: crate::api::RootRelayResidentWindow,
         reply: ActorReply<()>,
     },
     BindRootResult {
@@ -1422,6 +1461,7 @@ enum ActorCommand {
         root: TaskIdentity,
         expected_root: TaskIdentity,
         sequence: ResultPacketSequence,
+        root_output_rows: Option<u64>,
         reply: ActorReply<()>,
     },
     FinishResultStream {
@@ -2066,16 +2106,20 @@ pub(crate) fn spawn_logical_execution_actor(
             let capacity = config
                 .result_delivery_capacity
                 .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+            let carrier = config
+                .result_row_carrier
+                .ok_or(LogicalExecutionActorError::InvariantViolation)?;
             let (transport, schema_receipt, failure_sender, stream) =
                 QueryResultStream::try_channel(
                     config.initial_execution.query_id(),
-                    schema.clone(),
+                    schema,
+                    carrier,
                     capacity.get(),
                 )
                 .map_err(|_| LogicalExecutionActorError::InvariantViolation)?;
             (
                 Some(ResultRuntime {
-                    schema,
+                    carrier,
                     schema_receipt: Some(schema_receipt),
                     schema_writer_completed: false,
                     failure_sender: Some(failure_sender),
@@ -3373,9 +3417,7 @@ fn apply_result_capacity(
                     return;
                 }
             };
-            runtime
-                .transport
-                .enqueue(slot, ResultDelivery::Batch(pending.delivery));
+            runtime.transport.enqueue(slot, pending.delivery);
             runtime.in_flight = Some(InFlightResult::Batch {
                 permit,
                 receipt: pending.receipt,
@@ -3421,8 +3463,14 @@ fn apply_result_capacity(
                 conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
                 return;
             }
-            let (delivery, receipt) =
-                EndDelivery::success_eof(activation.execution(), pending.sequence);
+            let (delivery, receipt) = EndDelivery::success_eof_with_root_rows(
+                activation.execution(),
+                pending.sequence,
+                runtime
+                    .root_success
+                    .as_ref()
+                    .and_then(|gate| gate.root_output_rows),
+            );
             runtime
                 .transport
                 .enqueue(slot, ResultDelivery::End(delivery));
@@ -3753,30 +3801,30 @@ fn handle_command(
             }
             settle_terminal(state, permit.into_parts(), LogicalConclusion::Failed, reply);
         }
-        ActorCommand::DeliverResultBatch {
+        ActorCommand::DeliverRootSegment {
             activation,
             sequence,
-            batch,
-            credit,
+            segment,
+            client_rows,
+            rows,
+            resident_window,
             reply,
         } => {
+            // Admit one ordered item at a time, never outside the attempt's delivery gate.
             if let Some(conclusion) = state.conclusion() {
-                drop(batch);
-                drop(credit);
+                drop(segment);
                 let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
                     conclusion,
                 )));
                 return;
             }
             let Some(runtime) = result_runtime else {
-                drop(batch);
-                drop(credit);
+                drop(segment);
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 return;
             };
             if runtime.attempt_decision_pending == Some(activation) {
-                drop(batch);
-                drop(credit);
+                drop(segment);
                 let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
                 return;
             }
@@ -3785,9 +3833,8 @@ fn handle_command(
                 .as_ref()
                 .is_some_and(|gate| gate.activation == activation && gate.final_eos_ack.is_some())
             {
-                drop(batch);
-                drop(credit);
-                conclude_failed(state, "a result batch arrived outside its delivery gate");
+                drop(segment);
+                conclude_failed(state, "a root segment arrived outside its delivery gate");
                 reply_result_failure(state, reply);
                 return;
             }
@@ -3798,27 +3845,41 @@ fn handle_command(
                     Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
                 )
             {
-                drop(batch);
-                drop(credit);
+                drop(segment);
                 let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 return;
             }
-            if sequence.next().is_none() || !runtime.schema.accepts(batch.batch()) {
-                drop(batch);
-                drop(credit);
+            if sequence.next().is_none() {
+                drop(segment);
+                conclude_failed(state, "a root segment sequence overflowed");
+                reply_result_failure(state, reply);
+                return;
+            }
+            let expected = crate::api::ResultRowCarrier::Relayed {
+                kind: segment.kind(),
+                client_rows: client_rows.map(|(profile, _)| profile),
+            };
+            if runtime.carrier != expected {
+                drop(segment);
                 conclude_failed(
                     state,
-                    "a result batch did not match the schema this query declared",
+                    "a root segment does not match the row carrier this result declared",
                 );
                 reply_result_failure(state, reply);
                 return;
             }
-            let delivery = BatchDelivery::try_new(activation.execution(), sequence, batch, credit);
-            let Ok((delivery, receipt)) = delivery else {
-                conclude_failed(state, "a result batch could not be prepared for delivery");
+            let Ok((delivery, receipt)) = RootSegmentDelivery::try_new(
+                activation.execution(),
+                sequence,
+                segment,
+                client_rows,
+                rows,
+            ) else {
+                conclude_failed(state, "a root segment could not be prepared for delivery");
                 reply_result_failure(state, reply);
                 return;
             };
+            let delivery = delivery.with_resident_window(resident_window);
             if start_schema_delivery(state, runtime, activation).is_err() {
                 drop(delivery);
                 conclude_failed(state, "schema delivery could not be started");
@@ -3828,7 +3889,7 @@ fn handle_command(
             runtime.pending = Some(PendingResult::Batch(PendingResultBatch {
                 activation,
                 sequence,
-                delivery,
+                delivery: ResultDelivery::Segment(delivery),
                 receipt,
                 reply,
             }));
@@ -3873,6 +3934,7 @@ fn handle_command(
                         status: None,
                         terminal_failure: RootTerminalFailure::Unspecified,
                         final_eos_ack: None,
+                        root_output_rows: None,
                     });
                     *root_terminal_receiver = Some(terminal_receiver);
                     let _ = reply.send(Ok(()));
@@ -3947,6 +4009,7 @@ fn handle_command(
             root,
             expected_root,
             sequence,
+            root_output_rows,
             reply,
         } => {
             let Some(runtime) = result_runtime else {
@@ -3961,6 +4024,15 @@ fn handle_command(
             }
             if verify_result_observation_activation(state, activation).is_err() {
                 let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+                return;
+            }
+            if matches!(
+                runtime.carrier,
+                crate::api::ResultRowCarrier::Relayed { .. }
+            ) != root_output_rows.is_some()
+            {
+                fail_result_observation(state, runtime);
+                reply_result_failure(state, reply);
                 return;
             }
             let expected = ResultPacketSequence::new(state.accepted_result_packets());
@@ -3988,9 +4060,10 @@ fn handle_command(
             match gate.final_eos_ack {
                 None => {
                     gate.final_eos_ack = Some(sequence);
+                    gate.root_output_rows = root_output_rows;
                     let _ = reply.send(Ok(()));
                 }
-                Some(held) if held == sequence => {
+                Some(held) if held == sequence && gate.root_output_rows == root_output_rows => {
                     let _ = reply.send(Ok(()));
                 }
                 Some(_) => {
@@ -4865,9 +4938,7 @@ mod tests {
         ReplacementQualificationEffectReservation,
     };
     use super::*;
-    use arrow::array::Int64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
+    use arrow::datatypes::DataType;
     use novarocks_execution_contract::{
         AbortCause, AdmissionEpochCapability, AdmissionTicketId, CodecOwnedContent,
         ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
@@ -4880,8 +4951,7 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId,
     };
     use novarocks_workload_control::{
-        LocalResourceAuthority, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig,
-        WorkloadControl,
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
 
     use crate::api::{QueryExecutionErrorKind, ResultField};
@@ -5312,6 +5382,7 @@ mod tests {
             stage,
             result_schema(),
             NonZeroUsize::new(1).unwrap(),
+            result_carrier(),
         );
         assert!(matches!(
             result,
@@ -5681,6 +5752,7 @@ mod tests {
             Duration::from_secs(30),
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
+            result_carrier(),
         )
         .unwrap()
     }
@@ -5705,6 +5777,7 @@ mod tests {
             Duration::from_secs(30),
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
+            result_carrier(),
         )
         .unwrap()
     }
@@ -5733,29 +5806,43 @@ mod tests {
         )])
     }
 
-    fn result_batch() -> DecodedResultBatch {
-        DecodedResultBatch::try_new(
-            RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new(
-                    "value",
-                    DataType::Int64,
-                    false,
-                )])),
-                vec![Arc::new(Int64Array::from(vec![7_i64, 11]))],
-            )
-            .unwrap(),
+    fn result_carrier() -> crate::api::ResultRowCarrier {
+        crate::api::ResultRowCarrier::relayed(
+            novarocks_result_contract::RootOutputKind::ClientRows,
+            Some(result_profile()),
         )
         .unwrap()
     }
 
-    fn result_credit(
-        batch: &DecodedResultBatch,
+    fn result_end(position: u64) -> novarocks_execution_contract::root_result::RootResultEnd {
+        novarocks_execution_contract::root_result::RootResultEnd {
+            sequence: std::num::NonZeroU64::new(position + 1).unwrap(),
+            output_rows: position * 2,
+        }
+    }
+
+    fn result_profile() -> ClientRowProfile {
+        ClientRowProfile::try_new(
+            novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
+            novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
+        )
+        .unwrap()
+    }
+
+    fn result_segment(
+        execution: QueryExecutionId,
+        sequence: u64,
     ) -> (
         WorkloadControl,
         WorkOwner,
-        LocalResourceAuthority,
-        ResultCredit,
+        novarocks_workload_control::ResultCapacityHandle,
+        Arc<RetainedRootReply>,
     ) {
+        use novarocks_execution_contract::root_result::{
+            RootReadOutcome, RootResultData, RootResultReply,
+        };
+        use novarocks_result_contract::{RootOutputKind, RootProfileId};
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -5765,24 +5852,41 @@ mod tests {
             },
         )
         .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
         control.mark_ready().unwrap();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let bytes = batch.governance_charge_bytes();
-        let authority = control.resources();
-        let credit = authority
-            .reserve_result_credit(&root.owner.scope(), bytes)
-            .unwrap()
-            .begin_fetch()
-            .unwrap()
-            .retain_raw(bytes)
-            .unwrap()
-            .reserve_decode(&authority, bytes)
-            .unwrap()
-            .queue_decoded(bytes)
+        let window = capacity
+            .try_acquire(&root.owner.scope(), ResultWindowClass::Client)
             .unwrap();
-        (control, root.owner, authority, credit)
+        let segment = RetainedRootReply::try_new(
+            RootResultReply {
+                root_task: root_task(execution, 1),
+                profile: RootProfileId::V1,
+                kind: RootOutputKind::ClientRows,
+                accepted_consumed: 0,
+                outcome: RootReadOutcome::Data(
+                    RootResultData::try_new(
+                        RootOutputKind::ClientRows,
+                        std::num::NonZeroU64::new(sequence).unwrap(),
+                        bytes::Bytes::from_static(&[
+                            2, 0, 0, 0, 1, b'7', 3, 0, 0, 0, 2, b'1', b'1',
+                        ]),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            },
+            window.retain_alias(),
+            4096,
+        )
+        .unwrap();
+        drop(window);
+        root.business.release();
+        (control, root.owner, capacity, Arc::new(segment))
     }
 
     async fn wait_for_conclusion(
@@ -5848,8 +5952,10 @@ mod tests {
             stage,
             result_schema(),
             NonZeroUsize::new(1).unwrap(),
+            result_carrier(),
         )
-        .unwrap();
+        .unwrap()
+        .with_result_row_carrier(result_carrier());
         let spawned = spawn_logical_execution_actor(&runtime, actor_config).unwrap();
         let (owner, initial, output) = spawned.into_parts();
         let actor = owner.actor().clone();
@@ -6635,8 +6741,10 @@ mod tests {
             stage,
             result_schema(),
             NonZeroUsize::new(1).unwrap(),
+            result_carrier(),
         )
         .unwrap()
+        .with_result_row_carrier(result_carrier())
         .with_abort_query_context_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
@@ -6736,8 +6844,10 @@ mod tests {
             stage,
             result_schema(),
             NonZeroUsize::new(1).unwrap(),
+            result_carrier(),
         )
         .unwrap()
+        .with_result_row_carrier(result_carrier())
         .with_abort_query_context_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
@@ -6788,7 +6898,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish = tokio::spawn(async move { running.finish_result_stream().await });
@@ -6951,7 +7061,8 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -7001,7 +7112,8 @@ mod tests {
             stage,
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -7049,7 +7161,8 @@ mod tests {
             stage,
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -7103,7 +7216,8 @@ mod tests {
         .with_result_stream(
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
-        );
+        )
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -7162,6 +7276,7 @@ mod tests {
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
         )
+        .with_result_row_carrier(result_carrier())
         .with_abort_query_context_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
@@ -7494,6 +7609,7 @@ mod tests {
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
         )
+        .with_result_row_carrier(result_carrier())
         .with_clock(clock.clone());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
@@ -7553,6 +7669,7 @@ mod tests {
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
         )
+        .with_result_row_carrier(result_carrier())
         .with_clock(clock.clone());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
@@ -8087,7 +8204,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(103);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8100,30 +8218,28 @@ mod tests {
         let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
         let root = root_task(first, 1);
         let observer = running.bind_root_result(root).await.unwrap();
-        let batch = result_batch();
-        let bytes = batch.governance_charge_bytes();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         let delivery_running = Arc::clone(&running);
         let delivery_task = tokio::spawn(async move {
             delivery_running
-                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(0),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default(),
+                )
                 .await
         });
 
-        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+        let ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue one batch");
         };
         assert!(!delivery_task.is_finished());
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), bytes);
-        delivery
-            .reserve_protocol(&authority, bytes)
-            .unwrap()
-            .begin_protocol_write(bytes)
-            .unwrap()
-            .complete()
-            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        delivery.complete();
         delivery_task.await.unwrap().unwrap();
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
 
         let running = Arc::try_unwrap(running).expect("batch sender released its permit");
         observer
@@ -8131,7 +8247,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(1))
+            .observe_local_root_end(root, result_end(1))
             .await
             .unwrap();
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
@@ -8148,7 +8264,7 @@ mod tests {
         );
         end.complete();
         wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
@@ -8160,7 +8276,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(109);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8170,28 +8287,26 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
-        let batch = result_batch();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         let delivery_running = Arc::clone(&running);
         let delivery_task = tokio::spawn(async move {
             delivery_running
-                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(0),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default(),
+                )
                 .await
         });
-        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+        let ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue one batch");
         };
 
         delivery_task.abort();
         assert!(delivery_task.await.unwrap_err().is_cancelled());
-        let bytes = delivery.decoded_bytes();
-        delivery
-            .reserve_protocol(&authority, bytes)
-            .unwrap()
-            .begin_protocol_write(bytes)
-            .unwrap()
-            .complete()
-            .unwrap();
+        delivery.complete();
         for _ in 0..16 {
             let snapshot = actor.snapshot().await.unwrap();
             if snapshot.delivered_result_through == Some(ResultPacketSequence::new(0)) {
@@ -8203,14 +8318,14 @@ mod tests {
             actor.snapshot().await.unwrap().delivered_result_through,
             Some(ResultPacketSequence::new(0))
         );
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
 
         let running = Arc::try_unwrap(running).expect("cancelled waiter released its permit");
         assert_eq!(
             actor.fail_attempt(running).await.unwrap(),
             LogicalConclusion::Failed
         );
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
@@ -8222,7 +8337,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(110);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8268,7 +8384,8 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8278,12 +8395,17 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
-        let batch = result_batch();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         let delivery_running = Arc::clone(&running);
         let delivery_task = tokio::spawn(async move {
             delivery_running
-                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(0),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default(),
+                )
                 .await
         });
         for _ in 0..16 {
@@ -8312,11 +8434,11 @@ mod tests {
             delivery_task.await.unwrap().unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Cancelled)
         );
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         drop(stream);
 
         drop(running);
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(actor);
         drop(owner);
@@ -8341,7 +8463,8 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8352,15 +8475,20 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
-        let batch = result_batch();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         let delivery_running = Arc::clone(&running);
         let delivery_task = tokio::spawn(async move {
             delivery_running
-                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(0),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default(),
+                )
                 .await
         });
-        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+        let ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue one batch");
         };
 
@@ -8375,10 +8503,10 @@ mod tests {
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Cancelled)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
 
         drop(running);
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
@@ -8387,11 +8515,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_failure_fails_delivery_and_releases_result_credit() {
+    async fn writer_failure_fails_delivery_and_releases_original_window() {
         let runtime = Handle::current();
         let first = execution(104);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8401,15 +8530,20 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
-        let batch = result_batch();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         let delivery_running = Arc::clone(&running);
         let delivery_task = tokio::spawn(async move {
             delivery_running
-                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(0),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default(),
+                )
                 .await
         });
-        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+        let ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue one batch");
         };
         delivery.fail(QueryExecutionError::new(
@@ -8421,9 +8555,9 @@ mod tests {
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         drop(running);
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
@@ -8435,7 +8569,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(105);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8455,7 +8590,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(108);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8478,7 +8614,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(106);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8490,42 +8627,48 @@ mod tests {
         let running = actor.activate(initial.ready()).await.unwrap();
         let identity = running.identity();
 
-        let foreign_batch = result_batch();
-        let (foreign_control, foreign_owner, foreign_authority, foreign_credit) =
-            result_credit(&foreign_batch);
+        let (foreign_control, foreign_owner, foreign_capacity, foreign_segment) =
+            result_segment(first, 1);
         let foreign = AttemptActivationIdentity::from_parts(
             identity.actor().get(),
             replacement(first, 2),
             identity.generation(),
         );
         assert_eq!(
-            request(&actor.sender, |reply| ActorCommand::DeliverResultBatch {
+            request(&actor.sender, |reply| ActorCommand::DeliverRootSegment {
                 activation: foreign,
                 sequence: ResultPacketSequence::new(0),
-                batch: foreign_batch,
-                credit: foreign_credit,
+                segment: foreign_segment,
+                client_rows: Some((result_profile(), ClientRowStreamCursor::default())),
+                rows: 2,
+                resident_window: crate::api::RootRelayResidentWindow::default(),
                 reply,
             })
             .await
             .unwrap_err(),
             LogicalExecutionActorError::ResultDeliveryFailed
         );
-        assert_eq!(foreign_authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(foreign_capacity.snapshot().held_positions, [0; 4]);
         assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
         foreign_owner.complete();
         drop(foreign_control);
 
-        let gap_batch = result_batch();
-        let (gap_control, gap_owner, gap_authority, gap_credit) = result_credit(&gap_batch);
+        let (gap_control, gap_owner, gap_capacity, gap_segment) = result_segment(first, 2);
         assert_eq!(
             running
-                .deliver_result_batch(ResultPacketSequence::new(1), gap_batch, gap_credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(1),
+                    gap_segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default()
+                )
                 .await
                 .unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
-        assert_eq!(gap_authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(gap_capacity.snapshot().held_positions, [0; 4]);
         gap_owner.complete();
         drop(gap_control);
         drop(running);
@@ -8539,7 +8682,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(111);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8549,11 +8693,16 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let batch = result_batch();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         assert_eq!(
             running
-                .deliver_result_batch(ResultPacketSequence::new(u64::MAX), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(u64::MAX),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default()
+                )
                 .await
                 .unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
@@ -8564,9 +8713,9 @@ mod tests {
             Ok(_) => panic!("failed result stream must not expose a delivery"),
         };
         assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         drop(running);
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
@@ -8574,7 +8723,8 @@ mod tests {
 
         let second = execution(112);
         let config = recovery_config(second, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8589,7 +8739,7 @@ mod tests {
         let foreign = root_task(second, 3);
         assert_eq!(
             observer
-                .observe_final_worker_eos_ack(foreign, ResultPacketSequence::new(0))
+                .observe_local_root_end(foreign, result_end(0))
                 .await
                 .unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
@@ -8608,7 +8758,8 @@ mod tests {
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
         let config = recovery_config(first, port, 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8648,7 +8799,7 @@ mod tests {
         let root = root_task(second, 4);
         let observer = successor.bind_root_result(root).await.unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish_task = tokio::spawn(async move { successor.finish_result_stream().await });
@@ -8683,7 +8834,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(113);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8695,22 +8847,22 @@ mod tests {
         let running = actor.activate(initial.ready()).await.unwrap();
         let root = root_task(first, 6);
         let observer = running.bind_root_result(root).await.unwrap();
-        let batch = result_batch();
-        let bytes = batch.governance_charge_bytes();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         let (reply, response) = oneshot::channel();
         actor
             .sender
-            .send(ActorCommand::DeliverResultBatch {
+            .send(ActorCommand::DeliverRootSegment {
                 activation: running.identity(),
                 sequence: ResultPacketSequence::new(0),
-                batch,
-                credit,
+                segment,
+                client_rows: Some((result_profile(), ClientRowStreamCursor::default())),
+                rows: 2,
+                resident_window: crate::api::RootRelayResidentWindow::default(),
                 reply,
             })
             .await
             .unwrap();
-        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+        let ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue the pending batch");
         };
         observer
@@ -8721,16 +8873,12 @@ mod tests {
         actor.snapshot().await.unwrap();
         assert!(!finish_task.is_finished());
 
-        delivery
-            .reserve_protocol(&authority, bytes)
-            .unwrap()
-            .begin_protocol_write(bytes)
-            .unwrap()
-            .complete()
-            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        delivery.complete();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         response.await.unwrap().unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(1))
+            .observe_local_root_end(root, result_end(1))
             .await
             .unwrap();
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
@@ -8741,7 +8889,7 @@ mod tests {
             finish_task.await.unwrap().unwrap(),
             LogicalConclusion::Succeeded
         );
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
@@ -8753,7 +8901,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(114);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8778,17 +8927,22 @@ mod tests {
             snapshot.phase,
             ExecutionPhase::Running { execution, .. } if execution == first
         ));
-        let batch = result_batch();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
         assert_eq!(
             running
-                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(0),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default()
+                )
                 .await
                 .unwrap_err(),
             LogicalExecutionActorError::RootAttemptTerminal
         );
         assert!(!actor.snapshot().await.unwrap().output_visible);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         let terminal_error = QueryExecutionError::new(
             QueryExecutionErrorKind::Failed,
             "root task failed after attempt classification",
@@ -8805,7 +8959,7 @@ mod tests {
             Ok(_) => panic!("a final attempt failure must terminate the result stream"),
         };
         assert_eq!(error, terminal_error);
-        credit_owner.complete();
+        window_owner.complete();
         drop(control);
         drop(stream);
         drop(actor);
@@ -8817,7 +8971,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(1141);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8839,7 +8994,7 @@ mod tests {
             .unwrap();
         assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish = tokio::spawn(async move { running.finish_result_stream().await });
@@ -8858,7 +9013,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(115);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8872,7 +9028,7 @@ mod tests {
         let observer = running.bind_root_result(root).await.unwrap();
         assert_eq!(
             observer
-                .observe_final_worker_eos_ack(root, ResultPacketSequence::new(1))
+                .observe_local_root_end(root, result_end(1))
                 .await
                 .unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
@@ -8889,7 +9045,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(122);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8902,15 +9059,20 @@ mod tests {
         let root = root_task(first, 15);
         let observer = running.bind_root_result(root).await.unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
-        let batch = result_batch();
-        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let (control, window_owner, capacity, segment) = result_segment(first, 1);
 
         assert_eq!(
             running
-                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .deliver_root_segment(
+                    ResultPacketSequence::new(0),
+                    segment,
+                    Some((result_profile(), ClientRowStreamCursor::default())),
+                    2,
+                    crate::api::RootRelayResidentWindow::default()
+                )
                 .await
                 .unwrap_err(),
             LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
@@ -8921,8 +9083,8 @@ mod tests {
             Ok(_) => panic!("failed result stream must not expose a delivery"),
         };
         assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        credit_owner.complete();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        window_owner.complete();
         drop(control);
         drop(running);
         drop(observer);
@@ -8936,7 +9098,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(116);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8953,7 +9116,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         assert_eq!(
@@ -8971,7 +9134,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(117);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -8988,7 +9152,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
@@ -9028,7 +9192,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(118);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -9045,7 +9210,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
@@ -9085,7 +9250,8 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -9102,7 +9268,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
@@ -9142,7 +9308,8 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -9159,7 +9326,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
@@ -9187,7 +9354,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(120);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -9221,7 +9389,8 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(121);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
-            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
         let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -9238,7 +9407,7 @@ mod tests {
             .await
             .unwrap();
         observer
-            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .observe_local_root_end(root, result_end(0))
             .await
             .unwrap();
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });

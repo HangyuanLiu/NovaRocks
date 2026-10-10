@@ -30,6 +30,8 @@ pub struct ProjectNode {
     /// "main" operator's `CommonMetrics.PullRowNum`, so internal helper operators must be excluded
     /// via `CommonMetrics.IsSubordinate`.
     pub is_subordinate: bool,
+    /// Validate runtime identity input domains before publishing final result fields.
+    pub validate_final_result_input: bool,
     pub exprs: Vec<ExprId>,
     /// Slot ids for each expr in `exprs` (including CSE and outputs), in evaluation order.
     pub expr_slot_ids: Vec<SlotId>,

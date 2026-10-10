@@ -126,6 +126,7 @@ mod tests {
         let descriptor = BackendProcessDescriptor::try_new(
             process_id,
             RuntimeEndpoint::new("be-0.internal", 9090).expect("endpoint"),
+            RuntimeEndpoint::new("be-control.test.invalid", 19061).expect("control endpoint"),
             "warehouse-a",
             "build-identity",
             NativeCompatibilityId::new([7; 32]),

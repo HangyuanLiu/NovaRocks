@@ -630,6 +630,7 @@ fn finish_without_actual_canonical_source(
         control,
     )?;
     let result_port = ResultPort {
+        scalar_schema: None,
         fragment: root.fragment,
         output: OutputPort {
             node: root.node,

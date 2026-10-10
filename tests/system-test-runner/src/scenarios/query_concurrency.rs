@@ -806,10 +806,7 @@ struct Governance {
     obligations_tracking_ended_remote_unknown: usize,
     waiting_records: usize,
     peak_waiting_records: usize,
-    resource_limit_bytes: u64,
-    held_bytes: u64,
-    peak_held_bytes: u64,
-    result_credit_held_bytes: u64,
+    result_window_positions: Option<[usize; 4]>,
     control_ready: usize,
     control_inflight: usize,
 }
@@ -819,7 +816,7 @@ impl FrontendState {
         let workload = &self.workload;
         let governance = &workload.governance;
         format!(
-            "active_statement={} active_background={} roots={} admitted={} preparation={} execution={} obligations={} old_attempts={} unknown_creates={} evidence_endings={} remote_unknown_endings={} waiting={} held_bytes={} control_ready={} control_inflight={}",
+            "active_statement={} active_background={} roots={} admitted={} preparation={} execution={} obligations={} old_attempts={} unknown_creates={} evidence_endings={} remote_unknown_endings={} waiting={} result_window_positions={:?} control_ready={} control_inflight={}",
             workload.active.statement,
             workload.active.background,
             governance.root_responsibilities,
@@ -832,7 +829,7 @@ impl FrontendState {
             governance.obligations_settled_with_evidence,
             governance.obligations_tracking_ended_remote_unknown,
             governance.waiting_records,
-            governance.held_bytes,
+            governance.result_window_positions,
             governance.control_ready,
             governance.control_inflight,
         )
@@ -862,8 +859,8 @@ fn run_tier(
     let observed = await_governance(context, tier, &readers)?;
     assert_bounds(&observed, tier)?;
     context.action(format!(
-        "tier {tier} reached exact root admission with execution={} waiting={} peak_waiting={} peak_held_bytes={}",
-        observed.execution, observed.waiting_records, observed.peak_waiting_records, observed.peak_held_bytes
+        "tier {tier} reached exact root admission with execution={} waiting={} peak_waiting={} result_window_positions={:?}",
+        observed.execution, observed.waiting_records, observed.peak_waiting_records, observed.result_window_positions
     ));
     let outcomes = runtime.block_on(read_timeout_outcomes(readers))?;
     let mut terminal_failures = Vec::new();
@@ -1045,12 +1042,16 @@ fn assert_bounds(snapshot: &Governance, tier: usize) -> Result<()> {
         snapshot.peak_waiting_records > 0,
         "tier {tier} created no governed wait"
     );
-    ensure!(
-        snapshot.held_bytes <= snapshot.resource_limit_bytes
-            && snapshot.peak_held_bytes <= snapshot.resource_limit_bytes
-            && snapshot.result_credit_held_bytes <= snapshot.held_bytes,
-        "tier {tier} violated local resource authority bound"
-    );
+    let positions = snapshot
+        .result_window_positions
+        .context("FE must expose actual result-window positions")?;
+    // This scenario runs the frozen V1 host profile, not an allocation wallet.
+    for (class, (held, limit)) in positions.into_iter().zip([320, 16, 4, 64]).enumerate() {
+        ensure!(
+            held <= limit,
+            "tier {tier} exceeded V1 result class {class}: {held} > {limit}"
+        );
+    }
     Ok(())
 }
 
@@ -1060,7 +1061,7 @@ fn await_convergence(context: &mut ScenarioContext) -> Result<()> {
         if state.workload.active.statement == 0
             && state.workload.governance.root_responsibilities == 0
             && state.workload.governance.waiting_records == 0
-            && state.workload.governance.held_bytes == 0
+            && state.workload.governance.result_window_positions == Some([0; 4])
         {
             return Ok(());
         }

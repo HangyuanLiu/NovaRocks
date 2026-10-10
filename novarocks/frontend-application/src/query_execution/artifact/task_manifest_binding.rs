@@ -594,6 +594,7 @@ impl TaskManifestBinding {
                 prepared.execution_anchor
             )));
         }
+        validate_root_backend_support(schedule.root, &endpoint_by_process)?;
 
         validate_scan_assignments(&prepared, &fragment_tasks, &fragment_scan_assignments)?;
         let bound_edges = validate_edges(
@@ -1212,6 +1213,31 @@ fn validate_edges(
         .collect())
 }
 
+/// Require support from the root's original frozen process before activation
+/// can obtain Connector capabilities or initialize an execution attempt.
+/// Other snapshot candidates cannot lend their support to this placement.
+fn validate_root_backend_support(
+    root: TaskIdentity,
+    backends: &BTreeMap<BackendProcessId, BoundManifestBackend>,
+) -> Result<(), DistributedQueryError> {
+    let process = root.backend_process_id();
+    let backend = backends.get(&process).ok_or_else(|| {
+        contract_error(format!(
+            "attempt manifest root backend process {process} is absent from its frozen snapshot"
+        ))
+    })?;
+    backend
+        .target()
+        .descriptor()
+        .require_bounded_root_support()
+        .map_err(|error| {
+            contract_error(format!(
+                "attempt manifest root backend process {process} cannot serve bounded root results: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
 fn set_mismatch(
     label: &str,
     expected: &BTreeSet<FragmentId>,
@@ -1256,8 +1282,8 @@ mod tests {
         BoundManifestFrozenUnits, BoundManifestPartitionKind, FrozenAttemptTopology,
         PreparedManifestFacts, PreparedScanSource, ProjectedEdge, ProjectedScanAssignment,
         ProjectedTask, derive_and_record_fragment_instance_id, validate_backend_snapshot,
-        validate_edges, validate_frozen_unit_cover, validate_scan_assignments,
-        validate_schedule_execution, validate_task_identity,
+        validate_edges, validate_frozen_unit_cover, validate_root_backend_support,
+        validate_scan_assignments, validate_schedule_execution, validate_task_identity,
     };
     use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 
@@ -1360,6 +1386,8 @@ mod tests {
         let descriptor = BackendProcessDescriptor::try_new(
             process,
             RuntimeEndpoint::new("127.0.0.1", i32::from(port)).expect("valid endpoint"),
+            RuntimeEndpoint::new(format!("control-{ordinal}.test.invalid"), 19061)
+                .expect("valid control endpoint"),
             "test-deployment",
             "test-build",
             NativeCompatibilityId::new([0x71; 32]),
@@ -1371,6 +1399,350 @@ mod tests {
             descriptor,
             AdmissionEpochCapability::try_from_bytes([epoch; 16]).expect("nonzero admission epoch"),
         )
+    }
+
+    // This fixture exercises the production bind_facts call, never the support
+    // helper directly. It does not construct an application-owned AttemptSchedule:
+    // that value is private and move-only across the QA crate boundary.
+    #[derive(Clone, Copy)]
+    enum FullBindPurpose {
+        ClientRows,
+        CountOnly,
+    }
+
+    fn full_bind_native_template(
+        execution: QueryExecutionId,
+        purpose: FullBindPurpose,
+    ) -> super::super::RequestBoundNativeTemplate {
+        use arrow::datatypes::DataType;
+        use novarocks_physical_plan::{
+            Distribution, ExprKind, FragmentBuilder, FragmentSink, LiteralValue, NodeKind,
+            OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain, PlanBuilder,
+            PlanVersionId, ResultField, ResultPort, ResultValueDomain, RowMultiplicity,
+            ValueOrigin, ValueType,
+        };
+        use novarocks_query_application::preparation::{
+            CompletedPhysicalPlanCandidate, CompletedPlanWithAccess, FinalPlanRuntimeAccess,
+        };
+        use novarocks_result_contract::FrozenRootOutput;
+
+        let version = PlanVersionId::try_new([83; 16]).expect("finite component plan version");
+        let fragment_id = novarocks_physical_plan::FragmentId::new(1);
+        let mut fragment = FragmentBuilder::new(fragment_id);
+        let node = fragment.reserve_node_id().expect("one node");
+        let ty = ValueType::new(DataType::Int64, false);
+        let literal = fragment
+            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(7)))
+            .expect("one exact Int64 literal");
+        let value = fragment
+            .add_value(
+                ty.clone(),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .expect("one original node output");
+        let port = OutputPort {
+            node,
+            columns: Box::from([value]),
+        };
+        fragment
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: PhysicalProperties {
+                    distribution: Distribution::Singleton,
+                    row_multiplicity: RowMultiplicity::SingleCopy,
+                    ordering: Box::default(),
+                },
+                output: port.clone(),
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([literal])]),
+                },
+            })
+            .expect("one complete Values node");
+        let fragment = fragment
+            .finish_definition(
+                node,
+                FragmentSink::Result,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .expect("one singleton result fragment");
+        let mut plan = PlanBuilder::new(version);
+        plan.add_fragment(fragment).expect("one fragment");
+        plan.set_result_port(ResultPort {
+            scalar_schema: None,
+            fragment: fragment_id,
+            output: port,
+            fields: Box::from([ResultField {
+                domain: ResultValueDomain::Plain,
+                name: "payload".into(),
+                alias: None,
+                value,
+                ty,
+            }]),
+        })
+        .expect("one original result occurrence");
+        let plan = plan.finish().expect("production whole-plan validation");
+        let output = match purpose {
+            FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(
+                novarocks_sql::compiler::client_render_schema(&plan, 0)
+                    .expect("render schema from the original completed plan"),
+            ),
+            FullBindPurpose::CountOnly => FrozenRootOutput::CountOnly,
+        };
+        let candidate = CompletedPhysicalPlanCandidate::for_program(
+            plan,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+            .expect("production completed program validation")
+            .freeze_root_output(output)
+            .expect("freeze the original root purpose");
+        let paired =
+            CompletedPlanWithAccess::try_pair(
+                candidate,
+                FinalPlanRuntimeAccess::<
+                    crate::query_execution::provider_read_facts::FrozenProviderRead,
+                >::new(),
+            )
+            .unwrap_or_else(|(error, _access)| {
+                panic!("literal plan has no read capability: {error}")
+            });
+        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog()
+            .expect("original builtin engine function catalog");
+        let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+            paired,
+            &functions,
+            &crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+            crate::application::test_constant_policy(),
+            None,
+            false,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("production physical-to-native encoding");
+        assert_eq!(encoded.native.fragment_ids().count(), 1);
+        assert_eq!(encoded.access.iter().count(), 0);
+        assert!(encoded.plan_facts.scans().is_empty());
+        assert!(encoded.plan_facts.edges().is_empty());
+        let template = encoded.into_attempt_template(version);
+        let scheduling = template
+            .attempt_scheduling_facts()
+            .expect("original scheduling facts");
+        assert_eq!(scheduling.fragments.len(), 1);
+        assert!(scheduling.fragments[0].scans.is_empty());
+
+        // Finite component-only request-bound fixture. All static Native facts
+        // and template affinity above came from the real encoder; no provider,
+        // runtime, application request ticket or activation is opened here.
+        super::super::RequestBoundNativeTemplate {
+            execution,
+            template: template.native.fork_for_attempt(),
+            affinity: std::sync::Arc::new(super::super::PreparedDistributedAttemptAffinity),
+        }
+    }
+
+    fn full_bind_supported(target: LiveBackendTarget) -> LiveBackendTarget {
+        let descriptor = target.descriptor().clone();
+        let support = novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+            descriptor.control_endpoint().clone(),
+            novarocks_result_contract::RootProfileId::V1,
+        );
+        LiveBackendTarget::new(
+            target.backend_idx(),
+            descriptor
+                .with_bounded_root_support(support)
+                .expect("exact root capability"),
+            target.admission_epoch_capability(),
+        )
+    }
+
+    fn full_bind_schedule(
+        execution: QueryExecutionId,
+        backend: BackendProcessId,
+    ) -> super::ScheduleFacts {
+        let (root, context) = task(execution, 1, 1, backend);
+        super::ScheduleFacts {
+            execution,
+            fragments: vec![super::ProjectedFragment {
+                fragment_id: 1,
+                stage_id: StageId::new(1).expect("one nonzero stage"),
+                tasks: vec![ProjectedTask {
+                    identity: root,
+                    context,
+                    instance_index: 0,
+                    scan_work: Vec::new(),
+                }],
+            }],
+            edges: Vec::new(),
+            contexts: vec![context],
+            root,
+        }
+    }
+
+    #[test]
+    fn full_manifest_bind_refuses_missing_root_support_for_both_purposes() {
+        for purpose in [FullBindPurpose::ClientRows, FullBindPurpose::CountOnly] {
+            let execution = execution();
+            let legacy = live_target(0, BackendProcessId::new_v7(), 19010);
+            let process = legacy.descriptor().process_id();
+            let supported_peer =
+                full_bind_supported(live_target(1, BackendProcessId::new_v7(), 19011));
+            let snapshot = BackendTopologySnapshot::try_new(83, vec![legacy, supported_peer])
+                .expect("original snapshot preserves the supported non-root candidate");
+            let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
+                .expect("legacy descriptors are representable before selected-root use")
+                .into_parts();
+            let error = super::TaskManifestBinding::bind_facts(
+                full_bind_native_template(execution, purpose),
+                execution,
+                full_bind_schedule(execution, process),
+                revision,
+                backends,
+            )
+            .expect_err("the production bind call must refuse the exact unsupported root");
+            assert_eq!(
+                error.kind(),
+                crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation
+            );
+            assert!(
+                error
+                    .message()
+                    .contains("cannot serve bounded root results")
+            );
+            assert!(error.message().contains(&process.to_string()));
+        }
+    }
+
+    #[test]
+    fn full_manifest_bind_accepts_supported_root_and_retains_legacy_candidate() {
+        for purpose in [FullBindPurpose::ClientRows, FullBindPurpose::CountOnly] {
+            let execution = execution();
+            let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
+            let process = supported.descriptor().process_id();
+            let legacy = live_target(1, BackendProcessId::new_v7(), 19011);
+            let legacy_process = legacy.descriptor().process_id();
+            let snapshot = BackendTopologySnapshot::try_new(84, vec![supported, legacy])
+                .expect("one supported root and one legacy non-root candidate");
+            let frozen = FrozenAttemptTopology::capture(snapshot).expect("original snapshot");
+            assert!(frozen.eligible_backends().contains(&legacy_process));
+            let (revision, backends) = frozen.into_parts();
+            let schedule = full_bind_schedule(execution, process);
+            let root = schedule.root;
+            let manifest = super::TaskManifestBinding::bind_facts(
+                full_bind_native_template(execution, purpose),
+                execution,
+                schedule,
+                revision,
+                backends,
+            )
+            .expect("production full binding reaches a valid manifest");
+            assert_eq!(manifest.execution(), execution);
+            assert_eq!(manifest.root(), root);
+            assert_eq!(manifest.topology_revision(), 84);
+            assert_eq!(manifest.tasks().len(), 1);
+            assert_eq!(manifest.contexts().len(), 1);
+            assert!(manifest.edges().is_empty());
+            assert_eq!(manifest.contexts()[0].backend().process_id(), process);
+            assert!(
+                manifest.contexts()[0]
+                    .backend()
+                    .target()
+                    .descriptor()
+                    .require_bounded_root_support()
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn full_manifest_bind_cannot_borrow_supported_backend_for_a_foreign_root_identity() {
+        let execution = execution();
+        let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
+        let process = supported.descriptor().process_id();
+        let snapshot = BackendTopologySnapshot::try_new(85, vec![supported]).expect("snapshot");
+        let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
+            .unwrap()
+            .into_parts();
+        let mut schedule = full_bind_schedule(execution, process);
+        let foreign = QueryExecutionId::new(
+            execution.query_id(),
+            AttemptId::new(2).expect("another nonzero attempt"),
+        )
+        .expect("foreign attempt");
+        schedule.root = task(foreign, 1, 1, process).0;
+        let error = super::TaskManifestBinding::bind_facts(
+            full_bind_native_template(execution, FullBindPurpose::ClientRows),
+            execution,
+            schedule,
+            revision,
+            backends,
+        )
+        .expect_err("same supported backend cannot replace the complete scheduled task identity");
+        assert!(
+            error
+                .message()
+                .contains("root is absent from the scheduled task set")
+        );
+    }
+
+    #[test]
+    fn manifest_root_cannot_borrow_support_from_another_frozen_backend() {
+        let legacy = live_target(0, BackendProcessId::new_v7(), 19010);
+        let supported = live_target(1, BackendProcessId::new_v7(), 19011);
+        let descriptor = supported.descriptor().clone();
+        let support = novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+            descriptor.control_endpoint().clone(),
+            novarocks_result_contract::RootProfileId::V1,
+        );
+        let supported = LiveBackendTarget::new(
+            1,
+            descriptor.with_bounded_root_support(support).unwrap(),
+            supported.admission_epoch_capability(),
+        );
+        let (legacy_root, _) = task(execution(), 1, 1, legacy.descriptor().process_id());
+        let (supported_root, _) = task(execution(), 1, 2, supported.descriptor().process_id());
+        let snapshot = BackendTopologySnapshot::try_new(71, vec![legacy, supported]).unwrap();
+        let (_, backends) = FrozenAttemptTopology::capture(snapshot)
+            .unwrap()
+            .into_parts();
+
+        let error = validate_root_backend_support(legacy_root, &backends)
+            .expect_err("a supported peer cannot authorize a legacy root placement");
+        assert_eq!(
+            error.kind(),
+            crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation
+        );
+        assert!(
+            error
+                .message()
+                .contains(&legacy_root.backend_process_id().to_string())
+        );
+        assert!(
+            error
+                .message()
+                .contains("cannot serve bounded root results")
+        );
+        validate_root_backend_support(supported_root, &backends)
+            .expect("an unsupported non-root candidate does not change the selected root contract");
+    }
+
+    #[test]
+    fn manifest_root_support_requires_the_exact_frozen_process() {
+        let present = live_target(0, BackendProcessId::new_v7(), 19010);
+        let (foreign_root, _) = task(execution(), 1, 1, BackendProcessId::new_v7());
+        let snapshot = BackendTopologySnapshot::try_new(72, vec![present]).unwrap();
+        let (_, backends) = FrozenAttemptTopology::capture(snapshot)
+            .unwrap()
+            .into_parts();
+        let error = validate_root_backend_support(foreign_root, &backends)
+            .expect_err("root support must come from its original process");
+        assert!(error.message().contains("absent from its frozen snapshot"));
     }
 
     #[test]

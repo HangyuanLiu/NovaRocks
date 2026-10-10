@@ -137,9 +137,11 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&output].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_ty),
             name: "decoded".into(),
             alias: None,
             value: result_value,

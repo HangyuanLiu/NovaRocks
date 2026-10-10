@@ -540,6 +540,7 @@ impl ContractLoweringVisitor<'_> {
                 .clone();
             self.work.flush()?;
             fields.push(ResultField {
+                domain: field.domain,
                 name: field.name.clone(),
                 alias: field.alias.clone(),
                 value: field.value,
@@ -548,6 +549,7 @@ impl ContractLoweringVisitor<'_> {
             self.work.step()?;
         }
         Ok(ResultPort {
+            scalar_schema: original.scalar_schema.clone(),
             fragment: original.fragment,
             output: original.output.clone(),
             fields: fields.into_boxed_slice(),

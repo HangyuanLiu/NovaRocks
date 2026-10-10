@@ -74,6 +74,16 @@ The upstream license and notice files are retained verbatim. No upstream API
 is removed; the patch is additive except for the internal `FileIO` storage
 representation needed to host the authorized backend.
 
+## Independent test fixture correction (IRU-1)
+
+The null-filled predicate evolution test now records an id-only historical
+schema (ID 0) for the old file and the current id/value schema (ID 1) for the
+merged files. Its original equality and IS NULL assertions are preserved.
+The old fixture incorrectly declared the missing value column in the file's
+exact schema; it failed on both Rust 1.92.0 and 1.98.1 after strict physical
+input validation was introduced. This corrects baseline test metadata without
+changing the reader or weakening corruption checks.
+
 ## Removal condition
 
 Remove `[patch.crates-io]` and this vendored source once an upstream release

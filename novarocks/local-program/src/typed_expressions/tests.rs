@@ -80,6 +80,7 @@ fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(1),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: vec![ProgramExprId::new(0)],
                     expr_slot_ids: vec![SlotId::new(2)],
                     expr_slot_schemas: None,

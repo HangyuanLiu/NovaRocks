@@ -495,6 +495,7 @@ fn package_with_outputs(
             .unwrap();
     let mut result_fields = if downstream_consumer {
         vec![ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: "seed_downstream".into(),
             alias: None,
             value: seed_value,
@@ -502,6 +503,7 @@ fn package_with_outputs(
         }]
     } else {
         vec![ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: "sample".into(),
             alias: None,
             value: sample_value,
@@ -511,6 +513,7 @@ fn package_with_outputs(
     if !downstream_consumer {
         if repeated_rand {
             result_fields.push(ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "sample_repeated".into(),
                 alias: None,
                 value: sample_value,
@@ -519,12 +522,14 @@ fn package_with_outputs(
         }
         result_fields.extend([
             ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "seed_a".into(),
                 alias: None,
                 value: seed_value,
                 ty: seed_type.clone(),
             },
             ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "seed_b".into(),
                 alias: None,
                 value: seed_value,
@@ -533,6 +538,7 @@ fn package_with_outputs(
         ]);
     }
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&limit].output.clone(),
         fields: result_fields.into_boxed_slice(),

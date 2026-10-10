@@ -207,3 +207,132 @@ fn canonical_root_rejects_tampered_output_payload_and_missing_document() {
     let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &dto).unwrap();
     assert!(decode_projection(&key, &value).is_err());
 }
+
+#[test]
+fn projection_decode_checks_the_local_page_budget_before_materialization() {
+    use crate::persistence::validation::PersistenceDecodeBudget;
+    let expected = projection();
+    let key = projection_by_id_key(expected.mv_id).unwrap();
+    let value = encode_projection(Uuid::now_v7(), &expected).unwrap();
+    let budget = PersistenceDecodeBudget {
+        max_working_set_bytes: 4 * 1024 * 1024,
+        ..PersistenceDecodeBudget::default()
+    };
+    assert_eq!(
+        super::decode_projection_with_budget(&key, &value, budget)
+            .unwrap()
+            .value,
+        expected,
+    );
+    let refusal = super::decode_projection_with_budget(
+        &key,
+        &value,
+        PersistenceDecodeBudget {
+            max_working_set_bytes: 1,
+            ..budget
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refusal.contains("outer decode working set bound"),
+        "{refusal}"
+    );
+    let refusal = super::decode_projection_with_budget(
+        &key,
+        &value,
+        PersistenceDecodeBudget {
+            max_document_bytes: 1,
+            ..budget
+        },
+    )
+    .unwrap_err();
+    assert!(refusal.contains("exceeding the limit 1"), "{refusal}");
+}
+
+#[test]
+fn projection_preflight_refuses_a_huge_avro_byte_declaration_before_owned_decode() {
+    let expected = projection();
+    let key = projection_by_id_key(expected.mv_id).unwrap();
+    let value = encode_projection(Uuid::now_v7(), &expected).unwrap();
+    let mut bytes = value.as_bytes().to_vec();
+    let fingerprint_len = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
+    let payload_start = 12 + fingerprint_len + 16 + 4;
+    // mv_id=7, then a positive i64::MAX byte length, with no byte payload.
+    let mut payload = vec![14, 0xfe];
+    payload.extend_from_slice(&[0xff; 8]);
+    payload.push(1);
+    bytes.truncate(payload_start);
+    bytes[payload_start - 4..payload_start].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    let value = Value::try_from(Bytes::from(bytes)).unwrap();
+    assert_eq!(
+        decode_projection(&key, &value).unwrap_err(),
+        "MV Accelerator Avro bytes are truncated"
+    );
+}
+
+#[test]
+fn projection_preflight_reserves_outer_and_documents_in_the_same_working_set() {
+    use crate::persistence::validation::PersistenceDecodeBudget;
+    let expected = projection();
+    let key = projection_by_id_key(expected.mv_id).unwrap();
+    let value = encode_projection(Uuid::now_v7(), &expected).unwrap();
+    let bytes = value.as_bytes();
+    let fingerprint_len = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
+    let payload = &bytes[12 + fingerprint_len + 16 + 4..];
+    let outer = 4 * payload.len() + 4096;
+    let error = super::decode_projection_with_budget(
+        &key,
+        &value,
+        PersistenceDecodeBudget {
+            max_working_set_bytes: outer + 1,
+            ..PersistenceDecodeBudget::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("working set") && error.contains("limit 1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn dependency_decode_preflights_its_working_set_and_avro_lengths() {
+    let root = projection();
+    let dependency =
+        crate::persistence::dependency::projection_dependencies(root.mv_id, &root.facts).remove(0);
+    let key = super::super::key::dependency_by_downstream_key(
+        root.mv_id,
+        &dependency.upstream,
+        dependency.occurrence_id,
+    )
+    .unwrap();
+    let value = encode_record(MvRecordKind::Dependency, Uuid::now_v7(), &dependency).unwrap();
+    assert_eq!(
+        super::decode_dependency_with_budget(&key, &value, 4 * 1024 * 1024)
+            .unwrap()
+            .value,
+        dependency
+    );
+    assert!(
+        super::decode_dependency_with_budget(&key, &value, 1)
+            .unwrap_err()
+            .contains("decode working set bound")
+    );
+    let mut bytes = value.as_bytes().to_vec();
+    let fingerprint_len = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
+    let payload_start = 12 + fingerprint_len + 16 + 4;
+    // Small integers followed by an i64::MAX byte declaration, no owned Avro
+    // decoder or allocation receives this malformed length.
+    let mut payload = vec![14, 0, 0xfe];
+    payload.extend_from_slice(&[0xff; 8]);
+    payload.push(1);
+    bytes.truncate(payload_start);
+    bytes[payload_start - 4..payload_start].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    let value = Value::try_from(Bytes::from(bytes)).unwrap();
+    assert_eq!(
+        super::decode_dependency_with_budget(&key, &value, 4 * 1024 * 1024).unwrap_err(),
+        "MV Accelerator Avro bytes are truncated"
+    );
+}

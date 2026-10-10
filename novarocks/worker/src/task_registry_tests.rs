@@ -202,7 +202,14 @@ struct TestTaskHost {
     retain_normal_close: bool,
     inbound_capabilities: Option<Arc<TaskInboundCapabilities>>,
     install_gate: Option<Arc<InstallGate>>,
+    /// Restricts `install_gate` to creations of this static plan, so a peer
+    /// task of the same context can install while another one is held.
+    install_gate_plan: Option<&'static [u8]>,
+    /// Parks the named task's creation rollback after it decided how to stop
+    /// and before it publishes that task's terminal.
+    rollback_gate: Option<(TaskId, Arc<InstallGate>)>,
     prepared_bodies: Mutex<Vec<Bytes>>,
+    prepared_root: Mutex<Option<Arc<crate::root_result_channel::RootResultChannel>>>,
     receivers_installed: AtomicUsize,
     receivers_removed: AtomicUsize,
     capabilities_installed: AtomicUsize,
@@ -262,11 +269,15 @@ impl TaskExecutionHost for TestTaskHost {
         &self,
         _descriptor: &TaskDescriptor,
         input: TaskCreationInput,
-    ) -> Result<PreparedTaskFacts, HostRejection> {
-        if let Some(gate) = &self.install_gate {
+    ) -> Result<crate::PreparedTaskInstallation, HostRejection> {
+        let (plan, _assignment) = input.into_parts();
+        if let Some(gate) = &self.install_gate
+            && self
+                .install_gate_plan
+                .is_none_or(|gated| plan.bytes().as_ref() == gated)
+        {
             gate.wait_for_release();
         }
-        let (plan, _assignment) = input.into_parts();
         self.prepared_bodies
             .lock()
             .expect("test prepared bodies")
@@ -281,13 +292,17 @@ impl TaskExecutionHost for TestTaskHost {
             ));
         }
         self.receivers_installed.fetch_add(1, Ordering::SeqCst);
-        Ok(PreparedTaskFacts::new(
-            if plan.bytes().as_ref() == STREAM_PLAN {
+        crate::PreparedTaskInstallation::new(
+            PreparedTaskFacts::new(if plan.bytes().as_ref() == STREAM_PLAN {
                 FragmentSinkKind::DataStream
             } else {
                 FragmentSinkKind::Result
-            },
-        ))
+            }),
+            self.prepared_root
+                .lock()
+                .expect("test root installation")
+                .take(),
+        )
     }
 
     fn remove_receiver(&self, _descriptor: &TaskDescriptor) {
@@ -315,6 +330,11 @@ impl TaskExecutionHost for TestTaskHost {
 
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
         self.capabilities_removed.fetch_add(1, Ordering::SeqCst);
+        if let Some((task, gate)) = &self.rollback_gate
+            && descriptor.identity().task_id() == *task
+        {
+            gate.wait_for_release();
+        }
         if let Some(capabilities) = &self.inbound_capabilities {
             capabilities.remove(descriptor);
         }
@@ -538,6 +558,596 @@ fn descriptor_with(
 
 fn descriptor(identity: TaskIdentity) -> TaskDescriptor {
     descriptor_with(identity, UniqueId::new(1, 1), 1, 1)
+}
+
+fn bounded_root(
+    identity: TaskIdentity,
+) -> (
+    Arc<crate::root_result_channel::RootResultChannel>,
+    Arc<crate::result_buffer::ResultRetainedBudget>,
+) {
+    use novarocks_execution::runtime::fragment::io::RootResultWriteSpec;
+    use novarocks_result_contract::{
+        FrozenRootOutput, InternalResultDomain, RootOutputContract, RootProfileId,
+    };
+    let limits =
+        crate::WorkerResultRetainedLimits::try_new(256 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
+            .expect("frozen result limits");
+    let budget = crate::result_buffer::ResultRetainedBudget::new(limits.per_process());
+    let root = crate::root_result_channel::RootResultChannel::try_open(
+        RootResultWriteSpec {
+            task: identity,
+            contract: Arc::new(RootOutputContract::new(
+                RootProfileId::V1,
+                FrozenRootOutput::InternalFacts(InternalResultDomain::StatisticsArtifactV1),
+            )),
+        },
+        Arc::clone(&budget),
+        limits,
+    )
+    .expect("bounded root");
+    (root, budget)
+}
+
+fn bounded_read(
+    root: &crate::root_result_channel::RootResultChannel,
+    wanted: u64,
+) -> novarocks_execution_contract::root_result::RootResultRead {
+    novarocks_execution_contract::root_result::RootResultRead::try_new(
+        root.spec().task,
+        root.spec().contract.profile(),
+        root.spec().contract.kind(),
+        std::num::NonZeroU64::new(wanted),
+        0,
+        Duration::from_millis(1),
+    )
+    .expect("bounded read without final ACK")
+}
+
+fn install_bounded_root(
+    fixture: &Fixture,
+    identity: TaskIdentity,
+    root: &Arc<crate::root_result_channel::RootResultChannel>,
+) {
+    *fixture
+        .task_host
+        .prepared_root
+        .lock()
+        .expect("test root installation") = Some(Arc::clone(root));
+    let created = fixture.registry.create_task(
+        &fixture.create(descriptor(identity), Vec::new()),
+        body(RESULT_PLAN),
+    );
+    assert_eq!(created.outcome(), OperationOutcome::Accepted, "{created:?}");
+}
+
+fn finish_bounded_root(
+    fixture: &Fixture,
+    root: &Arc<crate::root_result_channel::RootResultChannel>,
+) {
+    let producer = root.start_producer().expect("one root producer");
+    root.note_rows(3).expect("checked rows");
+    root.request_finish().expect("finish request");
+    let mut builder = root
+        .try_segment()
+        .expect("segment admission")
+        .expect("segment");
+    builder.output()[..3].copy_from_slice(b"abc");
+    root.publish_segment(builder, 3, true)
+        .expect("atomic Data and End");
+    drop(producer);
+    assert_eq!(
+        root.producer_state(),
+        novarocks_execution::runtime::fragment::io::RootProducerState::ContextHeld
+    );
+    let reporter = fixture.task_host.reporters.lock().expect("test reporters")[0].clone();
+    reporter.running();
+    reporter.finished(novarocks_execution_contract::TaskOutputFacts::new(true));
+    reporter.release_output();
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
+    assert_eq!(fixture.registry.advance_deadlines().tasks_retired, 1);
+}
+
+#[test]
+fn root_ownership_snapshot_refuses_incomplete_scan_coverage() {
+    let fixture = Fixture::with_config(TestTaskHost::default(), |config| {
+        config.retained_context_capacity = 2048;
+    });
+    // Vacant quiesce fences are genuine existing context entries; they must
+    // count toward bounded work even though they contain no root channel.
+    for index in 0..1024 {
+        let context = fixture.context(execution(32_000 + index));
+        let receipt = fixture
+            .registry
+            .quiesce_query_context(&QuiesceQueryContext::new(
+                TaskOperationId::new_v7(),
+                context,
+            ));
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+    }
+    assert!(
+        fixture
+            .registry
+            .try_root_ownership_snapshot()
+            .unwrap()
+            .is_some()
+    );
+    let extra = fixture.context(execution(33_024));
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(TaskOperationId::new_v7(), extra));
+    assert_eq!(
+        fixture.registry.try_root_ownership_snapshot().unwrap(),
+        None
+    );
+}
+
+#[test]
+fn root_ownership_snapshot_observes_retired_task_context_and_busy_registry() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    assert_eq!(
+        fixture
+            .registry
+            .try_root_ownership_snapshot()
+            .unwrap()
+            .unwrap()
+            .channels,
+        0
+    );
+    let execution = execution(31_010);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, _) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    let snapshot = fixture
+        .registry
+        .try_root_ownership_snapshot()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            snapshot.channels,
+            snapshot.terminal_task_records,
+            snapshot.producers_exited
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        (
+            snapshot.ends_published,
+            snapshot.ends_acknowledged,
+            snapshot.segments
+        ),
+        (1, 0, 1)
+    );
+    fixture.registry.with_registry_lock_for_test(|| {
+        assert_eq!(
+            fixture.registry.try_root_ownership_snapshot().unwrap(),
+            None
+        );
+    });
+}
+
+#[tokio::test]
+async fn context_owned_root_survives_task_retirement_and_request_horizon() {
+    use crate::root_result_channel::ContextRootRoute;
+    use novarocks_execution_contract::root_result::RootReadOutcome;
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(31_001);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, _budget) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    // Keep the original context live while its task's separate receipt
+    // horizon expires. Each renewal is an exact monotonic domain update.
+    for sequence in 1..=25 {
+        fixture.clock.advance(Duration::from_secs(5));
+        let receipt = fixture
+            .registry
+            .update_query_context(&UpdateQueryContext::RenewLease(
+                RenewQueryExecutionLease::new(
+                    TaskOperationId::new_v7(),
+                    context,
+                    LeaseSequence::new(sequence),
+                    LeaseValidFor::new(Duration::from_secs(10)).expect("lease"),
+                ),
+            ));
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+        fixture.registry.advance_deadlines();
+    }
+    assert!(matches!(
+        fixture.registry.root_result_route(identity),
+        RootResultRoute::Gone
+    ));
+    let request = bounded_read(&root, 1);
+    let ContextRootRoute::Read(read) = fixture.registry.context_root_result_route(&request) else {
+        panic!("original context serves after the task horizon");
+    };
+    let delivery = read.read().await.expect("context read");
+    let RootReadOutcome::Data(data) = &delivery.reply().outcome else {
+        panic!("Data");
+    };
+    assert_eq!(data.body().as_ref(), b"abc");
+    assert_eq!(data.end_after_data().expect("End").output_rows, 3);
+    drop(delivery);
+    let ContextRootRoute::Read(read) = fixture.registry.context_root_result_route(&request) else {
+        panic!("replay");
+    };
+    let replay = read.read().await.expect("same sequence");
+    assert_eq!(replay.reply().accepted_consumed, 0);
+    assert!(matches!(replay.reply().outcome, RootReadOutcome::Data(_)));
+}
+
+#[tokio::test]
+async fn root_release_seals_before_late_reads_and_waits_for_body_only_alias() {
+    use crate::root_result_channel::ContextRootRoute;
+    use novarocks_execution_contract::root_result::RootReadOutcome;
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(31_002);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, budget) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    let request = bounded_read(&root, 1);
+    let ContextRootRoute::Read(read) = fixture.registry.context_root_result_route(&request) else {
+        panic!("read");
+    };
+    let delivery = read.read().await.expect("read");
+    let alias = match &delivery.reply().outcome {
+        RootReadOutcome::Data(data) => data.body().clone(),
+        _ => panic!("Data"),
+    };
+    drop(delivery);
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    let release = ReleaseQueryContext::new(TaskOperationId::new_v7(), context);
+    let receipt = fixture.registry.release_query_context(&release);
+    assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Releasing
+    );
+    assert!(matches!(
+        fixture.registry.context_root_result_route(&request),
+        ContextRootRoute::AwaitTerminalControl {
+            accepted_consumed: 0
+        }
+    ));
+    assert!(
+        budget.retained_bytes_for_test() > 1024 * 1024,
+        "real backing remains charged after queue clear"
+    );
+    let replay = fixture.registry.release_query_context(&release);
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(
+        fixture.task_host.retired_executions.lock().unwrap().len(),
+        0
+    );
+    drop(alias);
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::TerminalRetained
+    );
+    assert_eq!(
+        fixture.task_host.retired_executions.lock().unwrap().len(),
+        1
+    );
+    drop(root);
+    assert_eq!(budget.retained_bytes_for_test(), 0);
+    let replay = fixture.registry.release_query_context(&release);
+    assert_eq!(
+        replay.outcome(),
+        OperationOutcome::ContextTerminalReceipt,
+        "lost ACK still resolves to original context"
+    );
+}
+
+#[tokio::test]
+async fn closed_context_root_route_returns_frozen_ack_watermark_before_late_ack() {
+    use crate::root_result_channel::ContextRootRoute;
+    use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(31_007);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, _budget) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    let request = bounded_read(&root, 1);
+    let ContextRootRoute::Read(read) = fixture.registry.context_root_result_route(&request) else {
+        panic!("read original data");
+    };
+    let delivery = read.read().await.unwrap();
+    let alias = match &delivery.reply().outcome {
+        RootReadOutcome::Data(data) => data.body().clone(),
+        _ => panic!("original Data"),
+    };
+    drop(delivery);
+    let ack = RootResultRead::try_new(
+        identity,
+        root.spec().contract.profile(),
+        root.spec().contract.kind(),
+        None,
+        1,
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    let ContextRootRoute::Read(admitted) = fixture.registry.context_root_result_route(&ack) else {
+        panic!("apply ACK before seal");
+    };
+    let acknowledged = admitted.read().await.unwrap();
+    assert_eq!(acknowledged.reply().accepted_consumed, 1);
+    assert_eq!(acknowledged.reply().outcome, RootReadOutcome::AckOnly);
+    drop(acknowledged);
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    let late_ack = RootResultRead::try_new(
+        identity,
+        root.spec().contract.profile(),
+        root.spec().contract.kind(),
+        None,
+        2,
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture.registry.context_root_result_route(&late_ack),
+        ContextRootRoute::AwaitTerminalControl {
+            accepted_consumed: 1
+        },
+    ));
+    assert_eq!(root.snapshot().consumed_through, 1);
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Releasing
+    );
+    drop(alias);
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::TerminalRetained,
+    );
+}
+
+#[test]
+fn root_read_admission_under_context_fence_survives_until_actual_handler_exit() {
+    use crate::root_result_channel::ContextRootRoute;
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(31_003);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, _budget) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    let request = bounded_read(&root, 1);
+    let ContextRootRoute::Read(admitted) = fixture.registry.context_root_result_route(&request)
+    else {
+        panic!("admitted read");
+    };
+    // The handler has not polled yet. Its admission already counts; lookup
+    // cannot be detached from the context's closing fence.
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Releasing
+    );
+    assert!(matches!(
+        fixture.registry.context_root_result_route(&request),
+        ContextRootRoute::AwaitTerminalControl {
+            accepted_consumed: 0
+        }
+    ));
+    drop(admitted);
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::TerminalRetained
+    );
+}
+
+#[test]
+fn finished_root_abort_and_lease_expiry_wait_for_real_reservation_exit() {
+    use crate::root_result_channel::ContextRootRoute;
+    use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
+    for expire in [false, true] {
+        let fixture = Fixture::new(TestTaskHost::default());
+        let execution = execution(31_004 + i64::from(expire));
+        let context = fixture.context(execution);
+        establish(&fixture.registry, context);
+        let identity = task(execution, fixture.backend);
+        let (root, _budget) = bounded_root(identity);
+        install_bounded_root(&fixture, identity, &root);
+        finish_bounded_root(&fixture, &root);
+        let ResultWriteAdmission::Granted(mut reservation) =
+            root.try_reserve(1).expect("one holder")
+        else {
+            panic!("credit");
+        };
+        reservation
+            .shrink_to(0)
+            .expect("shrink does not mean physical exit");
+        if expire {
+            fixture.clock.advance(Duration::from_secs(10));
+            assert_eq!(fixture.registry.advance_deadlines().leases_expired, 1);
+        } else {
+            fixture
+                .registry
+                .abort_query_context(&AbortQueryContext::new(
+                    TaskOperationId::new_v7(),
+                    context,
+                    AbortCause::QueryFailed,
+                ));
+        }
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Aborting
+        );
+        assert!(matches!(
+            fixture
+                .registry
+                .context_root_result_route(&bounded_read(&root, 1)),
+            ContextRootRoute::AwaitTerminalControl {
+                accepted_consumed: 0
+            }
+        ));
+        assert_eq!(
+            fixture.task_host.retired_executions.lock().unwrap().len(),
+            0
+        );
+        drop(reservation);
+        fixture.registry.advance_deadlines();
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::TerminalRetained
+        );
+        assert_eq!(
+            fixture.task_host.retired_executions.lock().unwrap().len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn foreign_prepared_root_is_refused_before_installation_and_remains_unreadable() {
+    use crate::root_result_channel::ContextRootRoute;
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(31_006);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let foreign_identity = task(self::execution(31_007), fixture.backend);
+    let (foreign, _budget) = bounded_root(foreign_identity);
+    *fixture.task_host.prepared_root.lock().unwrap() = Some(Arc::clone(&foreign));
+    let receipt = fixture.registry.create_task(
+        &fixture.create(descriptor(identity), Vec::new()),
+        body(RESULT_PLAN),
+    );
+    assert!(receipt.acknowledgement().is_none(), "{receipt:?}");
+    assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.task_host.receivers_removed.load(Ordering::SeqCst),
+        1
+    );
+    assert!(matches!(
+        fixture
+            .registry
+            .context_root_result_route(&bounded_read(&foreign, 1)),
+        ContextRootRoute::UnknownRoot
+    ));
+    assert!(
+        foreign.begin_read(&bounded_read(&foreign, 1)).is_err(),
+        "no provisional channel becomes a route"
+    );
+}
+
+#[tokio::test]
+async fn release_wakes_an_already_parked_root_read_without_waiting_for_its_deadline() {
+    use crate::root_result_channel::ContextRootRoute;
+    use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(31_008);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, _budget) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    let ContextRootRoute::Read(first) = fixture
+        .registry
+        .context_root_result_route(&bounded_read(&root, 1))
+    else {
+        panic!("initial read");
+    };
+    drop(first.read().await.expect("offer immutable Data and End"));
+    let request = RootResultRead::try_new(
+        identity,
+        root.spec().contract.profile(),
+        root.spec().contract.kind(),
+        std::num::NonZeroU64::new(3),
+        0,
+        Duration::from_secs(1),
+    )
+    .expect("one-second read wait");
+    let ContextRootRoute::Read(admitted) = fixture.registry.context_root_result_route(&request)
+    else {
+        panic!("read");
+    };
+    let mut waiting = Box::pin(admitted.read());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending()))
+            .await,
+        "handler is actually parked before release"
+    );
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Releasing
+    );
+    let reply = tokio::time::timeout(Duration::from_millis(250), waiting)
+        .await
+        .expect("seal wakes the parked read")
+        .expect("closing reply");
+    assert!(matches!(
+        reply.reply().outcome,
+        RootReadOutcome::AwaitTerminalControl
+    ));
+    assert_eq!(
+        reply.reply().accepted_consumed,
+        0,
+        "release does not forge consumption"
+    );
+    drop(reply);
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::TerminalRetained
+    );
 }
 
 fn split_batch(node: i32, first: u64, last: u64) -> TaskDomainUpdate {
@@ -3353,4 +3963,166 @@ fn preparation_charge_adds_private_input_to_incoming_domain_backing_bound() {
     wait_for_accepted_installed(&fixture.registry, &request);
     wait_for_preparation_exit(&fixture.registry, identity);
     assert_eq!(fixture.registry.preparation_snapshot().bytes, 0);
+}
+
+/// A preparation that already decided to stand down normally can lose that
+/// stand-down to a context abort before its rollback publishes the task's
+/// terminal. This is the native shape: the frontend cancels a non-root task
+/// whose parent stage failed, and the backend's own settle pass escalates the
+/// same peer failure into a context abort right afterwards.
+#[test]
+fn preparation_rollback_concludes_on_the_stand_down_that_won() {
+    for (case, (plan, escalate)) in [
+        (STREAM_PLAN, true),
+        (REFUSED_PLAN, true),
+        (STREAM_PLAN, false),
+        (REFUSED_PLAN, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let install_gate = Arc::new(InstallGate::held());
+        let rollback_gate = Arc::new(InstallGate::held());
+        let _install_release = PreparationGateRelease(Arc::clone(&install_gate));
+        let _rollback_release = PreparationGateRelease(Arc::clone(&rollback_gate));
+        let preparing_task = TaskId::new(4).expect("nonzero task");
+        let fixture = Fixture::new(TestTaskHost {
+            install_gate: Some(Arc::clone(&install_gate)),
+            install_gate_plan: Some(plan),
+            rollback_gate: Some((preparing_task, Arc::clone(&rollback_gate))),
+            ..TestTaskHost::default()
+        });
+        let query_execution = execution(31_000 + case as i64);
+        let context = fixture.context(query_execution);
+        establish(&fixture.registry, context);
+        let source = fixture
+            .registry
+            .status_source(context)
+            .expect("context source");
+
+        let peer_identity = task(query_execution, fixture.backend);
+        let peer = fixture.create(descriptor(peer_identity), Vec::new());
+        assert_eq!(
+            fixture
+                .registry
+                .accept_create_task(&peer, body(RESULT_PLAN))
+                .outcome(),
+            OperationOutcome::Accepted,
+            "case {case}"
+        );
+        wait_for_accepted_installed(&fixture.registry, &peer);
+        let peer_reporter = fixture.task_host.reporters.lock().expect("test reporters")[0].clone();
+        assert!(matches!(
+            peer_reporter.running(),
+            crate::StatusAdvance::Published(_)
+        ));
+
+        let preparing_identity = TaskIdentity::new(
+            query_execution,
+            StageId::new(2).expect("nonzero stage"),
+            preparing_task,
+            fixture.backend,
+        );
+        let preparing = fixture.create(
+            descriptor_with(preparing_identity, UniqueId::new(4, 4), 1, 1),
+            Vec::new(),
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .accept_create_task(&preparing, body(plan))
+                .outcome(),
+            OperationOutcome::Accepted,
+            "case {case}"
+        );
+        install_gate.wait_until_entered();
+
+        let cancel = fixture.registry.cancel_task(&CancelTask::new(
+            TaskOperationId::new_v7(),
+            preparing_identity,
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        assert_eq!(cancel.outcome(), OperationOutcome::Accepted, "case {case}");
+        assert_eq!(
+            source.latest(preparing_identity).expect("accepted").state(),
+            TaskState::Canceling,
+            "case {case}"
+        );
+
+        // Preparation returns, observes the normal stand-down, and starts
+        // rolling back; it is parked before it publishes the terminal.
+        install_gate.release();
+        rollback_gate.wait_until_entered();
+
+        if escalate {
+            assert!(matches!(
+                peer_reporter.failing(novarocks_execution_contract::TaskFailure::new(
+                    TaskFailureCategory::Execution,
+                    novarocks_execution_contract::SafeDetail::new("injected peer failure")
+                        .expect("bounded detail"),
+                )),
+                crate::StatusAdvance::Published(_)
+            ));
+            fixture.registry.advance_deadlines();
+            assert_eq!(
+                fixture.registry.termination_cause(context),
+                Some(AbortCause::PeerTaskFailed),
+                "case {case}"
+            );
+            assert_eq!(
+                source.latest(preparing_identity).expect("accepted").state(),
+                TaskState::Aborting,
+                "case {case}: the context fan-out escalates the stand-down"
+            );
+        }
+
+        rollback_gate.release();
+        wait_for_terminal_record(&fixture.registry, preparing_identity);
+        wait_for_preparation_exit(&fixture.registry, preparing_identity);
+        let terminal = source
+            .latest(preparing_identity)
+            .expect("retained terminal");
+        let expected = if escalate {
+            (
+                TaskState::Aborted,
+                TerminationDetail::Aborted(AbortCause::PeerTaskFailed),
+            )
+        } else {
+            (
+                TaskState::Canceled,
+                TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            )
+        };
+        assert_eq!(
+            (terminal.state(), terminal.termination().cloned()),
+            (expected.0, Some(expected.1)),
+            "case {case}"
+        );
+        assert!(!terminal.installed(), "case {case}");
+        assert_eq!(
+            fixture.task_host.submitted.load(Ordering::SeqCst),
+            1,
+            "case {case}: only the peer was submitted"
+        );
+
+        if escalate {
+            assert!(matches!(
+                peer_reporter.failed(novarocks_execution_contract::TaskFailure::new(
+                    TaskFailureCategory::Execution,
+                    novarocks_execution_contract::SafeDetail::new("injected peer failure")
+                        .expect("bounded detail"),
+                )),
+                crate::StatusAdvance::Published(_)
+            ));
+            peer_reporter.release_output();
+            peer_reporter.note_actual_stopped();
+            peer_reporter.note_resources_converged();
+            fixture.registry.advance_deadlines();
+            assert_eq!(
+                fixture.registry.context_state(context),
+                QueryContextState::TerminalRetained,
+                "case {case}: every task is a terminal record"
+            );
+        }
+    }
 }

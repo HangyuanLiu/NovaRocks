@@ -35,6 +35,7 @@ MODELS = "novarocks-proto-models"
 PROTO = "novarocks-proto-codec"
 TASK_CODEC = "novarocks-task-codec"
 EXECUTION_CONTRACT = "novarocks-execution-contract"
+RESULT_CONTRACT = "novarocks-result-contract"
 PLAN_CODEC = "novarocks-plan-codec"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
@@ -44,15 +45,16 @@ SERVER = "novarocks-server"
 FAILPOINT = "novarocks-failpoint"
 STARROCKS = "novarocks-connector-starrocks"
 
-PROTO_INTERNAL_NORMAL_DEPENDENCIES = {EXECUTION_CONTRACT, MODELS, SPI, TYPES}
+PROTO_INTERNAL_NORMAL_DEPENDENCIES = {EXECUTION_CONTRACT, RESULT_CONTRACT, MODELS, SPI, TYPES, "novarocks-type-contract"}
 TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES = {
     EXECUTION_CONTRACT,
+    RESULT_CONTRACT,
     MODELS,
     PROTO,
     SPI,
     TYPES,
 }
-EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES = {TYPES}
+EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES = {TYPES, RESULT_CONTRACT}
 ROLE_DIRECT_REQUIREMENTS = {MODELS, PROTO}
 WIRE_PACKAGES = {MODELS, PROTO, TASK_CODEC}
 
@@ -102,6 +104,7 @@ LOWER_LAYER_ROOTS = {
     SPI,
     TYPES,
     EXECUTION_CONTRACT,
+    RESULT_CONTRACT,
     "novarocks-sql",
     "novarocks-execution",
     "novarocks-state-store-foundationdb",
@@ -290,6 +293,18 @@ def verify_role_direct_dependencies(metadata):
             )
 
 
+def verify_result_contract(metadata):
+    # The root-result vocabulary and flat validation are dependency-free facts.
+    # Check declarations and the resolved graph independently, including external
+    # crates and optional normal edges, rather than permitting a runtime closure.
+    direct = sorted(normal_dependency_names(package_by_name(metadata, RESULT_CONTRACT)))
+    if direct:
+        fail(f"{RESULT_CONTRACT} must not declare normal dependencies: " + ", ".join(direct))
+    reachable = sorted(normal_closure(metadata, RESULT_CONTRACT) - {RESULT_CONTRACT})
+    if reachable:
+        fail(f"{RESULT_CONTRACT} normal dependency closure must be empty: " + ", ".join(reachable))
+
+
 def verify_codec_closures(metadata):
     for package_name in (MODELS, PROTO, TASK_CODEC):
         forbidden = sorted(normal_closure(metadata, package_name) & FORBIDDEN_CODEC_CLOSURE)
@@ -400,6 +415,7 @@ def main():
     verify_proto(metadata)
     verify_task_codec(metadata)
     verify_execution_contract(metadata)
+    verify_result_contract(metadata)
     verify_role_direct_dependencies(metadata)
     verify_codec_closures(metadata)
     verify_lower_layer_closures(metadata)

@@ -753,6 +753,7 @@ fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
 
 fn result_port(fragment: FragmentId, node: NodeId, output: &[ValueId]) -> ResultPort {
     ResultPort {
+        scalar_schema: None,
         fragment,
         output: OutputPort {
             node,
@@ -762,6 +763,7 @@ fn result_port(fragment: FragmentId, node: NodeId, output: &[ValueId]) -> Result
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("c{ordinal}").into(),
                 alias: None,
                 value: *value,
@@ -1870,12 +1872,14 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     ))
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: GATHER,
         output: OutputPort {
             node: FINAL,
             columns: Box::from([total]),
         },
         fields: Box::from([ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: "count".into(),
             alias: None,
             value: total,

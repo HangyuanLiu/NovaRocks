@@ -707,6 +707,7 @@ fn project_program(arena: Arc<ImmutableExpressions>, definitions: &[usize]) -> L
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: definitions
                         .iter()
                         .map(|id| crate::ProgramExprId::new(*id))
@@ -1604,6 +1605,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
                 ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
+                    validate_final_result_input: false,
                     exprs: vec![crate::ProgramExprId::new(2)],
                     expr_slot_ids: vec![SlotId::new(10)],
                     expr_slot_schemas: None,

@@ -334,6 +334,7 @@ fn package(fixture: Fixture) -> Arc<FragmentPackage> {
         .get(&fixture.fragment.root())
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fixture.fragment.id(),
         output: root.output.clone(),
         fields: root
@@ -342,6 +343,7 @@ fn package(fixture: Fixture) -> Arc<FragmentPackage> {
             .iter()
             .enumerate()
             .map(|(ordinal, &value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: format!("result_{ordinal}").into_boxed_str(),
                 alias: None,
                 value,

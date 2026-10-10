@@ -282,6 +282,117 @@ impl TaskStatusOwner {
     ) -> StatusAdvance {
         let now = self.clock.now();
         let mut state = self.state.lock().expect("task status lock");
+        self.advance_locked(&mut state, now, to, termination, output)
+    }
+
+    /// Concludes this task on the termination that wins, in one step.
+    ///
+    /// `proposal` is the caller's own termination. Under this owner's lock it
+    /// competes exactly as a separate lifecycle proposal would: it applies
+    /// when the state machine allows it — a task that has not started
+    /// terminating, or a cancellation that an abort or a failure supersedes —
+    /// and otherwise loses to the termination already in progress, whose cause
+    /// is kept. The winning termination is then completed with `output` as its
+    /// independent output fact.
+    ///
+    /// A caller that decided its proposal from its own earlier snapshot of
+    /// the stand-down therefore cannot turn its conclusion into an illegal
+    /// move when that stand-down escalated in the meantime.
+    pub fn conclude_termination(
+        &self,
+        proposal: TerminationDetail,
+        output: TaskOutputFacts,
+    ) -> StatusAdvance {
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("task status lock");
+        let from = state.current.state();
+        if from.is_terminal() {
+            return StatusAdvance::AlreadyTerminal(from);
+        }
+        let terminating = terminating_state_of(&proposal);
+        if classify_task_transition(from, terminating) == TaskTransition::Apply {
+            let Some(version) = state.current.version().next() else {
+                return StatusAdvance::VersionExhausted;
+            };
+            state.output = TaskOutputFacts::default();
+            let next = match self.compose(&state, version, terminating, Some(proposal)) {
+                Ok(next) => next,
+                Err(error) => return StatusAdvance::Rejected(error),
+            };
+            self.commit_locked(&mut state, next, now);
+        }
+        self.complete_termination_locked(&mut state, now, output)
+    }
+
+    /// Finishes this task, unless a termination already won.
+    ///
+    /// A task that is already terminating completes that termination whatever
+    /// its work did next, keeping `output` as the independent fact that its
+    /// sink did run to completion. This is the same answer the execution owner
+    /// gives when its own stand-down latch is set; deciding it here covers the
+    /// window in which this owner already published the stand-down and the
+    /// execution owner has not yet been told.
+    pub fn conclude_success(&self, output: TaskOutputFacts) -> StatusAdvance {
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("task status lock");
+        let from = state.current.state();
+        if from.is_terminal() {
+            return StatusAdvance::AlreadyTerminal(from);
+        }
+        if terminal_state_of(from).is_some() {
+            return self.complete_termination_locked(&mut state, now, output);
+        }
+        self.advance_locked(&mut state, now, TaskState::Finished, None, output)
+    }
+
+    /// Completes the termination this task is in, keeping its winning cause.
+    fn complete_termination_locked(
+        &self,
+        state: &mut OwnedStatus,
+        now: MonotonicInstant,
+        output: TaskOutputFacts,
+    ) -> StatusAdvance {
+        let from = state.current.state();
+        // Both callers enter only once the task is terminating: every
+        // non-terminal, non-terminating state admits each terminating step.
+        let Some(to) = terminal_state_of(from) else {
+            return StatusAdvance::Illegal {
+                from,
+                to: TaskState::Aborted,
+            };
+        };
+        let Some(version) = state.current.version().next() else {
+            return StatusAdvance::VersionExhausted;
+        };
+        let termination = state.current.termination().cloned();
+        state.output = output;
+        let next = match self.compose(state, version, to, termination) {
+            Ok(next) => next,
+            Err(error) => return StatusAdvance::Rejected(error),
+        };
+        state.final_info = FinalTaskInfo::try_new(
+            self.identity,
+            next.clone(),
+            state.operator_statistics.clone(),
+            state.operator_statistics_truncated,
+        )
+        .ok();
+        state
+            .convergence
+            .note_conclusion_stable()
+            .expect("a live task accepts its stable conclusion");
+        self.commit_locked(state, next, now);
+        StatusAdvance::Published(version)
+    }
+
+    fn advance_locked(
+        &self,
+        state: &mut OwnedStatus,
+        now: MonotonicInstant,
+        to: TaskState,
+        termination: Option<TerminationDetail>,
+        output: TaskOutputFacts,
+    ) -> StatusAdvance {
         let from = state.current.state();
         if from.is_terminal() {
             return StatusAdvance::AlreadyTerminal(from);
@@ -291,14 +402,14 @@ impl TaskStatusOwner {
             TaskTransition::Illegal => StatusAdvance::Illegal { from, to },
             TaskTransition::SameState => {
                 state.output = output;
-                self.republish_locked(&mut state, now, false)
+                self.republish_locked(state, now, false)
             }
             TaskTransition::Apply => {
                 let Some(version) = state.current.version().next() else {
                     return StatusAdvance::VersionExhausted;
                 };
                 state.output = output;
-                let next = match self.compose(&state, version, to, termination) {
+                let next = match self.compose(state, version, to, termination) {
                     Ok(next) => next,
                     Err(error) => return StatusAdvance::Rejected(error),
                 };
@@ -315,7 +426,7 @@ impl TaskStatusOwner {
                         .note_conclusion_stable()
                         .expect("a live task accepts its stable conclusion");
                 }
-                self.commit_locked(&mut state, next, now);
+                self.commit_locked(state, next, now);
                 StatusAdvance::Published(version)
             }
         }
@@ -650,6 +761,26 @@ impl TaskStatusOwner {
     }
 }
 
+/// The terminating state a proposed termination enters first.
+const fn terminating_state_of(detail: &TerminationDetail) -> TaskState {
+    match detail {
+        TerminationDetail::Canceled(_) => TaskState::Canceling,
+        TerminationDetail::Aborted(_) => TaskState::Aborting,
+        TerminationDetail::Failed(_) => TaskState::Failing,
+    }
+}
+
+/// The terminal a terminating state completes to, or `None` for a state that
+/// has not started terminating.
+const fn terminal_state_of(state: TaskState) -> Option<TaskState> {
+    match state {
+        TaskState::Canceling => Some(TaskState::Canceled),
+        TaskState::Aborting => Some(TaskState::Aborted),
+        TaskState::Failing => Some(TaskState::Failed),
+        _ => None,
+    }
+}
+
 /// The lifecycle-writing handle of one task, held by its execution owner.
 #[derive(Clone, Debug)]
 pub struct TaskStatusReporter {
@@ -748,6 +879,22 @@ impl TaskStatusReporter {
             Some(TerminationDetail::Failed(failure)),
             TaskOutputFacts::default(),
         )
+    }
+
+    /// Concludes the task on the termination that wins; see
+    /// [`TaskStatusOwner::conclude_termination`].
+    pub fn conclude_termination(
+        &self,
+        proposal: TerminationDetail,
+        output: TaskOutputFacts,
+    ) -> StatusAdvance {
+        self.owner.conclude_termination(proposal, output)
+    }
+
+    /// Finishes the task unless a termination already won; see
+    /// [`TaskStatusOwner::conclude_success`].
+    pub fn conclude_success(&self, output: TaskOutputFacts) -> StatusAdvance {
+        self.owner.conclude_success(output)
     }
 
     pub fn advertise_dynamic_filters(
@@ -939,5 +1086,245 @@ mod task_convergence_tests {
         assert_eq!(receipt.version().get(), 1);
         owner.note_actual_stopped();
         assert_eq!(source.latest_task_convergence(identity), Some(receipt));
+    }
+}
+
+#[cfg(test)]
+mod conclusion_tests {
+    use super::*;
+    use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+
+    fn owner() -> TaskStatusOwner {
+        let execution = QueryExecutionId::new(
+            QueryId::new(23, 24),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero query id");
+        TaskStatusOwner::new(
+            TaskIdentity::new(
+                execution,
+                StageId::new(1).expect("nonzero stage"),
+                TaskId::new(1).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            Arc::new(TaskStatusSource::new()),
+            Arc::new(crate::ManualClock::new()),
+            Duration::from_millis(250),
+        )
+    }
+
+    fn failure(detail: &str) -> TaskFailure {
+        TaskFailure::new(
+            TaskFailureCategory::Execution,
+            SafeDetail::new(detail).expect("bounded detail"),
+        )
+    }
+
+    fn canceled(reason: CancelReason) -> TerminationDetail {
+        TerminationDetail::Canceled(reason)
+    }
+
+    fn aborted(cause: AbortCause) -> TerminationDetail {
+        TerminationDetail::Aborted(cause)
+    }
+
+    fn failed(detail: &str) -> TerminationDetail {
+        TerminationDetail::Failed(failure(detail))
+    }
+
+    #[derive(Clone, Debug)]
+    enum Start {
+        /// Accepted but not installed: the shape a rolled-back creation has.
+        Planned,
+        Running,
+        Terminating(TerminationDetail),
+    }
+
+    fn start(start: &Start) -> TaskStatusOwner {
+        let owner = owner();
+        let enter = |detail: &TerminationDetail| {
+            assert!(matches!(
+                owner.advance(
+                    terminating_state_of(detail),
+                    Some(detail.clone()),
+                    TaskOutputFacts::default()
+                ),
+                StatusAdvance::Published(_)
+            ));
+        };
+        match start {
+            Start::Planned => {}
+            Start::Running => {
+                owner.note_installed();
+                assert!(matches!(
+                    owner.advance(TaskState::Running, None, TaskOutputFacts::default()),
+                    StatusAdvance::Published(_)
+                ));
+            }
+            Start::Terminating(detail) => enter(detail),
+        }
+        owner
+    }
+
+    fn assert_concluded(
+        owner: &TaskStatusOwner,
+        state: TaskState,
+        termination: Option<TerminationDetail>,
+        context: &str,
+    ) {
+        let current = owner.current();
+        assert_eq!(
+            (current.state(), current.termination().cloned()),
+            (state, termination),
+            "{context}"
+        );
+        assert!(owner.convergence().conclusion_stable(), "{context}");
+        assert_eq!(
+            owner.final_info().map(|info| info.final_status().state()),
+            Some(state),
+            "{context}"
+        );
+    }
+
+    /// Every starting state against every proposal. A proposal applies only
+    /// where the state machine admits it; otherwise the termination already in
+    /// progress completes with its own cause.
+    #[test]
+    fn termination_proposals_complete_the_stand_down_that_won() {
+        let first_cancel = canceled(CancelReason::UpstreamNoLongerNeeded);
+        let first_abort = aborted(AbortCause::LeaseExpired);
+        let first_failure = failed("first failure");
+        let late_cancel = canceled(CancelReason::UpstreamNoLongerNeeded);
+        let late_abort = aborted(AbortCause::PeerTaskFailed);
+        let late_failure = failed("late failure");
+        let cases = [
+            (Start::Planned, late_cancel.clone(), late_cancel.clone()),
+            (Start::Planned, late_abort.clone(), late_abort.clone()),
+            (Start::Planned, late_failure.clone(), late_failure.clone()),
+            (Start::Running, late_cancel.clone(), late_cancel.clone()),
+            (Start::Running, late_abort.clone(), late_abort.clone()),
+            (Start::Running, late_failure.clone(), late_failure.clone()),
+            // An abort or a failure supersedes a cancellation in progress.
+            (
+                Start::Terminating(first_cancel.clone()),
+                late_cancel.clone(),
+                first_cancel.clone(),
+            ),
+            (
+                Start::Terminating(first_cancel.clone()),
+                late_abort.clone(),
+                late_abort.clone(),
+            ),
+            (
+                Start::Terminating(first_cancel.clone()),
+                late_failure.clone(),
+                late_failure.clone(),
+            ),
+            // A stale cancellation, a second abort, or a failure cannot
+            // rewrite an abort that already won.
+            (
+                Start::Terminating(first_abort.clone()),
+                late_cancel.clone(),
+                first_abort.clone(),
+            ),
+            (
+                Start::Terminating(first_abort.clone()),
+                late_abort.clone(),
+                first_abort.clone(),
+            ),
+            (
+                Start::Terminating(first_abort.clone()),
+                late_failure.clone(),
+                first_abort.clone(),
+            ),
+            (
+                Start::Terminating(first_failure.clone()),
+                late_cancel,
+                first_failure.clone(),
+            ),
+            (
+                Start::Terminating(first_failure.clone()),
+                late_abort,
+                first_failure.clone(),
+            ),
+            (
+                Start::Terminating(first_failure.clone()),
+                late_failure,
+                first_failure,
+            ),
+        ];
+        for (start_state, proposal, winner) in cases {
+            let context = format!("{start_state:?} + {proposal:?}");
+            let owner = start(&start_state);
+            assert!(
+                matches!(
+                    owner.conclude_termination(proposal.clone(), TaskOutputFacts::default()),
+                    StatusAdvance::Published(_)
+                ),
+                "{context}"
+            );
+            let terminal = terminal_state_of(terminating_state_of(&winner)).expect("terminal");
+            assert_concluded(&owner, terminal, Some(winner), &context);
+
+            let settled = owner.current();
+            assert_eq!(
+                owner.conclude_termination(proposal, TaskOutputFacts::default()),
+                StatusAdvance::AlreadyTerminal(terminal),
+                "{context}: the first terminal wins"
+            );
+            assert_eq!(owner.current(), settled, "{context}");
+        }
+    }
+
+    #[test]
+    fn a_termination_conclusion_records_the_sink_output_fact() {
+        let owner = start(&Start::Running);
+        owner.conclude_termination(
+            canceled(CancelReason::UpstreamNoLongerNeeded),
+            TaskOutputFacts::new(true),
+        );
+        assert_eq!(owner.state(), TaskState::Canceled);
+        assert!(owner.current().output().responsibility_complete());
+    }
+
+    #[test]
+    fn success_finishes_only_a_task_that_is_not_terminating() {
+        let owner = start(&Start::Running);
+        assert!(matches!(
+            owner.conclude_success(TaskOutputFacts::new(true)),
+            StatusAdvance::Published(_)
+        ));
+        assert_concluded(&owner, TaskState::Finished, None, "running");
+        assert!(owner.current().output().responsibility_complete());
+
+        for winner in [
+            canceled(CancelReason::UpstreamNoLongerNeeded),
+            aborted(AbortCause::PeerTaskFailed),
+            failed("own failure"),
+        ] {
+            let context = format!("{winner:?}");
+            let owner = start(&Start::Running);
+            owner.advance(
+                terminating_state_of(&winner),
+                Some(winner.clone()),
+                TaskOutputFacts::default(),
+            );
+            assert!(
+                matches!(
+                    owner.conclude_success(TaskOutputFacts::new(true)),
+                    StatusAdvance::Published(_)
+                ),
+                "{context}"
+            );
+            let terminal = terminal_state_of(terminating_state_of(&winner)).expect("terminal");
+            assert_concluded(&owner, terminal, Some(winner), &context);
+            assert!(
+                owner.current().output().responsibility_complete(),
+                "{context}: a sink that ran to success keeps that fact"
+            );
+        }
     }
 }

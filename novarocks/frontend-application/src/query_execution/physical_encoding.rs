@@ -399,7 +399,7 @@ const fn compiled_sink_refusal(sink: &FragmentSink) -> Option<&'static str> {
         FragmentSink::Router { .. } => {
             Some("the compiled package carrier does not express change-stream router sinks yet")
         }
-        FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Noop => None,
+        FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Stream { .. } | FragmentSink::Noop => None,
     }
 }
 
@@ -510,7 +510,9 @@ fn completed_plan_submission_fragments(
     let mut fragments = Vec::with_capacity(plan.fragments().len());
     for fragment in plan.fragments().values() {
         let role = match fragment.sink() {
-            FragmentSink::Result => NativeSubmissionFragmentRole::Result,
+            FragmentSink::Result | FragmentSink::RootResult(_) => {
+                NativeSubmissionFragmentRole::Result
+            }
             FragmentSink::Stream { .. }
             | FragmentSink::Multicast { .. }
             | FragmentSink::Router { .. } => NativeSubmissionFragmentRole::NonTerminal,
@@ -583,6 +585,7 @@ fn completed_fragment_output_columns(
                     name: field.alias.as_deref().unwrap_or(&field.name).to_string(),
                     data_type: field.ty.data_type.clone(),
                     nullable: field.ty.nullable,
+                    domain: field.domain,
                 })
                 .collect()
         })
@@ -1460,7 +1463,7 @@ mod tests {
                 assert!(!facts.declares_table_writer());
                 assert!(facts.carries_runtime_filter_bindings());
                 let expected_targets = match fragment.sink() {
-                    FragmentSink::Result => Vec::new(),
+                    FragmentSink::Result | FragmentSink::RootResult(_) => Vec::new(),
                     FragmentSink::Stream { edge } => {
                         let edge = &plan.edges()[edge];
                         vec![(
@@ -2123,6 +2126,42 @@ mod tests {
             .expect("query root");
         let scope = root.owner.scope();
         (root, scope)
+    }
+
+    #[test]
+    fn m07_completed_result_occurrences_supply_exact_attempt_domains() {
+        use novarocks_physical_plan::ResultValueDomain as D;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_root, scope) = query_scope();
+        let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(
+            request_for("SELECT hll_hash('x') AS h,to_bitmap(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_binary(to_bitmap(1)) AS raw", novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1), &scope,
+        )).unwrap();
+        let plan = completed.candidate().plan();
+        let result = plan.result_port().unwrap();
+        let outputs = completed_fragment_output_columns(completed.candidate().original_public_result_port(), result.fragment);
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|column| column.domain)
+                .collect::<Vec<_>>(),
+            vec![D::Hll, D::Bitmap, D::Percentile, D::Json, D::Plain]
+        );
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["h", "b", "p", "j", "raw"]
+        );
+        for (output, original) in outputs.iter().zip(result.fields.iter()) {
+            assert_eq!(output.data_type, original.ty.data_type);
+            assert_eq!(output.nullable, original.ty.nullable);
+            output.validate_domain().unwrap();
+        }
+        assert_eq!(outputs[4].logical_type().unwrap(), None);
     }
 
     fn request() -> SqlFinalPlanCompileRequest {

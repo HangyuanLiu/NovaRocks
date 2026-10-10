@@ -205,6 +205,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             .unwrap();
         for (ordinal, (value, ty)) in columns.iter().enumerate() {
             result_fields.push(ResultField {
+                domain: crate::test_result_domain::result_value_domain(&ty),
                 name: format!("input_{ordinal}").into(),
                 alias: None,
                 value: *value,
@@ -235,6 +236,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             )
             .unwrap();
         result_fields.push(ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "unary_result".into(),
             alias: None,
             value: result_value,
@@ -253,6 +255,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&output].output.clone(),
         fields: result_fields.into_boxed_slice(),

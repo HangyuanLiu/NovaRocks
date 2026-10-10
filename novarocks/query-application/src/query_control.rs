@@ -810,6 +810,417 @@ mod tests {
         (control, service, workload)
     }
 
+    #[test]
+    fn nonqueued_result_admission_rolls_back_registration_failure_and_retains_aliases() {
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass, WorkClass};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1, 2, 1, 1],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let session = register(&control, 7, 1, "root");
+        let other = register(&control, 8, 2, "root");
+        let begin = |session| {
+            service.begin_governed_statement_with_result(
+                session,
+                &workload.root_admission(),
+                WorkClass::Management,
+                None,
+                None,
+                None,
+                ResultWindowClass::Local,
+            )
+        };
+        let statement = begin(session).unwrap();
+        assert!(matches!(
+            begin(session),
+            Err(GovernedQueryStatementBeginError::QueryControl(_))
+        ));
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        assert_eq!(workload.snapshot().businesses, 1);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        let second = begin(other).unwrap();
+        let third = register(&control, 9, 3, "root");
+        assert!(matches!(
+            begin(third),
+            Err(GovernedQueryStatementBeginError::Admission(_))
+        ));
+        assert_eq!(workload.snapshot().root_responsibilities, 2);
+        assert_eq!(workload.snapshot().businesses, 2);
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        let alias = statement.result_window_alias().unwrap();
+        drop(statement);
+        drop(second);
+        assert_eq!(workload.snapshot().businesses, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        drop(alias);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        // The failed capacity admission did not start a protocol generation.
+        drop(begin(third).unwrap());
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
+    #[tokio::test]
+    async fn result_statement_takes_its_window_with_the_permit_and_keeps_it_for_aliases() {
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_queued_governed_query_statement_with_result(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+                ResultWindowClass::Client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(workload.snapshot().admitted_queries, 1);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        let alias = statement
+            .result_window_alias()
+            .expect("a result statement owns its window");
+        assert_eq!(alias.class(), ResultWindowClass::Client);
+        // An accepted cancel cut returns only the computation permit.
+        assert_eq!(
+            control.kill_query(session, 7),
+            QueryCancelOutcome::Requested
+        );
+        assert!(statement.accept_cancel_delivery_cut().unwrap());
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        // The owner's exit does not free the position while an alias lives.
+        drop(statement);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        drop(alias);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        // A plain statement takes no window.
+        let plain = service
+            .begin_queued_governed_query_statement(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(plain.result_window_alias().is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_closing_transfer_releases_ordinary_window_after_last_alias_exit() {
+        use crate::api::{
+            ExecutionHandle, ExecutionOutput, QueryResultStream, ResultField, ResultRowCarrier,
+            ResultSchema,
+        };
+        use crate::protocol_delivery::StreamingStatementResult;
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_queued_governed_query_statement_with_result(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+                ResultWindowClass::Client,
+            )
+            .await
+            .unwrap();
+        let token = statement.token();
+        let native_alias = statement.result_window_alias().unwrap();
+        let owner = statement.take_execution_owner().unwrap();
+        let (_transport, _receipt, _failure, stream) = QueryResultStream::try_channel(
+            novarocks_types::identity::QueryId::new(71, 1),
+            ResultSchema::new(vec![ResultField::new(
+                "value",
+                arrow::datatypes::DataType::Int32,
+                false,
+                None,
+            )]),
+            ResultRowCarrier::relayed(
+                novarocks_result_contract::RootOutputKind::ClientRows,
+                Some(
+                    novarocks_result_contract::ClientRowProfile::try_new(
+                        novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
+                        novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
+            1,
+        )
+        .unwrap();
+        let execution = ExecutionHandle::new(
+            owner.cancellation_requester(),
+            ExecutionOutput::Rows(stream),
+        );
+        let mut result =
+            StreamingStatementResult::try_from_execution(execution, statement).unwrap();
+        assert_eq!(result.statement_token(), Some(token));
+        assert!(matches!(
+            service.begin_statement(session),
+            Err(QueryControlError::StatementBusy)
+        ));
+        control.kill_query(session, 7);
+        let grant = result.try_closing_capacity(true).unwrap();
+        assert_eq!(result.statement_token(), Some(token));
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        let closing = result
+            .into_closing_delivery((), grant, 1024)
+            .unwrap_or_else(|_| panic!("valid transfer"));
+        assert_eq!(
+            capacity.snapshot().held_positions[0],
+            1,
+            "Native short tail retains the original window"
+        );
+        drop(native_alias);
+        assert_eq!(
+            capacity.snapshot().held_positions[0],
+            0,
+            "closing owns no ordinary window after actual alias exit"
+        );
+        assert_eq!(capacity.snapshot().held_positions[3], 1);
+        assert!(matches!(
+            service.begin_statement(session),
+            Err(QueryControlError::StatementBusy)
+        ));
+        owner.complete();
+        assert!(matches!(
+            closing.settle_after_writer_exit().await,
+            GovernedStatementFinishOutcome::Cancelled(_)
+        ));
+        assert_eq!(capacity.snapshot().held_positions[3], 0);
+        assert!(service.begin_statement(session).is_ok());
+    }
+
+    #[tokio::test]
+    async fn delivery_cut_returns_compute_only_and_closing_retains_generation_and_aliases() {
+        use crate::protocol_delivery::{ClosingDelivery, GovernedProtocolOwner};
+        use novarocks_workload_control::{ResultCapacityConfig, ResultClosingCut};
+        for abandon_wait in [false, true] {
+            let control = Arc::new(QueryApplicationControl::default());
+            let service = QueryControlService::new(control.clone());
+            let workload = WorkloadControl::try_new(
+                WorkloadConfig {
+                    query_concurrency_limit: 1,
+                    ..WorkloadConfig::default()
+                },
+                ResourceConfig {
+                    total_bytes: 1024,
+                    control_bytes: 128,
+                    per_scope_bytes: 896,
+                },
+            )
+            .unwrap();
+            let capacity = workload
+                .configure_result_capacity(ResultCapacityConfig {
+                    positions: [1; 4],
+                    client_compute_positions: 1,
+                    client_short_tail_positions: 0,
+                    supported_cancel_burst: 0,
+                    sustained_cancels_per_second: 0,
+                    ..ResultCapacityConfig::V1
+                })
+                .unwrap();
+            workload.mark_ready().unwrap();
+            let session = register(&control, 7, 1, "root");
+            let mut statement = service
+                .begin_queued_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let token = statement.token();
+            let scope = statement.scope().clone();
+            assert_eq!(workload.snapshot().admitted_queries, 1);
+            assert!(statement.accept_cancel_delivery_cut().is_err());
+            assert_eq!(
+                control.kill_query(session, 7),
+                QueryCancelOutcome::Requested
+            );
+            assert!(statement.accept_cancel_delivery_cut().unwrap());
+            assert!(!statement.accept_cancel_delivery_cut().unwrap());
+            assert!(!statement.accept_failed_delivery_cut().unwrap());
+            assert_eq!(workload.snapshot().admitted_queries, 0);
+            assert_eq!(statement.token(), token);
+            assert!(matches!(
+                service.begin_statement(session),
+                Err(QueryControlError::StatementBusy)
+            ));
+            let grant = capacity
+                .try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation)
+                .unwrap();
+            let protocol = GovernedProtocolOwner::new(statement);
+            let closing = ClosingDelivery::try_new((), protocol, grant, 1024)
+                .unwrap_or_else(|_| panic!("accepted closing cut"));
+            let alias = closing.retained_guard();
+            let mut settlement = Box::pin(closing.settle_after_writer_exit());
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    std::future::Future::poll(settlement.as_mut(), cx).is_pending()
+                ))
+                .await
+            );
+            assert!(
+                matches!(
+                    service.begin_statement(session),
+                    Err(QueryControlError::StatementBusy)
+                ),
+                "a still-live writer alias must retain the original statement generation"
+            );
+            assert_eq!(capacity.snapshot().held_positions[3], 1);
+            if abandon_wait {
+                drop(settlement);
+                assert!(
+                    matches!(
+                        service.begin_statement(session),
+                        Err(QueryControlError::StatementBusy)
+                    ),
+                    "dropping the closing waiter cannot settle a still-live writer alias"
+                );
+                drop(alias);
+            } else {
+                drop(alias);
+                assert!(matches!(
+                    settlement.await,
+                    GovernedStatementFinishOutcome::Cancelled(_)
+                ));
+            }
+            assert_eq!(
+                capacity.snapshot().held_positions[3],
+                0,
+                "settlement follows the last physical alias exit"
+            );
+            let successor = service.begin_statement(session).unwrap();
+            assert_ne!(successor.token(), token);
+        }
+    }
+
+    #[test]
+    fn failed_delivery_cut_retains_business_and_does_not_fabricate_cancel() {
+        for previously_sealed in [false, true] {
+            for finish_path in 0..3 {
+                let (control, service, workload) = governed_control();
+                let session = register(&control, 7, 1, "root");
+                let mut statement = service
+                    .begin_governed_query_statement(
+                        session,
+                        &workload.root_admission(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                if previously_sealed {
+                    assert_eq!(
+                        statement.seal_success_visibility(),
+                        GovernedStatementVisibilitySealOutcome::Sealed
+                    );
+                }
+                assert_eq!(workload.snapshot().businesses, 1);
+                // This entry owns a business permit rather than a compute
+                // permit. The failure cut retains that business owner.
+                assert!(!statement.accept_failed_delivery_cut().unwrap());
+                assert_eq!(workload.snapshot().businesses, 1);
+                assert!(statement.cancellation().reason().is_none());
+                assert_eq!(
+                    statement.seal_success_visibility(),
+                    GovernedStatementVisibilitySealOutcome::Failed
+                );
+                assert!(matches!(
+                    service.begin_statement(session),
+                    Err(QueryControlError::StatementBusy)
+                ));
+                let outcome = match finish_path {
+                    0 => statement.finish(),
+                    1 => statement.finish_unstarted_read_after_cancellation(),
+                    _ => statement.protocol_fail(),
+                };
+                assert_eq!(outcome, GovernedStatementFinishOutcome::ProtocolFailed);
+                assert_eq!(workload.snapshot().businesses, 0);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn queued_governed_query_registers_kill_before_its_concurrency_grant() {
         let control = Arc::new(QueryApplicationControl::default());

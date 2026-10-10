@@ -298,6 +298,7 @@ impl Scenario for FrozenReplayAndMembership {
 pub(super) struct RawBackendSession {
     pub(super) index: usize,
     pub(super) connector: NativeEndpointConnector,
+    pub(super) control_connector: NativeEndpointConnector,
     pub(super) authorization: String,
     pub(super) backend: BackendProcessId,
     pub(super) frontend: FrontendProcessId,
@@ -342,10 +343,14 @@ impl RawBackendSession {
         let endpoint = context.handle().native_be_endpoint(index)?;
         let mode = context.handle().native_trust_mode();
         let connector = context.handle().native_probe_connector(endpoint, mode)?;
+        let control_endpoint = context.handle().native_be_control_endpoint(index)?;
+        let control_connector = context
+            .handle()
+            .native_probe_connector(control_endpoint, mode)?;
         let trust = context.handle().native_probe_trust()?;
         let authorization = authorization_header(&trust)?;
         let heartbeat: proto::HeartbeatResponse = raw_unary(
-            connector.clone(),
+            control_connector.clone(),
             HEARTBEAT_PATH,
             &authorization,
             proto::HeartbeatRequest {
@@ -360,6 +365,7 @@ impl RawBackendSession {
         let mut session = Self {
             index,
             connector,
+            control_connector,
             authorization,
             backend,
             frontend: FrontendProcessId::new_v7(),
@@ -453,7 +459,7 @@ impl RawBackendSession {
         context: &mut ScenarioContext,
     ) -> Result<proto::ReleaseQueryContextOutcome> {
         let quiesce: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
-            &self.connector,
+            &self.control_connector,
             CONTROL_PATH,
             &self.authorization,
             proto::ApplyTaskControlOperationsRequest {
@@ -483,7 +489,7 @@ impl RawBackendSession {
         loop {
             let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> =
                 raw_unary_response(
-                    &self.connector,
+                    &self.control_connector,
                     CONTROL_PATH,
                     &self.authorization,
                     proto::ApplyTaskControlOperationsRequest {
@@ -1544,7 +1550,7 @@ pub(super) fn session_control(
 ) -> Result<proto::TaskOperationReceipt> {
     only_successful_receipt(
         raw_unary_response(
-            &session.connector,
+            &session.control_connector,
             CONTROL_PATH,
             &session.authorization,
             proto::ApplyTaskControlOperationsRequest {

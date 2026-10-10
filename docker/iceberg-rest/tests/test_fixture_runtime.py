@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 MODULE = Path(__file__).resolve().parents[1] / "fixture_runtime.py"
 sys.path.insert(0, str(MODULE.parent))
@@ -98,11 +99,12 @@ class Backend:
         self.calls.append(("untag", record["id"]))
 
 
-def bom(spark="one", rest="rest"):
+def bom(spark="one", rest="rest", rest_mv="rest-mv"):
     return {"lock_sha256": "lock", "images": {name: {"alias": alias} for name, alias in
             (("minio", "minio"), ("minio-mc", "mc"), ("iceberg-rest", rest))},
             "derived_images": {"iceberg-spark": {"image_id": "sha256:" + spark,
-              "definition_sha256": "definition-" + spark}}}
+              "definition_sha256": "definition-" + spark},
+              "rest-mv": {"image_id": "sha256:" + rest_mv, "definition_sha256": "definition-" + rest_mv}}}
 
 
 CONFIG = {"credentials": {"access_key": "access", "secret_key": "secret"},
@@ -271,6 +273,87 @@ class ProtocolTests(unittest.TestCase):
         newest = self.owner.bind("test", self.entry, config, bom())
         self.assertNotEqual(first["binding"]["object_store"], newest["binding"]["object_store"])
         self.assertEqual(len(newest["data_locations"]), 2)
+
+    def test_mv_image_changes_catalog_only_and_has_dedicated_runtime_resources(self):
+        first = self.bind()
+        second = self.bind(bom(rest_mv="rest-mv-two"))
+        self.assertEqual(first["binding"]["object_store"], second["binding"]["object_store"])
+        self.assertNotEqual(first["binding"]["catalog"], second["binding"]["catalog"])
+        self.assertEqual(first["data_locations"], second["data_locations"])
+        record = second["records"]["catalog"]
+        self.assertEqual(record["images"]["rest-mv"]["image_id"], "sha256:rest-mv-two")
+        self.assertEqual(set(record["required_services"]), {"rest", "rest-mv", "spark"})
+        self.assertEqual(record["service_ports"]["rest-mv"], {"8181/tcp": record["ports"]["rest_mv"]})
+        self.assertNotEqual(record["ports"]["rest"], record["ports"]["rest_mv"])
+        self.assertEqual(set(record["volumes"]), {record["project"] + "_rest-catalog", record["project"] + "_rest-mv-catalog"})
+        self.assertEqual(set(record["health_urls"]), {
+            f"http://127.0.0.1:{record['ports']['rest']}/v1/config",
+            f"http://127.0.0.1:{record['ports']['rest_mv']}/v1/config"})
+        endpoints = self.owner.endpoints(second["records"])
+        self.assertEqual(endpoints["rest_mv_uri"], f"http://127.0.0.1:{record['ports']['rest_mv']}")
+        self.assertEqual(endpoints["container_rest_mv_uri"], "http://rest-mv:8181")
+        self.assertIn(f"NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI='s3://warehouse/{record['id']}/rest-mv'\n",
+                      Path(record["compose_env"]).read_text())
+
+    def test_derived_mv_receipt_is_required_and_inspected_by_exact_id(self):
+        inputs = bom()
+        inputs["derived_images"]["rest-mv"]["alias"] = "mutable:current"
+        with mock.patch.object(self.backend, "image_id", wraps=self.backend.image_id) as image_id:
+            self.owner.image_facts(inputs)
+        self.assertIn(mock.call("sha256:rest-mv"), image_id.call_args_list)
+        self.assertNotIn(mock.call("mutable:current"), image_id.call_args_list)
+        with mock.patch.object(self.backend, "image_id", side_effect=lambda ref: "sha256:wrong" if ref == "sha256:rest-mv" else ref):
+            self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.image_facts(inputs))
+        del inputs["derived_images"]["rest-mv"]
+        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.image_facts(inputs))
+
+    def test_catalog_ensure_uses_saved_services(self):
+        first = self.bind()
+        record = first["records"]["catalog"]
+        backend = runtime.Docker()
+        with mock.patch.object(backend, "container", return_value={"Id": "saved-container"}), \
+             mock.patch.object(backend, "validate_resources"), mock.patch.object(backend, "tag"), \
+             mock.patch.object(backend, "repair_service_networks"), mock.patch.object(backend, "healthy", return_value=True), \
+             mock.patch.object(backend, "attach", return_value="saved-parent"), mock.patch.object(backend, "compose") as compose:
+            backend.ensure(record, first["records"]["object_store"])
+        self.assertEqual([call.args[1] for call in compose.call_args_list], [
+            ["create", *record["images"]], ["up", "-d", *record["images"]]])
+
+    def test_saved_catalog_without_mv_keeps_definition_and_can_stop_and_delete(self):
+        first = self.bind()
+        self.owner.unbind("test", self.entry)
+        record = copy.deepcopy(first["records"]["catalog"])
+        del record["images"]["rest-mv"], record["ports"]["rest_mv"], record["service_ports"]["rest-mv"]
+        record["required_services"] = ["rest", "spark"]
+        record["volumes"] = [record["project"] + "_rest-catalog"]
+        record["health_urls"] = [f"http://127.0.0.1:{record['ports']['rest']}/v1/config"]
+        record["template"] = "services:\n  rest:\n    image: ${REST_IMAGE}\n  spark:\n    image: ${SPARK_IMAGE}\n  mc:\n    image: ${MC_IMAGE}\n"
+        # Persist the historical compose.env layout independently of the new renderer.
+        values = {"NOVA_FIXTURE_OWNER": record["namespace"], "NOVA_FIXTURE_KEY": record["key"],
+                  "NOVA_FIXTURE_KIND": "cat", "NOVA_FIXTURE_PROJECT": record["project"],
+                  "MINIO_ROOT_USER": "access", "MINIO_ROOT_PASSWORD": "secret",
+                  "REST_IMAGE": record["images"]["rest"]["tag"], "SPARK_IMAGE": record["images"]["spark"]["tag"],
+                  "MC_IMAGE": record["images"]["mc"]["tag"], "NOVA_ENV_REST_PORT": record["ports"]["rest"],
+                  "NOVA_ENV_SPARK_PORT": record["ports"]["spark"], "NOVA_ENV_REST_SERVER_WAREHOUSE_URI": record["server_warehouse"]}
+        saved_env = ''.join(f"{key}='{value}'\n" for key, value in sorted(values.items())).encode()
+        Path(record["compose_env"]).write_bytes(saved_env)
+        Path(record["compose_file"]).write_text(record["template"])
+        self.owner.save_record(record)
+        self.owner.write_definition(record)
+        self.assertEqual(Path(record["compose_env"]).read_bytes(), saved_env)
+        self.assertNotIn("rest_mv_uri", self.owner.endpoints({"object_store": first["records"]["object_store"], "catalog": record}))
+        self.owner.manage(record["id"], "stop")
+        self.assertEqual(Path(record["compose_env"]).read_bytes(), saved_env)
+        self.owner.manage(record["id"], "delete")
+        self.assertIsNone(self.owner.record(record["id"]))
+        self.assertIn(("purge", first["binding"]["object_store"], [f"s3://warehouse/{record['id']}/"]), self.backend.calls)
+
+    def test_catalog_deletion_purges_parent_of_all_rest_warehouses(self):
+        first = self.bind()
+        self.owner.unbind("test", self.entry)
+        record = first["records"]["catalog"]
+        self.owner.manage(record["id"], "delete")
+        self.assertIn(("purge", first["binding"]["object_store"], [f"s3://warehouse/{record['id']}/"]), self.backend.calls)
 
     def test_repeated_bind_never_reallocates_or_recreates_healthy_instances(self):
         first = self.bind()

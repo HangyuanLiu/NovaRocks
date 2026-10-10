@@ -59,6 +59,7 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
         assignments.push((expr, value));
         output.push(value);
         result_fields.push(ResultField {
+            domain: crate::test_result_domain::result_value_domain(&ty),
             name: format!("literal_{ordinal}").into(),
             alias: None,
             value,
@@ -115,6 +116,7 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
     let calls =
         FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &FixtureControl).unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fragment_id,
         output: fragment.nodes()[&project].output.clone(),
         fields: result_fields.into_boxed_slice(),

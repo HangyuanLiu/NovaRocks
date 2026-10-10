@@ -322,7 +322,7 @@ fn sql_dependency_constant_host_abort_full_flat_recursive_bytes_metadata_and_ord
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = task.owner.scope();
-        let authority = actual.resources();
+        let authority = actual.resources().expect("test workload resource authority");
         let mut held = None;
         let mut stages = Vec::new();
         let after = workflow(&pool, &Control::new(None), &mut |stage, facts| {
@@ -349,9 +349,9 @@ fn sql_dependency_constant_host_abort_every_prepare_callback_preserves_nominal_f
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = task.owner.scope();
-        let authority = actual.resources();
+        let authority = actual.resources().expect("test workload resource authority");
         let cause = foreign
-            .resources()
+            .resources().expect("test workload resource authority")
             .reserve(&scope, 1, ResourceClass::Data)
             .err()
             .unwrap();
@@ -400,9 +400,9 @@ fn sql_dependency_constant_host_abort_every_emit_callback_consumes_one_original_
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = task.owner.scope();
-        let authority = actual.resources();
+        let authority = actual.resources().expect("test workload resource authority");
         let cause = foreign
-            .resources()
+            .resources().expect("test workload resource authority")
             .reserve(&scope, 1, ResourceClass::Data)
             .err()
             .unwrap();
@@ -510,7 +510,7 @@ fn sql_dependency_constant_host_abort_only_actual_capacity_uses_original_control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let scope = task.owner.scope();
-    let authority = actual.resources();
+    let authority = actual.resources().expect("test workload resource authority");
     let mut cause = None;
     let mut calls = 0;
     let error = workflow(&pool, &Control::new(None), &mut |_, _| {

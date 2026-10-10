@@ -523,9 +523,11 @@ fn fixture(
         )
         .unwrap();
     let result = ResultPort {
+        scalar_schema: None,
         fragment: fid,
         output: fragment.nodes()[&output_node].output.clone(),
         fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&root_type),
             name: "cast_result".into(),
             alias: None,
             value,

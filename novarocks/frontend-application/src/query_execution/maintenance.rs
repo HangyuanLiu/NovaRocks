@@ -211,6 +211,10 @@ impl AutomaticMaintenanceContext {
                 self.cancellation.clone(),
             ),
         }
+        .map(|context| {
+            context
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
+        })
     }
 
     pub fn ensure_active(&self) -> Result<(), String> {
@@ -319,6 +323,26 @@ pub enum MaintenanceStatementResult {
 /// to the Frontend MV background runtime until CLS-R3.
 // Design: ADR-0083 (docs/adr/ADR-0083-frontend-owns-table-maintenance-execution-port.md)
 pub trait TableMaintenanceEngine: Send + Sync {
+    /// Bind the one already-admitted root before any distributed rewrite
+    /// construction. This capability never enters durable job descriptions.
+    fn for_admitted_execution(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Arc<dyn TableMaintenanceEngine>, String>;
+
+    fn capture_admitted_optimize_target(
+        &self,
+        _target: &MaintenanceTarget,
+    ) -> Result<novarocks_table_maintenance::job_service::CapturedOptimizeTarget, String> {
+        Err("table maintenance job admission is unsupported".to_string())
+    }
+
+    fn statement_cancellation(
+        &self,
+    ) -> Option<(novarocks_spi::connector::ConnectorStopView, Instant)> {
+        None
+    }
+
     fn resolve_target(
         &self,
         name_parts: &[String],
@@ -746,6 +770,69 @@ fn capture_target_object_id_with_ports(
     captured_target_object_id_from_connector_result(binding)
 }
 
+/// Capture the completion rule and physical object from one exact generation.
+/// The product calls this only after acquiring its target activity gate.
+fn capture_admitted_optimize_target_with_ports(
+    controls: &dyn ConnectorControlResolver,
+    target: &MaintenanceTarget,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<novarocks_table_maintenance::job_service::CapturedOptimizeTarget, String> {
+    use novarocks_spi::connector::{
+        ConnectorReadReferenceFactsRequest, ConnectorTableJobAdmission,
+        ConnectorTableJobAdmissionRequest, ConnectorTableJobKind,
+    };
+    use novarocks_table_maintenance::{
+        OptimizeCompletionMode, job_service::CapturedOptimizeTarget,
+    };
+    let identity = RequestScopedMaintenanceEngine::target_identity(target)?;
+    let lease = controls
+        .acquire_current(&identity.instance_id)
+        .map_err(|error| error.to_string())?;
+    let completion = match lease
+        .binding()
+        .metadata()
+        .admit_table_job(ConnectorTableJobAdmissionRequest {
+            table: identity.clone(),
+            job: ConnectorTableJobKind::RewriteDataFiles,
+            context: context.clone(),
+        })
+        .map_err(|error| error.to_string())?
+    {
+        ConnectorTableJobAdmission::Detached => OptimizeCompletionMode::Detached,
+        ConnectorTableJobAdmission::AwaitTerminal => OptimizeCompletionMode::AwaitTerminal,
+    };
+    let context = crate::connector::context_for_planning_lease(&lease, context)?;
+    let captured = lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: identity.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    let facts = lease
+        .binding()
+        .metadata()
+        .read_reference_facts(ConnectorReadReferenceFactsRequest {
+            table: identity,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    let base_snapshot_id = facts.current_snapshot_id().ok_or_else(|| {
+        format!(
+            "iceberg table {}.{}.{} has no current snapshot",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    Ok(CapturedOptimizeTarget {
+        object_id: captured.object_id.as_bytes().to_vec(),
+        base_snapshot_id,
+        completion,
+    })
+}
+
 fn rebind_target_object_with_ports(
     controls: &dyn ConnectorControlResolver,
     target: &MaintenanceTarget,
@@ -827,7 +914,12 @@ impl BackgroundMaintenanceAttempt {
 /// for each call. There is deliberately no Core default, process-global lookup
 /// or application-facade fallback.
 pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
-    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String>;
+    fn begin_automatic_maintenance_attempt(
+        &self,
+        capacity: Option<
+            &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        >,
+    ) -> Result<BackgroundMaintenanceAttempt, String>;
 }
 
 /// Long-lived automatic-maintenance engine.
@@ -854,7 +946,9 @@ impl BackgroundMaintenanceEngine {
     }
 
     fn request_engine(&self) -> Result<RequestScopedMaintenanceEngine, String> {
-        let attempt = self.attempt_factory.begin_automatic_maintenance_attempt()?;
+        let attempt = self
+            .attempt_factory
+            .begin_automatic_maintenance_attempt(None)?;
         Ok(RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             attempt.execution,
@@ -878,6 +972,52 @@ impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
 }
 
 impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
+    fn for_admitted_execution(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )?;
+        let original = self
+            .execution
+            .result_capacity()
+            .ok_or("request maintenance engine has no admitted root binding")?;
+        if !original.window_alias().is_for_scope(capacity.scope())
+            || !original
+                .window_alias()
+                .shares_capacity_with(&capacity.window_alias())
+        {
+            return Err("request maintenance engine cannot change its admitted root".into());
+        }
+        Ok(Arc::new(Self::new(
+            self.kernel.clone(),
+            self.execution.clone(),
+            self.connector_context.clone(),
+        )))
+    }
+
+    fn capture_admitted_optimize_target(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<novarocks_table_maintenance::job_service::CapturedOptimizeTarget, String> {
+        capture_admitted_optimize_target_with_ports(
+            self.kernel.connector_control().as_ref(),
+            target,
+            self.connector_context.clone(),
+        )
+    }
+
+    fn statement_cancellation(
+        &self,
+    ) -> Option<(novarocks_spi::connector::ConnectorStopView, Instant)> {
+        Some((
+            self.connector_context.stop().clone(),
+            self.connector_context.deadline(),
+        ))
+    }
+
     fn resolve_target(
         &self,
         name_parts: &[String],
@@ -1232,6 +1372,14 @@ impl RequestScopedMaintenanceEngine {
         intent: DistributedRewriteIntent,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        let capacity = self
+            .execution
+            .result_capacity()
+            .ok_or("distributed maintenance rewrite has no admitted Internal window")?;
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )?;
         let identity = Self::target_identity(target)?;
         crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
             self.kernel.query_execution(),
@@ -1248,6 +1396,35 @@ impl RequestScopedMaintenanceEngine {
 }
 
 impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
+    fn for_admitted_execution(
+        &self,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
+        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
+            capacity.scope(),
+            &capacity.window_alias(),
+        )?;
+        let attempt = self
+            .attempt_factory
+            .begin_automatic_maintenance_attempt(Some(capacity))?;
+        let returned = attempt
+            .execution
+            .result_capacity()
+            .ok_or("automatic maintenance factory omitted its admitted root")?;
+        if !returned.window_alias().is_for_scope(capacity.scope())
+            || !returned
+                .window_alias()
+                .shares_capacity_with(&capacity.window_alias())
+        {
+            return Err("automatic maintenance factory replaced its admitted root".into());
+        }
+        Ok(Arc::new(RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            attempt.execution,
+            attempt.connector_context,
+        )))
+    }
+
     fn resolve_target(
         &self,
         name_parts: &[String],
@@ -1690,6 +1867,13 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan, control,
         )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
         .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
@@ -1781,6 +1965,220 @@ mod maintenance_attempt_context_tests {
         maintenance_target_rebind_from_connector_result,
     };
     use novarocks_table_maintenance::MaintenanceTargetRebind;
+
+    #[test]
+    fn optimize_admission_capture_and_snapshot_use_one_generation() {
+        use novarocks_spi::connector::*;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Generation {
+            instance: ConnectorInstanceId,
+            marker: u8,
+            admission: Option<ConnectorTableJobAdmission>,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl ConnectorMetadata for Generation {
+            fn instance_id(&self) -> &ConnectorInstanceId {
+                &self.instance
+            }
+            fn namespace_exists(
+                &self,
+                _: ConnectorNamespaceRequest,
+            ) -> Result<bool, ConnectorError> {
+                panic!("unexpected discovery")
+            }
+            fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+                panic!("unexpected discovery")
+            }
+            fn list_tables(
+                &self,
+                _: ConnectorListTablesRequest,
+            ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+                panic!("unexpected discovery")
+            }
+            fn load_table(
+                &self,
+                _: ConnectorTableRequest,
+            ) -> Result<ConnectorTableMetadata, ConnectorError> {
+                panic!("unexpected load")
+            }
+            fn admit_table_job(
+                &self,
+                request: ConnectorTableJobAdmissionRequest,
+            ) -> Result<ConnectorTableJobAdmission, ConnectorError> {
+                assert_eq!(request.job, ConnectorTableJobKind::RewriteDataFiles);
+                self.calls.lock().unwrap().push("admit");
+                self.admission.ok_or_else(|| {
+                    ConnectorError::new(ConnectorErrorKind::Unsupported, "read-only generation")
+                })
+            }
+            fn capture_table_object_binding(
+                &self,
+                request: ConnectorTableObjectCaptureRequest,
+            ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+                self.calls.lock().unwrap().push("capture");
+                Ok(ConnectorTableObjectBinding {
+                    object_id: ConnectorTableObjectId::try_new(Bytes::from(vec![self.marker]))
+                        .unwrap(),
+                    metadata: ConnectorTableMetadata {
+                        identity: request.table,
+                        schema: Arc::new(arrow::datatypes::Schema::empty()),
+                        planning_facts: ConnectorTablePlanningFacts::default(),
+                        definition_facts: ConnectorTableDefinitionFacts::default(),
+                        version: None,
+                        statistics_data_version: None,
+                        table: ConnectorTableHandle::try_new(
+                            self.instance.clone(),
+                            Bytes::from(vec![self.marker]),
+                        )
+                        .unwrap(),
+                    },
+                })
+            }
+            fn read_reference_facts(
+                &self,
+                request: ConnectorReadReferenceFactsRequest,
+            ) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
+                self.calls.lock().unwrap().push("reference");
+                ConnectorReadReferenceFacts::try_new(
+                    vec![i64::from(self.marker)],
+                    Vec::new(),
+                    Vec::new(),
+                    Some(i64::from(self.marker)),
+                    &request.context,
+                )
+            }
+        }
+        impl ConnectorScanPlanning for Generation {
+            fn instance_id(&self) -> &ConnectorInstanceId {
+                &self.instance
+            }
+            fn begin_scan(
+                &self,
+                _: &ConnectorTableHandle,
+                _: ConnectorBeginScanRequest,
+            ) -> Result<ConnectorScan, ConnectorError> {
+                panic!("unexpected scan")
+            }
+            fn plan_splits(
+                &self,
+                _: &ConnectorScanHandle,
+                _: ConnectorSplitPlanningRequest,
+            ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+                panic!("unexpected scan")
+            }
+        }
+        impl ConnectorExecutionDistribution for Generation {
+            fn declaration(
+                &self,
+                _: &ConnectorRequestContext,
+            ) -> Result<ConnectorProviderBinding, ConnectorError> {
+                panic!("unexpected distribution")
+            }
+        }
+        struct SwitchingResolver {
+            generations: Vec<Arc<ConnectorControlBinding>>,
+            acquired: AtomicUsize,
+        }
+        impl ConnectorControlResolver for SwitchingResolver {
+            fn observe_current_binding(
+                &self,
+                _: &ConnectorInstanceId,
+            ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
+                panic!("must acquire exact lease")
+            }
+            fn observe_current_control_runtime(
+                &self,
+                _: &ConnectorInstanceId,
+            ) -> Result<ConnectorControlRuntimeId, ConnectorError> {
+                panic!("must acquire exact lease")
+            }
+            fn acquire_current(
+                &self,
+                _: &ConnectorInstanceId,
+            ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+                let index = self.acquired.fetch_add(1, Ordering::AcqRel);
+                Ok(ConnectorControlPlanningLease::new(
+                    Arc::clone(&self.generations[index.min(1)]),
+                    || {},
+                ))
+            }
+        }
+        for admission in [
+            Some(ConnectorTableJobAdmission::Detached),
+            Some(ConnectorTableJobAdmission::AwaitTerminal),
+            None,
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let instance = ConnectorInstanceId::parse("catalog").unwrap();
+            let mut generations = Vec::new();
+            for marker in [1, 2] {
+                let capability = Arc::new(Generation {
+                    instance: instance.clone(),
+                    marker,
+                    admission,
+                    calls: Arc::clone(&calls),
+                });
+                generations.push(Arc::new(
+                    ConnectorControlBinding::try_new(
+                        ConnectorInstanceDescriptor {
+                            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                            instance_id: instance.clone(),
+                        },
+                        ProviderBindingEpoch::from_bytes([marker; 16]),
+                        capability.clone(),
+                        capability.clone(),
+                        capability,
+                        None,
+                    )
+                    .unwrap(),
+                ));
+            }
+            let controls = SwitchingResolver {
+                generations,
+                acquired: AtomicUsize::new(0),
+            };
+            let context =
+                crate::connector::connector_request_context(None, ConnectorStopOwner::new().view())
+                    .unwrap();
+            let result = super::capture_admitted_optimize_target_with_ports(
+                &controls,
+                &novarocks_table_maintenance::MaintenanceTarget {
+                    catalog: "catalog".into(),
+                    namespace: "db".into(),
+                    table: "t".into(),
+                },
+                context,
+            );
+            assert_eq!(
+                controls.acquired.load(Ordering::Acquire),
+                1,
+                "capture must not reacquire a replacement generation"
+            );
+            if let Some(admission) = admission {
+                let captured = result.unwrap();
+                assert_eq!(captured.object_id, vec![1]);
+                assert_eq!(captured.base_snapshot_id, 1);
+                assert_eq!(
+                    captured.completion,
+                    match admission {
+                        ConnectorTableJobAdmission::Detached =>
+                            novarocks_table_maintenance::OptimizeCompletionMode::Detached,
+                        ConnectorTableJobAdmission::AwaitTerminal =>
+                            novarocks_table_maintenance::OptimizeCompletionMode::AwaitTerminal,
+                    }
+                );
+                assert_eq!(*calls.lock().unwrap(), ["admit", "capture", "reference"]);
+            } else {
+                assert!(result.unwrap_err().contains("read-only generation"));
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    ["admit"],
+                    "refused job must not capture or read provider facts"
+                );
+            }
+        }
+    }
 
     #[test]
     fn source_context_and_connector_request_share_one_cancellation_flag() {
@@ -1962,5 +2360,139 @@ mod maintenance_attempt_context_tests {
             MaintenanceJobState::TargetReplaced.as_str(),
             "TARGET_REPLACED"
         );
+    }
+}
+
+#[cfg(test)]
+mod admitted_background_context_tests {
+    use super::*;
+    use novarocks_query_application::api::{
+        BackendTopologyError, BackendTopologyPort, BackendTopologySnapshot,
+        BackendTopologyValidationError,
+    };
+    use novarocks_workload_control::{
+        ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+        WorkloadConfig, WorkloadControl,
+    };
+    use std::time::Duration;
+
+    struct TopologyProbe {
+        allow_snapshot: bool,
+    }
+    impl BackendTopologyPort for TopologyProbe {
+        fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+            assert!(
+                self.allow_snapshot,
+                "capacity refusal must precede topology capture"
+            );
+            Ok(BackendTopologySnapshot::empty(7))
+        }
+        fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+            panic!("unused topology subscription")
+        }
+        fn validate_snapshot(
+            &self,
+            _: &BackendTopologySnapshot,
+        ) -> Result<(), BackendTopologyValidationError> {
+            panic!("unused topology validation")
+        }
+        fn wait_for_eligible_after(
+            &self,
+            _: u64,
+            _: Instant,
+        ) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+            panic!("unused topology wait")
+        }
+        fn record_successful_stage(&self, _: usize, _: usize) {
+            panic!("unused stage report")
+        }
+    }
+    fn control() -> (
+        WorkloadControl,
+        novarocks_workload_control::ResultCapacityHandle,
+    ) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        (control, capacity)
+    }
+
+    #[tokio::test]
+    async fn local_window_refuses_before_automatic_topology_capture() {
+        let (control, _) = control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+        let result = crate::capabilities::background_maintenance_attempt(
+            novarocks_types::ClusterRole::Fe,
+            Arc::new(TopologyProbe {
+                allow_snapshot: false,
+            }),
+            Duration::from_secs(60),
+            &tokio::runtime::Handle::current(),
+            Some(&binding),
+        );
+        assert!(matches!(result, Err(error) if error.contains("Internal")));
+        drop(binding);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[tokio::test]
+    async fn automatic_attempt_keeps_original_root_deadline_cancellation_and_window() {
+        let (control, capacity) = control();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut request = WorkRequest::new(WorkClass::Management);
+        request.deadline = Some(deadline.into());
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(request, ResultWindowClass::Internal)
+            .unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+        let attempt = crate::capabilities::background_maintenance_attempt(
+            novarocks_types::ClusterRole::Fe,
+            Arc::new(TopologyProbe {
+                allow_snapshot: true,
+            }),
+            Duration::from_secs(60),
+            &tokio::runtime::Handle::current(),
+            Some(&binding),
+        )
+        .unwrap();
+        assert_eq!(attempt.execution.deadline(), Some(deadline));
+        assert_eq!(attempt.execution.topology().revision(), 7);
+        let returned = attempt.execution.result_capacity().unwrap();
+        assert!(returned.window_alias().is_for_scope(binding.scope()));
+        assert!(
+            returned
+                .window_alias()
+                .shares_capacity_with(&binding.window_alias())
+        );
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
+        assert!(attempt.execution.cancellation().is_cancelled());
+        drop(binding);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(attempt);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 }
