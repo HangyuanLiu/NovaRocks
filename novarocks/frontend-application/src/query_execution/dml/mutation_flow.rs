@@ -1692,12 +1692,29 @@ fn update_change_stream_target_sql(
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<novarocks_parser::ast::Query, String> {
     let statements = novarocks_parser::parse(sql).map_err(|error| format!("{context}: {error}"))?;
-    match statements.as_slice() {
-        [novarocks_parser::ast::Statement::Query(query)] => Ok(query.clone()),
-        [other] => Err(format!(
+    take_single_generated_query(statements, context)
+}
+
+/// Transfer the parser's sole query without constructing a second owned AST.
+/// Statement count takes precedence over statement kind, as in the original
+/// generated-query path. This transfer creates no admission or new authority.
+fn take_single_generated_query(
+    mut statements: Vec<novarocks_parser::ast::Statement>,
+    context: &str,
+) -> Result<novarocks_parser::ast::Query, String> {
+    if statements.len() != 1 {
+        return Err(format!(
+            "{context} generated an empty or multi-statement query"
+        ));
+    }
+    match statements.pop() {
+        Some(novarocks_parser::ast::Statement::Query(query)) => Ok(query),
+        Some(other) => Err(format!(
             "{context} generated non-query statement: {other:?}"
         )),
-        _ => Err(format!(
+        // Kept explicit without a panic; the checked single-statement Vec
+        // cannot reach this branch in this closed synchronous transfer.
+        None => Err(format!(
             "{context} generated an empty or multi-statement query"
         )),
     }
@@ -6773,5 +6790,115 @@ mod tests {
         let calls = fixture.calls.lock().expect("recorded calls");
         assert_eq!(calls.finish, 0);
         assert_eq!(calls.abort, 1);
+    }
+}
+
+#[cfg(test)]
+mod generated_query_transfer_tests {
+    use super::{parse_generated_query, take_single_generated_query};
+    use novarocks_parser::ast::{Query, SelectItem, SetExpr, Statement};
+
+    fn original_result(sql: &str, context: &str) -> Result<Query, String> {
+        let statements =
+            novarocks_parser::parse(sql).map_err(|error| format!("{context}: {error}"))?;
+        match statements.as_slice() {
+            [Statement::Query(query)] => Ok(query.clone()),
+            [other] => Err(format!(
+                "{context} generated non-query statement: {other:?}"
+            )),
+            _ => Err(format!(
+                "{context} generated an empty or multi-statement query"
+            )),
+        }
+    }
+
+    #[test]
+    fn single_generated_query_moves_original_box_vector_and_string_allocations() {
+        let mut statements = novarocks_parser::parse("SELECT 7 AS owned_alias").unwrap();
+        let Statement::Query(query) = &mut statements[0] else {
+            panic!("query");
+        };
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        let SelectItem::ExprWithAlias { alias, .. } = &mut select.projection[0] else {
+            panic!("alias");
+        };
+        // Spare original capacity is meaningful: a deep clone would usually
+        // retain only length. Both allocation identity and capacity must move.
+        alias.value.reserve_exact(4096);
+        let alias_ptr = alias.value.as_ptr();
+        let alias_capacity = alias.value.capacity();
+        let body_ptr = query.body.as_ref() as *const SetExpr;
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select");
+        };
+        let projection_ptr = select.projection.as_ptr();
+        let projection_capacity = select.projection.capacity();
+        let moved = take_single_generated_query(statements, "COW append branch").unwrap();
+        assert_eq!(moved.body.as_ref() as *const SetExpr, body_ptr);
+        let SetExpr::Select(select) = moved.body.as_ref() else {
+            panic!("select");
+        };
+        assert_eq!(select.projection.as_ptr(), projection_ptr);
+        assert_eq!(select.projection.capacity(), projection_capacity);
+        let SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
+            panic!("alias");
+        };
+        assert_eq!(alias.value.as_ptr(), alias_ptr);
+        assert_eq!(alias.value.capacity(), alias_capacity);
+        assert_eq!(alias.value, "owned_alias");
+    }
+
+    #[test]
+    fn generated_query_move_preserves_all_syntax_facts_and_original_spans() {
+        for sql in [
+            "SELECT 1",
+            "SELECT CAST(7 AS BIGINT) AS __nr_v_0 FROM (VALUES (7)) AS __nr_values(__nr_v_0)",
+            "SELECT CASE WHEN TRUE THEN 'changed' ELSE 'original' END AS c FROM t LEFT JOIN (VALUES (7, TRUE)) AS v(k, marker) ON t.k = v.k WHERE v.marker IS NULL OR v.k <> 2",
+        ] {
+            let original = original_result(sql, "COW generated branch")
+                .expect("valid generated query fixture");
+            let actual = parse_generated_query(sql, "COW generated branch")
+                .expect("valid generated query transfer");
+            assert_eq!(actual, original);
+        }
+    }
+
+    #[test]
+    fn generated_query_empty_and_multiple_keep_original_count_error() {
+        for sql in ["", "SELECT 1; SELECT 2", "SET query_timeout=1; SELECT 1"] {
+            let actual = parse_generated_query(sql, "COW rewrite branch");
+            assert_eq!(actual, original_result(sql, "COW rewrite branch"));
+            assert_eq!(
+                actual.unwrap_err(),
+                "COW rewrite branch generated an empty or multi-statement query"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_nonquery_preserves_original_statement_debug_and_context() {
+        let sql = "SET query_timeout=1";
+        let expected = original_result(sql, "COW append branch");
+        let actual = parse_generated_query(sql, "COW append branch");
+        assert_eq!(actual, expected);
+        assert!(
+            actual
+                .unwrap_err()
+                .starts_with("COW append branch generated non-query statement: Session(")
+        );
+    }
+
+    #[test]
+    fn parser_failure_keeps_original_prefix_before_statement_count_or_kind() {
+        for sql in ["SELECT (", "SELECT 1; SELECT ("] {
+            let original = novarocks_parser::parse(sql).unwrap_err();
+            let expected = format!("COW rewrite branch: {original}");
+            assert_eq!(
+                parse_generated_query(sql, "COW rewrite branch").unwrap_err(),
+                expected
+            );
+        }
     }
 }
