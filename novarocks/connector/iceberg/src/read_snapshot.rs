@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::delete_semantics::{
     DataFileFact, DeleteCandidateIndex, DeleteContentAddress, DeleteKind, DeleteObservation,
-    DeleteReadFacts, EntrySequence, EqualityFieldGroup, FieldMetrics, FileMetrics,
+    DeleteReadFacts, EntrySequence, EqualityFieldGroup, FieldMetrics, FileMetrics, LoadView,
     ManifestDeleteObservation, POSITION_FILE_PATH_FIELD_ID, PinnedEndpointFacts, RawDeleteEntry,
     RawDeleteFile, ReadDomain, ReadObservationId, StatisticsPolicy, TypedPartition,
 };
@@ -40,6 +40,8 @@ use crate::scan_model::IcebergColumnStats;
 const MAX_STATS_DELETE_MEMBERS: usize = 256;
 const MAX_STATS_FIELD_COMPARISONS: usize = 1024;
 use sha2::{Digest, Sha256};
+pub(crate) mod cow_capture;
+use cow_capture::{CaptureBudget, ReadFailure, active as check_cow_active, recipe};
 
 /// Mint exactly once at the provider's pinned handle boundary. Standalone
 /// snapshot callers intentionally create an independent observation.
@@ -235,18 +237,101 @@ pub(crate) async fn build_read_snapshot_in_domain(
     domain: Arc<ReadDomain>,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<IcebergReadSnapshot, String> {
-    check_read_control(control)?;
+    let snapshot_id = domain.endpoint().snapshot_id();
+    let files = observe_read_files::<DataFile>(table, domain, control, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(IcebergReadSnapshot {
+        snapshot_id: Some(snapshot_id),
+        files,
+    })
+}
+
+/// COW needs the same validated read facts, but not the scan metadata graph.
+pub(crate) async fn build_cow_read_files_at_with_control(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<Vec<CowReadFile>, String> {
     let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    let schema = snapshot
+        .schema(metadata)
+        .map_err(|e| format!("resolve snapshot schema: {e}"))?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+    observe_read_files::<CowDataFileProjection>(table, domain, control, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Checked COW uses the original FE binding and returns its cumulative receipt.
+pub(crate) async fn build_cow_read_files_at_with_original_scope(
+    table: &Table,
+    snapshot_id: i64,
+    budget: &CaptureBudget<'_>,
+) -> Result<Vec<IcebergReadFile>, ReadFailure> {
+    budget.active()?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    let schema = snapshot
+        .schema(metadata)
+        .map_err(|e| format!("resolve snapshot schema: {e}"))?;
+    let serialized = budget.json(metadata)?;
+    budget.json_working(serialized)?;
+    let schema_bytes = budget.json(schema.as_ref())?;
+    budget.json_working(schema_bytes)?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+    observe_read_files::<FrozenCowDataFileProjection>(table, domain, None, Some(budget)).await
+}
+
+/// One common observation retains the original entry, delete and lineage checks.
+/// Only the data-file storage projection differs between scan and COW callers.
+async fn observe_read_files<P: ObservedDataFileProjection>(
+    table: &Table,
+    domain: Arc<ReadDomain>,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<Vec<P::File>, ReadFailure> {
+    check_read_control(control)?;
+    check_cow_active(budget)?;
+    let metadata = table.metadata();
+    if let Some(budget) = budget {
+        let bytes = budget.json(metadata)?;
+        budget.json_working(bytes)?;
+        budget.json_working(domain.endpoint().schema_json().len() as u64)?;
+    }
     if domain.endpoint().table_uuid() != metadata.uuid()
         || domain.endpoint().metadata_identity() != metadata_identity(metadata)?
     {
-        return Err("Iceberg read domain differs from the pinned table metadata".to_string());
+        return Err("Iceberg read domain differs from the pinned table metadata"
+            .to_string()
+            .into());
     }
     let snapshot_id = domain.endpoint().snapshot_id();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    if let Some(budget) = budget {
+        let source_schema = snapshot.schema(metadata).map_err(|e| e.to_string())?;
+        budget.schema_indexes(source_schema.as_ref())?;
+    }
     let schema = domain.endpoint().schema().map_err(|e| e.to_string())?;
+    if let Some(budget) = budget {
+        let map = recipe(cow_capture::geometry::hash_max::<
+            novarocks_spi::connector::ConnectorCowBeginCause,
+            (i32, String),
+        >(schema.as_struct().fields().len()))?;
+        let names = schema.as_struct().fields().iter().try_fold(map, |sum, f| {
+            recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(sum, f.name.len() as u64))
+        })?;
+        budget.charge(names)?;
+    }
     let field_id_to_name: HashMap<i32, String> = schema
         .as_struct()
         .fields()
@@ -262,6 +347,10 @@ pub(crate) async fn build_read_snapshot_in_domain(
     let mut observed_data = Vec::new();
     for manifest_file in manifest_list.entries() {
         check_read_control(control)?;
+        check_cow_active(budget)?;
+        if let Some(budget) = budget {
+            budget.hash_insert::<&str>(seen_manifests.len(), seen_manifests.capacity())?;
+        }
         if !seen_manifests.insert(manifest_file.manifest_path.as_str()) {
             continue;
         }
@@ -270,6 +359,7 @@ pub(crate) async fn build_read_snapshot_in_domain(
             .await
             .map_err(|e| format!("load manifest: {e}"))?;
         check_read_control(control)?;
+        check_cow_active(budget)?;
         let spec = metadata
             .partition_spec_by_id(manifest_file.partition_spec_id)
             .ok_or_else(|| {
@@ -282,7 +372,17 @@ pub(crate) async fn build_read_snapshot_in_domain(
             return Err(format!(
                 "manifest {} partition spec differs from pinned metadata",
                 manifest_file.manifest_path
-            ));
+            )
+            .into());
+        }
+        if let Some(budget) = budget {
+            if let Some(json) = domain
+                .endpoint()
+                .partition_type_jsons()
+                .get(&spec.spec_id())
+            {
+                budget.json_working(json.len() as u64)?;
+            }
         }
         let partition_type = domain
             .endpoint()
@@ -295,6 +395,7 @@ pub(crate) async fn build_read_snapshot_in_domain(
             .transpose()?;
         for entry in manifest.entries() {
             check_read_control(control)?;
+            check_cow_active(budget)?;
             // Deleted entries are not live facts; unresolved sequence metadata
             // on them cannot become a read failure or an inheritance fallback.
             if entry.status == ManifestStatus::Deleted {
@@ -307,9 +408,53 @@ pub(crate) async fn build_read_snapshot_in_domain(
                 manifest_sequence: manifest_file.sequence_number,
             };
             let df = entry.data_file();
-            let typed_partition = TypedPartition::bind_type(spec, &partition_type, df.partition())
-                .map_err(|e| e.to_string())?;
-            let metrics = manifest_metrics(df, &schema);
+            let typed_partition = if let Some(budget) = budget {
+                TypedPartition::bind_type_checked(
+                    spec,
+                    &partition_type,
+                    df.partition(),
+                    |ty, tuple| {
+                        let plan = recipe(cow_capture::partition::prospective::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(tuple, ty, &mut || {
+                            budget.scope.check_active().map_err(Into::into)
+                        }))?;
+                        budget.charge(plan.canonical_constructor_upper)
+                    },
+                    || budget.active(),
+                )
+                .map_err(|failure| match failure {
+                    crate::delete_semantics::PartitionBindFailure::Semantic(error) => {
+                        ReadFailure::Semantic(error.to_string())
+                    }
+                    crate::delete_semantics::PartitionBindFailure::Original(error) => error,
+                })?
+            } else {
+                TypedPartition::bind_type(spec, &partition_type, df.partition())
+                    .map_err(|e| e.to_string())?
+            };
+            let metrics_upper = if let Some(budget) = budget {
+                let plan = recipe(cow_capture::metrics::prospective::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(df, &schema, &mut || {
+                    budget.scope.check_active().map_err(Into::into)
+                }))?;
+                budget.charge(plan.constructor_upper)?;
+                Some(plan.retained_upper)
+            } else {
+                None
+            };
+            let metrics = manifest_metrics_checked(df, &schema, budget)?;
+            if let Some(upper) = metrics_upper {
+                let actual = recipe(cow_capture::metrics::retained::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(&metrics))?;
+                if actual.own_upper > upper {
+                    return Err(ReadFailure::Semantic(
+                        "COW metrics exceeded prospective receipt".into(),
+                    ));
+                }
+            }
             match df.content_type() {
                 DataContentType::Data => {
                     let count = i64::try_from(df.record_count())
@@ -323,6 +468,11 @@ pub(crate) async fn build_read_snapshot_in_domain(
                             )
                         })?;
                     }
+                    if let Some(budget) = budget {
+                        budget.charge(recipe(cow_capture::geometry::arc_bytes::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(df.file_path().len()))?)?;
+                    }
                     let data = DataFileFact::try_new(
                         df.file_path(),
                         sequence.required_sequence().map_err(|e| e.to_string())?,
@@ -331,9 +481,23 @@ pub(crate) async fn build_read_snapshot_in_domain(
                         metrics,
                     )
                     .map_err(|e| e.to_string())?;
+                    if let Some(budget) = budget {
+                        let plan = recipe(cow_capture::partition::prospective::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(
+                            df.partition(),
+                            &partition_type,
+                            &mut || budget.scope.check_active().map_err(Into::into),
+                        ))?;
+                        budget.charge(recipe(cow_capture::partition::before_resolved::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(plan))?)?;
+                        budget.charge(manifest_file.manifest_path.len() as u64)?;
+                        budget.vector(&observed_data)?;
+                    }
                     let values = resolved_partition_values(df.partition(), &partition_type);
                     observed_data.push((
-                        df.clone(),
+                        P::capture(df, &field_id_to_name, budget)?,
                         data,
                         values,
                         manifest_file.manifest_path.clone(),
@@ -347,6 +511,59 @@ pub(crate) async fn build_read_snapshot_in_domain(
                     i64::try_from(df.record_count()).map_err(|_| {
                         format!("delete record count is unrepresentable: {}", df.file_path())
                     })?;
+                    if let Some(budget) = budget {
+                        let mut own = recipe(cow_capture::geometry::arc_bytes::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(df.file_path().len()))?;
+                        if let Some(target) = df.referenced_data_file() {
+                            own = recipe(cow_capture::geometry::add::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                own,
+                                recipe(cow_capture::geometry::arc_bytes::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                >(target.len()))?,
+                            ))?;
+                        }
+                        own = recipe(cow_capture::geometry::add::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(
+                            own,
+                            recipe(cow_capture::geometry::arc_bytes::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                df.key_metadata().unwrap_or_default().len()
+                            ))?,
+                        ))?;
+                        if let Some(ids) = df.equality_ids() {
+                            let vectors = recipe(cow_capture::geometry::add::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                recipe(cow_capture::geometry::slots::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                    i32,
+                                >(ids.len()))?,
+                                recipe(cow_capture::geometry::slots::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                    (i32, PrimitiveType),
+                                >(ids.len()))?,
+                            ))?;
+                            let arc = recipe(cow_capture::geometry::arc_slice::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                                (i32, PrimitiveType),
+                            >(ids.len()))?;
+                            own = recipe(cow_capture::geometry::add::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                own,
+                                recipe(cow_capture::geometry::add::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                >(vectors, arc))?,
+                            ))?;
+                        }
+                        budget.charge(own)?;
+                        budget.vector(&delete_entries)?;
+                    }
                     let (address, kind) = match (df.content_type(), df.file_format()) {
                         (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
                             let offset = df.content_offset().ok_or_else(|| {
@@ -395,14 +612,16 @@ pub(crate) async fn build_read_snapshot_in_domain(
                                 "unsupported Iceberg delete format {:?}: {}",
                                 df.file_format(),
                                 df.file_path()
-                            ));
+                            )
+                            .into());
                         }
                     };
                     if df.key_metadata().is_some_and(|k| !k.is_empty()) {
                         return Err(format!(
                             "Iceberg encrypted delete file {} is unsupported",
                             df.file_path()
-                        ));
+                        )
+                        .into());
                     }
                     delete_entries.push(RawDeleteEntry {
                         sequence,
@@ -422,17 +641,141 @@ pub(crate) async fn build_read_snapshot_in_domain(
                 }
             }
         }
+        if let Some(budget) = budget {
+            budget.vector(&delete_manifests)?;
+            budget.charge(recipe(cow_capture::geometry::arc_bytes::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(manifest_file.manifest_path.len()))?)?;
+        }
         delete_manifests.push(ManifestDeleteObservation {
             manifest_path: manifest_file.manifest_path.clone().into(),
             entries: delete_entries,
         });
     }
+    if let Some(budget) = budget {
+        let members = delete_manifests
+            .iter()
+            .try_fold(0usize, |sum, m| sum.checked_add(m.entries.len()))
+            .ok_or_else(|| ReadFailure::Semantic("COW delete member upper overflow".into()))?;
+        budget.delete_structures(delete_manifests.len(), members)?;
+        for manifest in &delete_manifests {
+            for entry in &manifest.entries {
+                budget.active()?;
+                if let DeleteKind::Equality(group) = &entry.file.kind {
+                    let ids = recipe(cow_capture::geometry::slots::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                        i32,
+                    >(group.fields().len()))?;
+                    let fields = recipe(cow_capture::geometry::slots::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                        (i32, PrimitiveType),
+                    >(group.fields().len()))?;
+                    let arc = recipe(cow_capture::geometry::arc_slice::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                        (i32, PrimitiveType),
+                    >(group.fields().len()))?;
+                    let rebound = recipe(cow_capture::geometry::add::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                    >(
+                        recipe(cow_capture::geometry::mul::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(ids, 2))?,
+                        recipe(cow_capture::geometry::add::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(fields, arc))?,
+                    ))?;
+                    budget.charge(rebound)?;
+                }
+                let upper = entry.file.partition.json_owned_upper().ok_or_else(|| {
+                    ReadFailure::Semantic("COW partition JSON upper overflow".into())
+                })?;
+                // Prefix descriptions and bounded statistics may construct
+                // the same tuple; retain a conservative constructor sum.
+                budget.charge(recipe(cow_capture::geometry::mul::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(upper, 4))?)?;
+            }
+        }
+        budget.json_working(domain.endpoint().schema_json().len() as u64)?;
+        budget.schema_indexes(&schema)?;
+        for json in domain
+            .endpoint()
+            .partition_spec_jsons()
+            .values()
+            .chain(domain.endpoint().partition_type_jsons().values())
+        {
+            budget.json_working(json.len() as u64)?;
+        }
+    }
     let observation =
-        DeleteObservation::from_manifests(delete_manifests).map_err(|e| e.to_string())?;
-    let index = DeleteCandidateIndex::try_new(domain, observation).map_err(|e| e.to_string())?;
+        DeleteObservation::from_manifests_checked(delete_manifests, || check_cow_active(budget))
+            .map_err(|e| match e {
+                crate::delete_semantics::ConstructionFailure::Semantic(e) => {
+                    ReadFailure::Semantic(e.to_string())
+                }
+                crate::delete_semantics::ConstructionFailure::Original(e) => e,
+            })?;
+    let index =
+        DeleteCandidateIndex::try_new_checked(domain, observation, || check_cow_active(budget))
+            .map_err(|e| match e {
+                crate::delete_semantics::ConstructionFailure::Semantic(e) => {
+                    ReadFailure::Semantic(e.to_string())
+                }
+                crate::delete_semantics::ConstructionFailure::Original(e) => e,
+            })?;
+    if let Some(budget) = budget {
+        budget.charge(recipe(cow_capture::geometry::slots::<
+            novarocks_spi::connector::ConnectorCowBeginCause,
+            P::File,
+        >(observed_data.len()))?)?;
+    }
     let mut files = Vec::with_capacity(observed_data.len());
     for (df, data, partition_values, manifest_path, first_row_id) in observed_data {
         check_read_control(control)?;
+        check_cow_active(budget)?;
+        if let Some(budget) = budget {
+            let metrics = recipe(cow_capture::metrics::retained::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(&data.metrics))?;
+            let buckets = index.size().buckets;
+            let views = recipe(cow_capture::geometry::slots::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+                crate::delete_semantics::BucketView,
+            >(buckets.checked_add(2).ok_or_else(|| {
+                ReadFailure::Semantic("COW bucket upper overflow".into())
+            })?))?;
+            let upper = recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                recipe(cow_capture::geometry::mul::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(views, 4))?,
+                metrics.own_upper,
+            ))?;
+            let upper = recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                upper,
+                std::mem::size_of::<DataFileFact>() as u64
+                    + 2 * std::mem::size_of::<usize>() as u64,
+            ))?;
+            budget.charge(upper)?;
+            let plan = recipe(cow_capture::partition::prospective::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                &partition_values,
+                &crate::iceberg::spec::StructType::new(Vec::new()),
+                &mut || budget.scope.check_active().map_err(Into::into),
+            ))?;
+            budget.charge(plan.debug_key_upper)?;
+            // Existing metadata statistics policy bounds the pruning work.
+            budget.charge(recipe(cow_capture::geometry::slots::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+                usize,
+            >(
+                MAX_STATS_DELETE_MEMBERS.saturating_mul(4)
+            ))?)?;
+        }
         let logical = index.for_data(&data).map_err(|e| e.to_string())?;
         // This bound is selected entirely from metadata. A large suffix costs
         // no per-member work and stays a compact, conservative view.
@@ -445,37 +788,296 @@ pub(crate) async fn build_read_snapshot_in_domain(
             }
         };
         let deletes = logical.load_view(policy);
-        files.push(IcebergReadFile {
-            path: df.file_path().to_string(),
-            size: i64::try_from(df.file_size_in_bytes())
-                .map_err(|_| format!("file size too large: {}", df.file_path()))?,
-            record_count: Some(
-                i64::try_from(df.record_count()).map_err(|_| "record count too large")?,
-            ),
-            column_stats: column_stats(&df, &field_id_to_name),
-            partition_spec_id: Some(data.partition().spec_id()),
-            partition_key: iceberg_partition_key(&partition_values),
-            partition_values: Some(partition_values),
-            manifest_path: Some(manifest_path),
-            first_row_id,
-            data_sequence_number: Some(data.sequence().get()),
-            manifest: Arc::new(IcebergDataFileMetadata {
-                file_format: df.file_format(),
-                split_offsets: df.split_offsets().unwrap_or_default().to_vec(),
-                key_metadata: df.key_metadata().unwrap_or_default().to_vec(),
-                value_counts: df.value_counts().clone(),
-                null_value_counts: df.null_value_counts().clone(),
-                nan_value_counts: df.nan_value_counts().clone(),
-                lower_bounds: df.lower_bounds().clone(),
-                upper_bounds: df.upper_bounds().clone(),
-            }),
-            deletes,
-        });
+        files.push(df.into_file(
+            FinalReadFileFacts {
+                partition_spec_id: data.partition().spec_id(),
+                data_sequence_number: data.sequence().get(),
+                partition_values,
+                manifest_path,
+                first_row_id,
+                deletes,
+            },
+            &field_id_to_name,
+        )?);
     }
-    Ok(IcebergReadSnapshot {
-        snapshot_id: Some(snapshot_id),
-        files,
-    })
+    Ok(files)
+}
+
+/// All final conversions still occur after complete manifest/delete validation.
+struct FinalReadFileFacts {
+    partition_spec_id: i32,
+    data_sequence_number: i64,
+    partition_values: Struct,
+    manifest_path: String,
+    first_row_id: Option<i64>,
+    deletes: LoadView,
+}
+
+trait ObservedDataFileProjection: Sized {
+    type File;
+
+    fn capture(
+        df: &DataFile,
+        field_id_to_name: &HashMap<i32, String>,
+        budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure>;
+
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+    ) -> Result<Self::File, String>;
+}
+
+impl ObservedDataFileProjection for DataFile {
+    type File = IcebergReadFile;
+
+    fn capture(
+        df: &DataFile,
+        _field_id_to_name: &HashMap<i32, String>,
+        _budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure> {
+        Ok(df.clone())
+    }
+
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+    ) -> Result<Self::File, String> {
+        Ok(IcebergReadFile {
+            path: self.file_path().to_string(),
+            size: i64::try_from(self.file_size_in_bytes())
+                .map_err(|_| format!("file size too large: {}", self.file_path()))?,
+            record_count: Some(
+                i64::try_from(self.record_count()).map_err(|_| "record count too large")?,
+            ),
+            column_stats: column_stats(&self, field_id_to_name),
+            partition_spec_id: Some(facts.partition_spec_id),
+            partition_key: iceberg_partition_key(&facts.partition_values),
+            partition_values: Some(facts.partition_values),
+            manifest_path: Some(facts.manifest_path),
+            first_row_id: facts.first_row_id,
+            data_sequence_number: Some(facts.data_sequence_number),
+            manifest: Arc::new(IcebergDataFileMetadata {
+                file_format: self.file_format(),
+                split_offsets: self.split_offsets().unwrap_or_default().to_vec(),
+                key_metadata: self.key_metadata().unwrap_or_default().to_vec(),
+                value_counts: self.value_counts().clone(),
+                null_value_counts: self.null_value_counts().clone(),
+                nan_value_counts: self.nan_value_counts().clone(),
+                lower_bounds: self.lower_bounds().clone(),
+                upper_bounds: self.upper_bounds().clone(),
+            }),
+            deletes: facts.deletes,
+        })
+    }
+}
+
+/// Only fields consumed by the COW manifest projection are copied while the
+/// original SDK DataFile is borrowed. No DataFile or scan metadata is retained.
+struct CowDataFileProjection {
+    path: String,
+    file_size_in_bytes: u64,
+    record_count: u64,
+    column_stats: Option<HashMap<String, IcebergColumnStats>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CowReadFile {
+    pub path: String,
+    pub size: i64,
+    pub record_count: Option<i64>,
+    pub column_stats: Option<HashMap<String, IcebergColumnStats>>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_key: Option<String>,
+    pub partition_values: Option<Struct>,
+    pub manifest_path: Option<String>,
+    pub first_row_id: Option<i64>,
+    pub data_sequence_number: Option<i64>,
+    pub deletes: LoadView,
+}
+
+impl ObservedDataFileProjection for CowDataFileProjection {
+    type File = CowReadFile;
+
+    fn capture(
+        df: &DataFile,
+        field_id_to_name: &HashMap<i32, String>,
+        budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure> {
+        let stats_upper = if let Some(budget) = budget {
+            let plan = recipe(cow_capture::stats::prospective::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(df, field_id_to_name, &mut || {
+                budget.scope.check_active().map_err(Into::into)
+            }))?;
+            budget.charge(recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                plan.constructor_upper,
+                df.file_path().len() as u64,
+            ))?)?;
+            Some(plan.retained_upper)
+        } else {
+            None
+        };
+        let output = Self {
+            path: df.file_path().to_owned(),
+            file_size_in_bytes: df.file_size_in_bytes(),
+            record_count: df.record_count(),
+            column_stats: column_stats_checked(df, field_id_to_name, budget)?,
+        };
+        if let Some(upper) = stats_upper {
+            let actual = recipe(cow_capture::stats::retained::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(&output.column_stats))?;
+            if actual.own_upper > upper || output.path.capacity() > df.file_path().len() {
+                return Err(ReadFailure::Semantic(
+                    "COW file projection exceeded prospective receipt".into(),
+                ));
+            }
+        }
+        check_cow_active(budget)?;
+        Ok(output)
+    }
+
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        _field_id_to_name: &HashMap<i32, String>,
+    ) -> Result<Self::File, String> {
+        // Preserve the original final iteration's fallible conversion order.
+        let size = i64::try_from(self.file_size_in_bytes)
+            .map_err(|_| format!("file size too large: {}", self.path))?;
+        let record_count =
+            i64::try_from(self.record_count).map_err(|_| "record count too large")?;
+        Ok(CowReadFile {
+            path: self.path,
+            size,
+            record_count: Some(record_count),
+            column_stats: self.column_stats,
+            partition_spec_id: Some(facts.partition_spec_id),
+            partition_key: iceberg_partition_key(&facts.partition_values),
+            partition_values: Some(facts.partition_values),
+            manifest_path: Some(facts.manifest_path),
+            first_row_id: facts.first_row_id,
+            data_sequence_number: Some(facts.data_sequence_number),
+            deletes: facts.deletes,
+        })
+    }
+}
+
+/// Keep the exact typed manifest remainder required by frozen read authority.
+/// Only public immutable fields of the original SDK entry are copied, and every
+/// backing is covered before construction; no complete SDK DataFile is cloned.
+struct FrozenCowDataFileProjection {
+    stats: CowDataFileProjection,
+    manifest: Arc<IcebergDataFileMetadata>,
+}
+impl ObservedDataFileProjection for FrozenCowDataFileProjection {
+    type File = IcebergReadFile;
+    fn capture(
+        df: &DataFile,
+        names: &HashMap<i32, String>,
+        budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure> {
+        use cow_capture::geometry::{add, arc_slice, hash_max, slots};
+        use novarocks_spi::connector::ConnectorCowBeginCause;
+        let stats = CowDataFileProjection::capture(df, names, budget)?;
+        if let Some(budget) = budget {
+            let mut upper =
+                recipe(arc_slice::<ConnectorCowBeginCause, IcebergDataFileMetadata>(1))?;
+            upper = recipe(add::<ConnectorCowBeginCause>(
+                upper,
+                recipe(slots::<ConnectorCowBeginCause, i64>(
+                    df.split_offsets().unwrap_or_default().len(),
+                ))?,
+            ))?;
+            upper = recipe(add::<ConnectorCowBeginCause>(
+                upper,
+                df.key_metadata().unwrap_or_default().len() as u64,
+            ))?;
+            for counts in [
+                df.value_counts(),
+                df.null_value_counts(),
+                df.nan_value_counts(),
+            ] {
+                upper = recipe(add::<ConnectorCowBeginCause>(
+                    upper,
+                    recipe(hash_max::<ConnectorCowBeginCause, (i32, u64)>(counts.len()))?,
+                ))?;
+            }
+            for bounds in [df.lower_bounds(), df.upper_bounds()] {
+                upper = recipe(add::<ConnectorCowBeginCause>(
+                    upper,
+                    recipe(hash_max::<
+                        ConnectorCowBeginCause,
+                        (i32, crate::iceberg::spec::Datum),
+                    >(bounds.len()))?,
+                ))?;
+                for datum in bounds.values() {
+                    budget.active()?;
+                    let bytes = match datum.literal() {
+                        PrimitiveLiteral::String(value) => value.len(),
+                        PrimitiveLiteral::Binary(value) => value.len(),
+                        _ => 0,
+                    };
+                    upper = recipe(add::<ConnectorCowBeginCause>(upper, bytes as u64))?;
+                }
+            }
+            budget.charge(upper)?;
+        }
+        // Rebuild insert-only maps from the exact original pairs. This gives a
+        // prospective layout from their known lengths even if the SDK input
+        // maps retained spare buckets or tombstones from prior construction.
+        let counts = |map: &HashMap<i32, u64>| -> Result<HashMap<i32, u64>, ReadFailure> {
+            let mut output = HashMap::with_capacity(map.len());
+            for (&id, &value) in map {
+                check_cow_active(budget)?;
+                output.insert(id, value);
+            }
+            Ok(output)
+        };
+        let bounds = |map: &HashMap<i32,crate::iceberg::spec::Datum>| -> Result<HashMap<i32,crate::iceberg::spec::Datum>,ReadFailure> {
+            let mut output = HashMap::with_capacity(map.len());
+            for (&id,value) in map { check_cow_active(budget)?; output.insert(id,value.clone()); }
+            Ok(output)
+        };
+        let manifest = Arc::new(IcebergDataFileMetadata {
+            file_format: df.file_format(),
+            split_offsets: df.split_offsets().unwrap_or_default().to_vec(),
+            key_metadata: df.key_metadata().unwrap_or_default().to_vec(),
+            value_counts: counts(df.value_counts())?,
+            null_value_counts: counts(df.null_value_counts())?,
+            nan_value_counts: counts(df.nan_value_counts())?,
+            lower_bounds: bounds(df.lower_bounds())?,
+            upper_bounds: bounds(df.upper_bounds())?,
+        });
+        check_cow_active(budget)?;
+        Ok(Self { stats, manifest })
+    }
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        names: &HashMap<i32, String>,
+    ) -> Result<Self::File, String> {
+        let file = self.stats.into_file(facts, names)?;
+        Ok(IcebergReadFile {
+            path: file.path,
+            size: file.size,
+            record_count: file.record_count,
+            column_stats: file.column_stats,
+            partition_spec_id: file.partition_spec_id,
+            partition_key: file.partition_key,
+            partition_values: file.partition_values,
+            manifest_path: file.manifest_path,
+            first_row_id: file.first_row_id,
+            data_sequence_number: file.data_sequence_number,
+            manifest: self.manifest,
+            deletes: file.deletes,
+        })
+    }
 }
 
 fn resolved_partition_values(
@@ -501,15 +1103,26 @@ fn resolved_partition_values(
     )
 }
 
-fn manifest_metrics(df: &DataFile, schema: &Schema) -> FileMetrics {
+fn manifest_metrics_checked(
+    df: &DataFile,
+    schema: &Schema,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<FileMetrics, ReadFailure> {
     let mut ids = std::collections::BTreeSet::new();
-    ids.extend(df.value_counts().keys().copied());
-    ids.extend(df.null_value_counts().keys().copied());
-    ids.extend(df.nan_value_counts().keys().copied());
-    ids.extend(df.lower_bounds().keys().copied());
-    ids.extend(df.upper_bounds().keys().copied());
+    for id in df
+        .value_counts()
+        .keys()
+        .chain(df.null_value_counts().keys())
+        .chain(df.nan_value_counts().keys())
+        .chain(df.lower_bounds().keys())
+        .chain(df.upper_bounds().keys())
+    {
+        check_cow_active(budget)?;
+        ids.insert(*id);
+    }
     let mut fields = BTreeMap::new();
     for id in ids {
+        check_cow_active(budget)?;
         let value_type = match id {
             POSITION_FILE_PATH_FIELD_ID
                 if df.content_type() == DataContentType::PositionDeletes =>
@@ -544,13 +1157,22 @@ fn manifest_metrics(df: &DataFile, schema: &Schema) -> FileMetrics {
             .bind_bounds(),
         );
     }
-    FileMetrics::new(fields)
+    check_cow_active(budget)?;
+    FileMetrics::new_checked(fields, || check_cow_active(budget))
 }
 
 fn column_stats(
     df: &DataFile,
     field_id_to_name: &HashMap<i32, String>,
 ) -> Option<HashMap<String, IcebergColumnStats>> {
+    column_stats_checked(df, field_id_to_name, None)
+        .unwrap_or_else(|_| unreachable!("ordinary stats has no fallible scope"))
+}
+fn column_stats_checked(
+    df: &DataFile,
+    field_id_to_name: &HashMap<i32, String>,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<Option<HashMap<String, IcebergColumnStats>>, ReadFailure> {
     let null_counts = df.null_value_counts();
     let value_counts = df.value_counts();
     let col_sizes = df.column_sizes();
@@ -564,14 +1186,20 @@ fn column_stats(
 
     if has_any_stats {
         let mut all_ids = std::collections::HashSet::new();
-        all_ids.extend(null_counts.keys());
-        all_ids.extend(value_counts.keys());
-        all_ids.extend(col_sizes.keys());
-        all_ids.extend(lower.keys());
-        all_ids.extend(upper.keys());
+        for id in null_counts
+            .keys()
+            .chain(value_counts.keys())
+            .chain(col_sizes.keys())
+            .chain(lower.keys())
+            .chain(upper.keys())
+        {
+            check_cow_active(budget)?;
+            all_ids.insert(*id);
+        }
 
         let mut stats_map = HashMap::new();
         for &field_id in &all_ids {
+            check_cow_active(budget)?;
             if let Some(column_name) = field_id_to_name.get(&field_id) {
                 let lower_bound = lower
                     .get(&field_id)
@@ -600,9 +1228,9 @@ fn column_stats(
                 );
             }
         }
-        Some(stats_map)
+        Ok(Some(stats_map))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -1771,5 +2399,287 @@ mod tests {
             canonical["schemas"][0]["identifier-field-ids"],
             serde_json::json!([1, 2])
         );
+    }
+
+    fn assert_cow_data_file_parity(
+        ordinary: &crate::manifest::DataFileWithStats,
+        cow: &crate::manifest::DataFileWithStats,
+    ) {
+        assert_eq!(ordinary.path, cow.path);
+        assert_eq!(ordinary.size, cow.size);
+        assert_eq!(ordinary.record_count, cow.record_count);
+        assert_eq!(
+            serde_json::to_value(&ordinary.column_stats).unwrap(),
+            serde_json::to_value(&cow.column_stats).unwrap()
+        );
+        assert_eq!(ordinary.partition_spec_id, cow.partition_spec_id);
+        assert_eq!(ordinary.partition_key, cow.partition_key);
+        assert_eq!(ordinary.partition_values, cow.partition_values);
+        assert_eq!(ordinary.manifest_path, cow.manifest_path);
+        assert_eq!(ordinary.partition_field_values, cow.partition_field_values);
+        assert_eq!(ordinary.first_row_id, cow.first_row_id);
+        assert_eq!(ordinary.data_sequence_number, cow.data_sequence_number);
+        assert_eq!(ordinary.delete_files, cow.delete_files);
+    }
+
+    async fn compare_cow_extraction(table: &Table) -> Vec<crate::manifest::DataFileWithStats> {
+        let ordinary = crate::manifest::extract_data_files_with_stats_at(table, 77)
+            .await
+            .unwrap();
+        let cow = crate::manifest::extract_cow_data_files_with_stats_at(table, 77)
+            .await
+            .unwrap();
+        assert_eq!(ordinary.len(), cow.len());
+        for (ordinary, cow) in ordinary.iter().zip(&cow) {
+            assert_cow_data_file_parity(ordinary, cow);
+        }
+        cow
+    }
+
+    #[tokio::test]
+    async fn cow_extraction_matches_partition_statistics_and_attached_delete_facts() {
+        use crate::iceberg::spec::Datum;
+        let partition = || Struct::from_iter([Some(Literal::string("emea"))]);
+        let mut a = file("a", DataContentType::Data, partition());
+        a.value_counts(HashMap::from([(1, 10)]))
+            .null_value_counts(HashMap::from([(1, 0)]))
+            .column_sizes(HashMap::from([(1, 80)]))
+            .lower_bounds(HashMap::from([(1, Datum::long(0))]))
+            .upper_bounds(HashMap::from([(1, Datum::long(9))]))
+            .key_metadata(Some(vec![9; 4096]))
+            .split_offsets(Some(vec![0, 128, 512]));
+        let b = file("b", DataContentType::Data, partition())
+            .build()
+            .unwrap();
+        let mut position = file("position", DataContentType::PositionDeletes, partition());
+        position.referenced_data_file(Some("a".to_owned()));
+        let mut equality = file("equality", DataContentType::EqualityDeletes, partition());
+        equality.equality_ids(Some(vec![1]));
+        let mut vector = file("vector", DataContentType::PositionDeletes, partition());
+        vector
+            .file_format(DataFileFormat::Puffin)
+            .referenced_data_file(Some("b".to_owned()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(32));
+        let table = table(
+            vec![
+                vec![(a.build().unwrap(), 5), (b, 5)],
+                vec![
+                    (position.build().unwrap(), 5),
+                    (equality.build().unwrap(), 6),
+                ],
+                vec![(vector.build().unwrap(), 5)],
+            ],
+            Some(1),
+            true,
+        )
+        .await;
+        let files = compare_cow_extraction(&table).await;
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(files[0].delete_files.len(), 2);
+        assert_eq!(files[1].delete_files.len(), 2);
+        assert_eq!(files[0].partition_field_values[0].source_column, "region");
+        assert_eq!(
+            files[0].column_stats.as_ref().unwrap()["id"].lower_bound,
+            Some(0_i64.to_le_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn cow_extraction_keeps_all_live_files_and_inherited_first_row_ids() {
+        let mut a = file("before", DataContentType::Data, Struct::empty());
+        a.record_count(3);
+        let mut b = file("after", DataContentType::Data, Struct::empty());
+        b.record_count(7);
+        let table = table(
+            vec![vec![(a.build().unwrap(), 5), (b.build().unwrap(), 5)]],
+            None,
+            false,
+        )
+        .await;
+        let files = compare_cow_extraction(&table).await;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "before");
+        assert_eq!(files[1].path, "after");
+        assert_eq!(files[0].first_row_id, Some(0));
+        assert_eq!(files[1].first_row_id, Some(3));
+        assert_eq!(files[0].record_count, Some(3));
+        assert_eq!(files[1].record_count, Some(7));
+    }
+
+    #[tokio::test]
+    async fn cow_extraction_retains_complete_attached_delete_validation_and_error_priority() {
+        for (variant, expected) in [
+            (0, "older"),
+            (1, "deletion vector"),
+            (2, "encrypted"),
+            (3, "unsupported Iceberg delete format"),
+        ] {
+            let deletes = match variant {
+                0 => vec![(dv("puffin", "a", 4, 2), 4)],
+                1 => vec![(dv("puffin", "a", 4, 2), 5), (dv("puffin", "a", 4, 2), 5)],
+                2 => vec![(
+                    file(
+                        "encrypted",
+                        DataContentType::PositionDeletes,
+                        Struct::empty(),
+                    )
+                    .referenced_data_file(Some("a".to_owned()))
+                    .key_metadata(Some(vec![1]))
+                    .build()
+                    .unwrap(),
+                    5,
+                )],
+                _ => vec![(
+                    file(
+                        "unsupported",
+                        DataContentType::PositionDeletes,
+                        Struct::empty(),
+                    )
+                    .referenced_data_file(Some("a".to_owned()))
+                    .file_format(DataFileFormat::Avro)
+                    .build()
+                    .unwrap(),
+                    5,
+                )],
+            };
+            let table = table(
+                vec![vec![(data("a"), 5), (data("other"), 5)], deletes],
+                None,
+                false,
+            )
+            .await;
+            // Both extractors observe all entries before final projection.
+            let ordinary = match crate::manifest::extract_data_files_with_stats_at(&table, 77).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("ordinary extraction accepted invalid attached delete"),
+            };
+            let cow = match crate::manifest::extract_cow_data_files_with_stats_at(&table, 77).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("COW extraction accepted invalid attached delete"),
+            };
+            assert!(ordinary.contains(expected), "{ordinary}");
+            assert_eq!(cow, ordinary);
+        }
+    }
+
+    #[test]
+    fn cow_borrowed_projection_owns_only_final_fields_and_keeps_raw_size_until_finish() {
+        use crate::iceberg::spec::Datum;
+        let original = file("borrowed", DataContentType::Data, Struct::empty())
+            .file_size_in_bytes(u64::MAX)
+            .value_counts(HashMap::from([(1, 10)]))
+            .lower_bounds(HashMap::from([(1, Datum::long(0))]))
+            .key_metadata(Some(vec![7; 8192]))
+            .split_offsets(Some((0..1024).collect()))
+            .build()
+            .unwrap();
+        let names = HashMap::from([(1, "id".to_owned())]);
+        let projected = CowDataFileProjection::capture(&original, &names, None).unwrap();
+        // Enumerating every stored field prevents silently retaining a DataFile
+        // or scan metadata Arc in this projection in a later refactor.
+        let CowDataFileProjection {
+            path,
+            file_size_in_bytes,
+            record_count,
+            column_stats: stats,
+        } = projected;
+        assert_eq!(path, original.file_path());
+        assert_ne!(path.as_ptr(), original.file_path().as_ptr());
+        assert_eq!(file_size_in_bytes, u64::MAX);
+        assert_eq!(record_count, original.record_count());
+        assert_eq!(
+            serde_json::to_value(stats).unwrap(),
+            serde_json::to_value(column_stats(&original, &names)).unwrap()
+        );
+        assert_eq!(original.key_metadata().unwrap(), &[7; 8192]);
+        assert_eq!(original.split_offsets().unwrap().len(), 1024);
+    }
+
+    struct RejectFinalProjection;
+
+    impl ObservedDataFileProjection for RejectFinalProjection {
+        type File = ();
+
+        fn capture(
+            _df: &DataFile,
+            _names: &HashMap<i32, String>,
+            _budget: Option<&CaptureBudget<'_>>,
+        ) -> Result<Self, ReadFailure> {
+            Ok(Self)
+        }
+
+        fn into_file(
+            self,
+            _facts: FinalReadFileFacts,
+            _names: &HashMap<i32, String>,
+        ) -> Result<Self::File, String> {
+            Err("final projection canary".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn cow_observation_preserves_delete_failure_before_fallible_final_projection() {
+        let valid = table(vec![vec![(data("a"), 5)]], None, false).await;
+        let domain =
+            mint_read_domain(valid.metadata(), 77, valid.metadata().current_schema()).unwrap();
+        let canary = observe_read_files::<RejectFinalProjection>(&valid, domain, None, None)
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap_err();
+        assert_eq!(canary, "final projection canary");
+
+        let invalid = table(
+            vec![vec![(data("a"), 5)], vec![(dv("puffin", "a", 4, 2), 4)]],
+            None,
+            false,
+        )
+        .await;
+        let domain =
+            mint_read_domain(invalid.metadata(), 77, invalid.metadata().current_schema()).unwrap();
+        let actual = observe_read_files::<RejectFinalProjection>(&invalid, domain, None, None)
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap_err();
+        assert!(actual.contains("older"), "{actual}");
+        assert_ne!(actual, canary);
+    }
+
+    fn final_facts_from_read(file: IcebergReadFile) -> FinalReadFileFacts {
+        FinalReadFileFacts {
+            partition_spec_id: file.partition_spec_id.unwrap(),
+            data_sequence_number: file.data_sequence_number.unwrap(),
+            partition_values: file.partition_values.unwrap(),
+            manifest_path: file.manifest_path.unwrap(),
+            first_row_id: file.first_row_id,
+            deletes: file.deletes,
+        }
+    }
+
+    #[tokio::test]
+    async fn cow_final_size_conversion_matches_original_without_early_rejection() {
+        let table = table(vec![vec![(data("a"), 5)]], None, false).await;
+        let mut snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
+        let read = snapshot.files.pop().unwrap();
+        let original = file("a", DataContentType::Data, Struct::empty())
+            .file_size_in_bytes(u64::MAX)
+            .build()
+            .unwrap();
+        let names = HashMap::new();
+        let captured = CowDataFileProjection::capture(&original, &names, None).unwrap();
+        assert_eq!(captured.file_size_in_bytes, u64::MAX);
+        let ordinary = original
+            .into_file(final_facts_from_read(read.clone()), &names)
+            .unwrap_err();
+        let cow = captured
+            .into_file(final_facts_from_read(read), &names)
+            .unwrap_err();
+        assert_eq!(ordinary, "file size too large: a");
+        assert_eq!(cow, ordinary);
     }
 }

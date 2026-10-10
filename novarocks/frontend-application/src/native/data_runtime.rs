@@ -14,6 +14,8 @@ use novarocks_task_codec::TransportBudget;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio::runtime::Handle;
 
+use super::apply_send_owner::{ApplySendOwner, ApplySendPort, DrainObservation};
+use super::subscription_owner::{NativeSubscriptionOwner, NativeSubscriptionPort};
 use super::transport_supervisor::NativeTransportSupervisor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_native_adapter::FrontendNativeTransport;
@@ -46,6 +48,16 @@ pub(super) struct CachedNativeChannel {
     generation: Arc<DialGeneration>,
 }
 
+impl CachedNativeChannel {
+    /// Read-only component identity; grants no selection or dial authority.
+    #[cfg(test)]
+    pub(super) fn same_generation_for_test(&self, other: &Self) -> bool {
+        self.slot == other.slot
+            && Arc::ptr_eq(&self.generation, &other.generation)
+            && !self.generation.retired.load(Ordering::Acquire)
+    }
+}
+
 struct DialGeneration {
     retired: AtomicBool,
 }
@@ -74,6 +86,7 @@ struct LanePool {
 /// geometry's connection count.
 #[derive(Default)]
 struct ChannelPools {
+    closed: bool,
     pools: HashMap<NativeChannelKey, LanePool>,
 }
 
@@ -105,6 +118,9 @@ impl ChannelPools {
     /// may be evicted; eviction drops cache aliases only, while escaped
     /// channels and their connections keep their own owners.
     fn pool(&mut self, key: &NativeChannelKey) -> Result<&mut LanePool, String> {
+        if self.closed {
+            return Err("Frontend Native channel cache is closed".to_owned());
+        }
         if !self.pools.contains_key(key) {
             if self.pools.len() >= pool_limit() {
                 let cold = self
@@ -151,7 +167,7 @@ impl NativeDialReservation {
             .channels
             .lock()
             .expect("frontend native channel cache lock");
-        if self.is_retired() {
+        if channels.closed || self.is_retired() {
             return Err("Native channel generation retired before ready".to_owned());
         }
         match channels.row(&self.slot) {
@@ -179,7 +195,7 @@ impl NativeDialReservation {
             .lock()
             .expect("frontend native channel cache lock");
         let exact = matches!(channels.row(&self.slot), Some(NativeChannelCacheRow::Dialing(current)) if Arc::ptr_eq(current, &self.generation));
-        if !exact || !self.leader || self.is_retired() {
+        if channels.closed || !exact || !self.leader || self.is_retired() {
             drop(channels);
             // Actual IO/worker teardown occurs outside the cache lock.
             drop(channel);
@@ -224,7 +240,6 @@ impl Drop for NativeDialReservation {
 /// Native transport ports are synchronous Core-facing traits.  Their RPC work
 /// runs on this role-owned handle, and they retain the historical two-path
 /// `block_on` behavior when called both inside and outside a Tokio context.
-#[derive(Clone)]
 pub(crate) struct FrontendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
@@ -234,6 +249,30 @@ pub(crate) struct FrontendDataRuntime {
     dial_gates: Arc<[tokio::sync::Mutex<()>; 4]>,
     task_transport_supervisor: NativeTransportSupervisor,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
+    apply_send_port: ApplySendPort,
+    // Only the original runtime owns joins. Clones are capability projections.
+    original_apply_owner: Option<Mutex<ApplySendOwner>>,
+    subscription_port: NativeSubscriptionPort,
+    original_subscription_owner: Option<Mutex<NativeSubscriptionOwner>>,
+}
+
+impl Clone for FrontendDataRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            native_trust: Arc::clone(&self.native_trust),
+            native_transport: self.native_transport.clone(),
+            transport_admission: self.transport_admission.clone(),
+            channels: Arc::clone(&self.channels),
+            dial_gates: Arc::clone(&self.dial_gates),
+            task_transport_supervisor: self.task_transport_supervisor.clone(),
+            connector_blocking_io: self.connector_blocking_io.clone(),
+            apply_send_port: self.apply_send_port.clone(),
+            original_apply_owner: None,
+            subscription_port: self.subscription_port.clone(),
+            original_subscription_owner: None,
+        }
+    }
 }
 
 impl FrontendDataRuntime {
@@ -246,6 +285,7 @@ impl FrontendDataRuntime {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         task_transport_budget: TransportBudget,
+        subscription_scope_records_limit: usize,
     ) -> Result<Self, String> {
         // An inconsistent frozen geometry is refused before any channel. The
         // envelope's count part is logged; P00b freezes the coefficients.
@@ -266,18 +306,37 @@ impl FrontendDataRuntime {
             coefficients_frozen = geometry.frontend.coefficients.is_some(),
             "Frontend Native transport admission composed"
         );
+        // Refuse fallible configuration before creating the original reaper.
+        let task_transport_supervisor =
+            NativeTransportSupervisor::from_transport(task_transport_budget)?;
+        let channels = Arc::new(Mutex::new(ChannelPools::default()));
+        let dial_gates = Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(())));
         let connector_blocking_io = ConnectorBlockingIoSupervisor::new(handle.clone());
+        let (original_apply_owner, apply_send_port) =
+            ApplySendOwner::new(handle.clone(), task_transport_budget)
+                // The existing constructor is Result<Self, String>; this boundary
+                // cannot preserve the typed TryReserveError. No Native F exists yet.
+                .map_err(|_| {
+                    "allocate Native Apply original process-item storage failed".to_owned()
+                })?;
+        let (original_subscription_owner, subscription_port) =
+            NativeSubscriptionOwner::new(handle.clone(), subscription_scope_records_limit)
+                .map_err(|_| {
+                    "allocate Native subscription original scope storage failed".to_owned()
+                })?;
         Ok(Self {
             handle,
             native_trust,
             native_transport,
             transport_admission,
-            channels: Arc::new(Mutex::new(ChannelPools::default())),
-            dial_gates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
-            task_transport_supervisor: NativeTransportSupervisor::from_transport(
-                task_transport_budget,
-            )?,
+            channels,
+            dial_gates,
+            task_transport_supervisor,
             connector_blocking_io,
+            apply_send_port,
+            original_apply_owner: Some(Mutex::new(original_apply_owner)),
+            subscription_port,
+            original_subscription_owner: Some(Mutex::new(original_subscription_owner)),
         })
     }
 
@@ -295,13 +354,21 @@ impl FrontendDataRuntime {
             NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("fixed test caller"),
             NativeTransportMode::Disabled,
         );
-        Self::new_with_native_trust(
+        let mut runtime = Self::new_with_native_trust(
             handle,
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
+            novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
         )
-        .expect("the default task transport budget is valid")
+        .expect("the default task transport budget is valid");
+        runtime
+            .start_original_apply_reaper()
+            .expect("the test role starts its original Apply owner once");
+        runtime
+            .start_original_subscription_reaper()
+            .expect("the test role starts its original subscription owner once");
+        runtime
     }
 
     pub(crate) fn native_trust(&self) -> &Arc<NativeTrust> {
@@ -318,8 +385,179 @@ impl FrontendDataRuntime {
         &self.transport_admission
     }
 
+    /// Retire every original cache generation before dropping its aliases.
+    /// Escaped channels remain charged until their public IO/body exits.
+    pub(crate) fn close_native_outgoing(&self) -> Result<(), String> {
+        let retired = {
+            let mut channels = self
+                .channels
+                .lock()
+                .expect("frontend native channel cache lock");
+            channels.closed = true;
+            for pool in channels.pools.values() {
+                for row in pool.rows.iter().flatten() {
+                    row.generation().retired.store(true, Ordering::Release);
+                }
+            }
+            std::mem::take(&mut channels.pools)
+        };
+        // Actual channel teardown and observer callbacks stay outside the lock.
+        let close = self.transport_admission.close_frontend_outgoing();
+        drop(retired);
+        close.map_err(|error| format!("close Frontend Native outgoing transport: {error}"))
+    }
+
+    pub(crate) async fn drain_native_outgoing_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        self.close_native_outgoing()?;
+        self.transport_admission
+            .wait_frontend_outgoing_until(tokio::time::Instant::from_std(deadline))
+            .await
+            .map_err(|error| format!("drain Frontend Native outgoing public exits: {error}"))
+    }
+
     pub(crate) fn task_transport_supervisor(&self) -> &NativeTransportSupervisor {
         &self.task_transport_supervisor
+    }
+
+    pub(crate) fn start_original_apply_reaper(&mut self) -> Result<(), String> {
+        let Some(owner) = self.original_apply_owner.as_mut() else {
+            return Err(
+                "Native Apply original start requested through a capability projection".to_owned(),
+            );
+        };
+        owner
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .start_reaper()
+            .map_err(|failure| failure.to_string())
+    }
+
+    pub(crate) fn apply_send_port(&self) -> &ApplySendPort {
+        &self.apply_send_port
+    }
+
+    pub(crate) fn start_original_subscription_reaper(&mut self) -> Result<(), String> {
+        self.original_subscription_owner
+            .as_mut()
+            .ok_or_else(|| {
+                "Native subscription start requested through a capability projection".to_owned()
+            })?
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .start_reaper()
+            .map_err(|error| format!("start original Native subscription owner: {error:?}"))
+    }
+
+    pub(crate) fn subscription_port(&self) -> &NativeSubscriptionPort {
+        &self.subscription_port
+    }
+
+    pub(crate) async fn drain_original_subscriptions_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let owner = self
+            .original_subscription_owner
+            .as_mut()
+            .ok_or_else(|| {
+                "Native subscription drain requested through a capability projection".to_owned()
+            })?
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        match owner.drain_until(deadline).await {
+            super::subscription_owner::DrainObservation::Joined => Ok(()),
+            failure => Err(format!("drain original Native subscriptions: {failure:?}")),
+        }
+    }
+
+    pub(crate) fn original_subscriptions_joined(&self) -> bool {
+        self.original_subscription_owner
+            .as_ref()
+            .is_some_and(|owner| {
+                owner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_joined()
+            })
+    }
+
+    /// While execution drains, a failed original reaper must still retire its
+    /// original children, otherwise those SAME Workload children block drain.
+    pub(crate) async fn recover_failed_subscription_reaper_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let owner = self
+            .original_subscription_owner
+            .as_mut()
+            .ok_or_else(|| {
+                "Native subscription recovery requested through a capability projection".to_owned()
+            })?
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        owner.wait_for_failed_reaper().await;
+        // Only an already failed/closed original reaper reaches this path.
+        // The same owner polls the same JHs in place, without a replacement.
+        match owner.drain_until(deadline).await {
+            super::subscription_owner::DrainObservation::Joined => Ok(()),
+            failure => Err(format!(
+                "recover original Native subscription reaper: {failure:?}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_original_subscription_reaper(&mut self) {
+        self.original_subscription_owner
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .abort_original_reaper();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_original_subscription_reaper_failure(&mut self) {
+        self.original_subscription_owner
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .wait_for_failed_reaper()
+            .await;
+    }
+
+    pub(crate) async fn drain_original_apply_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let Some(owner) = self.original_apply_owner.as_mut() else {
+            return Err(
+                "Native Apply original drain requested through a capability projection".to_owned(),
+            );
+        };
+        // Exclusive Host access borrows its unique original owner without
+        // carrying a mutex guard across await. Capability projections stay Sync.
+        let owner = owner.get_mut().unwrap_or_else(|error| error.into_inner());
+        // Host calls only after the original Abort/Release/heartbeat callers exit.
+        owner.request_abort();
+        let observation = owner.drain_until(deadline).await;
+        match observation {
+            DrainObservation::Complete => Ok(()),
+            failure => Err(format!("{failure}; {:?}", owner.failure_snapshot())),
+        }
+    }
+
+    pub(crate) fn original_apply_joined(&self) -> bool {
+        self.original_apply_owner.as_ref().is_some_and(|owner| {
+            owner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_joined()
+        })
     }
 
     pub(crate) fn connector_blocking_io(&self) -> &ConnectorBlockingIoSupervisor {
@@ -361,14 +599,17 @@ impl FrontendDataRuntime {
     }
 
     pub(super) fn cached_channel(&self, slot: &NativeChannelSlot) -> Option<CachedNativeChannel> {
-        self.channels
+        let channels = self
+            .channels
             .lock()
-            .expect("frontend native channel cache lock")
-            .row(slot)
-            .and_then(|row| match row {
-                NativeChannelCacheRow::Ready(channel) => Some(CachedNativeChannel::clone(channel)),
-                NativeChannelCacheRow::Dialing(_) => None,
-            })
+            .expect("frontend native channel cache lock");
+        if channels.closed {
+            return None;
+        }
+        channels.row(slot).and_then(|row| match row {
+            NativeChannelCacheRow::Ready(channel) => Some(CachedNativeChannel::clone(channel)),
+            NativeChannelCacheRow::Dialing(_) => None,
+        })
     }
 
     pub(super) fn begin_dial(
@@ -531,6 +772,7 @@ mod tests {
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
+            novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
         )
         .expect("the default task transport budget is valid")
     }
@@ -637,6 +879,41 @@ mod tests {
             .await
             .unwrap(),
         );
+    }
+
+    #[tokio::test]
+    async fn outgoing_close_retires_ready_and_dialing_generations_and_refuses_late_publish() {
+        let runtime = data_runtime(tokio::runtime::Handle::current());
+        let key = NativeChannelKey {
+            endpoint: NativeEndpoint::from_host_port("be.example", 19040).unwrap(),
+            peer: novarocks_types::BackendProcessId::new_v7(),
+            lane: novarocks_proto_codec::native_rpc::FrontendNativeLane::Submission,
+        };
+        let ready_slot = slot(key.clone());
+        let (channel, _updates) = tonic::transport::Channel::balance_channel::<String>(1);
+        let escaped = runtime.cache_channel(ready_slot.clone(), channel);
+        let dialing_slot = NativeChannelSlot {
+            key: key.clone(),
+            index: 1,
+        };
+        let original_dial = runtime.begin_dial(dialing_slot.clone()).unwrap();
+        let follower = runtime.begin_dial(dialing_slot.clone()).unwrap();
+        runtime.close_native_outgoing().unwrap();
+        let (late, _updates) = tonic::transport::Channel::balance_channel::<String>(1);
+        let rejected = original_dial.publish(lane_channel(late)).is_err();
+        let retired_ready = escaped
+            .generation
+            .retired
+            .load(std::sync::atomic::Ordering::Acquire);
+        let retired_follower = follower.is_retired() && follower.ready_channel().is_err();
+        let not_cached = runtime.cached_channel(&ready_slot).is_none();
+        let refused =
+            runtime.select_slot(&key).is_err() && runtime.begin_dial(dialing_slot).is_err();
+        let empty = runtime.channels.lock().unwrap().pools.is_empty();
+        runtime.close_native_outgoing().unwrap();
+        drop(follower);
+        drop(escaped);
+        assert!(rejected && retired_ready && retired_follower && not_cached && refused && empty);
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ pub(crate) struct QueryPinnedFileSetRead {
     pub(crate) frozen_source:
         Option<novarocks_spi::connector::read_stack::runtime::ConnectorFrozenReadSource>,
     pub(crate) planning_lease: ConnectorControlPlanningLease,
+    // COW-only neutral holder: declared last so schema/source peers retire first.
+    pub(crate) original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
 
 impl std::fmt::Debug for QueryPinnedFileSetRead {

@@ -23,13 +23,29 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tracing::warn;
 
-#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+#[cfg(any(
+    test,
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 mod fixture_join_observation;
-#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+#[cfg(any(
+    test,
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 pub(crate) use fixture_join_observation::MysqlFixtureProtocolFailure;
-#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+#[cfg(any(
+    test,
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 pub(crate) use fixture_join_observation::MysqlFixtureSessionJoins;
-#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+#[cfg(any(
+    test,
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 pub(crate) use fixture_join_observation::{WatcherAbortGuard, WatcherFacts, WatcherPermit};
 
 /// Bind a TCP listener and retain accepted protocol tasks until `shutdown`.
@@ -157,13 +173,21 @@ where
         on_ready,
         cleanup_timeout,
         |result, _aborting| log_session_join_error(result),
-        #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+        #[cfg(any(
+            test,
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         None,
     )
     .await
 }
 
-#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+#[cfg(any(
+    test,
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 pub(crate) async fn serve_tcp_until_drain_then_shutdown_admitted_observed<F, G, H, HFut, R>(
     bind_addr: SocketAddr,
     drain: F,
@@ -202,9 +226,12 @@ async fn serve_tcp_until_drain_then_shutdown_with_joins<F, G, H, HFut, R, J>(
     on_ready: R,
     cleanup_timeout: Duration,
     mut observe_join: J,
-    #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))] watcher_observation: Option<
-        std::sync::Arc<MysqlFixtureSessionJoins>,
-    >,
+    #[cfg(any(
+        test,
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
+    watcher_observation: Option<std::sync::Arc<MysqlFixtureSessionJoins>>,
 ) -> Result<(), String>
 where
     F: Future<Output = ()> + Send,
@@ -214,33 +241,57 @@ where
     R: FnOnce(SocketAddr),
     J: FnMut(Result<(), tokio::task::JoinError>, bool),
 {
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(|error| format!("bind MySQL listener on {bind_addr} failed: {error}"))?;
-    let bound_addr = listener
-        .local_addr()
-        .map_err(|error| format!("read MySQL listener address failed: {error}"))?;
+    let listener = TcpListener::bind(bind_addr).await.map_err(|error| {
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if let Some(observation) = watcher_observation
+            .as_ref()
+            .filter(|owner| owner.is_closing_pressure())
+        {
+            observation.observe_listener_failure(error);
+            return format!("bind original pressure MySQL listener on {bind_addr} failed");
+        }
+        format!("bind MySQL listener on {bind_addr} failed: {error}")
+    })?;
+    let bound_addr = listener.local_addr().map_err(|error| {
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if let Some(observation) = watcher_observation
+            .as_ref()
+            .filter(|owner| owner.is_closing_pressure())
+        {
+            observation.observe_listener_failure(error);
+            return "read original pressure MySQL listener address failed".to_string();
+        }
+        format!("read MySQL listener address failed: {error}")
+    })?;
     on_ready(bound_addr);
 
     let mut sessions = JoinSet::new();
     tokio::pin!(drain);
     let serve_result = loop {
-        #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+        #[cfg(any(
+            test,
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         let observe_watchers = watcher_observation.is_some();
-        #[cfg(not(any(test, feature = "mem-1-m07-exact-mysql-write")))]
+        #[cfg(not(any(
+            test,
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        )))]
         let observe_watchers = false;
         tokio::select! {
             biased;
             _ = &mut drain => break Ok(()),
             _ = async {
-                #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+                #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write", feature = "mem-1-m07-closing-pressure"))]
                 std::future::poll_fn(|cx| {
                     match watcher_observation.as_ref().expect("fixture branch enabled").poll_next_watcher(cx) {
                         std::task::Poll::Ready(None) => std::task::Poll::Pending,
                         joined => joined,
                     }
                 }).await;
-                #[cfg(not(any(test, feature = "mem-1-m07-exact-mysql-write")))]
+                #[cfg(not(any(test, feature = "mem-1-m07-exact-mysql-write", feature = "mem-1-m07-closing-pressure")))]
                 std::future::pending::<()>().await;
             }, if observe_watchers => {},
             completed = sessions.join_next(), if !sessions.is_empty() => {
@@ -254,25 +305,44 @@ where
                         sessions.spawn(session);
                     }
                 }
-                Err(error) => break Err(format!("accept MySQL connection failed: {error}")),
+                Err(error) => {
+                    #[cfg(feature = "mem-1-m07-closing-pressure")]
+                    if let Some(observation) = watcher_observation.as_ref().filter(|owner| owner.is_closing_pressure()) {
+                        observation.observe_listener_failure(error);
+                        break Err("accept original pressure MySQL connection failed".to_string());
+                    }
+                    break Err(format!("accept MySQL connection failed: {error}"));
+                },
             },
         }
     };
     drop(listener);
     if serve_result.is_err() {
         drain_session_tasks_with_joins(&mut sessions, cleanup_timeout, &mut observe_join).await;
-        #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+        #[cfg(any(
+            test,
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        ))]
         join_original_fixture_watchers(watcher_observation.as_deref()).await;
         return serve_result;
     }
     finalize.await;
     drain_session_tasks_with_joins(&mut sessions, cleanup_timeout, &mut observe_join).await;
-    #[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+    #[cfg(any(
+        test,
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     join_original_fixture_watchers(watcher_observation.as_deref()).await;
     serve_result
 }
 
-#[cfg(any(test, feature = "mem-1-m07-exact-mysql-write"))]
+#[cfg(any(
+    test,
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 async fn join_original_fixture_watchers(observation: Option<&MysqlFixtureSessionJoins>) {
     if let Some(observation) = observation {
         // Sessions already joined and dropped their abort guards. Retain every

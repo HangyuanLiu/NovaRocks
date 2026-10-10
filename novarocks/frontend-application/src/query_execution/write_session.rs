@@ -117,6 +117,9 @@ pub(crate) struct ConnectorWriteSession {
     /// and dropping the session clears it too, so a write that neither commits
     /// nor reconciles cannot pin credential material.
     terminal_storage: Mutex<Option<Arc<dyn ConnectorStorageResolver>>>,
+    // Last holder retires after every session-owned plan and storage field.
+    cow_simultaneous_upper: u64,
+    cow_original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
 
 /// What a session has collected so far across the queries it drives.
@@ -253,6 +256,49 @@ impl ConnectorWriteSession {
             terminal: Mutex::new(None),
             finish_invocations: AtomicUsize::new(0),
             terminal_storage: Mutex::new(None),
+            cow_simultaneous_upper: 0,
+            cow_original: None,
+        })
+    }
+
+    /// COW-only checked entry. The caller receipt already includes this
+    /// session's fixed prospective header and catalog-properties clone.
+    fn begin_cow_checked(
+        lease: ConnectorWriteStackLease,
+        catalog_properties: novarocks_spi::connector::CatalogProperties,
+        request: ConnectorWriteBeginRequest,
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+        existing_caller_upper: u64,
+    ) -> Result<Self, novarocks_spi::connector::ConnectorCowBeginFailure> {
+        let checked =
+            lease
+                .session()
+                .begin_cow_write_checked(request, original, existing_caller_upper)?;
+        let cow_simultaneous_upper = checked.simultaneous_upper();
+        let (plan, original) = checked.into_parts();
+        // The provider already authorized its complete publication upper.
+        // This check rejects a stop between provider return and FE adoption.
+        if let Err(cause) = original.check_active() {
+            // Plan destruction precedes return of the guarded original cause.
+            drop(plan);
+            return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                cause.into(),
+                original,
+            ));
+        }
+        Ok(Self {
+            lease,
+            plan,
+            implicit_empty_staged_create: false,
+            metadata_only_publication: false,
+            finish_publication: Mutex::new(WritePublicationState::Ordinary),
+            catalog_properties,
+            accumulated: Mutex::new(AccumulatedWriteSet::default()),
+            terminal: Mutex::new(None),
+            finish_invocations: AtomicUsize::new(0),
+            terminal_storage: Mutex::new(None),
+            cow_simultaneous_upper,
+            cow_original: Some(original),
         })
     }
 
@@ -331,6 +377,16 @@ impl ConnectorWriteSession {
     /// The sealed ordinal set a prepared write set may not exceed.
     pub(crate) fn expected_targets(&self) -> Vec<WriteTargetOrdinal> {
         self.plan.expected_targets()
+    }
+
+    pub(crate) fn cow_simultaneous_upper(&self) -> u64 {
+        self.cow_simultaneous_upper
+    }
+
+    pub(crate) fn cow_original(
+        &self,
+    ) -> Option<&novarocks_spi::connector::ConnectorOriginalResultScope> {
+        self.cow_original.as_ref()
     }
 
     pub(crate) fn targets(&self) -> &[ConnectorWriteTargetPlan] {
@@ -991,6 +1047,78 @@ pub(crate) fn begin_connector_write_session(
         .map_err(|error| format!("begin connector write session: {error}"))
 }
 
+/// COW-only entry: retain the exact provider error until its original
+/// synchronous command worker projects and retires it. Other write callers
+/// keep their existing String boundary.
+pub(crate) fn begin_cow_connector_write_session(
+    lease: ConnectorWriteStackLease,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    request: ConnectorWriteBeginRequest,
+    original: novarocks_spi::connector::ConnectorOriginalResultScope,
+    existing_caller_upper: u64,
+) -> Result<Arc<ConnectorWriteSession>, crate::query_execution::dml::mutation_flow::CowFailure> {
+    use crate::query_execution::dml::mutation_flow::CowFailure;
+    if let Err(cause) = original.check_before_growth(existing_caller_upper) {
+        return Err(CowFailure::checked_begin(
+            novarocks_spi::connector::ConnectorCowBeginFailure::new(cause.into(), original),
+        ));
+    }
+    let Some(properties) = write_lease.catalog_properties() else {
+        return Err(CowFailure::missing_catalog_identity_bound(original));
+    };
+    // CatalogProperties::clone allocates exactly two Vec backings; all
+    // entries share their Arc strings. Cover the actual lease projection and
+    // Arc<Self> before either is allocated, separately from request context.
+    let extra = properties
+        .execution_properties()
+        .len()
+        .checked_mul(std::mem::size_of::<novarocks_spi::connector::CatalogProperty>())
+        .and_then(|bytes| {
+            properties
+                .credential_bindings()
+                .len()
+                .checked_mul(std::mem::size_of::<
+                    novarocks_spi::connector::CatalogCredentialBinding,
+                >())
+                .and_then(|bindings| bytes.checked_add(bindings))
+        })
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ConnectorWriteSession>()))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                2 * std::mem::size_of::<usize>()
+                    + 2 * (std::mem::align_of::<ConnectorWriteSession>() - 1),
+            )
+        })
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| existing_caller_upper.checked_add(bytes));
+    let Some(existing_caller_upper) = extra else {
+        return Err(CowFailure::checked_begin(
+            novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "COW session footprint arithmetic overflowed",
+                )
+                .into(),
+                original,
+            ),
+        ));
+    };
+    if let Err(cause) = original.check_before_growth(existing_caller_upper) {
+        return Err(CowFailure::checked_begin(
+            novarocks_spi::connector::ConnectorCowBeginFailure::new(cause.into(), original),
+        ));
+    }
+    ConnectorWriteSession::begin_cow_checked(
+        lease,
+        properties.clone(),
+        request,
+        original,
+        existing_caller_upper,
+    )
+    .map(Arc::new)
+    .map_err(CowFailure::checked_begin)
+}
+
 /// Open an application-document write with its declaration frozen and its
 /// exact publication pending until execution supplies the remaining facts.
 pub(crate) fn begin_connector_application_document_write_session_pending(
@@ -1283,6 +1411,35 @@ pub(crate) mod tests {
     }
 
     impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSession {
+        fn begin_cow_write_checked(
+            &self,
+            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+            original: novarocks_spi::connector::ConnectorOriginalResultScope,
+            existing_caller_upper: u64,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorCowBeginPlan,
+            novarocks_spi::connector::ConnectorCowBeginFailure,
+        > {
+            // Test-only scripted provider: the fixture owns its finite graph.
+            if let Err(cause) = original.check_before_growth(existing_caller_upper) {
+                return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                    cause.into(),
+                    original,
+                ));
+            }
+            match self.begin_write(request) {
+                Ok(plan) => Ok(novarocks_spi::connector::ConnectorCowBeginPlan::new(
+                    plan,
+                    original,
+                    existing_caller_upper,
+                )),
+                Err(cause) => Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                    cause.into(),
+                    original,
+                )),
+            }
+        }
+
         fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.binding_key
         }

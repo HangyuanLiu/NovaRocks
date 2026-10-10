@@ -15,8 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optional small HMS correctness preflight. This does not replace the large CL input.
+//! Optional small readonly HMS preflight. This does not replace the large CL input.
 use super::connector::require_three_backends;
+use super::hms_bulk_readonly_native::{
+    HmsRegistration, finish_evidence_errors, install_credential_overlays, register,
+    save_failure_diagnostic,
+};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Result, bail, ensure};
@@ -188,9 +192,9 @@ impl Scenario for HmsClassificationPreflight {
     fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
         self.remaining()?;
         let mut launch = ScenarioLaunchConfig::default();
-        // The companion owner supplies only the exact existing role references.
-        // The combined base config retains both metadata/data credentials;
-        // the harness projects each role's own credential purpose.
+        // The fresh owner supplies a provider-neutral base. Use exactly the bulk
+        // FE metadata / BE data overlays, never a combined duplicate credential.
+        install_credential_overlays(&mut launch)?;
         for name in SECRET_NAMES {
             let value = std::env::var(name)
                 .map_err(|_| anyhow::anyhow!("HMS fixture credential reference is unavailable"))?;
@@ -221,13 +225,29 @@ impl Scenario for HmsClassificationPreflight {
         let mut facts = json!({"schema_version":1,"scope":"small-hms-classification-only", "assertions":"pending",
             "launch_identities":identities, "parent_freeze_sha256":self.input.parent_freeze_sha256,
             "pre_native_oracle_sha256":self.input.pre_native_oracle_sha256,
-            "mutation_rpc_count":"unobserved; source/component pre-mutation guarantee only"});
+            "mutation_operations":"excluded: IRU-7 owns HMS mutation correctness"});
         let receipt = context
             .scenario_root()
             .join("hms-classification-assertions.json");
         std::fs::write(&receipt, serde_json::to_vec_pretty(&facts)?)?;
         let assertions: Result<()> = (|| {
-            facts["phase"] = json!("connect");
+            facts["phase"] = json!("same-bounded-bulk-register");
+            let input = HmsRegistration {
+                catalog: &self.input.catalog_name,
+                namespace: &self.input.namespace,
+                hms_uri: &self.input.hms_uri,
+                warehouse: &self.input.warehouse,
+                object_store_endpoint: &self.input.object_store_endpoint,
+            };
+            facts["registration"] = register(
+                &input,
+                context.mysql_user(),
+                context.mysql_port(),
+                self.assertions_deadline,
+            )?;
+            // Existing business checks have their own original client/session.
+            // Its USE below selects that session, not a second CREATE.
+            facts["phase"] = json!("post-registration-connect");
             let timeout = self.remaining()?.min(Duration::from_secs(15));
             let mut client =
                 mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout).map_err(
@@ -240,17 +260,6 @@ impl Scenario for HmsClassificationPreflight {
                 )?;
             let catalog = &self.input.catalog_name;
             let namespace = &self.input.namespace;
-            let sql = format!(
-                "CREATE EXTERNAL CATALOG {catalog} PROPERTIES (\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hive\",\"iceberg.catalog.hive.metastore.uris\"={},\"iceberg.catalog.warehouse\"={},\"aws.s3.endpoint\"={},\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"iceberg-test-data\",\"credential.object-store-metadata.generation\"=\"v1\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"iceberg-test-data\",\"credential.object-store-data.generation\"=\"v1\")",
-                sql_string(&self.input.hms_uri),
-                sql_string(&self.input.warehouse),
-                sql_string(&self.input.object_store_endpoint)
-            );
-            facts["phase"] = json!("create-catalog");
-            self.remaining()?;
-            client
-                .query_drop(sql)
-                .map_err(|error| safe_sql_error(&error))?;
             facts["phase"] = json!("use-namespace");
             self.remaining()?;
             client
@@ -282,36 +291,32 @@ impl Scenario for HmsClassificationPreflight {
             facts["phase"] = json!("show-views");
             self.remaining()?;
             facts["show_views"] = require_view_refusal(client.query_drop("SHOW VIEWS"))?;
-            facts["phase"] = json!("drop-database-force");
-            self.remaining()?;
-            facts["drop_database_force"] = require_view_refusal(
-                client.query_drop(format!("DROP DATABASE {catalog}.{namespace} FORCE")),
-            )?;
+            // IRU-7 owns HMS mutation correctness. This readonly preflight never
+            // issues DROP DATABASE; the external fixture owner checks unchanged
+            // metadata and performs its own cleanup after all native roles exit.
             self.remaining()?;
             facts["phase"] = json!("complete");
             Ok(())
         })();
-        if let Err(error) = &assertions {
-            // Every assertion error above is local fixed text or a redacted SQL/connection summary.
-            facts["failure_reason"] = json!(error.to_string());
+        let primary = assertions.err();
+        let diagnostic = primary
+            .as_ref()
+            .map(|error| save_failure_diagnostic(context.scenario_root(), error));
+        if let Some(Ok(summary)) = &diagnostic {
+            facts["failure_diagnostic"] = summary.clone();
         }
-        facts["assertions"] = json!(if assertions.is_ok() {
+        facts["assertions"] = json!(if primary.is_none() {
             "passed"
         } else {
             "failed"
         });
-        let save = std::fs::write(receipt, serde_json::to_vec_pretty(&facts)?);
-        match (assertions, save) {
-            (Ok(()), Ok(())) => {}
-            (Err(primary), Ok(())) => return Err(primary),
-            (Ok(()), Err(save)) => return Err(save.into()),
-            (Err(primary), Err(save)) => {
-                return Err(
-                    primary.context(format!("save HMS assertion receipt also failed: {save}"))
-                );
-            }
-        }
-        context.action("small HMS exact table projection and precise view/FORCE refusals passed; mutation RPC count unobserved");
+        // Actual primary + diagnostic/evidence IO sources survive role cleanup.
+        // No arbitrary source formatter is invoked for this receipt.
+        let saved = serde_json::to_vec_pretty(&facts)
+            .map_err(anyhow::Error::from)
+            .and_then(|raw| std::fs::write(receipt, raw).map_err(Into::into));
+        finish_evidence_errors(primary, diagnostic, saved)?;
+        context.action("small readonly HMS exact table projection and precise view refusal passed; HMS mutations excluded for IRU-7");
         Ok(())
     }
 }

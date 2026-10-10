@@ -344,7 +344,17 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         }
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
-    let provider_manifest = Arc::new(ServerProviderManifest::seal()?);
+    let provider_manifest = ServerProviderManifest::seal()?;
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    let provider_manifest = match std::env::var("NOVAROCKS_HMS_LISTING_OBSERVATION_CATALOG") {
+        Ok(name) => provider_manifest.with_hms_listing_probe(Arc::new(
+            novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe::new(&name)
+                .map_err(anyhow::Error::msg)?,
+        )),
+        Err(std::env::VarError::NotPresent) => provider_manifest,
+        Err(_) => anyhow::bail!("HMS observation catalog selection is not Unicode"),
+    };
+    let provider_manifest = Arc::new(provider_manifest);
     let runtime = init_process(process_config)?;
     // After `init_process`, because composing the authority is the first thing
     // this process reports about its own memory and logging is not installed
@@ -547,6 +557,24 @@ mod tests {
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={} build_identity={} hms_listing_observe=true",
+            novarocks_version::build_git_commit(),
+            novarocks_version::native_build_identity()
+        );
+        return;
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    if args.as_slice() == ["--mem-1-m07-closing-pressure-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_BUILD commit={} build_identity={} closing_pressure=true",
+            novarocks_version::build_git_commit(),
+            novarocks_version::native_build_identity()
+        );
+        return;
+    }
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     if args.as_slice() == ["--mem-1-m07-build-identity"] {
         println!(

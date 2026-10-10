@@ -36,6 +36,12 @@ use tokio::time::timeout as async_timeout;
 #[path = "mysql_stream/exact_result_reader.rs"]
 pub(crate) mod exact_result_reader;
 
+#[path = "mysql_stream/control_response.rs"]
+mod control_response;
+pub use control_response::{
+    BoundedCommandError, BoundedCommandOk, BoundedCommandResponse, CommandResponseFailure,
+};
+
 pub struct MysqlStream {
     stream: TcpStream,
 }
@@ -491,6 +497,7 @@ impl AsyncMysqlStream {
             pause,
             std::time::Instant::now() + self.timeout,
             false,
+            1,
         )
         .await
         .observation
@@ -506,7 +513,17 @@ impl AsyncMysqlStream {
         )>,
         original_deadline: std::time::Instant,
     ) -> OwnedTextResultObservation {
-        self.observe_text_query_kernel_until(sql, read_delay, pause, original_deadline, true)
+        self.observe_text_query_kernel_until(sql, read_delay, pause, original_deadline, true, 1)
+            .await
+    }
+    /// Observe the frozen three-column listing on the original socket and clock.
+    /// This does not relax the existing one-column owned observer.
+    pub(crate) async fn observe_three_column_text_query_owned_until(
+        &mut self,
+        sql: &str,
+        original_deadline: std::time::Instant,
+    ) -> OwnedTextResultObservation {
+        self.observe_text_query_kernel_until(sql, Duration::ZERO, None, original_deadline, true, 3)
             .await
     }
     async fn observe_text_query_kernel_until(
@@ -519,6 +536,7 @@ impl AsyncMysqlStream {
         )>,
         original_deadline: std::time::Instant,
         strict_owned: bool,
+        expected_owned_columns: u64,
     ) -> OwnedTextResultObservation {
         let started = std::time::Instant::now();
         let mut observation = TextResultObservation::default();
@@ -555,8 +573,8 @@ impl AsyncMysqlStream {
             );
             if strict_owned {
                 ensure!(
-                    columns == 1,
-                    "owned original observer requires one frozen column"
+                    columns == expected_owned_columns,
+                    "owned original observer column count differs from its frozen count"
                 );
             }
             observation.columns = columns;
@@ -636,6 +654,12 @@ impl AsyncMysqlStream {
                         }
                         if scratch[0] == 0xfe && length < 9 {
                             validate_observation_eof(&scratch[..count])?;
+                            if strict_owned {
+                                ensure!(
+                                    std::time::Instant::now() < original_deadline,
+                                    "original absolute deadline expired before result completion"
+                                );
+                            }
                             return Ok::<(), anyhow::Error>(());
                         }
                         observation
@@ -1824,3 +1848,7 @@ pub(crate) mod root_reply_test_peer {
 #[cfg(test)]
 #[path = "mysql_stream_owned_until_tests.rs"]
 mod owned_until_tests;
+
+#[cfg(test)]
+#[path = "mysql_stream/three_column_tests.rs"]
+mod three_column_tests;

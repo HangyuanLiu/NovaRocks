@@ -9171,9 +9171,7 @@ mod tests {
             .argument_types
             .iter()
             .map(|argument| match argument {
-                novarocks_functions::FunctionArgumentType::Value(value) => {
-                    value.data_type.clone()
-                }
+                novarocks_functions::FunctionArgumentType::Value(value) => value.data_type.clone(),
                 novarocks_functions::FunctionArgumentType::Lambda { .. } => {
                     panic!("aggregate update arguments cannot be lambdas")
                 }

@@ -178,6 +178,34 @@ pub struct TypedPartition {
     unpartitioned: bool,
 }
 
+/// Private provider construction failure. Preserve the actual callback/semantic
+/// objects without allocating or formatting either payload for presentation.
+pub(crate) enum PartitionBindFailure<E> {
+    Semantic(Error),
+    Original(E),
+}
+impl<E> std::fmt::Debug for PartitionBindFailure<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Semantic(_) => "TypedPartition::Semantic",
+            Self::Original(_) => "TypedPartition::Original",
+        })
+    }
+}
+impl<E> std::fmt::Display for PartitionBindFailure<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for PartitionBindFailure<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Semantic(error) => Some(error),
+            Self::Original(error) => Some(error),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PartitionTypeBinding {
     fields: Arc<[(i32, PrimitiveType)]>,
@@ -211,43 +239,76 @@ impl TypedPartition {
         partition_type: &StructType,
         tuple: &Struct,
     ) -> Result<Self> {
-        validate_partition_type(spec, partition_type)?;
+        match Self::bind_type_checked(
+            spec,
+            partition_type,
+            tuple,
+            |_, _| Ok::<(), std::convert::Infallible>(()),
+            || Ok::<(), std::convert::Infallible>(()),
+        ) {
+            Ok(partition) => Ok(partition),
+            Err(PartitionBindFailure::Semantic(error)) => Err(error),
+            Err(PartitionBindFailure::Original(never)) => match never {},
+        }
+    }
+
+    /// Private COW hook: the original validator precedes prospective own growth
+    /// authorization, and every original cell checks the same active owner.
+    /// Callers retain their original activity/window through all output holders.
+    pub(crate) fn bind_type_checked<E>(
+        spec: &PartitionSpec,
+        partition_type: &StructType,
+        tuple: &Struct,
+        mut prospective: impl FnMut(&StructType, &Struct) -> std::result::Result<(), E>,
+        mut active: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Self, PartitionBindFailure<E>> {
+        validate_partition_type(spec, partition_type).map_err(PartitionBindFailure::Semantic)?;
         if spec.spec_id() < 0 || partition_type.fields().len() != tuple.fields().len() {
-            return Err(Error::new(
+            return Err(PartitionBindFailure::Semantic(Error::new(
                 Kind::InvalidPartition,
                 "Iceberg partition spec or tuple arity is invalid",
-            ));
+            )));
         }
+        // Required, same-request prospective check: no Vec or CanonicalScalar
+        // backing has been constructed yet. This is not a second validator.
+        prospective(partition_type, tuple).map_err(PartitionBindFailure::Original)?;
+        active().map_err(PartitionBindFailure::Original)?;
         let mut fields = Vec::with_capacity(tuple.fields().len());
         let mut values = Vec::with_capacity(tuple.fields().len());
         for (field, value) in partition_type.fields().iter().zip(tuple.fields()) {
+            active().map_err(PartitionBindFailure::Original)?;
             let Type::Primitive(value_type) = field.field_type.as_ref() else {
-                return Err(Error::new(
+                return Err(PartitionBindFailure::Semantic(Error::new(
                     Kind::InvalidPartition,
                     "Iceberg partition field is not primitive",
-                ));
+                )));
             };
             let value = match value {
                 None => None,
-                Some(Literal::Primitive(value)) => {
-                    Some(CanonicalScalar::from_literal(value, value_type)?)
-                }
+                Some(Literal::Primitive(value)) => Some(
+                    CanonicalScalar::from_literal(value, value_type)
+                        .map_err(PartitionBindFailure::Semantic)?,
+                ),
                 Some(_) => {
-                    return Err(Error::new(
+                    return Err(PartitionBindFailure::Semantic(Error::new(
                         Kind::InvalidPartition,
                         "Iceberg partition value is not primitive",
-                    ));
+                    )));
                 }
             };
             fields.push((field.id, value_type.clone()));
             values.push(value);
         }
-        Ok(Self {
+        // Check again before the two Arc allocations and before publication.
+        active().map_err(PartitionBindFailure::Original)?;
+        let partition = Self {
             spec_id: spec.spec_id(),
             fields: fields.into(),
             values: values.into(),
             unpartitioned: spec.is_unpartitioned(),
-        })
+        };
+        active().map_err(PartitionBindFailure::Original)?;
+        Ok(partition)
     }
 
     pub const fn spec_id(&self) -> i32 {
@@ -638,16 +699,29 @@ impl DeleteObservation {
     pub fn from_manifests(
         manifests: impl IntoIterator<Item = ManifestDeleteObservation>,
     ) -> Result<Self> {
+        match Self::from_manifests_checked(manifests, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(value) => Ok(value),
+            Err(super::ConstructionFailure::Semantic(error)) => Err(error),
+            Err(super::ConstructionFailure::Original(never)) => match never {},
+        }
+    }
+    pub(crate) fn from_manifests_checked<E>(
+        manifests: impl IntoIterator<Item = ManifestDeleteObservation>,
+        mut active: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Self, super::ConstructionFailure<E>> {
+        active().map_err(super::ConstructionFailure::Original)?;
         let mut paths = HashSet::new();
         let mut dv_targets = HashSet::new();
         let mut facts = Vec::new();
         for manifest in manifests {
+            active().map_err(super::ConstructionFailure::Original)?;
             require_path(&manifest.manifest_path)?;
             // Java's manifest-list path dedup occurs before reading entries.
             if !paths.insert(Arc::clone(&manifest.manifest_path)) {
                 continue;
             }
             for (entry_ordinal, entry) in manifest.entries.into_iter().enumerate() {
+                active().map_err(super::ConstructionFailure::Original)?;
                 let Some(sequence) = entry.sequence.live_sequence()? else {
                     continue;
                 };
@@ -664,7 +738,8 @@ impl DeleteObservation {
                         return Err(Error::new(
                             Kind::MultipleDeletionVectors,
                             format!("multiple live deletion vector entries target {exact_target}"),
-                        ));
+                        )
+                        .into());
                     }
                 }
                 fact.provenance = Some(ManifestEntryProvenance {
@@ -674,6 +749,7 @@ impl DeleteObservation {
                 facts.push(Arc::new(fact));
             }
         }
+        active().map_err(super::ConstructionFailure::Original)?;
         Ok(Self {
             facts,
             observed_manifest_count: paths.len(),
@@ -1013,3 +1089,7 @@ impl ReadDomain {
         &self.endpoint
     }
 }
+
+#[cfg(test)]
+#[path = "typed_partition_checked_tests.rs"]
+mod typed_partition_checked_tests;

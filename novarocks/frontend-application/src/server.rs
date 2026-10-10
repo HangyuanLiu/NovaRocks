@@ -24,6 +24,8 @@ use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
 use tracing::info;
 
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+mod closing_pressure_fixture;
 #[cfg(feature = "mem-1-m07-exact-mysql-write")]
 mod exact_mysql_write_fixture;
 #[cfg(feature = "mem-1-m07-root-observation")]
@@ -109,6 +111,17 @@ pub struct FrontendApplicationOpenConfig {
     pub native_transport: FrontendNativeTransport,
 }
 
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+#[path = "server/hms_admission_observation.rs"]
+mod hms_admission_observation;
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub use hms_admission_observation::HmsListingObservationSetup;
+
+/// Feature-only observer supplied by Server; it owns no provider capability.
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub type HmsListingObservationHandler =
+    Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, &'static str> + Send + Sync>;
+
 /// Inputs for the Frontend-owned management listener.
 #[derive(Clone)]
 pub struct FrontendManagementConfig {
@@ -121,6 +134,8 @@ pub struct FrontendManagementConfig {
     /// This process's allocator and physical memory readings for `/metrics`;
     /// `None` exports no process memory series.
     pub process_memory: Option<crate::metrics::FrontendProcessMemoryObservation>,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub hms_listing_observation: Option<HmsListingObservationSetup>,
 }
 
 /// Inputs for serving one ready Frontend application through native and MySQL
@@ -797,6 +812,8 @@ pub struct FrontendManagementServer {
     island_reader: Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
     convergence_reader: Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
     metrics_http_server: crate::metrics::MetricsHttpServer,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    hms_admission_observation: Option<Arc<hms_admission_observation::HmsAdmissionObservation>>,
 }
 
 pub fn start_frontend_management_server(
@@ -817,6 +834,11 @@ pub fn start_frontend_management_server(
     let management_convergence_reader: Arc<
         dyn crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader,
     > = convergence_reader.clone();
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    let hms_admission_observation = config
+        .hms_listing_observation
+        .as_ref()
+        .map(hms_admission_observation::HmsAdmissionObservation::new);
     let metrics_http_server = crate::metrics::MetricsHttpServer::start(
         &config.bind_host,
         config.http_port,
@@ -825,6 +847,10 @@ pub fn start_frontend_management_server(
         management_island_reader,
         Some(management_convergence_reader),
         Arc::clone(&config.memory_authority),
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        hms_admission_observation
+            .as_ref()
+            .map(|owner| owner.handler()),
     )
     .map_err(FrontendApplicationError::server)?;
     Ok(FrontendManagementServer {
@@ -832,11 +858,21 @@ pub fn start_frontend_management_server(
         island_reader,
         convergence_reader,
         metrics_http_server,
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        hms_admission_observation,
     })
 }
 
 impl FrontendManagementServer {
     pub fn install(&self, host: &FrontendApplicationHost) -> Result<(), FrontendApplicationError> {
+        // The original role runner calls this after opening its original Host
+        // and before creating role products/admission observers/SQL readiness.
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        if let Some(owner) = self.hms_admission_observation.as_ref() {
+            owner
+                .install(&host.catalog_runtime_projection())
+                .map_err(FrontendApplicationError::server)?;
+        }
         self.serving_reader
             .install(host.serving_snapshot_reader())
             .map_err(|error| {
@@ -860,6 +896,19 @@ impl FrontendManagementServer {
             })
     }
 
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    fn require_hms_admission_projection(
+        &self,
+        host: &FrontendApplicationHost,
+    ) -> Result<(), FrontendApplicationError> {
+        if let Some(owner) = self.hms_admission_observation.as_ref() {
+            owner
+                .require_installed(&host.catalog_runtime_projection())
+                .map_err(FrontendApplicationError::server)?;
+        }
+        Ok(())
+    }
+
     pub fn poll_failure(&mut self) -> Result<Option<String>, FrontendApplicationError> {
         self.metrics_http_server
             .poll_failure()
@@ -881,6 +930,8 @@ pub async fn serve_ready_frontend_session_factory<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    management_server.require_hms_admission_projection(host)?;
     let mut report_server = host.start_report_server_from_host(
         &config.report_bind_host,
         config.report_grpc_port,
@@ -945,7 +996,8 @@ where
     let server_result = run_mysql_with_listener_supervision(
         #[cfg(any(
             feature = "mem-1-m07-exact-mysql-write",
-            feature = "mem-1-m07-root-observation"
+            feature = "mem-1-m07-root-observation",
+            feature = "mem-1-m07-closing-pressure"
         ))]
         Arc::clone(&config.native_trust),
         config.mysql_listener,
@@ -976,7 +1028,8 @@ where
 async fn run_mysql_with_listener_supervision<F>(
     #[cfg(any(
         feature = "mem-1-m07-exact-mysql-write",
-        feature = "mem-1-m07-root-observation"
+        feature = "mem-1-m07-root-observation",
+        feature = "mem-1-m07-closing-pressure"
     ))]
     native_trust: Arc<NativeTrust>,
     mysql_listener: ResolvedMysqlListenerSettings,
@@ -994,6 +1047,27 @@ where
 {
     #[cfg(feature = "mem-1-m07-root-observation")]
     root_observation_identity::emit(&native_trust)?;
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    let pressure = closing_pressure_fixture::bind_from_environment(
+        &native_trust,
+        host.workload_observation(),
+    )?;
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    if let Some(fixture) = pressure {
+        return closing_pressure_fixture::serve(
+            fixture,
+            mysql_listener,
+            session_factory,
+            client_connections,
+            shutdown,
+            report_server,
+            management_server,
+            host,
+            drain_timeout,
+            cleanup_timeout,
+        )
+        .await;
+    }
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     if let Some(fixture) = exact_mysql_write_fixture::bind_from_environment(&native_trust)? {
         return exact_mysql_write_fixture::serve(
@@ -1212,12 +1286,14 @@ fn combine_server_and_shutdown(
         (Err(server_error), Err(shutdown_error)) => {
             #[cfg(any(
                 feature = "mem-1-m07-exact-mysql-write",
-                feature = "mem-1-m07-root-observation"
+                feature = "mem-1-m07-root-observation",
+                feature = "mem-1-m07-closing-pressure"
             ))]
             return Err(server_error.with_role_cleanup(shutdown_error));
             #[cfg(not(any(
                 feature = "mem-1-m07-exact-mysql-write",
-                feature = "mem-1-m07-root-observation"
+                feature = "mem-1-m07-root-observation",
+                feature = "mem-1-m07-closing-pressure"
             )))]
             Err(server_error.with_cleanup_context(shutdown_error))
         }

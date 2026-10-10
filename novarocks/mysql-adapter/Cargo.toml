@@ -8,6 +8,8 @@ license.workspace = true
 workspace = true
 
 [features]
+# Private finite Closing pressure instrumentation; default-off and independent of the exact fixture.
+mem-1-m07-closing-pressure = ["dep:sha2"]
 mem-1-m07-exact-mysql-write = ["dep:sha2", "novarocks-query-application/mem-1-m07-exact-mysql-write"]
 
 [dependencies]

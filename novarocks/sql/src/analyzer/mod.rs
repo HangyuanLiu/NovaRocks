@@ -765,11 +765,12 @@ impl<'a> AnalyzerContext<'a> {
             (Some(current_rel), current_scope)
         };
 
+        // Finish FROM recursion before allocating the SELECT analysis frame.
+        // Nested derived tables must not retain every outer projection,
+        // grouping and subquery-rewrite temporary on the planning stack.
         self.analyze_select_after_from(select, from, scope)
     }
 
-    // Keep the SELECT tail out of the recursive FROM-dispatch frame. Nested
-    // derived relations finish resolving before these large locals exist.
     #[inline(never)]
     fn analyze_select_after_from(
         &self,
@@ -6431,9 +6432,13 @@ mod tests {
             let query = parse_native_query(sql).expect("parse metadata ORDER BY");
             let (resolved, registry, mut factory) =
                 analyze(&query, &TestCatalog, "default").expect("analyze metadata ORDER BY");
-            let logical_plan =
-                crate::planner::logical::build::plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded())
-                    .expect("plan metadata ORDER BY");
+            let logical_plan = crate::planner::logical::build::plan_query(
+                resolved,
+                registry,
+                &mut factory,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("plan metadata ORDER BY");
             let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
             let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
                 &logical_plan,

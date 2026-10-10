@@ -591,7 +591,14 @@ impl FrontendQueryCompiler {
                 Arc::clone(&bindings),
                 connector_context.clone(),
                 current_catalog,
-            ),
+                scope,
+                execution.result_capacity().cloned().ok_or_else(|| {
+                    FrontendQueryCompilerError::Engine(
+                        "completion facts require the admitted result capacity".to_owned(),
+                    )
+                })?,
+            )
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
             crate::query_execution::compiler::typed_connector_session()
                 .map_err(FrontendQueryCompilerError::Engine)?,
         );
@@ -679,7 +686,14 @@ impl FrontendQueryCompiler {
                 Arc::clone(&bindings),
                 connector_context.clone(),
                 current_catalog,
-            ),
+                scope,
+                execution.result_capacity().cloned().ok_or_else(|| {
+                    FrontendQueryCompilerError::Engine(
+                        "completion facts require the admitted result capacity".to_owned(),
+                    )
+                })?,
+            )
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
             crate::query_execution::compiler::typed_connector_session()
                 .map_err(FrontendQueryCompilerError::Engine)?,
         );
@@ -852,7 +866,14 @@ impl FrontendQueryCompiler {
                 Arc::clone(&bindings),
                 connector_planning_context.request().clone(),
                 current_catalog,
-            ),
+                scope,
+                execution.result_capacity().cloned().ok_or_else(|| {
+                    FrontendQueryCompilerError::Engine(
+                        "completion facts require the admitted result capacity".to_owned(),
+                    )
+                })?,
+            )
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
             crate::query_execution::compiler::typed_connector_session()
                 .map_err(FrontendQueryCompilerError::Engine)?,
         );

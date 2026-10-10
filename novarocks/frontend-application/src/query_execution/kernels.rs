@@ -637,6 +637,7 @@ impl SessionCatalogPort for SessionCatalogResolver {
     async fn external_namespace_exists(
         &self,
         request: novarocks_spi::connector::ConnectorRequestContext,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError> {
@@ -644,7 +645,7 @@ impl SessionCatalogPort for SessionCatalogResolver {
         let catalog_name = catalog_name.to_owned();
         let namespace_name = namespace_name.to_owned();
         self.connector_blocking_io
-            .spawn_ordinary(move || {
+            .spawn_admitted(capacity.scope(), &capacity.window_alias(), move || {
                 crate::connector::validate_request_context(&request)?;
                 crate::connector::metadata_namespace_exists(
                     connector_control.as_ref(),
@@ -653,10 +654,16 @@ impl SessionCatalogPort for SessionCatalogResolver {
                     &namespace_name,
                 )
             })
+            .map_err(|error| {
+                QueryServiceError::new(QueryServiceErrorKind::Unavailable, error.to_string())
+            })?
             .finish()
             .await
             .map_err(|error| {
-                QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string())
+                QueryServiceError::new(
+                    QueryServiceErrorKind::Internal,
+                    self.connector_blocking_io.present_and_retire_failure(error),
+                )
             })?
             .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
     }
@@ -724,12 +731,25 @@ mod session_catalog_tests {
         let request = crate::connector::connector_request_context(None, cancellation.view())
             .expect("connector request context");
         cancellation.request_stop();
+        let (control, root, window) = crate::task_execution::blocking_io::tests::admitted_class(
+            novarocks_workload_control::ResultWindowClass::Local,
+        );
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(), window.retain_alias(),
+        ).unwrap();
         let error = resolver
-            .external_namespace_exists(request, "warehouse", "analytics")
+            .external_namespace_exists(request, &capacity, "warehouse", "analytics")
             .await
             .expect_err("cancelled request must not reach the provider");
         release.send(()).expect("release held call");
         held.finish().await.expect("held call completes");
+        drop(capacity);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        crate::task_execution::blocking_io::tests::until(|| control.snapshot().scopes.is_empty());
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
         assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
         assert!(error.message().contains("connector request was cancelled"));
     }

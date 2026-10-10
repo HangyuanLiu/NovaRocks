@@ -41,6 +41,8 @@ pub struct IcebergCowPendingReadSource {
     pub(crate) metadata: crate::iceberg::spec::TableMetadataRef,
     pub(crate) access: Arc<crate::loaded_table::IcebergAttemptTableAccess>,
     pub(crate) read_file: Arc<crate::read_model::IcebergReadFile>,
+    // Must outlive every moved read-file fact and every shared source alias.
+    original_guard: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 
 impl std::fmt::Debug for IcebergCowPendingReadSource {
@@ -54,6 +56,14 @@ impl std::fmt::Debug for IcebergCowPendingReadSource {
 }
 
 impl IcebergCowPendingReadSource {
+    pub(crate) fn with_original_guard(
+        mut self,
+        guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    ) -> Self {
+        self.original_guard = Some(guard);
+        self
+    }
+
     /// Called after the ONE original branch/source author has completed.
     /// Metadata is an Arc loan of the original SDK table, and read_file moves
     /// original fields/remainder from that table's ReadSnapshot observation.
@@ -86,6 +96,7 @@ impl IcebergCowPendingReadSource {
             metadata,
             access,
             read_file: Arc::new(read_file),
+            original_guard: None,
         })
     }
 }

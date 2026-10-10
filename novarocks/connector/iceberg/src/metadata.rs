@@ -21,6 +21,8 @@
 //! binding. It owns opaque table payloads and uses only the catalog client and
 //! runtime injected into that exact generation.
 
+pub(crate) mod existing_serde_projection;
+
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
@@ -1392,6 +1394,213 @@ pub(crate) fn frozen_copy_on_write_source_payload(
     })
 }
 
+/// The same frozen payload constructor, using the original checked serializer
+/// for Nova's metadata JSON/default/schema outputs. The returned guard moves
+/// into the source's encoded backing before any handle can escape.
+pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
+    catalog: &ConnectorInstanceId,
+    namespace: &str,
+    table_name: &str,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot_id: i64,
+    file: IcebergDataFileInfo,
+    scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
+) -> Result<
+    (
+        IcebergTablePayload,
+        novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    ),
+    novarocks_spi::connector::ConnectorCowBeginCause,
+> {
+    use crate::commit::write_stack::control::cow_begin::{add, mul, projection_error};
+    use std::mem::size_of;
+    scope.active()?;
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        corrupt("Iceberg copy-on-write base snapshot is absent from its metadata")
+    })?;
+    let schema = snapshot.schema(metadata).map_err(|e| {
+        corrupt(format!(
+            "resolve Iceberg copy-on-write snapshot schema: {e}"
+        ))
+    })?;
+    let plan = existing_serde_projection::Plan::inspect(metadata, &schema, scope)
+        .map_err(projection_error)?;
+    let mut other = (size_of::<IcebergTablePayload>()
+        + size_of::<IcebergTableInfo>()
+        + size_of::<IcebergDataFileInfo>()) as u64;
+    for text in [
+        catalog.as_str(),
+        namespace,
+        namespace,
+        table_name,
+        table_name,
+        metadata.location(),
+    ] {
+        other = add(other, text.len() as u64)?;
+    }
+    other = add(other, 36)?;
+    // Fixed lineage identities plus growable metadata/hidden-name vectors.
+    // Reserve old+new Vec growth and every property-derived String before the
+    // original builders perform their case folding/splitting.
+    let identities = ["_file", "_pos", "_row_id", "_last_updated_sequence_number"];
+    for name in identities {
+        other = add(
+            other,
+            add(name.len() as u64, (2 * size_of::<String>()) as u64)?,
+        )?;
+    }
+    let node = (size_of::<usize>()
+        + 4
+        + 11 * 2 * size_of::<String>()
+        + 12 * size_of::<usize>()
+        + 9 * (std::mem::align_of::<usize>() - 1)) as u64;
+    for (key, value) in metadata.properties() {
+        let chars = value.split(',').count() as u64;
+        other = add(
+            other,
+            add(
+                mul((key.len() + value.len()) as u64, 3)?,
+                add(mul(chars, (3 * size_of::<String>()) as u64)?, mul(node, 2)?)?,
+            )?,
+        )?;
+    }
+    let shape = plan.shape();
+    let prospective = add(
+        add(
+            shape.owned_upper().map_err(projection_error)?,
+            shape.maximum_field_temporary,
+        )?,
+        other,
+    )?;
+    let existing = scope.upper();
+    // The same prospective recipe authorizes the complete overlap once; it is
+    // carried conservatively through the subsequent branch and compiler owners.
+    let mut checked = plan
+        .authorize(1, existing, other, scope)
+        .map_err(projection_error)?;
+    let output = checked.build_one().map_err(projection_error)?;
+    scope.cover_total(add(existing, prospective)?)?;
+    let (serialized_metadata, schema, guard) = output.into_guarded_parts();
+    let payload = IcebergTablePayload {
+        namespace: namespace.to_string(),
+        table: table_name.to_string(),
+        metadata_location: None,
+        table_info: Some(IcebergTableInfo {
+            catalog: catalog.as_str().to_string(),
+            namespace: namespace.to_string(),
+            table: table_name.to_string(),
+            table_uuid: Some(metadata.uuid().to_string()),
+            current_snapshot_id: Some(snapshot_id),
+            schema_id: snapshot
+                .schema(metadata)
+                .map_err(|_| corrupt("Iceberg copy-on-write snapshot schema changed"))?
+                .schema_id(),
+            location: metadata.location().to_string(),
+            schema,
+            serialized_metadata: Some(serialized_metadata),
+            serialized_metadata_rows: None,
+        }),
+        metadata_columns: metadata_column_names(metadata),
+        metadata_table_type: None,
+        prepared_files: Vec::new(),
+        explicit_files: Some(vec![file]),
+        row_mutation_frozen_source: true,
+        logical_type_columns: logical_type_columns(metadata.properties()),
+        hidden_columns: hidden_internal_columns(metadata.properties()),
+    };
+    scope.active()?;
+    Ok((payload, guard))
+}
+
+/// Borrowed layout for the Nova-owned Arrow projection/annotation passes.
+/// Library schema conversion internals remain under the original call owner;
+/// every explicit Field/name/metadata clone and vector pass is included here.
+pub(crate) fn cow_projected_schema_upper(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot_id: i64,
+    scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
+) -> Result<u64, novarocks_spi::connector::ConnectorCowBeginCause> {
+    use crate::commit::write_stack::control::cow_begin::{add, mul, projection_error};
+    use crate::iceberg::spec::{NestedField, Type};
+    use std::mem::size_of;
+    fn field_upper(
+        field: &NestedField,
+        scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
+    ) -> Result<u64, novarocks_spi::connector::ConnectorCowBeginCause> {
+        scope.active()?;
+        let defaults = existing_serde_projection::count(field, scope).map_err(projection_error)?;
+        let own =
+            (size_of::<Field>() + 2 * size_of::<usize>() + 3 * size_of::<Arc<Field>>()) as u64;
+        // Arrow field metadata includes field ids, defaults, logical-domain
+        // facts and hidden markers. The public map's next resize coexistence
+        // is covered by 16 possible entries and controls per field/pass.
+        let mut n = add(
+            own,
+            add(
+                field.name.len() as u64,
+                add(
+                    defaults,
+                    crate::read_snapshot::cow_capture::geometry::hash_max::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                        (String, String),
+                    >(16)
+                    .map_err(crate::commit::write_stack::control::cow_begin::geometry_error)?,
+                )?,
+            )?,
+        )?;
+        match field.field_type.as_ref() {
+            Type::Struct(ty) => {
+                for child in ty.fields() {
+                    n = add(n, field_upper(child, scope)?)?;
+                }
+            }
+            Type::List(ty) => {
+                n = add(n, field_upper(&ty.element_field, scope)?)?;
+            }
+            Type::Map(ty) => {
+                n = add(n, field_upper(&ty.key_field, scope)?)?;
+                n = add(n, field_upper(&ty.value_field, scope)?)?;
+                n = add(
+                    n,
+                    (size_of::<Field>()
+                        + 3 * size_of::<Arc<Field>>()
+                        + 2 * size_of::<usize>()
+                        + "entries".len()) as u64,
+                )?;
+            }
+            Type::Primitive(_) => {}
+        }
+        Ok(n)
+    }
+    let schema = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| corrupt("Iceberg exact table source snapshot is absent"))?
+        .schema(metadata)
+        .map_err(|_| corrupt("Iceberg exact table source schema is unavailable"))?;
+    let mut n = (size_of::<arrow::datatypes::Schema>() + 2 * size_of::<usize>()) as u64;
+    for f in schema.as_struct().fields() {
+        n = add(n, field_upper(f, scope)?)?;
+    }
+    // SQL carrier adaptation, scalar-domain projection, default annotation,
+    // hidden annotation and final projection retain old/new graphs. Six whole
+    // layouts conservatively cover these actual passes, including metadata fields.
+    n = mul(n, 6)?;
+    for (key, value) in metadata.properties() {
+        n = add(n, mul((key.len() + value.len()) as u64, 6)?)?;
+    }
+    let scalar_nodes = metadata
+        .properties()
+        .values()
+        .try_fold(0u64, |n, s| add(n, s.len() as u64))?;
+    n = add(
+        n,
+        crate::commit::write_stack::control::cow_begin::tree_upper::<i32, (i64, i64)>(
+            scalar_nodes,
+        )?,
+    )?;
+    Ok(n)
+}
+
 /// The frozen target one staged write session opens on.
 ///
 /// A registered table is loaded from the catalog on every session; a staged one
@@ -1472,6 +1681,16 @@ pub(crate) fn projected_schema(
         .ok_or_else(|| corrupt("Iceberg table handle has no serialized metadata"))?;
     let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
+    projected_schema_with_metadata(table, projection, &metadata)
+}
+
+/// COW uses its SAME loaded, wire-normalized immutable metadata owner.
+/// The ordinary entry above keeps its original decode and error ordering.
+pub(crate) fn projected_schema_with_metadata(
+    table: &IcebergTablePayload,
+    projection: &[usize],
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<SchemaRef, ConnectorError> {
     let table_info = table
         .table_info
         .as_ref()
@@ -1485,12 +1704,12 @@ pub(crate) fn projected_schema(
         metadata
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| corrupt("Iceberg exact table source snapshot is absent"))?
-            .schema(&metadata)
+            .schema(metadata)
             .map_err(|error| corrupt(format!("resolve exact table source schema: {error}")))?
     } else {
         metadata.current_schema().clone()
     };
-    let declarations = crate::scalar_integer_domain::metadata_declarations(&metadata)?;
+    let declarations = crate::scalar_integer_domain::metadata_declarations(metadata)?;
     let storage = crate::scalar_integer_domain::apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(&storage_schema).map_err(corrupt)?,
         &storage_schema,
@@ -2666,3 +2885,7 @@ mod plan_splits_pruning_tests {
         assert_eq!(metrics.scan_units_planned, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "metadata/cow_borrowed_schema_tests.rs"]
+mod cow_borrowed_schema_tests;

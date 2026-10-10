@@ -193,6 +193,17 @@ impl WorkloadObservationHandle {
         snapshot(&self.inner)
     }
 
+    /// Copy only the four result-class counters under their original owner lock.
+    /// This does not enumerate scopes, retain windows, or grant capacity.
+    pub fn result_capacity_snapshot(&self) -> crate::ResultCapacitySnapshot {
+        self.inner.state.lock().unwrap().result_windows
+    }
+
+    /// Identity of the observed authority alone grants no access or capacity.
+    pub fn observes_scope(&self, scope: &WorkScope) -> bool {
+        Arc::ptr_eq(&self.inner, &scope.inner)
+    }
+
     /// Wait until no root responsibility remains. This is an observation-only
     /// convergence point for role supervision; it cannot admit, cancel, or
     /// complete work.

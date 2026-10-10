@@ -96,6 +96,8 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
 /// execution resources and BE never constructs FE credentials or control
 /// resources.
 pub struct ServerProviderManifest {
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    hms_listing_probe: Option<Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>>,
     contracts: SealedProviderRegistry,
     builders: Arc<[SealedProviderBuilder]>,
 }
@@ -146,9 +148,27 @@ impl ServerProviderManifest {
             );
         }
         Ok(Self {
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            hms_listing_probe: None,
             contracts,
             builders: Arc::from(builders),
         })
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn with_hms_listing_probe(
+        mut self,
+        probe: Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>,
+    ) -> Self {
+        self.hms_listing_probe = Some(probe);
+        self
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn hms_listing_probe(
+        &self,
+    ) -> Option<Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>> {
+        self.hms_listing_probe.clone()
     }
 
     pub const fn contracts(&self) -> &SealedProviderRegistry {
@@ -163,9 +183,29 @@ impl ServerProviderManifest {
         self.builders
             .iter()
             .map(|builder| {
-                let factory = (builder.control)(config, runtime.clone()).with_context(|| {
-                    format!("compose `{}` FE factory", builder.provider_id.as_str())
-                })?;
+                #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+                let observed = builder.provider_id.as_str()
+                    == novarocks_connector_iceberg::PROVIDER_ID
+                    && self.hms_listing_probe.is_some();
+                #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+                let observed = false;
+                let factory = if observed {
+                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+                    {
+                        Arc::new(
+                            compose_iceberg_control_factory(config, runtime.clone())?
+                                .with_hms_listing_probe(Arc::clone(
+                                    self.hms_listing_probe.as_ref().expect("selected probe"),
+                                )),
+                        ) as Arc<dyn ConnectorControlRoleBindingFactory>
+                    }
+                    #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+                    unreachable!("observation is feature-only")
+                } else {
+                    (builder.control)(config, runtime.clone()).with_context(|| {
+                        format!("compose `{}` FE factory", builder.provider_id.as_str())
+                    })?
+                };
                 validate_factory_identity(
                     "FE control",
                     &builder.provider_id,
@@ -250,14 +290,21 @@ fn build_iceberg_control_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
+    Ok(Arc::new(compose_iceberg_control_factory(config, runtime)?))
+}
+
+fn compose_iceberg_control_factory(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<IcebergControlRoleBindingFactory> {
     let metadata_binding =
         crate::composition::compose_iceberg_metadata_access_template(config, runtime.clone())?;
     let max_inflight = NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
         .ok_or_else(|| anyhow::anyhow!("catalog materialization max inflight must be nonzero"))?;
-    Ok(Arc::new(IcebergControlRoleBindingFactory::new(
+    Ok(IcebergControlRoleBindingFactory::new(
         IcebergMetadataResources::new(metadata_binding, runtime),
         max_inflight,
-    )))
+    ))
 }
 
 fn build_iceberg_execution_factory(

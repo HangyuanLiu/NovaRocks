@@ -137,12 +137,27 @@ pub struct DeleteCandidateIndex {
 
 impl DeleteCandidateIndex {
     pub fn try_new(domain: Arc<ReadDomain>, observation: DeleteObservation) -> Result<Self> {
+        match Self::try_new_checked(domain, observation, || {
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(value) => Ok(value),
+            Err(super::ConstructionFailure::Semantic(error)) => Err(error),
+            Err(super::ConstructionFailure::Original(never)) => match never {},
+        }
+    }
+    pub(crate) fn try_new_checked<E>(
+        domain: Arc<ReadDomain>,
+        observation: DeleteObservation,
+        mut active: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Self, super::ConstructionFailure<E>> {
+        active().map_err(super::ConstructionFailure::Original)?;
         let schema = domain.endpoint().schema()?;
         let partition_bindings = domain.endpoint().bind_partition_specs()?;
         let mut validated_groups = HashSet::new();
         let mut groups: HashMap<BucketKind, Vec<Arc<DeleteFact>>> = HashMap::new();
         let mut deletion_vectors = HashMap::new();
         for fact in observation.facts {
+            active().map_err(super::ConstructionFailure::Original)?;
             validate_partition_binding(&partition_bindings, fact.partition())?;
             let kind = match fact.kind() {
                 DeleteKind::Equality(fields) => {
@@ -168,7 +183,8 @@ impl DeleteCandidateIndex {
                         return Err(Error::new(
                             Kind::MultipleDeletionVectors,
                             "closed observation contains multiple DVs for one target",
-                        ));
+                        )
+                        .into());
                     }
                     continue;
                 }
@@ -189,6 +205,7 @@ impl DeleteCandidateIndex {
             deletion_vectors,
         };
         for (kind, members) in groups {
+            active().map_err(super::ConstructionFailure::Original)?;
             result.size.member_references += members.len();
             result.size.buckets += 1;
             let bucket = FrozenBucket::new(kind.clone(), members);
@@ -228,8 +245,10 @@ impl DeleteCandidateIndex {
         }
         order(&mut result.global_equality);
         for buckets in result.partition_equality.values_mut() {
+            active().map_err(super::ConstructionFailure::Original)?;
             order(buckets);
         }
+        active().map_err(super::ConstructionFailure::Original)?;
         Ok(result)
     }
 

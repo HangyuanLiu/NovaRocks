@@ -95,7 +95,12 @@ fn combine(
         (Ok(()), Ok(())) => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
         (Ok(()), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => Err(primary.with_cleanup_context(cleanup)),
+        (Err(primary), Err(cleanup)) => {
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            return Err(primary.with_role_cleanup(cleanup));
+            #[cfg(not(feature = "mem-1-m07-closing-pressure"))]
+            Err(primary.with_cleanup_context(cleanup))
+        }
     }
 }
 

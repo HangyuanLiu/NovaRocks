@@ -22,6 +22,8 @@ mod config;
 mod exact_mysql_target_binding;
 #[cfg(unix)]
 mod exact_native_admission;
+#[cfg(unix)]
+mod held_live_source_fence;
 mod performance;
 mod runner;
 pub mod scenario;

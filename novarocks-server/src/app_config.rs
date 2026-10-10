@@ -794,7 +794,11 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 /// read by more than the startup path, and a value that can never be honoured
 /// should be refused where it is written, not where it is first used.
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
-    crate::sdk_listing_profile::validate_current()?;
+    if config.cluster.role == ClusterRole::Fe {
+        let _report = crate::composition::validate_frontend_joint_startup(&config.runtime)?;
+    } else {
+        crate::sdk_listing_profile::validate_current()?;
+    }
     config.application.state_store_policy.resolve()?;
     Ok(())
 }
@@ -4727,6 +4731,30 @@ role = "leader"
                 "{error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod joint_startup_load_tests {
+    use super::*;
+
+    #[test]
+    fn fe_application_load_checks_unsupported_concurrency_before_composition() {
+        let mut config = NovaRocksConfig::default();
+        config.cluster.role = ClusterRole::Fe;
+        config.runtime.frontend_workload.concurrency_limit = 257;
+        assert!(validate_application_configuration(&config).is_err());
+        config.runtime.frontend_workload.concurrency_limit = 16;
+        validate_application_configuration(&config).expect("supported FE policy");
+    }
+
+    #[test]
+    fn backend_load_does_not_apply_frontend_workload_policy() {
+        let mut config = NovaRocksConfig::default();
+        config.cluster.role = ClusterRole::Be;
+        config.runtime.frontend_workload.concurrency_limit = 257;
+        validate_application_configuration(&config)
+            .expect("BE keeps its original listing validation");
     }
 }
 

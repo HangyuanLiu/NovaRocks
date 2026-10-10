@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use novarocks_catalog_application::{CatalogApplicationPort, ConnectorControlHost};
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::preparation::{
     CatalogFactPort, MaterializedViewFactPort, ProviderReadFactPort, QueryCompletionFactSource,
     StatisticsFactPort,
@@ -107,6 +108,7 @@ pub(crate) struct StatementFactScope {
     bindings: Arc<QueryTableBindingStore>,
     connector_context: ConnectorRequestContext,
     current_catalog: Option<Arc<str>>,
+    capacity: QueryResultCapacityBinding,
 }
 
 impl StatementFactScope {
@@ -114,12 +116,18 @@ impl StatementFactScope {
         bindings: Arc<QueryTableBindingStore>,
         connector_context: ConnectorRequestContext,
         current_catalog: Option<&str>,
-    ) -> Self {
-        Self {
+        work_scope: &novarocks_workload_control::WorkScope,
+        capacity: QueryResultCapacityBinding,
+    ) -> Result<Self, novarocks_workload_control::WorkError> {
+        if !capacity.window_alias().is_for_scope(work_scope) {
+            return Err(novarocks_workload_control::WorkError::Conflict);
+        }
+        Ok(Self {
             bindings,
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
-        }
+            capacity,
+        })
     }
 }
 
@@ -144,7 +152,7 @@ impl CatalogFactPort for FrontendCatalogFacts {
         let needs = needs.to_vec();
         let owners = self.owners.clone();
         let scope = self.scope.clone();
-        admitted(&self.owners, move || {
+        admitted(&self.owners, &self.scope.capacity, move || {
             let loader = iceberg_table_binding_loader(
                 owners.connector_control.as_ref(),
                 scope.connector_context.clone(),
@@ -230,7 +238,7 @@ impl StatisticsFactPort for FrontendStatisticsFacts {
         let needs = needs.to_vec();
         let owners = self.owners.clone();
         let scope = self.scope.clone();
-        admitted(&self.owners, move || {
+        admitted(&self.owners, &self.scope.capacity, move || {
             needs
                 .iter()
                 .map(|need| {
@@ -250,11 +258,12 @@ impl StatisticsFactPort for FrontendStatisticsFacts {
 /// Answers materialized-view discovery from the request-local inventory.
 pub(crate) struct FrontendMaterializedViewFacts {
     owners: CompletionFactOwners,
+    scope: StatementFactScope,
 }
 
 impl FrontendMaterializedViewFacts {
-    pub(crate) const fn new(owners: CompletionFactOwners) -> Self {
-        Self { owners }
+    pub(crate) const fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
+        Self { owners, scope }
     }
 }
 
@@ -270,7 +279,7 @@ impl MaterializedViewFactPort for FrontendMaterializedViewFacts {
     ) -> Result<Vec<MaterializedViewFact>, String> {
         let needs = needs.to_vec();
         let owners = self.owners.clone();
-        admitted(&self.owners, move || {
+        admitted(&self.owners, &self.scope.capacity, move || {
             Ok(needs
                 .iter()
                 .map(|need| {
@@ -291,17 +300,27 @@ impl MaterializedViewFactPort for FrontendMaterializedViewFacts {
 ///
 /// Losing the lane is not the owner's answer and must not be reported as one:
 /// a query that was refused admission never asked its question.
-async fn admitted<T, F>(owners: &CompletionFactOwners, call: F) -> Result<T, String>
+async fn admitted<T, F>(
+    owners: &CompletionFactOwners,
+    capacity: &QueryResultCapacityBinding,
+    call: F,
+) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
     owners
         .blocking
-        .spawn_ordinary(call)
+        .spawn_admitted(capacity.scope(), &capacity.window_alias(), call)
+        .map_err(|error| format!("frontend completion fact admission: {error}"))?
         .finish()
         .await
-        .map_err(|error| format!("frontend completion fact lane: {error}"))?
+        .map_err(|error| {
+            format!(
+                "frontend completion fact lane: {}",
+                owners.blocking.present_and_retire_failure(error)
+            )
+        })?
 }
 
 /// The fact source one statement's completion is driven with, with all four
@@ -317,6 +336,7 @@ pub(crate) fn frontend_fact_source(
         session,
         scope.connector_context.clone(),
         owners.blocking.clone(),
+        scope.capacity.clone(),
     ));
     statement_fact_source(owners, scope, provider_reads)
 }
@@ -334,8 +354,8 @@ pub(crate) fn statement_fact_source<A>(
 ) -> QueryCompletionFactSource<A> {
     QueryCompletionFactSource::new(
         Arc::new(FrontendCatalogFacts::new(owners.clone(), scope.clone())),
-        Arc::new(FrontendStatisticsFacts::new(owners.clone(), scope)),
-        Arc::new(FrontendMaterializedViewFacts::new(owners)),
+        Arc::new(FrontendStatisticsFacts::new(owners.clone(), scope.clone())),
+        Arc::new(FrontendMaterializedViewFacts::new(owners, scope)),
         provider_reads,
     )
 }
@@ -388,3 +408,6 @@ mod tests {
         assert!(error.contains("REST timeout"), "{error}");
     }
 }
+
+#[cfg(test)]
+mod held_port_tests;

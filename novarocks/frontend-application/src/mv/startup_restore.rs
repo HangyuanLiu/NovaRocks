@@ -74,7 +74,13 @@ impl FrontendMvStartupRestore {
 /// frontend graph alive after shutdown released it. Admission names its own
 /// catalog, so there is nothing to look up.
 pub(crate) struct FrontendMvCatalogAdmission {
-    admitted: std::sync::mpsc::Sender<novarocks_spi::connector::ConnectorInstanceId>,
+    admitted: std::sync::mpsc::Sender<AdmissionRequest>,
+}
+
+struct AdmissionRequest {
+    instance_id: novarocks_spi::connector::ConnectorInstanceId,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    sweep: Option<crate::catalog_application::admission_completion::Sweep>,
 }
 
 /// The ports one rediscovery sweep needs, owned by the worker that runs them.
@@ -102,7 +108,7 @@ impl FrontendMvCatalogAdmission {
         readiness: Arc<MvReadinessPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
-        let (admitted, requests) = std::sync::mpsc::channel();
+        let (admitted, requests) = std::sync::mpsc::channel::<AdmissionRequest>();
         let rediscovery = MvRediscovery {
             connector_control,
             catalog_application,
@@ -112,8 +118,14 @@ impl FrontendMvCatalogAdmission {
         std::thread::Builder::new()
             .name("nr-mv-rediscovery".to_string())
             .spawn(move || {
-                while let Ok(instance_id) = requests.recv() {
-                    rediscovery.rediscover(&instance_id);
+                while let Ok(request) = requests.recv() {
+                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+                    crate::catalog_application::admission_completion::run_original_sweep(
+                        request.sweep.as_ref(),
+                        || rediscovery.rediscover(&request.instance_id, request.sweep.as_ref()),
+                    );
+                    #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+                    rediscovery.rediscover(&request.instance_id);
                 }
             })
             .expect("spawn the MV rediscovery worker");
@@ -144,11 +156,29 @@ impl MvRediscovery {
     /// Rebuild one catalog's MV inventory from the lake, then register what it
     /// found. The two steps have one order: an MV is rediscovered before it
     /// can be registered.
-    fn rediscover(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
-        if let Err(error) = crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_catalogs(
+    fn rediscover(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")] sweep: Option<
+            &crate::catalog_application::admission_completion::Sweep,
+        >,
+    ) {
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        let result = crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_catalogs_observed(
             &self.rebuild_context(),
             std::slice::from_ref(instance_id),
-        ) {
+            sweep,
+        );
+        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+        let result = crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_catalogs(
+            &self.rebuild_context(),
+            std::slice::from_ref(instance_id),
+        );
+        if let Err(error) = result {
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            if let Some(sweep) = sweep {
+                sweep.failed();
+            }
             // Admission already happened; nothing here can unadmit it. The
             // affected targets quarantine themselves inside the sweep, so what
             // is left to report is the sweep failing as a whole.
@@ -160,6 +190,10 @@ impl MvRediscovery {
             return;
         }
         if let Err(error) = self.restore_targets() {
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            if let Some(sweep) = sweep {
+                sweep.failed();
+            }
             tracing::warn!(
                 catalog = instance_id.as_str(),
                 %error,
@@ -170,6 +204,22 @@ impl MvRediscovery {
 }
 
 impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvCatalogAdmission {
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    fn catalog_admitted_observed(
+        &self,
+        observation: &novarocks_catalog_application::CatalogRuntimeObservation,
+        sweep: Option<crate::catalog_application::admission_completion::Sweep>,
+    ) {
+        if let Err(error) = self.admitted.send(AdmissionRequest {
+            instance_id: observation.instance_id.clone(),
+            sweep,
+        }) {
+            if let Some(sweep) = error.0.sweep {
+                sweep.failed();
+            }
+        }
+    }
+
     fn catalog_admitted(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
         // Rediscovery reads the provider, and this call is inside catalog
         // convergence. Doing the reads here would make admitting one catalog
@@ -180,7 +230,11 @@ impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvCatalogA
         //
         // A closed channel means the role graph is gone, and there is nothing
         // left to rediscover for.
-        let _ = self.admitted.send(instance_id.clone());
+        let _ = self.admitted.send(AdmissionRequest {
+            instance_id: instance_id.clone(),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            sweep: None,
+        });
     }
 }
 

@@ -3324,7 +3324,7 @@ impl CrossProcessServerHandle {
         options: CrossProcessClusterOptions,
         proxy_config: CrossProcessNativeFaultProxyConfig,
     ) -> Result<Self> {
-        Self::launch_with_native_fault_options(options, proxy_config, None, None)
+        Self::launch_with_native_fault_options(options, proxy_config, None, None, None)
     }
 
     /// Harness-only one-shot RootReply fault route. Existing launch/config
@@ -3334,7 +3334,13 @@ impl CrossProcessServerHandle {
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault: CrossProcessRootReplyFaultConfig,
     ) -> Result<Self> {
-        Self::launch_with_native_fault_options(options, proxy_config, Some(root_reply_fault), None)
+        Self::launch_with_native_fault_options(
+            options,
+            proxy_config,
+            Some(root_reply_fault),
+            None,
+            None,
+        )
     }
 
     /// Explicit fixture-only check after preparing exact configs, before any role spawn.
@@ -3347,6 +3353,27 @@ impl CrossProcessServerHandle {
             CrossProcessNativeFaultProxyConfig::default(),
             None,
             Some(check),
+            None,
+        )
+    }
+
+    /// Opt-in held-scene source observation; the normal launch path is unchanged.
+    /// Each log callback borrows the original writer's spawn-time identity source.
+    pub fn launch_with_held_live_source_checks(
+        options: CrossProcessClusterOptions,
+        prelaunch_check: &dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>,
+        log_owner_check: &dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>,
+    ) -> Result<Self> {
+        ensure!(
+            options.cluster_size == 3,
+            "held live sources require exactly three backends"
+        );
+        Self::launch_with_native_fault_options(
+            options,
+            CrossProcessNativeFaultProxyConfig::default(),
+            None,
+            Some(prelaunch_check),
+            Some(log_owner_check),
         )
     }
 
@@ -3355,6 +3382,7 @@ impl CrossProcessServerHandle {
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault_config: Option<CrossProcessRootReplyFaultConfig>,
         prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
+        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
     ) -> Result<Self> {
         let CrossProcessClusterOptions {
             binary: novarocks_bin,
@@ -3567,6 +3595,9 @@ impl CrossProcessServerHandle {
             child_environment: &fe_environment,
             launch_profile,
         })?;
+        if let Some(check) = log_owner_check {
+            check("fe", &fe_process.log_source())?;
+        }
         println!(
             "started cross-process FE pid={} mysql_port={} config={}",
             fe_process.pid(),
@@ -3604,6 +3635,9 @@ impl CrossProcessServerHandle {
                 child_environment: &be_environments[i],
                 launch_profile,
             })?;
+            if let Some(check) = log_owner_check {
+                check(&identity_role, &be_process.log_source())?;
+            }
             println!(
                 "started cross-process BE[{i}] pid={} grpc_port={} control_grpc_port={} config={}",
                 be_process.pid(),

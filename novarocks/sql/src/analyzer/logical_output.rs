@@ -648,7 +648,8 @@ mod scalar_domain_tests {
             .collect()
     }
     fn fixture_control() -> &'static crate::compiler::SqlCompileControl {
-        static CONTROL: std::sync::OnceLock<crate::compiler::SqlCompileControl> = std::sync::OnceLock::new();
+        static CONTROL: std::sync::OnceLock<crate::compiler::SqlCompileControl> =
+            std::sync::OnceLock::new();
         CONTROL.get_or_init(crate::compiler::SqlCompileControl::unbounded)
     }
     fn context(factory: Rc<RefCell<ColumnRefFactory>>) -> AnalyzerContext<'static> {
@@ -714,9 +715,11 @@ mod scalar_domain_tests {
             };
             let carrier = DataType::List(Arc::new(item));
             let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
-            let id = factory
-                .borrow_mut()
-                .create(None, "source".into(), novarocks_type_contract::FunctionValueType::new(carrier.clone(), true));
+            let id = factory.borrow_mut().create(
+                None,
+                "source".into(),
+                novarocks_type_contract::FunctionValueType::new(carrier.clone(), true),
+            );
             factory
                 .borrow_mut()
                 .set_logical_type(id, Some(SqlType::Array(Box::new(SqlType::Json))));
@@ -749,7 +752,9 @@ mod scalar_domain_tests {
                     "row",
                     vec![coerced],
                     Span::new(0, 0),
-                    context.sql_semantics.sql_mode().decimal_overflow_policy(), context.constant_policy, context.control,
+                    context.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    context.constant_policy,
+                    context.control,
                 )
                 .unwrap();
                 assert!(
@@ -763,7 +768,9 @@ mod scalar_domain_tests {
                 "row",
                 vec![source],
                 Span::new(0, 0),
-                context.sql_semantics.sql_mode().decimal_overflow_policy(), context.constant_policy, context.control,
+                context.sql_semantics.sql_mode().decimal_overflow_policy(),
+                context.constant_policy,
+                context.control,
             )
             .unwrap();
             let result = context.adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0));
@@ -918,7 +925,8 @@ mod scalar_domain_tests {
         let mut shadowed = binding.resolved().clone();
         shadowed.function_id =
             novarocks_functions::FunctionId::try_new("test.shadow/coalesce/v1").unwrap();
-        *binding = crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
+        *binding =
+            crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
         assert_eq!(
@@ -930,9 +938,11 @@ mod scalar_domain_tests {
     #[test]
     fn m07_scalar_implicit_offset_adaptation_preserves_authority_but_family_change_clears_it() {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
-        let id = factory
-            .borrow_mut()
-            .create(None, "j".into(), novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true));
+        let id = factory.borrow_mut().create(
+            None,
+            "j".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
         factory
             .borrow_mut()
             .set_logical_type(id, Some(SqlType::Json));
@@ -1250,7 +1260,10 @@ mod scalar_domain_tests {
                     result.data_type = DataType::Binary;
                 }
             }
-            *binding = crate::binding::SqlFunctionBinding::new(selected, binding.decimal_overflow_policy());
+            *binding = crate::binding::SqlFunctionBinding::new(
+                selected,
+                binding.decimal_overflow_policy(),
+            );
             assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
             let before = format!("{:?}", candidate.kind);
             let adapted = context
@@ -1310,7 +1323,10 @@ mod scalar_domain_tests {
         ));
         let bad_source = TypedExpr {
             kind: clean.kind.clone(),
-            value_type: novarocks_type_contract::FunctionValueType::new(corrupted, clean.value_type.nullable),
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                corrupted,
+                clean.value_type.nullable,
+            ),
         };
         args[0] = TypedExpr {
             kind: ExprKind::Cast {
@@ -1318,7 +1334,10 @@ mod scalar_domain_tests {
                 target: clean.value_type.data_type.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(clean.value_type.data_type, clean.value_type.nullable),
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                clean.value_type.data_type,
+                clean.value_type.nullable,
+            ),
         };
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
@@ -1370,7 +1389,10 @@ mod scalar_domain_tests {
                 target: clean.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(clean.clone(), args[0].value_type.nullable),
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                clean.clone(),
+                args[0].value_type.nullable,
+            ),
         };
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
@@ -1381,11 +1403,19 @@ mod scalar_domain_tests {
             .function_catalog
             .resolve_window_binding(
                 "first_value",
-                &[crate::analysis::function_argument(&coerced, context.constant_policy, context.control).unwrap()],
+                &[crate::analysis::function_argument(
+                    &coerced,
+                    context.constant_policy,
+                    context.control,
+                )
+                .unwrap()],
                 context.control,
             )
             .unwrap();
-        *binding = crate::binding::SqlFunctionBinding::new(original_binding.clone(), binding.decimal_overflow_policy());
+        *binding = crate::binding::SqlFunctionBinding::new(
+            original_binding.clone(),
+            binding.decimal_overflow_policy(),
+        );
         *args = vec![coerced];
         selected_window.value_type.data_type = clean;
         let adapted = context
@@ -1501,7 +1531,8 @@ mod scalar_domain_tests {
                 DEFAULT_COMPLETION_LIMITS,
             );
             let SqlCompileProgress::Complete(completed) =
-                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control()).unwrap()
+                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control())
+                    .unwrap()
             else {
                 panic!("source-free window unexpectedly needs observations: {sql}");
             };
@@ -1694,7 +1725,8 @@ mod scalar_domain_tests {
         let mut shadowed = binding.resolved().clone();
         shadowed.function_id =
             novarocks_functions::FunctionId::try_new("test.shadow/__array_literal/v1").unwrap();
-        *binding = crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
+        *binding =
+            crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
@@ -1965,7 +1997,10 @@ mod scalar_domain_tests {
                     result.nullable = !candidate.value_type.nullable;
                 }
             }
-            *binding = crate::binding::SqlFunctionBinding::new(selected, binding.decimal_overflow_policy());
+            *binding = crate::binding::SqlFunctionBinding::new(
+                selected,
+                binding.decimal_overflow_policy(),
+            );
             assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
             let before = format!("{candidate:?}");
             let result = context
@@ -2219,7 +2254,8 @@ mod scalar_domain_tests {
                 DEFAULT_COMPLETION_LIMITS,
             );
             let SqlCompileProgress::Complete(completed) =
-                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control()).unwrap()
+                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control())
+                    .unwrap()
             else {
                 panic!("source-free transform unexpectedly needs observations: {sql}");
             };

@@ -302,6 +302,100 @@ impl ResultStreamTestProducer {
         Ok(TestResultDeliveryReceipt(receipt))
     }
 
+    /// Component-only two-item resident window, using the original publish/take/freeze owners.
+    /// This performs no Native fetch and proves no Native actor or task lifecycle.
+    /// Both items have frontier zero and no piggyback End; no delivery receipt has completed.
+    pub async fn enqueue_resident_client_pair(
+        &self,
+        replies: [novarocks_execution_contract::root_result::RootResultReply; 2],
+    ) -> Result<TestResultDeliveryReceipt, QueryExecutionError> {
+        use crate::api::{
+            ResidentRootSegment, RetainedRootReply, RootRelayResidentWindow, RootReplyView,
+        };
+        use novarocks_result_contract::{
+            ClientRowProfile, ClientRowStreamCursor, RootOutputKind, RootProfileId, RootProfileV1,
+        };
+        let invalid = || {
+            QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::InvalidRequest,
+                "component resident pair differs from one contiguous ClientRows task",
+            )
+        };
+        let window = self.window.as_ref().expect("relayed test window");
+        let [first, next] = replies;
+        if first.root_task != next.root_task
+            || first.root_task.query_execution_id() != self.execution_id
+            || [&first, &next].iter().any(|reply| {
+                reply.kind != RootOutputKind::ClientRows
+                    || reply.profile != RootProfileId::V1
+                    || reply.accepted_consumed != 0
+            })
+        {
+            return Err(invalid());
+        }
+        let profile = ClientRowProfile::try_new(
+            RootProfileV1::SEGMENT_BYTES,
+            RootProfileV1::ROW_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let resident = RootRelayResidentWindow::default();
+        let mut cursor = ClientRowStreamCursor::new();
+        let mut delivery = None;
+        for (index, reply) in [first, next].into_iter().enumerate() {
+            let backing = match &reply.outcome {
+                novarocks_execution_contract::root_result::RootReadOutcome::Data(data) => {
+                    if data.end_after_data().is_some() {
+                        return Err(invalid());
+                    }
+                    data.body().len() as u64 + 4096
+                }
+                _ => return Err(invalid()),
+            };
+            let retained = std::sync::Arc::new(
+                RetainedRootReply::try_new(reply, window.retain_alias(), backing)
+                    .map_err(|_| invalid())?,
+            );
+            let RootReplyView::Data { sequence, body, .. } = retained.outcome() else {
+                return Err(invalid());
+            };
+            if sequence.get() != index as u64 + 1 {
+                return Err(invalid());
+            }
+            let after = cursor
+                .validate_body(profile, body)
+                .map_err(|_| invalid())?
+                .after();
+            let rows = after.completed_rows() - cursor.completed_rows();
+            if !resident.publish(ResidentRootSegment {
+                sequence,
+                reply: retained.clone(),
+                client_rows: Some((profile, cursor)),
+                rows,
+            }) {
+                return Err(invalid());
+            }
+            if index == 0 {
+                let _original_delivering = resident.take().ok_or_else(invalid)?;
+                delivery = Some(crate::api::RootSegmentDelivery::try_new(
+                    self.execution_id,
+                    ResultPacketSequence::new(0),
+                    retained,
+                    Some((profile, cursor)),
+                    rows,
+                )?);
+            }
+            cursor = after;
+        }
+        cursor.validate_end().map_err(|_| invalid())?;
+        let (delivery, receipt) = delivery.expect("first resident delivery");
+        let permit = self.transport.reserve_owned().await?;
+        self.transport.enqueue(
+            permit,
+            ResultDelivery::Segment(delivery.with_resident_window(resident)),
+        );
+        Ok(TestResultDeliveryReceipt(receipt))
+    }
+
     pub async fn enqueue_end(&self, sequence: u64) -> TestResultDeliveryReceipt {
         let (delivery, receipt) =
             EndDelivery::success_eof(self.execution_id, ResultPacketSequence::new(sequence));

@@ -162,6 +162,7 @@ pub(crate) struct FrontendProviderReadFacts {
     session: ConnectorSession,
     context: ConnectorRequestContext,
     blocking: ConnectorBlockingIoSupervisor,
+    capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 }
 
 impl FrontendProviderReadFacts {
@@ -171,6 +172,7 @@ impl FrontendProviderReadFacts {
         session: ConnectorSession,
         context: ConnectorRequestContext,
         blocking: ConnectorBlockingIoSupervisor,
+        capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Self {
         Self {
             control,
@@ -178,6 +180,7 @@ impl FrontendProviderReadFacts {
             session,
             context,
             blocking,
+            capacity,
         }
     }
 }
@@ -202,18 +205,28 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
         let session = self.session.clone();
         let context = self.context.clone();
         self.blocking
-            .spawn_ordinary(move || {
-                let mut facts = Vec::with_capacity(needs.len());
-                for need in &needs {
-                    facts.push(freeze_one_read(
-                        need, &control, &bindings, &session, &context, &deposits,
-                    )?);
-                }
-                Ok(facts)
-            })
+            .spawn_admitted(
+                self.capacity.scope(),
+                &self.capacity.window_alias(),
+                move || {
+                    let mut facts = Vec::with_capacity(needs.len());
+                    for need in &needs {
+                        facts.push(freeze_one_read(
+                            need, &control, &bindings, &session, &context, &deposits,
+                        )?);
+                    }
+                    Ok(facts)
+                },
+            )
+            .map_err(|error| format!("frontend provider read admission: {error}"))?
             .finish()
             .await
-            .map_err(|error| format!("frontend provider read lane: {error}"))?
+            .map_err(|error| {
+                format!(
+                    "frontend provider read lane: {}",
+                    self.blocking.present_and_retire_failure(error)
+                )
+            })?
     }
 }
 
@@ -1411,3 +1424,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod late_deposit_tests;

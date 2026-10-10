@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_proto_codec::native_rpc::{FrontendNativeLane, NativeRpcMethod};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::native_channel_identity::InlineNativeChannelIdentity;
 use crate::native_connection_key_capacity::{
@@ -260,6 +260,36 @@ impl ClassState {
     }
 }
 
+// Fixed observations of the original Frontend call/body holders, not capacity.
+#[derive(Default)]
+struct FrontendOutgoingState {
+    closed: bool,
+    requests: [usize; 4],
+}
+
+/// Frontend outgoing public-exit observations, independent of incoming Membership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontendOutgoingSnapshot {
+    pub closed: bool,
+    pub data_connections: usize,
+    pub control_connections: usize,
+    pub data_handshakes: usize,
+    pub control_handshakes: usize,
+    /// ResultData, Submission, Observation, LifecycleControl, in that order.
+    pub requests: [usize; 4],
+}
+
+impl FrontendOutgoingSnapshot {
+    pub fn is_drained(&self) -> bool {
+        self.closed
+            && self.data_connections == 0
+            && self.control_connections == 0
+            && self.data_handshakes == 0
+            && self.control_handshakes == 0
+            && self.requests == [0; 4]
+    }
+}
+
 struct Core {
     role: TransportRole,
     dimensions: AdmissionDimensions,
@@ -269,6 +299,8 @@ struct Core {
     incoming_streams: [NativeLaneStreamGate; NativeLane::COUNT],
     root_result_ingress_owners: usize,
     observer: SharedObserver,
+    frontend_outgoing: Mutex<FrontendOutgoingState>,
+    frontend_outgoing_changed: Arc<Notify>,
 }
 
 /// Stream positions a Backend serves per lane: every legal connection of the
@@ -433,6 +465,8 @@ impl NativeTransportAdmission {
                 incoming_streams,
                 root_result_ingress_owners,
                 observer,
+                frontend_outgoing: Mutex::new(FrontendOutgoingState::default()),
+                frontend_outgoing_changed: Arc::new(Notify::new()),
             }),
         };
         for class in [
@@ -444,6 +478,121 @@ impl NativeTransportAdmission {
             admission.publish(class, PositionKind::Handshake);
         }
         Ok(admission)
+    }
+
+    /// Close only this Frontend's outgoing Native capability. Existing holders
+    /// retain their original positions until their public exits.
+    pub fn close_frontend_outgoing(&self) -> io::Result<()> {
+        if self.core.role != TransportRole::Frontend {
+            return Err(invalid());
+        }
+        {
+            let mut state = self
+                .core
+                .frontend_outgoing
+                .lock()
+                .expect("outgoing state lock");
+            // The same lock linearizes call registration against close. Dial
+            // acquisitions linearize at the original Semaphore::close calls.
+            for class in [TransportClass::Data, TransportClass::Control] {
+                self.core.classes[class.index()].physical.close();
+                self.core.classes[class.index()].handshake.close();
+            }
+            state.closed = true;
+        }
+        self.core.frontend_outgoing_changed.notify_waiters();
+        Ok(())
+    }
+
+    pub fn frontend_outgoing_snapshot(&self) -> io::Result<FrontendOutgoingSnapshot> {
+        if self.core.role != TransportRole::Frontend {
+            return Err(invalid());
+        }
+        let state = self
+            .core
+            .frontend_outgoing
+            .lock()
+            .expect("outgoing state lock");
+        Ok(FrontendOutgoingSnapshot {
+            closed: state.closed,
+            data_connections: self.positions(TransportClass::Data)
+                - self.available_positions(TransportClass::Data),
+            control_connections: self.positions(TransportClass::Control)
+                - self.available_positions(TransportClass::Control),
+            data_handshakes: self.handshake_positions(TransportClass::Data)
+                - self.available_handshakes(TransportClass::Data),
+            control_handshakes: self.handshake_positions(TransportClass::Control)
+                - self.available_handshakes(TransportClass::Control),
+            requests: state.requests,
+        })
+    }
+
+    /// Observe the closed role's original exits using the caller's original
+    /// absolute deadline. A timeout consumes no holder and permits retry.
+    pub async fn wait_frontend_outgoing_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<()> {
+        if self.core.role != TransportRole::Frontend {
+            return Err(invalid());
+        }
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let changed = self.core.frontend_outgoing_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.frontend_outgoing_snapshot()?.is_drained() {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, changed)
+                .await
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+        }
+    }
+
+    pub(crate) fn frontend_outgoing_is_closed(&self) -> bool {
+        self.core
+            .frontend_outgoing
+            .lock()
+            .expect("outgoing state lock")
+            .closed
+    }
+
+    pub(crate) fn frontend_outgoing_notified(&self) -> tokio::sync::futures::OwnedNotified {
+        Arc::clone(&self.core.frontend_outgoing_changed).notified_owned()
+    }
+
+    /// Register the original outgoing request at its actual dispatch boundary.
+    /// This is an exit observation, not another admission position or wallet.
+    pub(crate) fn register_frontend_outgoing_call(
+        &self,
+        lane: NativeLane,
+    ) -> io::Result<FrontendOutgoingCallExit> {
+        if self.core.role != TransportRole::Frontend || lane.index() >= 4 {
+            return Err(invalid());
+        }
+        {
+            let mut state = self
+                .core
+                .frontend_outgoing
+                .lock()
+                .expect("outgoing state lock");
+            if state.closed {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            state.requests[lane.index()] = state.requests[lane.index()]
+                .checked_add(1)
+                .ok_or_else(invalid)?;
+        }
+        Ok(FrontendOutgoingCallExit {
+            admission: self.clone(),
+            lane,
+        })
     }
 
     pub fn role(&self) -> TransportRole {
@@ -639,7 +788,39 @@ struct ClassPermit {
 impl Drop for ClassPermit {
     fn drop(&mut self) {
         drop(self.permit.take());
+        // Wake from the original permit return, before optional diagnostics.
+        self.admission
+            .core
+            .frontend_outgoing_changed
+            .notify_waiters();
         self.admission.publish(self.class, self.kind);
+    }
+}
+
+/// An observation carried by the existing original stream holder. It grants
+/// no position and drops only at that holder's public exit.
+pub(crate) struct FrontendOutgoingCallExit {
+    admission: NativeTransportAdmission,
+    lane: NativeLane,
+}
+
+impl Drop for FrontendOutgoingCallExit {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .admission
+                .core
+                .frontend_outgoing
+                .lock()
+                .expect("outgoing state lock");
+            state.requests[self.lane.index()] = state.requests[self.lane.index()]
+                .checked_sub(1)
+                .expect("original outgoing request exits once");
+        }
+        self.admission
+            .core
+            .frontend_outgoing_changed
+            .notify_waiters();
     }
 }
 
