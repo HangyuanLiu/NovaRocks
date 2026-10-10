@@ -26,6 +26,7 @@ pub mod copy;
 pub mod formatting;
 pub mod hashmap;
 pub mod layout;
+pub mod metadata_request;
 pub mod profile;
 pub mod type_validation;
 pub mod vec;

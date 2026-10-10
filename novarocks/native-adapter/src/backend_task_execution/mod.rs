@@ -41,6 +41,7 @@
 mod compiled_package;
 mod context_host;
 mod execution_host;
+mod preparation_memory_control;
 mod type_materialization;
 
 #[cfg(test)]
