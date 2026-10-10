@@ -1966,3 +1966,7 @@ mod percentile_union_tests;
 #[cfg(test)]
 #[path = "pure_differential_left_right_shared_tests.rs"]
 mod left_right_shared_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_split_part_shared_tests.rs"]
+mod split_part_shared_tests;

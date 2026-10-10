@@ -1662,3 +1662,9 @@ mod legacy_left_right_shared_baseline_tests;
 
 #[cfg(test)]
 mod left_right_actual_sql_source_tests;
+
+#[cfg(test)]
+mod legacy_split_part_shared_baseline_tests;
+
+#[cfg(test)]
+mod split_part_actual_sql_source_tests;
