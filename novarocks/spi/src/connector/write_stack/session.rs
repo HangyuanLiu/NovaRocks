@@ -523,6 +523,33 @@ impl ConnectorWriteCohortRoutingProof {
     }
 }
 
+// Same enum order as ConnectorWriteInputShape::fields(), borrowed only.
+// Validation must not allocate a projection before the caller's growth gate.
+fn borrowed_write_input_fields(
+    input: &ConnectorWriteInputShape,
+) -> impl Iterator<Item = &crate::connector::ConnectorWriteFieldBinding> {
+    let (first, second): (
+        &[crate::connector::ConnectorWriteFieldBinding],
+        &[crate::connector::ConnectorWriteFieldBinding],
+    ) = match input {
+        ConnectorWriteInputShape::Data { fields } => (fields, &[]),
+        ConnectorWriteInputShape::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } => (data_fields, row_identity_fields),
+        ConnectorWriteInputShape::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        }
+        | ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } => (identity_fields, partition_source_fields),
+        ConnectorWriteInputShape::EqualityDelete { equality_fields } => (equality_fields, &[]),
+    };
+    first.iter().chain(second.iter())
+}
+
 impl ConnectorWriteRouteFacts {
     /// A branch that accepts no change event would silently drop every row
     /// routed to it, so an empty effect set is refused.
@@ -572,12 +599,12 @@ impl ConnectorWriteRouteFacts {
         &self,
         input: &ConnectorWriteInputShape,
     ) -> Result<(), ConnectorError> {
-        let fields = input.fields();
-        if self.input_ordinals.len() != fields.len()
+        let field_count = borrowed_write_input_fields(input).count();
+        if self.input_ordinals.len() != field_count
             || self
                 .input_ordinals
                 .iter()
-                .zip(&fields)
+                .zip(borrowed_write_input_fields(input))
                 .any(|(route, field)| route.token() != field.token())
         {
             return Err(ConnectorError::new(
@@ -586,11 +613,11 @@ impl ConnectorWriteRouteFacts {
             ));
         }
         if !self.selection_bindings.is_empty()
-            && (self.selection_bindings.len() != fields.len()
+            && (self.selection_bindings.len() != field_count
                 || self
                     .selection_bindings
                     .iter()
-                    .zip(&fields)
+                    .zip(borrowed_write_input_fields(input))
                     .any(|(binding, field)| binding.writer_token() != field.token()))
         {
             return Err(ConnectorError::new(
@@ -613,8 +640,11 @@ impl ConnectorWriteRouteFacts {
                 "COW route omits its provider-signed selection bindings",
             ));
         }
-        let fields = input.fields();
-        for (binding, writer) in self.selection_bindings.iter().zip(fields) {
+        for (binding, writer) in self
+            .selection_bindings
+            .iter()
+            .zip(borrowed_write_input_fields(input))
+        {
             match binding.source() {
                 ConnectorWriteValueSource::Selection {
                     token,
@@ -1063,6 +1093,79 @@ pub trait ConnectorWriteControl: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn borrowed_writer_fields_keep_all_original_enum_orders() {
+        let field = |id: u8| {
+            crate::connector::ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([id; 32]),
+                arrow::datatypes::Field::new(
+                    format!("field_{id}"),
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+            )
+        };
+        let first = vec![field(1), field(2)];
+        let second = vec![field(3), field(4)];
+        let inputs = [
+            ConnectorWriteInputShape::Data {
+                fields: first.clone(),
+            },
+            ConnectorWriteInputShape::RowLineage {
+                data_fields: first.clone(),
+                row_identity_fields: second.clone(),
+            },
+            ConnectorWriteInputShape::PositionDelete {
+                identity_fields: first.clone(),
+                partition_source_fields: second.clone(),
+            },
+            ConnectorWriteInputShape::DeletionVector {
+                identity_fields: first.clone(),
+                partition_source_fields: second.clone(),
+            },
+            ConnectorWriteInputShape::EqualityDelete {
+                equality_fields: first,
+            },
+        ];
+        for input in inputs {
+            let borrowed = borrowed_write_input_fields(&input)
+                .map(|f| f.token())
+                .collect::<Vec<_>>();
+            let public = input
+                .fields()
+                .into_iter()
+                .map(|f| f.token())
+                .collect::<Vec<_>>();
+            assert_eq!(borrowed, public);
+        }
+    }
+
+    #[test]
+    fn borrowed_route_validation_preserves_original_first_error_and_messages() {
+        let input = cow_input();
+        let contract = cow_contract();
+        let mut wrong = cow_route([1, 0]);
+        wrong.input_ordinals.clear();
+        wrong.selection_bindings = Arc::from([]);
+        let first = wrong
+            .validate_selection_contract(&input, &contract)
+            .unwrap_err();
+        assert_eq!(first.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            first.message(),
+            "row-mutation route input token order differs from its target input"
+        );
+        let mut missing = cow_route([1, 0]);
+        missing.selection_bindings = Arc::from([]);
+        let second = missing
+            .validate_selection_contract(&input, &contract)
+            .unwrap_err();
+        assert_eq!(
+            second.message(),
+            "COW route omits its provider-signed selection bindings"
+        );
+    }
+
     use super::*;
     use crate::connector::write_stack::adapter::{ProviderWriteRuntime, WriteRuntimeAdapter};
     use crate::connector::{
