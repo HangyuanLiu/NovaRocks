@@ -553,7 +553,8 @@ fn freeze_branch_source(
     // very handle, so it is resolved through that one composition instead of
     // being rebuilt here: a frozen read refuses a scan whose output schema
     // differs by so much as one field annotation.
-    let scan_schema = crate::metadata::projected_schema(&payload, &[])?;
+    let scan_schema =
+        crate::metadata::projected_schema_with_metadata(&payload, &[], freeze.metadata)?;
     let encoded = serde_json::to_vec(&payload).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::Internal,

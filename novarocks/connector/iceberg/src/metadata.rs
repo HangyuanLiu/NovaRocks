@@ -1472,6 +1472,16 @@ pub(crate) fn projected_schema(
         .ok_or_else(|| corrupt("Iceberg table handle has no serialized metadata"))?;
     let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
+    projected_schema_with_metadata(table, projection, &metadata)
+}
+
+/// COW uses its SAME loaded, wire-normalized immutable metadata owner.
+/// The ordinary entry above keeps its original decode and error ordering.
+pub(crate) fn projected_schema_with_metadata(
+    table: &IcebergTablePayload,
+    projection: &[usize],
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<SchemaRef, ConnectorError> {
     let table_info = table
         .table_info
         .as_ref()
@@ -1485,12 +1495,12 @@ pub(crate) fn projected_schema(
         metadata
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| corrupt("Iceberg exact table source snapshot is absent"))?
-            .schema(&metadata)
+            .schema(metadata)
             .map_err(|error| corrupt(format!("resolve exact table source schema: {error}")))?
     } else {
         metadata.current_schema().clone()
     };
-    let declarations = crate::scalar_integer_domain::metadata_declarations(&metadata)?;
+    let declarations = crate::scalar_integer_domain::metadata_declarations(metadata)?;
     let storage = crate::scalar_integer_domain::apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(&storage_schema).map_err(corrupt)?,
         &storage_schema,
@@ -2652,3 +2662,7 @@ mod plan_splits_pruning_tests {
         assert_eq!(metrics.scan_units_planned, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "metadata/cow_borrowed_schema_tests.rs"]
+mod cow_borrowed_schema_tests;
