@@ -628,18 +628,19 @@ pub(super) fn decode(
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, E> {
-    decode_body(table, limits, work, None)
+    decode_body(table, limits, work, None, &mut super::DirectTypeMaterialization)
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
-fn decode_body<'source>(
+fn decode_body<'source, H: super::PackageTypeMaterializationScope>(
     table: &'source wire::TypeTable,
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
     mut receiver: Option<Receiver<'_, 'source, '_>>,
-) -> Result<DecodedTypeTable, E> {
+    host: &mut H,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<E, H::HostError>> {
     let index = preflight(table, limits, work, &mut receiver)?;
     let (order, maximum) = topology(&index, table, limits, work, &mut receiver)?;
-    let package = receiver.is_some();
     if let Some(receiver) = receiver.as_mut() {
         let writer_roots = receiver.graph.roots().facts().writer_field_root_count;
         // An unfolded Arrow tree has at most one Field per child type edge,
@@ -658,6 +659,27 @@ fn decode_body<'source>(
     // No Arrow type, field, metadata or timezone was allocated above. Observe
     // the admitted graph tail before the first materialization.
     work.flush()?;
+    match receiver.as_ref() {
+        Some(receiver) => {
+            let facts = receiver.model.facts(receiver.limits)?;
+            host.materialize(&facts, || {
+                materialize_body(table, index, order, work, Some(receiver))
+            })
+        }
+        None => materialize_body(table, index, order, work, None)
+            .map_err(crate::host_projection_v2::ProjectionFailure::Codec),
+    }
+}
+
+/// The original Arrow author, shared by both host and direct adapters.
+fn materialize_body(
+    table: &wire::TypeTable,
+    index: ReceiverIndex<'_, '_>,
+    order: Vec<Node>,
+    work: &mut CompileCheckpoints<'_>,
+    receiver: Option<&Receiver<'_, '_, '_>>,
+) -> Result<DecodedTypeTable, E> {
+    let package = receiver.is_some();
     let mut carriers = BTreeMap::new();
     let mut fields = BTreeMap::new();
     let mut values = BTreeMap::new();
@@ -679,7 +701,7 @@ fn decode_body<'source>(
                 let ty = opaque(package, work, |work| {
                     materialize(index.kind(id)?, &carriers, &fields, work, graph)
                 })?;
-                if strict(receiver.as_ref(), node, work)? {
+                if strict(receiver, node, work)? {
                     validate_type(&ty, work)?;
                 } else {
                     novarocks_type_contract::validate_arrow_carrier_parameters_observed(
@@ -721,7 +743,7 @@ fn decode_body<'source>(
                     })?;
                 }
                 let field = metadata.into_field(field);
-                if strict(receiver.as_ref(), node, work)? {
+                if strict(receiver, node, work)? {
                     opaque(package, work, |_| {
                         field_logical_type(field.field()).map_err(E::from)
                     })?;
@@ -824,6 +846,18 @@ pub(super) fn decode_package(
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, E> {
+    decode_package_with_host(package, source, limits, admit, work, &mut super::DirectTypeMaterialization)
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+
+pub(super) fn decode_package_with_host<H: super::PackageTypeMaterializationScope>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    host: &mut H,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<E, H::HostError>> {
     let table = package
         .types
         .as_ref()
@@ -876,5 +910,6 @@ pub(super) fn decode_package(
             limits,
             admit,
         }),
+        host,
     )
 }
