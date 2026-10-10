@@ -35,6 +35,7 @@
 //!   recovery evidence. Marker absence during reconciliation is *not* proof of
 //!   non-commit, so an unresolved session stays unknown.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -326,7 +327,7 @@ pub(crate) fn validate_prepared_set<'a>(
         .iter()
         .map(|target| (target.ordinal(), target.branch()))
         .collect::<BTreeMap<_, _>>();
-    let mut paths = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     let mut delete_artifact_owner: BTreeMap<&str, WriteTargetOrdinal> = BTreeMap::new();
     let mut validated = Vec::with_capacity(prepared.fragments().len());
 
@@ -346,7 +347,7 @@ pub(crate) fn validate_prepared_set<'a>(
                 branch.as_str()
             )));
         }
-        if !paths.insert(fragment.path()) {
+        if !identities.insert(fragment.entry_identity()) {
             return Err(corrupt(format!(
                 "Iceberg prepared write set repeats staged artifact {}",
                 fragment.path()
@@ -408,7 +409,7 @@ pub(crate) fn validate_prepared_set<'a>(
 /// Demanding one artifact per frozen data file would therefore refuse every
 /// `DELETE` that does not happen to touch the whole table.
 pub(crate) fn validate_merged_old_references(
-    plans: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+    plans: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
     validated: &[ValidatedFragment<'_>],
 ) -> Result<(), ConnectorError> {
     for entry in validated {
@@ -1116,7 +1117,7 @@ impl IcebergWriteSessionControl {
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
-        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
         document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
@@ -1212,7 +1213,7 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
-        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         validate_context(context)?;
@@ -2832,7 +2833,7 @@ impl IcebergWriteSessionControl {
     fn frozen_references_of(
         &self,
         handle: &IcebergCommitHandle,
-    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>> {
+    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>> {
         handle.frozen_old_references()
     }
 
@@ -3160,7 +3161,7 @@ impl IcebergWriteSessionControl {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg row-level write requires a loaded target table")
                 })?;
-                self.freeze_old_delete_references(table, &metadata, snapshot_id)?
+                self.freeze_old_delete_references(table, &metadata, snapshot_id, &request.context)?
             } else {
                 Vec::new()
             },
@@ -3402,20 +3403,79 @@ impl IcebergWriteSessionControl {
         table: &crate::iceberg::table::Table,
         metadata: &TableMetadata,
         snapshot_id: i64,
+        context: &ConnectorRequestContext,
     ) -> Result<Vec<IcebergOldDeleteMergeTarget>, ConnectorError> {
+        validate_context(context)?;
         let owned = table.clone();
-        let files = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
-            })
-            .map_err(|error| unavailable(error.to_string()))?
-            .map_err(unavailable)?;
+        let control = context.clone();
+        let (files, facts) =
+            self.runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    let check = || validate_context(&control).map_err(|error| error.to_string());
+                    check()?;
+                    let files = crate::manifest::extract_data_files_with_stats_at_with_control(
+                        &owned,
+                        snapshot_id,
+                        Some(&control),
+                    )
+                    .await?;
+                    let snapshot = owned.metadata().snapshot_by_id(snapshot_id).ok_or_else(||
+                format!("Iceberg frozen snapshot {snapshot_id} disappeared from pinned metadata"))?;
+                    let manifests = snapshot
+                        .load_manifest_list(owned.file_io(), owned.metadata())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    check()?;
+                    let mut facts = BTreeMap::new();
+                    for descriptor in manifests.entries() {
+                        check()?;
+                        let manifest = descriptor
+                            .load_manifest(owned.file_io())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        check()?;
+                        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                            check()?;
+                            let identity = EntryIdentity::try_from(entry.data_file())
+                                .map_err(|error| error.to_string())?;
+                            // An absent entry snapshot inherits the manifest's actual added snapshot.
+                            let fact = (
+                                entry.data_file().record_count(),
+                                entry.snapshot_id().unwrap_or(descriptor.added_snapshot_id),
+                            );
+                            if facts.insert(identity, fact).is_some() {
+                                return Err(
+                                    "Iceberg pinned snapshot repeats a logical entry".to_string()
+                                );
+                            }
+                        }
+                    }
+                    check()?;
+                    Ok::<_, String>((files, facts))
+                })
+                .map_err(|error| unavailable(error.to_string()))?
+                .map_err(corrupt)?;
+        validate_context(context)?;
         let mut targets = Vec::with_capacity(files.len());
         for file in files {
-            let references = frozen_old_delete_references(&file)?;
+            let identity = EntryIdentity::DataFile {
+                path: file.path.clone(),
+            };
+            let (count, _) = facts
+                .get(&identity)
+                .ok_or_else(|| corrupt("Iceberg data projection has no pinned manifest entry"))?;
+            if file
+                .record_count
+                .and_then(|value| u64::try_from(value).ok())
+                != Some(*count)
+            {
+                return Err(corrupt(
+                    "Iceberg data projection disagrees with pinned manifest record count",
+                ));
+            }
+            let references = frozen_old_delete_references(&file, &facts)?;
             targets.push(frozen_delete_merge_target(
                 &file,
                 metadata,
@@ -3479,7 +3539,11 @@ fn frozen_delete_merge_target(
         partition_spec_id,
         descriptor,
     )?;
-    let record_count = u64::try_from(file.record_count.unwrap_or_default()).map_err(|_| {
+    let record_count = u64::try_from(
+        file.record_count
+            .ok_or_else(|| corrupt("Iceberg frozen data file has no record count"))?,
+    )
+    .map_err(|_| {
         corrupt(format!(
             "Iceberg data file {} has a negative record count",
             file.path
@@ -3499,6 +3563,7 @@ fn frozen_delete_merge_target(
 /// data file. It records what exists; it never opens one of those artifacts.
 fn frozen_old_delete_references(
     file: &crate::manifest::DataFileWithStats,
+    facts: &BTreeMap<EntryIdentity, (u64, i64)>,
 ) -> Result<Vec<IcebergOldDeleteArtifactRef>, ConnectorError> {
     let partition_spec_id = file.partition_spec_id.ok_or_else(|| {
         corrupt(format!(
@@ -3547,16 +3612,25 @@ fn frozen_old_delete_references(
             crate::delete_file::IcebergFileContent::PositionDeletes,
             file_format,
             length,
-            // The Iceberg manifest carries a record count per delete file, but
-            // the provider's read-model projection does not surface it, so the
-            // reference is frozen without one rather than with a guessed value.
-            // The backend still rejects an exclusive artifact that decodes to
-            // nothing.
-            None,
+            Some(
+                facts
+                    .get(&crate::distributed_rewrite::delete_entry_identity(delete)?)
+                    .ok_or_else(|| {
+                        corrupt("Iceberg delete projection has no pinned manifest entry")
+                    })?
+                    .0,
+            ),
             content_range,
             delete.referenced_data_file.clone(),
             delete.sequence_number,
-            None,
+            Some(
+                facts
+                    .get(&crate::distributed_rewrite::delete_entry_identity(delete)?)
+                    .ok_or_else(|| {
+                        corrupt("Iceberg delete projection has no pinned manifest entry")
+                    })?
+                    .1,
+            ),
             delete.partition_spec_id.unwrap_or(partition_spec_id),
             route,
         )?);

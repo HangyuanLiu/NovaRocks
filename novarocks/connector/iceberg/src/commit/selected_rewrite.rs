@@ -21,6 +21,7 @@
 //! action. The E2 provider freezes these paths before any C1 writer staging;
 //! the action must reject a base that no longer contains exactly that set.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeSet, HashSet};
 
 use crate::iceberg::spec::{
@@ -46,8 +47,8 @@ use crate::commit::CommitOutcome;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SelectedRewriteFiles {
     pub(crate) kind: SelectedRewriteKind,
-    pub(crate) data_paths: BTreeSet<String>,
-    pub(crate) delete_paths: BTreeSet<String>,
+    pub(crate) data_paths: BTreeSet<EntryIdentity>,
+    pub(crate) delete_paths: BTreeSet<EntryIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -64,8 +65,11 @@ impl SelectedRewriteFiles {
         {
             return Err("selected rewrite file set is empty".to_string());
         }
-        if self.data_paths.iter().any(|path| path.is_empty())
-            || self.delete_paths.iter().any(|path| path.is_empty())
+        if self.data_paths.iter().any(|path| path.validate().is_err())
+            || self
+                .delete_paths
+                .iter()
+                .any(|path| path.validate().is_err())
             || !self.data_paths.is_disjoint(&self.delete_paths)
         {
             return Err("selected rewrite file set is invalid".to_string());
@@ -93,15 +97,19 @@ impl IcebergCommitAction for SelectedRewriteCommit {
             .filter(|entry| {
                 entry.data_file.content_type() == crate::iceberg::spec::DataContentType::Data
             })
-            .map(|entry| entry.data_file.file_path().to_string())
-            .collect::<BTreeSet<_>>();
+            .map(|entry| {
+                EntryIdentity::try_from(&entry.data_file).map_err(|error| error.to_string())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
         let live_deletes = live
             .iter()
             .filter(|entry| {
                 entry.data_file.content_type() != crate::iceberg::spec::DataContentType::Data
             })
-            .map(|entry| entry.data_file.file_path().to_string())
-            .collect::<BTreeSet<_>>();
+            .map(|entry| {
+                EntryIdentity::try_from(&entry.data_file).map_err(|error| error.to_string())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
         if !self.files.data_paths.is_subset(&live_data)
             || !self.files.delete_paths.is_subset(&live_deletes)
         {
@@ -169,7 +177,7 @@ impl SelectedRewriteCommit {
             .files
             .data_paths
             .iter()
-            .cloned()
+            .map(|identity| identity.path().to_string())
             .collect::<HashSet<_>>();
         let output_data_paths = written_dvs
             .iter()
@@ -195,7 +203,7 @@ impl SelectedRewriteCommit {
             .files
             .delete_paths
             .iter()
-            .cloned()
+            .map(|identity| identity.path().to_string())
             .collect::<HashSet<_>>();
         if index.replaced_delete_paths != expected_delete_paths {
             return Err(

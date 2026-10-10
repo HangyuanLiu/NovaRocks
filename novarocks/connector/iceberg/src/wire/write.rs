@@ -23,6 +23,7 @@
 //! bounded allocation, and the field relationships that can be checked before
 //! the write domain's `try_new` constructors apply Iceberg semantics.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 
@@ -147,6 +148,8 @@ enum MessageKind {
     PositionDeleteFile,
     DeletionVector,
     EqualityDeleteFile,
+    MergedDeleteReference,
+    DeletionVectorReference,
 }
 
 #[derive(Clone, Copy)]
@@ -266,13 +269,19 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::PositionDeleteFile, 1) | (M::PositionDeleteFile, 4) => Some(singular(F::Text)),
         (M::PositionDeleteFile, 2) => Some(singular(F::Message(M::Partition))),
         (M::PositionDeleteFile, 3) => Some(singular(F::Message(M::Metrics))),
-        (M::PositionDeleteFile, 5) => Some(repeated(F::Text)),
+        (M::PositionDeleteFile, 5) => Some(repeated(F::Message(M::MergedDeleteReference))),
         (M::DeletionVector, 1) | (M::DeletionVector, 4) => Some(singular(F::Text)),
         (M::DeletionVector, 2) => Some(singular(F::Message(M::Partition))),
         (M::DeletionVector, 3) => Some(singular(F::Message(M::Metrics))),
         (M::DeletionVector, 5) => Some(singular(F::Message(M::ContentRange))),
         (M::DeletionVector, 6) => Some(singular(F::Varint)),
-        (M::DeletionVector, 7) => Some(repeated(F::Text)),
+        (M::DeletionVector, 7) => Some(repeated(F::Message(M::MergedDeleteReference))),
+        (M::MergedDeleteReference, 1) => Some(FieldRule::oneof(F::Text)),
+        (M::MergedDeleteReference, 2) => {
+            Some(FieldRule::oneof(F::Message(M::DeletionVectorReference)))
+        }
+        (M::DeletionVectorReference, 1 | 4) => Some(singular(F::Text)),
+        (M::DeletionVectorReference, 2 | 3) => Some(singular(F::Varint)),
         (M::EqualityDeleteFile, 1) => Some(singular(F::Text)),
         (M::EqualityDeleteFile, 2) => Some(singular(F::Message(M::Partition))),
         (M::EqualityDeleteFile, 3) => Some(singular(F::Message(M::Metrics))),
@@ -792,16 +801,43 @@ fn validate_old_delete_target(
         MAX_OLD_DELETE_REFERENCES,
         path.field("references"),
     )?;
-    let mut previous = None;
+    let mut previous: Option<EntryIdentity> = None;
     for (index, reference) in target.references.iter().enumerate() {
-        validate_old_delete_ref(reference, path.field("references").index(index))?;
-        if previous.is_some_and(|value: &str| value >= reference.path.as_str()) {
+        let entry_path = path.field("references").index(index);
+        validate_old_delete_ref(reference, entry_path.clone())?;
+        let identity = if reference.file_format == dto::IcebergWriteFileFormat::Puffin as i32 {
+            let range = reference.content_range.as_ref().ok_or_else(|| {
+                missing(
+                    entry_path.field("content_range"),
+                    "DV reference requires its range",
+                )
+            })?;
+            EntryIdentity::DeletionVector {
+                path: reference.path.clone(),
+                offset: range.offset,
+                length: range.size_in_bytes,
+                referenced_data_file: reference.referenced_data_file.clone().ok_or_else(|| {
+                    missing(
+                        entry_path.field("referenced_data_file"),
+                        "DV reference requires its data file",
+                    )
+                })?,
+            }
+        } else {
+            EntryIdentity::DeleteFile {
+                path: reference.path.clone(),
+            }
+        };
+        identity
+            .validate()
+            .map_err(|error| inconsistent(entry_path.clone(), error.to_string()))?;
+        if previous.as_ref().is_some_and(|value| value >= &identity) {
             return Err(inconsistent(
-                path.field("references").index(index).field("path"),
-                "old-delete references must be sorted and unique",
+                entry_path,
+                "old-delete references must be sorted and unique by logical entry",
             ));
         }
-        previous = Some(reference.path.as_str());
+        previous = Some(identity);
     }
     Ok(())
 }
@@ -969,7 +1005,7 @@ fn validate_delete_artifact_common(
     partition: Option<&dto::IcebergArtifactPartition>,
     metrics: Option<&dto::IcebergArtifactMetrics>,
     referenced_data_file: &str,
-    merged: &[String],
+    merged: &[dto::IcebergMergedDeleteReference],
     path: ConnectorFieldPath,
 ) -> Result<(), ConnectorCodecError> {
     bounded_text(path_value, MAX_PATH_BYTES, path.field("path"), false)?;
@@ -986,23 +1022,64 @@ fn validate_delete_artifact_common(
         MAX_MERGED_OLD_REFERENCES,
         path.field("merged_old_references"),
     )?;
-    let mut previous = None;
+    let mut previous: Option<EntryIdentity> = None;
     for (index, value) in merged.iter().enumerate() {
-        bounded_text(
-            value,
-            MAX_PATH_BYTES,
-            path.field("merged_old_references").index(index),
-            false,
-        )?;
-        if previous.is_some_and(|previous: &str| previous >= value.as_str()) {
+        let identity =
+            decode_merged_reference(value, path.field("merged_old_references").index(index))?;
+        if previous.as_ref().is_some_and(|last| last >= &identity) {
             return Err(inconsistent(
                 path.field("merged_old_references").index(index),
                 "merged old references must be sorted and unique",
             ));
         }
-        previous = Some(value);
+        previous = Some(identity);
     }
     Ok(())
+}
+
+/// Decode the complete logical reference only after bounded wire validation.
+pub(crate) fn decode_merged_reference(
+    value: &dto::IcebergMergedDeleteReference,
+    path: ConnectorFieldPath,
+) -> Result<EntryIdentity, ConnectorCodecError> {
+    let identity = match value.entry.as_ref() {
+        Some(dto::iceberg_merged_delete_reference::Entry::DeleteFilePath(value)) => {
+            bounded_text(value, MAX_PATH_BYTES, path.field("delete_file_path"), false)?;
+            EntryIdentity::DeleteFile {
+                path: value.clone(),
+            }
+        }
+        Some(dto::iceberg_merged_delete_reference::Entry::DeletionVector(value)) => {
+            bounded_text(
+                &value.path,
+                MAX_PATH_BYTES,
+                path.field("deletion_vector").field("path"),
+                false,
+            )?;
+            bounded_text(
+                &value.referenced_data_file,
+                MAX_PATH_BYTES,
+                path.field("deletion_vector").field("referenced_data_file"),
+                false,
+            )?;
+            EntryIdentity::DeletionVector {
+                path: value.path.clone(),
+                offset: value.content_offset,
+                length: value.content_size_in_bytes,
+                referenced_data_file: value.referenced_data_file.clone(),
+            }
+        }
+        None => {
+            return Err(inconsistent(
+                path,
+                "merged old reference requires an exact delete entry",
+            ));
+        }
+    };
+    identity
+        .validate()
+        .map_err(|error| inconsistent(path, error.to_string()))?;
+    Ok(identity)
 }
 
 fn validate_partition(

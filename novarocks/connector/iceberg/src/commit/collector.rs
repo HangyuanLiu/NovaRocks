@@ -348,7 +348,7 @@ impl IcebergCommitCollector {
         let content_size_in_bytes =
             i64_option_non_negative(file.content_size_in_bytes, "content_size_in_bytes")?;
 
-        Ok(WrittenFile {
+        let written = WrittenFile {
             path: file.path,
             format,
             content,
@@ -373,7 +373,11 @@ impl IcebergCommitCollector {
                 .cardinality
                 .map(|c| i64_to_u64(c, "cardinality"))
                 .transpose()?,
-        })
+        };
+        written
+            .entry_identity()
+            .map_err(|error| error.to_string())?;
+        Ok(written)
     }
 
     /// Decode per-column bound bytes (Iceberg single-value binary encoding)

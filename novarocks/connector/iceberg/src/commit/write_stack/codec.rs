@@ -41,6 +41,7 @@
 //! Where a domain fact has no faithful carrier the answer is an error carrying
 //! the real field path, never a default and never a silent narrowing.
 
+use crate::commit::model::EntryIdentity;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -86,6 +87,31 @@ use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueD
 /// is installed as an `Arc<dyn ...>` trait object, so a role host holds a codec
 /// it can call and can never reach the adapter, an erased payload, or a
 /// downcast behind it.
+fn encode_merged_reference(identity: &EntryIdentity) -> dto::IcebergMergedDeleteReference {
+    let entry = match identity {
+        EntryIdentity::DeleteFile { path } => {
+            dto::iceberg_merged_delete_reference::Entry::DeleteFilePath(path.clone())
+        }
+        EntryIdentity::DeletionVector {
+            path,
+            offset,
+            length,
+            referenced_data_file,
+        } => dto::iceberg_merged_delete_reference::Entry::DeletionVector(
+            dto::IcebergDeletionVectorReference {
+                path: path.clone(),
+                content_offset: *offset,
+                content_size_in_bytes: *length,
+                referenced_data_file: referenced_data_file.clone(),
+            },
+        ),
+        EntryIdentity::DataFile { .. } => {
+            unreachable!("validated merged delete references exclude data entries")
+        }
+    };
+    dto::IcebergMergedDeleteReference { entry: Some(entry) }
+}
+
 #[derive(Clone)]
 struct IcebergWriteCodec {
     adapter: IcebergWriteAdapter,
@@ -852,7 +878,11 @@ impl IcebergWriteCodec {
                         partition: Some(self.encode_partition(file.partition())),
                         metrics: Some(self.encode_metrics(file.metrics())),
                         referenced_data_file: file.referenced_data_file().to_string(),
-                        merged_old_references: file.merged_old_references().to_vec(),
+                        merged_old_references: file
+                            .merged_old_references()
+                            .iter()
+                            .map(encode_merged_reference)
+                            .collect(),
                     },
                 )
             }
@@ -875,7 +905,11 @@ impl IcebergWriteCodec {
                         referenced_data_file: file.referenced_data_file().to_string(),
                         content_range: Some(self.encode_content_range(file.content_range())),
                         cardinality: file.cardinality(),
-                        merged_old_references: file.merged_old_references().to_vec(),
+                        merged_old_references: file
+                            .merged_old_references()
+                            .iter()
+                            .map(encode_merged_reference)
+                            .collect(),
                     },
                 )
             }
@@ -883,6 +917,37 @@ impl IcebergWriteCodec {
         Ok(dto::IcebergCommitFragment {
             artifact: Some(artifact),
         })
+    }
+
+    fn decode_merged_reference(
+        &self,
+        value: &dto::IcebergMergedDeleteReference,
+        path: FieldPath,
+    ) -> Result<EntryIdentity, ConnectorWriteCodecError> {
+        let identity = match value.entry.as_ref().ok_or_else(|| {
+            self.missing(
+                path.clone(),
+                "a merged delete reference requires its logical entry",
+            )
+        })? {
+            dto::iceberg_merged_delete_reference::Entry::DeleteFilePath(value) => {
+                EntryIdentity::DeleteFile {
+                    path: value.clone(),
+                }
+            }
+            dto::iceberg_merged_delete_reference::Entry::DeletionVector(value) => {
+                EntryIdentity::DeletionVector {
+                    path: value.path.clone(),
+                    offset: value.content_offset,
+                    length: value.content_size_in_bytes,
+                    referenced_data_file: value.referenced_data_file.clone(),
+                }
+            }
+        };
+        identity
+            .validate()
+            .map_err(|error| self.invalid(path, error.to_string()))?;
+        Ok(identity)
     }
 
     fn decode_commit_fragment_value(
@@ -916,7 +981,16 @@ impl IcebergWriteCodec {
                     self.decode_partition(file.partition.as_ref(), path.field("partition"))?,
                     self.decode_metrics(file.metrics.as_ref(), path.field("metrics"))?,
                     file.referenced_data_file.clone(),
-                    file.merged_old_references.clone(),
+                    file.merged_old_references
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            self.decode_merged_reference(
+                                value,
+                                path.field("merged_old_references").index(index),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
                 )
                 .map_err(|error| self.rejected(path, &error))?;
                 Ok(IcebergCommitFragment::position_delete_file(artifact))
@@ -950,7 +1024,16 @@ impl IcebergWriteCodec {
                     file.referenced_data_file.clone(),
                     self.decode_content_range(content_range, path.field("content_range"))?,
                     file.cardinality,
-                    file.merged_old_references.clone(),
+                    file.merged_old_references
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            self.decode_merged_reference(
+                                value,
+                                path.field("merged_old_references").index(index),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
                 )
                 .map_err(|error| self.rejected(path, &error))?;
                 Ok(IcebergCommitFragment::deletion_vector(artifact))
@@ -1430,8 +1513,12 @@ mod tests {
                 sample_metrics(4, 2048),
                 "s3://b/wh/db/t/data/a.parquet".to_string(),
                 vec![
-                    "s3://b/wh/db/t/data/old-1.parquet".to_string(),
-                    "s3://b/wh/db/t/data/old-2.parquet".to_string(),
+                    EntryIdentity::DeleteFile {
+                        path: "s3://b/wh/db/t/data/old-1.parquet".to_string(),
+                    },
+                    EntryIdentity::DeleteFile {
+                        path: "s3://b/wh/db/t/data/old-2.parquet".to_string(),
+                    },
                 ],
             )
             .expect("position delete file"),
@@ -1447,7 +1534,12 @@ mod tests {
                 "s3://b/wh/db/t/data/a.parquet".to_string(),
                 IcebergContentRange::try_new(4, 64).expect("range"),
                 3,
-                vec!["s3://b/wh/db/t/data/a-dv-1.puffin".to_string()],
+                vec![EntryIdentity::DeletionVector {
+                    path: "s3://b/wh/db/t/data/a-dv-1.puffin".to_string(),
+                    offset: 4,
+                    length: 64,
+                    referenced_data_file: "s3://b/wh/db/t/data/a.parquet".to_string(),
+                }],
             )
             .expect("deletion vector"),
         )
@@ -1929,6 +2021,85 @@ mod tests {
                 .expect("shared reference");
             assert_eq!(unknown.record_count(), None);
         }
+    }
+
+    #[test]
+    fn old_delete_recipe_round_trips_two_vectors_in_one_puffin() {
+        let facets = generation();
+        let data = "s3://b/wh/db/t/data/a.parquet";
+        let refs = [80, 4]
+            .map(|offset| {
+                puffin_ref(
+                    "s3://b/wh/db/t/data/shared.puffin",
+                    Some(data),
+                    4096,
+                    3,
+                    offset,
+                    64,
+                )
+                .unwrap()
+            })
+            .to_vec();
+        let target = merge_target(data, 100, refs);
+        let expected = target
+            .references()
+            .iter()
+            .map(|entry| entry.entry_identity())
+            .collect::<Vec<_>>();
+        let handle = IcebergWriterHandle::try_new_delete(
+            IcebergWriteBranch::DeletionVector,
+            table_facts(),
+            output(IcebergFileFormat::Puffin),
+            vec![target],
+        )
+        .unwrap();
+        let recovered = round_trip_handle(&facets, &handle);
+        assert_eq!(
+            recovered.old_deletes()[data]
+                .references()
+                .iter()
+                .map(|entry| entry.entry_identity())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let raw = facets.handle_encoder.encode_private(&handle).unwrap();
+        let mut private = dto::IcebergWriterHandle::decode(raw.as_ref()).unwrap();
+        let references = &mut private.old_deletes.get_mut(data).unwrap().references;
+        references.swap(0, 1);
+        assert_eq!(
+            decode_private_handle(&facets, &private.encode_to_vec(), private_limits())
+                .unwrap_err()
+                .kind(),
+            ConnectorCodecErrorKind::InconsistentFields
+        );
+    }
+
+    #[test]
+    fn merged_vectors_in_one_puffin_round_trip_with_distinct_ranges() {
+        let facets = facets("unit", 1);
+        let references = [4, 80]
+            .map(|offset| EntryIdentity::DeletionVector {
+                path: "s3://b/wh/db/t/data/shared.puffin".to_string(),
+                offset,
+                length: 64,
+                referenced_data_file: "s3://b/wh/db/t/data/a.parquet".to_string(),
+            })
+            .to_vec();
+        let fragment = IcebergCommitFragment::deletion_vector(
+            IcebergDeletionVectorArtifact::try_new(
+                "s3://b/wh/db/t/data/new.puffin".to_string(),
+                sample_partition(),
+                sample_metrics(3, 4096),
+                "s3://b/wh/db/t/data/a.parquet".to_string(),
+                IcebergContentRange::try_new(4, 64).unwrap(),
+                3,
+                references.clone(),
+            )
+            .unwrap(),
+        );
+        let recovered = round_trip_fragment(&facets, &fragment);
+        assert_eq!(recovered.merged_old_references(), references.as_slice());
+        assert_ne!(references[0], references[1]);
     }
 
     #[test]

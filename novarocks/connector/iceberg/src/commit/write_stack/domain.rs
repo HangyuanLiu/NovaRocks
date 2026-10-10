@@ -32,6 +32,7 @@
 //!   file, one position-delete file, or one deletion vector. It is not a report
 //!   document and carries no writer identity.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -593,8 +594,8 @@ pub fn allowed_session_branches(
 /// group's inputs.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IcebergFrozenRewriteBranchInput {
-    data_paths: BTreeSet<String>,
-    delete_paths: BTreeSet<String>,
+    data_paths: BTreeSet<EntryIdentity>,
+    delete_paths: BTreeSet<EntryIdentity>,
 }
 
 impl IcebergFrozenRewriteBranchInput {
@@ -602,13 +603,26 @@ impl IcebergFrozenRewriteBranchInput {
     /// still seals one branch so its session can terminate. An empty *path* is
     /// not, because it would name no file while claiming to replace one.
     pub fn try_new(
-        data_paths: BTreeSet<String>,
-        delete_paths: BTreeSet<String>,
+        data_paths: BTreeSet<EntryIdentity>,
+        delete_paths: BTreeSet<EntryIdentity>,
     ) -> Result<Self, ConnectorError> {
         for path in data_paths.iter().chain(&delete_paths) {
-            validate_location("rewrite input path", path)?;
+            path.validate()
+                .map_err(|error| invalid(error.to_string()))?;
+            validate_location("rewrite input path", path.path())?;
         }
-        if !data_paths.is_disjoint(&delete_paths) {
+        if data_paths
+            .iter()
+            .any(|entry| !matches!(entry, EntryIdentity::DataFile { .. }))
+            || delete_paths
+                .iter()
+                .any(|entry| matches!(entry, EntryIdentity::DataFile { .. }))
+            || data_paths.iter().any(|data| {
+                delete_paths
+                    .iter()
+                    .any(|delete| data.path() == delete.path())
+            })
+        {
             return Err(invalid(
                 "Iceberg rewrite branch input names one path as both data and delete",
             ));
@@ -619,11 +633,11 @@ impl IcebergFrozenRewriteBranchInput {
         })
     }
 
-    pub const fn data_paths(&self) -> &BTreeSet<String> {
+    pub const fn data_paths(&self) -> &BTreeSet<EntryIdentity> {
         &self.data_paths
     }
 
-    pub const fn delete_paths(&self) -> &BTreeSet<String> {
+    pub const fn delete_paths(&self) -> &BTreeSet<EntryIdentity> {
         &self.delete_paths
     }
 
@@ -1296,7 +1310,7 @@ pub struct IcebergPositionDeleteFileArtifact {
     partition: IcebergArtifactPartition,
     metrics: IcebergArtifactMetrics,
     referenced_data_file: String,
-    merged_old_references: Vec<String>,
+    merged_old_references: Vec<EntryIdentity>,
 }
 
 impl IcebergPositionDeleteFileArtifact {
@@ -1305,7 +1319,7 @@ impl IcebergPositionDeleteFileArtifact {
         partition: IcebergArtifactPartition,
         metrics: IcebergArtifactMetrics,
         referenced_data_file: String,
-        merged_old_references: Vec<String>,
+        merged_old_references: Vec<EntryIdentity>,
     ) -> Result<Self, ConnectorError> {
         validate_location("staged position-delete file", &path)?;
         validate_location("referenced data file", &referenced_data_file)?;
@@ -1337,7 +1351,7 @@ impl IcebergPositionDeleteFileArtifact {
         &self.referenced_data_file
     }
     /// The exact old artifacts this file superseded, in sorted order.
-    pub fn merged_old_references(&self) -> &[String] {
+    pub fn merged_old_references(&self) -> &[EntryIdentity] {
         &self.merged_old_references
     }
 }
@@ -1522,7 +1536,7 @@ pub struct IcebergDeletionVectorArtifact {
     referenced_data_file: String,
     content_range: IcebergContentRange,
     cardinality: u64,
-    merged_old_references: Vec<String>,
+    merged_old_references: Vec<EntryIdentity>,
 }
 
 impl IcebergDeletionVectorArtifact {
@@ -1533,7 +1547,7 @@ impl IcebergDeletionVectorArtifact {
         referenced_data_file: String,
         content_range: IcebergContentRange,
         cardinality: u64,
-        merged_old_references: Vec<String>,
+        merged_old_references: Vec<EntryIdentity>,
     ) -> Result<Self, ConnectorError> {
         validate_location("staged deletion vector", &path)?;
         validate_location("referenced data file", &referenced_data_file)?;
@@ -1584,16 +1598,24 @@ impl IcebergDeletionVectorArtifact {
     pub const fn cardinality(&self) -> u64 {
         self.cardinality
     }
-    pub fn merged_old_references(&self) -> &[String] {
+    pub fn merged_old_references(&self) -> &[EntryIdentity] {
         &self.merged_old_references
     }
 }
 
-fn validate_merged_references(references: &[String]) -> Result<(), ConnectorError> {
-    let mut previous: Option<&str> = None;
+fn validate_merged_references(references: &[EntryIdentity]) -> Result<(), ConnectorError> {
+    let mut previous: Option<&EntryIdentity> = None;
     for reference in references {
-        validate_location("merged old delete reference", reference)?;
-        if previous.is_some_and(|last| last >= reference.as_str()) {
+        reference
+            .validate()
+            .map_err(|error| corrupt(error.to_string()))?;
+        validate_location("merged old delete reference", reference.path())?;
+        if matches!(reference, EntryIdentity::DataFile { .. }) {
+            return Err(corrupt(
+                "Merged old-delete reference must identify a delete entry",
+            ));
+        }
+        if previous.is_some_and(|last| last >= reference) {
             return Err(corrupt(
                 "Iceberg merged old-delete references must be sorted and unique",
             ));
@@ -1647,7 +1669,28 @@ impl IcebergCommitFragment {
         &self.artifact
     }
 
-    /// The staged path, which is unique across one prepared write set.
+    /// The logical identity is unique across one prepared write set.
+    pub fn entry_identity(&self) -> EntryIdentity {
+        match &self.artifact {
+            IcebergCommitArtifact::DataFile(file) => EntryIdentity::DataFile {
+                path: file.path().to_string(),
+            },
+            IcebergCommitArtifact::PositionDeleteFile(file) => EntryIdentity::DeleteFile {
+                path: file.path().to_string(),
+            },
+            IcebergCommitArtifact::EqualityDeleteFile(file) => EntryIdentity::DeleteFile {
+                path: file.path().to_string(),
+            },
+            IcebergCommitArtifact::DeletionVector(file) => EntryIdentity::DeletionVector {
+                path: file.path().to_string(),
+                offset: file.content_range().offset(),
+                length: file.content_range().size_in_bytes(),
+                referenced_data_file: file.referenced_data_file().to_string(),
+            },
+        }
+    }
+
+    /// The physical object location; distinct DV entries may share it.
     pub fn path(&self) -> &str {
         match &self.artifact {
             IcebergCommitArtifact::DataFile(file) => file.path(),
@@ -1689,7 +1732,7 @@ impl IcebergCommitFragment {
         }
     }
 
-    pub fn merged_old_references(&self) -> &[String] {
+    pub fn merged_old_references(&self) -> &[EntryIdentity] {
         match &self.artifact {
             IcebergCommitArtifact::DataFile(_) | IcebergCommitArtifact::EqualityDeleteFile(_) => {
                 &[]
@@ -1720,14 +1763,14 @@ impl IcebergCommitFragment {
 pub struct IcebergSealedWriteTarget {
     ordinal: WriteTargetOrdinal,
     branch: IcebergWriteBranch,
-    owned_data_files: BTreeMap<String, Vec<String>>,
+    owned_data_files: BTreeMap<String, Vec<EntryIdentity>>,
 }
 
 impl IcebergSealedWriteTarget {
     pub const fn new(
         ordinal: WriteTargetOrdinal,
         branch: IcebergWriteBranch,
-        owned_data_files: BTreeMap<String, Vec<String>>,
+        owned_data_files: BTreeMap<String, Vec<EntryIdentity>>,
     ) -> Self {
         Self {
             ordinal,
@@ -1742,7 +1785,7 @@ impl IcebergSealedWriteTarget {
     pub const fn branch(&self) -> IcebergWriteBranch {
         self.branch
     }
-    pub const fn owned_data_files(&self) -> &BTreeMap<String, Vec<String>> {
+    pub const fn owned_data_files(&self) -> &BTreeMap<String, Vec<EntryIdentity>> {
         &self.owned_data_files
     }
     pub fn data_files(&self) -> impl Iterator<Item = &String> {
@@ -2290,7 +2333,7 @@ impl IcebergCommitHandle {
     /// exactly the references the session froze.
     pub fn frozen_old_references(
         &self,
-    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>> {
+    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>> {
         self.targets
             .iter()
             .filter(|target| target.branch().writes_deletes())
@@ -2502,7 +2545,7 @@ mod tests {
 
     #[test]
     fn merged_old_references_must_be_sorted_and_unique() {
-        let build = |references: Vec<String>| {
+        let build = |references: Vec<EntryIdentity>| {
             IcebergPositionDeleteFileArtifact::try_new(
                 "s3://b/d.parquet".to_string(),
                 sample_partition(),
@@ -2511,9 +2554,65 @@ mod tests {
                 references,
             )
         };
-        assert!(build(vec!["s3://b/1".to_string(), "s3://b/2".to_string()]).is_ok());
-        assert!(build(vec!["s3://b/2".to_string(), "s3://b/1".to_string()]).is_err());
-        assert!(build(vec!["s3://b/1".to_string(), "s3://b/1".to_string()]).is_err());
+        assert!(
+            build(vec![
+                EntryIdentity::DeleteFile {
+                    path: "s3://b/1".to_string()
+                },
+                EntryIdentity::DeleteFile {
+                    path: "s3://b/2".to_string()
+                }
+            ])
+            .is_ok()
+        );
+        assert!(
+            build(vec![
+                EntryIdentity::DeleteFile {
+                    path: "s3://b/2".to_string()
+                },
+                EntryIdentity::DeleteFile {
+                    path: "s3://b/1".to_string()
+                }
+            ])
+            .is_err()
+        );
+        assert!(
+            build(vec![
+                EntryIdentity::DeleteFile {
+                    path: "s3://b/1".to_string()
+                },
+                EntryIdentity::DeleteFile {
+                    path: "s3://b/1".to_string()
+                }
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn merged_vector_identity_keeps_range_and_referenced_data_file() {
+        let first = EntryIdentity::DeletionVector {
+            path: "s3://b/shared.puffin".to_string(),
+            offset: 4,
+            length: 64,
+            referenced_data_file: "s3://b/a.parquet".to_string(),
+        };
+        let mut second = first.clone();
+        if let EntryIdentity::DeletionVector { offset, .. } = &mut second {
+            *offset = 80;
+        }
+        assert!(validate_merged_references(&[first.clone(), second.clone()]).is_ok());
+        assert!(validate_merged_references(&[first.clone(), first.clone()]).is_err());
+        assert!(
+            validate_merged_references(&[EntryIdentity::DataFile {
+                path: "s3://b/a.parquet".to_string()
+            }])
+            .is_err()
+        );
+        if let EntryIdentity::DeletionVector { length, .. } = &mut second {
+            *length = 0;
+        }
+        assert!(validate_merged_references(&[first, second]).is_err());
     }
 
     #[test]
