@@ -3039,6 +3039,7 @@ impl IcebergWriteSessionControl {
             }
             base.validate()?;
         }
+        let base_sequence_number = source_snapshot_sequence(&metadata, base_snapshot_id)?;
         let facts = IcebergWriteTableFacts::try_new(
             metadata.uuid().to_string(),
             namespace.to_string(),
@@ -3047,7 +3048,7 @@ impl IcebergWriteSessionControl {
             iceberg_data_location(&metadata),
             target_ref.to_string(),
             base_snapshot_id,
-            metadata.last_sequence_number(),
+            base_sequence_number,
             metadata.current_schema_id(),
             metadata.default_partition_spec_id(),
             format_version_number(&metadata),
@@ -3129,7 +3130,7 @@ impl IcebergWriteSessionControl {
                 iceberg_data_location(writer_metadata),
                 target_ref.to_string(),
                 base_snapshot_id,
-                writer_metadata.last_sequence_number(),
+                base_sequence_number,
                 writer_metadata.current_schema_id(),
                 writer_metadata.default_partition_spec_id(),
                 format_version_number(writer_metadata),
@@ -3646,6 +3647,19 @@ fn iceberg_data_location(metadata: &TableMetadata) -> String {
         .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')))
 }
 
+fn source_snapshot_sequence(
+    metadata: &TableMetadata,
+    snapshot_id: Option<i64>,
+) -> Result<i64, ConnectorError> {
+    match snapshot_id {
+        None => Ok(0),
+        Some(id) => metadata
+            .snapshot_by_id(id)
+            .map(|snapshot| snapshot.sequence_number())
+            .ok_or_else(|| corrupt("Admitted source snapshot is absent from table metadata")),
+    }
+}
+
 fn format_version_number(metadata: &TableMetadata) -> u8 {
     match metadata.format_version() {
         crate::iceberg::spec::FormatVersion::V1 => 1,
@@ -4081,6 +4095,73 @@ mod statistics_contract_tests {
         resolve_statistics_field, validate_theta_properties,
     };
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    #[tokio::test]
+    async fn frozen_source_sequence_tracks_its_ref_instead_of_the_global_allocator() {
+        use crate::commit::fast_append::FastAppendPreparer;
+        use crate::commit::model::AddedContent;
+        use crate::commit::overwrite::preparer_tests::{Fixture, data};
+        use crate::iceberg::spec::{FormatVersion, SnapshotReference, SnapshotRetention, Struct};
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let initial = fixture.intent(
+            &metadata,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data("file:///initial.parquet", 3, Struct::empty()),
+                    0,
+                )
+                .unwrap(),
+            ],
+        );
+        let (metadata, _) = fixture.stage(metadata, &initial, &FastAppendPreparer).await;
+        let main = metadata.snapshot_for_ref("main").unwrap().snapshot_id();
+        let metadata = metadata
+            .into_builder(None)
+            .set_ref(
+                "dev".into(),
+                SnapshotReference::new(
+                    main,
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let next = fixture.intent(
+            &metadata,
+            "dev",
+            vec![
+                AddedContent::new_logical_data(
+                    data("file:///other-branch.parquet", 2, Struct::empty()),
+                    0,
+                )
+                .unwrap(),
+            ],
+        );
+        let (metadata, _) = fixture.stage(metadata, &next, &FastAppendPreparer).await;
+        assert_eq!(metadata.last_sequence_number(), 2);
+        assert_eq!(
+            super::source_snapshot_sequence(&metadata, Some(main)).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::source_snapshot_sequence(
+                &metadata,
+                Some(metadata.snapshot_for_ref("dev").unwrap().snapshot_id())
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(super::source_snapshot_sequence(&metadata, None).unwrap(), 0);
+        assert!(super::source_snapshot_sequence(&metadata, Some(-1)).is_err());
+    }
 
     fn schema(fields: Vec<Arc<NestedField>>) -> Schema {
         Schema::builder()

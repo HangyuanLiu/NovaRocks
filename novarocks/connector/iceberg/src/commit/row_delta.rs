@@ -380,52 +380,7 @@ async fn write_delete_manifest(
 fn written_file_to_iceberg_data_file_minimal(
     f: &WrittenFile,
 ) -> Result<crate::iceberg::spec::DataFile, String> {
-    use crate::iceberg::spec::DataFileBuilder;
-    let mut builder = DataFileBuilder::default();
-    builder
-        .content(f.content)
-        .file_path(f.path.clone())
-        .file_format(f.format)
-        .partition(f.partition_values.clone())
-        .partition_spec_id(f.partition_spec_id)
-        .record_count(f.record_count)
-        .file_size_in_bytes(f.file_size_in_bytes);
-    if !f.split_offsets.is_empty() {
-        builder.split_offsets(Some(f.split_offsets.clone()));
-    }
-    if let Some(km) = &f.key_metadata {
-        builder.key_metadata(Some(km.clone()));
-    }
-    if let Some(ref_path) = &f.referenced_data_file {
-        builder.referenced_data_file(Some(ref_path.clone()));
-    }
-    if let Some(equality_ids) = &f.equality_ids {
-        builder.equality_ids(Some(equality_ids.clone()));
-    }
-    if let Some(offset) = f.content_offset {
-        builder.content_offset(Some(offset));
-    }
-    if let Some(size) = f.content_size_in_bytes {
-        builder.content_size_in_bytes(Some(size));
-    }
-    if !f.column_sizes.is_empty() {
-        builder.column_sizes(f.column_sizes.clone());
-    }
-    if !f.value_counts.is_empty() {
-        builder.value_counts(f.value_counts.clone());
-    }
-    if !f.null_value_counts.is_empty() {
-        builder.null_value_counts(f.null_value_counts.clone());
-    }
-    if !f.lower_bounds.is_empty() {
-        builder.lower_bounds(f.lower_bounds.clone());
-    }
-    if !f.upper_bounds.is_empty() {
-        builder.upper_bounds(f.upper_bounds.clone());
-    }
-    builder
-        .build()
-        .map_err(|e| format!("DataFileBuilder::build failed: {e}"))
+    super::data_file::from_written_file(f).map_err(|error| error.to_string())
 }
 
 fn row_delta_summary(written: &[WrittenFile]) -> HashMap<String, String> {

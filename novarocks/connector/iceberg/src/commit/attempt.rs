@@ -50,7 +50,7 @@ pub(crate) trait Publisher: Send + Sync {
 /// The retained OCC entrance has one direct catalog dispatch per attempt.
 /// It shares staging and retry with owner publication without changing topology.
 pub(crate) struct TransitionalPublisher {
-    pub catalog: std::sync::Arc<dyn crate::iceberg::Catalog>,
+    pub catalog: std::sync::Arc<dyn crate::catalog::NovaRocksCatalog>,
     pub ident: crate::iceberg::TableIdent,
     pub target_ref: String,
     pub evidence: CatalogCommitEvidence,
@@ -60,20 +60,18 @@ pub(crate) struct TransitionalPublisher {
 impl Publisher for TransitionalPublisher {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         attempt.check_active()?;
-        let table = self.catalog.load_table(&self.ident).await?;
+        let loaded = self
+            .catalog
+            .load_commit_base(
+                crate::catalog::CatalogTableName::from_identifier(&self.ident),
+                attempt.file_io().clone(),
+            )
+            .await;
         attempt.check_active()?;
-        let metadata_location = table
-            .metadata_location()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Loaded Iceberg table has no metadata location",
-                )
-            })?
-            .to_owned();
+        let base = loaded?;
         Ok(StagingBase::Existing {
-            metadata: table.metadata().clone(),
-            metadata_location,
+            metadata: base.metadata,
+            metadata_location: base.metadata_location,
         })
     }
 
@@ -91,7 +89,12 @@ impl Publisher for TransitionalPublisher {
             );
         }
         let expected = request.ref_snapshot_after(&self.target_ref);
-        match self.catalog.update_table(request.into_table_commit()).await {
+        match self
+            .catalog
+            .vendored_client()
+            .update_table(request.into_table_commit())
+            .await
+        {
             Ok(table) => {
                 match crate::catalog::dispatch::committed_snapshot_id(
                     table.metadata(),
@@ -356,20 +359,36 @@ async fn prepare(
         .collect();
     let mut references = BTreeSet::new();
     if !cross_attempt.is_empty() {
-        let parent = engine
-            .metadata()
-            .snapshot_for_ref(intent.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs = ValidationInputs::new(engine.metadata(), parent, attempt);
-        for identity in inputs
-            .live_set()
-            .await
-            .map_err(|e| before_dispatch_failure(&e))?
-            .keys()
-        {
-            let object = identity.object();
-            if cross_attempt.contains(&object) {
-                references.insert(object);
+        // Every snapshot published in this request remains readable by time travel,
+        // even when a later stage removes its files from the final head.
+        let mut snapshots: BTreeSet<_> = engine
+            .updates()
+            .iter()
+            .filter_map(|update| match update {
+                crate::iceberg::TableUpdate::AddSnapshot { snapshot } => {
+                    Some(snapshot.snapshot_id())
+                }
+                _ => None,
+            })
+            .collect();
+        snapshots.extend(
+            engine
+                .metadata()
+                .snapshot_for_ref(intent.target_ref())
+                .map(|s| s.snapshot_id()),
+        );
+        for snapshot in snapshots {
+            let mut inputs = ValidationInputs::new(engine.metadata(), Some(snapshot), attempt);
+            for identity in inputs
+                .live_set()
+                .await
+                .map_err(|e| before_dispatch_failure(&e))?
+                .keys()
+            {
+                let object = identity.object();
+                if cross_attempt.contains(&object) {
+                    references.insert(object);
+                }
             }
         }
     }
@@ -944,5 +963,83 @@ mod tests {
         );
         assert!(publisher.requests.lock().unwrap().is_empty());
         assert!(fixture.operation.artifacts().unwrap().is_empty());
+    }
+
+    struct RemoveAfterAppend;
+
+    #[async_trait]
+    impl Preparer for RemoveAfterAppend {
+        async fn prepare(
+            &self,
+            view: &super::super::staging::StagedView<'_>,
+            intent: &OperationIntent,
+        ) -> Result<PreparedChange> {
+            let remove_intent = OperationIntent::new(OperationIntentParts {
+                target: intent.target().clone(),
+                target_ref: intent.target_ref().to_owned(),
+                start: intent.start(),
+                changes: FileChanges::default(),
+                dependencies: intent.dependencies().to_vec(),
+                isolation: intent.isolation(),
+                shape: intent.shape(),
+                summary: intent.summary().clone(),
+                token: intent.token(),
+            })?;
+            super::super::truncate::TruncatePreparer
+                .prepare(view, &remove_intent)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn earlier_published_snapshot_retains_owned_data_after_a_later_stage_removes_it() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::RefUnchanged]);
+        let file = intent.changes().added[0].file().file_path();
+        std::fs::write(file.strip_prefix("file://").unwrap(), b"session data").unwrap();
+        fixture
+            .operation
+            .adopt_session_data(ObjectIdentity::new(file).unwrap())
+            .unwrap();
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&FastAppendPreparer, &RemoveAfterAppend],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(matches!(
+            report.publication,
+            PublicationOutcome::Committed(_)
+        ));
+        assert_eq!(
+            report.cleanup,
+            IcebergCleanupReport::Complete { deleted: 0 }
+        );
+        assert!(std::path::Path::new(file.strip_prefix("file://").unwrap()).exists());
+        let after = publisher.metadata.lock().unwrap().clone();
+        assert_eq!(after.snapshots().count(), 2);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let head = after.snapshot_for_ref("main").unwrap().snapshot_id();
+        let mut final_live = ValidationInputs::new(&after, Some(head), &attempt);
+        assert!(final_live.live_set().await.unwrap().is_empty());
+        let earlier = after
+            .snapshots()
+            .find(|s| s.snapshot_id() != head)
+            .unwrap()
+            .snapshot_id();
+        let mut historical_live = ValidationInputs::new(&after, Some(earlier), &attempt);
+        assert!(
+            historical_live
+                .live_set()
+                .await
+                .unwrap()
+                .keys()
+                .any(|identity| identity.object().path() == file)
+        );
     }
 }

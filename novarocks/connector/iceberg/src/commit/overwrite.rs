@@ -1049,46 +1049,7 @@ pub(super) async fn write_added_data_manifest(
 }
 
 pub(super) fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, String> {
-    use crate::iceberg::spec::DataFileBuilder;
-    let mut builder = DataFileBuilder::default();
-    builder
-        .content(f.content)
-        .file_path(f.path.clone())
-        .file_format(f.format)
-        .partition(f.partition_values.clone())
-        .partition_spec_id(f.partition_spec_id)
-        .record_count(f.record_count)
-        .file_size_in_bytes(f.file_size_in_bytes);
-    if !f.split_offsets.is_empty() {
-        builder.split_offsets(Some(f.split_offsets.clone()));
-    }
-    if let Some(km) = &f.key_metadata {
-        builder.key_metadata(Some(km.clone()));
-    }
-    if let Some(ref_path) = &f.referenced_data_file {
-        builder.referenced_data_file(Some(ref_path.clone()));
-    }
-    if !f.column_sizes.is_empty() {
-        builder.column_sizes(f.column_sizes.clone());
-    }
-    if !f.value_counts.is_empty() {
-        builder.value_counts(f.value_counts.clone());
-    }
-    if !f.null_value_counts.is_empty() {
-        builder.null_value_counts(f.null_value_counts.clone());
-    }
-    if !f.lower_bounds.is_empty() {
-        builder.lower_bounds(f.lower_bounds.clone());
-    }
-    if !f.upper_bounds.is_empty() {
-        builder.upper_bounds(f.upper_bounds.clone());
-    }
-    if let Some(first_row_id) = f.first_row_id {
-        builder.first_row_id(Some(first_row_id));
-    }
-    builder
-        .build()
-        .map_err(|e| format!("DataFileBuilder::build failed: {e}"))
+    super::data_file::from_written_file(f).map_err(|error| error.to_string())
 }
 
 fn overwrite_summary(

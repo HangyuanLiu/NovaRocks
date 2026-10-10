@@ -866,6 +866,11 @@ mod tests {
                         // TCP reads need not contain a complete request line.
                         let mut line = String::new();
                         let _ = std::io::BufReader::new(&socket).read_line(&mut line);
+                        if line.is_empty() {
+                            // An empty connection issued no HTTP request. Only
+                            // an actual DELETE exercises response-loss behavior.
+                            continue;
+                        }
                         let _ = request_seen.send(line);
                         let _ = wait_release.recv_timeout(Duration::from_secs(3));
                         let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
