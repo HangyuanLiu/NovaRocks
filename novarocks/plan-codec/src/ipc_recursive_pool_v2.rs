@@ -237,7 +237,7 @@ fn prepare_core<'pool, H>(
     }
     if !LOCKED_FAMILY
         || !LOCKED_TOOLCHAIN
-        || arrow::ARROW_VERSION != "58.2.0"
+        || arrow::ARROW_VERSION != crate::resource_source_model::LOCKED_ARROW_VERSION
         || !cfg!(target_endian = "little")
     {
         return Err((shape("recursive writer source model does not match this target")).into());

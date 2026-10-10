@@ -101,7 +101,7 @@ pub(crate) fn environment(work: &mut impl ResourceWork) -> Result<Layout, FlatPo
     let bytes = bytes_layout();
     let supported = LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
-        && arrow::ARROW_VERSION == "58.2.0"
+        && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION
         && cfg!(target_endian = "little")
         && Layout::new::<MutableBuffer>() == Layout::new::<NoPoolMutableBuffer>()
         && bytes == Layout::new::<NoPoolBytes>();
@@ -471,22 +471,42 @@ mod tests {
         }
         let lock = include_str!("../../../../Cargo.lock");
         assert!(locked_family(lock.as_bytes()));
+        assert_eq!(
+            crate::resource_source_model::LOCKED_ARROW_VERSION,
+            arrow::ARROW_VERSION
+        );
         let changed = lock.replacen(
-            "name = \"arrow-array\"\nversion = \"58.2.0\"",
-            "name = \"arrow-array\"\nversion = \"58.3.0\"",
+            &format!(
+                "name = \"arrow-array\"\nversion = \"{}\"",
+                crate::resource_source_model::LOCKED_ARROW_VERSION
+            ),
+            "name = \"arrow-array\"\nversion = \"999.0.0\"",
             1,
         );
         assert!(!locked_family(changed.as_bytes()));
-        let duplicated = format!("{lock}\nname = \"arrow-array\"\nversion = \"58.2.0\"\n");
-        assert!(!locked_family(duplicated.as_bytes()));
-        let bigint_changed = lock.replacen(
-            "name = \"num-bigint\"\nversion = \"0.4.6\"",
-            "name = \"num-bigint\"\nversion = \"0.4.7\"",
-            1,
-        );
-        assert!(!locked_family(bigint_changed.as_bytes()));
-        let bigint_duplicated = format!("{lock}\nname = \"num-bigint\"\nversion = \"0.4.6\"\n");
-        assert!(!locked_family(bigint_duplicated.as_bytes()));
+        // These probes test actual identity/source completeness, not an
+        // independently hardcoded release compatibility policy.
+        for member in ["arrow-array", "num-bigint", "flatbuffers"] {
+            let record = lock
+                .split("[[package]]")
+                .find(|record| {
+                    record
+                        .lines()
+                        .any(|line| line == format!("name = \"{member}\""))
+                })
+                .unwrap();
+            let duplicate = format!("{lock}\n[[package]]{record}");
+            assert!(!locked_family(duplicate.as_bytes()));
+            let bad_source = record.replacen(
+                "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+                "source = \"registry+https://example.invalid/index\"",
+                1,
+            );
+            assert_ne!(bad_source, record);
+            assert!(!locked_family(
+                lock.replacen(record, &bad_source, 1).as_bytes()
+            ));
+        }
     }
     #[test]
     fn actual_flat_stream_families_supply_checked_structural_requests() {

@@ -433,7 +433,8 @@ impl ConstantPool {
 
     /// Locked Rust Arc allocation request for this owner's actual backing.
     /// This is a layout input, not allocator usable size, RSS or a MEM grant.
-    /// Rust 1.92 ArcInner is repr(C): two AtomicUsize counters then the payload.
+    /// Audited Rust 1.98.1 ArcInner is repr(C, align(2)): two atomic usize
+    /// counters followed by the payload; the common layout author owns the guard.
     pub fn backing_allocation_layout() -> std::alloc::Layout {
         std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
             .extend(std::alloc::Layout::new::<PoolBacking>())

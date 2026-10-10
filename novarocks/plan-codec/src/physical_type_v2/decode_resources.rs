@@ -421,7 +421,11 @@ mod tests {
         assert_eq!(actual.definition_count, 3);
         // C/F/V/Vguard use 1 entry each; summary/active use 2 each. Active
         // false overwrites are work only, with no remove/rebuild requests.
-        assert_eq!(actual.allocation_requests_upper_bound, 8 + 2 + 1 + 128);
+        // The materialized Field namespace also owns one Vec, its copy,
+        // and the final Arc slice of the real metadata origin loans.
+        type Loan =
+            novarocks_type_contract::owned_resources::metadata_materialization::MetadataFieldLoan;
+        assert_eq!(actual.allocation_requests_upper_bound, 8 + 2 + 1 + 3 + 128);
         let trees = btree::insertion_only::<u32, DataType>(1)
             .unwrap()
             .request_bytes_upper_bound
@@ -444,6 +448,8 @@ mod tests {
             + 2 * size_of::<Node>()
             + 2 * size_of::<[usize; 4]>()
             + arc_golden(Layout::new::<Field>())
+            + 2 * size_of::<Loan>()
+            + arc_golden(Layout::new::<Loan>())
             + 512;
         assert_eq!(actual.allocation_request_bytes_upper_bound, expected);
         assert_eq!(

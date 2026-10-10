@@ -47,7 +47,7 @@ fn repeat(
     })
 }
 fn quoted(bytes: usize) -> Result<usize, FlatPoolResourceError> {
-    // Rust 1.92 str Debug: an ASCII control can require six bytes (\u{xx});
+    // Audited Rust 1.98.1 str Debug: an ASCII control can require six bytes (\u{xx});
     // non-ASCII scalars require <=6 times their UTF8 byte count. Include quotes.
     add(mul(bytes, 6)?, 2)
 }

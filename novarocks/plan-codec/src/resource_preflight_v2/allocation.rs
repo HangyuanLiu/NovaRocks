@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Requested-size bounds for Rust 1.92.0 RawVec and fresh Prost 0.13.5
+//! Requested-size bounds for the audited Rust 1.98.1 RawVec and fresh Prost 0.13.5
 //! decoding from &[u8], with bytes 1.11.0. These are not allocator RSS or a
 //! grant. Each contribution counts all occurrences, including overwritten
 //! objects. Old blocks already occur in the cumulative allocation sum.

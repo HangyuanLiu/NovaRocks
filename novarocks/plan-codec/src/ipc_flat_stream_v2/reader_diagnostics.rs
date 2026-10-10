@@ -17,8 +17,8 @@
 
 //! Requested diagnostic allocations for the checked, one-column flat reader
 //! and its ConstantPool validation. This is not the whole reader envelope or
-//! a memory grant. It assumes Arrow 58.2.0, num-bigint 0.4.6 and the inspected
-//! Rust 1.92 String/RawVec growth implementation. The parent owns entry/tail
+//! a memory grant. Its current source audit covers Arrow 58.4.0, num-bigint 0.4.6 and
+//! Rust 1.98.1 String/RawVec growth. Cargo identity is a separate receipt. The parent owns entry/tail
 //! observations and combines this with all successful reader allocations.
 
 use super::{FlatConstantStream, FlatPoolResourceError};

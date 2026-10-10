@@ -92,7 +92,7 @@ impl Requests {
         if tables == 0 {
             return Ok(());
         }
-        // Rust 1.92 RawVec<u32>: the first push reserves four elements;
+        // Audited Rust 1.98.1 RawVec<u32>: the first push reserves four elements;
         // subsequent pushes double the capacity. Count every request, not
         // only the final backing, even if some vtables deduplicate.
         let mut capacity = 4usize;

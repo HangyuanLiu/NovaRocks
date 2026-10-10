@@ -75,7 +75,7 @@ fn environment(work: &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError> 
     let loc = field_location_layout();
     let valid = LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
-        && arrow::ARROW_VERSION == "58.2.0"
+        && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION
         && cfg!(target_endian = "little")
         && loc.size() == 8
         && loc.align() == 4;
