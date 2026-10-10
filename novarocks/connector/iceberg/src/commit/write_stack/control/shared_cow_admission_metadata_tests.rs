@@ -327,7 +327,7 @@ fn signed_and_frozen(
             table_name: "t",
             metadata,
             snapshot_id: metadata.current_snapshot_id().expect("original snapshot"),
-            base_files: Vec::new(),
+            base_files: Vec::<crate::manifest::DataFileWithStats>::new(),
             input: &signed,
             base_version_digest: preparation.base_version().digest(),
             max_handle_payload_bytes: context.max_handle_payload_bytes(),
