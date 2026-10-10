@@ -2834,6 +2834,57 @@ fn resolve_statistics_field(
     Ok(Some(iceberg_field.id))
 }
 
+/// COW retains the already-loaded immutable generation. No capacity is minted.
+enum IcebergAdmissionStatisticsMetadata {
+    Shared(Arc<TableMetadata>),
+    Owned(TableMetadata),
+}
+
+impl IcebergAdmissionStatisticsMetadata {
+    fn from_loaded_table(table: &crate::iceberg::table::Table, copy_on_write: bool) -> Self {
+        if copy_on_write {
+            Self::Shared(table.metadata_ref())
+        } else {
+            Self::Owned(table.metadata().clone())
+        }
+    }
+
+    fn for_statistics(
+        &self,
+        prospective: Option<&TableMetadata>,
+        copy_on_write: bool,
+    ) -> Result<Self, ConnectorError> {
+        if copy_on_write {
+            match (self, prospective) {
+                (Self::Shared(original), None) => Ok(Self::Shared(Arc::clone(original))),
+                _ => Err(invalid(
+                    "Iceberg COW admission lost its original immutable metadata owner",
+                )),
+            }
+        } else {
+            Ok(Self::Owned(
+                prospective.unwrap_or_else(|| self.as_ref()).clone(),
+            ))
+        }
+    }
+}
+
+impl AsRef<TableMetadata> for IcebergAdmissionStatisticsMetadata {
+    fn as_ref(&self) -> &TableMetadata {
+        match self {
+            Self::Shared(value) => value.as_ref(),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+impl std::ops::Deref for IcebergAdmissionStatisticsMetadata {
+    type Target = TableMetadata;
+    fn deref(&self) -> &TableMetadata {
+        self.as_ref()
+    }
+}
+
 impl IcebergWriteSessionControl {
     fn frozen_references_of(
         &self,
@@ -2856,7 +2907,7 @@ impl IcebergWriteSessionControl {
         (
             IcebergCommitHandle,
             Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
-            TableMetadata,
+            IcebergAdmissionStatisticsMetadata,
         ),
         ConnectorError,
     > {
@@ -2928,7 +2979,10 @@ impl IcebergWriteSessionControl {
                         "Iceberg staged write target names a different table than its frozen facts",
                     ));
                 }
-                (None, staged.metadata.clone())
+                (
+                    None,
+                    IcebergAdmissionStatisticsMetadata::Owned(staged.metadata.clone()),
+                )
             }
             None => {
                 let physical = self
@@ -2936,7 +2990,13 @@ impl IcebergWriteSessionControl {
                     .load_table_for_request(namespace, table_name, &request.context)
                     .map_err(|error| unavailable(error.to_string()))?;
                 let table = physical.into_table();
-                let metadata = table.metadata().clone();
+                let metadata = IcebergAdmissionStatisticsMetadata::from_loaded_table(
+                    &table,
+                    matches!(
+                        &request.flavor,
+                        ConnectorWriteSessionFlavor::CopyOnWrite { .. }
+                    ),
+                );
                 (Some(table), metadata)
             }
         };
@@ -3121,9 +3181,9 @@ impl IcebergWriteSessionControl {
         // replacement it is the prospective one; the session's own facts stay
         // on the generation the table currently holds, because that is what its
         // commit-time compare-and-swap has to match.
-        let writer_metadata = repartition
-            .as_ref()
-            .map_or(&metadata, |prepared| prepared.prospective_metadata());
+        let writer_metadata = repartition.as_ref().map_or(metadata.as_ref(), |prepared| {
+            prepared.prospective_metadata()
+        });
         let writer_facts = match &repartition {
             None => None,
             Some(_) => Some(IcebergWriteTableFacts::try_new(
@@ -3140,7 +3200,15 @@ impl IcebergWriteSessionControl {
                 format_version_number(writer_metadata),
             )?),
         };
-        let statistics_metadata = writer_metadata.clone();
+        let statistics_metadata = metadata.for_statistics(
+            repartition
+                .as_ref()
+                .map(|prepared| prepared.prospective_metadata()),
+            matches!(
+                &request.flavor,
+                ConnectorWriteSessionFlavor::CopyOnWrite { .. }
+            ),
+        )?;
         let signed = sign_input_shape(&facts, &request.input)?;
         let material = IcebergSessionMaterial {
             data_output: IcebergWriterOutput::try_new(
@@ -4818,3 +4886,6 @@ mod eager_attempt_io_tests {
         fixture.trace.assert_data_was_not_reopened();
     }
 }
+
+#[cfg(test)]
+mod shared_cow_admission_metadata_tests;
