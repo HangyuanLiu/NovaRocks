@@ -16,10 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, Int64Array};
-use md5::{Digest, Md5};
-use novarocks_types::largeint;
-use std::sync::Arc;
+use arrow::array::ArrayRef;
+use novarocks_functions::builtin::md5_shared::{self, Operation};
 
 pub fn eval_md5sum_numeric(
     arena: &ExprArena,
@@ -28,6 +26,7 @@ pub fn eval_md5sum_numeric(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let mut inputs = Vec::with_capacity(args.len());
+    // Keep admission before evaluation of the next child, as in the original shell.
     for (idx, arg) in args.iter().enumerate() {
         inputs.push(super::common::to_owned_bytes_array_with_varchar_cast(
             arena.eval(*arg, chunk)?,
@@ -35,47 +34,10 @@ pub fn eval_md5sum_numeric(
             idx,
         )?);
     }
-
-    let output_type = arena.data_type(expr);
-    if output_type
-        .map(largeint::is_largeint_data_type)
-        .unwrap_or(false)
-    {
-        let mut out = Vec::with_capacity(chunk.len());
-        for row in 0..chunk.len() {
-            let mut hasher = Md5::new();
-            for input in &inputs {
-                if input.is_null(row) {
-                    continue;
-                }
-                hasher.update(input.bytes(row));
-            }
-
-            let digest = hasher.finalize();
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&digest[..16]);
-            out.push(Some(i128::from_be_bytes(bytes)));
-        }
-        return largeint::array_from_i128(&out);
-    }
-
-    let mut out_i64 = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
-        let mut hasher = Md5::new();
-        for input in &inputs {
-            if input.is_null(row) {
-                continue;
-            }
-            hasher.update(input.bytes(row));
-        }
-
-        let digest = hasher.finalize();
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        let value = u128::from_be_bytes(bytes) as i64;
-        out_i64.push(Some(value));
-    }
-
-    let out = Arc::new(Int64Array::from(out_i64)) as ArrayRef;
-    super::common::cast_output(out, output_type, "md5sum_numeric")
+    md5_shared::evaluate_legacy(
+        Operation::Md5sumNumeric,
+        &inputs,
+        chunk.len(),
+        arena.data_type(expr),
+    )
 }

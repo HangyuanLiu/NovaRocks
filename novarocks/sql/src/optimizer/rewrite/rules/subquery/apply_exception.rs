@@ -18,6 +18,7 @@
 //! Terminal guard of the SubqueryRewrite stage: any Apply node still present
 //! after the decorrelation rules means the subquery shape is unsupported.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::{ApplyOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -48,9 +49,15 @@ impl LogicalRewriteRule for ApplyException {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         match &expr.op {
-            Operator::LogicalApply(op) => Err(apply_exception_message(op)),
+            Operator::LogicalApply(op) => {
+                Err(SqlCompileError::Compilation(apply_exception_message(op)))
+            }
             _ => Ok(RewriteResult::Unchanged),
         }
     }

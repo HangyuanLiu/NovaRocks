@@ -38,7 +38,7 @@ pub(crate) fn validate_aggregate_sequences(plan: &PhysicalPlan, errors: &mut Val
     let mut calls_by_ref = BTreeMap::new();
     for fragment in plan.fragments().values() {
         for node in fragment.nodes().values() {
-            let NodeKind::Aggregate { calls, .. } = &node.kind else {
+            let Some((_, calls)) = node.kind.aggregate_contract() else {
                 continue;
             };
             for call in calls {
@@ -185,15 +185,175 @@ fn aggregate_outputs_reduce_into(produced: &[ValueId], expected: &[ValueId]) -> 
     produced_state == expected_state && expected_keys.iter().all(|key| produced_keys.contains(key))
 }
 
+// This comparison consumes the original owner's state argument contract;
+// it is separate from each phase's exact local function signature validation.
+#[derive(Debug)]
+enum StateSignatureComparisonError {
+    WorkExhausted,
+    InvalidType,
+    Control(novarocks_type_contract::CompileControlError),
+}
+impl From<novarocks_type_contract::ValueTypeError> for StateSignatureComparisonError {
+    fn from(_: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::InvalidType
+    }
+}
+
+fn state_value_types_match(
+    left: &crate::ValueType,
+    right: &crate::ValueType,
+    ignore_root_nullability: bool,
+    charge: &mut impl FnMut(usize) -> Result<(), StateSignatureComparisonError>,
+) -> Result<bool, StateSignatureComparisonError> {
+    charge(1)?;
+    if left.logical_type != right.logical_type
+        || (!ignore_root_nullability && left.nullable != right.nullable)
+    {
+        return Ok(false);
+    }
+    novarocks_type_contract::arrow_data_types_exact_observed::<StateSignatureComparisonError>(
+        &left.data_type,
+        &right.data_type,
+        || charge(1),
+    )
+}
+
+fn aggregate_bindings_match_with(
+    expected: &crate::AggregateBinding,
+    actual: &crate::AggregateBinding,
+    charge: &mut impl FnMut(usize) -> Result<(), StateSignatureComparisonError>,
+) -> Result<bool, StateSignatureComparisonError> {
+    use novarocks_type_contract::{AggregateStateArgumentContract, FunctionArgumentType};
+    let left = &expected.function;
+    let right = &actual.function;
+    let identity_work = [
+        left.function_id.as_str().len(),
+        right.function_id.as_str().len(),
+        left.overload.as_str().len(),
+        right.overload.as_str().len(),
+        expected.state_format.as_str().len(),
+        actual.state_format.as_str().len(),
+    ]
+    .into_iter()
+    .try_fold(8usize, usize::checked_add);
+    charge(identity_work.ok_or(StateSignatureComparisonError::WorkExhausted)?)?;
+    if left.function_id != right.function_id
+        || left.overload != right.overload
+        || left.kind != right.kind
+        || left.argument_types.len() != right.argument_types.len()
+        || expected.logical_argument_count != actual.logical_argument_count
+        || expected.state_argument_contract != actual.state_argument_contract
+        || expected.state_format != actual.state_format
+        || expected.phase.sequence() != actual.phase.sequence()
+        || usize::try_from(expected.logical_argument_count)
+            .map_or(true, |count| count > left.argument_types.len())
+    {
+        return Ok(false);
+    }
+    let same_state = match (&expected.state_interpretation, &actual.state_interpretation) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.matches_observed(b, || charge(1))?,
+        _ => false,
+    };
+    if !same_state {
+        return Ok(false);
+    }
+    for (ordinal, (a, b)) in left
+        .argument_types
+        .iter()
+        .zip(&right.argument_types)
+        .enumerate()
+    {
+        let ignore_root = expected.state_argument_contract
+            == AggregateStateArgumentContract::ValueRootNullabilityIndependent
+            && ordinal < expected.logical_argument_count as usize;
+        let matches = match (a, b) {
+            (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) => {
+                state_value_types_match(a, b, ignore_root, charge)?
+            }
+            (
+                FunctionArgumentType::Lambda {
+                    parameter_types: ap,
+                    result_type: ar,
+                },
+                FunctionArgumentType::Lambda {
+                    parameter_types: bp,
+                    result_type: br,
+                },
+            ) => {
+                charge(1)?;
+                if ap.len() != bp.len() {
+                    return Ok(false);
+                }
+                for (a, b) in ap.iter().zip(bp) {
+                    if !state_value_types_match(a, b, false, charge)? {
+                        return Ok(false);
+                    }
+                }
+                state_value_types_match(ar, br, false, charge)?
+            }
+            _ => false,
+        };
+        if !matches {
+            return Ok(false);
+        }
+    }
+    Ok(
+        state_value_types_match(&left.result_type, &right.result_type, false, charge)?
+            && state_value_types_match(
+                &expected.intermediate_type,
+                &actual.intermediate_type,
+                false,
+                charge,
+            )?,
+    )
+}
+
 pub(crate) fn aggregate_bindings_match(
     expected: &crate::AggregateBinding,
     actual: &crate::AggregateBinding,
+    budget: &mut SemanticTraceWorkBudget,
 ) -> bool {
-    expected.function == actual.function
-        && expected.logical_argument_count == actual.logical_argument_count
-        && expected.intermediate_type == actual.intermediate_type
-        && expected.state_format == actual.state_format
-        && expected.phase.sequence() == actual.phase.sequence()
+    aggregate_bindings_match_with(expected, actual, &mut |units| {
+        if budget.charge(units) {
+            Ok(())
+        } else {
+            Err(StateSignatureComparisonError::WorkExhausted)
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Borrow the original cross-phase state comparison with the caller's exact
+/// control meter. Installed declarations and source provenance remain separate
+/// mandatory gates; a matching signature alone supplies neither proof.
+pub fn aggregate_bindings_match_observed(
+    expected: &crate::AggregateBinding,
+    actual: &crate::AggregateBinding,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, novarocks_type_contract::CompileControlError> {
+    work.flush()?;
+    let result = aggregate_bindings_match_with(expected, actual, &mut |units| {
+        for _ in 0..units {
+            work.step()
+                .map_err(StateSignatureComparisonError::Control)?;
+        }
+        Ok(())
+    });
+    match result {
+        Ok(matches) => {
+            work.flush()?;
+            Ok(matches)
+        }
+        Err(StateSignatureComparisonError::Control(cause)) => Err(cause),
+        Err(StateSignatureComparisonError::WorkExhausted) => {
+            Err(novarocks_type_contract::CompileControlError::ResourceExhausted)
+        }
+        Err(StateSignatureComparisonError::InvalidType) => {
+            work.flush()?;
+            Ok(false)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,7 +386,24 @@ pub(crate) fn trace_aggregate_sequence_inputs(
         match &node.kind {
             NodeKind::Aggregate {
                 group_by, calls, ..
+            }
+            | NodeKind::TopN {
+                reduction:
+                    crate::TopNReduction::GroupedStates {
+                        group_by, calls, ..
+                    },
+                ..
             } => {
+                if matches!(
+                    node.kind,
+                    NodeKind::TopN {
+                        reduction: crate::TopNReduction::GroupedStates { .. },
+                        ..
+                    }
+                ) && partial_shape.0
+                {
+                    return false;
+                }
                 let Some(call) = trace_indexes.aggregate_sequence_call(
                     fragment.id(),
                     node.id,
@@ -236,7 +413,7 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                 ) else {
                     return false;
                 };
-                if !aggregate_bindings_match(expected_binding, &call.binding)
+                if !aggregate_bindings_match(expected_binding, &call.binding, trace_budget)
                     || !aggregate_outputs_reduce_into(
                         &aggregate_outputs(group_by, call),
                         &expected_values,
@@ -316,13 +493,12 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                 };
                 pending.push(((fragment.id(), input), values));
             }
-            // A partial top-N between two phases of an aggregate drops whole
-            // groups the final would not have published anyway -- that is what
-            // it is placed for, and its own sequence proves the order it prunes
-            // by is the grouping. The states that survive it carry on
-            // unchanged.
+            // Only Rows preserves state identity. The separate TopN sequence
+            // proves Complete input whenever this row budget ranks groups.
+            // GroupedStates above instead follows its exact Intermediate call.
             NodeKind::TopN {
                 phase: crate::TopNPhase::Partial { .. },
+                reduction: crate::TopNReduction::Rows,
                 ..
             } => {
                 let Some(input) = node.inputs.first().copied() else {
@@ -425,6 +601,7 @@ pub(crate) fn validate_topn_reductions(plan: &PhysicalPlan, errors: &mut Validat
             limit,
             offset,
             phase: crate::TopNPhase::Final { .. },
+            ..
         } = &final_node.kind
         else {
             continue;
@@ -465,6 +642,13 @@ struct Traced {
     reduced: bool,
     /// The order being pruned by is an aggregate's own grouping.
     by_grouping: bool,
+    /// A downstream grouped merge or Complete aggregate covers duplicates.
+    duplicate_states_covered: bool,
+    /// A grouped reduction must reach and check its full producing grouping.
+    key_contract_pending: bool,
+    /// A grouped sequence's ordinary row budget needs Complete input.
+    row_unique_pending: bool,
+    comparator: Option<crate::OrderedComparisonAlgorithm>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,14 +662,11 @@ pub(crate) fn trace_topn_reduction_inputs(
     trace_budget: &mut SemanticTraceWorkBudget,
     trace_indexes: &mut SemanticTraceIndexes,
 ) -> bool {
-    // Two facts travel down the walk. `reduced` says a partial has already
-    // been matched on this path: above the first one every step has to lead
-    // somewhere, because a path that reaches the final without reducing is
-    // what this check exists to catch, while below one there is nothing left
-    // to prove and a step that leads nowhere simply ends that branch.
-    // `by_grouping` says the order being pruned by is an aggregate's grouping,
-    // which an aggregate hop establishes -- see the exchange arm for what it
-    // licenses.
+    // A matched member does not discharge its input obligations. Grouped
+    // reductions must reach the full producing grouping; ordinary row budgets
+    // in a grouping sequence require Complete before encountering another
+    // grouped reduction. Exact aliases and cuts preserve these obligations.
+    // Only a fully discharged ordinary raw-row path may stop below a partial.
     let mut pending = vec![(start, initial_ordering, Traced::default())];
     let mut visited = BTreeSet::new();
     while let Some((node_ref, expected_ordering, traced)) = pending.pop() {
@@ -495,13 +676,16 @@ pub(crate) fn trace_topn_reduction_inputs(
             return false;
         }
         macro_rules! dead_end {
-            () => {
+            () => {{
+                if traced.key_contract_pending {
+                    return false;
+                }
                 if traced.reduced {
                     continue;
                 } else {
                     return false;
                 }
-            };
+            }};
         }
         let Some(fragment) = plan.fragments().get(&node_ref.0) else {
             dead_end!();
@@ -517,8 +701,25 @@ pub(crate) fn trace_topn_reduction_inputs(
                     crate::TopNPhase::Partial {
                         sequence: partial_sequence,
                     },
+                reduction,
                 ..
             } => {
+                let grouped_comparator =
+                    if let crate::TopNReduction::GroupedStates { comparator, .. } = reduction {
+                        Some(*comparator)
+                    } else {
+                        None
+                    };
+                if grouped_comparator.is_some() && traced.row_unique_pending {
+                    return false;
+                }
+                if traced
+                    .comparator
+                    .zip(grouped_comparator)
+                    .is_some_and(|(a, b)| a != b)
+                {
+                    return false;
+                }
                 if *partial_sequence != sequence
                     || *offset != 0
                     || *limit != required_partial_limit
@@ -538,6 +739,15 @@ pub(crate) fn trace_topn_reduction_inputs(
                         expected_ordering,
                         Traced {
                             reduced: true,
+                            duplicate_states_covered: matches!(
+                                reduction,
+                                crate::TopNReduction::GroupedStates { .. }
+                            ),
+                            row_unique_pending: matches!(reduction, crate::TopNReduction::Rows)
+                                && traced.by_grouping,
+                            comparator: grouped_comparator.or(traced.comparator),
+                            key_contract_pending: traced.by_grouping
+                                || matches!(reduction, crate::TopNReduction::GroupedStates { .. }),
                             ..traced
                         },
                     ));
@@ -589,31 +799,56 @@ pub(crate) fn trace_topn_reduction_inputs(
                 };
                 pending.push(((source.id(), source.root()), mapped, traced));
             }
-            NodeKind::Project { .. } => {
+            NodeKind::Project { expressions } => {
                 let Some(input) = node.inputs.first().copied() else {
                     dead_end!();
                 };
                 let Some(child) = fragment.nodes().get(&input) else {
                     dead_end!();
                 };
-                if !trace_indexes.port_contains_all(
-                    fragment.id(),
+                let expected_values = expected_ordering
+                    .iter()
+                    .map(|key| key.value)
+                    .collect::<Vec<_>>();
+                let Some(values) = trace_indexes.map_project_values(
+                    fragment,
+                    node,
                     child,
-                    expected_ordering.iter().map(|key| key.value),
-                    expected_ordering.len(),
+                    expressions,
+                    &expected_values,
                     trace_budget,
-                ) {
+                ) else {
                     dead_end!();
-                }
-                pending.push(((fragment.id(), input), expected_ordering, traced));
+                };
+                let ordering = expected_ordering
+                    .iter()
+                    .zip(values)
+                    .map(|(key, value)| crate::OrderingKey {
+                        value,
+                        direction: key.direction,
+                        null_ordering: key.null_ordering,
+                    })
+                    .collect();
+                pending.push(((fragment.id(), input), ordering, traced));
             }
-            // An aggregate keeps one row per group, so pruning below it is
-            // sound exactly when the order it is pruned by is the grouping
-            // itself: every ordering key is one of this node's group keys and
-            // every group key is ordered by. The order then continues over the
-            // values those keys read.
-            NodeKind::Aggregate { group_by, .. } => {
+            // A Partial may repeat a group at any local DOP. Only a key
+            // budget consumer can retain/merge all such contributions. A
+            // complete grouping can also make an ordinary row budget sound.
+            NodeKind::Aggregate {
+                group_by, grouping, ..
+            } => {
+                if traced.row_unique_pending && *grouping != crate::AggregateGrouping::Complete {
+                    return false;
+                }
+                if *grouping == crate::AggregateGrouping::Partial
+                    && !traced.duplicate_states_covered
+                {
+                    return false;
+                }
                 if group_by.len() != expected_ordering.len() {
+                    if traced.key_contract_pending {
+                        return false;
+                    }
                     dead_end!();
                 }
                 let Some(input) = node.inputs.first().copied() else {
@@ -624,6 +859,9 @@ pub(crate) fn trace_topn_reduction_inputs(
                     let Some((expression, _)) =
                         group_by.iter().find(|(_, output)| *output == key.value)
                     else {
+                        if traced.key_contract_pending {
+                            return false;
+                        }
                         dead_end!();
                     };
                     let Some(source) =
@@ -635,6 +873,9 @@ pub(crate) fn trace_topn_reduction_inputs(
                                 _ => None,
                             })
                     else {
+                        if traced.key_contract_pending {
+                            return false;
+                        }
                         dead_end!();
                     };
                     mapped.push(crate::OrderingKey {
@@ -651,6 +892,10 @@ pub(crate) fn trace_topn_reduction_inputs(
                     mapped,
                     Traced {
                         by_grouping: true,
+                        duplicate_states_covered: traced.duplicate_states_covered
+                            || *grouping == crate::AggregateGrouping::Complete,
+                        key_contract_pending: false,
+                        row_unique_pending: false,
                         ..traced
                     },
                 ));
@@ -659,6 +904,10 @@ pub(crate) fn trace_topn_reduction_inputs(
                 kind: crate::SetOperationKind::UnionAll,
                 input_mappings,
             } => {
+                // Branch-local uniqueness does not prove disjoint union keys.
+                if traced.row_unique_pending {
+                    return false;
+                }
                 if node.inputs.len() != input_mappings.len() || node.inputs.is_empty() {
                     dead_end!();
                 }
@@ -699,3 +948,7 @@ pub(crate) fn trace_topn_reduction_inputs(
     }
     true
 }
+
+#[cfg(test)]
+#[path = "aggregate_state_argument_tests.rs"]
+mod aggregate_state_argument_tests;

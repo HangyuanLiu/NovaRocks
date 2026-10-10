@@ -186,17 +186,42 @@ impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
         }
     }
 
-    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), String> {
+    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), OptimizeTerminalError> {
         let cohort =
             self.session.plan().cohorts().get(ordinal).ok_or_else(|| {
                 format!("rewrite cohort ordinal {ordinal} is not in the frozen plan")
             })?;
         let prepared = self
             .engine
-            .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())?;
+            .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())
+            .map_err(|error| match error {
+                novarocks_sql::compiler::SqlCompileError::Cancelled => {
+                    OptimizeTerminalError::from_compile_control(
+                        novarocks_type_contract::CompileControlError::Cancelled,
+                    )
+                }
+                novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
+                    OptimizeTerminalError::from_compile_control(
+                        novarocks_type_contract::CompileControlError::DeadlineExceeded,
+                    )
+                }
+                novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+                    OptimizeTerminalError::from_compile_control(
+                        novarocks_type_contract::CompileControlError::ResourceExhausted,
+                    )
+                }
+                novarocks_sql::compiler::SqlCompileError::Analyze(error) => {
+                    match error.control_error() {
+                        Some(error) => OptimizeTerminalError::from_compile_control(error),
+                        None => OptimizeTerminalError::pre_dispatch_failed(error.to_string()),
+                    }
+                }
+                error => OptimizeTerminalError::pre_dispatch_failed(error.to_string()),
+            })?;
         let completion = prepared.finish()?;
         self.engine
             .accumulate_distributed_rewrite_group(&self.session, completion)
+            .map_err(OptimizeTerminalError::pre_dispatch_failed)
     }
 
     fn commit(&mut self) -> Result<RewriteCommit, String> {

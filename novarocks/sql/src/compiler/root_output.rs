@@ -44,8 +44,8 @@ impl RootOutputSemantics {
         // a nested declaration once per repeated output occurrence.
         let scalar_field = match columns {
             [column] => super::root_scalar_type::scalar_field(
-                &column.data_type,
-                column.nullable,
+                &column.value_type.data_type,
+                column.value_type.nullable,
                 factory.borrowed_logical_type(column.column_id),
             )
             .ok(),
@@ -101,7 +101,8 @@ impl RootOutputSemantics {
             .zip(columns)
             .enumerate()
             .map(|(ordinal, ((id, domain), column))| {
-                if *id != column.column_id || !domain.matches_storage(&column.data_type) {
+                if *id != column.column_id || !domain.matches_storage(&column.value_type.data_type)
+                {
                     return Err(format!(
                         "root semantic occurrence changed at ordinal {ordinal}"
                     ));
@@ -171,7 +172,8 @@ mod tests {
             false,
         );
         let mut factory = ColumnRefFactory::new();
-        let id = factory.create(None, "m".into(), data_type.clone(), false);
+        let value_type = novarocks_type_contract::FunctionValueType::new(data_type.clone(), false);
+        let id = factory.create(None, "m".into(), value_type.clone());
         factory.set_logical_type(
             id,
             Some(SqlType::Map(
@@ -184,8 +186,7 @@ mod tests {
             OutputColumn {
                 column_id: id,
                 name: "m".into(),
-                data_type,
-                nullable: false,
+                value_type,
                 is_internal: false,
             },
         )
@@ -220,6 +221,11 @@ mod tests {
                 },
                 None,
                 semantics,
+                crate::functions::test_function_catalog_snapshot(),
+                false,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
         let request = crate::compiler::completion::SqlCompileRequest::pending(
@@ -232,7 +238,11 @@ mod tests {
             crate::compiler::DEFAULT_COMPLETION_LIMITS,
         );
         let crate::compiler::SqlCompileProgress::Complete(completed) =
-            crate::compiler::SqlCompiler::start(request).unwrap()
+            crate::compiler::SqlCompiler::start(
+                request,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap()
         else {
             panic!("unexpected observation");
         };
@@ -274,7 +284,13 @@ mod tests {
         assert_eq!(semantics.occurrences.len(), repeated.len());
         assert!(
             semantics
-                .scalar_schema(&vec![ValueType::new(column.data_type.clone(), true); 2])
+                .scalar_schema(&vec![
+                    ValueType::new(
+                        column.value_type.data_type.clone(),
+                        true
+                    );
+                    2
+                ])
                 .is_none()
         );
         let excessive = vec![column; novarocks_result_contract::RootProfileV1::MAX_COLUMNS + 1];

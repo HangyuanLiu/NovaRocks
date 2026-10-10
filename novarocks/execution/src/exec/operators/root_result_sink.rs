@@ -19,6 +19,8 @@
 //! Drivers transfer an opaque grant and Chunk; a host's finite producer owns
 //! carrier validation/hydration/rendering. No driver does those operations.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -164,8 +166,8 @@ impl Operator for RootResultSink {
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
         Some(self)
     }
-    fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        self.check_state()
+    fn activate(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        (|| -> Result<(), String> { self.check_state() })().map_err(Into::into)
     }
     fn is_finished(&self) -> bool {
         self.finished
@@ -201,31 +203,34 @@ impl ProcessorOperator for RootResultSink {
                 self.session.writable_observable().generation() != generation
             })
     }
-    fn prepare_upstream_pull(&self) -> Result<bool, String> {
-        self.check_state()?;
-        if !self.need_input() {
-            return Ok(false);
-        }
-        let mut input = self.input.lock().unwrap();
-        if input.is_some() {
-            return Ok(true);
-        }
-        let generation = self.session.writable_observable().generation();
-        match self
-            .session
-            .try_acquire_input()
-            .map_err(|error| error.to_string())?
-        {
-            RootInputAdmission::Granted(permit) => {
-                *self.blocked_at.lock().unwrap() = None;
-                *input = Some(permit);
-                Ok(true)
+    fn prepare_upstream_pull(&self) -> ExecutionResult<bool> {
+        (|| -> Result<bool, String> {
+            self.check_state()?;
+            if !self.need_input() {
+                return Ok(false);
             }
-            RootInputAdmission::Blocked => {
-                *self.blocked_at.lock().unwrap() = Some(generation);
-                Ok(false)
+            let mut input = self.input.lock().unwrap();
+            if input.is_some() {
+                return Ok(true);
             }
-        }
+            let generation = self.session.writable_observable().generation();
+            match self
+                .session
+                .try_acquire_input()
+                .map_err(|error| error.to_string())?
+            {
+                RootInputAdmission::Granted(permit) => {
+                    *self.blocked_at.lock().unwrap() = None;
+                    *input = Some(permit);
+                    Ok(true)
+                }
+                RootInputAdmission::Blocked => {
+                    *self.blocked_at.lock().unwrap() = Some(generation);
+                    Ok(false)
+                }
+            }
+        })()
+        .map_err(Into::into)
     }
     fn finish_upstream_pull(&self, produced_chunk: bool) {
         if !produced_chunk {
@@ -239,42 +244,51 @@ impl ProcessorOperator for RootResultSink {
         &self,
         _chunk: &Chunk,
         input: &RootInputPermit,
-    ) -> Result<bool, String> {
-        self.check_state()?;
-        if input.task() != self.session.spec().task {
-            return Err("root edge input grant belongs to a different task".to_string());
-        }
-        Ok(!self.finished && !self.cancelled)
+    ) -> ExecutionResult<bool> {
+        (|| -> Result<bool, String> {
+            self.check_state()?;
+            if input.task() != self.session.spec().task {
+                return Err("root edge input grant belongs to a different task".to_string());
+            }
+            Ok(!self.finished && !self.cancelled)
+        })()
+        .map_err(Into::into)
     }
     fn push_chunk_with_root_input(
         &mut self,
         _state: &RuntimeState,
         chunk: Chunk,
         input: RootInputPermit,
-    ) -> Result<(), String> {
-        let input = PreparedRootInput {
-            chunk,
-            permit: input,
-        };
-        self.check_state()?;
-        if self.finished || self.cancelled {
-            return Err("bounded root input reached a closed driver".to_string());
-        }
-        self.session
-            .submit_input(input.chunk, input.permit)
-            .map_err(|error| error.to_string())
+    ) -> ExecutionResult<()> {
+        (|| -> Result<(), String> {
+            let input = PreparedRootInput {
+                chunk,
+                permit: input,
+            };
+            self.check_state()?;
+            if self.finished || self.cancelled {
+                return Err("bounded root input reached a closed driver".to_string());
+            }
+            self.session
+                .submit_input(input.chunk, input.permit)
+                .map_err(|error| error.to_string())
+        })()
+        .map_err(Into::into)
     }
-    fn can_accept_input(&self, _chunk: &Chunk) -> Result<bool, String> {
-        self.check_state()?;
-        if self.finished || self.cancelled {
-            return Ok(false);
-        }
-        if self.input.lock().unwrap().is_none() {
-            return Err(
-                "bounded root input reached its edge without pre-pull coverage".to_string(),
-            );
-        }
-        Ok(true)
+    fn can_accept_input(&self, _chunk: &Chunk) -> ExecutionResult<bool> {
+        (|| -> Result<bool, String> {
+            self.check_state()?;
+            if self.finished || self.cancelled {
+                return Ok(false);
+            }
+            if self.input.lock().unwrap().is_none() {
+                return Err(
+                    "bounded root input reached its edge without pre-pull coverage".to_string(),
+                );
+            }
+            Ok(true)
+        })()
+        .map_err(Into::into)
     }
     fn takes_original_input(&self) -> bool {
         true
@@ -282,41 +296,45 @@ impl ProcessorOperator for RootResultSink {
     fn has_output(&self) -> bool {
         false
     }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        self.check_state()?;
-        if self.finished || self.cancelled {
-            return Err("bounded root input reached a closed driver".to_string());
-        }
-        let permit = self
-            .input
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| "bounded root push has no original pre-pull grant".to_string())?;
-        self.session
-            .submit_input(chunk, permit)
-            .map_err(|error| error.to_string())
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        Ok(None)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        self.check_state()?;
-        if self.finished {
-            return Ok(());
-        }
-        self.release_unused_input();
-        self.finished = true;
-        let old = self.remaining.fetch_sub(1, Ordering::AcqRel);
-        if old <= 0 {
-            return Err("bounded root driver finish count underflow".to_string());
-        }
-        if old == 1 {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        (|| -> Result<(), String> {
+            self.check_state()?;
+            if self.finished || self.cancelled {
+                return Err("bounded root input reached a closed driver".to_string());
+            }
+            let permit =
+                self.input.lock().unwrap().take().ok_or_else(|| {
+                    "bounded root push has no original pre-pull grant".to_string()
+                })?;
             self.session
-                .finish_input()
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
+                .submit_input(chunk, permit)
+                .map_err(|error| error.to_string())
+        })()
+        .map_err(Into::into)
+    }
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        (|| -> Result<Option<Chunk>, String> { Ok(None) })().map_err(Into::into)
+    }
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        (|| -> Result<(), String> {
+            self.check_state()?;
+            if self.finished {
+                return Ok(());
+            }
+            self.release_unused_input();
+            self.finished = true;
+            let old = self.remaining.fetch_sub(1, Ordering::AcqRel);
+            if old <= 0 {
+                return Err("bounded root driver finish count underflow".to_string());
+            }
+            if old == 1 {
+                self.session
+                    .finish_input()
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })()
+        .map_err(Into::into)
     }
     fn accepts_encoded_column(&self, _slot: SlotId, _data_type: &DataType) -> bool {
         // The host receives the original carrier under its exact overlap
@@ -330,8 +348,8 @@ impl ProcessorOperator for RootResultSink {
     fn early_finish_observable(&self) -> Option<Arc<Observable>> {
         Some(self.session.writable_observable())
     }
-    fn execution_error(&self) -> Option<String> {
-        self.check_state().err()
+    fn execution_error(&self) -> Option<crate::runtime::fragment::ExecutionFailure> {
+        self.check_state().err().map(Into::into)
     }
 }
 
@@ -347,9 +365,7 @@ mod tests {
     use arrow::array::Int32Array;
     use novarocks_execution_contract::TaskIdentity;
     use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
-    use novarocks_types::{
-        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
-    };
+    use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
 
@@ -639,6 +655,7 @@ mod tests {
             sink.as_processor_ref()
                 .unwrap()
                 .execution_error()
+                .map(|error| error.to_string())
                 .as_deref(),
             Some("root producer failed")
         );
@@ -756,42 +773,46 @@ mod tests {
         fn has_output(&self) -> bool {
             !self.produced
         }
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> Result<(), String> {
-            Err("source cannot accept input".to_string())
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
+            (|| -> Result<(), String> { Err("source cannot accept input".to_string()) })()
+                .map_err(Into::into)
         }
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
-            assert_eq!(
-                self.session.held_bytes.load(Ordering::SeqCst),
-                self.session.authority.required_bytes(),
-                "coverage must exist before this owner can allocate its final output"
-            );
-            self.pulls.fetch_add(1, Ordering::SeqCst);
-            self.produced = true;
-            if self.fail_in_pull {
-                let array = Arc::new(Int32Array::from(vec![1, 2, 3]));
-                *self.session.input_backing.lock().unwrap() = Some(Arc::downgrade(&array));
-                let schema = Arc::new(
-                    ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                        SlotId::new(1),
-                        arrow::datatypes::Field::new("input", DataType::Int32, false),
-                        None,
-                        None,
-                    )])
-                    .unwrap(),
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+            (|| -> Result<Option<Chunk>, String> {
+                assert_eq!(
+                    self.session.held_bytes.load(Ordering::SeqCst),
+                    self.session.authority.required_bytes(),
+                    "coverage must exist before this owner can allocate its final output"
                 );
-                let batch = arrow::record_batch::RecordBatch::try_new(
-                    schema.arrow_schema_ref(),
-                    vec![array],
-                )
-                .unwrap();
-                let chunk = Chunk::new_with_chunk_schema(batch, schema);
-                self.session.fail();
-                return Ok(Some(chunk));
-            }
-            Ok((!self.empty).then(Chunk::default))
+                self.pulls.fetch_add(1, Ordering::SeqCst);
+                self.produced = true;
+                if self.fail_in_pull {
+                    let array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+                    *self.session.input_backing.lock().unwrap() = Some(Arc::downgrade(&array));
+                    let schema = Arc::new(
+                        ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                            SlotId::new(1),
+                            arrow::datatypes::Field::new("input", DataType::Int32, false),
+                            None,
+                            None,
+                        )])
+                        .unwrap(),
+                    );
+                    let batch = arrow::record_batch::RecordBatch::try_new(
+                        schema.arrow_schema_ref(),
+                        vec![array],
+                    )
+                    .unwrap();
+                    let chunk = Chunk::new_with_chunk_schema(batch, schema);
+                    self.session.fail();
+                    return Ok(Some(chunk));
+                }
+                Ok((!self.empty).then(Chunk::default))
+            })()
+            .map_err(Into::into)
         }
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
-            Ok(())
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+            (|| -> Result<(), String> { Ok(()) })().map_err(Into::into)
         }
     }
     #[test]
@@ -919,7 +940,7 @@ mod tests {
         session.actual_exit();
         assert_eq!(
             driver.process(Duration::from_millis(100)),
-            DriverState::Failed("root producer failed".to_string())
+            DriverState::Failed("root producer failed".into())
         );
     }
 
@@ -963,66 +984,73 @@ mod tests {
         fn has_output(&self) -> bool {
             !self.done && !self.pulled_this_turn && self.workspace.is_none()
         }
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> Result<(), String> {
-            Err("source cannot accept input".into())
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
+            (|| -> Result<(), String> { Err("source cannot accept input".into()) })()
+                .map_err(Into::into)
         }
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
-            panic!("protected source must borrow the original root grant")
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+            (|| -> Result<Option<Chunk>, String> {
+                panic!("protected source must borrow the original root grant")
+            })()
+            .map_err(Into::into)
         }
         fn pull_chunk_with_root_input(
             &mut self,
             _: &RuntimeState,
             input: &RootInputPermit,
-        ) -> Result<crate::exec::pipeline::operator::RootPreparedPull, String> {
-            use crate::exec::pipeline::operator::RootPreparedPull;
-            assert_eq!(input.task(), self.session.spec.task);
-            assert_eq!(
-                input.retained_bytes(),
-                self.session.authority.required_bytes()
-            );
-            assert_eq!(
-                self.session.held_bytes.load(Ordering::SeqCst),
-                input.retained_bytes()
-            );
-            let turn = self.pulls.fetch_add(1, Ordering::SeqCst);
-            if turn == 0 {
-                self.generation.store(input.generation(), Ordering::SeqCst);
-                let array = Arc::new(Int32Array::from(vec![1, 2, 3]));
-                *self.session.input_backing.lock().unwrap() = Some(Arc::downgrade(&array));
-                self.workspace = Some(array);
-            }
-            assert_eq!(input.generation(), self.generation.load(Ordering::SeqCst));
-            self.pulled_this_turn = true;
-            if turn < 2 {
-                return Ok(RootPreparedPull::Yielded);
-            }
-            self.done = true;
-            match self.exit {
-                QuantumExit::Empty => Ok(RootPreparedPull::Empty),
-                QuantumExit::Error => Err("protected materializer failed".into()),
-                QuantumExit::Panic => panic!("protected materializer panic"),
-                QuantumExit::Chunk => {
-                    let schema = Arc::new(
-                        ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                            SlotId::new(1),
-                            arrow::datatypes::Field::new("input", DataType::Int32, false),
-                            None,
-                            None,
-                        )])
-                        .unwrap(),
-                    );
-                    let batch = arrow::record_batch::RecordBatch::try_new(
-                        schema.arrow_schema_ref(),
-                        vec![self.workspace.as_ref().unwrap().clone()],
-                    )
-                    .unwrap();
-                    // Keep construction scratch until the driver synchronously
-                    // clears it before transferring the grant into the host.
-                    Ok(RootPreparedPull::Chunk(Chunk::new_with_chunk_schema(
-                        batch, schema,
-                    )))
+        ) -> ExecutionResult<crate::exec::pipeline::operator::RootPreparedPull> {
+            (|| -> Result<crate::exec::pipeline::operator::RootPreparedPull, String> {
+                use crate::exec::pipeline::operator::RootPreparedPull;
+                assert_eq!(input.task(), self.session.spec.task);
+                assert_eq!(
+                    input.retained_bytes(),
+                    self.session.authority.required_bytes()
+                );
+                assert_eq!(
+                    self.session.held_bytes.load(Ordering::SeqCst),
+                    input.retained_bytes()
+                );
+                let turn = self.pulls.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    self.generation.store(input.generation(), Ordering::SeqCst);
+                    let array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+                    *self.session.input_backing.lock().unwrap() = Some(Arc::downgrade(&array));
+                    self.workspace = Some(array);
                 }
-            }
+                assert_eq!(input.generation(), self.generation.load(Ordering::SeqCst));
+                self.pulled_this_turn = true;
+                if turn < 2 {
+                    return Ok(RootPreparedPull::Yielded);
+                }
+                self.done = true;
+                match self.exit {
+                    QuantumExit::Empty => Ok(RootPreparedPull::Empty),
+                    QuantumExit::Error => Err("protected materializer failed".into()),
+                    QuantumExit::Panic => panic!("protected materializer panic"),
+                    QuantumExit::Chunk => {
+                        let schema = Arc::new(
+                            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                                SlotId::new(1),
+                                arrow::datatypes::Field::new("input", DataType::Int32, false),
+                                None,
+                                None,
+                            )])
+                            .unwrap(),
+                        );
+                        let batch = arrow::record_batch::RecordBatch::try_new(
+                            schema.arrow_schema_ref(),
+                            vec![self.workspace.as_ref().unwrap().clone()],
+                        )
+                        .unwrap();
+                        // Keep construction scratch until the driver synchronously
+                        // clears it before transferring the grant into the host.
+                        Ok(RootPreparedPull::Chunk(Chunk::new_with_chunk_schema(
+                            batch, schema,
+                        )))
+                    }
+                }
+            })()
+            .map_err(Into::into)
         }
         fn release_root_pull_workspace(&mut self) {
             if self.workspace.is_some() {
@@ -1033,8 +1061,8 @@ mod tests {
                 drop(self.workspace.take());
             }
         }
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
-            Ok(())
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+            (|| -> Result<(), String> { Ok(()) })().map_err(Into::into)
         }
     }
     fn quantum_driver(
@@ -1158,7 +1186,7 @@ mod tests {
             match exit {
                 QuantumExit::Empty => assert_eq!(state, DriverState::Finished),
                 QuantumExit::Error => assert!(matches!(state,
-                    DriverState::Failed(error) if error.ends_with("protected materializer failed"))),
+                    DriverState::Failed(error) if error.to_string().ends_with("protected materializer failed"))),
                 QuantumExit::Chunk | QuantumExit::Panic => unreachable!(),
             }
         }

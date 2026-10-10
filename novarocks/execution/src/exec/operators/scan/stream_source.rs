@@ -29,6 +29,8 @@
 
 // Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -39,13 +41,14 @@ use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 use tracing::warn;
 
 use super::output_filter::{
-    ScanLimitDecision, ScanOutputFilter, record_rows_read, scan_limit_decision,
+    ScanDriverFilter, ScanLimitDecision, ScanOutputFilter, record_rows_read, scan_limit_decision,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::{ScanNode, ScanOp, ScanOutputStream, ScanStreamSource};
 use crate::exec::operators::runtime_filter::{
-    NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet, RuntimeFilterGate,
+    CompiledRuntimeFilterConsumers, NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet,
+    RuntimeFilterConsumerState, RuntimeFilterGate,
 };
 use crate::exec::pipeline::operator::{
     DriverBlockDeadline, FinishWatch, Operator, ProcessorOperator, forward_observable,
@@ -96,14 +99,14 @@ fn native_scan_consumers(
 
 /// The operator and profile name of a scan source, always carrying the plan
 /// node id.
-fn scan_source_name(scan: &ScanNode, op: &dyn ScanOp) -> String {
+fn scan_source_name(node_id: Option<i32>, op: &dyn ScanOp) -> String {
     let name = op
         .profile_name()
         .unwrap_or_else(|| "ScanSource".to_string());
     if name.contains("plan_node_id=") || name.contains("(id=") {
         return name;
     }
-    if let Some(node_id) = scan.node_id() {
+    if let Some(node_id) = node_id {
         // A scan op's profile name template does not carry the plan node id;
         // appending it keeps profile naming consistent.
         return format!("{name} (plan_node_id={node_id})");
@@ -162,11 +165,11 @@ impl Wake for SourceReadiness {
 /// Factory for the scan source of a scan that hands its driver one stream.
 pub(crate) struct StreamScanSourceFactory {
     name: String,
-    scan: ScanNode,
+    node_id: Option<i32>,
+    limit: Option<usize>,
     op: Arc<dyn ScanOp>,
     source: Arc<dyn ScanStreamSource>,
     filter: ScanOutputFilter,
-    blocking: RuntimeFilterConsumerSet,
 }
 
 impl StreamScanSourceFactory {
@@ -177,17 +180,39 @@ impl StreamScanSourceFactory {
     ) -> Result<Self, String> {
         let source = op.stream_source();
         let (blocking, ordered_live) = native_scan_consumers(&scan, &arena)?;
-        let name = scan_source_name(&scan, op.as_ref());
-        let filter =
-            ScanOutputFilter::new(&scan, arena, Some(blocking.clone()), Some(ordered_live));
+        let name = scan_source_name(scan.node_id(), op.as_ref());
+        let filter = ScanOutputFilter::new(&scan, arena, Some(blocking), Some(ordered_live));
         Ok(Self {
             name,
-            scan,
+            node_id: scan.node_id(),
+            limit: scan.limit(),
             op,
             source,
             filter,
-            blocking,
         })
+    }
+
+    /// Build the source of a compiled Scan (local-compiler output). It owns
+    /// no legacy expression arena and no conjunct: a compiled residual runs
+    /// as a compiled filter after the source, and a compiled scan has no
+    /// scan-level limit. Its blocking membership `runtime_filters`, if any,
+    /// gate the first read and filter every chunk by their compiled key
+    /// roots; every other chunk the stream delivers is handed downstream as
+    /// read.
+    pub(crate) fn new_compiled(
+        display_id: i32,
+        op: Arc<dyn ScanOp>,
+        runtime_filters: Option<Arc<CompiledRuntimeFilterConsumers>>,
+    ) -> Self {
+        let source = op.stream_source();
+        Self {
+            name: scan_source_name(Some(display_id), op.as_ref()),
+            node_id: Some(display_id),
+            limit: None,
+            op,
+            source,
+            filter: ScanOutputFilter::compiled(runtime_filters),
+        }
     }
 }
 
@@ -200,10 +225,12 @@ impl OperatorFactory for StreamScanSourceFactory {
         let readiness = SourceReadiness::new();
         // A scan held at its runtime-filter gate waits on the same stable
         // source observable as a scan waiting for its stream.
-        forward_observable(&self.blocking.gate_observable(), &readiness.observable());
+        if let Some(blocking) = self.filter.blocking() {
+            forward_observable(&blocking.gate_observable(), &readiness.observable());
+        }
         Box::new(StreamScanSourceOperator {
             name: self.name.clone(),
-            scan: self.scan.clone(),
+            limit: self.limit,
             op: Arc::clone(&self.op),
             source: Arc::clone(&self.source),
             stage: StreamStage::Unclaimed,
@@ -211,14 +238,14 @@ impl OperatorFactory for StreamScanSourceFactory {
             readiness,
             budget: ConnectorPollBudget::new(),
             wake_generation: None,
-            filter: self.filter.clone(),
+            filter: self.filter.for_driver(),
             rows_emitted: 0,
             profiles: None,
             event_sink: Arc::new(NoopFragmentEventSink),
             runtime_error: None,
             output_tracker_label: format!(
                 "scan_stream_output node={} driver={driver_id}",
-                self.scan.node_id().unwrap_or(-1)
+                self.node_id.unwrap_or(-1)
             ),
             output_tracker: None,
             downstream_paused: false,
@@ -241,7 +268,8 @@ enum StreamStage {
 
 struct StreamScanSourceOperator {
     name: String,
-    scan: ScanNode,
+    /// Scan-level LIMIT: delivery ends once this many rows were emitted.
+    limit: Option<usize>,
     op: Arc<dyn ScanOp>,
     source: Arc<dyn ScanStreamSource>,
     stage: StreamStage,
@@ -252,7 +280,7 @@ struct StreamScanSourceOperator {
     /// The readiness generation sampled before the last poll, when that poll
     /// returned `Pending`. A different generation means the stream woke up.
     wake_generation: Option<u64>,
-    filter: ScanOutputFilter,
+    filter: ScanDriverFilter,
     rows_emitted: usize,
     profiles: Option<OperatorProfiles>,
     event_sink: Arc<dyn FragmentEventSink>,
@@ -284,11 +312,14 @@ impl StreamScanSourceOperator {
     fn gate_holds_input(&self) -> bool {
         self.filter
             .blocking()
-            .is_some_and(RuntimeFilterConsumerSet::gate_holds_input)
+            .is_some_and(RuntimeFilterConsumerState::gate_holds_input)
     }
 }
 
 impl Operator for StreamScanSourceOperator {
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.filter.bind_mem_tracker(tracker);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -301,7 +332,7 @@ impl Operator for StreamScanSourceOperator {
         self.event_sink = sink;
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(consumers) = self.filter.blocking() {
             consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
             consumers.bind(state)?;
@@ -316,7 +347,7 @@ impl Operator for StreamScanSourceOperator {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         self.end_delivery();
         Ok(())
     }
@@ -381,11 +412,13 @@ impl ProcessorOperator for StreamScanSourceOperator {
         }
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-        Err("scan source operator does not accept input".to_string())
+    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        Err("scan source operator does not accept input"
+            .to_string()
+            .into())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if matches!(self.stage, StreamStage::Ended) {
             return Ok(None);
         }
@@ -428,7 +461,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
                 }
                 Poll::Ready(Some(Err(error))) => {
                     self.end_delivery();
-                    return Err(error);
+                    return Err(error.into());
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
                     self.wake_generation = None;
@@ -440,7 +473,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
                         continue;
                     };
                     let rows = chunk.len();
-                    match scan_limit_decision(self.scan.limit(), self.rows_emitted, rows) {
+                    match scan_limit_decision(self.limit, self.rows_emitted, rows) {
                         ScanLimitDecision::Stop => {
                             self.end_delivery();
                             return Ok(None);
@@ -465,7 +498,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
         }
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 
@@ -476,7 +509,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
     fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
         self.filter
             .blocking()
-            .and_then(RuntimeFilterConsumerSet::gate_deadline)
+            .and_then(RuntimeFilterConsumerState::gate_deadline)
     }
 
     fn begin_turn(&mut self) {
@@ -697,16 +730,16 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.values.lock().expect("values").push(value_of(&chunk));
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             self.finished = true;
             Ok(())
         }
@@ -961,6 +994,58 @@ mod tests {
         );
     }
 
+    // A compiled scan source owns no conjunct, runtime filter or limit: every
+    // nonempty chunk its stream delivers is handed on as read.
+    #[test]
+    fn a_compiled_scan_source_hands_every_chunk_on_as_read() {
+        let control = Arc::new(StreamControl::default());
+        let source = Arc::new(ScriptedSource {
+            control: Arc::clone(&control),
+            claims: AtomicUsize::new(0),
+        });
+        let op: Arc<dyn ScanOp> = Arc::new(StreamScanOp {
+            source: Arc::clone(&source),
+            backpressure: Arc::new(Mutex::new(Vec::new())),
+        });
+        let factory = StreamScanSourceFactory::new_compiled(3, op, None);
+        assert!(
+            factory.name().contains("plan_node_id=3"),
+            "{}",
+            factory.name()
+        );
+        let mut scan = factory.create(1, 0);
+        scan.bind_runtime_state(&RuntimeState::default())
+            .expect("bind compiled stream scan");
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let mut driver = PipelineDriver::new(
+            1,
+            vec![
+                scan,
+                Box::new(CollectSink {
+                    values: Arc::clone(&values),
+                    finished: false,
+                    observable: Arc::new(Observable::new()),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+        for value in [4, 5, 6] {
+            control.push(one_row(value));
+        }
+        control.ended.store(true, Ordering::Release);
+
+        let mut state = run_until_parked(&mut driver);
+        if matches!(state, DriverState::PendingFinish) {
+            state = driver.process(TURN);
+        }
+        assert!(matches!(state, DriverState::Finished), "{state:?}");
+        assert_eq!(*values.lock().expect("values"), vec![4, 5, 6]);
+        assert_eq!(source.claims.load(Ordering::Acquire), 1);
+    }
+
     #[test]
     fn cancelling_a_stream_scan_starts_its_scan_s_terminal_cleanup() {
         let control = Arc::new(StreamControl::default());
@@ -1030,16 +1115,16 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.values.lock().expect("values").push(value_of(&chunk));
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -1128,7 +1213,7 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.entered.send(value_of(&chunk)).expect("entered");
             self.release
                 .lock()
@@ -1138,11 +1223,11 @@ mod tests {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 

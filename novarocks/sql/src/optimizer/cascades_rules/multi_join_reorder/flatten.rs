@@ -37,7 +37,11 @@ use super::{EquiClass, MultiJoinGraph};
 /// joins, `LogicalProject`, scans, aggregates, CTE consumes, etc. — is an opaque
 /// atom (M4: the chain never descends through a projection or a non-inner/cross
 /// join). Returns `None` for fewer than two atoms or more than 32 (mask cap).
-pub(crate) fn flatten_join_chain(memo: &mut Memo, root: GroupId) -> Option<MultiJoinGraph> {
+pub(crate) fn flatten_join_chain(
+    memo: &mut Memo,
+    root: GroupId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<MultiJoinGraph>, crate::compiler::SqlCompileError> {
     let mut atoms: Vec<GroupId> = Vec::new();
     let mut raw_predicates: Vec<ScalarId> = Vec::new();
     let mut chain_joins: Vec<GroupId> = Vec::new();
@@ -50,7 +54,7 @@ pub(crate) fn flatten_join_chain(memo: &mut Memo, root: GroupId) -> Option<Multi
     );
 
     if atoms.len() < 2 || atoms.len() > 32 {
-        return None;
+        return Ok(None);
     }
 
     let atom_cols: Vec<HashSet<ColumnId>> = atoms
@@ -67,20 +71,20 @@ pub(crate) fn flatten_join_chain(memo: &mut Memo, root: GroupId) -> Option<Multi
             // condition (rare after predicate pushdown). Bail rather than risk
             // dropping it during materialization — this chain keeps its
             // original (un-reordered) join order.
-            return None;
+            return Ok(None);
         }
         predicates.push((pred, mask));
     }
 
-    let equi_classes = project_root_equi_classes(memo, root, &atoms, &atom_cols);
+    let equi_classes = project_root_equi_classes(memo, root, &atoms, &atom_cols, control)?;
 
-    Some(MultiJoinGraph {
+    Ok(Some(MultiJoinGraph {
         atoms,
         atom_stats,
         predicates,
         chain_join_groups: chain_joins,
         equi_classes,
-    })
+    }))
 }
 
 /// Project root strict equivalence facts onto the atoms in this join chain.
@@ -92,7 +96,8 @@ fn project_root_equi_classes(
     root: GroupId,
     atoms: &[GroupId],
     atom_cols: &[HashSet<ColumnId>],
-) -> Vec<EquiClass> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<EquiClass>, crate::compiler::SqlCompileError> {
     let classes: Vec<_> = memo
         .groups
         .get(root)
@@ -110,7 +115,7 @@ fn project_root_equi_classes(
                 .filter_map(|column_id| atom_output_column(memo, *atom, column_id))
                 .min_by_key(|column| column.column_id);
             if let Some(column) = rep_column {
-                let scalar = intern_output_column_ref(memo, &column);
+                let scalar = intern_output_column_ref(memo, &column, control)?;
                 reps.push((atom_idx, scalar));
             }
         }
@@ -118,7 +123,7 @@ fn project_root_equi_classes(
             out.push(EquiClass::new(class.iter().collect(), reps));
         }
     }
-    out
+    Ok(out)
 }
 
 fn atom_output_column(
@@ -138,13 +143,17 @@ fn atom_output_column(
         })
 }
 
-fn intern_output_column_ref(memo: &mut Memo, column: &crate::common::OutputColumn) -> ScalarId {
+fn intern_output_column_ref(
+    memo: &mut Memo,
+    column: &crate::common::OutputColumn,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     memo.scalars
         .remember_source_column_display(column.column_id, None, column.name.clone());
-    memo.scalars.intern(
+    memo.scalars.intern_observed(
         ScalarNode::ColumnRef(column.column_id),
-        column.data_type.clone(),
-        column.nullable,
+        column.value_type.clone(),
+        control,
     )
 }
 
@@ -263,7 +272,7 @@ fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut Hash
                 out.insert(*id);
             }
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_scalar_column_ids(arena, *left, out);
             collect_scalar_column_ids(arena, *right, out);
@@ -355,16 +364,14 @@ mod tests {
     fn col(memo: &mut Memo, id: u32) -> ScalarId {
         memo.scalars.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
     fn int_lit(memo: &mut Memo, v: i64) -> ScalarId {
         memo.scalars.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(v))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -376,8 +383,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         )
     }
 
@@ -415,8 +421,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: format!("c{id}"),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -498,9 +504,21 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c1_eq_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
-        let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
+        let graph = flatten_join_chain(
+            &mut memo,
+            root,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("3-atom chain flattens");
         assert_eq!(graph.atoms, vec![a, b, c], "left-to-right atom order");
         assert_eq!(graph.predicates.len(), 2, "two multi-relation join edges");
         let masks: std::collections::HashSet<u32> =
@@ -536,9 +554,21 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c1_eq_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
-        let graph = flatten_join_chain(&mut memo, root).expect("chain over {LO, C}");
+        let graph = flatten_join_chain(
+            &mut memo,
+            root,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("chain over {LO, C}");
         assert_eq!(
             graph.atoms.len(),
             2,
@@ -565,13 +595,25 @@ mod tests {
             right: Box::new(JoinTree::Leaf(b)),
             op: inner(cond),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // A single-relation predicate inside the join condition makes the chain
         // non-reorderable (we never drop predicates); flatten returns None and
         // the original order / RBO path handles this chain.
         assert!(
-            flatten_join_chain(&mut memo, root).is_none(),
+            flatten_join_chain(
+                &mut memo,
+                root,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_none(),
             "chain with a single-side join-condition predicate must not be reordered"
         );
     }
@@ -595,8 +637,20 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_eq_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
-        let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let graph = flatten_join_chain(
+            &mut memo,
+            root,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("3-atom chain flattens");
 
         // Literal edges only connect A-B and B-C; no literal A-C edge exists.
         let masks: std::collections::HashSet<u32> =
@@ -640,7 +694,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_eq_c4),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut root_props =
             LogicalProperties::new(vec![out_col(1), out_col(2), out_col(3), out_col(4)], 50.0);
         root_props
@@ -654,7 +714,13 @@ mod tests {
             .merge_pair(ColumnId::new_for_test(2), ColumnId::new_for_test(4));
         memo.groups[root].logical_props = Some(root_props);
 
-        let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
+        let graph = flatten_join_chain(
+            &mut memo,
+            root,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("3-atom chain flattens");
 
         assert_eq!(
             graph.equi_classes.len(),
@@ -688,7 +754,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_eq_c4),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut root_props =
             LogicalProperties::new(vec![out_col(1), out_col(2), out_col(3), out_col(4)], 50.0);
         root_props
@@ -699,7 +771,13 @@ mod tests {
             .merge_pair(ColumnId::new_for_test(2), ColumnId::new_for_test(4));
         memo.groups[root].logical_props = Some(root_props);
 
-        let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
+        let graph = flatten_join_chain(
+            &mut memo,
+            root,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("3-atom chain flattens");
 
         assert!(
             !graph
@@ -727,13 +805,25 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_null_safe_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         memo.groups[root].logical_props = Some(LogicalProperties::new(
             vec![out_col(1), out_col(2), out_col(3)],
             50.0,
         ));
 
-        let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
+        let graph = flatten_join_chain(
+            &mut memo,
+            root,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("3-atom chain flattens");
 
         assert!(
             graph.equi_classes.is_empty(),
@@ -755,8 +845,20 @@ mod tests {
             right: Box::new(JoinTree::Leaf(b)),
             op: inner(c1_eq_c2),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
-        let graph = flatten_join_chain(&mut memo, root).expect("2-atom chain flattens");
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let graph = flatten_join_chain(
+            &mut memo,
+            root,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("2-atom chain flattens");
         assert_eq!(graph.equi_classes.len(), 1, "one 2-atom class");
         assert!(graph.equi_classes[0].straddles(0b01, 0b10));
     }

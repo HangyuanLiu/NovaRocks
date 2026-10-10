@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
+use novarocks_type_contract::FunctionValueType;
 
 use crate::column_id::ColumnId;
 use crate::common::OutputColumn;
@@ -42,12 +42,19 @@ impl Rule for SplitAggregateRule {
         matches!(op, Operator::LogicalAggregate(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalAggregate(agg) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if !is_eligible(agg) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let local_output_columns = local_output_columns(agg, &memo.scalars);
@@ -68,7 +75,8 @@ impl Rule for SplitAggregateRule {
             &mut memo.scalars,
             &local_output_columns,
             agg.group_by.len(),
-        );
+            control,
+        )?;
         remember_group_key_output_displays(
             &mut memo.scalars,
             &local_group_by,
@@ -103,11 +111,10 @@ impl Rule for SplitAggregateRule {
             vec![true; agg.aggregates.len()],
             true,
         );
-
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::LogicalAggregate(global),
             children: vec![local_group],
-        }]
+        }])
     }
 }
 
@@ -158,8 +165,8 @@ fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<Ou
         OutputColumn {
             column_id,
             name,
-            data_type: arena.data_type(*expr).clone(),
-            nullable: arena.nullable(*expr),
+            value_type: arena.value_type(*expr).clone(),
+
             is_internal: layout_column
                 .map(|output| output.is_internal)
                 .unwrap_or(false),
@@ -169,32 +176,29 @@ fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<Ou
         let name = scalar_expr::aggregate_display_name(
             arena,
             &call.name,
-            &call.args,
+            call.source.arguments(),
             call.distinct,
-            &call.order_by,
+            call.source.order_by(),
         );
         let source_output = aggregate_output_column(agg, idx);
         OutputColumn {
             column_id: aggregate_output_column_id(&name, source_output),
             name,
-            data_type: local_aggregate_intermediate_type(arena, call, source_output),
-            nullable: true,
+            value_type: local_aggregate_intermediate_type(call),
+
             is_internal: true,
         }
     }));
     columns
 }
 
-fn local_aggregate_intermediate_type(
-    arena: &ScalarArena,
-    call: &ScalarAggregateSpec,
-    source_output: Option<&OutputColumn>,
-) -> DataType {
-    let _ = (arena, source_output);
-    crate::functions::aggregate_selection(&call.resolved)
+fn local_aggregate_intermediate_type(call: &ScalarAggregateSpec) -> FunctionValueType {
+    let mut value_type = crate::functions::aggregate_selection(call.source.binding())
         .intermediate_type
-        .data_type
-        .clone()
+        .clone();
+    // Preserve the existing phase-output root nullability widening.
+    value_type.nullable = true;
+    value_type
 }
 
 pub(crate) fn group_key_output_column_id(
@@ -234,16 +238,17 @@ pub(crate) fn aggregate_group_key_output_ref(
     arena: &mut ScalarArena,
     local_output_columns: &[OutputColumn],
     group_by_len: usize,
-) -> Vec<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarId>, crate::compiler::SqlCompileError> {
     local_output_columns
         .iter()
         .take(group_by_len)
         .map(|output| {
             arena.remember_project_output_display(output.column_id, None, output.name.clone());
-            arena.intern(
+            arena.intern_observed(
                 ScalarNode::ColumnRef(output.column_id),
-                output.data_type.clone(),
-                output.nullable,
+                output.value_type.clone(),
+                control,
             )
         })
         .collect()
@@ -282,8 +287,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+
             is_internal: false,
         }
     }
@@ -299,23 +304,20 @@ mod tests {
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         }
     }
 
     fn count_call(distinct: bool) -> AggregateCall {
         AggregateCall {
             name: "count".to_string(),
-            args: vec![col_ref(2, "v")],
             distinct,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
-            resolved: crate::functions::test_resolved_aggregate(
-                "count",
-                &[DataType::Int64],
-                distinct,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col_ref(2, "v")],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], distinct),
             ),
         }
     }
@@ -340,8 +342,8 @@ mod tests {
                         .unwrap_or_else(|| OutputColumn {
                             column_id: *column_id,
                             name: column.clone(),
-                            data_type: expr.data_type.clone(),
-                            nullable: expr.nullable,
+                            value_type: expr.value_type.clone(),
+
                             is_internal: false,
                         })
                 } else {
@@ -351,8 +353,8 @@ mod tests {
                         .unwrap_or_else(|| OutputColumn {
                             column_id: ColumnId::new_for_test(9000 + idx as u32),
                             name: format!("group_{idx}"),
-                            data_type: expr.data_type.clone(),
-                            nullable: expr.nullable,
+                            value_type: expr.value_type.clone(),
+
                             is_internal: false,
                         })
                 }
@@ -370,8 +372,11 @@ mod tests {
                     .unwrap_or_else(|| OutputColumn {
                         column_id: aggregate.output_column_id,
                         name: aggregate.name.clone(),
-                        data_type: aggregate.result_type.clone(),
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            aggregate.result_type.clone(),
+                            true,
+                        ),
+
                         is_internal: false,
                     });
                 column.column_id = aggregate.output_column_id;
@@ -388,8 +393,18 @@ mod tests {
         output_columns: Vec<OutputColumn>,
     ) -> LogicalAggregateOp {
         let output_layout = aggregate_output_layout(&group_by, &aggregates, &output_columns);
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         LogicalAggregateOp::single(group_by, aggregates, output_layout, output_columns)
     }
 
@@ -403,8 +418,18 @@ mod tests {
         is_split: bool,
     ) -> LogicalAggregateOp {
         let output_layout = aggregate_output_layout(&group_by, &aggregates, &output_columns);
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         LogicalAggregateOp::staged(
             stage,
             group_by,
@@ -474,7 +499,13 @@ mod tests {
     fn splits_grouped_aggregate_into_global_over_local() {
         let mut memo = Memo::new();
         let expr = single_grouped_expr(&mut memo);
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -483,7 +514,11 @@ mod tests {
         assert_eq!(global.is_merge, vec![true]);
         assert!(global.is_split);
         assert_eq!(global.group_by.len(), 1);
-        assert!(materialize(&memo.scalars, global.group_by[0]).nullable);
+        assert!(
+            materialize(&memo.scalars, global.group_by[0])
+                .value_type
+                .nullable
+        );
         assert_eq!(out[0].children.len(), 1);
         let local_group_id = out[0].children[0];
         let local_group = &memo.groups[local_group_id];
@@ -504,7 +539,13 @@ mod tests {
     fn split_global_group_by_uses_local_group_key_layout_not_select_order_output() {
         let mut memo = Memo::new();
         let expr = select_order_grouped_expr(&mut memo);
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -522,43 +563,57 @@ mod tests {
         let mut memo = Memo::new();
         let group_output_id = ColumnId::new_for_test(101);
         let sum_output_id = ColumnId::new_for_test(201);
-        let group = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")])[0];
-        let arg = intern_exprs(&mut memo.scalars, &[col_ref(2, "v")])[0];
+        let group = intern_exprs(
+            &mut memo.scalars,
+            &[col_ref(1, "k")],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()[0];
+        let arg = intern_exprs(
+            &mut memo.scalars,
+            &[col_ref(2, "v")],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()[0];
         let agg = LogicalAggregateOp::single(
             vec![group],
             vec![ScalarAggregateSpec {
                 output_column_id: sum_output_id,
                 name: "sum".to_string(),
-                args: vec![arg],
                 distinct: false,
-                order_by: vec![],
-                resolved: crate::functions::test_resolved_aggregate(
-                    "sum",
-                    &[DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![arg],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                 ),
             }],
             AggregateOutputLayout::new(
                 vec![OutputColumn {
                     column_id: group_output_id,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 vec![OutputColumn {
                     column_id: sum_output_id,
                     name: "sum(v)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
             ),
             vec![OutputColumn {
                 column_id: sum_output_id,
                 name: "sum(v)".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         );
@@ -568,7 +623,13 @@ mod tests {
             children: vec![values_group(&mut memo)],
         };
 
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -585,12 +646,24 @@ mod tests {
     fn repeated_apply_reuses_existing_local_group() {
         let mut memo = Memo::new();
         let expr = single_grouped_expr(&mut memo);
-        let first = SplitAggregateRule.apply(&expr, &mut memo);
+        let first = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1);
         let first_local_group = first[0].children[0];
         let group_count_after_first = memo.groups.len();
 
-        let second = SplitAggregateRule.apply(&expr, &mut memo);
+        let second = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].children[0], first_local_group);
         assert_eq!(memo.groups.len(), group_count_after_first);
@@ -600,7 +673,13 @@ mod tests {
     fn splits_scalar_aggregate() {
         let mut memo = Memo::new();
         let expr = single_scalar_expr(&mut memo);
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -620,12 +699,172 @@ mod tests {
     fn avg_call() -> AggregateCall {
         AggregateCall {
             name: "avg".to_string(),
-            args: vec![col_ref(2, "v")],
             distinct: false,
             result_type: arrow::datatypes::DataType::Float64,
-            order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
-            resolved: crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col_ref(2, "v")],
+                vec![],
+                crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
+            ),
+        }
+    }
+
+    #[test]
+    fn split_preserves_actual_selected_value_domains_through_local_and_global() {
+        use arrow::datatypes::Field;
+        use novarocks_functions::FunctionArgument;
+        use novarocks_type_contract::ValueLogicalType;
+        use std::sync::Arc;
+
+        let sources = [
+            (
+                "min",
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
+            ),
+            (
+                "min",
+                FunctionValueType::new(
+                    DataType::List(Arc::new(
+                        Field::new("item", DataType::Utf8, false).with_metadata(
+                            [
+                                ("nr_logical_type".into(), "json".into()),
+                                ("provider.field-id".into(), "71".into()),
+                            ]
+                            .into(),
+                        ),
+                    )),
+                    false,
+                ),
+            ),
+            (
+                "sum",
+                FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    false,
+                    ValueLogicalType::LargeInt,
+                )
+                .unwrap(),
+            ),
+        ];
+        for (name, source) in sources {
+            let arguments = [FunctionArgument::Value {
+                value_type: source.clone(),
+                constant: None,
+            }];
+            let resolved = crate::functions::builtin_sql_function_catalog()
+                .resolve_aggregate_binding(
+                    name,
+                    1,
+                    &arguments,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+            let resolved = crate::binding::SqlFunctionBinding::new(
+                resolved,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            );
+            let result = crate::functions::aggregate_result_type(&resolved).clone();
+            let mut state = crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .clone();
+            state.nullable = true;
+            let input = OutputColumn {
+                column_id: ColumnId(2),
+                name: "v".into(),
+                value_type: source.clone(),
+                is_internal: false,
+            };
+            let group = OutputColumn {
+                column_id: ColumnId(1),
+                name: "g".into(),
+                value_type: source.clone(),
+                is_internal: false,
+            };
+            let output = OutputColumn {
+                column_id: ColumnId(3),
+                name: format!("{name}(v)"),
+                value_type: result.clone(),
+                is_internal: false,
+            };
+            let typed = |column: &OutputColumn| TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: column.column_id,
+                    qualifier: None,
+                    column: column.name.clone(),
+                },
+                value_type: column.value_type.clone(),
+            };
+            let call = AggregateCall {
+                name: name.into(),
+                distinct: false,
+                result_type: result.data_type.clone(),
+                output_column_id: output.column_id,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![typed(&input)],
+                    vec![],
+                    resolved.clone(),
+                ),
+            };
+            let mut memo = Memo::new();
+            let id = memo.next_expr_id();
+            let child = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(ValuesOp {
+                    rows: vec![],
+                    columns: vec![group.clone(), input],
+                }),
+                children: vec![],
+            });
+            let aggregate = single_agg(
+                &mut memo,
+                vec![typed(&group)],
+                vec![call],
+                vec![group.clone(), output.clone()],
+            );
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalAggregate(aggregate),
+                children: vec![child],
+            };
+            let alternative = SplitAggregateRule
+                .apply(
+                    &expr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+            assert_eq!(
+                alternative.len(),
+                1,
+                "actual selected {name} domain {source:?}"
+            );
+            let Operator::LogicalAggregate(global) = &alternative[0].op else {
+                panic!("global aggregate");
+            };
+            let Operator::LogicalAggregate(local) =
+                &memo.groups[alternative[0].children[0]].logical_exprs[0].op
+            else {
+                panic!("local aggregate");
+            };
+            assert_eq!(local.output_layout.aggregate_columns[0].value_type, state);
+            assert_eq!(local.output_layout.group_key_columns[0].value_type, source);
+            assert_eq!(global.output_layout.aggregate_columns[0].value_type, result);
+            assert_eq!(global.output_columns[1].value_type, output.value_type);
+            assert_eq!(memo.scalars.value_type(global.group_by[0]), &source);
+            assert!(std::ptr::eq(
+                local.aggregates[0].source.binding().resolved(),
+                resolved.resolved()
+            ));
+            assert!(std::ptr::eq(
+                global.aggregates[0].source.binding().resolved(),
+                resolved.resolved()
+            ));
         }
     }
 
@@ -646,7 +885,13 @@ mod tests {
             )),
             children: vec![child],
         };
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "avg must now produce a split alternative");
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -660,10 +905,12 @@ mod tests {
         };
         assert_eq!(local.stage, AggStage::Local);
         assert_eq!(
-            local.output_layout.aggregate_columns[0].data_type,
+            local.output_layout.aggregate_columns[0]
+                .value_type
+                .data_type,
             DataType::Utf8
         );
-        assert_eq!(local.output_columns[1].data_type, DataType::Utf8);
+        assert_eq!(local.output_columns[1].value_type.data_type, DataType::Utf8);
     }
 
     #[test]
@@ -680,7 +927,16 @@ mod tests {
             )),
             children: vec![child],
         };
-        assert!(SplitAggregateRule.apply(&distinct, &mut memo).is_empty());
+        assert!(
+            SplitAggregateRule
+                .apply(
+                    &distinct,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
 
         let already_split = MExpr {
             id: memo.next_expr_id(),
@@ -697,7 +953,12 @@ mod tests {
         };
         assert!(
             SplitAggregateRule
-                .apply(&already_split, &mut memo)
+                .apply(
+                    &already_split,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
                 .is_empty()
         );
     }

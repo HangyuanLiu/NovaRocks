@@ -172,7 +172,7 @@ impl CatalogFactPort for FrontendCatalogFacts {
 /// query, while a catalog that could not say is a fact about this process. The
 /// second must not be flattened into the first, or a query over a healthy table
 /// would report that the table does not exist whenever the catalog is down.
-fn catalog_fact(
+pub(crate) fn catalog_fact(
     materializer: &CatalogServiceMaterializer<'_>,
     need: &CatalogRelationNeed,
 ) -> Result<CatalogRelationFact, String> {

@@ -63,21 +63,31 @@ impl ExprArena {
         )
     }
 
-    /// Build the existing expression kernel ABI for one LocalProgram instance.
+    /// Build the existing expression kernel ABI for one LocalProgramGraph instance.
     /// The source remains the only retained static expression graph; dictionary
     /// bytes stay behind shared Arcs.
-    pub(crate) fn from_immutable(expressions: &ImmutableExpressions) -> Self {
+    pub(crate) fn from_immutable(expressions: &ImmutableExpressions) -> Result<Self, String> {
+        if expressions.nodes().iter().any(|node| {
+            matches!(
+                node.kind(),
+                StaticExprKind::BoundCall { .. }
+                    | StaticExprKind::NaryAnd { .. }
+                    | StaticExprKind::NaryOr { .. }
+            )
+        }) {
+            return Err("compiled calls cannot enter the legacy expression bridge".to_string());
+        }
         let mut arena = Self::default();
         arena.set_allow_throw_exception(expressions.allow_throw_exception());
         arena.set_query_global_dicts(expressions.query_global_dicts().clone());
         arena.set_session_time_zone(expressions.session_time_zone().map(str::to_owned));
         for node in expressions.nodes() {
-            let id = arena.push_typed(thaw_kind(node.kind()), node.data_type().clone());
+            let id = arena.push_typed(thaw_kind(node.kind())?, node.data_type().clone());
             if let Some(schema) = node.field_schema() {
                 arena.set_field_schema(id, thaw_field_schema(schema));
             }
         }
-        arena
+        Ok(arena)
     }
 }
 
@@ -104,10 +114,47 @@ fn old_id(id: ProgramExprId) -> ExprId {
     ExprId(id.index())
 }
 
-fn thaw_kind(kind: &StaticExprKind) -> ExprNode {
+fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
     use StaticExprKind as Static;
-    match kind {
+    Ok(match kind {
+        Static::PreparedNullSafeComparison { .. } => {
+            return Err(
+                "compiled null-safe comparison cannot enter the legacy expression bridge"
+                    .to_string(),
+            );
+        }
+        Static::PreparedCast { .. } => {
+            return Err("compiled cast cannot enter the legacy expression bridge".to_string());
+        }
+        Static::PreparedNativeNegate(..) => {
+            return Err(
+                "compiled native negate cannot enter the legacy expression bridge".to_string(),
+            );
+        }
+        Static::PreparedNativeBitNot(..) => {
+            return Err(
+                "compiled native BitwiseNot cannot enter the legacy expression bridge".to_string(),
+            );
+        }
+        Static::PreparedLike { .. } => {
+            return Err("compiled LIKE cannot enter the legacy expression bridge".to_string());
+        }
+        Static::PreparedInList { .. } => {
+            return Err("compiled IN cannot enter the legacy expression bridge".to_string());
+        }
+        Static::PreparedBetween { .. } => {
+            return Err("compiled BETWEEN cannot enter the legacy expression bridge".to_string());
+        }
+        Static::PreparedArithmetic { .. } => {
+            return Err(
+                "compiled arithmetic cannot enter the legacy expression bridge".to_string(),
+            );
+        }
+        Static::BoundCall { .. } | Static::NaryAnd { .. } | Static::NaryOr { .. } => {
+            return Err("compiled calls cannot enter the legacy expression bridge".to_string());
+        }
         Static::Literal(value) => ExprNode::Literal(thaw_literal(value)),
+        Static::Constant(value) => ExprNode::Constant(value.clone()),
         Static::SlotId(slot) => ExprNode::SlotId(*slot),
         Static::ArrayExpr { elements } => ExprNode::ArrayExpr {
             elements: elements.iter().copied().map(old_id).collect(),
@@ -178,7 +225,7 @@ fn thaw_kind(kind: &StaticExprKind) -> ExprNode {
             args: args.iter().copied().map(old_id).collect(),
         },
         Static::Clone(child) => ExprNode::Clone(old_id(*child)),
-    }
+    })
 }
 
 fn thaw_literal(value: &StaticLiteral) -> LiteralValue {
@@ -263,6 +310,7 @@ fn id(id: ExprId) -> ProgramExprId {
 fn freeze_kind(node: ExprNode) -> StaticExprKind {
     match node {
         ExprNode::Literal(value) => StaticExprKind::Literal(freeze_literal(value)),
+        ExprNode::Constant(value) => StaticExprKind::Constant(value),
         ExprNode::SlotId(slot) => StaticExprKind::SlotId(slot),
         ExprNode::ArrayExpr { elements } => StaticExprKind::ArrayExpr {
             elements: elements.into_iter().map(id).collect(),
@@ -421,6 +469,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compiled_nullsafe_cannot_lose_intrinsic_null_semantics_in_legacy_bridge() {
+        let left = ProgramExprId::new(0);
+        let right = ProgramExprId::new(1);
+        assert_eq!(
+            thaw_kind(&StaticExprKind::PreparedNullSafeComparison { left, right }).unwrap_err(),
+            "compiled null-safe comparison cannot enter the legacy expression bridge"
+        );
+        assert!(matches!(
+            thaw_kind(&StaticExprKind::EqForNull(left, right)).unwrap(),
+            ExprNode::EqForNull(..)
+        ));
+    }
+
+    #[test]
+    fn compiled_cast_cannot_lose_source_semantics_in_legacy_bridge() {
+        let kind = StaticExprKind::PreparedCast {
+            operation: novarocks_functions::CastOperation::Carrier,
+            child: ProgramExprId::new(0),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            allow_throw_exception: true,
+        };
+        assert_eq!(
+            thaw_kind(&kind).unwrap_err(),
+            "compiled cast cannot enter the legacy expression bridge"
+        );
+    }
+
+    #[test]
+    fn compiled_arithmetic_cannot_lose_source_semantics_in_legacy_bridge() {
+        let kind = StaticExprKind::PreparedArithmetic {
+            operator: novarocks_type_contract::ArithmeticOperator::Add,
+            left: ProgramExprId::new(0),
+            right: ProgramExprId::new(1),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            allow_throw_exception: true,
+        };
+        assert_eq!(
+            thaw_kind(&kind).unwrap_err(),
+            "compiled arithmetic cannot enter the legacy expression bridge"
+        );
+    }
+
+    #[test]
+    fn compiled_call_cannot_enter_legacy_expression_dispatch() {
+        let expressions = ImmutableExpressions::try_new(
+            vec![StaticExprNode::new(
+                StaticExprKind::BoundCall { args: vec![] },
+                DataType::Float64,
+                None,
+            )],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let error = match ExprArena::from_immutable(&expressions) {
+            Err(error) => error,
+            Ok(_) => panic!("compiled call entered legacy dispatch"),
+        };
+        assert_eq!(
+            error,
+            "compiled calls cannot enter the legacy expression bridge"
+        );
+    }
+
+    #[test]
+    fn compiled_nary_occurrences_cannot_be_rebuilt_as_legacy_binary_uses() {
+        for kind in [
+            StaticExprKind::NaryAnd {
+                args: vec![ProgramExprId::new(0); 3],
+            },
+            StaticExprKind::NaryOr {
+                args: vec![ProgramExprId::new(0); 3],
+            },
+        ] {
+            let expressions = ImmutableExpressions::try_new(
+                vec![
+                    StaticExprNode::new(
+                        StaticExprKind::Literal(StaticLiteral::Bool(true)),
+                        DataType::Boolean,
+                        None,
+                    ),
+                    StaticExprNode::new(kind, DataType::Boolean, None),
+                ],
+                false,
+                HashMap::new(),
+                None,
+            )
+            .unwrap();
+            assert!(ExprArena::from_immutable(&expressions).is_err());
+            assert!(thaw_kind(expressions.node(ProgramExprId::new(1)).unwrap().kind()).is_err());
+        }
+    }
+
+    #[test]
     fn runtime_bound_arena_cannot_be_frozen_again() {
         let mut arena = ExprArena::default();
         arena.bind_runtime_error(Arc::new(
@@ -506,8 +649,9 @@ mod tests {
                 Some(*policy)
             );
         }
-        let mut first = ExprArena::from_immutable(&frozen);
-        let second = ExprArena::from_immutable(&frozen);
+        let mut first =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
+        let second = ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         first.set_allow_throw_exception(true);
         for (id, policy) in expected {
             assert_eq!(first.decimal_overflow_policy(id), Some(policy));

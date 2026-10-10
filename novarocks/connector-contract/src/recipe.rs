@@ -22,6 +22,9 @@
 //! canonical draft before sealing it as a program recipe. A recipe holds no
 //! reader, catalog client, credential, task, or runtime adapter.
 
+use crate::owned_copy::{ObservedCopy, OwnedCopy};
+use crate::{ConnectorError, PureProviderCompileError, WriterOwnedResourceFacts};
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use std::{error::Error, fmt, sync::Arc};
 
 use crate::{
@@ -270,76 +273,88 @@ impl ConnectorReadRelationRecipeDraft {
         relation: ConnectorReadRelationPayload,
         columns: Vec<ConnectorEncodedPayload>,
     ) -> Result<Self, ConnectorReadRelationRecipeError> {
-        if binding.descriptor().instance_id != *binding.catalog_handle().catalog_name() {
-            return Err(ConnectorReadRelationRecipeError::BindingMismatch);
-        }
-        if columns.len() > MAX_CONNECTOR_RECIPE_COLUMNS {
-            return Err(ConnectorReadRelationRecipeError::TooManyColumns);
-        }
-        let revision = relation.table().header().codec_revision();
-        let mut payload_bytes = 0usize;
-        // The fixed charge covers the binding's bounded identity allocation.
-        // Element sizes include each embedded header; its variable string
-        // backing and allocation overhead are charged in the loop below.
-        let mut charged_bytes = std::mem::size_of::<Self>()
-            .checked_add(RECIPE_IDENTITY_AND_ALLOCATION_CHARGE)
-            .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?
-            .checked_add(
-                columns
-                    .len()
-                    .checked_mul(std::mem::size_of::<ConnectorEncodedPayload>())
-                    .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?,
-            )
-            .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?;
-        for (payload, category) in [
-            (relation.table(), ConnectorCodecCategory::ReadTable),
-            (relation.view(), ConnectorCodecCategory::ReadView),
-        ]
-        .into_iter()
-        .chain(
-            columns
-                .iter()
-                .map(|payload| (payload, ConnectorCodecCategory::ReadColumn)),
-        ) {
-            payload
-                .header()
-                .validate_expected::<ConnectorCodecContractError>(
-                    &binding.descriptor().provider_id,
-                    binding.catalog_handle(),
-                    category,
-                    revision,
-                )
-                .map_err(ConnectorReadRelationRecipeError::Header)?;
-            if payload.payload().len() > MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES {
-                return Err(ConnectorReadRelationRecipeError::PayloadTooLarge);
-            }
-            payload_bytes = payload_bytes
-                .checked_add(payload.payload().len())
-                .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?;
-            charged_bytes = charged_bytes
-                .checked_add(payload.payload().len())
-                .and_then(|bytes| bytes.checked_add(payload.header().provider_id().as_str().len()))
-                .and_then(|bytes| {
-                    bytes.checked_add(payload.header().catalog().catalog_name().as_str().len())
-                })
-                .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
-                .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?;
-            if charged_bytes > MAX_CONNECTOR_RECIPE_BYTES {
-                return Err(ConnectorReadRelationRecipeError::RecipeTooLarge);
-            }
-        }
-        // Copy payloads into bounded owned backing: a short Bytes slice may
-        // otherwise retain an arbitrarily large source allocation.
-        let relation = ConnectorReadRelationPayload::new(
-            relation.kind(),
-            owned_payload(relation.table()),
-            owned_payload(relation.view()),
-        );
-        let columns = columns.iter().map(owned_payload).collect::<Vec<_>>();
+        let (payload_bytes, charged_bytes) =
+            match validate_read_recipe(&binding, &relation, &columns, &mut || {
+                Ok::<(), std::convert::Infallible>(())
+            }) {
+                Ok(facts) => facts,
+                Err(ReadRecipeValidationError::Contract(error)) => return Err(error),
+                Err(ReadRecipeValidationError::Observer(never)) => match never {},
+            };
+        let (relation, columns) = match copy_read_recipe(&relation, &columns, &mut PlainPayloadCopy)
+        {
+            Ok(owned) => owned,
+            Err(never) => match never {},
+        };
         Ok(Self {
             binding,
             relation,
-            columns: Arc::from(columns),
+            columns,
+            payload_bytes,
+            charged_bytes,
+        })
+    }
+
+    /// Original structurally checked recipe law plus one detached owned copy.
+    /// The caller owns the true source union, admission and checkpoint footer.
+    pub fn try_new_observed(
+        binding: &ConnectorReadBinding,
+        relation: ConnectorReadRelationPayload,
+        columns: Vec<ConnectorEncodedPayload>,
+        source_retained_bytes: usize,
+        admit: &mut impl FnMut(&WriterOwnedResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PureProviderCompileError<ReadRecipeOwnedError>> {
+        let mut observer =
+            ObservedCopy::new(source_retained_bytes, admit, work).map_err(lift_read_owned_error)?;
+        let identity = preflight_read_recipe_header(binding, &columns, &mut observer)
+            .map_err(lift_read_owned_error)?;
+        observer.flush().map_err(lift_read_owned_error)?;
+        let header = validate_read_recipe_header(binding, &columns, &mut || {
+            observer.step()?;
+            observer.flush()
+        });
+        match header {
+            Ok(()) => {}
+            Err(ReadRecipeValidationError::Contract(error)) => {
+                return Err(PureProviderCompileError::Provider(
+                    ReadRecipeOwnedError::Contract(error),
+                ));
+            }
+            Err(ReadRecipeValidationError::Observer(error)) => {
+                return Err(lift_read_owned_error(error));
+            }
+        }
+        preflight_read_recipe_payloads(&relation, &columns, identity, &mut observer)
+            .map_err(lift_read_owned_error)?;
+        observer.flush().map_err(lift_read_owned_error)?;
+        let result = validate_read_recipe_payloads(binding, &relation, &columns, &mut || {
+            observer.step()?;
+            observer.flush()
+        });
+        let (payload_bytes, charged_bytes) = match result {
+            Ok(facts) => facts,
+            Err(ReadRecipeValidationError::Contract(error)) => {
+                return Err(PureProviderCompileError::Provider(
+                    ReadRecipeOwnedError::Contract(error),
+                ));
+            }
+            Err(ReadRecipeValidationError::Observer(error)) => {
+                return Err(lift_read_owned_error(error));
+            }
+        };
+        observer.begin_copy().map_err(lift_read_owned_error)?;
+        let (relation, columns) =
+            copy_read_recipe(&relation, &columns, &mut ObservedPayloadCopy(&mut observer))
+                .map_err(lift_read_owned_error)?;
+        observer.flush().map_err(lift_read_owned_error)?;
+        let binding = binding.clone();
+        observer.step().map_err(lift_read_owned_error)?;
+        observer.flush().map_err(lift_read_owned_error)?;
+        Ok(Self {
+            binding,
+            relation,
+            columns,
             payload_bytes,
             charged_bytes,
         })
@@ -376,11 +391,302 @@ impl ConnectorReadRelationRecipeDraft {
     }
 }
 
+/// The original recipe contract and the original owned-resource rejection stay
+/// distinct. Neither branch certifies provider-private payload semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadRecipeOwnedError {
+    Contract(ConnectorReadRelationRecipeError),
+    Resources(ConnectorError),
+}
+impl fmt::Display for ReadRecipeOwnedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(error) => error.fmt(f),
+            Self::Resources(error) => error.fmt(f),
+        }
+    }
+}
+impl Error for ReadRecipeOwnedError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(match self {
+            Self::Contract(error) => error,
+            Self::Resources(error) => error,
+        })
+    }
+}
+fn lift_read_owned_error(
+    error: PureProviderCompileError<ConnectorError>,
+) -> PureProviderCompileError<ReadRecipeOwnedError> {
+    match error {
+        PureProviderCompileError::Control(cause) => PureProviderCompileError::Control(cause),
+        PureProviderCompileError::Provider(error) => {
+            PureProviderCompileError::Provider(ReadRecipeOwnedError::Resources(error))
+        }
+    }
+}
+enum ReadRecipeValidationError<E> {
+    Contract(ConnectorReadRelationRecipeError),
+    Observer(E),
+}
+fn validate_read_recipe<E>(
+    binding: &ConnectorReadBinding,
+    relation: &ConnectorReadRelationPayload,
+    columns: &[ConnectorEncodedPayload],
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(usize, usize), ReadRecipeValidationError<E>> {
+    validate_read_recipe_header(binding, columns, observe)?;
+    validate_read_recipe_payloads(binding, relation, columns, observe)
+}
+fn validate_read_recipe_header<E>(
+    binding: &ConnectorReadBinding,
+    columns: &[ConnectorEncodedPayload],
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), ReadRecipeValidationError<E>> {
+    let same_instance =
+        binding.descriptor().instance_id == *binding.catalog_handle().catalog_name();
+    observe().map_err(ReadRecipeValidationError::Observer)?;
+    if !same_instance {
+        return Err(ReadRecipeValidationError::Contract(
+            ConnectorReadRelationRecipeError::BindingMismatch,
+        ));
+    }
+    let too_many = columns.len() > MAX_CONNECTOR_RECIPE_COLUMNS;
+    observe().map_err(ReadRecipeValidationError::Observer)?;
+    if too_many {
+        return Err(ReadRecipeValidationError::Contract(
+            ConnectorReadRelationRecipeError::TooManyColumns,
+        ));
+    }
+    Ok(())
+}
+fn validate_read_recipe_payloads<E>(
+    binding: &ConnectorReadBinding,
+    relation: &ConnectorReadRelationPayload,
+    columns: &[ConnectorEncodedPayload],
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(usize, usize), ReadRecipeValidationError<E>> {
+    let revision = relation.table().header().codec_revision();
+    let mut payload_bytes = 0usize;
+    // The fixed charge covers the binding's bounded identity allocation.
+    // Element sizes include each embedded header; its variable string
+    // backing and allocation overhead are charged in the loop below.
+    let initial = (|| {
+        let charged_bytes = std::mem::size_of::<ConnectorReadRelationRecipeDraft>()
+            .checked_add(RECIPE_IDENTITY_AND_ALLOCATION_CHARGE)
+            .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?
+            .checked_add(
+                columns
+                    .len()
+                    .checked_mul(std::mem::size_of::<ConnectorEncodedPayload>())
+                    .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?,
+            )
+            .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?;
+        Ok::<usize, ConnectorReadRelationRecipeError>(charged_bytes)
+    })();
+    observe().map_err(ReadRecipeValidationError::Observer)?;
+    let mut charged_bytes = initial.map_err(ReadRecipeValidationError::Contract)?;
+    for (payload, category) in [
+        (relation.table(), ConnectorCodecCategory::ReadTable),
+        (relation.view(), ConnectorCodecCategory::ReadView),
+    ]
+    .into_iter()
+    .chain(
+        columns
+            .iter()
+            .map(|payload| (payload, ConnectorCodecCategory::ReadColumn)),
+    ) {
+        let header = payload
+            .header()
+            .validate_expected::<ConnectorCodecContractError>(
+                &binding.descriptor().provider_id,
+                binding.catalog_handle(),
+                category,
+                revision,
+            )
+            .map_err(ConnectorReadRelationRecipeError::Header);
+        observe().map_err(ReadRecipeValidationError::Observer)?;
+        header.map_err(ReadRecipeValidationError::Contract)?;
+        let oversized = payload.payload().len() > MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES;
+        observe().map_err(ReadRecipeValidationError::Observer)?;
+        if oversized {
+            return Err(ReadRecipeValidationError::Contract(
+                ConnectorReadRelationRecipeError::PayloadTooLarge,
+            ));
+        }
+        let charge = (|| {
+            let next_payload_bytes = payload_bytes
+                .checked_add(payload.payload().len())
+                .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?;
+            let next_charged_bytes = charged_bytes
+                .checked_add(payload.payload().len())
+                .and_then(|bytes| bytes.checked_add(payload.header().provider_id().as_str().len()))
+                .and_then(|bytes| {
+                    bytes.checked_add(payload.header().catalog().catalog_name().as_str().len())
+                })
+                .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+                .ok_or(ConnectorReadRelationRecipeError::RecipeTooLarge)?;
+            Ok::<_, ConnectorReadRelationRecipeError>((next_payload_bytes, next_charged_bytes))
+        })();
+        observe().map_err(ReadRecipeValidationError::Observer)?;
+        (payload_bytes, charged_bytes) = charge.map_err(ReadRecipeValidationError::Contract)?;
+        if charged_bytes > MAX_CONNECTOR_RECIPE_BYTES {
+            return Err(ReadRecipeValidationError::Contract(
+                ConnectorReadRelationRecipeError::RecipeTooLarge,
+            ));
+        }
+    }
+    Ok((payload_bytes, charged_bytes))
+}
+
+fn preflight_read_recipe_header<O: OwnedCopy>(
+    binding: &ConnectorReadBinding,
+    columns: &Vec<ConnectorEncodedPayload>,
+    observer: &mut O,
+) -> Result<usize, O::Error> {
+    // The caller's input Vec is source backing, not a fresh-output request.
+    observer.source_floor(observer.add(
+        size_of::<Vec<ConnectorEncodedPayload>>(),
+        observer.mul(columns.capacity(), size_of::<ConnectorEncodedPayload>())?,
+    )?)?;
+    observer.source_floor(size_of::<ConnectorReadRelationPayload>())?;
+    observer.source_floor(size_of::<ConnectorReadBinding>())?;
+    observer.array::<ConnectorEncodedPayload>(columns.len(), 2)?;
+    observer.arc_slice::<ConnectorEncodedPayload>(columns.len())?;
+    observer.work(observer.add(
+        observer.mul(columns.len(), 2 * size_of::<ConnectorEncodedPayload>())?,
+        256,
+    )?)?;
+    let identity = observer.add(
+        binding.descriptor().provider_id.as_str().len(),
+        observer.add(
+            binding.descriptor().instance_id.as_str().len(),
+            binding.catalog_handle().catalog_name().as_str().len(),
+        )?,
+    )?;
+    observer.work(observer.add(observer.mul(identity, 8)?, 128)?)?;
+    Ok(identity)
+}
+fn preflight_read_recipe_payloads<O: OwnedCopy>(
+    relation: &ConnectorReadRelationPayload,
+    columns: &[ConnectorEncodedPayload],
+    identity: usize,
+    observer: &mut O,
+) -> Result<(), O::Error> {
+    for payload in [relation.table(), relation.view()]
+        .into_iter()
+        .chain(columns.iter())
+    {
+        observer.source_floor(payload.payload().len())?;
+        observer.array::<u8>(payload.payload().len(), 1)?;
+        if !payload.payload().is_empty() {
+            let shared = novarocks_type_contract::owned_resources::layout::bytes_shared_upper()
+                .map_err(|error| match error {
+                    novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel =>
+                        O::Error::from(ConnectorError::new(crate::ConnectorErrorKind::InvalidRequest,
+                            "read recipe bytes request source model differs from the locked implementation")),
+                    _ => observer.arithmetic(),
+                })?;
+            observer.array::<u8>(shared, 1)?;
+        }
+        let text = observer.add(
+            payload.header().provider_id().as_str().len(),
+            payload.header().catalog().catalog_name().as_str().len(),
+        )?;
+        observer.source_floor(text)?;
+        observer.work(observer.add(
+            observer.mul(payload.payload().len(), 2)?,
+            observer.add(observer.mul(observer.add(identity, text)?, 8)?, 256)?,
+        )?)?;
+        observer.step()?;
+    }
+    Ok(())
+}
+
+trait PayloadCopy {
+    type Error;
+    fn reserve<T>(&mut self, count: usize) -> Result<Vec<T>, Self::Error>;
+    fn step(&mut self) -> Result<(), Self::Error>;
+    fn flush(&mut self) -> Result<(), Self::Error>;
+}
+struct PlainPayloadCopy;
+impl PayloadCopy for PlainPayloadCopy {
+    type Error = std::convert::Infallible;
+    fn reserve<T>(&mut self, count: usize) -> Result<Vec<T>, Self::Error> {
+        Ok(Vec::with_capacity(count))
+    }
+    fn step(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+struct ObservedPayloadCopy<'a, O>(&'a mut O);
+impl<O: OwnedCopy> PayloadCopy for ObservedPayloadCopy<'_, O> {
+    type Error = O::Error;
+    fn reserve<T>(&mut self, count: usize) -> Result<Vec<T>, Self::Error> {
+        self.0.flush()?;
+        let mut output = Vec::new();
+        let result = output.try_reserve_exact(count);
+        self.0.reserve_exit(result)?;
+        Ok(output)
+    }
+    fn step(&mut self) -> Result<(), Self::Error> {
+        self.0.step()
+    }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.0.flush()
+    }
+}
+fn owned_payload_with<P: PayloadCopy>(
+    payload: &ConnectorEncodedPayload,
+    policy: &mut P,
+) -> Result<ConnectorEncodedPayload, P::Error> {
+    policy.flush()?;
+    let header = payload.header().clone();
+    policy.step()?;
+    policy.flush()?;
+    let mut bytes = policy.reserve(payload.payload().len())?;
+    for segment in payload.payload().chunks(256) {
+        bytes.extend_from_slice(segment);
+        policy.step()?;
+    }
+    policy.flush()?;
+    let output = ConnectorEncodedPayload::new(header, bytes::Bytes::from(bytes));
+    policy.step()?;
+    policy.flush()?;
+    Ok(output)
+}
+fn copy_read_recipe<P: PayloadCopy>(
+    relation: &ConnectorReadRelationPayload,
+    columns: &[ConnectorEncodedPayload],
+    policy: &mut P,
+) -> Result<(ConnectorReadRelationPayload, Arc<[ConnectorEncodedPayload]>), P::Error> {
+    let relation = ConnectorReadRelationPayload::new(
+        relation.kind(),
+        owned_payload_with(relation.table(), policy)?,
+        owned_payload_with(relation.view(), policy)?,
+    );
+    policy.step()?;
+    let mut output = policy.reserve(columns.len())?;
+    for column in columns {
+        output.push(owned_payload_with(column, policy)?);
+        policy.step()?;
+    }
+    policy.flush()?;
+    let output = output.into_boxed_slice().into_vec();
+    policy.step()?;
+    policy.flush()?;
+    let output = Arc::from(output);
+    policy.step()?;
+    policy.flush()?;
+    Ok((relation, output))
+}
 fn owned_payload(payload: &ConnectorEncodedPayload) -> ConnectorEncodedPayload {
-    ConnectorEncodedPayload::new(
-        payload.header().clone(),
-        bytes::Bytes::copy_from_slice(payload.payload()),
-    )
+    match owned_payload_with(payload, &mut PlainPayloadCopy) {
+        Ok(output) => output,
+        Err(never) => match never {},
+    }
 }
 
 /// Exact-generation pure recipe returned only after provider-private decode.
@@ -431,19 +737,42 @@ impl ConnectorReadRelationRecipe {
         let canonical = compiler
             .compile_private(draft)
             .map_err(ConnectorReadRelationRecipeCompileError::Provider)?;
+        Self::validate_canonical_public_headers(draft, &canonical)
+            .map_err(ConnectorReadRelationRecipeCompileError::Contract)?;
+        Ok(Self(canonical))
+    }
+
+    pub(crate) fn validate_canonical_public_headers(
+        draft: &ConnectorReadRelationRecipeDraft,
+        canonical: &ConnectorReadRelationRecipeDraft,
+    ) -> Result<(), ConnectorReadRelationRecipeError> {
+        Self::validate_canonical_header_shape(draft, canonical)?;
+        if canonical
+            .columns
+            .iter()
+            .zip(draft.columns.iter())
+            .any(|(canonical, original)| canonical.header() != original.header())
+        {
+            return Err(ConnectorReadRelationRecipeError::PublicFactsMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_canonical_header_shape(
+        draft: &ConnectorReadRelationRecipeDraft,
+        canonical: &ConnectorReadRelationRecipeDraft,
+    ) -> Result<(), ConnectorReadRelationRecipeError> {
         if canonical.binding != draft.binding {
-            return Err(ConnectorReadRelationRecipeCompileError::Contract(
-                ConnectorReadRelationRecipeError::BindingMismatch,
-            ));
+            return Err(ConnectorReadRelationRecipeError::BindingMismatch);
         }
         if canonical.relation.kind() != draft.relation.kind()
             || canonical.columns.len() != draft.columns.len()
+            || canonical.relation.table().header() != draft.relation.table().header()
+            || canonical.relation.view().header() != draft.relation.view().header()
         {
-            return Err(ConnectorReadRelationRecipeCompileError::Contract(
-                ConnectorReadRelationRecipeError::PublicFactsMismatch,
-            ));
+            return Err(ConnectorReadRelationRecipeError::PublicFactsMismatch);
         }
-        Ok(Self(canonical))
+        Ok(())
     }
 
     pub const fn draft(&self) -> &ConnectorReadRelationRecipeDraft {
@@ -462,6 +791,18 @@ impl ConnectorReadRelationRecipe {
     }
 }
 
+impl AsRef<ConnectorReadRelationRecipeDraft> for ConnectorReadRelationRecipeDraft {
+    fn as_ref(&self) -> &ConnectorReadRelationRecipeDraft {
+        self
+    }
+}
+
+impl AsRef<ConnectorReadRelationRecipeDraft> for ConnectorReadRelationRecipe {
+    fn as_ref(&self) -> &ConnectorReadRelationRecipeDraft {
+        self.draft()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -473,7 +814,7 @@ mod tests {
         ConnectorReadRelationKind,
     };
 
-    fn binding(version: u8) -> ConnectorReadBinding {
+    pub(super) fn binding(version: u8) -> ConnectorReadBinding {
         let instance_id = ConnectorInstanceId::try_from_canonical("lake").unwrap();
         ConnectorReadBinding::new(
             ConnectorInstanceDescriptor {
@@ -484,7 +825,7 @@ mod tests {
         )
     }
 
-    fn payload(
+    pub(super) fn payload(
         binding: &ConnectorReadBinding,
         category: ConnectorCodecCategory,
         bytes: Bytes,
@@ -650,3 +991,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "recipe/owned_tests.rs"]
+mod owned_tests;

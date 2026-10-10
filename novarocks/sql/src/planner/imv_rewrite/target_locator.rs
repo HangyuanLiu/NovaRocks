@@ -22,6 +22,7 @@
 //! this rule appends a refresh-only target scan and LEFT JOINs it for DELETE
 //! rows before the sink boundary.
 
+use crate::compiler::SqlCompileError;
 use crate::planner::vocabulary::ApplyKeySource;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,7 +88,11 @@ impl LogicalRewriteRule for InjectTargetLocatorJoinRule {
         matches!(target_locator_join_input(&plan, ctx), Ok(Some(_)) | Err(_))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let Some(input) = target_locator_join_input(&plan, ctx)? else {
@@ -203,44 +208,34 @@ fn build_target_locator_join(
     let right_apply_key_id = allocate_imv_column(
         ctx,
         &input.target_apply_key_column,
-        input.left_apply_key.data_type.clone(),
-        input.left_apply_key.nullable,
+        input.left_apply_key.value_type.clone(),
     )?;
     let right_branch_id = input
         .branch
         .as_ref()
         .map(|branch| {
-            allocate_imv_column(
-                ctx,
-                &branch.target_column,
-                branch.left.data_type.clone(),
-                branch.left.nullable,
-            )
+            allocate_imv_column(ctx, &branch.target_column, branch.left.value_type.clone())
         })
         .transpose()?;
     let right_file_id = allocate_imv_column(
         ctx,
         crate::common::ICEBERG_FILE_PATH_COL,
-        DataType::Utf8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
     )?;
     let right_pos_id = allocate_imv_column(
         ctx,
         crate::common::ICEBERG_ROW_POS_COL,
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     )?;
     let right_row_id_id = allocate_imv_column(
         ctx,
         crate::common::ICEBERG_ROW_ID_COL,
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     )?;
     let right_last_updated_seq_id = allocate_imv_column(
         ctx,
         crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
     )?;
 
     let right_scan = build_target_locator_scan(
@@ -252,7 +247,7 @@ fn build_target_locator_join(
         right_pos_id,
         right_row_id_id,
         right_last_updated_seq_id,
-    );
+    )?;
     let join = LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
             join_type: JoinKind::LeftOuter,
@@ -332,23 +327,25 @@ fn build_target_locator_scan(
     right_pos_id: ColumnId,
     right_row_id_id: ColumnId,
     right_last_updated_seq_id: ColumnId,
-) -> LogicalPlanNode {
+) -> Result<LogicalPlanNode, String> {
     let target = &ext.snapshot.target;
-    let mut columns = vec![ColumnDef {
-        name: input.target_apply_key_column.clone(),
-        data_type: input.left_apply_key.data_type.clone(),
-        nullable: input.left_apply_key.nullable,
-        write_default: None,
-        logical_type: None,
-    }];
+    let mut columns = vec![
+        ColumnDef::from_value_type(
+            input.target_apply_key_column.clone(),
+            input.left_apply_key.value_type.clone(),
+            None,
+        )
+        .map_err(|error| format!("invalid IMV locator apply-key declaration: {error}"))?,
+    ];
     if let Some(branch) = &input.branch {
-        columns.push(ColumnDef {
-            name: branch.target_column.clone(),
-            data_type: branch.left.data_type.clone(),
-            nullable: branch.left.nullable,
-            write_default: None,
-            logical_type: None,
-        });
+        columns.push(
+            ColumnDef::from_value_type(
+                branch.target_column.clone(),
+                branch.left.value_type.clone(),
+                None,
+            )
+            .map_err(|error| format!("invalid IMV locator branch declaration: {error}"))?,
+        );
     }
     let metadata_columns = vec![
         ColumnDef {
@@ -383,49 +380,43 @@ fn build_target_locator_scan(
     let mut scan_columns = vec![output_column(
         right_apply_key_id,
         &input.target_apply_key_column,
-        input.left_apply_key.data_type.clone(),
-        input.left_apply_key.nullable,
+        input.left_apply_key.value_type.clone(),
         false,
     )];
     if let (Some(branch), Some(column_id)) = (&input.branch, right_branch_id) {
         scan_columns.push(output_column(
             column_id,
             &branch.target_column,
-            branch.left.data_type.clone(),
-            branch.left.nullable,
+            branch.left.value_type.clone(),
             false,
         ));
     }
     scan_columns.push(output_column(
         right_file_id,
         crate::common::ICEBERG_FILE_PATH_COL,
-        DataType::Utf8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         true,
     ));
     scan_columns.push(output_column(
         right_pos_id,
         crate::common::ICEBERG_ROW_POS_COL,
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         true,
     ));
     scan_columns.push(output_column(
         right_row_id_id,
         crate::common::ICEBERG_ROW_ID_COL,
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         true,
     ));
     scan_columns.push(output_column(
         right_last_updated_seq_id,
         crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     ));
 
-    LogicalPlanNode::new(
+    Ok(LogicalPlanNode::new(
         LogicalPlanKind::Scan(PlanScanNode {
             database: target.namespace.clone(),
             table: TableDef {
@@ -461,7 +452,7 @@ fn build_target_locator_scan(
         }),
         Vec::new(),
         None,
-    )
+    ))
 }
 
 fn target_locator_join_condition(
@@ -476,8 +467,7 @@ fn target_locator_join_condition(
             kind: ExprKind::Literal(LiteralValue::Int(i64::from(
                 crate::common::CHANGE_OP_DELETE,
             ))),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         },
     );
     let apply_key_eq = binary(
@@ -489,8 +479,7 @@ fn target_locator_join_condition(
                 qualifier: None,
                 column: input.target_apply_key_column.clone(),
             },
-            data_type: input.left_apply_key.data_type.clone(),
-            nullable: input.left_apply_key.nullable,
+            value_type: input.left_apply_key.value_type.clone(),
         },
     );
     let mut condition = binary(delete_only, BinOp::And, apply_key_eq);
@@ -507,8 +496,7 @@ fn target_locator_join_condition(
                     qualifier: None,
                     column: branch.target_column.clone(),
                 },
-                data_type: branch.left.data_type.clone(),
-                nullable: branch.left.nullable,
+                value_type: branch.left.value_type.clone(),
             },
         );
         condition = binary(condition, BinOp::And, branch_eq);
@@ -525,8 +513,8 @@ fn effective_output_columns(plan: &LogicalPlanNode) -> Option<Vec<OutputColumn>>
                 .map(|item| OutputColumn {
                     column_id: item.output_column_id,
                     name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
+                    value_type: item.expr.value_type.clone(),
+
                     is_internal: is_internal_output_name(&item.output_name),
                 })
                 .collect(),
@@ -582,8 +570,7 @@ fn nullable_locator_project_item(
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
         },
         output_name: name.to_string(),
         output_column_id: column_id,
@@ -597,8 +584,7 @@ fn column_ref(column: &OutputColumn) -> TypedExpr {
             qualifier: None,
             column: column.name.clone(),
         },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
+        value_type: column.value_type.clone(),
     }
 }
 
@@ -610,23 +596,21 @@ fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
             right: Box::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
 fn output_column(
     column_id: ColumnId,
     name: &str,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
     is_internal: bool,
 ) -> OutputColumn {
     OutputColumn {
         column_id,
         name: name.to_string(),
-        data_type,
-        nullable,
+        value_type,
+
         is_internal,
     }
 }

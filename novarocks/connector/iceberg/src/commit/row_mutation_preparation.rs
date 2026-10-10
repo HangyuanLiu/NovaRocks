@@ -1513,22 +1513,33 @@ mod tests {
     fn real_row_mutation_pins_scalar_domains_to_the_resolved_old_or_current_schema() {
         let owner = owner();
         let metadata = scalar_integer_metadata_with_older_base_schema();
+        // Signed target fields are the provider's exact frozen fields, so each
+        // carries the Iceberg field-id annotation of the resolved schema.
+        let provider_field = |name: &str, data_type: DataType, nullable: bool, field_id: i32| {
+            Field::new(name, data_type, nullable).with_metadata(
+                [(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                    field_id.to_string(),
+                )]
+                .into(),
+            )
+        };
         for (target_ref, snapshot, expected) in [
             (
                 "dev",
                 41,
                 vec![
-                    Field::new("id", DataType::Int8, false),
-                    Field::new("name", DataType::Int16, true),
+                    provider_field("id", DataType::Int8, false, 1),
+                    provider_field("name", DataType::Int16, true, 2),
                 ],
             ),
             (
                 "main",
                 42,
                 vec![
-                    Field::new("wide", DataType::Int64, false),
-                    Field::new("renamed", DataType::Int16, true),
-                    Field::new("later", DataType::Int32, true),
+                    provider_field("wide", DataType::Int64, false, 1),
+                    provider_field("renamed", DataType::Int16, true, 2),
+                    provider_field("later", DataType::Int32, true, 3),
                 ],
             ),
         ] {

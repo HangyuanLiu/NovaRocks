@@ -20,10 +20,13 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ArtifactInputField, CoverageSet, Distribution, Edge, EdgeId, Fragment, FragmentId,
-    FragmentSink, NodeId, NodeKind, PhysicalPlan, RowMultiplicity, SealedArtifactRef,
-    SealedArtifactSinkSpec, ValueId, ValueOrigin,
+    Distribution, Edge, EdgeId, Fragment, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
+    RowMultiplicity, ValueId, ValueOrigin,
 };
+
+#[cfg(test)]
+#[path = "node_graph_tests.rs"]
+mod node_graph_tests;
 
 pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut indegree = plan
@@ -207,7 +210,6 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                 ));
             }
         }
-        FragmentSink::SealedArtifact(spec) => validate_artifact_sink(fragment, spec, errors),
         FragmentSink::Result | FragmentSink::RootResult(_) => {
             if root_multiplicity != Some(RowMultiplicity::SingleCopy) {
                 errors.push(ValidationError::new(
@@ -251,53 +253,321 @@ pub(crate) fn import_origin_matches(
     }
 }
 
-pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationContext) {
-    let path = format!("fragments[{}].nodes", fragment.id().get());
+/// One original Kahn author serves structural validation and observed property
+/// consumers. Allocation facts remain a contribution to the caller's original
+/// counter, not an allocator or property-publication grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NodeGraphEvent {
+    Step,
+    Ready(NodeId),
+}
+
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, ControlOwnedResourceFacts, ControlResourceCounter,
+    ControlResourceError, control_resource_add, control_resource_mul,
+    owned_resources::vec::reserve_for_push_in,
+};
+
+#[cfg(test)]
+#[path = "node_graph_borrowed_tests.rs"]
+mod node_graph_borrowed_tests;
+
+trait GraphPolicy<E> {
+    fn headers(&mut self, nodes: usize) -> Result<(), E>;
+    fn inputs(&mut self, nodes: usize, inputs: usize) -> Result<(), E>;
+    fn reachability(&mut self, nodes: usize) -> Result<(), E>;
+    fn reachable_inputs(&mut self, inputs: usize) -> Result<(), E>;
+    fn before_library(&mut self) -> Result<(), E>;
+    fn after_library(&mut self) -> Result<(), E>;
+    fn reserve(&mut self, values: &mut Vec<NodeId>) -> Result<(), E>;
+    fn pending(&mut self, root: NodeId) -> Result<Vec<NodeId>, E>;
+    fn push(&mut self, values: &mut Vec<NodeId>, value: NodeId) -> Result<(), E>;
+    fn extend(&mut self, values: &mut Vec<NodeId>, inputs: &[NodeId]) -> Result<(), E>;
+    fn reachable_step(&mut self) -> Result<(), E>;
+    fn observe(&mut self, event: NodeGraphEvent) -> Result<bool, E>;
+}
+
+struct PlainGraph<F>(F);
+impl<E, F: FnMut(NodeGraphEvent) -> Result<bool, E>> GraphPolicy<E> for PlainGraph<F> {
+    fn headers(&mut self, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn inputs(&mut self, _: usize, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn reachability(&mut self, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn reachable_inputs(&mut self, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn before_library(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+    fn after_library(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+    fn reserve(&mut self, _: &mut Vec<NodeId>) -> Result<(), E> {
+        Ok(())
+    }
+    fn pending(&mut self, root: NodeId) -> Result<Vec<NodeId>, E> {
+        Ok(vec![root])
+    }
+    fn push(&mut self, values: &mut Vec<NodeId>, value: NodeId) -> Result<(), E> {
+        values.push(value);
+        Ok(())
+    }
+    fn extend(&mut self, values: &mut Vec<NodeId>, inputs: &[NodeId]) -> Result<(), E> {
+        values.extend(inputs.iter().copied());
+        Ok(())
+    }
+    fn reachable_step(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+    fn observe(&mut self, event: NodeGraphEvent) -> Result<bool, E> {
+        (self.0)(event)
+    }
+}
+
+struct CallerGraph<'a, 'control, F> {
+    counter: &'a mut ControlResourceCounter,
+    admit: &'a mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &'a mut CompileCheckpoints<'control>,
+    observe: F,
+    raw_inputs: usize,
+}
+impl<E, F> GraphPolicy<E> for CallerGraph<'_, '_, F>
+where
+    E: From<ControlResourceError> + From<CompileControlError>,
+    F: FnMut(NodeGraphEvent, &mut CompileCheckpoints<'_>) -> Result<bool, E>,
+{
+    fn headers(&mut self, nodes: usize) -> Result<(), E> {
+        self.counter.tree::<NodeId, usize>(nodes).map_err(E::from)?;
+        self.counter
+            .tree::<NodeId, Vec<NodeId>>(nodes)
+            .map_err(E::from)?;
+        // Header traversal and final Kahn processing are bounded by actual N.
+        self.counter
+            .work(control_resource_mul(nodes, 4).map_err(E::from)?)
+            .map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn inputs(&mut self, nodes: usize, inputs: usize) -> Result<(), E> {
+        self.raw_inputs = control_resource_add(self.raw_inputs, inputs).map_err(E::from)?;
+        self.counter.tree::<NodeId, ()>(inputs).map_err(E::from)?;
+        let lookup = ControlResourceCounter::lookup_work(nodes).map_err(E::from)?;
+        // contains_key, dependency-entry and remaining-degree lookups, plus
+        // original input/dependency events. Duplicates keep their raw work.
+        let per_input = control_resource_add(control_resource_mul(lookup, 4).map_err(E::from)?, 4)
+            .map_err(E::from)?;
+        self.counter
+            .work(control_resource_mul(inputs, per_input).map_err(E::from)?)
+            .map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn reachability(&mut self, nodes: usize) -> Result<(), E> {
+        // The original insert precedes node lookup: unknown IDs count too.
+        // Every visited ID comes from the root or an actual raw input.
+        let upper = control_resource_add(self.raw_inputs, 1).map_err(E::from)?;
+        self.counter.tree::<NodeId, ()>(upper).map_err(E::from)?;
+        let lookup = ControlResourceCounter::lookup_work(upper.max(nodes)).map_err(E::from)?;
+        self.counter
+            .work(
+                control_resource_mul(
+                    upper,
+                    control_resource_add(control_resource_mul(lookup, 2).map_err(E::from)?, 4)
+                        .map_err(E::from)?,
+                )
+                .map_err(E::from)?,
+            )
+            .map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn reachable_inputs(&mut self, inputs: usize) -> Result<(), E> {
+        self.counter.work(inputs).map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn before_library(&mut self) -> Result<(), E> {
+        self.work.flush().map_err(E::from)
+    }
+    fn after_library(&mut self) -> Result<(), E> {
+        self.work.step().map_err(E::from)?;
+        self.work.flush().map_err(E::from)
+    }
+    fn reserve(&mut self, values: &mut Vec<NodeId>) -> Result<(), E> {
+        let counter = &mut *self.counter;
+        let admit = &mut *self.admit;
+        reserve_for_push_in::<_, E>(
+            values,
+            &mut |facts| {
+                if let Some(layout) = facts.requested_backing {
+                    counter.layout(layout, 1).map_err(E::from)?;
+                }
+                admit(&counter.facts()).map_err(E::from)
+            },
+            self.work,
+        )
+    }
+    fn pending(&mut self, root: NodeId) -> Result<Vec<NodeId>, E> {
+        let mut values = Vec::new();
+        self.push(&mut values, root)?;
+        Ok(values)
+    }
+    fn push(&mut self, values: &mut Vec<NodeId>, value: NodeId) -> Result<(), E> {
+        self.reserve(values)?;
+        values.push(value);
+        Ok(())
+    }
+    fn extend(&mut self, values: &mut Vec<NodeId>, inputs: &[NodeId]) -> Result<(), E> {
+        for input in inputs {
+            self.push(values, *input)?;
+            self.work.step().map_err(E::from)?;
+        }
+        Ok(())
+    }
+    fn reachable_step(&mut self) -> Result<(), E> {
+        self.work.step().map_err(E::from)
+    }
+    fn observe(&mut self, event: NodeGraphEvent) -> Result<bool, E> {
+        (self.observe)(event, self.work)
+    }
+}
+
+fn visit_node_graph_core<E>(
+    fragment: &Fragment,
+    policy: &mut impl GraphPolicy<E>,
+) -> Result<Option<usize>, E> {
+    policy.headers(fragment.nodes().len())?;
     let mut remaining_inputs = BTreeMap::new();
     let mut dependents: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     let mut ready = Vec::new();
     for (id, node) in fragment.nodes() {
-        let inputs = node
-            .inputs
-            .iter()
-            .copied()
-            .filter(|input| fragment.nodes().contains_key(input))
-            .collect::<BTreeSet<_>>();
-        remaining_inputs.insert(*id, inputs.len());
+        policy.inputs(fragment.nodes().len(), node.inputs.len())?;
+        let mut inputs = BTreeSet::new();
+        for input in &node.inputs {
+            policy.before_library()?;
+            if fragment.nodes().contains_key(input) {
+                inputs.insert(*input);
+            }
+            policy.after_library()?;
+            if !policy.observe(NodeGraphEvent::Step)? {
+                return Ok(None);
+            }
+        }
         if inputs.is_empty() {
-            ready.push(*id);
+            policy.reserve(&mut ready)?;
+        }
+        policy.before_library()?;
+        remaining_inputs.insert(*id, inputs.len());
+        // The header's potential ready growth is admitted before its completed
+        // library observation; Plain retains the original infallible push.
+        if inputs.is_empty() {
+            policy.push(&mut ready, *id)?;
+        }
+        policy.after_library()?;
+        if !policy.observe(NodeGraphEvent::Step)? {
+            return Ok(None);
         }
         for input in inputs {
-            dependents.entry(input).or_default().push(*id);
+            policy.before_library()?;
+            policy.push(dependents.entry(input).or_default(), *id)?;
+            policy.after_library()?;
+            if !policy.observe(NodeGraphEvent::Step)? {
+                return Ok(None);
+            }
         }
     }
     let mut processed = 0_usize;
     while let Some(id) = ready.pop() {
         processed += 1;
+        if !policy.observe(NodeGraphEvent::Ready(id))? {
+            return Ok(None);
+        }
+        policy.before_library()?;
         if let Some(users) = dependents.get(&id) {
+            // No captured heap-producing value exists at this lookup.
+            policy.after_library()?;
             for user in users {
+                policy.before_library()?;
                 if let Some(remaining) = remaining_inputs.get_mut(user) {
                     *remaining -= 1;
                     if *remaining == 0 {
-                        ready.push(*user);
+                        policy.push(&mut ready, *user)?;
                     }
                 }
+                policy.after_library()?;
+                if !policy.observe(NodeGraphEvent::Step)? {
+                    return Ok(None);
+                }
             }
+        } else {
+            policy.after_library()?;
         }
     }
-    if processed != fragment.nodes().len() {
+    Ok(Some(processed))
+}
+
+/// `None` is an explicit caller stop, not successful graph completion. Missing
+/// references keep the original structural author's treatment; its node-owner
+/// validator independently rejects them before frozen property consumption.
+pub(crate) fn visit_node_graph_child_first<E>(
+    fragment: &Fragment,
+    observe: impl FnMut(NodeGraphEvent) -> Result<bool, E>,
+) -> Result<Option<usize>, E> {
+    visit_node_graph_core(fragment, &mut PlainGraph(observe))
+}
+
+pub(crate) fn visit_node_graph_child_first_in<E>(
+    fragment: &Fragment,
+    counter: &mut ControlResourceCounter,
+    admit: &mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    observe: impl FnMut(NodeGraphEvent, &mut CompileCheckpoints<'_>) -> Result<bool, E>,
+) -> Result<Option<usize>, E>
+where
+    E: From<ControlResourceError> + From<CompileControlError>,
+{
+    visit_node_graph_core(
+        fragment,
+        &mut CallerGraph {
+            counter,
+            admit,
+            work,
+            observe,
+            raw_inputs: 0,
+        },
+    )
+}
+
+fn validate_node_graph_core<E>(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    policy: &mut impl GraphPolicy<E>,
+) -> Result<(), E> {
+    let path = format!("fragments[{}].nodes", fragment.id().get());
+    let completed = visit_node_graph_core(fragment, policy)?;
+    if completed != Some(fragment.nodes().len()) {
         errors.push(ValidationError::new(&path, "node graph contains a cycle"));
     }
-
+    policy.reachability(fragment.nodes().len())?;
     let mut visited = BTreeSet::new();
-    let mut pending = vec![fragment.root()];
+    let mut pending = policy.pending(fragment.root())?;
     while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
+        policy.before_library()?;
+        let new = visited.insert(id);
+        policy.after_library()?;
+        if !new {
             continue;
         }
+        policy.before_library()?;
         if let Some(node) = fragment.nodes().get(&id) {
-            pending.extend(node.inputs.iter().copied());
+            policy.reachable_inputs(node.inputs.len())?;
+            // Capture and admit each actual mutable pending growth before the
+            // completed lookup observation; raw duplicates/order are retained.
+            policy.extend(&mut pending, &node.inputs)?;
         }
+        policy.after_library()?;
+        policy.reachable_step()?;
     }
     if visited.len() != fragment.nodes().len() {
         errors.push(ValidationError::new(
@@ -305,6 +575,39 @@ pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationCo
             "fragment contains nodes unreachable from its root",
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationContext) {
+    validate_node_graph_core(
+        fragment,
+        errors,
+        &mut PlainGraph(|_| Ok::<_, std::convert::Infallible>(true)),
+    )
+    .unwrap_or_else(|never| match never {});
+}
+
+pub(crate) fn validate_node_graph_in(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    counter: &mut ControlResourceCounter,
+    admit: &mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ControlResourceError> {
+    validate_node_graph_core(
+        fragment,
+        errors,
+        &mut CallerGraph {
+            counter,
+            admit,
+            work,
+            observe: |_, work: &mut CompileCheckpoints<'_>| {
+                work.step()?;
+                Ok(true)
+            },
+            raw_inputs: 0,
+        },
+    )
 }
 
 pub(crate) fn validate_edge(
@@ -396,7 +699,7 @@ pub(crate) fn validate_edge(
                 // the sender never writes -- it is declared by the statement's
                 // column layout, not by the value that happens to fill it. It
                 // may not declare the reverse.
-                if source_value.ty.data_type != destination_value.ty.data_type
+                if !source_value.ty.same_value_domain(&destination_value.ty)
                     || (source_value.ty.nullable && !destination_value.ty.nullable)
                 {
                     errors.push(ValidationError::new(
@@ -593,10 +896,7 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
                 }
                 &[]
             }
-            FragmentSink::Result
-            | FragmentSink::RootResult(_)
-            | FragmentSink::SealedArtifact(_)
-            | FragmentSink::Noop => &[],
+            FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => &[],
         };
         for edge_id in edges {
             if !referenced.insert(*edge_id) {
@@ -713,10 +1013,7 @@ pub(crate) fn edge_kind_matches_sink(sink: &FragmentSink, kind: crate::EdgeKind)
         FragmentSink::Stream { .. } => kind == crate::EdgeKind::Stream,
         FragmentSink::Multicast { .. } => kind == crate::EdgeKind::CteMulticast,
         FragmentSink::Router { .. } => kind == crate::EdgeKind::ChangeStreamRouter,
-        FragmentSink::Result
-        | FragmentSink::RootResult(_)
-        | FragmentSink::SealedArtifact(_)
-        | FragmentSink::Noop => false,
+        FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => false,
     }
 }
 
@@ -935,371 +1232,127 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
             "result_port",
             "plan has more than one result sink",
         )),
-        (Some(result), [fragment]) => {
-            if result.fragment != fragment.id() {
-                errors.push(ValidationError::new(
-                    "result_port.fragment",
-                    "result port belongs to another fragment",
-                ));
-            }
-            if result.output.node != fragment.root() {
-                errors.push(ValidationError::new(
-                    "result_port.output",
-                    "result output is not the result fragment root",
-                ));
-            }
-            match fragment.nodes().get(&result.output.node) {
-                Some(node) if node.output == result.output => {}
-                Some(_) => errors.push(ValidationError::new(
-                    "result_port.output",
-                    "result output differs from the node output port",
-                )),
-                None => errors.push(ValidationError::new(
-                    "result_port.output",
-                    "result node is not defined",
-                )),
-            }
-            if let FragmentSink::RootResult(contract) = fragment.sink()
-                && let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
-                    contract.output()
-            {
-                if schema.columns().len() != result.fields.len() {
-                    errors.push(ValidationError::new(
-                        "result_port.render_schema",
-                        "render schema width differs from ordered result occurrences",
-                    ));
-                }
-                for (ordinal, (column, field)) in
-                    schema.columns().iter().zip(&result.fields).enumerate()
-                {
-                    let name = field.alias.as_deref().unwrap_or(&field.name);
-                    if column.source_ordinal as usize != ordinal
-                        || column.name != name
-                        || !novarocks_type_contract::result_render_type::render_field_matches_storage(
-                            &column.field, &field.ty.data_type, field.ty.nullable)
-                    {
-                        errors.push(ValidationError::new(
-                            "result_port.render_schema",
-                            format!("render occurrence differs at ordinal {ordinal}"),
-                        ));
-                    }
-                }
-            }
-            if let FragmentSink::RootResult(contract) = fragment.sink()
-                && let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) =
-                    contract.output()
-            {
-                match result.fields.as_ref() {
-                    [field] if result.scalar_schema.as_ref().is_some_and(|frozen| frozen.field() == schema.field()) && field.domain.matches_scalar(&schema.field().value_type) && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
-                        schema.field(), &field.ty.data_type, field.ty.nullable
-                    ) => {}
-                    _ => errors.push(ValidationError::new(
-                        "result_port.scalar_schema", "scalar schema differs from the sole ordered root occurrence"
-                    )),
-                }
-            }
-            if let Some(schema) = &result.scalar_schema {
-                let consistent = match result.fields.as_ref() {
-                    [field] => field.domain.matches_scalar(&schema.field().value_type)
-                        && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
-                            schema.field(), &field.ty.data_type, field.ty.nullable),
-                    _ => false,
-                };
-                if !consistent {
-                    errors.push(ValidationError::new(
-                        "result_port.scalar_schema",
-                        "compiler scalar identity differs from the final result carrier",
-                    ));
-                }
-            }
-            if result.fields.len() != result.output.columns.len() {
-                errors.push(ValidationError::new(
-                    "result_port.fields",
-                    "result schema width differs from output width",
-                ));
-            }
-            for (ordinal, (field, value)) in
-                result.fields.iter().zip(&result.output.columns).enumerate()
-            {
-                if field.value != *value {
-                    errors.push(ValidationError::new(
-                        "result_port.fields",
-                        format!("result value differs at ordinal {ordinal}"),
-                    ));
-                }
-                if !field.domain.matches_storage(&field.ty.data_type) {
-                    errors.push(ValidationError::new(
-                        "result_port.fields",
-                        format!("result logical domain differs from storage at ordinal {ordinal}"),
-                    ));
-                }
-                if field.name.is_empty() {
-                    errors.push(ValidationError::new(
-                        "result_port.fields",
-                        format!("result name is empty at ordinal {ordinal}"),
-                    ));
-                }
-                if let Some(definition) = fragment.values().get(value)
-                    && definition.ty != field.ty
-                {
-                    errors.push(ValidationError::new(
-                        "result_port.fields",
-                        format!("result type differs at ordinal {ordinal}"),
-                    ));
-                }
-            }
-        }
+        (Some(result), [fragment]) => validate_result_port_fields(fragment, result, errors),
     }
 }
 
-pub(crate) fn validate_artifact_sink(
+pub(crate) fn validate_result_port_fields(
     fragment: &Fragment,
-    spec: &SealedArtifactSinkSpec,
+    result: &crate::ResultPort,
     errors: &mut ValidationContext,
 ) {
-    let path = format!("fragments[{}].sink.sealed_artifact", fragment.id().get());
-    if spec.format.revision == 0
-        || spec.input.is_empty()
-        || spec.max_reference_bytes == 0
-        || spec.max_reference_bytes > MAX_ARTIFACT_REFERENCE_BYTES
-        || spec.source.selection_digest == [0; 32]
+    if result.fragment != fragment.id() {
+        errors.push(ValidationError::new(
+            "result_port.fragment",
+            "result port belongs to another fragment",
+        ));
+    }
+    if result.output.node != fragment.root() {
+        errors.push(ValidationError::new(
+            "result_port.output",
+            "result output is not the result fragment root",
+        ));
+    }
+    match fragment.nodes().get(&result.output.node) {
+        Some(node) if node.output == result.output => {}
+        Some(_) => errors.push(ValidationError::new(
+            "result_port.output",
+            "result output differs from the node output port",
+        )),
+        None => errors.push(ValidationError::new(
+            "result_port.output",
+            "result node is not defined",
+        )),
+    }
+    if let FragmentSink::RootResult(contract) = fragment.sink()
+        && let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) = contract.output()
     {
-        errors.push(ValidationError::new(
-            &path,
-            "sealed artifact sink requires a format revision, input and reference budget",
-        ));
-    }
-    validate_read_reference(&spec.source.source, &path, errors);
-    validate_coverage(&spec.required_coverage, &path, errors);
-    if spec.required_coverage.selection_digest != spec.source.selection_digest {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact coverage is not bound to the exact source selection",
-        ));
-    }
-    for ArtifactInputField { value, ty } in &spec.input {
-        match fragment.values().get(value) {
-            Some(definition) if definition.ty != *ty => errors.push(ValidationError::new(
-                &path,
-                "artifact input type differs from its value definition",
-            )),
-            Some(_) => {}
-            None => require_value(fragment, *value, &path, errors),
+        if schema.columns().len() != result.fields.len() {
+            errors.push(ValidationError::new(
+                "result_port.render_schema",
+                "render schema width differs from ordered result occurrences",
+            ));
+        }
+        for (ordinal, (column, field)) in schema.columns().iter().zip(&result.fields).enumerate() {
+            let name = field.alias.as_deref().unwrap_or(&field.name);
+            if column.source_ordinal as usize != ordinal
+                || column.name != name
+                || !novarocks_type_contract::result_render_type::render_field_matches_storage(
+                    &column.field,
+                    &field.ty.data_type,
+                    field.ty.nullable,
+                )
+            {
+                errors.push(ValidationError::new(
+                    "result_port.render_schema",
+                    format!("render occurrence differs at ordinal {ordinal}"),
+                ));
+            }
         }
     }
-    for value in &spec.partition_by {
-        require_value(fragment, *value, &path, errors);
-    }
-    for key in &spec.order_by {
-        require_value(fragment, key.value, &path, errors);
-    }
-    for value in &spec.group_boundaries {
-        require_value(fragment, *value, &path, errors);
-    }
-    let Some(root) = fragment.nodes().get(&fragment.root()) else {
-        return;
-    };
-    let input_values = spec
-        .input
-        .iter()
-        .map(|field| field.value)
-        .collect::<Vec<_>>();
-    let input_value_index = ValuePortIndex::new(&input_values);
-    if input_values.as_slice() != root.output.columns.as_ref() {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact input schema differs from the fragment root output",
-        ));
-    }
-    if !spec.partition_by.is_empty() {
-        match &root.output_properties.distribution {
-            Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. }
-                if keys.as_ref() == spec.partition_by.as_ref() => {}
+    if let FragmentSink::RootResult(contract) = fragment.sink()
+        && let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) = contract.output()
+    {
+        match result.fields.as_ref() {
+            [field] if result.scalar_schema.as_ref().is_some_and(|frozen| frozen.field() == schema.field()) && field.domain.matches_scalar(&schema.field().value_type) && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                schema.field(), &field.ty.data_type, field.ty.nullable
+            ) => {}
             _ => errors.push(ValidationError::new(
-                &path,
-                "artifact partition requirement is not guaranteed by the fragment output",
+                "result_port.scalar_schema", "scalar schema differs from the sole ordered root occurrence"
             )),
         }
-    } else if root.output_properties.distribution != Distribution::Singleton {
+    }
+    if let Some(schema) = &result.scalar_schema {
+        let consistent = match result.fields.as_ref() {
+            [field] => {
+                field.domain.matches_scalar(&schema.field().value_type)
+                    && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                        schema.field(),
+                        &field.ty.data_type,
+                        field.ty.nullable,
+                    )
+            }
+            _ => false,
+        };
+        if !consistent {
+            errors.push(ValidationError::new(
+                "result_port.scalar_schema",
+                "compiler scalar identity differs from the final result carrier",
+            ));
+        }
+    }
+    if result.fields.len() != result.output.columns.len() {
         errors.push(ValidationError::new(
-            &path,
-            "unpartitioned sealed artifact requires singleton placement",
+            "result_port.fields",
+            "result schema width differs from output width",
         ));
     }
-    if root.output_properties.row_multiplicity != RowMultiplicity::SingleCopy {
-        errors.push(ValidationError::new(
-            &path,
-            "sealed artifact requires single-copy row ownership",
-        ));
-    }
-    let required_order = spec
-        .order_by
-        .iter()
-        .map(|key| crate::OrderingKey {
-            value: key.value,
-            direction: key.direction,
-            null_ordering: key.null_ordering,
-        })
-        .collect::<Vec<_>>();
-    if root.output_properties.ordering.len() < required_order.len()
-        || root.output_properties.ordering[..required_order.len()] != required_order
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact ordering requirement is not guaranteed by the fragment root",
-        ));
-    }
-    if spec
-        .group_boundaries
-        .iter()
-        .any(|value| !input_value_index.contains(value))
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact group boundary is absent from the exact input schema",
-        ));
-    }
-}
-
-pub(crate) fn validate_artifact_refs(plan: &PhysicalPlan, errors: &mut ValidationContext) {
-    for artifact in plan.artifact_refs().values() {
-        validate_artifact_ref(artifact, errors);
-    }
-}
-
-pub(crate) fn validate_artifact_ref(artifact: &SealedArtifactRef, errors: &mut ValidationContext) {
-    let path = format!("artifact_refs[{}]", artifact.id.get());
-    if artifact.format.revision == 0 || artifact.schema.is_empty() {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact reference requires a format revision and schema",
-        ));
-    }
-    if artifact.location.is_empty() || artifact.location.len() > 4096 {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact location must be bounded and non-empty",
-        ));
-    }
-    if artifact.content_digest == [0; 32]
-        || artifact.schema_digest == [0; 32]
-        || artifact.source.selection_digest == [0; 32]
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact evidence digests must be non-zero",
-        ));
-    }
-    validate_read_reference(&artifact.source.source, &path, errors);
-    validate_coverage(&artifact.coverage, &path, errors);
-    if artifact.coverage.selection_digest != artifact.source.selection_digest {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact coverage is not bound to the exact source selection",
-        ));
-    }
-}
-
-pub(crate) fn validate_coverage(
-    coverage: &CoverageSet,
-    path: &str,
-    errors: &mut ValidationContext,
-) {
-    if coverage.domain.is_empty()
-        || coverage.domain.len() > 1024
-        || coverage.selection_digest == [0; 32]
-        || coverage.ranges.is_empty()
-    {
-        errors.push(ValidationError::new(
-            path,
-            "coverage requires a bounded domain and at least one range",
-        ));
-        return;
-    }
-    for (index, range) in coverage.ranges.iter().enumerate() {
-        if let (Some(start), Some(end)) = (&range.start, &range.end)
-            && start.as_ref() >= end.as_ref()
+    for (ordinal, (field, value)) in result.fields.iter().zip(&result.output.columns).enumerate() {
+        if field.value != *value {
+            errors.push(ValidationError::new(
+                "result_port.fields",
+                format!("result value differs at ordinal {ordinal}"),
+            ));
+        }
+        if !field.domain.matches_storage(&field.ty.data_type) {
+            errors.push(ValidationError::new(
+                "result_port.fields",
+                format!("result logical domain differs from storage at ordinal {ordinal}"),
+            ));
+        }
+        if field.name.is_empty() {
+            errors.push(ValidationError::new(
+                "result_port.fields",
+                format!("result name is empty at ordinal {ordinal}"),
+            ));
+        }
+        if let Some(definition) = fragment.values().get(value)
+            && definition.ty != field.ty
         {
             errors.push(ValidationError::new(
-                path,
-                format!("coverage range {index} is empty or reversed"),
+                "result_port.fields",
+                format!("result type differs at ordinal {ordinal}"),
             ));
-        }
-        if index > 0 {
-            let previous = &coverage.ranges[index - 1];
-            let ordered = match (&previous.end, &range.start) {
-                (Some(previous_end), Some(current_start)) => {
-                    previous_end.as_ref() <= current_start.as_ref()
-                }
-                (Some(_), None) | (None, _) => false,
-            };
-            if !ordered {
-                errors.push(ValidationError::new(
-                    path,
-                    format!("coverage ranges overlap or are out of order at {index}"),
-                ));
-            }
-        }
-    }
-    if coverage.complete_input {
-        let spans_complete_domain = coverage
-            .ranges
-            .first()
-            .is_some_and(|range| range.start.is_none())
-            && coverage
-                .ranges
-                .last()
-                .is_some_and(|range| range.end.is_none())
-            && coverage.ranges.windows(2).all(|pair| {
-                matches!(
-                    (&pair[0].end, &pair[1].start),
-                    (Some(previous_end), Some(next_start))
-                        if previous_end.as_ref() == next_start.as_ref()
-                )
-            });
-        if !spans_complete_domain {
-            errors.push(ValidationError::new(
-                path,
-                "complete coverage must form one gap-free unbounded domain",
-            ));
-        }
-    }
-}
-
-pub(crate) fn validate_artifact_inputs(plan: &PhysicalPlan, errors: &mut ValidationContext) {
-    for fragment in plan.fragments().values() {
-        for node in fragment.nodes().values() {
-            if let NodeKind::Scan { relation, .. } = &node.kind {
-                let path = format!(
-                    "fragments[{}].nodes[{}].relation.artifact_inputs",
-                    fragment.id().get(),
-                    node.id.get()
-                );
-                for requirement in relation.artifact_inputs() {
-                    match plan.artifact_refs().get(&requirement.artifact) {
-                        Some(artifact)
-                            if artifact.kind == requirement.kind
-                                && artifact.format == requirement.format
-                                && artifact.schema == requirement.schema
-                                && artifact.source == requirement.source
-                                && artifact.coverage == requirement.required_coverage => {}
-                        Some(_) => errors.push(ValidationError::new(
-                            &path,
-                            format!(
-                                "artifact {} differs from the relation's exact input requirement",
-                                requirement.artifact.get()
-                            ),
-                        )),
-                        None => errors.push(ValidationError::new(
-                            &path,
-                            format!(
-                                "artifact reference {} is not defined",
-                                requirement.artifact.get()
-                            ),
-                        )),
-                    }
-                }
-            }
         }
     }
 }

@@ -35,6 +35,7 @@
 
 use crate::column_id::ColumnId;
 use crate::common::JoinKind;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -72,7 +73,11 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         ) && j.condition.is_some()
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -122,9 +127,11 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let new_condition = if keep_in_condition.is_empty() {
             None
         } else {
-            scalar_expr::combine_conjuncts(&mut arena, keep_in_condition)
+            scalar_expr::combine_conjuncts(&mut arena, keep_in_condition, &ctx.control_view())?
         };
-        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, push_to_right) else {
+        let Some(pushed_id) =
+            scalar_expr::combine_conjuncts(&mut arena, push_to_right, &ctx.control_view())?
+        else {
             return Ok(RewriteResult::Unchanged);
         };
         let new_right = OptExpr::new(
@@ -207,8 +214,8 @@ mod tests {
 
     fn col_typed(name: &str) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: test_col_id(name),
                 qualifier: None,
@@ -219,8 +226,8 @@ mod tests {
 
     fn col_with_id_typed(qualifier: &str, name: &str, id: u32) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(id),
                 qualifier: Some(qualifier.to_string()),
@@ -231,16 +238,16 @@ mod tests {
 
     fn int_lit_typed(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn eq_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
@@ -252,8 +259,8 @@ mod tests {
 
     fn gt_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Gt,
@@ -265,8 +272,8 @@ mod tests {
 
     fn and_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::And,
@@ -304,8 +311,11 @@ mod tests {
                 .map(|n| OutputColumn {
                     column_id: test_col_id(n),
                     name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -322,14 +332,14 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         }))
     }
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -341,7 +351,14 @@ mod tests {
         right: OptExpr,
         condition: Option<TypedExpr>,
     ) -> OptExpr {
-        let cond_id = condition.map(|c| intern_typed(arena, &c));
+        let cond_id = condition.map(|c| {
+            intern_typed(
+                arena,
+                &c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftSemi,
@@ -357,7 +374,14 @@ mod tests {
         right: OptExpr,
         condition: Option<TypedExpr>,
     ) -> OptExpr {
-        let cond_id = condition.map(|c| intern_typed(arena, &c));
+        let cond_id = condition.map(|c| {
+            intern_typed(
+                arena,
+                &c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -380,15 +404,20 @@ mod tests {
                     expr: intern_typed(
                         &mut arena,
                         &TypedExpr {
-                            data_type: DataType::Int64,
-                            nullable: true,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                true,
+                            ),
+
                             kind: ExprKind::ColumnRef {
                                 column_id: ColumnId::new_for_test(22),
                                 qualifier: None,
                                 column: "right_source".to_string(),
                             },
                         },
-                    ),
+                        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                    )
+                    .unwrap(),
                     output_name: "k".to_string(),
                     output_column_id: ColumnId::new_for_test(202),
                     expr_display: None,
@@ -570,7 +599,13 @@ mod tests {
         let rule = PushSemiAntiRightOnlyCondition;
 
         assert!(
-            bind_tree(&rule.pattern(), &scan).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &scan,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "PushSemiAntiRightOnlyCondition pattern must only match Join roots"
         );
     }

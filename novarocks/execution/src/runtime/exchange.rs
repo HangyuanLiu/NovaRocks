@@ -138,6 +138,38 @@ impl std::fmt::Display for ExchangeSenderIdentity {
     }
 }
 
+/// How a registered receiver binds the columns of a decoded wire payload to
+/// its expected chunk schema.
+///
+/// The choice belongs to the receiver's registration and is never inferred
+/// from the payload: whether a sender's slot ids mean anything in the
+/// receiver's namespace is a property of how both fragments were compiled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeColumnBinding {
+    /// Legacy fragments share one slot namespace across the edge: a wire
+    /// column binds to the expected slot with the same id whenever every wire
+    /// slot id exists in the expected schema, and by position otherwise.
+    BySlotId,
+    /// Compiled fragments allocate slot ids per fragment, so a sender's ids
+    /// carry no meaning in the receiver. Wire column `i` binds to expected
+    /// slot `i`, exactly the cut law that pairs `projection[i]` with
+    /// `imports[i]`; slot ids are never consulted.
+    Positional,
+}
+
+impl ExchangeColumnBinding {
+    const fn prefers_wire_slot_ids(self) -> bool {
+        matches!(self, Self::BySlotId)
+    }
+}
+
+/// The receiver's registered type contract and how wire columns bind to it.
+#[derive(Clone)]
+struct ExpectedReceiverSchema {
+    chunk_schema: ChunkSchemaRef,
+    column_binding: ExchangeColumnBinding,
+}
+
 const CANCELED_KEYS_TTL: Duration = Duration::from_secs(600);
 const CANCELED_KEYS_MAX_SIZE: usize = 8192;
 const EXCHANGE_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -251,7 +283,7 @@ struct DecodedExchangePayload<'a> {
 #[derive(Default)]
 struct ReceiverState {
     expected_senders: usize,
-    expected_chunk_schema: Option<ChunkSchemaRef>,
+    expected: Option<ExpectedReceiverSchema>,
     sender_wire_meta: HashMap<ExchangeSenderIdentity, ExchangeWireMeta>,
     finished: HashSet<ExchangeSenderIdentity>,
     chunks: VecDeque<Chunk>,
@@ -380,22 +412,56 @@ impl ExecutionExchangeRegistry {
         r.cv.notify_all();
     }
 
+    /// Register a legacy receiver: wire columns bind by slot id
+    /// ([`ExchangeColumnBinding::BySlotId`]).
     pub fn register_expected_chunk_schema(
         &self,
         key: ExchangeKey,
         expected_senders: usize,
         chunk_schema: ChunkSchemaRef,
     ) -> Result<(), String> {
-        Self::register_expected_chunk_schema_inner(self, key, expected_senders, chunk_schema, false)
+        Self::register_expected_chunk_schema_inner(
+            self,
+            key,
+            expected_senders,
+            chunk_schema,
+            ExchangeColumnBinding::BySlotId,
+            false,
+        )
     }
 
+    /// Register a legacy receiver exactly once: wire columns bind by slot id
+    /// ([`ExchangeColumnBinding::BySlotId`]).
     pub fn try_register_expected_chunk_schema(
         &self,
         key: ExchangeKey,
         expected_senders: usize,
         chunk_schema: ChunkSchemaRef,
     ) -> Result<(), String> {
-        Self::register_expected_chunk_schema_inner(self, key, expected_senders, chunk_schema, true)
+        self.try_register_expected_chunk_schema_with_binding(
+            key,
+            expected_senders,
+            chunk_schema,
+            ExchangeColumnBinding::BySlotId,
+        )
+    }
+
+    /// Register a receiver exactly once with an explicit column binding.
+    pub fn try_register_expected_chunk_schema_with_binding(
+        &self,
+        key: ExchangeKey,
+        expected_senders: usize,
+        chunk_schema: ChunkSchemaRef,
+        column_binding: ExchangeColumnBinding,
+    ) -> Result<(), String> {
+        Self::register_expected_chunk_schema_inner(
+            self,
+            key,
+            expected_senders,
+            chunk_schema,
+            column_binding,
+            true,
+        )
     }
 
     fn register_expected_chunk_schema_inner(
@@ -403,6 +469,7 @@ impl ExecutionExchangeRegistry {
         key: ExchangeKey,
         expected_senders: usize,
         chunk_schema: ChunkSchemaRef,
+        column_binding: ExchangeColumnBinding,
         reject_existing: bool,
     ) -> Result<(), String> {
         if is_key_canceled(registry, &key) {
@@ -410,7 +477,7 @@ impl ExecutionExchangeRegistry {
         }
         let receiver = get_or_create(registry, key);
         let mut st = receiver.mu.lock().expect("exchange receiver lock");
-        match st.expected_chunk_schema.as_ref() {
+        match st.expected.as_ref() {
             Some(_) if reject_existing => {
                 return Err(format!(
                     "exchange receiver already registered: finst={} node_id={}",
@@ -418,17 +485,33 @@ impl ExecutionExchangeRegistry {
                     key.node_id
                 ));
             }
-            Some(existing) if existing.as_ref() != chunk_schema.as_ref() => {
+            Some(existing) if existing.chunk_schema.as_ref() != chunk_schema.as_ref() => {
                 return Err(format!(
                     "exchange expected chunk schema mismatch: finst={} node_id={}",
                     key.finst_uuid(),
                     key.node_id
                 ));
             }
+            Some(existing) if existing.column_binding != column_binding => {
+                return Err(format!(
+                    "exchange column binding mismatch: finst={} node_id={} registered={:?} requested={:?}",
+                    key.finst_uuid(),
+                    key.node_id,
+                    existing.column_binding,
+                    column_binding
+                ));
+            }
             Some(_) => {}
             None => {
-                Self::retag_queued_chunks_for_expected_schema(&mut st, &chunk_schema)?;
-                st.expected_chunk_schema = Some(chunk_schema);
+                Self::retag_queued_chunks_for_expected_schema(
+                    &mut st,
+                    &chunk_schema,
+                    column_binding,
+                )?;
+                st.expected = Some(ExpectedReceiverSchema {
+                    chunk_schema,
+                    column_binding,
+                });
             }
         }
         st.expected_senders = st.expected_senders.max(expected_senders);
@@ -439,6 +522,7 @@ impl ExecutionExchangeRegistry {
     fn retag_queued_chunks_for_expected_schema(
         st: &mut ReceiverState,
         expected_chunk_schema: &ChunkSchemaRef,
+        column_binding: ExchangeColumnBinding,
     ) -> Result<(), String> {
         if st.chunks.is_empty() {
             return Ok(());
@@ -453,10 +537,15 @@ impl ExecutionExchangeRegistry {
                     .map(|slot| slot.slot_id())
                     .collect(),
             };
+            // A chunk queued before registration still carries its sender's
+            // wire slot ids in wire column order, so the registered binding
+            // applies to it exactly as it would have at decode time.
             let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
                 Some(expected_chunk_schema),
                 &chunk.batch,
                 &wire_meta,
+                column_binding.prefers_wire_slot_ids(),
+                column_binding == ExchangeColumnBinding::Positional,
                 DecodeCarrierContract::Exchange,
             )?;
             let mut retagged = chunk_from_exchange_batch(batch, chunk_schema).map_err(|e| {
@@ -1513,10 +1602,16 @@ fn validate_root_result_wire_domains(
 /// Descriptor-authoritative decode: the receiver's registered chunk schema is
 /// the exact Arrow type contract. Decoded columns may be rebuilt to the
 /// receiver's field metadata and slot namespace, but type drift fails here.
+/// `exact_expected_fields` is set for a compiled positional receiver: each
+/// decoded column must already be the receiver's frozen carrier, and the
+/// chunk presents exactly the receiver's frozen fields -- name, metadata and
+/// nullability -- because compiled roots check their input port exactly.
 fn materialize_chunk_for_wire_meta(
     expected_chunk_schema: Option<&ChunkSchemaRef>,
     batch: &RecordBatch,
     wire_meta: &ExchangeWireMeta,
+    prefer_wire_slot_ids: bool,
+    exact_expected_fields: bool,
     carrier_contract: DecodeCarrierContract,
 ) -> Result<(RecordBatch, ChunkSchemaRef), String> {
     if wire_meta.slot_ids_by_index.len() != batch.num_columns() {
@@ -1546,6 +1641,7 @@ fn materialize_chunk_for_wire_meta(
     // deliberately use an independent expected-slot namespace, so they force
     // position-based mapping even when numeric slot IDs overlap.
     let wire_ids_match = carrier_contract == DecodeCarrierContract::Exchange
+        && prefer_wire_slot_ids
         && wire_meta
             .slot_ids_by_index
             .iter()
@@ -1631,6 +1727,31 @@ fn materialize_chunk_for_wire_meta(
                     }
                 }
             }
+        }
+
+        if exact_expected_fields {
+            let expected_field = expected_slot.field();
+            if out_column.data_type() != expected_field.data_type() {
+                return Err(format!(
+                    "compiled exchange column {idx} arrives as {:?}, expected {:?}",
+                    out_column.data_type(),
+                    expected_field.data_type()
+                ));
+            }
+            if !expected_field.is_nullable() && out_column.null_count() > 0 {
+                return Err(format!(
+                    "compiled exchange column {idx} carries NULL into a non-null receiver field"
+                ));
+            }
+            if out_field != *expected_field {
+                out_field = expected_field.clone();
+                any_materialized = true;
+            }
+            slots.push(
+                expected_slot.with_field_and_slot_id(expected_slot.slot_id(), out_field.clone())?,
+            );
+            columns.push(out_column);
+            continue;
         }
 
         // Reconcile nullability against the expected slot the same way the
@@ -1808,6 +1929,8 @@ pub fn decode_root_result_chunks(
             expected_chunk_schema,
             &batch,
             &wire_meta,
+            false,
+            false,
             DecodeCarrierContract::RootResult,
         )?;
         chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
@@ -1851,7 +1974,7 @@ impl ExecutionExchangeRegistry {
         }
 
         let receiver = get_or_create(self, key);
-        let expected_chunk_schema;
+        let expected;
         let wire_meta;
         {
             let mut st = receiver.mu.lock().expect("exchange receiver lock");
@@ -1888,17 +2011,28 @@ impl ExecutionExchangeRegistry {
             if st.canceled {
                 return Err("exchange canceled".to_string());
             }
-            expected_chunk_schema = st.expected_chunk_schema.clone();
+            expected = st.expected.clone();
         }
 
+        // Before registration there is no expected schema and the decoded
+        // chunk keeps its wire slot ids; the binding is then applied by the
+        // late registration's retag.
+        let prefer_wire_slot_ids = expected
+            .as_ref()
+            .is_some_and(|expected| expected.column_binding.prefers_wire_slot_ids());
+        let exact_expected_fields = expected
+            .as_ref()
+            .is_some_and(|expected| expected.column_binding == ExchangeColumnBinding::Positional);
         let batches = decode_arrow_ipc_batches(arrow_payload)?;
         let mut chunks = Vec::with_capacity(batches.len());
         for batch in batches {
             let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
             let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
-                expected_chunk_schema.as_ref(),
+                expected.as_ref().map(|expected| &expected.chunk_schema),
                 &batch,
                 &wire_meta,
+                prefer_wire_slot_ids,
+                exact_expected_fields,
                 DecodeCarrierContract::Exchange,
             )?;
             chunks.push(chunk_from_exchange_batch(batch, chunk_schema)?);
@@ -2388,6 +2522,45 @@ mod tests {
         assert!(
             error.contains("slot count") && error.contains("hard limit"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn typed_root_result_preflight_preserves_frame_error_precedence() {
+        let payload = encode_chunks(&[exchange_test_chunk("name")], true).unwrap();
+        let start = typed_test_arrow_payload_offset(&payload);
+        let declared = u32::try_from(MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES + 1).unwrap();
+
+        // This prefix is simultaneously oversized, unaligned and beyond the packet.
+        let mut oversized = payload.clone();
+        oversized[start + 4..start + 8].copy_from_slice(&declared.to_le_bytes());
+        assert_eq!(
+            preflight_typed_test_payload(&oversized).unwrap_err(),
+            format!(
+                "Arrow IPC message metadata has {declared} bytes, exceeding per-message hard limit {MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES}"
+            ),
+        );
+
+        let mut bad_marker = oversized;
+        bad_marker[start] = 0;
+        assert_eq!(
+            preflight_typed_test_payload(&bad_marker).unwrap_err(),
+            "Arrow IPC message at byte offset 0 is not continuation-framed",
+        );
+        bad_marker.truncate(start + 7);
+        assert_eq!(
+            preflight_typed_test_payload(&bad_marker).unwrap_err(),
+            "Arrow IPC message prefix is truncated at byte offset 0",
+        );
+
+        // EOS trailing bytes fail before the missing schema and record batch.
+        let mut early_end = payload[..start].to_vec();
+        early_end.extend_from_slice(&ARROW_IPC_CONTINUATION_MARKER);
+        early_end.extend_from_slice(&0_u32.to_le_bytes());
+        early_end.push(0);
+        assert_eq!(
+            preflight_typed_test_payload(&early_end).unwrap_err(),
+            "Arrow IPC terminal marker has trailing bytes",
         );
     }
 
@@ -3524,6 +3697,143 @@ mod tests {
                 .decode_chunks_for_sender(key, first_sender, &second_payload)
                 .expect_err("one exact sender cannot change its wire metadata")
                 .contains("sender wire meta changed unexpectedly")
+        );
+    }
+
+    // Compiled fragments allocate slot ids per fragment. The sender projects
+    // (b, a) from its own slots [1, 0]; the receiver imports (b', a') into its
+    // slots [0, 1]. Every wire id exists in the receiver schema with the same
+    // type, so a slot-id binding silently swaps the two columns.
+    #[test]
+    fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
+        use super::ExchangeColumnBinding;
+
+        let sender_schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let sender_batch = RecordBatch::try_new(
+            Arc::clone(&sender_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ],
+        )
+        .expect("sender batch");
+        let sender_chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            sender_schema.as_ref(),
+            &[SlotId::new(1), SlotId::new(0)],
+        )
+        .expect("sender chunk schema");
+        let payload = encode_chunks(
+            &[Chunk::new_with_chunk_schema(
+                sender_batch,
+                sender_chunk_schema,
+            )],
+            true,
+        )
+        .expect("encode sender payload");
+        let receiver_schema = Schema::new(vec![
+            Field::new("b_import", DataType::Int64, false),
+            Field::new("a_import", DataType::Int64, false),
+        ]);
+        let expected = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &receiver_schema,
+            &[SlotId::new(0), SlotId::new(1)],
+        )
+        .expect("receiver chunk schema");
+        let sender = ExchangeSenderIdentity::native(UniqueId::new(1, 1), 0);
+        let column = |chunk: &Chunk, slot: u32| -> Vec<i64> {
+            chunk
+                .column_by_slot_id(SlotId::new(slot))
+                .expect("slot column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 column")
+                .values()
+                .to_vec()
+        };
+        let registry = ExecutionExchangeRegistry::default();
+
+        let positional = ExchangeKey {
+            finst_id_hi: 601,
+            finst_id_lo: 602,
+            node_id: 3,
+        };
+        registry
+            .try_register_expected_chunk_schema_with_binding(
+                positional,
+                1,
+                Arc::clone(&expected),
+                ExchangeColumnBinding::Positional,
+            )
+            .expect("register positional receiver");
+        let decoded = registry
+            .decode_chunks_for_sender(positional, sender, &payload)
+            .expect("positional decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0]
+                .chunk_schema()
+                .slots()
+                .iter()
+                .map(|slot| slot.slot_id())
+                .collect::<Vec<_>>(),
+            vec![SlotId::new(0), SlotId::new(1)]
+        );
+        assert_eq!(column(&decoded[0], 0), vec![10, 20]);
+        assert_eq!(column(&decoded[0], 1), vec![1, 2]);
+
+        // A chunk queued before registration keeps its wire ids; the late
+        // positional registration retags it by position as well.
+        let late = ExchangeKey {
+            node_id: 5,
+            ..positional
+        };
+        let queued = registry
+            .decode_chunks_for_sender(late, sender, &payload)
+            .expect("decode before registration");
+        registry.push_chunks(late, sender, queued, false);
+        registry
+            .try_register_expected_chunk_schema_with_binding(
+                late,
+                1,
+                Arc::clone(&expected),
+                ExchangeColumnBinding::Positional,
+            )
+            .expect("late positional registration");
+        let handle = registry
+            .get_receiver_handle(late, 1)
+            .expect("receiver handle");
+        let Some(ExchangePopResult::Chunk(retagged)) =
+            handle.try_pop_next_with_stats(1).expect("pop queued chunk")
+        else {
+            panic!("expected the queued chunk");
+        };
+        assert_eq!(column(&retagged, 0), vec![10, 20]);
+        assert_eq!(column(&retagged, 1), vec![1, 2]);
+
+        // The same payload under the legacy slot-id binding is exactly the
+        // hazard the positional registration exists to avoid.
+        let by_slot = ExchangeKey {
+            node_id: 4,
+            ..positional
+        };
+        registry
+            .try_register_expected_chunk_schema(by_slot, 1, Arc::clone(&expected))
+            .expect("register slot-id receiver");
+        let swapped = registry
+            .decode_chunks_for_sender(by_slot, sender, &payload)
+            .expect("slot-id decode");
+        assert_eq!(column(&swapped[0], 0), vec![1, 2]);
+        assert_eq!(column(&swapped[0], 1), vec![10, 20]);
+
+        // One receiver has one binding; a conflicting re-registration fails.
+        assert!(
+            registry
+                .register_expected_chunk_schema(positional, 1, expected)
+                .expect_err("binding conflict")
+                .contains("exchange column binding mismatch")
         );
     }
 }

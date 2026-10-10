@@ -31,8 +31,8 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
                 .map(|item| OutputColumn {
                     column_id: item.output_column_id,
                     name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
+                    value_type: item.expr.value_type.clone(),
+
                     is_internal: project_item_refs_internal_column(item, &input_columns),
                 })
                 .collect())
@@ -52,8 +52,11 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::GenerateSeries(node) => Ok(vec![OutputColumn {
             column_id: node.output_column_id,
             name: node.column_name.clone(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         }]),
         LogicalPlanKind::TableFunction(node) => {
@@ -70,8 +73,11 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
                     .map(|(name, column_id)| OutputColumn {
                         column_id: *column_id,
                         name: name.clone(),
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: true,
                     }),
             );
@@ -144,16 +150,16 @@ pub(super) fn adapt_plan_output_with_qualifier(
         .iter()
         .zip(target_output_columns.iter())
     {
-        if source.data_type != target.data_type {
+        if source.value_type.data_type != target.value_type.data_type {
             return Err(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
-                target.name, source.data_type, target.data_type
+                target.name, source.value_type.data_type, target.value_type.data_type
             ));
         }
-        if source.nullable && !target.nullable {
+        if source.value_type.nullable && !target.value_type.nullable {
             return Err(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
-                target.name, source.nullable, target.nullable
+                target.name, source.value_type.nullable, target.value_type.nullable
             ));
         }
         items.push(ProjectItem {
@@ -163,8 +169,10 @@ pub(super) fn adapt_plan_output_with_qualifier(
                     qualifier: None,
                     column: source.name.clone(),
                 },
-                data_type: source.data_type.clone(),
-                nullable: target.nullable,
+                value_type: novarocks_type_contract::FunctionValueType {
+                    nullable: target.value_type.nullable,
+                    ..source.value_type.clone()
+                },
             },
             output_name: target.name.clone(),
             output_column_id: target.column_id,
@@ -184,8 +192,8 @@ pub(super) fn adapt_plan_output_with_qualifier(
 fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
         && left.name == right.name
-        && left.data_type == right.data_type
-        && left.nullable == right.nullable
+        && left.value_type.data_type == right.value_type.data_type
+        && left.value_type.nullable == right.value_type.nullable
         && left.is_internal == right.is_internal
 }
 
@@ -222,7 +230,7 @@ fn join_output_columns(
 
 fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.nullable = true;
+        column.value_type.nullable = true;
     }
     columns
 }

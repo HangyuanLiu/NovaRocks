@@ -251,8 +251,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -265,13 +265,11 @@ mod tests {
         let sum_output = output_column(3, "sum_v");
         let group = arena.intern(
             ScalarNode::ColumnRef(group_output.column_id),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let value = arena.intern(
             ScalarNode::ColumnRef(value_output.column_id),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let aggregate = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp::single(
@@ -279,13 +277,11 @@ mod tests {
                 vec![ScalarAggregateSpec {
                     output_column_id: sum_output.column_id,
                     name: "sum".to_string(),
-                    args: vec![value],
                     distinct: false,
-                    order_by: vec![],
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![value],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 AggregateOutputLayout::new(vec![group_output.clone()], vec![sum_output.clone()]),

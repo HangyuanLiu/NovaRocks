@@ -27,6 +27,10 @@ use novarocks_spi::connector::{
 pub(crate) struct QueryPinnedFileSetRead {
     pub(crate) pinned: ConnectorPinnedFileSet,
     pub(crate) owner: ConnectorInstanceId,
+    /// Provider-owned original source; FE only loans it to the admitted reader.
+    /// Ordinary maintenance cohorts have no such receipt.
+    pub(crate) frozen_source:
+        Option<novarocks_spi::connector::read_stack::runtime::ConnectorFrozenReadSource>,
     pub(crate) planning_lease: ConnectorControlPlanningLease,
 }
 

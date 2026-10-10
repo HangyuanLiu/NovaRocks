@@ -52,7 +52,7 @@ fn collect_column_ids_strict_inner(
             }
             out.insert(*id);
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_column_ids_strict_inner(arena, *left, out)?;
             collect_column_ids_strict_inner(arena, *right, out)?;
@@ -154,8 +154,9 @@ pub(crate) fn split_conjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec
 pub(crate) fn combine_conjuncts(
     arena: &mut ScalarArena,
     mut exprs: Vec<ScalarId>,
-) -> Option<ScalarId> {
-    combine_binary_bool(arena, &mut exprs, BinOp::And)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    combine_binary_bool(arena, &mut exprs, BinOp::And, control)
 }
 
 pub(crate) fn split_disjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
@@ -177,54 +178,108 @@ pub(crate) fn split_disjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec
 pub(crate) fn combine_disjuncts(
     arena: &mut ScalarArena,
     mut exprs: Vec<ScalarId>,
-) -> Option<ScalarId> {
-    combine_binary_bool(arena, &mut exprs, BinOp::Or)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    combine_binary_bool(arena, &mut exprs, BinOp::Or, control)
 }
 
 fn combine_binary_bool(
     arena: &mut ScalarArena,
     exprs: &mut Vec<ScalarId>,
     op: BinOp,
-) -> Option<ScalarId> {
-    let mut result = exprs.pop()?;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    let Some(mut result) = exprs.pop() else {
+        return Ok(None);
+    };
     while let Some(next) = exprs.pop() {
         let nullable = arena.nullable(next) || arena.nullable(result);
-        result = arena.intern(
+        result = arena.intern_observed(
             ScalarNode::BinaryOp {
                 op,
                 left: next,
                 right: result,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            nullable,
-        );
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
+            control,
+        )?;
     }
-    Some(result)
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    Ok(Some(result))
 }
 
-pub(crate) fn bool_literal(arena: &mut ScalarArena, value: bool) -> ScalarId {
-    arena.intern(
+pub(crate) fn bool_literal(
+    arena: &mut ScalarArena,
+    value: bool,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    arena.intern_observed(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(value))),
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        control,
     )
 }
 
-pub(crate) fn int_literal(arena: &mut ScalarArena, value: i64) -> ScalarId {
-    arena.intern(
+pub(crate) fn int_literal(
+    arena: &mut ScalarArena,
+    value: i64,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    arena.intern_observed(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        control,
     )
 }
 
-pub(crate) fn is_literal_count_arg(arena: &ScalarArena, expr: ScalarId) -> bool {
-    matches!(
-        arena.node(expr),
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(_)))
-            | ScalarNode::Literal(HashableLiteral(LiteralValue::Null))
-    )
+pub(crate) fn literal_count_value(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<i64>, crate::compiler::SqlCompileError> {
+    use crate::compiler::SqlCompileError;
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result: Result<Option<i64>, SqlCompileError> = (|| {
+        let node = arena.node(expr);
+        work.step()?;
+        match node {
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)) => Ok(Some(0)),
+            ScalarNode::Literal(_) => Ok(Some(1)),
+            ScalarNode::Constant(value) => {
+                if !arena
+                    .value_type(expr)
+                    .exactly_equals_observed(value.value_type(), || {
+                        work.step()
+                            .map_err(novarocks_functions::ConstantError::from)
+                    })?
+                {
+                    return Err(SqlCompileError::InvalidRequest(
+                        "COUNT constant source differs from its frozen scalar type".into(),
+                    ));
+                }
+                work.flush()?;
+                // COUNT observes logical SQL NULL at the original selected
+                // ordinal. Encoded/nested backing and nominal domains remain
+                // facts of the sole constant owner, not carrier guesses here.
+                let null = value.is_null_observed(CompilePhase::Validate, control)?;
+                Ok(Some(i64::from(!null)))
+            }
+            _ => Ok(None),
+        }
+    })();
+    if matches!(
+        result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
 pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
@@ -283,9 +338,10 @@ pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
                     .iter()
                     .any(|item| contains_aggregate(arena, item.expr))
         }
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            false
-        }
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => false,
     }
 }
 
@@ -418,7 +474,12 @@ pub(crate) fn aggregate_display_name(
 
     let visible_order_by = order_by
         .iter()
-        .filter(|item| !matches!(arena.node(item.expr), ScalarNode::Literal(_)))
+        .filter(|item| {
+            !matches!(
+                arena.node(item.expr),
+                ScalarNode::Literal(_) | ScalarNode::Constant(_)
+            )
+        })
         .collect::<Vec<_>>();
     if !visible_order_by.is_empty() {
         let order_by_display = visible_order_by
@@ -466,6 +527,7 @@ fn scalar_display_name_with_parens(arena: &ScalarArena, expr: ScalarId) -> Strin
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_)
         | ScalarNode::FunctionCall { .. }
         | ScalarNode::AggregateCall { .. } => scalar_display_name(arena, expr),
         _ => format!("({})", scalar_display_name(arena, expr)),
@@ -501,11 +563,66 @@ fn canonical_agg_display_name(name: &str) -> &str {
     }
 }
 
-pub(crate) fn is_true_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
-    matches!(
-        arena.node(expr),
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true)))
-    )
+pub(crate) fn is_true_literal(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    Ok(boolean_literal_value(arena, expr, control)? == Some(true))
+}
+
+fn boolean_literal_value(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<bool>, crate::compiler::SqlCompileError> {
+    use crate::compiler::SqlCompileError;
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result: Result<Option<bool>, SqlCompileError> = (|| {
+        let node = arena.node(expr);
+        work.step()?;
+        match node {
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(value))) => Ok(Some(*value)),
+            ScalarNode::Constant(value) => {
+                if !arena
+                    .value_type(expr)
+                    .exactly_equals_observed(value.value_type(), || {
+                        work.step()
+                            .map_err(novarocks_functions::ConstantError::from)
+                    })?
+                {
+                    return Err(SqlCompileError::InvalidRequest(
+                        "Boolean constant source differs from its frozen scalar type".into(),
+                    ));
+                }
+                let physical_boolean = value.value_type().logical_type
+                    == ValueLogicalType::Physical
+                    && value.value_type().data_type == DataType::Boolean;
+                work.step()?;
+                if !physical_boolean {
+                    return Ok(None);
+                }
+                // Reuse the admitted canonical Boolean array and checked
+                // selected ordinal. A wrong type is not a Boolean match;
+                // corrupt carrier facts remain typed errors, rather than NULL.
+                let selected = value.try_boolean();
+                work.step()?;
+                selected.map_err(SqlCompileError::from)
+            }
+            _ => Ok(None),
+        }
+    })();
+    if matches!(
+        result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
 pub(crate) fn contains_non_deterministic_function(arena: &ScalarArena, expr: ScalarId) -> bool {
@@ -596,9 +713,10 @@ fn contains_function_matching(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             contains_function_matching(arena, *body, matches)
         }
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            false
-        }
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => false,
     }
 }
 
@@ -735,13 +853,16 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
                 novarocks_functions::FunctionKind::Scalar,
                 "a non-row binding cannot be consumed as a scalar function"
             );
-            match binding.semantics.intrinsic_row_error {
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
-                novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
-                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
-                    unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+            binding
+                .admitted_execution_abi
+                .is_some_and(|abi| abi.may_raise_invocation_data())
+                || match binding.semantics.intrinsic_row_error {
+                    novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
+                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
+                        unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+                    }
                 }
-            }
         }
         ScalarNode::BinaryOp {
             op,
@@ -824,9 +945,10 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             can_fail(arena, *body)
         }
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            false
-        }
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => false,
     }
 }
 
@@ -843,8 +965,7 @@ mod tests {
     fn col(arena: &mut ScalarArena, id: u32, nullable: bool) -> ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId(id)),
-            DataType::Int64,
-            nullable,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         )
     }
 
@@ -853,8 +974,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let expr = arena.intern(
             ScalarNode::ColumnRef(ColumnId::UNSET),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         assert_eq!(collect_column_ids_strict(&arena, expr), None);
@@ -872,15 +992,20 @@ mod tests {
                 right: b,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
 
         let mut parts = Vec::new();
         split_conjuncts(&arena, and, &mut parts);
         assert_eq!(parts, vec![a, b]);
 
-        let rebuilt = combine_conjuncts(&mut arena, parts).unwrap();
+        let rebuilt = combine_conjuncts(
+            &mut arena,
+            parts,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             arena.node(rebuilt),
             ScalarNode::BinaryOp { op: BinOp::And, .. }
@@ -894,18 +1019,19 @@ mod tests {
         let mut arena = ScalarArena::new();
         let child = arena.intern(
             ScalarNode::ColumnRef(ColumnId(1)),
-            DataType::Decimal128(38, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
         );
-        let integer = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let integer = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let nullable = arena.intern(
             ScalarNode::Cast {
                 child: integer,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: OutputNull,
             },
-            DataType::Decimal128(9, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
         );
         let throwing = arena.intern(
             ScalarNode::Cast {
@@ -913,8 +1039,7 @@ mod tests {
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,
             },
-            DataType::Decimal128(9, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
         );
         assert!(!can_fail(&arena, nullable));
         assert!(can_fail(&arena, throwing));
@@ -926,8 +1051,7 @@ mod tests {
                 right: nullable,
                 decimal_overflow_policy: OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         assert!(can_fail(&arena, predicate));
         assert!(!contains_non_deterministic_function(&arena, predicate));
@@ -961,18 +1085,22 @@ mod intrinsic_error_consumer_tests {
                 name,
                 FunctionKind::Scalar,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: args.len(),
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
         catalog
             .validate_bound(
                 &binding,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: args.len(),
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
         let FunctionResultType::Scalar(output) = binding.selected.result_type.clone() else {
@@ -984,19 +1112,27 @@ mod intrinsic_error_consumer_tests {
                 name: name.into(),
                 args,
                 distinct: false,
-                binding: binding.into(),
+                binding: crate::binding::SqlFunctionBinding::new(
+                    binding,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
                 volatility,
             },
-            output.data_type,
-            output.nullable,
+            novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
         )
     }
 
     #[test]
     fn selected_intrinsic_fact_controls_effect_without_display_name_dispatch() {
         let mut arena = ScalarArena::new();
-        let text = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Utf8, true);
-        let boolean = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Boolean, true);
+        let text = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let boolean = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         let total = actual_call(&mut arena, "parse_json", vec![text]);
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         assert!(!can_fail(&arena, total));
@@ -1007,18 +1143,17 @@ mod intrinsic_error_consumer_tests {
             unreachable!()
         };
         *name = "parse_json".into();
-        let renamed = arena.intern(
-            renamed,
-            arena.data_type(raises).clone(),
-            arena.nullable(raises),
-        );
+        let renamed = arena.intern(renamed, arena.value_type(raises).clone());
         assert!(can_fail(&arena, renamed));
     }
 
     #[test]
     fn independent_catching_fact_and_short_circuit_children_are_preserved() {
         let mut arena = ScalarArena::new();
-        let boolean = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Boolean, true);
+        let boolean = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         // A structurally valid custom ReturnsNull declaration may still expose its own
         // Result error. Catalog kind/fact validation is covered in binding tests.
@@ -1029,13 +1164,16 @@ mod intrinsic_error_consumer_tests {
         let mut exact = binding.as_ref().clone();
         exact.semantics.failure_behavior =
             novarocks_functions::FunctionFailureBehavior::ReturnsNull;
-        *binding = exact.into();
-        let catching = arena.intern(catching, DataType::Boolean, true);
+        *binding =
+            crate::binding::SqlFunctionBinding::new(exact, binding.decimal_overflow_policy());
+        let catching = arena.intern(
+            catching,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         assert!(can_fail(&arena, catching));
         let condition = arena.intern(
             ScalarNode::Literal(HashableLiteral(crate::analysis::LiteralValue::Bool(false))),
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let branch = arena.intern(
             ScalarNode::Case {
@@ -1043,8 +1181,7 @@ mod intrinsic_error_consumer_tests {
                 when_then: vec![(condition, catching)],
                 else_expr: Some(boolean),
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         assert!(can_fail(&arena, branch));
         let wrapper = arena.intern(
@@ -1052,8 +1189,7 @@ mod intrinsic_error_consumer_tests {
                 child: branch,
                 negated: false,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         assert!(can_fail(&arena, wrapper));
     }
@@ -1061,8 +1197,14 @@ mod intrinsic_error_consumer_tests {
     #[test]
     fn non_row_boundaries_retain_aggregate_and_window_ordering_child_effects() {
         let mut arena = ScalarArena::new();
-        let text = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Utf8, true);
-        let boolean = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Boolean, true);
+        let text = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let boolean = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         let total = actual_call(&mut arena, "parse_json", vec![text]);
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         let order = |expr| SortKey {
@@ -1085,12 +1227,14 @@ mod intrinsic_error_consumer_tests {
                 order_by: vec![order(raises)],
                 resolved: aggregate.clone(),
             },
-            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                "item",
-                DataType::Boolean,
+            novarocks_type_contract::FunctionValueType::new(
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Boolean,
+                    true,
+                ))),
                 true,
-            ))),
-            true,
+            ),
         );
         assert!(can_fail(&arena, agg));
         let binding = aggregate;
@@ -1113,12 +1257,14 @@ mod intrinsic_error_consumer_tests {
                     window_frame: None,
                     ignore_nulls: false,
                 },
-                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Boolean,
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        DataType::Boolean,
+                        true,
+                    ))),
                     true,
-                ))),
-                true,
+                ),
             );
             assert_eq!(can_fail(&arena, window), expected);
         }
@@ -1153,7 +1299,10 @@ mod intrinsic_cast_effect_tests {
             (DataType::Date32, DataType::Date32, false),
         ] {
             let mut arena = ScalarArena::new();
-            let child = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), source, true);
+            let child = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(1)),
+                novarocks_type_contract::FunctionValueType::new(source, true),
+            );
             for policy in [
                 DecimalOverflowPolicy::OutputNull,
                 DecimalOverflowPolicy::ReportError,
@@ -1164,8 +1313,7 @@ mod intrinsic_cast_effect_tests {
                         target: target.clone(),
                         decimal_overflow_policy: policy,
                     },
-                    target.clone(),
-                    true,
+                    novarocks_type_contract::FunctionValueType::new(target.clone(), true),
                 );
                 assert_eq!(can_fail(&arena, cast), expected);
             }
@@ -1223,8 +1371,14 @@ mod intrinsic_cast_effect_tests {
             DataType::Decimal256(76, 0),
             DataType::Float64,
         ] {
-            let left = arena.intern(ScalarNode::ColumnRef(ColumnId(51)), dtype.clone(), true);
-            let right = arena.intern(ScalarNode::ColumnRef(ColumnId(52)), dtype.clone(), true);
+            let left = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(51)),
+                novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
+            );
+            let right = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(52)),
+                novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
+            );
             for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod] {
                 for policy in [OutputNull, ReportError] {
                     let expr = arena.intern(
@@ -1234,8 +1388,7 @@ mod intrinsic_cast_effect_tests {
                             right,
                             decimal_overflow_policy: policy,
                         },
-                        dtype.clone(),
-                        true,
+                        novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
                     );
                     let is_decimal =
                         matches!(dtype, DataType::Decimal128(..) | DataType::Decimal256(..));
@@ -1288,17 +1441,280 @@ mod intrinsic_cast_effect_tests {
             ),
             (DataType::Int64, DataType::Decimal128(9, 0), false),
         ] {
-            let child = arena.intern(ScalarNode::ColumnRef(ColumnId(61)), source.clone(), true);
+            let child = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(61)),
+                novarocks_type_contract::FunctionValueType::new(source.clone(), true),
+            );
             let cast = arena.intern(
                 ScalarNode::Cast {
                     child,
                     target: target.clone(),
                     decimal_overflow_policy: OutputNull,
                 },
-                target.clone(),
-                true,
+                novarocks_type_contract::FunctionValueType::new(target.clone(), true),
             );
             assert_eq!(can_fail(&arena, cast), expected, "{source:?} -> {target:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod selected_boolean_consumer_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+    use novarocks_functions::{ConstantPool, ConstantValue};
+    use novarocks_type_contract::{
+        CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Control {
+        trace: Mutex<Vec<u32>>,
+        refuse: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            assert!(units <= 256);
+            let mut trace = self.trace.lock().unwrap();
+            trace.push(units);
+            match self.refuse {
+                Some((at, error)) if trace.len() == at + 1 => Err(error),
+                _ => Ok(()),
+            }
+        }
+    }
+    fn constant(array: ArrayRef, logical: ValueLogicalType, ordinal: u32) -> ConstantValue {
+        let ty = FunctionValueType::try_with_logical_type(array.data_type().clone(), true, logical)
+            .unwrap();
+        let field = Arc::new(
+            ty.try_to_field("actual.constant").unwrap().with_metadata(
+                ty.try_to_field("actual.constant")
+                    .unwrap()
+                    .metadata()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .chain([("provider.fact".to_owned(), "kept".to_owned())])
+                    .collect(),
+            ),
+        );
+        ConstantPool::try_new(
+            field,
+            ty,
+            array.to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            &Control::default(),
+        )
+        .unwrap()
+        .value(ordinal)
+        .unwrap()
+    }
+    fn intern(arena: &mut ScalarArena, value: ConstantValue) -> ScalarId {
+        let ty = value.value_type().clone();
+        arena
+            .intern_observed(ScalarNode::Constant(value), ty, &Control::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn selected_count_uses_logical_null_and_not_boolean_or_json_payload_truth() {
+        let mut arena = ScalarArena::new();
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![Some(7), None]));
+        for (value, expected) in [
+            (constant(source.clone(), ValueLogicalType::Physical, 1), 0),
+            (constant(source, ValueLogicalType::Physical, 0), 1),
+            (
+                constant(
+                    Arc::new(BooleanArray::from(vec![false])),
+                    ValueLogicalType::Physical,
+                    0,
+                ),
+                1,
+            ),
+            (
+                constant(
+                    Arc::new(StringArray::from(vec!["null"])),
+                    ValueLogicalType::Json,
+                    0,
+                ),
+                1,
+            ),
+        ] {
+            let ty = value.value_type().clone();
+            let ordinal = value.ordinal();
+            let id = intern(&mut arena, value);
+            assert_eq!(
+                literal_count_value(&arena, id, &Control::default()).unwrap(),
+                Some(expected)
+            );
+            assert_eq!(arena.value_type(id), &ty);
+            let ScalarNode::Constant(actual) = arena.node(id) else {
+                panic!("expected selected constant")
+            };
+            assert_eq!(actual.ordinal(), ordinal);
+            assert_eq!(actual.field().metadata()["provider.fact"], "kept");
+        }
+        let column = arena.intern(
+            ScalarNode::ColumnRef(crate::column_id::ColumnId::new_for_test(91)),
+            FunctionValueType::new(DataType::Int64, true),
+        );
+        assert_eq!(
+            literal_count_value(&arena, column, &Control::default()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_count_original_control_refusal_preserves_prefix_and_arena() {
+        let mut arena = ScalarArena::new();
+        let id = intern(
+            &mut arena,
+            constant(
+                Arc::new(Int64Array::from(vec![Some(7), None])),
+                ValueLogicalType::Physical,
+                1,
+            ),
+        );
+        let baseline = Control::default();
+        assert_eq!(literal_count_value(&arena, id, &baseline).unwrap(), Some(0));
+        let trace = baseline.trace.into_inner().unwrap();
+        let nodes = arena.node_count();
+        for at in 0..trace.len() {
+            for (cause, expected) in [
+                (
+                    CompileControlError::Cancelled,
+                    crate::compiler::SqlCompileError::Cancelled,
+                ),
+                (
+                    CompileControlError::DeadlineExceeded,
+                    crate::compiler::SqlCompileError::DeadlineExceeded,
+                ),
+                (
+                    CompileControlError::ResourceExhausted,
+                    crate::compiler::SqlCompileError::ResourceExhausted,
+                ),
+            ] {
+                let control = Control {
+                    refuse: Some((at, cause)),
+                    ..Control::default()
+                };
+                assert_eq!(
+                    literal_count_value(&arena, id, &control).unwrap_err(),
+                    expected
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                assert_eq!(arena.node_count(), nodes);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_boolean_true_false_and_typed_null_keep_actual_ordinal_and_source_type() {
+        let source: ArrayRef = Arc::new(BooleanArray::from(vec![Some(false), Some(true), None]));
+        let mut arena = ScalarArena::new();
+        for (ordinal, expected) in [(0, Some(false)), (1, Some(true)), (2, None)] {
+            let value = constant(source.clone(), ValueLogicalType::Physical, ordinal);
+            let expected_type = value.value_type().clone();
+            let id = intern(&mut arena, value);
+            assert_eq!(arena.value_type(id), &expected_type);
+            assert_eq!(
+                boolean_literal_value(&arena, id, &Control::default()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                is_true_literal(&arena, id, &Control::default()).unwrap(),
+                expected == Some(true)
+            );
+            let ScalarNode::Constant(actual) = arena.node(id) else {
+                panic!("expected checked constant")
+            };
+            assert_eq!(actual.ordinal(), ordinal);
+            assert_eq!(actual.field().metadata()["provider.fact"], "kept");
+        }
+    }
+
+    #[test]
+    fn selected_boolean_wrong_types_are_no_match_and_false_source_metadata_is_rejected() {
+        let mut arena = ScalarArena::new();
+        for value in [
+            constant(
+                Arc::new(Int64Array::from(vec![1])),
+                ValueLogicalType::Physical,
+                0,
+            ),
+            constant(
+                Arc::new(StringArray::from(vec!["true"])),
+                ValueLogicalType::Json,
+                0,
+            ),
+        ] {
+            let id = intern(&mut arena, value);
+            assert_eq!(
+                boolean_literal_value(&arena, id, &Control::default()).unwrap(),
+                None
+            );
+            assert!(!is_true_literal(&arena, id, &Control::default()).unwrap());
+        }
+        let value = constant(
+            Arc::new(BooleanArray::from(vec![true])),
+            ValueLogicalType::Physical,
+            0,
+        );
+        let error = arena
+            .intern_observed(
+                ScalarNode::Constant(value),
+                FunctionValueType::new(DataType::Boolean, false),
+                &Control::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::compiler::SqlCompileError::Compilation(_)
+        ));
+    }
+
+    #[test]
+    fn selected_boolean_each_original_callback_refusal_has_no_replay_or_publication() {
+        let mut arena = ScalarArena::new();
+        let id = intern(
+            &mut arena,
+            constant(
+                Arc::new(BooleanArray::from(vec![false, true])),
+                ValueLogicalType::Physical,
+                1,
+            ),
+        );
+        let baseline = Control::default();
+        assert!(is_true_literal(&arena, id, &baseline).unwrap());
+        let trace = baseline.trace.into_inner().unwrap();
+        assert_eq!(trace[0], 0);
+        assert!(trace.last().copied().unwrap() > 0);
+        let nodes = arena.node_count();
+        for at in 0..trace.len() {
+            for (cause, expected) in [
+                (
+                    CompileControlError::Cancelled,
+                    crate::compiler::SqlCompileError::Cancelled,
+                ),
+                (
+                    CompileControlError::DeadlineExceeded,
+                    crate::compiler::SqlCompileError::DeadlineExceeded,
+                ),
+                (
+                    CompileControlError::ResourceExhausted,
+                    crate::compiler::SqlCompileError::ResourceExhausted,
+                ),
+            ] {
+                let control = Control {
+                    refuse: Some((at, cause)),
+                    ..Control::default()
+                };
+                assert_eq!(is_true_literal(&arena, id, &control).unwrap_err(), expected);
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                assert_eq!(arena.node_count(), nodes);
+            }
         }
     }
 }

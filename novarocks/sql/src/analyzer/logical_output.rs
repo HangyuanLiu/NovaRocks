@@ -40,7 +40,7 @@ impl AnalyzerContext<'_> {
         // empty/all-null JSON literals and catalog JSON-list columns. A physical
         // List<Utf8> or an output CAST alone does not establish this witness.
         if self.json_list_provenance(source, expression, scope)
-            && matches!(&expression.data_type, DataType::List(item)
+            && matches!(&expression.value_type.data_type, DataType::List(item)
                 if item.data_type() == &DataType::Utf8)
         {
             return Some(SqlType::Array(Box::new(SqlType::Json)));
@@ -63,8 +63,8 @@ impl AnalyzerContext<'_> {
                     .logical_output_type(Some(&cast.expr), inner, scope)
                     .filter(|domain| *domain == SqlType::Json),
                 (ExprKind::Cast { expr: inner, .. }, _, true)
-                    if inner.data_type == DataType::LargeBinary
-                        && expression.data_type == DataType::LargeBinary =>
+                    if inner.value_type.data_type == DataType::LargeBinary
+                        && expression.value_type.data_type == DataType::LargeBinary =>
                 {
                     self.logical_output_type(Some(&cast.expr), inner, scope)
                         .filter(|domain| *domain == SqlType::Variant)
@@ -76,8 +76,8 @@ impl AnalyzerContext<'_> {
         // carriers remain compatible with that already-established domain.
         if let ExprKind::Cast { expr: inner, .. } = &expression.kind {
             let domain = self.logical_output_type(source, inner, scope)?;
-            return (logical_carrier_matches(&domain, &inner.data_type)
-                && logical_carrier_matches(&domain, &expression.data_type))
+            return (logical_carrier_matches(&domain, &inner.value_type.data_type)
+                && logical_carrier_matches(&domain, &expression.value_type.data_type))
             .then_some(domain);
         }
         let source_binding = match source {
@@ -95,7 +95,9 @@ impl AnalyzerContext<'_> {
                 .factory
                 .borrow()
                 .logical_type(column_id)
-                .filter(|domain| logical_carrier_matches(domain, &expression.data_type));
+                .filter(|domain| {
+                    logical_carrier_matches(domain, &expression.value_type.data_type)
+                });
         }
         let domain = match &expression.kind {
             ExprKind::ColumnRef { .. } => scope.logical_type_of_expr(expression),
@@ -203,7 +205,7 @@ impl AnalyzerContext<'_> {
             ),
             _ => None,
         };
-        domain.filter(|domain| logical_carrier_matches(domain, &expression.data_type))
+        domain.filter(|domain| logical_carrier_matches(domain, &expression.value_type.data_type))
     }
 
     fn merge_logical_values<'a>(
@@ -431,7 +433,7 @@ impl AnalyzerContext<'_> {
         }) {
             return Ok(expression);
         }
-        let DataType::List(item) = &expression.data_type else {
+        let DataType::List(item) = &expression.value_type.data_type else {
             return Err(AnalyzeError::type_mismatch(
                 "JSON list producer binding must declare a List result",
                 span,
@@ -452,15 +454,15 @@ impl AnalyzerContext<'_> {
             Field::new(item.name(), DataType::Utf8, item.is_nullable()),
             LogicalType::Json,
         )));
-        let nullable = expression.nullable;
+        let mut value_type = expression.value_type.clone();
+        value_type.data_type = target.clone();
         Ok(TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(expression),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: target,
-            nullable,
+            value_type,
         })
     }
 }
@@ -518,7 +520,7 @@ fn logical_carrier_matches(domain: &SqlType, carrier: &DataType) -> bool {
     }
 }
 fn is_null_value(source: Option<&ast::Expr>, value: &TypedExpr) -> bool {
-    if value.data_type == DataType::Null {
+    if value.value_type.data_type == DataType::Null {
         return true;
     }
     match &value.kind {
@@ -645,8 +647,14 @@ mod scalar_domain_tests {
             .map(|column| factory.logical_type(column.column_id))
             .collect()
     }
+    fn fixture_control() -> &'static crate::compiler::SqlCompileControl {
+        static CONTROL: std::sync::OnceLock<crate::compiler::SqlCompileControl> = std::sync::OnceLock::new();
+        CONTROL.get_or_init(crate::compiler::SqlCompileControl::unbounded)
+    }
     fn context(factory: Rc<RefCell<ColumnRefFactory>>) -> AnalyzerContext<'static> {
         AnalyzerContext {
+            constant_policy: crate::constant::test_constant_policy(),
+            control: fixture_control(),
             catalog: &Catalog,
             current_database: "db",
             function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -708,7 +716,7 @@ mod scalar_domain_tests {
             let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
             let id = factory
                 .borrow_mut()
-                .create(None, "source".into(), carrier.clone(), true);
+                .create(None, "source".into(), novarocks_type_contract::FunctionValueType::new(carrier.clone(), true));
             factory
                 .borrow_mut()
                 .set_logical_type(id, Some(SqlType::Array(Box::new(SqlType::Json))));
@@ -721,8 +729,7 @@ mod scalar_domain_tests {
                     qualifier: None,
                     column: "source".into(),
                 },
-                data_type: carrier,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(carrier, true),
             };
             if witness && !accepted {
                 // A binding coercion must not hide the original conflicting
@@ -735,14 +742,14 @@ mod scalar_domain_tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: target,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(target, true),
                 };
                 let bound = super::super::resolve_expr::resolved_scalar_call_at(
                     context.function_catalog,
                     "row",
                     vec![coerced],
                     Span::new(0, 0),
+                    context.sql_semantics.sql_mode().decimal_overflow_policy(), context.constant_policy, context.control,
                 )
                 .unwrap();
                 assert!(
@@ -756,6 +763,7 @@ mod scalar_domain_tests {
                 "row",
                 vec![source],
                 Span::new(0, 0),
+                context.sql_semantics.sql_mode().decimal_overflow_policy(), context.constant_policy, context.control,
             )
             .unwrap();
             let result = context.adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0));
@@ -766,7 +774,7 @@ mod scalar_domain_tests {
             );
             if accepted {
                 let result = result.unwrap();
-                let DataType::Struct(fields) = result.data_type else {
+                let DataType::Struct(fields) = result.value_type.data_type else {
                     panic!("row result");
                 };
                 let DataType::List(item) = fields[0].data_type() else {
@@ -910,7 +918,7 @@ mod scalar_domain_tests {
         let mut shadowed = binding.resolved().clone();
         shadowed.function_id =
             novarocks_functions::FunctionId::try_new("test.shadow/coalesce/v1").unwrap();
-        *binding = shadowed.into();
+        *binding = crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
         assert_eq!(
@@ -924,7 +932,7 @@ mod scalar_domain_tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let id = factory
             .borrow_mut()
-            .create(None, "j".into(), DataType::Utf8, true);
+            .create(None, "j".into(), novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true));
         factory
             .borrow_mut()
             .set_logical_type(id, Some(SqlType::Json));
@@ -936,8 +944,7 @@ mod scalar_domain_tests {
                 qualifier: None,
                 column: "j".into(),
             },
-            data_type: DataType::Utf8,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         };
         let cast = |target: DataType| TypedExpr {
             kind: ExprKind::Cast {
@@ -945,8 +952,7 @@ mod scalar_domain_tests {
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: target,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(target, true),
         };
         assert_eq!(
             context.logical_output_type(None, &cast(DataType::LargeUtf8), &scope),
@@ -1045,11 +1051,11 @@ mod scalar_domain_tests {
             else {
                 panic!("scalar selection")
             };
-            assert_eq!(result.data_type, selected.data_type);
-            let DataType::List(output) = &expression.data_type else {
+            assert_eq!(result.data_type, selected.value_type.data_type);
+            let DataType::List(output) = &expression.value_type.data_type else {
                 panic!("list output")
             };
-            let DataType::List(input) = &args[0].data_type else {
+            let DataType::List(input) = &args[0].value_type.data_type else {
                 panic!("list input")
             };
             assert_eq!(output.name(), input.name());
@@ -1062,7 +1068,7 @@ mod scalar_domain_tests {
         }
         let expression =
             output_expressions("select first_value(row(null,to_bitmap(1))) over ()").remove(0);
-        let DataType::Struct(fields) = &expression.data_type else {
+        let DataType::Struct(fields) = &expression.value_type.data_type else {
             panic!("struct output")
         };
         assert_eq!(fields[0].data_type(), &DataType::Null);
@@ -1121,14 +1127,14 @@ mod scalar_domain_tests {
             let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
                 unreachable!()
             };
-            let DataType::Struct(fields) = &expression.data_type else {
+            let DataType::Struct(fields) = &expression.value_type.data_type else {
                 panic!("struct result")
             };
             assert_eq!(fields[0].data_type(), &DataType::Null);
             let DataType::Map(entries, sorted) = fields[1].data_type() else {
                 panic!("map sibling")
             };
-            let DataType::Struct(input) = &args[0].data_type else {
+            let DataType::Struct(input) = &args[0].value_type.data_type else {
                 panic!("struct input")
             };
             let DataType::Map(input_entries, input_sorted) = input[1].data_type() else {
@@ -1188,12 +1194,12 @@ mod scalar_domain_tests {
             panic!("scalar")
         };
         assert_eq!(result.data_type, DataType::LargeBinary);
-        assert_eq!(selected.data_type, result.data_type);
+        assert_eq!(selected.value_type.data_type, result.data_type);
         let ExprKind::Cast { expr, target, .. } = &args[0].kind else {
             panic!("public CAST")
         };
         assert_eq!(target, &DataType::LargeBinary);
-        assert_eq!(expr.data_type, DataType::LargeBinary);
+        assert_eq!(expr.value_type.data_type, DataType::LargeBinary);
         let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
             panic!("original producer")
         };
@@ -1244,7 +1250,7 @@ mod scalar_domain_tests {
                     result.data_type = DataType::Binary;
                 }
             }
-            *binding = selected.into();
+            *binding = crate::binding::SqlFunctionBinding::new(selected, binding.decimal_overflow_policy());
             assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
             let before = format!("{:?}", candidate.kind);
             let adapted = context
@@ -1304,17 +1310,15 @@ mod scalar_domain_tests {
         ));
         let bad_source = TypedExpr {
             kind: clean.kind.clone(),
-            data_type: corrupted,
-            nullable: clean.nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(corrupted, clean.value_type.nullable),
         };
         args[0] = TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(bad_source),
-                target: clean.data_type.clone(),
+                target: clean.value_type.data_type.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: clean.data_type,
-            nullable: clean.nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(clean.value_type.data_type, clean.value_type.nullable),
         };
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
@@ -1344,7 +1348,7 @@ mod scalar_domain_tests {
             unreachable!()
         };
         let value = args[0].clone();
-        let DataType::Struct(fields) = &value.data_type else {
+        let DataType::Struct(fields) = &value.value_type.data_type else {
             panic!("struct")
         };
         let clean = DataType::Struct(
@@ -1366,8 +1370,7 @@ mod scalar_domain_tests {
                 target: clean.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: clean.clone(),
-            nullable: args[0].nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(clean.clone(), args[0].value_type.nullable),
         };
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
@@ -1378,16 +1381,17 @@ mod scalar_domain_tests {
             .function_catalog
             .resolve_window_binding(
                 "first_value",
-                &[crate::analysis::function_argument(&coerced)],
+                &[crate::analysis::function_argument(&coerced, context.constant_policy, context.control).unwrap()],
+                context.control,
             )
             .unwrap();
-        *binding = original_binding.clone().into();
+        *binding = crate::binding::SqlFunctionBinding::new(original_binding.clone(), binding.decimal_overflow_policy());
         *args = vec![coerced];
-        selected_window.data_type = clean;
+        selected_window.value_type.data_type = clean;
         let adapted = context
             .adapt_bound_output_domains(selected_window, None, &scope, Span::new(0, 0))
             .unwrap();
-        let DataType::Struct(fields) = &adapted.data_type else {
+        let DataType::Struct(fields) = &adapted.value_type.data_type else {
             panic!("struct")
         };
         assert_eq!(fields[0].data_type(), &DataType::Null);
@@ -1404,7 +1408,7 @@ mod scalar_domain_tests {
         else {
             panic!("scalar")
         };
-        assert_eq!(result.data_type, args[0].data_type);
+        assert_eq!(result.data_type, args[0].value_type.data_type);
         assert_eq!(
             novarocks_types::logical::logical_type_of_field(match &result.data_type {
                 DataType::Struct(fields) => &fields[1],
@@ -1482,6 +1486,8 @@ mod scalar_domain_tests {
                 SqlPlanningEnvironment::Distributed,
                 builtin_sql_function_catalog().snapshot(),
                 noop_constant_evaluator(),
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {
                     min: 1,
@@ -1495,7 +1501,7 @@ mod scalar_domain_tests {
                 DEFAULT_COMPLETION_LIMITS,
             );
             let SqlCompileProgress::Complete(completed) =
-                SqlCompiler::start(request.try_into_completion().unwrap()).unwrap()
+                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control()).unwrap()
             else {
                 panic!("source-free window unexpectedly needs observations: {sql}");
             };
@@ -1590,7 +1596,7 @@ mod scalar_domain_tests {
                 ["missing", "value"],
             ),
         ] {
-            let DataType::Struct(fields) = &expression.data_type else {
+            let DataType::Struct(fields) = &expression.value_type.data_type else {
                 panic!("expected struct")
             };
             assert_eq!(fields[0].data_type(), &DataType::Null);
@@ -1629,8 +1635,10 @@ mod scalar_domain_tests {
         else {
             panic!("expected scalar result")
         };
-        assert_eq!(result.data_type, expr.data_type);
-        let (DataType::List(actual), DataType::List(adapted)) = (&expr.data_type, target) else {
+        assert_eq!(result.data_type, expr.value_type.data_type);
+        let (DataType::List(actual), DataType::List(adapted)) =
+            (&expr.value_type.data_type, target)
+        else {
             panic!("expected lists")
         };
         assert_eq!(actual.name(), adapted.name());
@@ -1686,14 +1694,14 @@ mod scalar_domain_tests {
         let mut shadowed = binding.resolved().clone();
         shadowed.function_id =
             novarocks_functions::FunctionId::try_new("test.shadow/__array_literal/v1").unwrap();
-        *binding = shadowed.into();
+        *binding = crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
         let adapted = context
             .adapt_bound_output_domains(original, None, &scope, Span::new(0, 0))
             .unwrap();
-        let DataType::List(field) = &adapted.data_type else {
+        let DataType::List(field) = &adapted.value_type.data_type else {
             panic!("expected list")
         };
         assert_eq!(novarocks_types::logical::logical_type_of_field(field), None);
@@ -1752,10 +1760,10 @@ mod scalar_domain_tests {
             };
             assert_eq!(
                 &selected.data_type,
-                &original_transform(expression).data_type
+                &original_transform(expression).value_type.data_type
             );
             let (DataType::List(actual), DataType::List(selected)) =
-                (&expression.data_type, &selected.data_type)
+                (&expression.value_type.data_type, &selected.data_type)
             else {
                 panic!("List result");
             };
@@ -1789,7 +1797,7 @@ mod scalar_domain_tests {
             panic!("scalar");
         };
         let (DataType::List(item), DataType::List(selected_item)) =
-            (&expression.data_type, &selected.data_type)
+            (&expression.value_type.data_type, &selected.data_type)
         else {
             panic!("List");
         };
@@ -1827,7 +1835,7 @@ mod scalar_domain_tests {
         ] {
             assert_eq!(output_domains(sql), vec![None]);
             let expression = output_expressions(sql).remove(0);
-            let DataType::List(item) = &expression.data_type else {
+            let DataType::List(item) = &expression.value_type.data_type else {
                 panic!("List");
             };
             let DataType::Struct(fields) = item.data_type() else {
@@ -1845,13 +1853,13 @@ mod scalar_domain_tests {
             "select arrays_zip([1],[2])",
         ] {
             let expression = output_expressions(sql).remove(0);
-            let DataType::List(item) = &expression.data_type else {
+            let DataType::List(item) = &expression.value_type.data_type else {
                 panic!("ordinary List");
             };
             assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
         }
         let expression = output_expressions("select array_repeat(null,2)").remove(0);
-        let DataType::List(item) = &expression.data_type else {
+        let DataType::List(item) = &expression.value_type.data_type else {
             panic!("NULL List");
         };
         assert_eq!(item.data_type(), &DataType::Null);
@@ -1861,7 +1869,7 @@ mod scalar_domain_tests {
     fn m07_container_trusted_and_null_variant_preserve_identity_unknown_cast_is_rejected() {
         let expression =
             output_expressions("select array_repeat(cast(null as variant),2)").remove(0);
-        let DataType::List(item) = &expression.data_type else {
+        let DataType::List(item) = &expression.value_type.data_type else {
             panic!("typed NULL List");
         };
         assert_eq!(item.data_type(), &DataType::LargeBinary);
@@ -1954,10 +1962,10 @@ mod scalar_domain_tests {
                     else {
                         unreachable!();
                     };
-                    result.nullable = !candidate.nullable;
+                    result.nullable = !candidate.value_type.nullable;
                 }
             }
-            *binding = selected.into();
+            *binding = crate::binding::SqlFunctionBinding::new(selected, binding.decimal_overflow_policy());
             assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
             let before = format!("{candidate:?}");
             let result = context
@@ -1981,7 +1989,7 @@ mod scalar_domain_tests {
             binding.function_id.as_str(),
             "builtin.scalar/__array_struct_subfield/v1"
         );
-        let DataType::List(item) = &expression.data_type else {
+        let DataType::List(item) = &expression.value_type.data_type else {
             panic!("List");
         };
         let DataType::Struct(fields) = item.data_type() else {
@@ -2013,9 +2021,9 @@ mod scalar_domain_tests {
             panic!("selected key value");
         };
         let key = &args[1];
-        assert_eq!(key.data_type, selected_key.data_type);
-        assert_eq!(key.nullable, selected_key.nullable);
-        let DataType::List(outer_item) = &key.data_type else {
+        assert_eq!(key.value_type.data_type, selected_key.data_type);
+        assert_eq!(key.value_type.nullable, selected_key.nullable);
+        let DataType::List(outer_item) = &key.value_type.data_type else {
             panic!("key List");
         };
         assert_eq!(outer_item.data_type(), &DataType::Utf8);
@@ -2032,7 +2040,7 @@ mod scalar_domain_tests {
             panic!("selected key coercion");
         };
         assert_eq!(target, &selected_key.data_type);
-        let DataType::List(inner_item) = &adapted_key.data_type else {
+        let DataType::List(inner_item) = &adapted_key.value_type.data_type else {
             panic!("adapted key List");
         };
         assert_eq!(
@@ -2062,11 +2070,11 @@ mod scalar_domain_tests {
         };
         assert_eq!(
             subfield_result.data_type,
-            original_transform(adapted_key).data_type
+            original_transform(adapted_key).value_type.data_type
         );
         assert_eq!(
             subfield_result.nullable,
-            original_transform(adapted_key).nullable
+            original_transform(adapted_key).value_type.nullable
         );
         let DataType::List(selected_item) = &subfield_result.data_type else {
             panic!("selected subfield List");
@@ -2078,7 +2086,7 @@ mod scalar_domain_tests {
         assert!(
             matches!(&subfield_args[1].kind, ExprKind::Literal(crate::analysis::LiteralValue::String(name)) if name == "key")
         );
-        let DataType::List(source_item) = &subfield_args[0].data_type else {
+        let DataType::List(source_item) = &subfield_args[0].value_type.data_type else {
             panic!("source List");
         };
         let DataType::Struct(source_fields) = source_item.data_type() else {
@@ -2196,6 +2204,8 @@ mod scalar_domain_tests {
                 SqlPlanningEnvironment::Distributed,
                 builtin_sql_function_catalog().snapshot(),
                 noop_constant_evaluator(),
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {
                     min: 1,
@@ -2209,7 +2219,7 @@ mod scalar_domain_tests {
                 DEFAULT_COMPLETION_LIMITS,
             );
             let SqlCompileProgress::Complete(completed) =
-                SqlCompiler::start(request.try_into_completion().unwrap()).unwrap()
+                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control()).unwrap()
             else {
                 panic!("source-free transform unexpectedly needs observations: {sql}");
             };

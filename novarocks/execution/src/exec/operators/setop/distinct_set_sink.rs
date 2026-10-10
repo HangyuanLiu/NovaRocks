@@ -28,6 +28,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -118,7 +120,7 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSinkOperator<S> {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished || chunk.is_empty() {
             return Ok(());
         }
@@ -133,11 +135,11 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSinkOperator<S> {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }

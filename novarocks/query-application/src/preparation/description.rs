@@ -79,16 +79,32 @@ impl OutputContract {
     /// A completed plan states what it delivers as part of being complete:
     /// the port names each field, and the name is the alias where the
     /// statement gave one, which is the name the client asked for.
+    /// Preserve the original SQL public declaration from its actual source
+    /// owner. Program sources retain the original exact physical port path.
+    pub fn from_completed_candidate(
+        kind: QueryExecutionKind,
+        candidate: &CompletedPhysicalPlanCandidate,
+    ) -> Result<Self, String> {
+        Self::from_result_port(kind, candidate.original_public_result_port())
+    }
+
     pub fn from_completed_plan(
         kind: QueryExecutionKind,
         plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Result<Self, String> {
+        Self::from_result_port(kind, plan.result_port())
+    }
+
+    fn from_result_port(
+        kind: QueryExecutionKind,
+        port: Option<&novarocks_physical_plan::ResultPort>,
     ) -> Result<Self, String> {
         // A write plan's root port carries the connector commit relation for
         // its internal finish. It is not a client row result.
         if kind == QueryExecutionKind::Write {
             return Ok(Self::CompletionOnly);
         }
-        match plan.result_port() {
+        match port {
             Some(result) if !result.fields.is_empty() => {
                 if result
                     .fields
@@ -310,7 +326,7 @@ impl FrozenExecutionDescription {
         validate_frozen_cost(cost)?;
         validate_effect_recovery(effect, recovery)?;
         let plan = candidate.plan().version();
-        let expected_output = OutputContract::from_completed_plan(kind, candidate.plan())?;
+        let expected_output = OutputContract::from_completed_candidate(kind, &candidate)?;
         let row_carrier = OutputContract::row_carrier_from_plan(candidate.plan())?;
         if matches!(output, OutputContract::Rows(_)) && row_carrier.is_none() {
             return Err("row output requires a frozen root result sink".into());
@@ -367,6 +383,55 @@ impl FrozenExecutionDescription {
             cost,
             resources,
         })
+    }
+
+    /// Check the exact intrinsic values before legacy native submission folds
+    /// them into one admitted runtime option. Every definition is observed,
+    /// including definitions that consume no parameter.
+    pub fn validate_legacy_intrinsic_allow_throw_exception(
+        &self,
+        actual: bool,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, SemanticParameterValue};
+
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let plan = self.candidate.plan();
+        let result = (|| -> Result<(), SqlCompileError> {
+            for fragment in plan.fragments().values() {
+                for (_, definition) in fragment.expressions().iter() {
+                    let checked = (|| -> Result<(), SqlCompileError> {
+                        for reference in definition.kind.intrinsic_parameter_references() {
+                            let value = plan.parameters().require(*reference).map_err(|error| {
+                                SqlCompileError::InvalidRequest(error.to_string())
+                            })?;
+                            if value != &SemanticParameterValue::AllowThrowException(actual) {
+                                return Err(SqlCompileError::InvalidRequest(
+                                    "legacy native runtime ALLOW_THROW_EXCEPTION differs from the exact intrinsic parameter".into(),
+                                ));
+                            }
+                        }
+                        Ok(())
+                    })();
+                    // The lookup/comparison is completed even on ordinary refusal.
+                    work.step()?;
+                    checked?;
+                }
+                work.step()?;
+            }
+            Ok(())
+        })();
+        if matches!(
+            &result,
+            Err(SqlCompileError::Cancelled
+                | SqlCompileError::DeadlineExceeded
+                | SqlCompileError::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish()?;
+        result
     }
 
     pub const fn kind(&self) -> QueryExecutionKind {
@@ -586,6 +651,234 @@ mod tests {
             .is_err()
         );
         assert!(freeze(candidate, Vec::new(), output).is_ok());
+    }
+
+    fn intrinsic_description(values: &[bool], nonconsumers: usize) -> FrozenExecutionDescription {
+        use arrow::datatypes::DataType;
+        use novarocks_physical_plan::{
+            ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, PipelineDopDomain,
+            PlanBuilder, PlanVersionId, ValueOrigin, ValueType,
+        };
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+            SemanticParameterValue, SemanticParameters,
+        };
+        let mut fragment = FragmentBuilder::new(FragmentId::new(7));
+        let node = fragment.reserve_node_id().unwrap();
+        let ty = ValueType::new(DataType::Int64, false);
+        let mut row = Vec::new();
+        for ordinal in 0..nonconsumers {
+            row.push(
+                fragment
+                    .add_expression(
+                        node,
+                        ty.clone(),
+                        ExprKind::Literal(LiteralValue::Int64(ordinal as i64)),
+                    )
+                    .unwrap(),
+            );
+        }
+        let ids = [0, u32::MAX];
+        assert!(values.len() <= ids.len());
+        for (ordinal, _) in values.iter().enumerate() {
+            let literal = fragment
+                .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(13)))
+                .unwrap();
+            row.push(
+                fragment
+                    .add_expression(
+                        node,
+                        ty.clone(),
+                        ExprKind::Cast {
+                            expr: literal,
+                            target: DataType::Int64,
+                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                            allow_throw_exception: SemanticParameterRef {
+                                id: SemanticParameterId::new(ids[ordinal]),
+                                expected_key: SemanticParameterKey::AllowThrowException,
+                            },
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        let output = (0..row.len())
+            .map(|ordinal| {
+                fragment
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::NodeOutput {
+                            node,
+                            output_ordinal: ordinal as u32,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        fragment
+            .add_values(
+                node,
+                Box::from([row.into_boxed_slice()]),
+                output.into_boxed_slice(),
+            )
+            .unwrap();
+        let fragment = fragment
+            .finish_definition(
+                node,
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let parameters =
+            SemanticParameters::try_new(values.iter().enumerate().map(|(ordinal, value)| {
+                (
+                    SemanticParameterId::new(ids[ordinal]),
+                    SemanticParameterValue::AllowThrowException(*value),
+                )
+            }))
+            .unwrap();
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap())
+            .with_semantic_parameters(parameters);
+        builder.add_fragment(fragment).unwrap();
+        let candidate = CompletedPhysicalPlanCandidate::for_program(
+            builder.finish().unwrap(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        FrozenExecutionDescription::for_completed_plan(
+            QueryExecutionKind::Write,
+            candidate,
+            Vec::new(),
+            OutputContract::CompletionOnly,
+            ExecutionEffect::None,
+            RecoveryMode::NoRecovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .unwrap()
+    }
+
+    struct IntrinsicTrace {
+        calls: std::sync::Mutex<Vec<(novarocks_type_contract::CompilePhase, u32)>>,
+        refuse: Option<(usize, novarocks_type_contract::CompileControlError)>,
+    }
+    impl novarocks_type_contract::PureCompileControl for IntrinsicTrace {
+        fn checkpoint(
+            &self,
+            phase: novarocks_type_contract::CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((phase, units));
+            match self.refuse {
+                Some((ordinal, cause)) if calls.len() == ordinal + 1 => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    fn intrinsic_trace(
+        refuse: Option<(usize, novarocks_type_contract::CompileControlError)>,
+    ) -> IntrinsicTrace {
+        IntrinsicTrace {
+            calls: std::sync::Mutex::new(Vec::new()),
+            refuse,
+        }
+    }
+
+    #[test]
+    fn legacy_intrinsic_gate_checks_sparse_scoped_values_against_actual_runtime_bool() {
+        use novarocks_sql::compiler::SqlCompileError;
+        for actual in [false, true] {
+            let description = intrinsic_description(&[actual, actual], 1);
+            assert!(
+                description
+                    .validate_legacy_intrinsic_allow_throw_exception(actual, &intrinsic_trace(None))
+                    .is_ok()
+            );
+            assert!(matches!(
+                description.validate_legacy_intrinsic_allow_throw_exception(
+                    !actual,
+                    &intrinsic_trace(None)
+                ),
+                Err(SqlCompileError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                intrinsic_description(&[false, true], 1)
+                    .validate_legacy_intrinsic_allow_throw_exception(
+                        actual,
+                        &intrinsic_trace(None)
+                    ),
+                Err(SqlCompileError::InvalidRequest(_))
+            ));
+            assert!(
+                intrinsic_description(&[], 3)
+                    .validate_legacy_intrinsic_allow_throw_exception(actual, &intrinsic_trace(None))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_intrinsic_gate_observes_nonconsumer_definitions_and_preserves_every_control_prefix() {
+        use novarocks_type_contract::CompileControlError;
+        let description = intrinsic_description(&[true], 320);
+        let trace = intrinsic_trace(None);
+        description
+            .validate_legacy_intrinsic_allow_throw_exception(true, &trace)
+            .unwrap();
+        let success = trace.calls.into_inner().unwrap();
+        assert_eq!(success.first().unwrap().1, 0);
+        assert!(success.iter().any(|(_, units)| *units == 256));
+        assert!(success.last().unwrap().1 > 0);
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for ordinal in 0..success.len() {
+                let trace = intrinsic_trace(Some((ordinal, cause)));
+                let error = description
+                    .validate_legacy_intrinsic_allow_throw_exception(true, &trace)
+                    .unwrap_err();
+                assert_eq!(error, novarocks_sql::compiler::SqlCompileError::from(cause));
+                assert_eq!(*trace.calls.lock().unwrap(), success[..=ordinal]);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_intrinsic_gate_ordinary_refusal_observes_tail_and_keeps_primary_control() {
+        use novarocks_type_contract::CompileControlError;
+        let description = intrinsic_description(&[true], 3);
+        let trace = intrinsic_trace(None);
+        assert!(matches!(
+            description.validate_legacy_intrinsic_allow_throw_exception(false, &trace),
+            Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(_))
+        ));
+        let refused = trace.calls.into_inner().unwrap();
+        assert_eq!(refused.len(), 2);
+        assert!(refused[1].1 > 0);
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for ordinal in 0..refused.len() {
+                let trace = intrinsic_trace(Some((ordinal, cause)));
+                assert_eq!(
+                    description
+                        .validate_legacy_intrinsic_allow_throw_exception(false, &trace)
+                        .unwrap_err(),
+                    novarocks_sql::compiler::SqlCompileError::from(cause)
+                );
+                assert_eq!(*trace.calls.lock().unwrap(), refused[..=ordinal]);
+            }
+        }
     }
 
     #[test]

@@ -41,34 +41,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use crate::connector::{CatalogHandle, ConnectorInstanceDescriptor};
-
-/// The exact provider generation a write value belongs to.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorWriteBinding {
-    descriptor: ConnectorInstanceDescriptor,
-    catalog_handle: CatalogHandle,
-}
-
-impl ConnectorWriteBinding {
-    pub const fn new(
-        descriptor: ConnectorInstanceDescriptor,
-        catalog_handle: CatalogHandle,
-    ) -> Self {
-        Self {
-            descriptor,
-            catalog_handle,
-        }
-    }
-
-    pub const fn descriptor(&self) -> &ConnectorInstanceDescriptor {
-        &self.descriptor
-    }
-
-    pub const fn catalog_handle(&self) -> &CatalogHandle {
-        &self.catalog_handle
-    }
-}
+pub use novarocks_connector_contract::ConnectorWriteBinding;
 
 #[derive(Clone)]
 pub(super) struct OpaqueWritePayload(Arc<dyn Any + Send + Sync>);

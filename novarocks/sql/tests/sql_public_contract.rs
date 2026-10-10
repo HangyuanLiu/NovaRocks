@@ -116,6 +116,19 @@ fn external_sql_contract_analyzes_and_optimizes_query() {
             functions,
             novarocks_sql::compiler::noop_constant_evaluator(),
             None,
+            novarocks_constant_contract::ConstantPolicy {
+                max_rows: 4096,
+                max_array_nodes: 4096,
+                max_retained_buffer_bytes: 1 << 20,
+                max_logical_elements: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 24,
+                max_library_validation_bytes: 1 << 24,
+            },
+            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         );
 

@@ -21,10 +21,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 use crate::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::column_id::{ColumnId, ColumnRefFactory};
+use crate::compiler::SqlCompileError;
 use crate::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::trace::RewriteTrace;
@@ -35,11 +37,13 @@ use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::optimizer_bridge::logical::{to_logical_plan, try_to_optimizer_expr};
 use crate::planner::payload::{AggregateCall, WindowExpr};
 
-pub(crate) struct ImvRewriteInput {
+pub(crate) struct ImvRewriteInput<'a> {
     pub plan: LogicalPlanNode,
     pub snapshot: Arc<SqlImvRewriteSnapshot>,
     pub disabled_rules: Vec<String>,
-    pub deadline: Option<Instant>,
+    pub decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub control: &'a dyn PureCompileControl,
     pub column_ref_factory: Rc<RefCell<ColumnRefFactory>>,
     #[cfg(not(test))]
     pub function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -52,24 +56,39 @@ pub(crate) struct ImvRewriteOutcome {
     pub annotation: ImvPlanAnnotation,
 }
 
-pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcome, String> {
+pub(crate) fn run_imv_rewrite(
+    input: ImvRewriteInput<'_>,
+) -> Result<ImvRewriteOutcome, SqlCompileError> {
     let ImvRewriteInput {
         mut plan,
         snapshot,
         disabled_rules,
-        deadline,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
         column_ref_factory,
         #[cfg(not(test))]
         function_catalog,
     } = input;
 
-    bind_definition_occurrences(&mut plan, &snapshot)?;
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+        .map_err(crate::compiler::SqlCompileError::from)?;
+    // These boundary helpers still own opaque internal traversals. The stage
+    // steps below account completed calls; they do not establish a bound on
+    // unobserved work inside those helpers.
+    bind_definition_occurrences(&mut plan, &snapshot).map_err(SqlCompileError::Compilation)?;
+    work.step()
+        .map_err(crate::compiler::SqlCompileError::from)?;
     reserve_existing_plan_column_ids(&column_ref_factory, &plan);
+    work.step()
+        .map_err(crate::compiler::SqlCompileError::from)?;
     let mut ctx_rw = RewriteContext::for_mv_refresh_with_settings(
         crate::optimizer::options::SessionOptimizerSettings {
             disabled_rules,
             ..Default::default()
         },
+        decimal_overflow_policy,
+        control,
     );
     ctx_rw.set_column_ref_factory(Rc::clone(&column_ref_factory));
     #[cfg(test)]
@@ -79,16 +98,17 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         snapshot,
         annotation: ImvPlanAnnotation::default(),
     });
-    if let Some(deadline) = deadline {
-        ctx_rw.set_deadline(deadline);
-    }
 
     // Boundary materialization for ImvRewriteInput: engine-side refresh code
     // hands this entrypoint a LogicalPlanNode, while the optimizer rewrite
     // pipeline operates on OptExpr. This is not a production rewrite
     // round-trip inside the optimizer.
-    let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
-    let opt_in = try_to_optimizer_expr(&plan, &mut scalars.borrow_mut())?;
+    let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::with_constant_policy(
+        constant_policy,
+    )));
+    let opt_in = try_to_optimizer_expr(&plan, &mut scalars.borrow_mut(), control)?;
+    work.step()
+        .map_err(crate::compiler::SqlCompileError::from)?;
     ctx_rw.set_scalar_arena(std::rc::Rc::clone(&scalars));
 
     let pipeline = build_imv_pipeline();
@@ -104,6 +124,8 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         .expect("ImvExtension installed before rewrite")
         .clone();
 
+    work.finish()
+        .map_err(crate::compiler::SqlCompileError::from)?;
     Ok(ImvRewriteOutcome {
         plan: plan_out,
         trace: ctx_rw.trace().clone(),
@@ -232,8 +254,8 @@ pub(crate) fn normalize_imv_rewrite_root_project(plan: LogicalPlanNode) -> Logic
             Some(OutputColumn {
                 column_id: *column_id,
                 name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+                value_type: item.expr.value_type.clone(),
+
                 is_internal: false,
             })
         })
@@ -284,8 +306,8 @@ fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
                 collect_expr_column_ids(predicate, max_id);
             }
             for variant in &scan.variant_columns {
-                collect_column_id(variant.source_column_id, max_id);
-                collect_column_id(variant.synthetic_column_id, max_id);
+                collect_column_id(variant.source_column_id(), max_id);
+                collect_column_id(variant.synthetic_column_id(), max_id);
             }
         }
         LogicalPlanKind::Filter(filter) => collect_expr_column_ids(&filter.predicate, max_id),
@@ -412,10 +434,10 @@ fn collect_output_column(column: &OutputColumn, max_id: &mut u32) {
 
 fn collect_aggregate_call_column_ids(call: &AggregateCall, max_id: &mut u32) {
     collect_column_id(call.output_column_id, max_id);
-    for arg in &call.args {
+    for arg in call.source.arguments() {
         collect_expr_column_ids(arg, max_id);
     }
-    collect_sort_items(&call.order_by, max_id);
+    collect_sort_items(call.source.order_by(), max_id);
 }
 
 fn collect_window_expr_column_ids(window: &WindowExpr, max_id: &mut u32) {
@@ -509,6 +531,7 @@ fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
         }
         ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => {}
     }
 }
@@ -653,8 +676,7 @@ pub(crate) mod tests {
                 qualifier: None,
                 column: column.name.clone(),
             },
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            value_type: column.value_type.clone(),
         }
     }
 
@@ -683,8 +705,8 @@ pub(crate) mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -724,12 +746,14 @@ pub(crate) mod tests {
                 group_by: vec![normalization_column_ref(&g1), normalization_column_ref(&g2)],
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
-                    args: Vec::new(),
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: sum_output.column_id,
-                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        Vec::new(),
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("count", &[], false),
+                    ),
                 }],
                 output_columns: vec![g1, g2, sum_output],
                 already_pushed: false,
@@ -765,12 +789,14 @@ pub(crate) mod tests {
                 group_by: vec![normalization_column_ref(&group_output)],
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
-                    args: Vec::new(),
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: aggregate_output.column_id,
-                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        Vec::new(),
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("count", &[], false),
+                    ),
                 }],
                 output_columns: vec![group_output.clone(), aggregate_output.clone()],
                 already_pushed: false,
@@ -814,8 +840,12 @@ pub(crate) mod tests {
         );
 
         let mut arena = ScalarArena::new();
-        try_to_optimizer_expr(&normalized, &mut arena)
-            .expect("normalized aggregate must satisfy optimizer bridge contract");
+        try_to_optimizer_expr(
+            &normalized,
+            &mut arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("normalized aggregate must satisfy optimizer bridge contract");
     }
 
     #[test]
@@ -909,8 +939,11 @@ pub(crate) mod tests {
                 columns: vec![OutputColumn {
                     column_id: ColumnId(column_id),
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 predicates: Vec::new(),
@@ -934,8 +967,11 @@ pub(crate) mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId(1),
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -966,14 +1002,18 @@ pub(crate) mod tests {
                             op: BinOp::Ge,
                             right: Box::new(TypedExpr {
                                 kind: ExprKind::Literal(LiteralValue::Int(0)),
-                                data_type: DataType::Int32,
-                                nullable: false,
+                                value_type: novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Int32,
+                                    false,
+                                ),
                             }),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
                     },
                 }),
                 vec![iceberg_scan_plan_with_column_id(first_id)],
@@ -994,8 +1034,7 @@ pub(crate) mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         }
     }
 
@@ -1146,8 +1185,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
             snapshot: repeated_source_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .unwrap();
@@ -1211,8 +1253,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: Arc::new(snapshot),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .unwrap();
@@ -1366,15 +1411,21 @@ pub(crate) mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(2),
                         name: "v".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1391,30 +1442,34 @@ pub(crate) mod tests {
                 group_by: vec![column_ref(1, "k", DataType::Int64, false)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![column_ref(2, "v", DataType::Int64, true)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId(3),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![column_ref(2, "v", DataType::Int64, true)],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(3),
                         name: "s".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1466,15 +1521,21 @@ pub(crate) mod tests {
                     OutputColumn {
                         column_id: ColumnId(first_id),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(first_id + 1),
                         name: "v".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1517,8 +1578,7 @@ pub(crate) mod tests {
                 qualifier: None,
                 column: column.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         }
     }
 
@@ -1534,30 +1594,34 @@ pub(crate) mod tests {
                 group_by: vec![column_expr(1, "k", false)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![column_expr(11, "v", true)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId(12),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![column_expr(11, "v", true)],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(12),
                         name: "s".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1574,8 +1638,10 @@ pub(crate) mod tests {
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
                     }),
                 }),
                 vec![left, right],
@@ -1599,8 +1665,10 @@ pub(crate) mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -1648,8 +1716,10 @@ pub(crate) mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -1663,14 +1733,18 @@ pub(crate) mod tests {
                         op: BinOp::Gt,
                         right: Box::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         }),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![join],
@@ -1696,14 +1770,18 @@ pub(crate) mod tests {
                         op: BinOp::Gt,
                         right: Box::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         }),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![left_scan],
@@ -1722,8 +1800,10 @@ pub(crate) mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -1779,7 +1859,7 @@ pub(crate) mod tests {
             &self,
             _expr: crate::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Unchanged)
         }
     }
@@ -1791,8 +1871,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: std::rc::Rc::clone(&factory),
         })
         .expect("plain Iceberg scan should pass through IMV rewrite");
@@ -1809,8 +1892,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .unwrap();
@@ -1833,8 +1919,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("logical scan sidecars should not be stage validation errors");
@@ -1909,7 +1998,7 @@ pub(crate) mod tests {
             &self,
             _expr: crate::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Unchanged)
         }
     }
@@ -1954,8 +2043,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("unknown disabled rule must not break the pipeline");
@@ -2007,8 +2099,10 @@ pub(crate) mod tests {
             &self,
             _expr: crate::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
-            Err("synthetic failure".to_string())
+        ) -> Result<RewriteResult, SqlCompileError> {
+            Err(SqlCompileError::Compilation(
+                "synthetic failure".to_string(),
+            ))
         }
     }
 
@@ -2035,7 +2129,10 @@ pub(crate) mod tests {
         let plan = empty_values_plan();
         let opt_in = plan_to_opt_expr_with_arena(&plan, &mut ctx_rw);
         let err = pipeline.rewrite(opt_in, &mut ctx_rw).unwrap_err();
-        assert_eq!(err, "synthetic failure");
+        assert_eq!(
+            err,
+            SqlCompileError::Compilation("synthetic failure".to_string())
+        );
 
         // Original plan binding is intact (Rust value semantics guarantee
         // this; the assert documents the contract for future readers).
@@ -2059,12 +2156,18 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect_err("PR-β pipeline rejects plain plans");
-        assert!(err.starts_with("IVM rewrite failed to resolve incremental markers:"));
+        assert!(
+            err.to_string()
+                .starts_with("IVM rewrite failed to resolve incremental markers:")
+        );
     }
 
     // ── PR-β tests (Task 7) ─────────────────────────────────────────────────
@@ -2078,13 +2181,17 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect_err("PR-β pipeline must Reject on plain plan");
         assert!(
-            err.starts_with("IVM rewrite failed to resolve incremental markers:"),
+            err.to_string()
+                .starts_with("IVM rewrite failed to resolve incremental markers:"),
             "unexpected error: {err}"
         );
     }
@@ -2097,8 +2204,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("disabled wrap rule must let the pipeline succeed");
@@ -2112,8 +2222,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("pipeline must succeed when wrap rule is disabled");
@@ -2151,11 +2264,14 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
             ],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("Delta(Scan) must bind successfully");
@@ -2194,8 +2310,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("Version(Scan, From) must bind and pass validation");
@@ -2230,8 +2349,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("Version(Scan, To) must bind and pass validation");
@@ -2258,11 +2380,14 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
             ],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("pipeline must succeed");
@@ -2275,8 +2400,11 @@ pub(crate) mod tests {
             .iter()
             .find(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op"))
             .expect("action column must be present");
-        assert_eq!(action.data_type, arrow::datatypes::DataType::Int8);
-        assert!(!action.nullable);
+        assert_eq!(
+            action.value_type.data_type,
+            arrow::datatypes::DataType::Int8
+        );
+        assert!(!action.value_type.nullable);
     }
 
     #[test]
@@ -2294,8 +2422,10 @@ pub(crate) mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: ColumnId(1),
@@ -2309,8 +2439,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("Project over delta scan must rewrite and pass validation");
@@ -2366,8 +2499,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(100),
         })
         .expect("projection/filter rewrite must carry target locator metadata");
@@ -2418,8 +2554,10 @@ pub(crate) mod tests {
                             kind: ExprKind::Literal(LiteralValue::String(
                                 "not-target-file".to_string(),
                             )),
-                            data_type: DataType::Utf8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Utf8,
+                                false,
+                            ),
                         },
                         output_name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
                         output_column_id: ColumnId(2),
@@ -2427,8 +2565,10 @@ pub(crate) mod tests {
                     ProjectItem {
                         expr: TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(7)),
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: crate::common::ICEBERG_ROW_POS_COL.to_string(),
                         output_column_id: ColumnId(3),
@@ -2443,14 +2583,18 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(100),
         })
         .expect_err("preexisting _file/_pos names must not bypass target locator injection");
 
         assert!(
-            err.contains("reserved target locator metadata column"),
+            err.to_string()
+                .contains("reserved target locator metadata column"),
             "{err}"
         );
     }
@@ -2460,8 +2604,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
             snapshot: repeated_source_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("top-level projection/filter UNION ALL must rewrite through the full IMV pipeline");
@@ -2536,8 +2683,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: partitioned_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("aggregate IMV pipeline must rewrite and validate");
@@ -2569,8 +2719,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("aggregate IMV pipeline must rewrite and validate");
@@ -2601,8 +2754,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: ctx,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("NotDerivable must not fail the rewrite");
@@ -2636,8 +2792,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("projection/filter rewrite must succeed");
@@ -2649,8 +2808,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("aggregate IMV pipeline must rewrite and validate");
@@ -2687,7 +2849,7 @@ pub(crate) mod tests {
             .find(|column| ImvActionColumn::matches(column))
             .expect("delta scan must carry action column")
             .column_id;
-        let signed_input = &delta_aggregate.aggregates[0].args[0];
+        let signed_input = &delta_aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
             panic!("expected signed state named_struct input");
         };
@@ -2705,8 +2867,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
@@ -2747,8 +2912,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
@@ -2762,8 +2930,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(30),
         })
         .expect("join projection IMV pipeline must rewrite and validate");
@@ -2835,8 +3006,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(30),
         })
         .expect("join projection IMV pipeline must rewrite and validate");
@@ -2872,8 +3046,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: Rc::clone(&factory_cell),
         })
         .expect("join projection IMV pipeline must rewrite and validate");
@@ -2899,7 +3076,9 @@ pub(crate) mod tests {
                 202,
                 203,
                 204,
-            )
+             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
         }
         .expect("join projection coalesce plan");
 
@@ -2916,8 +3095,10 @@ pub(crate) mod tests {
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection IMV pipeline must rewrite and validate");
@@ -2943,7 +3124,9 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                    )
+                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -2965,8 +3148,10 @@ pub(crate) mod tests {
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_filter_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection/filter IMV pipeline must rewrite and validate");
@@ -2992,7 +3177,9 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                    )
+                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection/filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3018,8 +3205,10 @@ pub(crate) mod tests {
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_left_filter_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection side-filter IMV pipeline must rewrite and validate");
@@ -3045,7 +3234,9 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                    )
+                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join side-filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3101,8 +3292,11 @@ pub(crate) mod tests {
             let outcome = run_imv_rewrite(ImvRewriteInput {
                 plan,
                 snapshot: Arc::clone(&snapshot),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                deadline: None,
+
+                constant_policy: crate::constant::test_constant_policy(),
+                control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                 column_ref_factory: Rc::clone(&factory_cell),
                 #[cfg(not(test))]
                 function_catalog: crate::functions::test_function_catalog_snapshot(),
@@ -3128,7 +3322,9 @@ pub(crate) mod tests {
                     204,
                     #[cfg(not(test))]
                     crate::functions::builtin_sql_function_catalog(),
-                )
+                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
             }
             .expect("join projection coalesce plan");
             optimize_logical_for_test(coalesce)
@@ -3183,8 +3379,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: ctx,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("aggregate change stream should not require join refresh descriptor");
@@ -3207,8 +3406,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: ctx,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("zero-key aggregate join uses aggregate state merge");
@@ -3281,8 +3483,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
-            deadline: None,
+
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
@@ -3565,6 +3770,7 @@ pub(crate) mod tests {
             }
             ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => {}
         }
     }
@@ -3759,7 +3965,7 @@ pub(crate) mod tests {
         reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
     )]
     fn signed_action_column_id(aggregate: &LogicalAggregateNode) -> ColumnId {
-        let signed_input = &aggregate.aggregates[0].args[0];
+        let signed_input = &aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
             panic!("expected signed state named_struct input");
         };
@@ -3781,5 +3987,40 @@ pub(crate) mod tests {
             panic!("expected Project(Scan)");
         };
         scan
+    }
+
+    #[test]
+    fn imv_rewrite_observes_all_request_stops_before_plain_plan_validation() {
+        struct Stop(novarocks_type_contract::CompileControlError);
+        impl novarocks_type_contract::PureCompileControl for Stop {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                units: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                assert_eq!(units, 0);
+                Err(self.0)
+            }
+        }
+        use novarocks_type_contract::CompileControlError as Error;
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::ResourceExhausted,
+        ] {
+            let control = Stop(error);
+            let failure = run_imv_rewrite(ImvRewriteInput {
+                plan: empty_values_plan(),
+                snapshot: empty_mv_ctx(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                disabled_rules: vec![],
+
+                constant_policy: crate::constant::test_constant_policy(),
+                control: &control,
+                column_ref_factory: test_column_ref_factory(),
+            })
+            .unwrap_err();
+            assert_eq!(failure, crate::compiler::SqlCompileError::from(error));
+        }
     }
 }

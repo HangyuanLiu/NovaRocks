@@ -1795,6 +1795,7 @@ mod tests {
             error
                 .error()
                 .expect("runtime error")
+                .detail()
                 .contains("injected append failure")
         );
     }
@@ -1963,6 +1964,7 @@ mod tests {
             error
                 .error()
                 .expect("actor panic must be recorded")
+                .detail()
                 .contains("append connector writer batch panicked: injected provider panic")
         );
     }
@@ -2030,6 +2032,7 @@ mod tests {
             error
                 .error()
                 .expect("finish panic must be recorded")
+                .detail()
                 .contains("finish connector writer panicked: injected finish panic")
         );
     }
@@ -2096,6 +2099,7 @@ mod tests {
             error
                 .error()
                 .expect("abort panic must be recorded")
+                .detail()
                 .contains("abort connector writer panicked: injected abort panic")
         );
     }
@@ -2131,6 +2135,7 @@ mod tests {
             error
                 .error()
                 .expect("abort failure")
+                .detail()
                 .contains("injected abort failure")
         );
     }
@@ -2196,6 +2201,7 @@ mod tests {
             error
                 .error()
                 .expect("abort timeout must fail the writer")
+                .detail()
                 .contains("exceeded the bounded wait of 20 ms")
         );
     }

@@ -153,6 +153,14 @@ pub enum MaintenanceAdmission {
     Admitted,
 }
 
+/// Actual action classification and optional compilation cause; policy uses `kind` only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaintenanceActionFailure {
+    pub action: MaintenanceActionKind,
+    pub kind: MvBackgroundEngineErrorKind,
+    pub compile_control: Option<novarocks_type_contract::CompileControlError>,
+}
+
 /// Result of a policy evaluation plus action evidence. A no-op is a completed
 /// policy pass, not a request to retry absent actions.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,7 +170,7 @@ pub struct MaintenanceExecutionReport {
     /// The exact OPTIMIZE job whose terminal success was observed, if any.
     pub optimize_finished_handle: Option<JobHandle>,
     pub already_active: Vec<MaintenanceActionKind>,
-    pub failures: Vec<(MaintenanceActionKind, MvBackgroundEngineErrorKind)>,
+    pub failures: Vec<MaintenanceActionFailure>,
 }
 
 impl MaintenanceExecutionReport {
@@ -217,6 +225,7 @@ pub enum MvBackgroundEngineErrorKind {
 pub struct MvBackgroundEngineError {
     kind: MvBackgroundEngineErrorKind,
     message: String,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl MvBackgroundEngineError {
@@ -224,7 +233,21 @@ impl MvBackgroundEngineError {
         Self {
             kind,
             message: message.into(),
+            compile_control: None,
         }
+    }
+
+    pub fn with_compile_control(
+        mut self,
+        control: Option<novarocks_type_contract::CompileControlError>,
+    ) -> Self {
+        self.compile_control = control;
+        self
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub const fn kind(&self) -> MvBackgroundEngineErrorKind {
@@ -332,8 +355,8 @@ impl MaintenancePolicyState {
         for kind in &report.completed {
             self.record_success(attempt.mv_id, *kind, now_ms);
         }
-        for (kind, error) in &report.failures {
-            self.record_failure(attempt.mv_id, *kind, *error, now_ms);
+        for failure in &report.failures {
+            self.record_failure(attempt.mv_id, failure.action, failure.kind, now_ms);
         }
         // A failed, cancelled, or already-active pass has not consumed the
         // observed snapshot: later actions must remain eligible on reentry.
@@ -541,9 +564,11 @@ impl MaintenanceCoordinator {
                 Ok(outcome) if expected_outcome(kind, &outcome) => report.completed.push(kind),
                 Ok(outcome) => {
                     tracing::error!(action = ?kind, ?outcome, "automatic maintenance returned an incompatible durable outcome");
-                    report
-                        .failures
-                        .push((kind, MvBackgroundEngineErrorKind::InvariantViolation));
+                    report.failures.push(MaintenanceActionFailure {
+                        action: kind,
+                        kind: MvBackgroundEngineErrorKind::InvariantViolation,
+                        compile_control: None,
+                    });
                     break;
                 }
                 Err(error) => {
@@ -554,7 +579,11 @@ impl MaintenanceCoordinator {
                         error = %error,
                         "automatic MV maintenance action failed"
                     );
-                    report.failures.push((kind, error.kind()));
+                    report.failures.push(MaintenanceActionFailure {
+                        action: kind,
+                        kind: error.kind(),
+                        compile_control: error.compile_control_error(),
+                    });
                     break;
                 }
             }
@@ -932,6 +961,7 @@ mod tests {
 
     struct Runner {
         expire_error: Option<MvBackgroundEngineErrorKind>,
+        compile_control: Option<novarocks_type_contract::CompileControlError>,
         optimize_outcome: OptimizeDurableOutcome,
         calls: Vec<MaintenanceActionKind>,
     }
@@ -940,6 +970,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 expire_error: None,
+                compile_control: None,
                 optimize_outcome: OptimizeDurableOutcome::Finished {
                     handle: JobHandle::new(7),
                 },
@@ -958,7 +989,8 @@ mod tests {
                 return Err(MvBackgroundEngineError::new(
                     kind,
                     "maintenance operation did not complete",
-                ));
+                )
+                .with_compile_control(self.compile_control));
             }
             Ok(MaintenanceActionOutcome::ExpireSnapshots {
                 deleted_data_files_count: None,
@@ -1070,7 +1102,11 @@ mod tests {
             assert_eq!(runner.calls, vec![MaintenanceActionKind::Expire]);
             assert_eq!(
                 report.failures,
-                vec![(MaintenanceActionKind::Expire, error)]
+                vec![super::MaintenanceActionFailure {
+                    action: MaintenanceActionKind::Expire,
+                    kind: error,
+                    compile_control: None
+                }]
             );
             assert!(report.completed.is_empty());
             assert!(report.optimize_finished_handle.is_none());
@@ -1139,10 +1175,11 @@ mod tests {
         );
         assert_eq!(
             report.failures,
-            vec![(
-                MaintenanceActionKind::Expire,
-                MvBackgroundEngineErrorKind::TransientUnavailable,
-            )]
+            vec![super::MaintenanceActionFailure {
+                action: MaintenanceActionKind::Expire,
+                kind: MvBackgroundEngineErrorKind::TransientUnavailable,
+                compile_control: None
+            }]
         );
 
         let second = coordinator
@@ -1304,5 +1341,54 @@ mod tests {
         );
         coordinator.cancel_attempt(first);
         assert_eq!(coordinator.active_count(), 0);
+    }
+    #[test]
+    fn actual_maintenance_report_keeps_compile_cause_without_changing_policy() {
+        use novarocks_type_contract::CompileControlError as C;
+        for control in [C::Cancelled, C::DeadlineExceeded, C::ResourceExhausted] {
+            for kind in [
+                MvBackgroundEngineErrorKind::TransientUnavailable,
+                MvBackgroundEngineErrorKind::ShutdownCancelled,
+                MvBackgroundEngineErrorKind::TerminalFailure,
+            ] {
+                let mut baseline =
+                    MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+                let mut typed =
+                    MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+                let baseline_attempt = baseline
+                    .try_begin(1, target("mv"), &policy_facts(), NOW)
+                    .unwrap();
+                let typed_attempt = typed
+                    .try_begin(1, target("mv"), &policy_facts(), NOW)
+                    .unwrap();
+                let baseline_report = run_attempt(
+                    &mut baseline,
+                    baseline_attempt,
+                    &mut Runner {
+                        expire_error: Some(kind),
+                        ..Runner::default()
+                    },
+                    NOW,
+                );
+                let mut runner = Runner {
+                    expire_error: Some(kind),
+                    compile_control: Some(control),
+                    ..Runner::default()
+                };
+                let report = run_attempt(&mut typed, typed_attempt, &mut runner, NOW);
+                assert_eq!(runner.calls, [MaintenanceActionKind::Expire]);
+                assert_eq!(report.failures.len(), 1);
+                assert_eq!(report.failures[0].kind, baseline_report.failures[0].kind);
+                assert_eq!(report.failures[0].compile_control, Some(control));
+                assert_eq!(baseline_report.failures[0].compile_control, None);
+                let baseline_next = baseline
+                    .try_begin(1, target("mv"), &policy_facts(), NOW + 1)
+                    .unwrap();
+                let typed_next = typed
+                    .try_begin(1, target("mv"), &policy_facts(), NOW + 1)
+                    .unwrap();
+                assert_eq!(typed_next.evaluation(), baseline_next.evaluation());
+            }
+        }
     }
 }

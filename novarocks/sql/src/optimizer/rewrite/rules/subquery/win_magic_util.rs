@@ -235,8 +235,9 @@ pub(super) fn expr_phys_eq(
             },
         ) => ga == gb && expr_phys_eq(arena, *ea, *eb, map),
         (ScalarNode::Literal(la), ScalarNode::Literal(lb)) => la == lb,
-        // Other / mixed kinds: conservative debug-structural equality.
-        _ => arena.node(a) == arena.node(b),
+        // Same-arena IDs retain the canonical observed structural/value identity.
+        // CV backing or ordinal is never an equality shortcut.
+        _ => a == b,
     }
 }
 
@@ -286,8 +287,11 @@ mod tests {
                     .map(|(cid, name)| OutputColumn {
                         column_id: cid,
                         name: name.to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     })
                     .collect(),
@@ -308,16 +312,14 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -329,8 +331,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -354,8 +355,18 @@ mod tests {
         map: &HashMap<ColumnId, (TableIdentity, String)>,
     ) -> bool {
         let mut arena = ScalarArena::new();
-        let a = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, a);
-        let b = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, b);
+        let a = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            a,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let b = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            b,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         super::expr_phys_eq(&arena, a, b, map)
     }
 
@@ -580,5 +591,41 @@ mod tests {
             !expr_phys_eq(&a_lt_b, &b_lt_a, &map),
             "Lt must NOT be commutative: a < b should not match b < a"
         );
+    }
+    #[test]
+    fn materialized_constants_match_only_the_same_observed_arena_identity() {
+        use novarocks_functions::ConstantValue;
+        use novarocks_type_contract::{CompilePhase, FunctionValueType};
+        use std::sync::Arc;
+        let ty = FunctionValueType::new(DataType::Int64, false);
+        let control = crate::optimizer::test_optimizer_control();
+        let value = |fact: &str| {
+            ConstantValue::from_i64(
+                Arc::new(
+                    ty.try_to_field("literal")
+                        .unwrap()
+                        .with_metadata([("provider.fact".to_owned(), fact.to_owned())].into()),
+                ),
+                ty.clone(),
+                7,
+                crate::constant::test_constant_policy(),
+                CompilePhase::Validate,
+                control,
+            )
+            .unwrap()
+        };
+        let mut arena = ScalarArena::new();
+        let a = arena
+            .intern_observed(ScalarNode::Constant(value("a")), ty.clone(), control)
+            .unwrap();
+        let same = arena
+            .intern_observed(ScalarNode::Constant(value("a")), ty.clone(), control)
+            .unwrap();
+        let other = arena
+            .intern_observed(ScalarNode::Constant(value("b")), ty, control)
+            .unwrap();
+        assert_eq!(a, same);
+        assert!(super::expr_phys_eq(&arena, a, same, &HashMap::new()));
+        assert!(!super::expr_phys_eq(&arena, a, other, &HashMap::new()));
     }
 }

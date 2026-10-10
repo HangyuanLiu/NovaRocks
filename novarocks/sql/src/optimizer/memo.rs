@@ -91,14 +91,19 @@ pub(crate) struct Memo {
 }
 
 impl Memo {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_scalar_arena(ScalarArena::new())
+    }
+
+    pub(crate) fn with_scalar_arena(scalars: ScalarArena) -> Self {
         Self {
             groups: Vec::new(),
             cte_produce_groups: HashMap::new(),
             factory: ColumnRefFactory::new(),
             join_group_index: HashMap::new(),
             reorder_owned_groups: HashSet::new(),
-            scalars: ScalarArena::new(),
+            scalars,
             function_catalog: None,
         }
     }

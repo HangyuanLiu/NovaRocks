@@ -133,7 +133,7 @@ fn prove_topn_placement(
         return None;
     }
     let order_expr = &topn.items[0].expr;
-    if !is_supported_topn_key_type(&order_expr.data_type) {
+    if !is_supported_topn_key_type(&order_expr.value_type.data_type) {
         return None;
     }
     let direction = if topn.items[0].asc {
@@ -255,8 +255,8 @@ fn trace_exact_source_probes(
             let mut probes = Vec::new();
             for (child_index, child) in node.children.iter().enumerate() {
                 let branch_column = set_op.child_output_columns[child_index].get(target_index)?;
-                if branch_column.data_type != probe_expr.data_type
-                    || branch_column.nullable != probe_expr.nullable
+                if branch_column.value_type.data_type != probe_expr.value_type.data_type
+                    || branch_column.value_type.nullable != probe_expr.value_type.nullable
                 {
                     return None;
                 }
@@ -266,8 +266,7 @@ fn trace_exact_source_probes(
                         qualifier: None,
                         column: branch_column.name.clone(),
                     },
-                    data_type: branch_column.data_type.clone(),
-                    nullable: branch_column.nullable,
+                    value_type: branch_column.value_type.clone(),
                 };
                 let branch_expr = bind_exact_column_ref(&branch_expr, &child.output_columns)?;
                 node_path.push(child_index);
@@ -296,8 +295,8 @@ fn bind_exact_column_ref(expr: &TypedExpr, columns: &[OutputColumn]) -> Option<T
 
 fn is_exact_column_ref(expr: &TypedExpr, column: &OutputColumn) -> bool {
     matches!(&expr.kind, ExprKind::ColumnRef { column_id, .. } if *column_id == column.column_id)
-        && expr.data_type == column.data_type
-        && expr.nullable == column.nullable
+        && expr.value_type.data_type == column.value_type.data_type
+        && expr.value_type.nullable == column.value_type.nullable
 }
 
 fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
@@ -312,8 +311,8 @@ fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
             },
         ) => {
             left_id == right_id
-                && left.data_type == right.data_type
-                && left.nullable == right.nullable
+                && left.value_type.data_type == right.value_type.data_type
+                && left.value_type.nullable == right.value_type.nullable
         }
         _ => false,
     }
@@ -321,8 +320,8 @@ fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
 
 fn is_same_column(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
-        && left.data_type == right.data_type
-        && left.nullable == right.nullable
+        && left.value_type.data_type == right.value_type.data_type
+        && left.value_type.nullable == right.value_type.nullable
 }
 
 fn is_supported_topn_key_type(data_type: &DataType) -> bool {
@@ -589,8 +588,10 @@ mod tests {
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     }
                 }),
             ),
@@ -620,11 +621,13 @@ mod tests {
             ),
             (
                 "type drift",
-                Box::new(|plan| aggregate_mut(plan).output_columns[0].data_type = DataType::Int32),
+                Box::new(|plan| {
+                    aggregate_mut(plan).output_columns[0].value_type.data_type = DataType::Int32
+                }),
             ),
             (
                 "nullability drift",
-                Box::new(|plan| aggregate_mut(plan).output_columns[0].nullable = true),
+                Box::new(|plan| aggregate_mut(plan).output_columns[0].value_type.nullable = true),
             ),
             (
                 "window boundary",
@@ -895,8 +898,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         }
     }
 
@@ -904,8 +906,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -928,7 +930,7 @@ mod tests {
                         name: "t".to_string(),
                         columns: vec![ColumnDef {
                             name: name.to_string(),
-                            data_type: output.data_type.clone(),
+                            data_type: output.value_type.data_type.clone(),
                             nullable,
                             write_default: None,
                             logical_type: None,
@@ -973,8 +975,10 @@ mod tests {
             kind: PhysicalPlanKind::Values(PlanValuesNode {
                 rows: vec![vec![TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }]],
                 columns: vec![key.clone()],
             }),
@@ -1002,7 +1006,12 @@ mod tests {
         PhysicalPlanNode {
             kind: PhysicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
-                    expr: column(1, &key.name, key.data_type.clone(), key.nullable),
+                    expr: column(
+                        1,
+                        &key.name,
+                        key.value_type.data_type.clone(),
+                        key.value_type.nullable,
+                    ),
                     output_name: key.name.clone(),
                     output_column_id: key.column_id,
                 }],
@@ -1019,12 +1028,19 @@ mod tests {
         let key = child.output_columns[0].clone();
         let expr = TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(column(1, &key.name, key.data_type.clone(), key.nullable)),
+                expr: Box::new(column(
+                    1,
+                    &key.name,
+                    key.value_type.data_type.clone(),
+                    key.value_type.nullable,
+                )),
                 target: DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Int32,
-            nullable: key.nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                key.value_type.nullable,
+            ),
         };
         PhysicalPlanNode {
             kind: PhysicalPlanKind::Project(PlanProjectNode {
@@ -1035,7 +1051,12 @@ mod tests {
                 }],
                 output_qualifier: None,
             }),
-            output_columns: vec![output(1, &key.name, DataType::Int32, key.nullable)],
+            output_columns: vec![output(
+                1,
+                &key.name,
+                DataType::Int32,
+                key.value_type.nullable,
+            )],
             children: vec![child],
             stats: stats(),
             probe_runtime_filters: Vec::new(),
@@ -1175,12 +1196,14 @@ mod tests {
     }
 
     fn replace_key_type(plan: &mut PhysicalPlanNode, data_type: DataType) {
-        topn_mut(plan).items[0].expr.data_type = data_type.clone();
+        topn_mut(plan).items[0].expr.value_type.data_type = data_type.clone();
         let aggregate = aggregate_mut(plan);
-        aggregate.group_by[0].data_type = data_type.clone();
-        aggregate.output_columns[0].data_type = data_type.clone();
-        aggregate.output_layout.group_key_columns[0].data_type = data_type.clone();
-        plan.output_columns[0].data_type = data_type;
+        aggregate.group_by[0].value_type.data_type = data_type.clone();
+        aggregate.output_columns[0].value_type.data_type = data_type.clone();
+        aggregate.output_layout.group_key_columns[0]
+            .value_type
+            .data_type = data_type.clone();
+        plan.output_columns[0].value_type.data_type = data_type;
     }
 
     fn stats() -> PhysicalPlanStats {

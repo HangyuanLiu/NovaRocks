@@ -15,3 +15,8 @@ novarocks-result-contract.workspace = true
 arrow-schema.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-type-contract.workspace = true
+novarocks-function-contract.workspace = true
+novarocks-constant-contract.workspace = true
+
+[dev-dependencies]
+arrow-array.workspace = true

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -171,9 +173,11 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         self.input.is_some() && !self.finished
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if !self.need_input() {
-            return Err("unpivot received input while its input buffer is full".to_string());
+            return Err("unpivot received input while its input buffer is full"
+                .to_string()
+                .into());
         }
         validate_input_contract(
             &chunk,
@@ -189,7 +193,7 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let Some(input) = self.input.as_ref() else {
             if self.finishing {
                 self.finished = true;
@@ -203,97 +207,16 @@ impl ProcessorOperator for UnpivotProcessorOperator {
                 "ResourceExhausted: unpivot expanded row count exceeds addressable memory"
                     .to_string()
             })?;
-        let remaining = total_rows - self.cursor;
-        let row_limit = remaining.min(self.max_output_rows);
-        let had_size_hint = self.output_rows_hint.is_some();
-        let mut candidate_rows = if self.max_output_bytes == usize::MAX {
-            row_limit
-        } else {
-            self.output_rows_hint.unwrap_or(1).min(row_limit)
-        };
-        let mut output = track_candidate(
-            self.build_output(input, self.cursor, candidate_rows)?,
+        let mut hint = self.output_rows_hint;
+        let (output, candidate_rows) = next_bounded_output(
+            total_rows - self.cursor,
+            self.max_output_rows,
+            self.max_output_bytes,
+            &mut hint,
             self.mem_tracker.as_ref(),
+            |len| self.build_output(input, self.cursor, len),
         )?;
-        let mut upper_bound = row_limit;
-        let candidate_bytes = if self.max_output_bytes == usize::MAX {
-            None
-        } else {
-            Some(output_size(&output, self.mem_tracker.as_ref())?)
-        };
-        if candidate_bytes.is_some_and(|bytes| bytes > self.max_output_bytes) {
-            upper_bound = candidate_rows - 1;
-            loop {
-                if candidate_rows == 1 {
-                    let actual_bytes = output_size(&output, self.mem_tracker.as_ref())?;
-                    return Err(format!(
-                        "ResourceExhausted: one unpivot output value requires {actual_bytes} bytes, limit is {}",
-                        self.max_output_bytes
-                    ));
-                }
-                candidate_rows = (candidate_rows / 2).max(1);
-                output = track_candidate(
-                    self.build_output(input, self.cursor, candidate_rows)?,
-                    self.mem_tracker.as_ref(),
-                )?;
-                if output_fits_budget(&output, self.max_output_bytes, self.mem_tracker.as_ref())? {
-                    break;
-                }
-            }
-        } else if had_size_hint || candidate_rows == row_limit {
-            // Reuse the preceding batch's exact fit, but allow one bounded
-            // doubling probe when it now occupies at most half the budget.
-            // This recovers from a hint reduced by an earlier large value
-            // without repeating a logarithmic search for every output batch.
-            upper_bound = candidate_rows;
-            if candidate_rows < row_limit
-                && candidate_bytes
-                    .is_some_and(|bytes| bytes.saturating_mul(2) <= self.max_output_bytes)
-            {
-                let next_rows = candidate_rows.saturating_mul(2).min(row_limit);
-                let next = track_candidate(
-                    self.build_output(input, self.cursor, next_rows)?,
-                    self.mem_tracker.as_ref(),
-                )?;
-                if output_fits_budget(&next, self.max_output_bytes, self.mem_tracker.as_ref())? {
-                    candidate_rows = next_rows;
-                    output = next;
-                    upper_bound = candidate_rows;
-                }
-            }
-        } else {
-            // The first byte-bounded batch grows from one row so a small budget
-            // never materializes the complete wide expansion merely to learn it
-            // is too large.
-            while candidate_rows < row_limit {
-                let next_rows = candidate_rows.saturating_mul(2).min(row_limit);
-                let next = track_candidate(
-                    self.build_output(input, self.cursor, next_rows)?,
-                    self.mem_tracker.as_ref(),
-                )?;
-                if output_fits_budget(&next, self.max_output_bytes, self.mem_tracker.as_ref())? {
-                    candidate_rows = next_rows;
-                    output = next;
-                } else {
-                    upper_bound = next_rows - 1;
-                    break;
-                }
-            }
-        }
-        while candidate_rows < upper_bound {
-            let middle = candidate_rows + (upper_bound - candidate_rows).div_ceil(2);
-            let candidate = track_candidate(
-                self.build_output(input, self.cursor, middle)?,
-                self.mem_tracker.as_ref(),
-            )?;
-            if output_fits_budget(&candidate, self.max_output_bytes, self.mem_tracker.as_ref())? {
-                candidate_rows = middle;
-                output = candidate;
-            } else {
-                upper_bound = middle - 1;
-            }
-        }
-        self.output_rows_hint = Some(candidate_rows);
+        self.output_rows_hint = hint;
         self.cursor += candidate_rows;
         if self.cursor == total_rows {
             self.input = None;
@@ -305,13 +228,102 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         Ok(Some(output))
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.input.is_none() {
             self.finished = true;
         }
         Ok(())
     }
+}
+
+/// Choose the next expanded batch within the row and byte budgets. `build`
+/// materializes the next `len` expanded rows; `remaining` counts the rows not
+/// yet emitted. `hint` carries the previous batch's exact fit between calls.
+/// Returns the batch and its row count. Shared by the legacy and compiled
+/// Unpivot processors so both honor one budget law.
+pub(crate) fn next_bounded_output(
+    remaining: usize,
+    max_output_rows: usize,
+    max_output_bytes: usize,
+    hint: &mut Option<usize>,
+    tracker: Option<&Arc<MemTracker>>,
+    mut build: impl FnMut(usize) -> Result<Chunk, String>,
+) -> Result<(Chunk, usize), String> {
+    let row_limit = remaining.min(max_output_rows);
+    let had_size_hint = hint.is_some();
+    let mut candidate_rows = if max_output_bytes == usize::MAX {
+        row_limit
+    } else {
+        hint.unwrap_or(1).min(row_limit)
+    };
+    let mut output = track_candidate(build(candidate_rows)?, tracker)?;
+    let mut upper_bound = row_limit;
+    let candidate_bytes = if max_output_bytes == usize::MAX {
+        None
+    } else {
+        Some(output_size(&output, tracker)?)
+    };
+    if candidate_bytes.is_some_and(|bytes| bytes > max_output_bytes) {
+        upper_bound = candidate_rows - 1;
+        loop {
+            if candidate_rows == 1 {
+                let actual_bytes = output_size(&output, tracker)?;
+                return Err(format!(
+                    "ResourceExhausted: one unpivot output value requires {actual_bytes} bytes, limit is {max_output_bytes}"
+                ));
+            }
+            candidate_rows = (candidate_rows / 2).max(1);
+            output = track_candidate(build(candidate_rows)?, tracker)?;
+            if output_fits_budget(&output, max_output_bytes, tracker)? {
+                break;
+            }
+        }
+    } else if had_size_hint || candidate_rows == row_limit {
+        // Reuse the preceding batch's exact fit, but allow one bounded
+        // doubling probe when it now occupies at most half the budget.
+        // This recovers from a hint reduced by an earlier large value
+        // without repeating a logarithmic search for every output batch.
+        upper_bound = candidate_rows;
+        if candidate_rows < row_limit
+            && candidate_bytes.is_some_and(|bytes| bytes.saturating_mul(2) <= max_output_bytes)
+        {
+            let next_rows = candidate_rows.saturating_mul(2).min(row_limit);
+            let next = track_candidate(build(next_rows)?, tracker)?;
+            if output_fits_budget(&next, max_output_bytes, tracker)? {
+                candidate_rows = next_rows;
+                output = next;
+                upper_bound = candidate_rows;
+            }
+        }
+    } else {
+        // The first byte-bounded batch grows from one row so a small budget
+        // never materializes the complete wide expansion merely to learn it
+        // is too large.
+        while candidate_rows < row_limit {
+            let next_rows = candidate_rows.saturating_mul(2).min(row_limit);
+            let next = track_candidate(build(next_rows)?, tracker)?;
+            if output_fits_budget(&next, max_output_bytes, tracker)? {
+                candidate_rows = next_rows;
+                output = next;
+            } else {
+                upper_bound = next_rows - 1;
+                break;
+            }
+        }
+    }
+    while candidate_rows < upper_bound {
+        let middle = candidate_rows + (upper_bound - candidate_rows).div_ceil(2);
+        let candidate = track_candidate(build(middle)?, tracker)?;
+        if output_fits_budget(&candidate, max_output_bytes, tracker)? {
+            candidate_rows = middle;
+            output = candidate;
+        } else {
+            upper_bound = middle - 1;
+        }
+    }
+    *hint = Some(candidate_rows);
+    Ok((output, candidate_rows))
 }
 
 fn track_candidate(mut chunk: Chunk, tracker: Option<&Arc<MemTracker>>) -> Result<Chunk, String> {
@@ -424,10 +436,10 @@ fn materialize_constant(
 }
 
 #[derive(Clone, Copy)]
-struct Segment {
-    mapping_index: usize,
-    input_offset: usize,
-    len: usize,
+pub(crate) struct Segment {
+    pub(crate) mapping_index: usize,
+    pub(crate) input_offset: usize,
+    pub(crate) len: usize,
 }
 
 impl UnpivotProcessorOperator {
@@ -488,7 +500,7 @@ impl UnpivotProcessorOperator {
     }
 }
 
-fn flattened_segments(start: usize, len: usize, input_rows: usize) -> Vec<Segment> {
+pub(crate) fn flattened_segments(start: usize, len: usize, input_rows: usize) -> Vec<Segment> {
     // Mapping-major traversal is an implementation detail. The relational
     // Unpivot contract deliberately exposes no output ordering guarantee.
     let mut segments = Vec::new();
@@ -520,7 +532,10 @@ fn segment_input_parts(
         .collect())
 }
 
-fn concat_owned(parts: Vec<ArrayRef>, output_slot_id: SlotId) -> Result<ArrayRef, String> {
+pub(crate) fn concat_owned(
+    parts: Vec<ArrayRef>,
+    output_slot_id: SlotId,
+) -> Result<ArrayRef, String> {
     let capacity = parts.iter().try_fold(0_usize, |total, part| {
         total.checked_add(part.len()).ok_or_else(|| {
             "ResourceExhausted: unpivot output column length exceeds addressable memory".to_string()
@@ -618,14 +633,75 @@ fn validate_static_contract(
                 .slot(literal_output_slot_ids[literal_index])
                 .expect("validated output slot membership");
             let constant_type = match constant {
-                UnpivotConstant::Scalar { expr_id, .. } => {
-                    let Some(ExprNode::Literal(value)) = arena.node(*expr_id) else {
-                        return Err(format!(
-                            "unpivot mapping {mapping_index} scalar constant {literal_index} is not a literal expression"
-                        ));
+                UnpivotConstant::Scalar { expr_id, nullable } => {
+                    let retained = match arena.node(*expr_id) {
+                        Some(ExprNode::Literal(value)) => execution_literal_retained_bytes(value),
+                        Some(ExprNode::Constant(value)) => {
+                            let target =
+                                novarocks_type_contract::FunctionValueType::try_from_field(
+                                    output_slot.field(),
+                                )
+                                .map_err(|error| error.to_string())?;
+                            if value.value_type().logical_type != target.logical_type
+                                || value.value_type().nullable != *nullable
+                                || !novarocks_type_contract::arrow_data_types_exact(
+                                    &value.value_type().data_type,
+                                    &target.data_type,
+                                )
+                            {
+                                return Err(
+                                    "unpivot constant differs from its frozen complete type".into(),
+                                );
+                            }
+                            let facts = value.pool().resource_facts();
+                            let mut logical_carrier = &value.value_type().data_type;
+                            loop {
+                                logical_carrier = match logical_carrier {
+                                    DataType::Dictionary(_, values) => values,
+                                    DataType::RunEndEncoded(_, values) => values.data_type(),
+                                    _ => break,
+                                };
+                            }
+                            if matches!(
+                                logical_carrier,
+                                DataType::List(_)
+                                    | DataType::LargeList(_)
+                                    | DataType::FixedSizeList(_, _)
+                                    | DataType::ListView(_)
+                                    | DataType::LargeListView(_)
+                                    | DataType::Struct(_)
+                                    | DataType::Map(_, _)
+                                    | DataType::Union(_, _)
+                            ) {
+                                // Conservatively include the retained pool's
+                                // admitted logical extent, not only one row.
+                                nested_element_count = nested_element_count
+                                    .checked_add(
+                                        usize::try_from(facts.logical_elements_upper_bound)
+                                            .map_err(
+                                                |_| "unpivot nested element count overflowed",
+                                            )?,
+                                    )
+                                    .ok_or_else(|| {
+                                        "unpivot nested element count overflowed".to_string()
+                                    })?;
+                            }
+                            facts
+                                .retained_buffer_capacity_bytes
+                                .checked_add(facts.metadata_bytes)
+                                .and_then(|bytes| usize::try_from(bytes).ok())
+                                .ok_or_else(|| {
+                                    "unpivot constant byte charge overflowed".to_string()
+                                })?
+                        }
+                        _ => {
+                            return Err(format!(
+                                "unpivot mapping {mapping_index} scalar constant {literal_index} is not a literal expression"
+                            ));
+                        }
                     };
                     constant_bytes = constant_bytes
-                        .checked_add(execution_literal_retained_bytes(value))
+                        .checked_add(retained)
                         .ok_or_else(|| "unpivot constant byte charge overflowed".to_string())?;
                     arena.data_type(*expr_id).cloned().ok_or_else(|| {
                         format!(
@@ -1021,7 +1097,7 @@ mod tests {
         let processor = operator.as_processor_mut().unwrap();
         processor.push_chunk(&state, input_chunk()).unwrap();
         let error = processor.pull_chunk(&state).unwrap_err();
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert!(error.detail().contains("ResourceExhausted"), "{error}");
     }
 
     #[test]
@@ -1124,9 +1200,19 @@ mod tests {
 
     #[test]
     fn supports_independent_passthrough_literal_and_value_types() {
+        independent_type_case(ExprNode::Literal(LiteralValue::Int8(7)));
+        let source = cv_constant(
+            Arc::new(arrow::array::Int8Array::from(vec![99, 7])),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+            1,
+        );
+        independent_type_case(ExprNode::Constant(source));
+    }
+
+    fn independent_type_case(label: ExprNode) {
         let state = RuntimeState::default();
         let mut arena = ExprArena::default();
-        let label = arena.push_typed(ExprNode::Literal(LiteralValue::Int8(7)), DataType::Int8);
+        let label = arena.push_typed(label, DataType::Int8);
         let factory = UnpivotProcessorFactory::new(
             11,
             Arc::new(arena),
@@ -1299,10 +1385,169 @@ mod tests {
             .unwrap()
             .pull_chunk(&state)
             .expect_err("retained input plus pending output must exceed the query limit");
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert!(error.detail().contains("ResourceExhausted"), "{error}");
         assert_eq!(tracker.current(), input_bytes);
 
         drop(operator);
         assert_eq!(tracker.current(), 0);
+    }
+    fn cv_constant(
+        array: ArrayRef,
+        ty: novarocks_type_contract::FunctionValueType,
+        ordinal: u32,
+    ) -> novarocks_functions::ConstantValue {
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        novarocks_functions::ConstantPool::try_new(
+            Arc::new(ty.try_to_field("source").unwrap()),
+            ty,
+            array.to_data(),
+            novarocks_functions::ConstantPolicy {
+                max_rows: 10000,
+                max_array_nodes: 100,
+                max_logical_elements: 10000,
+                max_retained_buffer_bytes: 1024 * 1024,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 65536,
+                max_library_validation_work: 1024 * 1024,
+                max_library_validation_bytes: 1024 * 1024,
+            },
+            novarocks_type_contract::CompilePhase::Validate,
+            &Control,
+        )
+        .unwrap()
+        .value(ordinal)
+        .unwrap()
+    }
+
+    #[test]
+    fn shared_scalar_constants_cannot_retag_logical_identity_or_nullability() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for source in [
+            cv_constant(
+                Arc::new(StringArray::from(vec!["{}"])),
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
+                0,
+            ),
+            cv_constant(
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                FunctionValueType::new(DataType::Utf8, true),
+                0,
+            ),
+        ] {
+            let mut arena = ExprArena::default();
+            let id = arena.push_typed(ExprNode::Constant(source), DataType::Utf8);
+            let error = UnpivotProcessorFactory::new(
+                1,
+                Arc::new(arena),
+                vec![],
+                SlotId::new(11),
+                vec![SlotId::new(12)],
+                vec![UnpivotValueMapping {
+                    input_value_slot_id: SlotId::new(1),
+                    constants: vec![UnpivotConstant::Scalar {
+                        expr_id: id,
+                        nullable: false,
+                    }],
+                }],
+                schema(vec![
+                    (11, "value", DataType::Int64, false),
+                    (12, "label", DataType::Utf8, false),
+                ]),
+                128,
+                1024,
+            )
+            .err()
+            .expect("shared CV retagging must be refused");
+            assert!(error.contains("frozen complete type"), "{error}");
+        }
+    }
+
+    #[test]
+    fn encoded_nested_constants_cannot_bypass_the_element_limit() {
+        use arrow::array::{DictionaryArray, Int8Array, Int16Array, ListArray, RunArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{Int8Type, Int16Type};
+        use novarocks_type_contract::FunctionValueType;
+
+        for elements in [4093_i32, 4094, 4095, 5000] {
+            let values: ArrayRef = Arc::new(ListArray::new(
+                Arc::new(Field::new("item", DataType::Utf8, false)),
+                OffsetBuffer::new(vec![0_i32, elements].into()),
+                Arc::new(StringArray::from(vec![""; elements as usize])),
+                None,
+            ));
+            let encoded: [ArrayRef; 2] = [
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![0]),
+                        Arc::clone(&values),
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(
+                    RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1]), values.as_ref())
+                        .unwrap(),
+                ),
+            ];
+            for (encoding, array) in encoded.into_iter().enumerate() {
+                let ty = array.data_type().clone();
+                let source = cv_constant(array, FunctionValueType::new(ty.clone(), false), 0);
+                // REE retains its run-end row as well as the encoded value.
+                let logical_elements = elements as u64 + if encoding == 0 { 2 } else { 3 };
+                assert_eq!(
+                    source.pool().resource_facts().logical_elements_upper_bound,
+                    logical_elements
+                );
+                let mut arena = ExprArena::default();
+                let id = arena.push_typed(ExprNode::Constant(source), ty.clone());
+                let result = UnpivotProcessorFactory::new(
+                    1,
+                    Arc::new(arena),
+                    vec![],
+                    SlotId::new(11),
+                    vec![SlotId::new(12)],
+                    vec![UnpivotValueMapping {
+                        input_value_slot_id: SlotId::new(1),
+                        constants: vec![UnpivotConstant::Scalar {
+                            expr_id: id,
+                            nullable: false,
+                        }],
+                    }],
+                    schema(vec![
+                        (11, "value", DataType::Int64, false),
+                        (12, "label", ty, false),
+                    ]),
+                    128,
+                    1024,
+                );
+                if logical_elements <= 4096 {
+                    assert!(
+                        result.is_ok(),
+                        "encoded nested payload at the limit must be accepted"
+                    );
+                } else {
+                    let error = result
+                        .err()
+                        .expect("encoded nested payload must count toward the same element limit");
+                    assert!(error.contains("nested element limit"), "{error}");
+                }
+            }
+        }
     }
 }

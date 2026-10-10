@@ -42,14 +42,21 @@ impl Rule for SplitTopN {
         )
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(src) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         // Finite limit required; plain ORDER BY without LIMIT is out of scope.
         let limit = match src.limit {
             Some(l) if l >= 0 => l,
-            _ => return vec![],
+            _ => return Ok(vec![]),
         };
         let offset = src.offset.unwrap_or(0).max(0);
         if offset > 0 {
@@ -57,7 +64,7 @@ impl Rule for SplitTopN {
             // single-stage TopN. Split TopN with a non-zero final offset still
             // needs tighter parity work in the merging exchange path, so keep
             // the conservative single-stage plan for semantic correctness.
-            return vec![];
+            return Ok(vec![]);
         }
         // Saturating add: if L+O would overflow, cap at i64::MAX (effectively
         // means "partial passes everything through"; cost search will prefer
@@ -89,8 +96,7 @@ impl Rule for SplitTopN {
             }),
             children: vec![partial_group],
         };
-
-        vec![final_expr]
+        Ok(vec![final_expr])
     }
 }
 
@@ -141,7 +147,13 @@ mod tests {
             }),
             children: vec![scan_group],
         };
-        let out = SplitTopN.apply(&topn_mexpr, &mut memo);
+        let out = SplitTopN
+            .apply(
+                &topn_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one split alternative");
         match &out[0].op {
             Operator::LogicalTopN(t) => {
@@ -182,7 +194,13 @@ mod tests {
             }),
             children: vec![scan_group],
         };
-        let out = SplitTopN.apply(&topn_mexpr, &mut memo);
+        let out = SplitTopN
+            .apply(
+                &topn_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert!(
             out.is_empty(),
             "non-zero offset should stay single-stage for now"
@@ -246,7 +264,13 @@ mod tests {
             }),
             children: vec![scan_group],
         };
-        let out = SplitTopN.apply(&topn_mexpr, &mut memo);
+        let out = SplitTopN
+            .apply(
+                &topn_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert!(out.is_empty(), "no limit => out of scope");
     }
 }

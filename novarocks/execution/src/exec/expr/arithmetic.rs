@@ -15,738 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::decimal::{div_round_i256, pow10_i128, pow10_i256};
+#[cfg(test)]
+use crate::exec::expr::decimal::{pow10_i128, pow10_i256};
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Float64Array, Int64Array};
-use arrow::compute::kernels::numeric::{add, div, mul, rem, sub};
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
+#[cfg(test)]
+use novarocks_functions::legacy_arithmetic::{
+    DecimalOp, decimal_overflow_error, eval_decimal_binop,
+};
 use novarocks_type_contract::DecimalOverflowPolicy;
 use novarocks_types::largeint;
 use std::sync::Arc;
-
-// Helper to cast array to Int64Array for arithmetic
-fn cast_to_i64(arr: &ArrayRef) -> Result<&Int64Array, String> {
-    arr.as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| format!("expected Int64Array, got {:?}", arr.data_type()))
-}
-
-// Helper to cast array to Float64Array for arithmetic
-fn cast_to_f64(arr: &ArrayRef) -> Result<&Float64Array, String> {
-    arr.as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| format!("expected Float64Array, got {:?}", arr.data_type()))
-}
-
-fn to_largeint_values(arr: &ArrayRef, context: &str) -> Result<Vec<Option<i128>>, String> {
-    match arr.data_type() {
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let fixed = largeint::as_fixed_size_binary_array(arr, context)?;
-            let mut values = Vec::with_capacity(fixed.len());
-            for row in 0..fixed.len() {
-                if fixed.is_null(row) {
-                    values.push(None);
-                } else {
-                    values.push(Some(largeint::value_at(fixed, row)?));
-                }
-            }
-            Ok(values)
-        }
-        DataType::Int64 => {
-            let int_arr = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
-            let mut values = Vec::with_capacity(int_arr.len());
-            for row in 0..int_arr.len() {
-                if int_arr.is_null(row) {
-                    values.push(None);
-                } else {
-                    values.push(Some(int_arr.value(row) as i128));
-                }
-            }
-            Ok(values)
-        }
-        DataType::Int8 | DataType::Int16 | DataType::Int32 => {
-            let casted = arrow::compute::cast(arr, &DataType::Int64)
-                .map_err(|e| format!("{context}: failed to cast operand to Int64: {e}"))?;
-            let int_arr = casted
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
-            let mut values = Vec::with_capacity(int_arr.len());
-            for row in 0..int_arr.len() {
-                if int_arr.is_null(row) {
-                    values.push(None);
-                } else {
-                    values.push(Some(int_arr.value(row) as i128));
-                }
-            }
-            Ok(values)
-        }
-        DataType::Null => Ok(vec![None; arr.len()]),
-        other => Err(format!(
-            "{context}: unsupported LARGEINT operand type: {:?}",
-            other
-        )),
-    }
-}
-
-enum LargeIntOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-}
-
-fn eval_largeint_binop(
-    lhs: &ArrayRef,
-    rhs: &ArrayRef,
-    output_type: &DataType,
-    op: LargeIntOp,
-) -> Result<Option<ArrayRef>, String> {
-    if !largeint::is_largeint_data_type(output_type) {
-        return Ok(None);
-    }
-    let context = match op {
-        LargeIntOp::Add => "add",
-        LargeIntOp::Sub => "sub",
-        LargeIntOp::Mul => "mul",
-        LargeIntOp::Div => "div",
-        LargeIntOp::Mod => "mod",
-    };
-    let lhs_values = to_largeint_values(lhs, context)?;
-    let rhs_values = to_largeint_values(rhs, context)?;
-    if lhs_values.len() != rhs_values.len() {
-        return Err(format!("largeint {context} length mismatch"));
-    }
-
-    let mut values = Vec::with_capacity(lhs_values.len());
-    for row in 0..lhs_values.len() {
-        let out = match (lhs_values[row], rhs_values[row]) {
-            (Some(l), Some(r)) => match op {
-                LargeIntOp::Add => Some(l.wrapping_add(r)),
-                LargeIntOp::Sub => Some(l.wrapping_sub(r)),
-                LargeIntOp::Mul => Some(l.wrapping_mul(r)),
-                LargeIntOp::Div => {
-                    if r == 0 {
-                        None
-                    } else if l == i128::MIN && r == -1 {
-                        Some(i128::MIN)
-                    } else {
-                        Some(l / r)
-                    }
-                }
-                LargeIntOp::Mod => {
-                    if r == 0 {
-                        None
-                    } else if l == i128::MIN && r == -1 {
-                        Some(0)
-                    } else {
-                        Some(l % r)
-                    }
-                }
-            },
-            _ => None,
-        };
-        values.push(out);
-    }
-    largeint::array_from_i128(&values).map(Some)
-}
-
-#[derive(Clone, Copy)]
-enum DecimalOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-}
-
-fn to_decimal128_values(arr: &ArrayRef, context: &str) -> Result<(Vec<Option<i128>>, i32), String> {
-    match arr.data_type() {
-        DataType::Decimal128(_, scale) => {
-            let typed = arr
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Decimal128Array"))?;
-            let mut out = Vec::with_capacity(typed.len());
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(typed.value(row)));
-                }
-            }
-            Ok((out, *scale as i32))
-        }
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-            let casted = if matches!(arr.data_type(), DataType::Int64) {
-                arr.clone()
-            } else {
-                arrow::compute::cast(arr, &DataType::Int64).map_err(|e| {
-                    format!("{context}: failed to cast integer operand to Int64: {e}")
-                })?
-            };
-            let typed = casted
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
-            let mut out = Vec::with_capacity(typed.len());
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(typed.value(row) as i128));
-                }
-            }
-            Ok((out, 0))
-        }
-        DataType::Null => Ok((vec![None; arr.len()], 0)),
-        other => Err(format!(
-            "{context}: unsupported Decimal128 operand type: {:?}",
-            other
-        )),
-    }
-}
-
-fn to_decimal256_values(arr: &ArrayRef, context: &str) -> Result<(Vec<Option<i256>>, i32), String> {
-    match arr.data_type() {
-        DataType::Decimal256(_, scale) => {
-            let typed = arr
-                .as_any()
-                .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Decimal256Array"))?;
-            let mut out = Vec::with_capacity(typed.len());
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(typed.value(row)));
-                }
-            }
-            Ok((out, *scale as i32))
-        }
-        DataType::Decimal128(_, scale) => {
-            let typed = arr
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Decimal128Array"))?;
-            let mut out = Vec::with_capacity(typed.len());
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(i256::from_i128(typed.value(row))));
-                }
-            }
-            Ok((out, *scale as i32))
-        }
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-            let casted = if matches!(arr.data_type(), DataType::Int64) {
-                arr.clone()
-            } else {
-                arrow::compute::cast(arr, &DataType::Int64).map_err(|e| {
-                    format!("{context}: failed to cast integer operand to Int64: {e}")
-                })?
-            };
-            let typed = casted
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
-            let mut out = Vec::with_capacity(typed.len());
-            for row in 0..typed.len() {
-                if typed.is_null(row) {
-                    out.push(None);
-                } else {
-                    out.push(Some(i256::from_i128(typed.value(row) as i128)));
-                }
-            }
-            Ok((out, 0))
-        }
-        ty if largeint::is_largeint_data_type(ty) => {
-            let typed = largeint::as_fixed_size_binary_array(arr, context)?;
-            let values = (0..typed.len())
-                .map(|row| {
-                    if typed.is_null(row) {
-                        Ok(None)
-                    } else {
-                        largeint::value_at(typed, row).map(|value| Some(i256::from_i128(value)))
-                    }
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok((values, 0))
-        }
-        DataType::Null => Ok((vec![None; arr.len()], 0)),
-        other => Err(format!(
-            "{context}: unsupported Decimal256 operand type: {:?}",
-            other
-        )),
-    }
-}
-
-fn eval_decimal256_div_value(
-    lhs_val: i256,
-    rhs_val: i256,
-    lhs_scale_i32: i32,
-    rhs_scale_i32: i32,
-    out_scale_i32: i32,
-) -> Result<Option<i256>, String> {
-    if rhs_val == i256::ZERO {
-        return Ok(None);
-    }
-    let exponent = out_scale_i32 + rhs_scale_i32 - lhs_scale_i32;
-    let numerator = if exponent >= 0 {
-        let factor = match pow10_i256(exponent as usize) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
-        match lhs_val.checked_mul(factor) {
-            Some(v) => v,
-            None => return Ok(None),
-        }
-    } else {
-        let factor = match pow10_i256((-exponent) as usize) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
-        lhs_val
-            .checked_div(factor)
-            .ok_or_else(|| "decimal overflow".to_string())?
-    };
-    Ok(Some(div_round_i256(numerator, rhs_val)?))
-}
-
-fn checked_decimal_divide_half_up(numerator: i128, denominator: i128) -> Option<i128> {
-    let quotient = numerator.checked_div(denominator)?;
-    let remainder = numerator.checked_rem(denominator)?;
-    let magnitude = denominator.unsigned_abs();
-    let threshold = (magnitude >> 1) + (magnitude & 1);
-    if remainder.unsigned_abs() >= threshold {
-        quotient.checked_add(if (numerator < 0) ^ (denominator < 0) {
-            -1
-        } else {
-            1
-        })
-    } else {
-        Some(quotient)
-    }
-}
-
-fn decimal_overflow_error(op: DecimalOp) -> String {
-    let name = match op {
-        DecimalOp::Add => "add",
-        DecimalOp::Sub => "sub",
-        DecimalOp::Mul => "mul",
-        DecimalOp::Div => "div",
-        DecimalOp::Mod => "mod",
-    };
-    format!("Expr evaluate meet error: The '{name}' operation involving decimal values overflows")
-}
-
-fn eval_decimal_binop(
-    lhs: &ArrayRef,
-    rhs: &ArrayRef,
-    output_type: &DataType,
-    op: DecimalOp,
-    strict_overflow: bool,
-    decimal_overflow_policy: DecimalOverflowPolicy,
-) -> Result<Option<ArrayRef>, String> {
-    let is_decimal =
-        |ty: &DataType| matches!(ty, DataType::Decimal128(_, _) | DataType::Decimal256(_, _));
-    if (largeint::is_largeint_data_type(lhs.data_type()) && is_decimal(rhs.data_type()))
-        || (largeint::is_largeint_data_type(rhs.data_type()) && is_decimal(lhs.data_type()))
-    {
-        let operation = match &op {
-            DecimalOp::Add => novarocks_type_contract::ArithmeticOperator::Add,
-            DecimalOp::Sub => novarocks_type_contract::ArithmeticOperator::Subtract,
-            DecimalOp::Mul => novarocks_type_contract::ArithmeticOperator::Multiply,
-            DecimalOp::Div => novarocks_type_contract::ArithmeticOperator::Divide,
-            DecimalOp::Mod => novarocks_type_contract::ArithmeticOperator::Modulo,
-        };
-        if novarocks_type_contract::arithmetic_result_type_with_op(
-            lhs.data_type(),
-            rhs.data_type(),
-            operation,
-        )
-        .as_ref()
-            != Some(output_type)
-        {
-            return Err(
-                "Decimal/LARGEINT arithmetic differs from its frozen add/subtract rule".to_string(),
-            );
-        }
-    }
-    match output_type {
-        DataType::Decimal128(out_precision, out_scale) => {
-            if !matches!(
-                lhs.data_type(),
-                DataType::Decimal128(_, _)
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Null
-            ) || !matches!(
-                rhs.data_type(),
-                DataType::Decimal128(_, _)
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Null
-            ) {
-                return Ok(None);
-            }
-            let (lhs_values, lhs_scale_i32) = to_decimal128_values(lhs, "decimal arithmetic lhs")?;
-            let (rhs_values, rhs_scale_i32) = to_decimal128_values(rhs, "decimal arithmetic rhs")?;
-            if lhs_values.len() != rhs_values.len() {
-                return Err("decimal arithmetic length mismatch".to_string());
-            }
-            let mut values = Vec::with_capacity(lhs_values.len());
-            let ls = lhs_scale_i32;
-            let rs = rhs_scale_i32;
-            let os = i32::from(*out_scale);
-            if matches!(op, DecimalOp::Add | DecimalOp::Sub | DecimalOp::Mod)
-                && (os < ls || os < rs)
-            {
-                return Err("frozen decimal add/sub/mod scale mismatch".to_string());
-            }
-            let precision_limit = 10_u128
-                .checked_pow(u32::from(*out_precision))
-                .filter(|_| (1..=38).contains(out_precision))
-                .ok_or_else(|| "invalid frozen Decimal128 precision".to_string())?;
-            // All metadata-derived factors are computed once per batch.
-            let factor = |exponent: i32| pow10_i128(exponent.unsigned_abs() as usize).ok();
-            let left_factor = factor(os - ls);
-            let right_factor = factor(os - rs);
-            let product_diff = os - ls - rs;
-            let product_factor = factor(product_diff);
-            let division_diff = os + rs - ls;
-            let division_factor = factor(division_diff);
-            for row in 0..lhs_values.len() {
-                let (Some(left), Some(right)) = (lhs_values[row], rhs_values[row]) else {
-                    values.push(None);
-                    continue;
-                };
-                if matches!(op, DecimalOp::Div | DecimalOp::Mod) && right == 0 {
-                    values.push(None);
-                    continue;
-                }
-                let checked = match op {
-                    DecimalOp::Add | DecimalOp::Sub | DecimalOp::Mod => left_factor
-                        .and_then(|factor| left.checked_mul(factor))
-                        .zip(right_factor.and_then(|factor| right.checked_mul(factor)))
-                        .and_then(|(left, right)| match op {
-                            DecimalOp::Add => left.checked_add(right),
-                            DecimalOp::Sub => left.checked_sub(right),
-                            DecimalOp::Mod => left.checked_rem(right),
-                            _ => unreachable!(),
-                        }),
-                    DecimalOp::Mul => left.checked_mul(right).and_then(|product| {
-                        product_factor.and_then(|factor| {
-                            if product_diff >= 0 {
-                                product.checked_mul(factor)
-                            } else {
-                                product.checked_div(factor)
-                            }
-                        })
-                    }),
-                    DecimalOp::Div => division_factor
-                        .and_then(|factor| {
-                            if division_diff >= 0 {
-                                left.checked_mul(factor)
-                            } else {
-                                left.checked_div(factor)
-                            }
-                        })
-                        .and_then(|numerator| checked_decimal_divide_half_up(numerator, right)),
-                }
-                .filter(|value| value.unsigned_abs() < precision_limit);
-                match checked {
-                    Some(value) => values.push(Some(value)),
-                    None if decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                        || (strict_overflow && matches!(op, DecimalOp::Mul)) =>
-                    {
-                        return Err(decimal_overflow_error(op));
-                    }
-                    None => values.push(None),
-                }
-            }
-            let array = Decimal128Array::from(values)
-                .with_precision_and_scale(*out_precision, *out_scale)
-                .map_err(|e| e.to_string())?;
-            Ok(Some(Arc::new(array)))
-        }
-        DataType::Decimal256(out_precision, out_scale) => {
-            let (lhs_values, lhs_scale_i32) = to_decimal256_values(lhs, "decimal arithmetic lhs")?;
-            let (rhs_values, rhs_scale_i32) = to_decimal256_values(rhs, "decimal arithmetic rhs")?;
-            if lhs_values.len() != rhs_values.len() {
-                return Err("decimal arithmetic length mismatch".to_string());
-            }
-            let out_scale_i32 = *out_scale as i32;
-            let mut values: Vec<Option<i256>> = Vec::with_capacity(lhs_values.len());
-            let mut had_mul_overflow = false;
-            let mut had_numeric_overflow = false;
-            let precision_limit = pow10_i256(*out_precision as usize)?;
-            for row in 0..lhs_values.len() {
-                let (Some(lhs_val), Some(rhs_val)) = (lhs_values[row], rhs_values[row]) else {
-                    values.push(None);
-                    continue;
-                };
-                let out_val = match op {
-                    DecimalOp::Add | DecimalOp::Sub => {
-                        if out_scale_i32 < lhs_scale_i32 || out_scale_i32 < rhs_scale_i32 {
-                            return Err("decimal add/sub scale mismatch".to_string());
-                        }
-                        let lhs_factor = match pow10_i256((out_scale_i32 - lhs_scale_i32) as usize)
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                had_numeric_overflow = true;
-                                values.push(None);
-                                continue;
-                            }
-                        };
-                        let rhs_factor = match pow10_i256((out_scale_i32 - rhs_scale_i32) as usize)
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                had_numeric_overflow = true;
-                                values.push(None);
-                                continue;
-                            }
-                        };
-                        let Some(lhs_scaled) = lhs_val.checked_mul(lhs_factor) else {
-                            had_numeric_overflow = true;
-                            values.push(None);
-                            continue;
-                        };
-                        let Some(rhs_scaled) = rhs_val.checked_mul(rhs_factor) else {
-                            had_numeric_overflow = true;
-                            values.push(None);
-                            continue;
-                        };
-                        let out = if matches!(op, DecimalOp::Add) {
-                            lhs_scaled.checked_add(rhs_scaled)
-                        } else {
-                            lhs_scaled.checked_sub(rhs_scaled)
-                        };
-                        let Some(out) = out else {
-                            had_numeric_overflow = true;
-                            values.push(None);
-                            continue;
-                        };
-                        out
-                    }
-                    DecimalOp::Mul => {
-                        let scale_in = lhs_scale_i32 + rhs_scale_i32;
-                        let diff = out_scale_i32 - scale_in;
-                        let Some(product) = lhs_val.checked_mul(rhs_val) else {
-                            had_mul_overflow = true;
-                            had_numeric_overflow = true;
-                            values.push(None);
-                            continue;
-                        };
-                        if diff >= 0 {
-                            let factor = match pow10_i256(diff as usize) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    had_mul_overflow = true;
-                                    had_numeric_overflow = true;
-                                    values.push(None);
-                                    continue;
-                                }
-                            };
-                            let Some(out) = product.checked_mul(factor) else {
-                                had_mul_overflow = true;
-                                had_numeric_overflow = true;
-                                values.push(None);
-                                continue;
-                            };
-                            out
-                        } else {
-                            let factor = match pow10_i256((-diff) as usize) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    had_mul_overflow = true;
-                                    had_numeric_overflow = true;
-                                    values.push(None);
-                                    continue;
-                                }
-                            };
-                            match product.checked_div(factor) {
-                                Some(v) => v,
-                                None => {
-                                    had_mul_overflow = true;
-                                    had_numeric_overflow = true;
-                                    values.push(None);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    DecimalOp::Div => {
-                        let Some(divided) = eval_decimal256_div_value(
-                            lhs_val,
-                            rhs_val,
-                            lhs_scale_i32,
-                            rhs_scale_i32,
-                            out_scale_i32,
-                        )?
-                        else {
-                            had_numeric_overflow |= rhs_val != i256::ZERO;
-                            values.push(None);
-                            continue;
-                        };
-                        divided
-                    }
-                    DecimalOp::Mod => {
-                        if rhs_val == i256::ZERO {
-                            values.push(None);
-                            continue;
-                        }
-                        if out_scale_i32 < lhs_scale_i32 || out_scale_i32 < rhs_scale_i32 {
-                            return Err("decimal mod scale mismatch".to_string());
-                        }
-                        let lhs_factor = match pow10_i256((out_scale_i32 - lhs_scale_i32) as usize)
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                had_numeric_overflow = true;
-                                values.push(None);
-                                continue;
-                            }
-                        };
-                        let rhs_factor = match pow10_i256((out_scale_i32 - rhs_scale_i32) as usize)
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                had_numeric_overflow = true;
-                                values.push(None);
-                                continue;
-                            }
-                        };
-                        let Some(lhs_scaled) = lhs_val.checked_mul(lhs_factor) else {
-                            had_numeric_overflow = true;
-                            values.push(None);
-                            continue;
-                        };
-                        let Some(rhs_scaled) = rhs_val.checked_mul(rhs_factor) else {
-                            had_numeric_overflow = true;
-                            values.push(None);
-                            continue;
-                        };
-                        match lhs_scaled.checked_rem(rhs_scaled) {
-                            Some(v) => v,
-                            None => {
-                                had_numeric_overflow = true;
-                                values.push(None);
-                                continue;
-                            }
-                        }
-                    }
-                };
-                // Declared precision and carrier capacity both bound the result;
-                // the frozen policy determines how numeric overflow is returned.
-                if out_val <= -precision_limit || out_val >= precision_limit {
-                    had_numeric_overflow = true;
-                    had_mul_overflow |= matches!(op, DecimalOp::Mul);
-                    values.push(None);
-                    continue;
-                }
-                values.push(Some(out_val));
-            }
-            if (decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                && had_numeric_overflow)
-                || (strict_overflow && matches!(op, DecimalOp::Mul) && had_mul_overflow)
-            {
-                return Err(decimal_overflow_error(op));
-            }
-            let array = Decimal256Array::from(values)
-                .with_precision_and_scale(*out_precision, *out_scale)
-                .map_err(|e| e.to_string())?;
-            Ok(Some(Arc::new(array)))
-        }
-        _ => Ok(None),
-    }
-}
-
-// Generic Arrow arithmetic operation with type coercion
-fn eval_numeric_binop_arrays<F1, F2>(
-    lhs: ArrayRef,
-    rhs: ArrayRef,
-    int_op: F1,
-    float_op: F2,
-) -> Result<ArrayRef, String>
-where
-    F1: FnOnce(
-        &Int64Array,
-        &Int64Array,
-    ) -> Result<Arc<dyn arrow::array::Array>, arrow::error::ArrowError>,
-    F2: FnOnce(
-        &Float64Array,
-        &Float64Array,
-    ) -> Result<Arc<dyn arrow::array::Array>, arrow::error::ArrowError>,
-{
-    use arrow::compute::cast;
-
-    let is_float = |dt: &DataType| matches!(dt, DataType::Float32 | DataType::Float64);
-    let is_lhs_float = is_float(lhs.data_type());
-    let is_rhs_float = is_float(rhs.data_type());
-
-    if is_lhs_float || is_rhs_float {
-        let lhs_f64_arr = if matches!(lhs.data_type(), DataType::Float64) {
-            lhs
-        } else {
-            cast(&lhs, &DataType::Float64).map_err(|e| e.to_string())?
-        };
-        let rhs_f64_arr = if matches!(rhs.data_type(), DataType::Float64) {
-            rhs
-        } else {
-            cast(&rhs, &DataType::Float64).map_err(|e| e.to_string())?
-        };
-        let lhs_f64 = cast_to_f64(&lhs_f64_arr)?;
-        let rhs_f64 = cast_to_f64(&rhs_f64_arr)?;
-        float_op(lhs_f64, rhs_f64)
-            .map_err(|e| e.to_string())
-            .map(|arc| arc as ArrayRef)
-    } else {
-        let lhs_i64_arr = if matches!(lhs.data_type(), DataType::Int64) {
-            lhs
-        } else {
-            cast(&lhs, &DataType::Int64).map_err(|e| e.to_string())?
-        };
-        let rhs_i64_arr = if matches!(rhs.data_type(), DataType::Int64) {
-            rhs
-        } else {
-            cast(&rhs, &DataType::Int64).map_err(|e| e.to_string())?
-        };
-        let lhs_i64 = cast_to_i64(&lhs_i64_arr)?;
-        let rhs_i64 = cast_to_i64(&rhs_i64_arr)?;
-        int_op(lhs_i64, rhs_i64)
-            .map_err(|e| e.to_string())
-            .map(|arc| arc as ArrayRef)
-    }
-}
-
-fn cast_numeric_output(result: ArrayRef, output_type: &DataType) -> Result<ArrayRef, String> {
-    use arrow::compute::cast;
-    if matches!(output_type, DataType::Null) || result.data_type() == output_type {
-        return Ok(result);
-    }
-    match output_type {
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Float32
-        | DataType::Float64 => cast(&result, output_type).map_err(|e| e.to_string()),
-        other => Err(format!("arithmetic output type mismatch: {:?}", other)),
-    }
-}
 
 pub fn eval_add(
     arena: &ExprArena,
@@ -759,32 +40,13 @@ pub fn eval_add(
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    if let Some(arr) = eval_largeint_binop(&lhs, &rhs, &output_type, LargeIntOp::Add)? {
-        return Ok(arr);
-    }
-    if let Some(arr) = eval_decimal_binop(
-        &lhs,
-        &rhs,
-        &output_type,
-        DecimalOp::Add,
-        arena.allow_throw_exception(),
-        decimal_overflow_policy,
-    )? {
-        return Ok(arr);
-    }
-    let result = eval_numeric_binop_arrays(
+    novarocks_functions::legacy_arithmetic::eval_add_arrays(
         lhs,
         rhs,
-        |x, y| {
-            let result = add(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = add(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
-    cast_numeric_output(result, &output_type)
+        output_type,
+        arena.allow_throw_exception(),
+        decimal_overflow_policy,
+    )
 }
 
 pub fn eval_sub(
@@ -798,32 +60,13 @@ pub fn eval_sub(
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    if let Some(arr) = eval_largeint_binop(&lhs, &rhs, &output_type, LargeIntOp::Sub)? {
-        return Ok(arr);
-    }
-    if let Some(arr) = eval_decimal_binop(
-        &lhs,
-        &rhs,
-        &output_type,
-        DecimalOp::Sub,
-        arena.allow_throw_exception(),
-        decimal_overflow_policy,
-    )? {
-        return Ok(arr);
-    }
-    let result = eval_numeric_binop_arrays(
+    novarocks_functions::legacy_arithmetic::eval_sub_arrays(
         lhs,
         rhs,
-        |x, y| {
-            let result = sub(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = sub(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
-    cast_numeric_output(result, &output_type)
+        output_type,
+        arena.allow_throw_exception(),
+        decimal_overflow_policy,
+    )
 }
 
 pub fn eval_mul(
@@ -837,32 +80,13 @@ pub fn eval_mul(
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    if let Some(arr) = eval_largeint_binop(&lhs, &rhs, &output_type, LargeIntOp::Mul)? {
-        return Ok(arr);
-    }
-    if let Some(arr) = eval_decimal_binop(
-        &lhs,
-        &rhs,
-        &output_type,
-        DecimalOp::Mul,
-        arena.allow_throw_exception(),
-        decimal_overflow_policy,
-    )? {
-        return Ok(arr);
-    }
-    let result = eval_numeric_binop_arrays(
+    novarocks_functions::legacy_arithmetic::eval_mul_arrays(
         lhs,
         rhs,
-        |x, y| {
-            let result = mul(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = mul(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
-    cast_numeric_output(result, &output_type)
+        output_type,
+        arena.allow_throw_exception(),
+        decimal_overflow_policy,
+    )
 }
 
 pub fn eval_div(
@@ -875,129 +99,14 @@ pub fn eval_div(
 ) -> Result<ArrayRef, String> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
-    // Replace zeros in the divisor with NULLs so that division by zero
-    // returns NULL instead of an error (matches StarRocks behavior).
-    let rhs = nullify_zeros(&rhs);
-    let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    if let Some(arr) = eval_largeint_binop(&lhs, &rhs, &output_type, LargeIntOp::Div)? {
-        return Ok(arr);
-    }
-    if let Some(arr) = eval_decimal_binop(
-        &lhs,
-        &rhs,
-        &output_type,
-        DecimalOp::Div,
-        arena.allow_throw_exception(),
-        decimal_overflow_policy,
-    )? {
-        return Ok(arr);
-    }
-    // StarRocks: integer / integer → DOUBLE. Cast integer inputs to Float64
-    // BEFORE dividing so that the result preserves fractional parts.
-    let both_integral = is_integer_type(lhs.data_type()) && is_integer_type(rhs.data_type());
-    if both_integral && matches!(output_type, DataType::Float64) {
-        let lhs_f = arrow::compute::cast(&lhs, &DataType::Float64)
-            .map_err(|e| format!("div cast lhs: {e}"))?;
-        let rhs_f = arrow::compute::cast(&rhs, &DataType::Float64)
-            .map_err(|e| format!("div cast rhs: {e}"))?;
-        let result = eval_numeric_binop_arrays(
-            lhs_f,
-            rhs_f,
-            |x, y| {
-                let result = div(x, y)?;
-                Ok(Arc::new(result))
-            },
-            |x, y| {
-                let result = div(x, y)?;
-                Ok(Arc::new(result))
-            },
-        )?;
-        return Ok(result);
-    }
-    let result = eval_numeric_binop_arrays(
+    let output_type = arena.data_type(expr).unwrap_or(&DataType::Null);
+    novarocks_functions::legacy_arithmetic::eval_div_arrays(
         lhs,
         rhs,
-        |x, y| {
-            let result = div(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = div(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
-    cast_numeric_output(result, &output_type)
-}
-
-fn is_integer_type(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
+        output_type,
+        arena.allow_throw_exception(),
+        decimal_overflow_policy,
     )
-}
-
-/// Replace zero values in a numeric array with NULLs for safe division.
-fn nullify_zeros(arr: &ArrayRef) -> ArrayRef {
-    use arrow::array::BooleanArray;
-    let len = arr.len();
-    let mut is_zero_buf = vec![false; len];
-    match arr.data_type() {
-        DataType::Int8 => {
-            if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int8Array>() {
-                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
-                    if !a.is_null(i) && a.value(i) == 0 {
-                        *is_zero = true;
-                    }
-                }
-            }
-        }
-        DataType::Int16 => {
-            if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int16Array>() {
-                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
-                    if !a.is_null(i) && a.value(i) == 0 {
-                        *is_zero = true;
-                    }
-                }
-            }
-        }
-        DataType::Int32 => {
-            if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
-                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
-                    if !a.is_null(i) && a.value(i) == 0 {
-                        *is_zero = true;
-                    }
-                }
-            }
-        }
-        DataType::Int64 => {
-            if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
-                    if !a.is_null(i) && a.value(i) == 0 {
-                        *is_zero = true;
-                    }
-                }
-            }
-        }
-        DataType::Float64 => {
-            if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
-                    if !a.is_null(i) && a.value(i) == 0.0 {
-                        *is_zero = true;
-                    }
-                }
-            }
-        }
-        _ => return arr.clone(),
-    }
-    let mask = BooleanArray::from(is_zero_buf);
-    arrow::compute::nullif(arr, &mask).unwrap_or_else(|_| arr.clone())
 }
 
 pub fn eval_mod(
@@ -1011,34 +120,14 @@ pub fn eval_mod(
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    if let Some(arr) = eval_largeint_binop(&lhs, &rhs, &output_type, LargeIntOp::Mod)? {
-        return Ok(arr);
-    }
-    if let Some(arr) = eval_decimal_binop(
-        &lhs,
-        &rhs,
-        &output_type,
-        DecimalOp::Mod,
-        arena.allow_throw_exception(),
-        decimal_overflow_policy,
-    )? {
-        return Ok(arr);
-    }
-    let result = eval_numeric_binop_arrays(
+    novarocks_functions::legacy_arithmetic::eval_mod_arrays(
         lhs,
         rhs,
-        |x, y| {
-            let result = rem(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = rem(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
-    cast_numeric_output(result, &output_type)
+        output_type,
+        arena.allow_throw_exception(),
+        decimal_overflow_policy,
+    )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,7 +267,8 @@ mod tests {
             out,
         );
         let frozen = arena.into_immutable().unwrap();
-        let prepared = ExprArena::from_immutable(&frozen);
+        let prepared =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let factor = pow10_i256(15).unwrap();
         let scaled = [
             i256::from_i128(i128::MAX).checked_mul(factor).unwrap(),
@@ -1896,3 +986,288 @@ mod overflow_policy_prepared_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod legacy_signed_prepared_oracle_tests {
+    use super::*;
+    use crate::exec::expr::ExprNode;
+    use arrow::array::{Int8Array, Int16Array, Int32Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_functions::{
+        ArithmeticRowResult, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
+        PreparedArithmeticRecipe,
+    };
+    use novarocks_type_contract::{
+        ArithmeticOperator, CompileControlError, CompilePhase, FunctionValueType,
+        PureCompileControl, arithmetic_result_value_type_with_op,
+    };
+    use novarocks_types::SlotId;
+    use std::time::Duration;
+
+    struct OriginalControl;
+    impl PureCompileControl for OriginalControl {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert!(units <= 256);
+            Ok(())
+        }
+    }
+    impl KernelEvaluationControl for OriginalControl {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= 256);
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("signed arithmetic has no waiting operation")
+        }
+    }
+
+    fn signed_array(ty: &DataType, values: &[Option<i64>]) -> ArrayRef {
+        match ty {
+            DataType::Int8 => Arc::new(Int8Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i8::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int16 => Arc::new(Int16Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i16::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int32 => Arc::new(Int32Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i32::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int64 => Arc::new(Int64Array::from(values.to_vec())),
+            _ => panic!("fixture must author a signed source"),
+        }
+    }
+
+    fn fixture(
+        op: ArithmeticOperator,
+        left: ArrayRef,
+        right: ArrayRef,
+        policy: DecimalOverflowPolicy,
+        allow: bool,
+    ) -> (ExprArena, ExprId, Chunk, PreparedArithmeticRecipe) {
+        let left_type = FunctionValueType::new(left.data_type().clone(), true);
+        let right_type = FunctionValueType::new(right.data_type().clone(), true);
+        let result = arithmetic_result_value_type_with_op(&left_type, &right_type, op).unwrap();
+        let recipe = PreparedArithmeticRecipe::try_new(
+            op,
+            &left_type,
+            &right_type,
+            &result,
+            policy,
+            allow,
+            &OriginalControl,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left", left_type.data_type.clone(), true),
+            Field::new("right", right_type.data_type.clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let mut arena = ExprArena::default();
+        arena.set_allow_throw_exception(allow);
+        let left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), left_type.data_type);
+        let right = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), right_type.data_type);
+        let kind = match op {
+            ArithmeticOperator::Add => ExprNode::Add(left, right, policy),
+            ArithmeticOperator::Subtract => ExprNode::Sub(left, right, policy),
+            ArithmeticOperator::Multiply => ExprNode::Mul(left, right, policy),
+            ArithmeticOperator::Divide => ExprNode::Div(left, right, policy),
+            ArithmeticOperator::Modulo => ExprNode::Mod(left, right, policy),
+        };
+        let id = arena.push_typed(kind, result.data_type);
+        (arena, id, chunk, recipe)
+    }
+
+    fn prepared_row(
+        recipe: &PreparedArithmeticRecipe,
+        left: &ArrayRef,
+        right: &ArrayRef,
+        row: usize,
+    ) -> ArithmeticRowResult {
+        recipe
+            .evaluate_row(
+                EvaluatedArgument::Column(left),
+                row,
+                row,
+                EvaluatedArgument::Column(right),
+                row,
+                row,
+                &OriginalControl,
+            )
+            .unwrap()
+    }
+
+    fn assert_same_row(legacy: &ArrayRef, row: usize, prepared: ArithmeticRowResult) {
+        match prepared {
+            ArithmeticRowResult::Null => assert!(legacy.is_null(row)),
+            ArithmeticRowResult::Signed(value) => {
+                assert!(!legacy.is_null(row));
+                let value_at = match legacy.data_type() {
+                    DataType::Int16 => i64::from(
+                        legacy
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .unwrap()
+                            .value(row),
+                    ),
+                    DataType::Int32 => i64::from(
+                        legacy
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .value(row),
+                    ),
+                    DataType::Int64 => legacy
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(row),
+                    _ => panic!("foreign signed result"),
+                };
+                assert_eq!(value_at, value);
+            }
+            ArithmeticRowResult::Float(value) => {
+                assert!(!legacy.is_null(row));
+                assert_eq!(
+                    legacy
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                        .value(row)
+                        .to_bits(),
+                    value.to_bits()
+                );
+            }
+            ArithmeticRowResult::LargeInt(_)
+            | ArithmeticRowResult::Decimal128(_)
+            | ArithmeticRowResult::Decimal256(_) => {
+                panic!("foreign result in signed legacy oracle")
+            }
+            ArithmeticRowResult::RowError(error) => {
+                panic!("unexpected row error: {}", error.message())
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_signed_arithmetic_oracle_matches_prepared_rows_for_all_frozen_width_pairs() {
+        use ArithmeticOperator::{Add, Divide, Modulo, Multiply, Subtract};
+        for left_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            for right_type in [
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
+            ] {
+                let left = signed_array(&left_type, &[Some(7), Some(-7), None, Some(0)]);
+                let right = signed_array(&right_type, &[Some(3), Some(-3), Some(7), None]);
+                for op in [Add, Subtract, Multiply, Divide, Modulo] {
+                    let (arena, id, chunk, recipe) = fixture(
+                        op,
+                        left.clone(),
+                        right.clone(),
+                        DecimalOverflowPolicy::OutputNull,
+                        false,
+                    );
+                    let legacy = arena.eval(id, &chunk).unwrap();
+                    assert_eq!(legacy.data_type(), &recipe.result_type().data_type);
+                    for row in 0..left.len() {
+                        assert_same_row(&legacy, row, prepared_row(&recipe, &left, &right, row));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_signed_fault_oracle_distinguishes_whole_batch_errors_from_prepared_row_errors() {
+        use ArithmeticOperator::{Add, Divide, Modulo, Multiply, Subtract};
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ] {
+            for allow in [false, true] {
+                for (op, lhs, rhs) in [
+                    (Add, i64::MAX, 1),
+                    (Subtract, i64::MIN, 1),
+                    (Multiply, i64::MAX, 2),
+                    (Modulo, 7, 0),
+                ] {
+                    let left = signed_array(&DataType::Int64, &[None, Some(lhs)]);
+                    let right = signed_array(&DataType::Int64, &[Some(rhs), Some(rhs)]);
+                    let (arena, id, chunk, recipe) =
+                        fixture(op, left.clone(), right.clone(), policy, allow);
+                    // The legacy Arrow kernel fails the batch; the selected recipe
+                    // retains the same diagnostic at the actual required row.
+                    let legacy_error = arena.eval(id, &chunk).unwrap_err();
+                    assert_eq!(
+                        prepared_row(&recipe, &left, &right, 0),
+                        ArithmeticRowResult::Null
+                    );
+                    let ArithmeticRowResult::RowError(error) =
+                        prepared_row(&recipe, &left, &right, 1)
+                    else {
+                        panic!("required signed fault disappeared");
+                    };
+                    assert_eq!(error.selected_ordinal(), 1);
+                    assert!(legacy_error.contains(error.message()), "{legacy_error}");
+                    let masked_left = signed_array(&DataType::Int64, &[None]);
+                    let masked_right = signed_array(&DataType::Int64, &[Some(rhs)]);
+                    let (arena, id, chunk, recipe) =
+                        fixture(op, masked_left.clone(), masked_right.clone(), policy, allow);
+                    let masked = arena.eval(id, &chunk).unwrap();
+                    assert_same_row(
+                        &masked,
+                        0,
+                        prepared_row(&recipe, &masked_left, &masked_right, 0),
+                    );
+                }
+                let left =
+                    signed_array(&DataType::Int64, &[Some(7), Some(i64::MIN), Some(7), None]);
+                let right = signed_array(&DataType::Int64, &[Some(0), Some(-1), Some(2), Some(0)]);
+                let (arena, id, chunk, recipe) =
+                    fixture(Divide, left.clone(), right.clone(), policy, allow);
+                let legacy = arena.eval(id, &chunk).unwrap();
+                assert_eq!(legacy.data_type(), &DataType::Float64);
+                let values = legacy.as_any().downcast_ref::<Float64Array>().unwrap();
+                assert!(values.is_null(0));
+                assert_eq!(
+                    values.value(1).to_bits(),
+                    9_223_372_036_854_775_808.0_f64.to_bits()
+                );
+                assert_eq!(values.value(2), 3.5);
+                assert!(values.is_null(3));
+                for row in 0..left.len() {
+                    assert_same_row(&legacy, row, prepared_row(&recipe, &left, &right, row));
+                }
+            }
+        }
+    }
+}
+#[cfg(test)]
+#[path = "arithmetic_decimal_oracle_tests.rs"]
+mod arithmetic_decimal_oracle_tests;
+
+#[cfg(test)]
+#[path = "arithmetic_largeint_oracle_tests.rs"]
+mod arithmetic_largeint_oracle_tests;

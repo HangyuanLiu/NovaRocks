@@ -16,9 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, StringArray};
-use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
-use std::sync::Arc;
+use arrow::array::ArrayRef;
+use novarocks_functions::builtin::sha2_shared;
 
 pub fn eval_sha2(
     arena: &ExprArena,
@@ -29,41 +28,5 @@ pub fn eval_sha2(
     let _ = expr;
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "sha2", 0)?;
     let length = super::common::to_i64_array(&arena.eval(args[1], chunk)?, "sha2", 1)?;
-
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
-        if input.is_null(row) || length.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let hash_len = length.value(row);
-        let bytes = input.bytes(row);
-        let digest = match hash_len {
-            224 => {
-                let mut h = Sha224::new();
-                h.update(bytes);
-                Some(hex::encode(h.finalize()))
-            }
-            0 | 256 => {
-                let mut h = Sha256::new();
-                h.update(bytes);
-                Some(hex::encode(h.finalize()))
-            }
-            384 => {
-                let mut h = Sha384::new();
-                h.update(bytes);
-                Some(hex::encode(h.finalize()))
-            }
-            512 => {
-                let mut h = Sha512::new();
-                h.update(bytes);
-                Some(hex::encode(h.finalize()))
-            }
-            _ => None,
-        };
-        out.push(digest);
-    }
-
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    Ok(sha2_shared::evaluate_legacy(&input, &length, chunk.len()))
 }

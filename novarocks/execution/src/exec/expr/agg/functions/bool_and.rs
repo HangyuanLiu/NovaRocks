@@ -21,7 +21,6 @@ use crate::exec::node::aggregate::AggFunction;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::build_bool_array;
 
 pub(super) struct BoolAndAgg;
 
@@ -106,26 +105,15 @@ impl AggregateFunction for BoolAndAgg {
     }
     fn update_batch(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        let AggInputView::Bool(arr) = input else {
-            return Err("bool_and batch input type mismatch".to_string());
-        };
-        for (row, &base) in state_ptrs.iter().enumerate() {
-            // bool_and over raw input rows should treat NULL as true (the
-            // multiplicative identity) while preserving the fact that the
-            // group has seen at least one row.
-            let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut BoolState) };
-            state.has_value = true;
-            if arr.is_null(row) {
-                continue;
-            }
-            state.value = state.value && arr.value(row);
+        if !matches!(input, AggInputView::Bool(_)) {
+            return Err("bool_and batch input type mismatch".to_owned());
         }
-        Ok(())
+        super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
 
     fn merge_batch(
@@ -135,29 +123,20 @@ impl AggregateFunction for BoolAndAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        let AggInputView::Bool(arr) = input else {
-            return Err("bool_and merge input type mismatch".to_string());
-        };
-        for (row, &base) in state_ptrs.iter().enumerate() {
-            if arr.is_null(row) {
-                continue;
-            }
-            let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut BoolState) };
-            state.has_value = true;
-            state.value = state.value && arr.value(row);
+        if !matches!(input, AggInputView::Bool(_)) {
+            return Err("bool_and merge input type mismatch".to_owned());
         }
-        let _ = spec;
-        Ok(())
+        super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
 
     fn build_array(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         group_states: &[AggStatePtr],
-        _output_intermediate: bool,
+        output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        build_bool_array(offset, group_states)
+        super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
 }
 

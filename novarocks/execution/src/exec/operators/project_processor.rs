@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -96,6 +98,8 @@ fn projected_chunk_schema(
 ) -> Result<ChunkSchemaRef, String> {
     let schema = if let Some(source) = declared.schema_metadata_origin() {
         ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+    } else if let Some(source) = declared.metadata_materializations() {
+        ChunkSchema::try_new_with_original_schema_metadata(slots, source)?
     } else {
         ChunkSchema::try_new_with_schema_metadata(
             slots,
@@ -166,6 +170,212 @@ fn slots_adjusted_for_actual_nullability(
 }
 
 /// Factory for projection processors that evaluate expression lists into projected chunks.
+pub(crate) fn validate_final_result_identity_input_source(
+    chunk: &Chunk,
+    output: &ChunkSchema,
+    identity_layout: bool,
+    pair_count: usize,
+    pairs: impl Iterator<Item = Result<(SlotId, SlotId), String>>,
+) -> Result<(), String> {
+    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+
+    fn marker(field: &arrow::datatypes::Field) -> Result<Option<LogicalType>, String> {
+        let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
+            return Ok(None);
+        };
+        let value = value.trim();
+        for domain in [
+            LogicalType::Json,
+            LogicalType::Hll,
+            LogicalType::Bitmap,
+            LogicalType::Object,
+            LogicalType::Percentile,
+        ] {
+            if value.eq_ignore_ascii_case(domain.metadata_value()) {
+                return Ok(Some(domain));
+            }
+        }
+        Err("final result input contains an unknown logical domain marker".into())
+    }
+
+    fn check_field(
+        source: &arrow::datatypes::Field,
+        target: &arrow::datatypes::Field,
+    ) -> Result<(), String> {
+        let actual = marker(source)?;
+        let expected = marker(target)?;
+        if actual.is_some() && actual != expected {
+            return Err("final result input logical domain differs from output domain".into());
+        }
+        check_type(source.data_type(), target.data_type())
+    }
+
+    fn check_type(source: &DataType, target: &DataType) -> Result<(), String> {
+        use DataType as D;
+        match (source, target) {
+            (D::Dictionary(_, _), D::Utf8) if is_final_result_string_dictionary(source) => Ok(()),
+            (D::List(source), D::List(target)) | (D::LargeList(source), D::LargeList(target)) => {
+                check_field(source, target)
+            }
+            (D::FixedSizeList(source, sw), D::FixedSizeList(target, tw)) if sw == tw => {
+                check_field(source, target)
+            }
+            (D::Map(source, so), D::Map(target, to)) if so == to => check_field(source, target),
+            (D::Struct(source), D::Struct(target)) if source.len() == target.len() => {
+                for (source, target) in source.iter().zip(target) {
+                    check_field(source, target)?;
+                }
+                Ok(())
+            }
+            (
+                D::List(_) | D::LargeList(_) | D::FixedSizeList(_, _) | D::Map(_, _) | D::Struct(_),
+                _,
+            )
+            | (
+                _,
+                D::List(_) | D::LargeList(_) | D::FixedSizeList(_, _) | D::Map(_, _) | D::Struct(_),
+            ) => Err("final result input carrier differs from output carrier".into()),
+            // Native result descriptors do not admit these opaque recursive carriers.
+            (D::Union(_, _) | D::RunEndEncoded(_, _), _)
+            | (_, D::Union(_, _) | D::RunEndEncoded(_, _)) => {
+                Err("final result input carrier differs from output carrier".into())
+            }
+            _ if source == target => Ok(()),
+            _ => Err("final result input carrier differs from output carrier".into()),
+        }
+    }
+
+    fn check_cached(
+        source: &crate::exec::chunk::ChunkFieldSchema,
+        target: &arrow::datatypes::Field,
+    ) -> Result<(), String> {
+        let actual = source.logical_type();
+        if actual.is_some() && actual != marker(target)? {
+            return Err("final result input logical domain differs from output domain".into());
+        }
+        if source.children().is_empty() {
+            return Ok(());
+        }
+        match target.data_type() {
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _)
+                if source.children().len() == 1 =>
+            {
+                check_cached(&source.children()[0], child)
+            }
+            DataType::Struct(children) if children.len() == source.children().len() => {
+                for (source, target) in source.children().iter().zip(children) {
+                    check_cached(source, target)?;
+                }
+                Ok(())
+            }
+            DataType::Map(entries, _) => {
+                let DataType::Struct(children) = entries.data_type() else {
+                    return Err(
+                        "final result input cached field shape differs from output shape".into(),
+                    );
+                };
+                if children.len() != 2 || source.children().len() != 2 {
+                    return Err(
+                        "final result input cached field shape differs from output shape".into(),
+                    );
+                }
+                for (source, target) in source.children().iter().zip(children) {
+                    check_cached(source, target)?;
+                }
+                Ok(())
+            }
+            _ => Err("final result input cached field shape differs from output shape".into()),
+        }
+    }
+
+    if !identity_layout || pair_count != output.slots().len() {
+        return Err("final result input validation requires an identity output layout".into());
+    }
+    let batch_schema = chunk.batch.schema();
+    for (pair, target) in pairs.zip(output.slots()) {
+        let (source_slot, output_slot) = pair?;
+        if output_slot != target.slot_id() || source_slot != output_slot {
+            return Err("final result input validation requires exact identity slots".into());
+        }
+        let expected = marker(target.field())?;
+        if target.field_schema().logical_type() != expected {
+            return Err("final result output contains conflicting logical domain facts".into());
+        }
+        let index = chunk
+            .slot_id_to_index()
+            .get(&source_slot)
+            .copied()
+            .ok_or("final result input source slot is missing")?;
+        let actual_field = batch_schema
+            .fields()
+            .get(index)
+            .ok_or("final result input batch field is missing")?;
+        let actual_slot = chunk
+            .chunk_schema()
+            .slot(source_slot)
+            .ok_or("final result input slot field is missing")?;
+        check_field(actual_field, target.field())?;
+        check_field(actual_slot.field(), target.field())?;
+        let array = chunk
+            .columns()
+            .get(index)
+            .ok_or("final result input array is missing")?;
+        check_type(array.data_type(), target.data_type())?;
+        check_cached(actual_slot.field_schema(), target.field())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn materialize_project_output(
+    final_columns: Vec<ArrayRef>,
+    output_chunk_schema: &ChunkSchema,
+    validate_final_result_input: bool,
+) -> Result<Chunk, String> {
+    // Infer schema from final columns
+    if output_chunk_schema.slot_ids().len() != final_columns.len() {
+        return Err(format!(
+            "project output slots mismatch: slots={} columns={}",
+            output_chunk_schema.slot_ids().len(),
+            final_columns.len()
+        ));
+    }
+
+    let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(final_columns.len());
+    let mut slots = Vec::with_capacity(final_columns.len());
+    for (array, slot_id) in final_columns.iter().zip(output_chunk_schema.slot_ids()) {
+        let declared = output_chunk_schema
+            .slot(*slot_id)
+            .ok_or_else(|| format!("project output slot {slot_id} is missing"))?;
+        let array = cast_project_output_to_slot(
+            Arc::clone(array),
+            Some(declared),
+            validate_final_result_input,
+        )?;
+        let field_type = if declared.data_type() == &DataType::Utf8
+            && (is_supported_i32_string_dictionary(array.data_type())
+                || (validate_final_result_input
+                    && is_final_result_string_dictionary(array.data_type())))
+        {
+            array.data_type()
+        } else {
+            declared.data_type()
+        };
+        slots.push(projected_slot_schema(
+            declared,
+            *slot_id,
+            field_type,
+            array.null_count() > 0,
+        )?);
+        output_columns.push(array);
+    }
+    let output_chunk_schema = projected_chunk_schema(slots, &output_chunk_schema)?;
+
+    Chunk::try_new_with_columns(output_chunk_schema, output_columns)
+        .map_err(|e| format!("Failed to create output batch: {}", e))
+}
+
 pub struct ProjectProcessorFactory {
     name: String,
     arena: Arc<ExprArena>,
@@ -310,19 +520,21 @@ impl ProcessorOperator for ProjectProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         if self.pending_output.is_some() {
-            return Err("project received input while output buffer is full".to_string());
+            return Err("project received input while output buffer is full"
+                .to_string()
+                .into());
         }
         let out = self.process_one(chunk)?;
         self.pending_output = out;
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if self.finishing && self.pending_output.is_none() {
             self.finished = true;
@@ -330,7 +542,7 @@ impl ProcessorOperator for ProjectProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.pending_output.is_none() {
             self.finished = true;
@@ -393,176 +605,19 @@ impl ProjectProcessorOperator {
     }
 
     fn validate_final_result_identity_input(&self, chunk: &Chunk) -> Result<(), String> {
-        use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
-
-        fn marker(field: &arrow::datatypes::Field) -> Result<Option<LogicalType>, String> {
-            let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
-                return Ok(None);
-            };
-            let value = value.trim();
-            for domain in [
-                LogicalType::Json,
-                LogicalType::Hll,
-                LogicalType::Bitmap,
-                LogicalType::Object,
-                LogicalType::Percentile,
-            ] {
-                if value.eq_ignore_ascii_case(domain.metadata_value()) {
-                    return Ok(Some(domain));
-                }
-            }
-            Err("final result input contains an unknown logical domain marker".into())
-        }
-
-        fn check_field(
-            source: &arrow::datatypes::Field,
-            target: &arrow::datatypes::Field,
-        ) -> Result<(), String> {
-            let actual = marker(source)?;
-            let expected = marker(target)?;
-            if actual.is_some() && actual != expected {
-                return Err("final result input logical domain differs from output domain".into());
-            }
-            check_type(source.data_type(), target.data_type())
-        }
-
-        fn check_type(source: &DataType, target: &DataType) -> Result<(), String> {
-            use DataType as D;
-            match (source, target) {
-                (D::Dictionary(_, _), D::Utf8) if is_final_result_string_dictionary(source) => {
-                    Ok(())
-                }
-                (D::List(source), D::List(target))
-                | (D::LargeList(source), D::LargeList(target)) => check_field(source, target),
-                (D::FixedSizeList(source, sw), D::FixedSizeList(target, tw)) if sw == tw => {
-                    check_field(source, target)
-                }
-                (D::Map(source, so), D::Map(target, to)) if so == to => check_field(source, target),
-                (D::Struct(source), D::Struct(target)) if source.len() == target.len() => {
-                    for (source, target) in source.iter().zip(target) {
-                        check_field(source, target)?;
-                    }
-                    Ok(())
-                }
-                (
-                    D::List(_)
-                    | D::LargeList(_)
-                    | D::FixedSizeList(_, _)
-                    | D::Map(_, _)
-                    | D::Struct(_),
-                    _,
-                )
-                | (
-                    _,
-                    D::List(_)
-                    | D::LargeList(_)
-                    | D::FixedSizeList(_, _)
-                    | D::Map(_, _)
-                    | D::Struct(_),
-                ) => Err("final result input carrier differs from output carrier".into()),
-                // Native result descriptors do not admit these opaque recursive carriers.
-                (D::Union(_, _) | D::RunEndEncoded(_, _), _)
-                | (_, D::Union(_, _) | D::RunEndEncoded(_, _)) => {
-                    Err("final result input carrier differs from output carrier".into())
-                }
-                _ if source == target => Ok(()),
-                _ => Err("final result input carrier differs from output carrier".into()),
-            }
-        }
-
-        fn check_cached(
-            source: &crate::exec::chunk::ChunkFieldSchema,
-            target: &arrow::datatypes::Field,
-        ) -> Result<(), String> {
-            let actual = source.logical_type();
-            if actual.is_some() && actual != marker(target)? {
-                return Err("final result input logical domain differs from output domain".into());
-            }
-            if source.children().is_empty() {
-                return Ok(());
-            }
-            match target.data_type() {
-                DataType::List(child)
-                | DataType::LargeList(child)
-                | DataType::FixedSizeList(child, _)
-                    if source.children().len() == 1 =>
-                {
-                    check_cached(&source.children()[0], child)
-                }
-                DataType::Struct(children) if children.len() == source.children().len() => {
-                    for (source, target) in source.children().iter().zip(children) {
-                        check_cached(source, target)?;
-                    }
-                    Ok(())
-                }
-                DataType::Map(entries, _) => {
-                    let DataType::Struct(children) = entries.data_type() else {
-                        return Err(
-                            "final result input cached field shape differs from output shape"
-                                .into(),
-                        );
-                    };
-                    if children.len() != 2 || source.children().len() != 2 {
-                        return Err(
-                            "final result input cached field shape differs from output shape"
-                                .into(),
-                        );
-                    }
-                    for (source, target) in source.children().iter().zip(children) {
-                        check_cached(source, target)?;
-                    }
-                    Ok(())
-                }
-                _ => Err("final result input cached field shape differs from output shape".into()),
-            }
-        }
-
-        if self.output_indices.is_some()
-            || self.exprs.len() != self.expr_slot_ids.len()
-            || self.exprs.len() != self.output_chunk_schema.slots().len()
-        {
-            return Err("final result input validation requires an identity output layout".into());
-        }
-        let batch_schema = chunk.batch.schema();
-        for ((expr, output_slot), target) in self
-            .exprs
-            .iter()
-            .zip(&self.expr_slot_ids)
-            .zip(self.output_chunk_schema.slots())
-        {
-            let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr) else {
-                return Err("final result input validation requires identity expressions".into());
-            };
-            if output_slot != &target.slot_id() || source_slot != output_slot {
-                return Err("final result input validation requires exact identity slots".into());
-            }
-            let expected = marker(target.field())?;
-            if target.field_schema().logical_type() != expected {
-                return Err("final result output contains conflicting logical domain facts".into());
-            }
-            let index = chunk
-                .slot_id_to_index()
-                .get(source_slot)
-                .copied()
-                .ok_or("final result input source slot is missing")?;
-            let actual_field = batch_schema
-                .fields()
-                .get(index)
-                .ok_or("final result input batch field is missing")?;
-            let actual_slot = chunk
-                .chunk_schema()
-                .slot(*source_slot)
-                .ok_or("final result input slot field is missing")?;
-            check_field(actual_field, target.field())?;
-            check_field(actual_slot.field(), target.field())?;
-            let array = chunk
-                .columns()
-                .get(index)
-                .ok_or("final result input array is missing")?;
-            check_type(array.data_type(), target.data_type())?;
-            check_cached(actual_slot.field_schema(), target.field())?;
-        }
-        Ok(())
+        validate_final_result_identity_input_source(
+            chunk,
+            &self.output_chunk_schema,
+            self.output_indices.is_none() && self.exprs.len() == self.expr_slot_ids.len(),
+            self.exprs.len(),
+            self.exprs
+                .iter()
+                .zip(&self.expr_slot_ids)
+                .map(|(expr, output)| match self.arena.node(*expr) {
+                    Some(ExprNode::SlotId(source)) => Ok((*source, *output)),
+                    _ => Err("final result input validation requires identity expressions".into()),
+                }),
+        )
     }
 
     fn process_one(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
@@ -683,53 +738,12 @@ impl ProjectProcessorOperator {
             computed_columns
         };
 
-        // Infer schema from final columns
-        if self.output_chunk_schema.slot_ids().len() != final_columns.len() {
-            return Err(format!(
-                "project output slots mismatch: slots={} columns={}",
-                self.output_chunk_schema.slot_ids().len(),
-                final_columns.len()
-            ));
-        }
-
-        let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(final_columns.len());
-        let mut slots = Vec::with_capacity(final_columns.len());
-        for (array, slot_id) in final_columns
-            .iter()
-            .zip(self.output_chunk_schema.slot_ids())
-        {
-            let declared = self
-                .output_chunk_schema
-                .slot(*slot_id)
-                .ok_or_else(|| format!("project output slot {slot_id} is missing"))?;
-            let array = cast_project_output_to_slot(
-                Arc::clone(array),
-                Some(declared),
-                self.validate_final_result_input,
-            )?;
-            let field_type = if declared.data_type() == &DataType::Utf8
-                && (is_supported_i32_string_dictionary(array.data_type())
-                    || (self.validate_final_result_input
-                        && is_final_result_string_dictionary(array.data_type())))
-            {
-                array.data_type()
-            } else {
-                declared.data_type()
-            };
-            slots.push(projected_slot_schema(
-                declared,
-                *slot_id,
-                field_type,
-                array.null_count() > 0,
-            )?);
-            output_columns.push(array);
-        }
-        let output_chunk_schema = projected_chunk_schema(slots, &self.output_chunk_schema)?;
-
-        Ok(Some(
-            Chunk::try_new_with_columns(output_chunk_schema, output_columns)
-                .map_err(|e| format!("Failed to create output batch: {}", e))?,
-        ))
+        materialize_project_output(
+            final_columns,
+            &self.output_chunk_schema,
+            self.validate_final_result_input,
+        )
+        .map(Some)
     }
 
     fn empty_output_chunk(&self) -> Result<Chunk, String> {
@@ -2038,6 +2052,6 @@ mod tests {
                 final_binary_input(Some("hll"), None, None, false),
             )
             .unwrap_err();
-        assert!(error.contains("logical domain differs"), "{error}");
+        assert!(error.to_string().contains("logical domain differs"), "{error}");
     }
 }

@@ -1079,6 +1079,11 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
         frozen.get_field_by_name("plan_version").unwrap().kind(),
         prost_reflect::Kind::Bytes
     ));
+    // The compiled-package carrier is opaque bytes, never a nested message:
+    // decoding it must wait for the receiver's generated resource preflight.
+    let package = frozen.get_field_by_name("package").expect("package");
+    assert_eq!(package.number(), 7);
+    assert!(matches!(package.kind(), prost_reflect::Kind::Bytes));
     assert!(frozen.get_field_by_name("instance_params").is_none());
     // The empty provider requirement placeholder is retired with its number
     // and name. A later requirement carrier must use a new field.

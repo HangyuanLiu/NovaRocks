@@ -26,6 +26,7 @@ use super::predicate_apply_util::lift_correlated_inner_opt;
 use super::scalar_utils;
 use crate::common::ApplyKind;
 use crate::common::JoinKind;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::{ApplyOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -59,10 +60,14 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
         matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, &mut arena)? {
+        match apply_expr(expr, &mut arena, &ctx.control_view())? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -80,7 +85,11 @@ fn apply_payload_after_pattern_gate(expr: &OptExpr) -> &ApplyOp {
     apply
 }
 
-fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
+fn apply_expr(
+    expr: OptExpr,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -105,9 +114,13 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
     };
 
     let (right, condition) = if a.correlation_column_ids.is_empty() {
-        (apply_right, scalar_utils::bool_literal(arena, true))
+        (
+            apply_right,
+            scalar_utils::bool_literal(arena, true, control)?,
+        )
     } else {
-        let Some(lifted) = lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena)
+        let Some(lifted) =
+            lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena, control)?
         else {
             return Ok(None);
         };
@@ -155,7 +168,7 @@ mod tests {
     const EXISTS_OUT: ColumnId = ColumnId(3);
     const CONST_ONE: ColumnId = ColumnId(4);
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
@@ -169,8 +182,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+
             is_internal: false,
         }
     }
@@ -210,16 +223,14 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn bool_expr() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -227,8 +238,8 @@ mod tests {
         OutputColumn {
             column_id: EXISTS_OUT,
             name: "exists".to_string(),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             is_internal: true,
         }
     }
@@ -241,8 +252,7 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -273,8 +283,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "1".to_string(),
                     output_column_id: CONST_ONE,
@@ -346,7 +358,13 @@ mod tests {
         let expr = to_opt_expr(&scan("outer", OUTER_K), &mut ctx);
 
         assert!(
-            bind_tree(&rule.pattern(), &expr).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "ExistentialApplyToJoin pattern must only match Apply roots"
         );
     }
@@ -396,8 +414,8 @@ mod tests {
             condition.kind,
             ExprKind::Literal(LiteralValue::Bool(true))
         ));
-        assert_eq!(condition.data_type, DataType::Boolean);
-        assert!(!condition.nullable);
+        assert_eq!(condition.value_type.data_type, DataType::Boolean);
+        assert!(!condition.value_type.nullable);
     }
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {

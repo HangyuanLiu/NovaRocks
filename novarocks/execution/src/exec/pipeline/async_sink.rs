@@ -28,6 +28,8 @@
 //! Concrete sinks implement only `AsyncSinkBackend`; `AsyncSinkOperator<B>`
 //! wraps them and is the single place the contract is implemented.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -50,7 +52,7 @@ pub trait AsyncSinkBackend: Send + 'static {
     /// Observe the runtime state before the backend is moved to the `sink_io`
     /// task. Backends that publish side-channel metadata can clone the pieces
     /// they need here without extending the per-chunk driver contract.
-    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 
@@ -181,12 +183,12 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
         &self.name
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         let _ = state;
         Ok(())
     }
 
-    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if self.join.is_some() {
             return Ok(());
         }
@@ -283,9 +285,9 @@ impl<B: AsyncSinkBackend> ProcessorOperator for AsyncSinkOperator<B> {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         let Some(sender) = self.sender.as_ref() else {
-            return Err("async sink push after finishing/cancel".to_string());
+            return Err("async sink push after finishing/cancel".to_string().into());
         };
         self.shared.queued.fetch_add(1, Ordering::AcqRel);
         match sender.try_send(chunk) {
@@ -293,16 +295,16 @@ impl<B: AsyncSinkBackend> ProcessorOperator for AsyncSinkOperator<B> {
             Err(e) => {
                 // need_input gates this; a Full/closed here is a contract bug.
                 self.shared.queued.fetch_sub(1, Ordering::AcqRel);
-                Err(format!("async sink enqueue failed: {e}"))
+                Err(format!("async sink enqueue failed: {e}").into())
             }
         }
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         self.sender = None; // drop sender → background sees recv()==None → finish()
         Ok(())
@@ -380,7 +382,7 @@ mod tests {
     impl AsyncSinkBackend for TestAsyncSink {
         type Output = usize;
 
-        fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.binds.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
@@ -490,6 +492,7 @@ mod tests {
             state
                 .error()
                 .expect("panic error")
+                .detail()
                 .contains("async sink actor panicked: injected sink panic")
         );
         assert!(op.is_finished());
@@ -714,7 +717,7 @@ mod tests {
         );
         assert!(!op.need_input(), "errored sink must stop accepting input");
         assert!(
-            state.error().unwrap().contains("forced failure"),
+            state.error().unwrap().detail().contains("forced failure"),
             "unexpected error text"
         );
     }
@@ -815,10 +818,10 @@ mod tests {
         fn has_output(&self) -> bool {
             self.remaining > 0
         }
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-            Err("source does not accept input".to_string())
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+            Err("source does not accept input".to_string().into())
         }
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             if self.remaining == 0 {
                 self.finished = true;
                 return Ok(None);
@@ -829,7 +832,7 @@ mod tests {
             }
             Ok(Some(make_chunk(1)))
         }
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.finished = true;
             Ok(())
         }

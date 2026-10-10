@@ -19,7 +19,6 @@ use std::fmt;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::DataType;
 use datasketches::hash::value::raw_bytes;
@@ -30,12 +29,19 @@ use novarocks_functions::{
     AggregateBindOptions, AggregateImplementationIdentity, AggregateInputBatch,
     AggregateOverloadDeclaration, AggregateOverloadIdentity, AggregateStateFormatIdentity,
     AggregateStateMemoryPolicy, EngineFunctionCatalogBuilder, FunctionBundleContributor,
-    FunctionCatalogError, FunctionResolutionError, FunctionVisibility, FunctionVolatility,
-    ResolvedAggregateSignature, TypedAggregateFamily, TypedAggregateKernel,
-    TypedAggregateRegistration,
+    FunctionCatalogError, FunctionResolutionError, FunctionValueType, FunctionVisibility,
+    FunctionVolatility, ResolvedAggregateSignature, TypedAggregateFamily, TypedAggregateKernel,
+    TypedAggregateRegistration, ValueLogicalType,
 };
 
 use crate::canonical::{CanonicalKind, PreparedCanonicalBatch, canonical_width};
+
+#[path = "theta_pure.rs"]
+mod pure;
+pub use pure::{
+    PreparedThetaKernel, THETA_EMISSION_LIBRARY_REQUEST_BYTES, ThetaOutputResourceFacts,
+    iceberg_theta_pure_definition, theta_output_resource_facts,
+};
 
 pub const ICEBERG_THETA_AGGREGATE_NAME: &str = "$iceberg_theta_stat";
 pub const ICEBERG_THETA_STATE_FORMAT_IDENTITY: &str =
@@ -77,6 +83,8 @@ pub enum IcebergThetaError {
     CompactTooLarge { actual: usize, maximum: usize },
     MixedUpdateAndMerge,
     Sketch(String),
+    OutputResourceExhausted,
+    InvalidOutputExtent,
 }
 
 impl fmt::Display for IcebergThetaError {
@@ -110,6 +118,12 @@ impl fmt::Display for IcebergThetaError {
                 "Iceberg Theta state cannot mix raw updates and compact merges in one phase",
             ),
             Self::Sketch(message) => formatter.write_str(message),
+            Self::OutputResourceExhausted => {
+                formatter.write_str("Iceberg Theta output resources were exhausted")
+            }
+            Self::InvalidOutputExtent => {
+                formatter.write_str("Iceberg Theta output iterator or Binary extent is invalid")
+            }
         }
     }
 }
@@ -157,26 +171,11 @@ impl IcebergThetaAggregateFamily {
             overloads: overloads.into_boxed_slice(),
         })
     }
-}
 
-impl TypedAggregateFamily for IcebergThetaAggregateFamily {
-    type Kernel = IcebergThetaKernel;
-    type PrepareError = IcebergThetaError;
-
-    fn overloads(&self) -> &[AggregateOverloadDeclaration] {
-        &self.overloads
-    }
-
-    /// A Theta sketch always has an answer: a group with no rows produces the
-    /// canonical empty sketch, not the absence of one.
-    fn produces_null(&self) -> bool {
-        false
-    }
-
-    fn resolve_signature(
+    fn canonical_argument<'a>(
         &self,
-        argument_types: &[DataType],
-    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        argument_types: &'a [DataType],
+    ) -> Result<(&'a DataType, CanonicalKind), FunctionResolutionError> {
         let [argument_type] = argument_types else {
             return Err(FunctionResolutionError::NoMatchingSignature {
                 candidates: self.overloads.len(),
@@ -189,6 +188,14 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
                 binding_enforced: true,
             }
         })?;
+        Ok((argument_type, kind))
+    }
+
+    fn materialize_signature(
+        &self,
+        argument_type: &DataType,
+        kind: CanonicalKind,
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
         Ok(ResolvedAggregateSignature {
             overload: AggregateOverloadIdentity::try_new(overload_identity(kind))
                 .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
@@ -201,6 +208,102 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
             .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
         })
     }
+}
+
+impl TypedAggregateFamily for IcebergThetaAggregateFamily {
+    type Kernel = IcebergThetaKernel;
+    type PrepareError = IcebergThetaError;
+
+    fn overloads(&self) -> &[AggregateOverloadDeclaration] {
+        &self.overloads
+    }
+
+    fn state_argument_contract(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_functions::AggregateStateArgumentContract, FunctionResolutionError> {
+        if !self
+            .overloads
+            .iter()
+            .any(|overload| overload.identity == *selected_overload)
+        {
+            return Err(FunctionResolutionError::BadSignature(
+                "Iceberg Theta state contract references a foreign overload".into(),
+            ));
+        }
+        // Canonical update and compact merge skip physical NULL roots. Only
+        // logical Value root nullability is independent; all other metadata
+        // and the original state format remain exact.
+        Ok(novarocks_functions::AggregateStateArgumentContract::ValueRootNullabilityIndependent)
+    }
+
+    /// A Theta sketch always has an answer: a group with no rows produces the
+    /// canonical empty sketch, not the absence of one.
+    fn produces_null(&self) -> bool {
+        false
+    }
+
+    fn validate_value_arguments(
+        &self,
+        arguments: &[FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        let [argument] = arguments else {
+            return Err(FunctionResolutionError::NoMatchingSignature {
+                candidates: self.overloads.len(),
+                binding_enforced: true,
+            });
+        };
+        argument
+            .validate()
+            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
+        match argument.logical_type {
+            ValueLogicalType::Physical => {}
+            // Iceberg UUID uses its exact raw 16 bytes. This grants no
+            // numeric meaning to the fixed-binary carrier. LARGEINT statistics
+            // retain the existing storage-byte policy as well.
+            ValueLogicalType::Uuid | ValueLogicalType::LargeInt
+                if argument.data_type == DataType::FixedSizeBinary(16) => {}
+            // These source-declared opaque domains retain the original raw
+            // serialized-byte statistics policy, without interpreting them.
+            ValueLogicalType::Hll | ValueLogicalType::Bitmap
+                if argument.data_type == DataType::Binary => {}
+            // Existing Iceberg VARIANT statistics hash the serialized raw
+            // bytes. This preserves that source-authored domain without
+            // parsing it or deriving identity from a LargeBinary carrier.
+            ValueLogicalType::Variant if argument.data_type == DataType::LargeBinary => {}
+            _ => {
+                return Err(FunctionResolutionError::BadSignature(format!(
+                    "Iceberg Theta does not support input value domain {argument:?}"
+                )));
+            }
+        }
+        // The original canonical family remains the sole carrier admission
+        // rule, including fixed width, decimal shape, and temporal units.
+        self.canonical_argument(std::slice::from_ref(&argument.data_type))
+            .map(|_| ())
+    }
+
+    fn resolve_signature(
+        &self,
+        argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let (argument_type, kind) = self.canonical_argument(argument_types)?;
+        self.materialize_signature(argument_type, kind)
+    }
+
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let (argument_type, kind) = self.canonical_argument(argument_types)?;
+        if selected_overload.as_str() != overload_identity(kind) {
+            return Err(FunctionResolutionError::BadSignature(
+                "Iceberg Theta update carrier differs from the selected overload".into(),
+            ));
+        }
+        self.materialize_signature(argument_type, kind)
+    }
 
     fn prepare(
         &self,
@@ -208,7 +311,7 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
         options: &AggregateBindOptions,
     ) -> Result<Self::Kernel, Self::PrepareError> {
         let expected = self
-            .resolve_signature(&selected.argument_types)
+            .resolve_update_signature(&selected.overload, &selected.argument_types)
             .map_err(|_| IcebergThetaError::InvalidResolvedSignature)?;
         if expected != *selected {
             return Err(IcebergThetaError::InvalidResolvedSignature);
@@ -379,6 +482,11 @@ impl FunctionBundleContributor for IcebergFunctionBundle {
 
 pub fn iceberg_theta_registration()
 -> Result<TypedAggregateRegistration<IcebergThetaAggregateFamily>, FunctionCatalogError> {
+    pure::attach_registration(metadata_registration()?)
+}
+
+fn metadata_registration()
+-> Result<TypedAggregateRegistration<IcebergThetaAggregateFamily>, FunctionCatalogError> {
     TypedAggregateRegistration::try_new(
         ICEBERG_THETA_AGGREGATE_NAME,
         FunctionVisibility::Hidden,
@@ -456,22 +564,12 @@ fn build_output<'state, I>(states: I) -> Result<ArrayRef, IcebergThetaError>
 where
     I: ExactSizeIterator<Item = &'state IcebergThetaState>,
 {
-    let state_count = states.len();
-    // Do not reserve the per-state worst case. Empty and sparse sketches are
-    // common, and Arrow grows this output from the actual serialized bodies.
-    let mut builder = BinaryBuilder::with_capacity(state_count, 0);
-    for state in states {
-        let compact = match &state.mode {
-            ThetaStateMode::Update(_) if !state.has_updates => {
-                builder.append_value(EMPTY_ORDERED_COMPACT_V3);
-                continue;
-            }
-            ThetaStateMode::Update(sketch) => sketch.compact(true),
-            ThetaStateMode::Merge(union) => union.to_sketch(true),
-        };
-        builder.append_value(serialize_canonical_compact(&compact));
-    }
-    Ok(Arc::new(builder.finish()))
+    pure::build_output_observed(states, None).map_err(|error| match error {
+        novarocks_functions::KernelFailure::ResourceExhausted => {
+            IcebergThetaError::OutputResourceExhausted
+        }
+        _ => IcebergThetaError::InvalidOutputExtent,
+    })
 }
 
 #[cfg(test)]
@@ -484,6 +582,21 @@ mod tests {
         TimestampNanosecondArray,
     };
     use novarocks_functions::{EngineFunctionCatalogBuilder, FunctionResolutionError};
+
+    fn compile_control() -> &'static dyn novarocks_type_contract::PureCompileControl {
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _phase: novarocks_type_contract::CompilePhase,
+                _work: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        static CONTROL: Control = Control;
+        &CONTROL
+    }
 
     fn run_update(input: ArrayRef) -> Vec<u8> {
         let kernel = IcebergThetaKernel;
@@ -601,6 +714,325 @@ mod tests {
             resolved.state_format.as_str(),
             ICEBERG_THETA_STATE_FORMAT_IDENTITY
         );
+    }
+
+    fn theta_value_request(
+        arguments: &[novarocks_functions::FunctionArgument],
+    ) -> novarocks_functions::FunctionBindingRequest<'_> {
+        novarocks_functions::FunctionBindingRequest {
+            arguments,
+            logical_argument_count: arguments.len(),
+            expected_result_type: None,
+        }
+    }
+
+    fn theta_value_argument(
+        value_type: FunctionValueType,
+    ) -> novarocks_functions::FunctionArgument {
+        novarocks_functions::FunctionArgument::Value {
+            value_type,
+            constant: None,
+        }
+    }
+
+    #[test]
+    fn exact_uuid_variant_and_physical_bindings_keep_overload_and_state_identity() {
+        use novarocks_functions::{FunctionArgumentType, FunctionKind, FunctionResultType};
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        IcebergFunctionBundle.contribute(&mut builder).unwrap();
+        let catalog = builder.seal().unwrap();
+        for nullable in [false, true] {
+            for (value_type, overload) in [
+                (
+                    FunctionValueType::new(DataType::Int32, nullable),
+                    "iceberg/theta-stat/int/v1",
+                ),
+                (
+                    FunctionValueType::new(DataType::FixedSizeBinary(4), nullable),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::new(DataType::FixedSizeBinary(16), nullable),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::FixedSizeBinary(16),
+                        nullable,
+                        ValueLogicalType::Uuid,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::new(DataType::LargeBinary, nullable),
+                    "iceberg/theta-stat/large-binary/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::LargeBinary,
+                        nullable,
+                        ValueLogicalType::Variant,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/large-binary/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::FixedSizeBinary(16),
+                        nullable,
+                        ValueLogicalType::LargeInt,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::Binary,
+                        nullable,
+                        ValueLogicalType::Hll,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/binary/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::Binary,
+                        nullable,
+                        ValueLogicalType::Bitmap,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/binary/v1",
+                ),
+            ] {
+                let arguments = [theta_value_argument(value_type.clone())];
+                let request = theta_value_request(&arguments);
+                let bound = catalog
+                    .resolve_bound_trusted(
+                        ICEBERG_THETA_AGGREGATE_NAME,
+                        FunctionKind::Aggregate,
+                        request,
+                        compile_control(),
+                    )
+                    .unwrap();
+                catalog
+                    .validate_bound(&bound, request, compile_control())
+                    .unwrap();
+                let exact = catalog
+                    .select_exact_overload_observed(
+                        &bound.function_id,
+                        FunctionKind::Aggregate,
+                        &bound.selected.overload,
+                        request,
+                        compile_control(),
+                    )
+                    .unwrap();
+                assert_eq!(exact.as_ref(), &bound.selected);
+                assert_eq!(
+                    bound.selected.argument_types.as_ref(),
+                    &[FunctionArgumentType::Value(value_type)]
+                );
+                assert_eq!(bound.selected.overload.as_str(), overload);
+                assert_eq!(
+                    bound.selected.result_type,
+                    FunctionResultType::Scalar(FunctionValueType::new(DataType::Binary, false))
+                );
+                let state = bound.selected.aggregate.as_ref().unwrap();
+                assert_eq!(
+                    state.intermediate_type,
+                    FunctionValueType::new(DataType::Binary, false)
+                );
+                assert_eq!(
+                    state.state_format.as_str(),
+                    ICEBERG_THETA_STATE_FORMAT_IDENTITY
+                );
+            }
+        }
+        let registration = iceberg_theta_registration().unwrap();
+        assert_eq!(
+            registration.implementation().as_str(),
+            ICEBERG_THETA_IMPLEMENTATION_IDENTITY
+        );
+        let raw = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert_java_oracle(
+            "uuid",
+            Arc::new(FixedSizeBinaryArray::try_from_iter([raw].into_iter()).unwrap()),
+        );
+    }
+
+    #[test]
+    fn theta_fixed_update_refuses_carrier_reselection_and_forged_preparation() {
+        let family = IcebergThetaAggregateFamily::try_new().unwrap();
+        let int = AggregateOverloadIdentity::try_new("iceberg/theta-stat/int/v1").unwrap();
+        let selected = family
+            .resolve_update_signature(&int, &[DataType::Int32])
+            .unwrap();
+        assert_eq!(
+            selected,
+            family.resolve_signature(&[DataType::Int32]).unwrap()
+        );
+        for actual in [
+            vec![],
+            vec![DataType::Int64],
+            vec![DataType::Int32, DataType::Int32],
+        ] {
+            assert!(family.resolve_update_signature(&int, &actual).is_err());
+        }
+        let foreign = AggregateOverloadIdentity::try_new("foreign/theta-stat/int/v1").unwrap();
+        assert!(
+            family
+                .resolve_update_signature(&foreign, &[DataType::Int32])
+                .is_err()
+        );
+        let mut forged = selected.clone();
+        forged.argument_types = vec![DataType::Int64];
+        assert!(matches!(
+            family.prepare(&forged, &AggregateBindOptions::default()),
+            Err(IcebergThetaError::InvalidResolvedSignature)
+        ));
+        let kernel = family
+            .prepare(&selected, &AggregateBindOptions::default())
+            .unwrap();
+        let state = kernel.create_state().unwrap();
+        assert_eq!(
+            kernel.build_final(std::iter::once(&state)).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn exact_theta_validation_rejects_root_forgery_and_new_logical_domains() {
+        use novarocks_functions::{FunctionArgumentType, FunctionKind};
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        IcebergFunctionBundle.contribute(&mut builder).unwrap();
+        let catalog = builder.seal().unwrap();
+        let uuid = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        let arguments = [theta_value_argument(uuid.clone())];
+        let bound = catalog
+            .resolve_bound_trusted(
+                ICEBERG_THETA_AGGREGATE_NAME,
+                FunctionKind::Aggregate,
+                theta_value_request(&arguments),
+                compile_control(),
+            )
+            .unwrap();
+        // Even another admitted domain cannot replace a frozen source while
+        // the real expression still supplies UUID.
+        let mut changed = bound.clone();
+        changed.selected.argument_types[0] = FunctionArgumentType::Value(FunctionValueType::new(
+            DataType::FixedSizeBinary(16),
+            false,
+        ));
+        assert!(
+            catalog
+                .validate_bound(&changed, theta_value_request(&arguments), compile_control())
+                .is_err()
+        );
+        for value_type in [
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                false,
+                ValueLogicalType::Object,
+            )
+            .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                false,
+                ValueLogicalType::Percentile,
+            )
+            .unwrap(),
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap(),
+            FunctionValueType {
+                data_type: DataType::Binary,
+                nullable: false,
+                logical_type: ValueLogicalType::Variant,
+            },
+            FunctionValueType {
+                data_type: DataType::FixedSizeBinary(4),
+                nullable: false,
+                logical_type: ValueLogicalType::Uuid,
+            },
+        ] {
+            let arguments = [theta_value_argument(value_type.clone())];
+            let request = theta_value_request(&arguments);
+            assert!(
+                catalog
+                    .resolve_bound_trusted(
+                        ICEBERG_THETA_AGGREGATE_NAME,
+                        FunctionKind::Aggregate,
+                        request,
+                        compile_control(),
+                    )
+                    .is_err(),
+                "{value_type:?}"
+            );
+            let mut changed = bound.clone();
+            changed.selected.argument_types[0] = FunctionArgumentType::Value(value_type.clone());
+            // Change both the request and selected root to exercise the
+            // family gate after exact expression/selection correspondence.
+            assert!(
+                catalog
+                    .validate_bound(&changed, request, compile_control())
+                    .is_err(),
+                "{value_type:?}"
+            );
+        }
+        let family = IcebergThetaAggregateFamily::try_new().unwrap();
+        assert!(family.validate_value_arguments(&[uuid]).is_ok());
+        assert!(
+            family
+                .validate_value_arguments(&[FunctionValueType::new(DataType::UInt8, false)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn variant_statistics_preserve_the_existing_serialized_raw_bytes() {
+        use novarocks_functions::FunctionKind;
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        IcebergFunctionBundle.contribute(&mut builder).unwrap();
+        let catalog = builder.seal().unwrap();
+        let variant = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Variant,
+        )
+        .unwrap();
+        let arguments = [theta_value_argument(variant)];
+        let request = theta_value_request(&arguments);
+        let bound = catalog
+            .resolve_bound_trusted(
+                ICEBERG_THETA_AGGREGATE_NAME,
+                FunctionKind::Aggregate,
+                request,
+                compile_control(),
+            )
+            .unwrap();
+        catalog
+            .validate_bound(&bound, request, compile_control())
+            .unwrap();
+        assert_eq!(
+            bound.selected.overload.as_str(),
+            "iceberg/theta-stat/large-binary/v1"
+        );
+        let raw_a: &[u8] = &[0, 1, 255, 127];
+        let raw_b: &[u8] = &[127, 255, 1, 0];
+        // The legacy producer supplied these exact serialized bytes. The
+        // family must not decode VARIANT values or normalize their contents.
+        let values = vec![Some(raw_a), None, Some(raw_b), Some(raw_a)];
+        let actual = run_update(Arc::new(LargeBinaryArray::from(values.clone())));
+        let old_binary = run_update(Arc::new(BinaryArray::from(values)));
+        assert_eq!(actual, old_binary);
+        assert_eq!(estimate_compact_theta(&actual).unwrap(), 2.0);
     }
 
     #[test]
@@ -830,5 +1262,169 @@ mod tests {
         let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
         let estimate = estimate_compact_theta(output.value(0)).unwrap();
         assert!((90_000.0..110_000.0).contains(&estimate));
+    }
+
+    #[test]
+    fn theta_state_law_is_owned_by_every_registered_overload_and_exact_selection() {
+        use novarocks_functions::AggregateStateArgumentContract;
+        use novarocks_functions::{FunctionArgumentType, FunctionKind, FunctionResultType};
+        let registration = iceberg_theta_registration().unwrap();
+        let family = registration.family().clone();
+        let declaration = registration.definition().binding_declaration().unwrap();
+        assert_eq!(declaration.overloads().len(), 17);
+        for overload in declaration.overloads() {
+            let identity = AggregateOverloadIdentity::try_new(overload.identity.as_str()).unwrap();
+            assert_eq!(
+                family.state_argument_contract(&identity).unwrap(),
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent
+            );
+            assert_eq!(
+                overload.aggregate.as_ref().unwrap().state_argument_contract,
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent
+            );
+        }
+        let foreign = AggregateOverloadIdentity::try_new("foreign/theta-state/v1").unwrap();
+        assert!(
+            matches!(family.state_argument_contract(&foreign), Err(FunctionResolutionError::BadSignature(message)) if message == "Iceberg Theta state contract references a foreign overload")
+        );
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder.register(registration.definition().clone()).unwrap();
+        let catalog = builder.seal_bound().unwrap();
+        let carriers = [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Decimal128(18, 2),
+            DataType::Date32,
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::FixedSizeBinary(16),
+        ];
+        for carrier in carriers {
+            for nullable in [false, true] {
+                let value_type = FunctionValueType::new(carrier.clone(), nullable);
+                let arguments = [theta_value_argument(value_type.clone())];
+                let request = theta_value_request(&arguments);
+                let original = catalog
+                    .resolve_bound_trusted(
+                        ICEBERG_THETA_AGGREGATE_NAME,
+                        FunctionKind::Aggregate,
+                        request,
+                        compile_control(),
+                    )
+                    .unwrap();
+                let selected = catalog
+                    .select_exact_overload_observed(
+                        &original.function_id,
+                        FunctionKind::Aggregate,
+                        &original.selected.overload,
+                        request,
+                        compile_control(),
+                    )
+                    .unwrap();
+                assert_eq!(selected.as_ref(), &original.selected);
+                assert_eq!(
+                    selected.argument_types.as_ref(),
+                    &[FunctionArgumentType::Value(value_type)]
+                );
+                assert_eq!(
+                    selected.result_type,
+                    FunctionResultType::Scalar(FunctionValueType::new(DataType::Binary, false))
+                );
+                let state = selected.aggregate.as_ref().unwrap();
+                assert_eq!(
+                    state.state_argument_contract,
+                    AggregateStateArgumentContract::ValueRootNullabilityIndependent
+                );
+                assert_eq!(
+                    state.intermediate_type,
+                    FunctionValueType::new(DataType::Binary, false)
+                );
+                assert_eq!(
+                    state.state_format.as_str(),
+                    ICEBERG_THETA_STATE_FORMAT_IDENTITY
+                );
+                let mut forged = selected.as_ref().clone();
+                forged.aggregate.as_mut().unwrap().state_argument_contract =
+                    AggregateStateArgumentContract::ExactSignature;
+                assert!(
+                    catalog
+                        .validate_frozen_selection(
+                            &original.function_id,
+                            FunctionKind::Aggregate,
+                            &forged,
+                            request,
+                            compile_control()
+                        )
+                        .is_err()
+                );
+            }
+        }
+        assert!(
+            Arc::ptr_eq(&family, registration.family()),
+            "declaration and selections keep the original family owner"
+        );
+    }
+
+    #[test]
+    fn theta_null_update_and_merge_preserve_original_nonnull_compact_bytes() {
+        let nonnull = run_update(Arc::new(Int64Array::from(vec![7, 11])));
+        let nullable = run_update(Arc::new(Int64Array::from(vec![
+            None,
+            Some(7),
+            None,
+            Some(11),
+            Some(7),
+            None,
+        ])));
+        assert_eq!(nullable, nonnull);
+        assert_eq!(estimate_compact_theta(&nullable).unwrap(), 2.0);
+        assert_eq!(
+            run_update(Arc::new(Int64Array::from(vec![None, None]))),
+            EMPTY_ORDERED_COMPACT_V3
+        );
+        let kernel = IcebergThetaKernel;
+        for rows in [
+            vec![Some(nonnull.as_slice())],
+            vec![None, Some(nonnull.as_slice()), None],
+        ] {
+            let array: ArrayRef = Arc::new(BinaryArray::from(rows));
+            let batch = AggregateInputBatch::try_new(Some(&array), array.len()).unwrap();
+            let prepared = kernel.prepare_merge(&batch).unwrap();
+            let mut state = kernel.create_state().unwrap();
+            for row in 0..array.len() {
+                kernel.merge_row(&mut state, &prepared, row).unwrap();
+            }
+            let output = kernel.build_final(std::iter::once(&state)).unwrap();
+            let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(output.len(), 1);
+            assert!(!output.is_null(0));
+            assert_eq!(output.value(0), nonnull);
+        }
+        let nulls: ArrayRef = Arc::new(BinaryArray::from(vec![None::<&[u8]>, None]));
+        let batch = AggregateInputBatch::try_new(Some(&nulls), nulls.len()).unwrap();
+        let prepared = kernel.prepare_merge(&batch).unwrap();
+        let mut state = kernel.create_state().unwrap();
+        for row in 0..nulls.len() {
+            kernel.merge_row(&mut state, &prepared, row).unwrap();
+        }
+        let output = kernel.build_final(std::iter::once(&state)).unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            EMPTY_ORDERED_COMPACT_V3
+        );
     }
 }

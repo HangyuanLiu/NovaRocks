@@ -26,6 +26,8 @@
 //! still use the `TypedExpr` bridge during the migration.
 #![allow(dead_code)] // wired into operators in M1.
 
+mod interner;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -34,6 +36,7 @@ use arrow::datatypes::DataType;
 use crate::column_id::ColumnId;
 use crate::common::{BinOp, LambdaParam, LiteralValue, UnOp, WindowFrame};
 use crate::functions::FunctionVolatility;
+use novarocks_type_contract::FunctionValueType;
 
 /// `LiteralValue` is only `PartialEq` (it holds `Float(f64)` / `Decimal(String)`),
 /// so it cannot be a `HashMap` key directly. This newtype provides `Eq`/`Hash`
@@ -83,7 +86,7 @@ pub(crate) struct SortKey {
 /// One scalar node. Children are referenced by `ScalarId` (never inlined), so a
 /// node is cheap to hash/compare. Type metadata is part of `ScalarKey`; semantic
 /// operation details that are not implied by children still belong in the node.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum ScalarNode {
     ColumnRef(ColumnId),
     LambdaParamRef {
@@ -91,6 +94,8 @@ pub(crate) enum ScalarNode {
         slot_id: i32,
     },
     Literal(HashableLiteral),
+    /// A materialized value retains its checked owner; syntax is never rebuilt.
+    Constant(novarocks_functions::ConstantValue),
     BinaryOp {
         op: BinOp,
         left: ScalarId,
@@ -121,6 +126,8 @@ pub(crate) enum ScalarNode {
     },
     Cast {
         child: ScalarId,
+        /// Carrier projection of the CAST target. The arena's complete result
+        /// value type retains its logical identity and nullability.
         target: DataType,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
@@ -174,13 +181,6 @@ pub(crate) enum ScalarNode {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct ScalarKey {
-    node: ScalarNode,
-    data_type: DataType,
-    nullable: bool,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ColumnDisplay {
     pub qualifier: Option<String>,
     pub column: String,
@@ -211,52 +211,60 @@ struct StoredColumnDisplay {
 /// Owns all scalar nodes for one optimize() call; interns (hash-conses) on push.
 #[derive(Clone, Debug)]
 pub(crate) struct ScalarArena {
+    constant_policy: novarocks_functions::ConstantPolicy,
     nodes: Vec<ScalarNode>,
-    types: Vec<DataType>,
-    nullable: Vec<bool>,
+    value_types: Vec<FunctionValueType>,
     /// Function semantics resolved at scalar interning time.  It is kept
     /// alongside the compact node representation so optimizer passes never
     /// have to carry their own name-based volatility policy.
     function_volatility: Vec<Option<FunctionVolatility>>,
-    intern: HashMap<ScalarKey, ScalarId>,
+    intern: HashMap<u64, Vec<ScalarId>>,
     column_displays: HashMap<ColumnId, StoredColumnDisplay>,
 }
 
 impl ScalarArena {
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new() -> Self {
+        Self::with_constant_policy(crate::constant::test_constant_policy())
+    }
+
+    pub(crate) fn with_constant_policy(
+        constant_policy: novarocks_functions::ConstantPolicy,
+    ) -> Self {
         Self {
+            constant_policy,
             nodes: Vec::new(),
-            types: Vec::new(),
-            nullable: Vec::new(),
+            value_types: Vec::new(),
             function_volatility: Vec::new(),
             intern: HashMap::new(),
             column_displays: HashMap::new(),
         }
     }
 
-    /// Intern a typed node. Returns the existing id for a structurally-identical
-    /// node with the same type and nullability metadata.
-    pub(crate) fn intern(&mut self, node: ScalarNode, ty: DataType, nullable: bool) -> ScalarId {
-        let node = Self::normalize(node);
-        let key = ScalarKey {
-            node: node.clone(),
-            data_type: ty.clone(),
-            nullable,
-        };
-        if let Some(&id) = self.intern.get(&key) {
-            return id;
-        }
-        let id = ScalarId(self.nodes.len() as u32);
-        let function_volatility = match &node {
-            ScalarNode::FunctionCall { volatility, .. } => Some(*volatility),
-            _ => None,
-        };
-        self.nodes.push(node);
-        self.types.push(ty);
-        self.nullable.push(nullable);
-        self.function_volatility.push(function_volatility);
-        self.intern.insert(key, id);
-        id
+    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
+
+    /// Intern a typed node with the original request control. Bucket keys are
+    /// only lookup accelerators; every hit uses observed exact comparison.
+    pub(crate) fn intern_observed(
+        &mut self,
+        node: ScalarNode,
+        value_type: FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+        interner::intern(self, node, value_type, control)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn intern(&mut self, node: ScalarNode, value_type: FunctionValueType) -> ScalarId {
+        self.intern_observed(node, value_type, crate::optimizer::test_optimizer_control())
+            .expect("explicit test scalar interning control")
     }
 
     /// Canonicalize commutative binary ops by ordering operands by ScalarId, so
@@ -294,11 +302,15 @@ impl ScalarArena {
     }
 
     pub(crate) fn data_type(&self, id: ScalarId) -> &DataType {
-        &self.types[id.0 as usize]
+        &self.value_type(id).data_type
     }
 
     pub(crate) fn nullable(&self, id: ScalarId) -> bool {
-        self.nullable[id.0 as usize]
+        self.value_type(id).nullable
+    }
+
+    pub(crate) fn value_type(&self, id: ScalarId) -> &FunctionValueType {
+        &self.value_types[id.0 as usize]
     }
 
     /// Returns the resolved volatility for a scalar function node.
@@ -420,71 +432,56 @@ pub(crate) fn resolve_function_binding(
     arena: &ScalarArena,
     name: &str,
     args: &[ScalarId],
-) -> Result<crate::binding::SqlFunctionBinding, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::binding::SqlFunctionBinding, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let arguments = args
         .iter()
-        .map(|arg| function_argument(arena, *arg))
-        .collect::<Vec<_>>();
+        .map(|arg| function_argument(arena, *arg, control))
+        .collect::<Result<Vec<_>, _>>()?;
     catalog
-        .resolve_scalar_binding(name, &arguments)
-        .map(crate::binding::SqlFunctionBinding::new)
-        .map_err(|error| error.to_string())
+        .resolve_scalar_binding(name, &arguments, control)
+        .map(|resolved| crate::binding::SqlFunctionBinding::new(resolved, policy))
+        .map_err(crate::compiler::SqlCompileError::from)
 }
 
-fn function_argument(arena: &ScalarArena, arg: ScalarId) -> novarocks_functions::FunctionArgument {
-    use novarocks_functions::{FunctionArgument, FunctionLiteral, FunctionValueType};
-
-    match arena.node(arg) {
+pub(crate) fn function_argument(
+    arena: &ScalarArena,
+    arg: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_functions::FunctionArgument, crate::compiler::SqlCompileError> {
+    use novarocks_functions::FunctionArgument;
+    let value_type = arena.value_type(arg);
+    Ok(match arena.node(arg) {
         ScalarNode::LambdaFunction { params, body } => FunctionArgument::Lambda {
             parameter_types: params
                 .iter()
-                .map(|param| FunctionValueType::new(param.data_type.clone(), param.nullable))
+                .map(|param| param.value_type.clone())
                 .collect(),
-            result_type: FunctionValueType::new(
-                arena.data_type(*body).clone(),
-                arena.nullable(*body),
+            result_type: arena.value_type(*body).clone(),
+        },
+        ScalarNode::Literal(HashableLiteral(value)) => FunctionArgument::Value {
+            value_type: value_type.clone(),
+            constant: Some(
+                crate::constant::admit_syntax_constant(
+                    value,
+                    value_type,
+                    arena.constant_policy,
+                    control,
+                )
+                .map_err(crate::compiler::SqlCompileError::from)?,
             ),
         },
-        ScalarNode::Literal(HashableLiteral(value)) => {
-            let constant = match value {
-                LiteralValue::Null => Some(FunctionLiteral::Null),
-                LiteralValue::Bool(value) => Some(FunctionLiteral::Boolean(*value)),
-                LiteralValue::Int(value) => Some(FunctionLiteral::Int64(*value)),
-                LiteralValue::LargeInt(value) => Some(FunctionLiteral::LargeInt(*value)),
-                LiteralValue::Float(value) => {
-                    Some(FunctionLiteral::Float64Bits(value.to_bits()))
-                }
-                LiteralValue::Decimal(value) => match arena.data_type(arg) {
-                    DataType::Decimal128(_, scale) => Some(FunctionLiteral::Decimal128(
-                        crate::analysis::decimal128_literal_unscaled(value, *scale)
-                            .unwrap_or_else(|message| {
-                                panic!(
-                                    "interned Decimal128 literal must have an exact value: {message}"
-                                )
-                            }),
-                    )),
-                    _ => None,
-                },
-                LiteralValue::String(value) => {
-                    Some(FunctionLiteral::Utf8(value.clone().into_boxed_str()))
-                }
-                LiteralValue::Binary(value) => {
-                    Some(FunctionLiteral::Binary(value.clone().into_boxed_slice()))
-                }
-            };
-            FunctionArgument::Value {
-                value_type: FunctionValueType::new(
-                    arena.data_type(arg).clone(),
-                    arena.nullable(arg),
-                ),
-                constant,
-            }
-        }
+        ScalarNode::Constant(value) => FunctionArgument::Value {
+            value_type: value_type.clone(),
+            constant: Some(value.clone()),
+        },
         _ => FunctionArgument::Value {
-            value_type: FunctionValueType::new(arena.data_type(arg).clone(), arena.nullable(arg)),
+            value_type: value_type.clone(),
             constant: None,
         },
-    }
+    })
 }
 
 pub(crate) fn resolve_aggregate_binding(
@@ -494,20 +491,23 @@ pub(crate) fn resolve_aggregate_binding(
     args: &[ScalarId],
     order_by: &[SortKey],
     trusted: bool,
-) -> Result<crate::binding::SqlFunctionBinding, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::binding::SqlFunctionBinding, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let arguments = args
         .iter()
         .copied()
         .chain(order_by.iter().map(|item| item.expr))
-        .map(|argument| function_argument(arena, argument))
-        .collect::<Vec<_>>();
+        .map(|argument| function_argument(arena, argument, control))
+        .collect::<Result<Vec<_>, _>>()?;
     let exact = if trusted {
-        catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments)
+        catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments, control)
     } else {
-        catalog.resolve_aggregate_binding(name, args.len(), &arguments)
+        catalog.resolve_aggregate_binding(name, args.len(), &arguments, control)
     }
-    .map_err(|error| error.to_string())?;
-    Ok(crate::binding::SqlFunctionBinding::new(exact))
+    .map_err(crate::compiler::SqlCompileError::from)?;
+    Ok(crate::binding::SqlFunctionBinding::new(exact, policy))
 }
 
 #[cfg(test)]
@@ -532,44 +532,42 @@ pub(crate) fn test_function_binding(
                 novarocks_functions::FunctionArgumentType::Lambda {
                     parameter_types: params
                         .iter()
-                        .map(|param| {
-                            FunctionValueType::new(param.data_type.clone(), param.nullable)
-                        })
+                        .map(|param| param.value_type.clone())
                         .collect(),
-                    result_type: FunctionValueType::new(
-                        arena.data_type(*body).clone(),
-                        arena.nullable(*body),
-                    ),
+                    result_type: arena.value_type(*body).clone(),
                 }
             }
-            _ => novarocks_functions::FunctionArgumentType::Value(FunctionValueType::new(
-                arena.data_type(*argument).clone(),
-                arena.nullable(*argument),
-            )),
+            _ => novarocks_functions::FunctionArgumentType::Value(
+                arena.value_type(*argument).clone(),
+            ),
         })
         .collect();
-    crate::binding::SqlFunctionBinding::new(ResolvedFunctionBinding {
-        function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
-            .expect("test function identity"),
-        kind: FunctionKind::Scalar,
-        semantics: FunctionSemantics {
-            volatility,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+    crate::binding::SqlFunctionBinding::new(
+        ResolvedFunctionBinding {
+            admitted_execution_abi: None,
+            function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
+                .expect("test function identity"),
+            kind: FunctionKind::Scalar,
+            semantics: FunctionSemantics {
+                volatility,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+            },
+            logical_argument_count: args.len(),
+            selected: novarocks_functions::FunctionBindingSelection {
+                overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
+                    .expect("test function overload identity"),
+                argument_types: selected_arguments,
+                result_type: FunctionResultType::Scalar(FunctionValueType::new(
+                    result_type,
+                    result_nullable,
+                )),
+                aggregate: None,
+            },
         },
-        logical_argument_count: args.len(),
-        selected: novarocks_functions::FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
-                .expect("test function overload identity"),
-            argument_types: selected_arguments,
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                result_type,
-                result_nullable,
-            )),
-            aggregate: None,
-        },
-    })
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 #[cfg(test)]
@@ -600,7 +598,10 @@ pub(crate) fn test_window_binding(
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
             .expect("test window function overload identity");
-    crate::binding::SqlFunctionBinding::new(binding)
+    crate::binding::SqlFunctionBinding::new(
+        binding,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 #[cfg(test)]
@@ -629,7 +630,10 @@ pub(crate) fn test_table_binding(
         FunctionOverloadId::try_new(format!("test.table/{name}/overload-v1"))
             .expect("test table function overload identity");
     binding.selected.result_type = FunctionResultType::Relation(result_columns.into());
-    crate::binding::SqlFunctionBinding::new(binding)
+    crate::binding::SqlFunctionBinding::new(
+        binding,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 fn should_replace_column_display(
@@ -690,16 +694,24 @@ mod tests {
     #[test]
     fn intern_dedups_structurally_equal_nodes() {
         let mut a = ScalarArena::new();
-        let c = a.intern(ScalarNode::ColumnRef(ColumnId(1)), int(), false);
-        let c2 = a.intern(ScalarNode::ColumnRef(ColumnId(1)), int(), false);
+        let c = a.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            FunctionValueType::new(int(), false),
+        );
+        let c2 = a.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            FunctionValueType::new(int(), false),
+        );
         assert_eq!(c, c2, "same ColumnRef must intern to one id");
-        let d = a.intern(ScalarNode::ColumnRef(ColumnId(2)), int(), false);
+        let d = a.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            FunctionValueType::new(int(), false),
+        );
         assert_ne!(c, d, "different ColumnRef must get different ids");
 
         let lit = a.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
-            int(),
-            false,
+            FunctionValueType::new(int(), false),
         );
         let add1 = a.intern(
             ScalarNode::BinaryOp {
@@ -708,8 +720,7 @@ mod tests {
                 right: lit,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            int(),
-            false,
+            FunctionValueType::new(int(), false),
         );
         let add2 = a.intern(
             ScalarNode::BinaryOp {
@@ -718,8 +729,7 @@ mod tests {
                 right: lit,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            int(),
-            false,
+            FunctionValueType::new(int(), false),
         );
         assert_eq!(
             add1, add2,
@@ -748,8 +758,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
             },
-            DataType::Date32,
-            false,
+            FunctionValueType::new(DataType::Date32, false),
         );
         let immutable_binding = test_function_binding(
             &arena,
@@ -767,8 +776,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
             },
-            DataType::Utf8,
-            false,
+            FunctionValueType::new(DataType::Utf8, false),
         );
 
         assert_eq!(
@@ -784,8 +792,14 @@ mod tests {
     #[test]
     fn commutative_ops_normalize_to_one_id() {
         let mut a = ScalarArena::new();
-        let x = a.intern(ScalarNode::ColumnRef(ColumnId(1)), int(), false);
-        let y = a.intern(ScalarNode::ColumnRef(ColumnId(2)), int(), false);
+        let x = a.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            FunctionValueType::new(int(), false),
+        );
+        let y = a.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            FunctionValueType::new(int(), false),
+        );
         let b = DataType::Boolean;
         let xy = a.intern(
             ScalarNode::BinaryOp {
@@ -794,8 +808,7 @@ mod tests {
                 right: y,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            b.clone(),
-            false,
+            FunctionValueType::new(b.clone(), false),
         );
         let yx = a.intern(
             ScalarNode::BinaryOp {
@@ -804,8 +817,7 @@ mod tests {
                 right: x,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            b.clone(),
-            false,
+            FunctionValueType::new(b.clone(), false),
         );
         assert_eq!(xy, yx, "AND must be commutative-normalized to one id");
 
@@ -816,8 +828,7 @@ mod tests {
                 right: y,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            int(),
-            false,
+            FunctionValueType::new(int(), false),
         );
         let sub_yx = a.intern(
             ScalarNode::BinaryOp {
@@ -826,8 +837,7 @@ mod tests {
                 right: x,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            int(),
-            false,
+            FunctionValueType::new(int(), false),
         );
         assert_ne!(sub_xy, sub_yx, "Sub must NOT be normalized");
     }
@@ -853,24 +863,21 @@ mod bridge_tests {
                 qualifier: None,
                 column: format!("col{id}"),
             },
-            data_type: ty,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, false),
         }
     }
 
     fn lit_int(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn lit_int_as(v: i64, ty: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: ty,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, false),
         }
     }
 
@@ -882,16 +889,14 @@ mod bridge_tests {
                 right: Box::new(r),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
     fn typed(kind: ExprKind, data_type: DataType, nullable: bool) -> TypedExpr {
         TypedExpr {
             kind,
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         }
     }
 
@@ -924,22 +929,47 @@ mod bridge_tests {
         let mut a = ScalarArena::new();
         // Independently constructed but structurally identical TypedExpr trees
         // must intern to the same ScalarId.
-        let id1 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(5)));
-        let id2 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(5)));
+        let id1 = intern_typed(
+            &mut a,
+            &eq(col(1, DataType::Int64), lit_int(5)),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let id2 = intern_typed(
+            &mut a,
+            &eq(col(1, DataType::Int64), lit_int(5)),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         assert_eq!(
             id1, id2,
             "structurally-identical TypedExprs must intern to one ScalarId"
         );
 
-        let id3 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(6)));
+        let id3 = intern_typed(
+            &mut a,
+            &eq(col(1, DataType::Int64), lit_int(6)),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         assert_ne!(id1, id3);
     }
 
     #[test]
     fn intern_typed_separates_literals_by_type_metadata() {
         let mut a = ScalarArena::new();
-        let int8 = intern_typed(&mut a, &lit_int_as(1, DataType::Int8));
-        let int64 = intern_typed(&mut a, &lit_int_as(1, DataType::Int64));
+        let int8 = intern_typed(
+            &mut a,
+            &lit_int_as(1, DataType::Int8),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let int64 = intern_typed(
+            &mut a,
+            &lit_int_as(1, DataType::Int64),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_ne!(
             int8, int64,
@@ -959,11 +989,10 @@ mod bridge_tests {
                 qualifier: Some("q".into()),
                 column: "name_a".into(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
 
-        intern_typed(&mut a, &expr);
+        intern_typed(&mut a, &expr, crate::optimizer::test_optimizer_control()).unwrap();
     }
 
     #[test]
@@ -975,11 +1004,10 @@ mod bridge_tests {
                 qualifier: Some("t".into()),
                 column: "k".into(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
 
-        let id = intern_typed(&mut a, &expr);
+        let id = intern_typed(&mut a, &expr, crate::optimizer::test_optimizer_control()).unwrap();
         let back = materialize(&a, id);
 
         let ExprKind::ColumnRef {
@@ -1005,14 +1033,14 @@ mod bridge_tests {
                     qualifier: None,
                     column: "id".into(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "alias_id".into(),
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
 
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef { column, .. } = general.kind else {
@@ -1038,14 +1066,14 @@ mod bridge_tests {
                     qualifier: Some("a".into()),
                     column: "k".into(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "k".into(),
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef {
             qualifier, column, ..
@@ -1067,14 +1095,14 @@ mod bridge_tests {
                     qualifier: Some("a".into()),
                     column: "v".into(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "av".into(),
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef {
             qualifier, column, ..
@@ -1096,14 +1124,14 @@ mod bridge_tests {
                     qualifier: Some("a".into()),
                     column: "k".into(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "a.k".into(),
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef {
             qualifier, column, ..
@@ -1123,13 +1151,11 @@ mod bridge_tests {
         let mut a = ScalarArena::new();
         let not_nullable = a.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-            DataType::Int64,
-            false,
+            FunctionValueType::new(DataType::Int64, false),
         );
         let nullable = a.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-            DataType::Int64,
-            true,
+            FunctionValueType::new(DataType::Int64, true),
         );
 
         assert_ne!(
@@ -1141,10 +1167,178 @@ mod bridge_tests {
     }
 
     #[test]
+    fn full_result_domain_distinguishes_same_carrier_and_round_trips() {
+        use novarocks_type_contract::ValueLogicalType;
+
+        let mut arena = ScalarArena::new();
+        let mut ids = Vec::new();
+        for logical in [
+            ValueLogicalType::Physical,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Uuid,
+        ] {
+            let value_type = FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                logical,
+            )
+            .unwrap();
+            let mut source = col(700, value_type.data_type.clone());
+            source.value_type = value_type.clone();
+            let id = intern_typed(
+                &mut arena,
+                &source,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert_eq!(arena.value_type(id), &value_type);
+            assert_eq!(materialize(&arena, id).value_type, value_type);
+            assert_eq!(
+                intern_typed(
+                    &mut arena,
+                    &source,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap(),
+                id
+            );
+            assert!(!ids.contains(&id));
+            ids.push(id);
+        }
+    }
+
+    #[test]
+    fn nested_provider_field_identity_is_retained_in_key_and_bridge() {
+        use arrow::datatypes::Field;
+        use std::sync::Arc;
+
+        #[allow(deprecated)]
+        let nested = |dictionary_id, ordered, nullable, annotation: &str| {
+            FunctionValueType::new(
+                DataType::Struct(
+                    vec![Arc::new(
+                        Field::new_dict(
+                            "provider_dictionary",
+                            DataType::Dictionary(
+                                Box::new(DataType::Int8),
+                                Box::new(DataType::Utf8),
+                            ),
+                            nullable,
+                            dictionary_id,
+                            ordered,
+                        )
+                        .with_metadata([("provider.field-id".into(), annotation.into())].into()),
+                    )]
+                    .into(),
+                ),
+                false,
+            )
+        };
+        let mut arena = ScalarArena::new();
+        let mut ids = Vec::new();
+        for value_type in [
+            nested(7, false, true, "1"),
+            nested(8, false, true, "1"),
+            nested(7, true, true, "1"),
+            nested(7, false, false, "1"),
+            nested(7, false, true, "2"),
+        ] {
+            let mut source = col(701, value_type.data_type.clone());
+            source.value_type = value_type.clone();
+            let id = intern_typed(
+                &mut arena,
+                &source,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert_eq!(materialize(&arena, id).value_type, value_type);
+            assert_eq!(
+                intern_typed(
+                    &mut arena,
+                    &source,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap(),
+                id
+            );
+            assert!(!ids.contains(&id));
+            ids.push(id);
+        }
+    }
+
+    #[test]
+    fn function_arguments_borrow_complete_value_and_lambda_domains() {
+        use novarocks_functions::FunctionArgument;
+        use novarocks_type_contract::ValueLogicalType;
+
+        let parameter = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        let result =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap();
+        let mut arena = ScalarArena::new();
+        let body = arena.intern(ScalarNode::ColumnRef(ColumnId(702)), result.clone());
+        let lambda = arena.intern(
+            ScalarNode::LambdaFunction {
+                params: vec![LambdaParam {
+                    name: "uuid".into(),
+                    slot_id: 17,
+                    value_type: parameter.clone(),
+                }],
+                body,
+            },
+            result.clone(),
+        );
+        let FunctionArgument::Value {
+            value_type,
+            constant,
+        } = function_argument(
+            &arena,
+            body,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+        else {
+            panic!("ordinary argument must remain a value");
+        };
+        assert_eq!(value_type, result);
+        assert!(constant.is_none());
+        let FunctionArgument::Lambda {
+            parameter_types,
+            result_type,
+        } = function_argument(
+            &arena,
+            lambda,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+        else {
+            panic!("lambda argument must retain its signature");
+        };
+        assert_eq!(parameter_types.as_ref(), &[parameter]);
+        assert_eq!(result_type, result);
+        let materialized = materialize(&arena, lambda);
+        let ExprKind::LambdaFunction { params, body } = materialized.kind else {
+            panic!("materialized lambda must retain its shape");
+        };
+        assert_eq!(params[0].value_type, parameter_types[0]);
+        assert_eq!(body.value_type, result_type);
+    }
+
+    #[test]
     fn materialize_round_trips_core_variants() {
         let mut a = ScalarArena::new();
         let original = eq(col(1, DataType::Int64), lit_int(5));
-        let id = intern_typed(&mut a, &original);
+        let id = intern_typed(
+            &mut a,
+            &original,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let back = materialize(&a, id);
         assert_eq!(
             format!("{:?}", back),
@@ -1159,8 +1353,7 @@ mod bridge_tests {
         let lambda_param = LambdaParam {
             name: "x".to_string(),
             slot_id: 10,
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
         let lambda_param_ref = typed(
             ExprKind::LambdaParamRef {
@@ -1352,14 +1545,14 @@ mod bridge_tests {
             DataType::Utf8,
             true,
         );
-        let id1 = intern_typed(&mut a, &e);
+        let id1 = intern_typed(&mut a, &e, crate::optimizer::test_optimizer_control()).unwrap();
         let back = materialize(&a, id1);
         assert_eq!(
             format!("{back:?}"),
             format!("{e:?}"),
             "complex expr must round-trip"
         );
-        let id2 = intern_typed(&mut a, &e);
+        let id2 = intern_typed(&mut a, &e, crate::optimizer::test_optimizer_control()).unwrap();
         assert_eq!(id1, id2, "complex expr must dedup to one id");
     }
 }
@@ -1376,8 +1569,7 @@ mod overflow_policy_tests {
         let mut arena = ScalarArena::new();
         let child = arena.intern(
             ScalarNode::ColumnRef(ColumnId(1)),
-            DataType::Decimal128(38, 0),
-            true,
+            FunctionValueType::new(DataType::Decimal128(38, 0), true),
         );
         let mut ids = Vec::new();
         for policy in [OutputNull, ReportError] {
@@ -1388,8 +1580,7 @@ mod overflow_policy_tests {
                     right: child,
                     decimal_overflow_policy: policy,
                 },
-                DataType::Decimal128(38, 0),
-                true,
+                FunctionValueType::new(DataType::Decimal128(38, 0), true),
             ));
             ids.push(arena.intern(
                 ScalarNode::Cast {
@@ -1397,15 +1588,22 @@ mod overflow_policy_tests {
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: policy,
                 },
-                DataType::Decimal128(9, 0),
-                true,
+                FunctionValueType::new(DataType::Decimal128(9, 0), true),
             ));
         }
         assert_ne!(ids[0], ids[2]);
         assert_ne!(ids[1], ids[3]);
         for id in ids {
             let typed = materialize(&arena, id);
-            assert_eq!(intern_typed(&mut arena, &typed), id);
+            assert_eq!(
+                intern_typed(
+                    &mut arena,
+                    &typed,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap(),
+                id
+            );
             let expected = match arena.node(id) {
                 ScalarNode::BinaryOp {
                     decimal_overflow_policy,
@@ -1458,5 +1656,101 @@ mod intrinsic_binding_helper_tests {
                     .is_valid_for_kind(binding.kind)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod call_policy_tests {
+    use super::*;
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+    #[test]
+    fn real_scalar_rebinding_preserves_requested_policy_and_prevents_cross_policy_cse() {
+        let mut arena = ScalarArena::new();
+        let value_type = FunctionValueType::new(DataType::Int64, false);
+        let argument = arena.intern(ScalarNode::ColumnRef(ColumnId(911)), value_type);
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        let control = crate::optimizer::test_optimizer_control();
+        let binding =
+            resolve_function_binding(catalog, &arena, "abs", &[argument], ReportError, control)
+                .unwrap();
+        let rebound = resolve_function_binding(
+            catalog,
+            &arena,
+            "abs",
+            &[argument],
+            binding.decimal_overflow_policy(),
+            control,
+        )
+        .unwrap();
+        assert_eq!(binding, rebound);
+        let null_binding =
+            resolve_function_binding(catalog, &arena, "abs", &[argument], OutputNull, control)
+                .unwrap();
+        assert_eq!(binding.resolved(), null_binding.resolved());
+        assert_ne!(binding, null_binding);
+        let result_type = match &binding.selected.result_type {
+            novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
+            _ => panic!("abs must have its real scalar result"),
+        };
+        let node = |binding: crate::binding::SqlFunctionBinding| ScalarNode::FunctionCall {
+            name: "abs".into(),
+            args: vec![argument],
+            distinct: false,
+            volatility: binding.semantics.volatility,
+            binding,
+        };
+        let report = arena.intern(node(binding), result_type.clone());
+        let repeated = arena.intern(node(rebound), result_type.clone());
+        let output_null = arena.intern(node(null_binding), result_type);
+        assert_eq!(report, repeated);
+        assert_ne!(report, output_null);
+    }
+
+    #[test]
+    fn real_aggregate_rebinding_keeps_original_call_policy_with_equal_selection() {
+        let mut arena = ScalarArena::new();
+        let argument = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(912)),
+            FunctionValueType::new(DataType::Int32, false),
+        );
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        let control = crate::optimizer::test_optimizer_control();
+        let original = resolve_aggregate_binding(
+            catalog,
+            &arena,
+            "sum",
+            &[argument],
+            &[],
+            false,
+            ReportError,
+            control,
+        )
+        .unwrap();
+        let rebound = resolve_aggregate_binding(
+            catalog,
+            &arena,
+            "sum",
+            &[argument],
+            &[],
+            true,
+            original.decimal_overflow_policy(),
+            control,
+        )
+        .unwrap();
+        assert_eq!(original, rebound);
+        let other = resolve_aggregate_binding(
+            catalog,
+            &arena,
+            "sum",
+            &[argument],
+            &[],
+            true,
+            OutputNull,
+            control,
+        )
+        .unwrap();
+        assert_eq!(original.resolved(), other.resolved());
+        assert_ne!(original, other);
     }
 }

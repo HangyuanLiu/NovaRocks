@@ -283,17 +283,19 @@ fn collect_literal_equalities_inner(
             right,
             ..
         } => match (scalars.node(*left), scalars.node(*right)) {
-            (ScalarNode::ColumnRef(column_id), ScalarNode::Literal(_))
-                if *column_id != ColumnId::UNSET =>
-            {
+            (
+                ScalarNode::ColumnRef(column_id),
+                ScalarNode::Literal(_) | ScalarNode::Constant(_),
+            ) if *column_id != ColumnId::UNSET => {
                 out.push(LiteralEquality {
                     column_id: *column_id,
                     literal: *right,
                 });
             }
-            (ScalarNode::Literal(_), ScalarNode::ColumnRef(column_id))
-                if *column_id != ColumnId::UNSET =>
-            {
+            (
+                ScalarNode::Literal(_) | ScalarNode::Constant(_),
+                ScalarNode::ColumnRef(column_id),
+            ) if *column_id != ColumnId::UNSET => {
                 out.push(LiteralEquality {
                     column_id: *column_id,
                     literal: *left,
@@ -305,59 +307,156 @@ fn collect_literal_equalities_inner(
     }
 }
 
-pub(crate) fn make_column_ref_expr(arena: &mut ScalarArena, column: &OutputColumn) -> ScalarId {
-    arena.remember_source_column_display(column.column_id, None, column.name.clone());
-    arena.intern(
+pub(crate) fn make_column_ref_expr(
+    arena: &mut ScalarArena,
+    column: &OutputColumn,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    let result = arena.intern_observed(
         ScalarNode::ColumnRef(column.column_id),
-        column.data_type.clone(),
-        column.nullable,
-    )
+        column.value_type.clone(),
+        control,
+    )?;
+    arena.remember_source_column_display(column.column_id, None, column.name.clone());
+    Ok(result)
 }
 
 pub(crate) fn make_eq_literal_predicate(
     arena: &mut ScalarArena,
     column: &OutputColumn,
     literal: ScalarId,
-) -> ScalarId {
-    let left = make_column_ref_expr(arena, column);
-    arena.intern(
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    let left = make_column_ref_expr(arena, column, control)?;
+    arena.intern_observed(
         ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
             right: literal,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        DataType::Boolean,
-        column.nullable || arena.nullable(literal),
+        novarocks_type_contract::FunctionValueType::new(
+            DataType::Boolean,
+            column.value_type.nullable || arena.nullable(literal),
+        ),
+        control,
     )
 }
 
 pub(crate) fn combine_with_and(
     arena: &mut ScalarArena,
-    mut predicates: Vec<ScalarId>,
-) -> Option<ScalarId> {
-    let first = predicates.drain(..1).next()?;
-    Some(predicates.into_iter().fold(first, |left, right| {
-        arena.intern(
+    predicates: Vec<ScalarId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    let mut predicates = predicates.into_iter();
+    let Some(mut left) = predicates.next() else {
+        return Ok(None);
+    };
+    for right in predicates {
+        left = arena.intern_observed(
             ScalarNode::BinaryOp {
                 left,
                 op: BinOp::And,
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            arena.nullable(left) || arena.nullable(right),
-        )
-    }))
+            novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                arena.nullable(left) || arena.nullable(right),
+            ),
+            control,
+        )?;
+    }
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    Ok(Some(left))
 }
 
-pub(crate) fn literal_signature(arena: &ScalarArena, literal: ScalarId) -> String {
-    match arena.node(literal) {
-        ScalarNode::Literal(HashableLiteral(value)) => {
-            format!("{:?}:{:?}", arena.data_type(literal), value)
+/// Compare literal leaves without rendering payloads or source pool identities.
+/// Syntax leaves retain their existing representation-sensitive rules; they do
+/// not implicitly equal materialized constants during this migration stage.
+pub(crate) fn literal_equal_observed(
+    left_arena: &ScalarArena,
+    left: ScalarId,
+    right_arena: &ScalarArena,
+    right: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    use crate::compiler::SqlCompileError;
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        let same_type = left_arena
+            .value_type(left)
+            .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                right_arena.value_type(right),
+                || work.step().map_err(Into::into),
+            )
+            .map_err(SqlCompileError::from)?;
+        if !same_type {
+            return Ok(false);
         }
-        other => format!("{:?}:{:?}", arena.data_type(literal), other),
+        let equal = match (left_arena.node(left), right_arena.node(right)) {
+            (ScalarNode::Constant(left), ScalarNode::Constant(right)) => {
+                work.flush()?;
+                left.equals_observed(right, CompilePhase::Validate, work.control())?
+            }
+            (
+                ScalarNode::Literal(HashableLiteral(left)),
+                ScalarNode::Literal(HashableLiteral(right)),
+            ) => {
+                use crate::common::LiteralValue;
+                match (left, right) {
+                    (LiteralValue::Float(left), LiteralValue::Float(right)) => {
+                        // Old syntax signatures rendered every NaN as NaN, but
+                        // retained the sign of zero. This is not CV equality.
+                        (left.is_nan() && right.is_nan()) || left.to_bits() == right.to_bits()
+                    }
+                    (LiteralValue::String(left), LiteralValue::String(right))
+                    | (LiteralValue::Decimal(left), LiteralValue::Decimal(right)) => {
+                        equal_literal_bytes(left.as_bytes(), right.as_bytes(), &mut work)?
+                    }
+                    (LiteralValue::Binary(left), LiteralValue::Binary(right)) => {
+                        equal_literal_bytes(left, right, &mut work)?
+                    }
+                    (left, right) => left == right,
+                }
+            }
+            _ => false,
+        };
+        work.step()?;
+        Ok(equal)
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
+    work.finish()?;
+    result
+}
+
+fn equal_literal_bytes(
+    left: &[u8],
+    right: &[u8],
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    let same_len = left.len() == right.len();
+    work.step()?;
+    if !same_len {
+        return Ok(false);
+    }
+    for (left, right) in left.chunks(1024).zip(right.chunks(1024)) {
+        let equal = left == right;
+        work.step()?;
+        if !equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -372,14 +471,16 @@ mod tests {
     use crate::planner::table::TableDef;
 
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
-        arena.intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, false)
+        arena.intern(
+            ScalarNode::ColumnRef(ColumnId(id)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        )
     }
 
     fn lit(arena: &mut ScalarArena, value: i64) -> ScalarId {
         arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -391,8 +492,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         )
     }
 
@@ -430,8 +530,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -705,6 +805,275 @@ mod tests {
         assert_eq!(
             class.iter().collect::<Vec<_>>(),
             vec![ColumnId(1), ColumnId(2)]
+        );
+    }
+
+    fn cv_node(
+        array: std::sync::Arc<dyn arrow::array::Array>,
+        ordinal: u32,
+        logical: novarocks_type_contract::ValueLogicalType,
+        nullable: bool,
+        metadata: &str,
+    ) -> (ScalarArena, ScalarId, novarocks_functions::ConstantValue) {
+        let ty = novarocks_type_contract::FunctionValueType {
+            data_type: array.data_type().clone(),
+            nullable,
+            logical_type: logical,
+        };
+        let field = arrow::datatypes::Field::new("selected", ty.data_type.clone(), nullable)
+            .with_metadata(HashMap::from([("provider".into(), metadata.into())]));
+        let value = novarocks_functions::ConstantPool::try_new(
+            std::sync::Arc::new(field),
+            ty.clone(),
+            array.to_data(),
+            crate::constant::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .value(ordinal)
+        .unwrap();
+        let mut arena = ScalarArena::new();
+        let id = arena
+            .intern_observed(
+                ScalarNode::Constant(value.clone()),
+                ty,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        (arena, id, value)
+    }
+
+    #[test]
+    fn literal_identity_compares_selected_cv_and_complete_source_without_pool_or_scalar_id_keys() {
+        use arrow::array::{Int64Array, StringArray};
+        use novarocks_type_contract::ValueLogicalType;
+        use std::sync::Arc;
+        let (left, l, lv) = cv_node(
+            Arc::new(Int64Array::from(vec![99, 7])),
+            1,
+            ValueLogicalType::Physical,
+            false,
+            "same",
+        );
+        let (right, r, rv) = cv_node(
+            Arc::new(Int64Array::from(vec![7, -20, 8])),
+            0,
+            ValueLogicalType::Physical,
+            false,
+            "same",
+        );
+        assert_ne!(lv.pool().backing_identity(), rv.pool().backing_identity());
+        assert_ne!(lv.ordinal(), rv.ordinal());
+        assert!(
+            literal_equal_observed(
+                &left,
+                l,
+                &right,
+                r,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        let mut different = ScalarArena::new();
+        let different_id = different
+            .intern_observed(
+                ScalarNode::Constant(rv.pool().value(2).unwrap()),
+                rv.value_type().clone(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        assert_eq!(
+            l, different_id,
+            "same arena-local number does not imply the same selected value"
+        );
+        assert!(
+            !literal_equal_observed(
+                &left,
+                l,
+                &different,
+                different_id,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        let mut same_pool = ScalarArena::new();
+        let selected = same_pool
+            .intern_observed(
+                ScalarNode::Constant(rv.clone()),
+                rv.value_type().clone(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        let other = same_pool
+            .intern_observed(
+                ScalarNode::Constant(rv.pool().value(2).unwrap()),
+                rv.value_type().clone(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        assert!(
+            !literal_equal_observed(
+                &same_pool,
+                selected,
+                &same_pool,
+                other,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        for (other_arena, other_id, _) in [
+            cv_node(
+                Arc::new(Int64Array::from(vec![7])),
+                0,
+                ValueLogicalType::Physical,
+                true,
+                "same",
+            ),
+            cv_node(
+                Arc::new(Int64Array::from(vec![7])),
+                0,
+                ValueLogicalType::Physical,
+                false,
+                "different",
+            ),
+        ] {
+            assert!(
+                !literal_equal_observed(
+                    &left,
+                    l,
+                    &other_arena,
+                    other_id,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap()
+            );
+        }
+        let (text, text_id, _) = cv_node(
+            Arc::new(StringArray::from(vec!["\"same\""])),
+            0,
+            ValueLogicalType::Physical,
+            false,
+            "same",
+        );
+        let (json, json_id, _) = cv_node(
+            Arc::new(StringArray::from(vec!["\"same\""])),
+            0,
+            ValueLogicalType::Json,
+            false,
+            "same",
+        );
+        assert!(
+            !literal_equal_observed(
+                &text,
+                text_id,
+                &json,
+                json_id,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn literal_identity_keeps_legacy_syntax_nan_zero_rules_without_implicit_cv_interchange() {
+        use arrow::array::{Float64Array, Int64Array};
+        use novarocks_type_contract::ValueLogicalType;
+        use std::sync::Arc;
+        let mut left = ScalarArena::new();
+        let mut right = ScalarArena::new();
+        let ty = novarocks_type_contract::FunctionValueType::new(DataType::Float64, false);
+        let a = left.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Float(f64::from_bits(
+                0x7ff8000000000001,
+            )))),
+            ty.clone(),
+        );
+        let b = right.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Float(f64::from_bits(
+                0x7ff8000000000002,
+            )))),
+            ty.clone(),
+        );
+        assert!(
+            literal_equal_observed(
+                &left,
+                a,
+                &right,
+                b,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        let zero = left.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Float(0.0))),
+            ty.clone(),
+        );
+        let negative_zero = right.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Float(-0.0))),
+            ty,
+        );
+        assert!(
+            !literal_equal_observed(
+                &left,
+                zero,
+                &right,
+                negative_zero,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        let (first, first_id, _) = cv_node(
+            Arc::new(Float64Array::from(vec![f64::from_bits(0x7ff8000000000001)])),
+            0,
+            ValueLogicalType::Physical,
+            false,
+            "same",
+        );
+        let (second, second_id, _) = cv_node(
+            Arc::new(Float64Array::from(vec![f64::from_bits(0x7ff8000000000002)])),
+            0,
+            ValueLogicalType::Physical,
+            false,
+            "same",
+        );
+        assert!(
+            !literal_equal_observed(
+                &first,
+                first_id,
+                &second,
+                second_id,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        let syntax = lit(&mut left, 7);
+        let (cv_arena, cv_id, _) = cv_node(
+            Arc::new(Int64Array::from(vec![7])),
+            0,
+            ValueLogicalType::Physical,
+            false,
+            "same",
+        );
+        assert!(
+            !literal_equal_observed(
+                &left,
+                syntax,
+                &cv_arena,
+                cv_id,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        assert!(
+            !literal_equal_observed(
+                &cv_arena,
+                cv_id,
+                &left,
+                syntax,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
         );
     }
 }

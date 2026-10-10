@@ -185,6 +185,7 @@ impl RefreshErrorKind {
 pub struct RefreshError {
     pub kind: RefreshErrorKind,
     pub message: String,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl RefreshError {
@@ -192,7 +193,14 @@ impl RefreshError {
         Self {
             kind,
             message: message.into(),
+            compile_control: None,
         }
+    }
+
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub fn user(message: impl Into<String>) -> Self {
@@ -217,6 +225,23 @@ impl RefreshError {
 
     pub fn metadata_finalize(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::MetadataFinalizeFailed, message)
+    }
+}
+
+impl From<novarocks_sql::compiler::SqlCompileError> for RefreshError {
+    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        use novarocks_sql::compiler::SqlCompileError as E;
+        use novarocks_type_contract::CompileControlError as C;
+        let control = match &error {
+            E::Cancelled => Some(C::Cancelled),
+            E::DeadlineExceeded => Some(C::DeadlineExceeded),
+            E::ResourceExhausted => Some(C::ResourceExhausted),
+            E::Analyze(error) => error.control_error(),
+            _ => None,
+        };
+        let mut failure = Self::user(error.to_string());
+        failure.compile_control = control;
+        failure
     }
 }
 
@@ -281,5 +306,23 @@ mod tests {
             MvStorageEngine::from_sql_str("duckdb").unwrap_err(),
             "unknown materialized view storage_engine `duckdb`"
         );
+    }
+    #[test]
+    fn compile_control_cause_keeps_existing_refresh_kind_and_rollback_rule() {
+        use novarocks_type_contract::CompileControlError;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = RefreshError::from(novarocks_sql::compiler::SqlCompileError::from(control));
+            assert_eq!(error.compile_control_error(), Some(control));
+            assert_eq!(error.kind, RefreshErrorKind::UserError);
+            assert!(error.kind.should_rollback_after_commit());
+            assert_eq!(
+                RefreshError::user(error.message.clone()).compile_control_error(),
+                None
+            );
+        }
     }
 }

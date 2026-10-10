@@ -787,9 +787,10 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
         return 1.0;
     };
     match arena.node(expr) {
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            0.1
-        }
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => 0.1,
         ScalarNode::Nested(child) | ScalarNode::Cast { child, .. } => {
             0.2 + scalar_complexity(Some(arena), *child)
         }
@@ -1288,8 +1289,11 @@ mod tests {
         crate::analysis::OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         }
     }
@@ -1363,8 +1367,10 @@ mod tests {
             .map(|id| {
                 scalars.intern(
                     ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-                    arrow::datatypes::DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 )
             })
             .collect();
@@ -1418,20 +1424,28 @@ mod tests {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
                     left_value,
                 )),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let right = intern_typed(
             arena,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
                     right_value,
                 )),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         OptimizerPhysicalHashJoinEqCondition {
             left,
             right,
@@ -1442,8 +1456,10 @@ mod tests {
     fn column_ref(arena: &mut ScalarArena, id: u32) -> ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-            arrow::datatypes::DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         )
     }
 
@@ -1451,8 +1467,10 @@ mod tests {
         let child = column_ref(arena, id);
         arena.intern(
             ScalarNode::Nested(child),
-            arrow::datatypes::DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         )
     }
 
@@ -2163,10 +2181,14 @@ mod tests {
             &mut arena,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut op = scan_op();
         let Operator::PhysicalScan(scan) = &mut op else {
             panic!("expected scan");
@@ -2218,10 +2240,14 @@ mod tests {
             &mut arena,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut op = two_column_scan_op(Some(vec!["narrow"]));
         let Operator::PhysicalScan(scan) = &mut op else {
             panic!("expected scan");
@@ -2306,10 +2332,14 @@ mod tests {
             &mut arena,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let input_stats = stats(1_000_000.0, 16.0);
         let output_stats = stats(10.0, 16.0);
         let op = Operator::PhysicalFilter(FilterOp { predicate });
@@ -3513,10 +3543,14 @@ mod tests {
             &mut scalars,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],

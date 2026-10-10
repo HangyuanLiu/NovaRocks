@@ -14,64 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#[cfg(test)]
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryBuilder};
+#[cfg(test)]
+use crate::exec::hll::HllHandle;
+use arrow::array::ArrayRef;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array};
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::hll::{HllHandle, HllTargetType};
-use crate::exec::sketch_hash::prehash_array_value;
-
-const DEFAULT_LOG_K: u8 = 17;
-const DEFAULT_TARGET_TYPE: HllTargetType = HllTargetType::Hll6;
-
-fn parse_log_k(array: &ArrayRef, row: usize) -> Result<Option<u8>, String> {
-    match agg_scalar_from_array(array, row)? {
-        Some(AggScalarValue::Int64(v)) => {
-            let lg_k = u8::try_from(v)
-                .map_err(|_| format!("ds_hll_count_distinct_state log_k out of range: {}", v))?;
-            if !(4..=21).contains(&lg_k) {
-                return Err(format!(
-                    "ds_hll_count_distinct_state log_k must be in [4, 21], got {}",
-                    lg_k
-                ));
-            }
-            Ok(Some(lg_k))
-        }
-        Some(AggScalarValue::Float64(v)) => {
-            let lg_k = v as u8;
-            if !(4..=21).contains(&lg_k) {
-                return Err(format!(
-                    "ds_hll_count_distinct_state log_k must be in [4, 21], got {}",
-                    v
-                ));
-            }
-            Ok(Some(lg_k))
-        }
-        Some(other) => Err(format!(
-            "ds_hll_count_distinct_state log_k expects numeric input, got {:?}",
-            other
-        )),
-        None => Ok(None),
-    }
-}
-
-fn parse_target_type(array: &ArrayRef, row: usize) -> Result<Option<HllTargetType>, String> {
-    match agg_scalar_from_array(array, row)? {
-        Some(AggScalarValue::Utf8(v)) => Ok(Some(match v.to_ascii_uppercase().as_str() {
-            "HLL_4" => HllTargetType::Hll4,
-            "HLL_8" => HllTargetType::Hll8,
-            _ => HllTargetType::Hll6,
-        })),
-        Some(other) => Err(format!(
-            "ds_hll_count_distinct_state target type expects string input, got {:?}",
-            other
-        )),
-        None => Ok(None),
-    }
-}
 
 pub fn eval_ds_hll_count_distinct_state(
     arena: &ExprArena,
@@ -91,26 +42,9 @@ pub fn eval_ds_hll_count_distinct_state(
         None
     };
 
-    let mut builder = BinaryBuilder::new();
-    for row in 0..values.len() {
-        let Some(hash) = prehash_array_value(&values, row, "ds_hll_count_distinct_state")? else {
-            builder.append_null();
-            continue;
-        };
-
-        let lg_k = match &log_ks {
-            Some(array) => parse_log_k(array, row)?.unwrap_or(DEFAULT_LOG_K),
-            None => DEFAULT_LOG_K,
-        };
-        let target_type = match &target_types {
-            Some(array) => parse_target_type(array, row)?.unwrap_or(DEFAULT_TARGET_TYPE),
-            None => DEFAULT_TARGET_TYPE,
-        };
-
-        let mut handle = HllHandle::new_unreserved(lg_k, target_type)?;
-        handle.update_hash_unreserved(hash)?;
-        builder.append_value(handle.serialize()?);
-    }
-
-    Ok(Arc::new(builder.finish()))
+    novarocks_functions::builtin::ds_hll_state_core::evaluate(&values, log_ks, target_types)
 }
+
+#[cfg(test)]
+#[path = "legacy_ds_hll_scalar_baseline_tests.rs"]
+mod legacy_ds_hll_scalar_baseline_tests;

@@ -29,17 +29,28 @@
 //! these bytes with facts describing some other plan, and it is why nothing
 //! later ever parses the bytes or reaches back into a generated message: the
 //! plan leaves this module as bytes and facts only.
+//!
+//! A compiled-package carrier is frozen the same way: the checked package is
+//! encoded here, and its facts are read from the package's own physical
+//! fragment and the plan edges its sink names. No plan tree exists for it.
 // Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{FragmentContractVersion, FrozenBytes};
-use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
+use novarocks_physical_plan::{
+    Edge, EdgeId, Fragment, FragmentPackage, FragmentSink, NodeKind, PipelineDopDomain,
+    PlanVersionId,
+};
+use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
 use novarocks_proto_models::{novarocks as wire, plan};
+use novarocks_type_contract::PureCompileControl;
 use prost::Message;
 
 use crate::metrics::task_creation::{RetainedPayload, static_fragment_frozen};
 use crate::query_execution::artifact::FragmentId;
+use crate::query_execution::package_freeze::{PackageFreezeError, encode_checked_package};
 
 /// One static sink branch, in the order the static plan declares it.
 ///
@@ -124,9 +135,10 @@ pub(crate) struct StaticFragmentHeader {
 
 /// One fragment's static plan as immutable bytes, with its typed facts.
 ///
-/// Its only constructor is [`FragmentArtifact::freeze`], so the bytes and the
-/// facts always come from one plan. Tasks and resends hold it by `Arc` and
-/// clone the bytes' shared backing; nothing re-encodes it.
+/// Its only constructors are [`FragmentArtifact::freeze`] for a plan tree and
+/// [`FragmentArtifact::freeze_package`] for a compiled package, so the bytes
+/// and the facts always come from one plan. Tasks and resends hold it by
+/// `Arc` and clone the bytes' shared backing; nothing re-encodes it.
 #[derive(Debug)]
 pub(crate) struct FragmentArtifact {
     content: FrozenBytes,
@@ -170,6 +182,7 @@ impl FragmentArtifact {
             carries_runtime_filter_bindings,
         };
         let frozen = wire::FrozenFragment {
+            package: Default::default(),
             plan_version: header.plan_version.as_bytes().to_vec(),
             plan_contract_revision: header.plan_contract_revision,
             fragment_contract_version: u32::from(FragmentContractVersion::CURRENT.get()),
@@ -179,6 +192,56 @@ impl FragmentArtifact {
                 requires_power_of_two: header.dop_domain.requires_power_of_two,
             }),
             plan: Some(plan),
+        };
+        let content = FrozenBytes::freeze(frozen.encode_to_vec().into());
+        #[cfg(test)]
+        tests::record_freeze();
+        let retained = static_fragment_frozen(content.len());
+        Ok(Arc::new(Self {
+            content,
+            facts,
+            _retained: retained,
+        }))
+    }
+
+    /// Encodes one fragment's checked v2 package, once, as a compiled
+    /// carrier.
+    ///
+    /// The bytes are a `FrozenFragment` whose only field is the package: the
+    /// package owns its plan version, contract revision and DOP domain, so
+    /// nothing beside it restates them. The facts are read from the same
+    /// package's physical fragment, and its sink branches from the plan
+    /// edges that sink names, in declared order.
+    pub(crate) fn freeze_package(
+        package: &FragmentPackage,
+        edges: &BTreeMap<EdgeId, Edge>,
+        limits: &PackageEncodeLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self>, PackageFreezeError> {
+        let fragment = package.fragment();
+        let fragment_id = u32::from(fragment.id().get());
+        let root_plan_node_id = i32::try_from(fragment.root().get()).map_err(|_| {
+            PackageFreezeError::Facts(format!(
+                "fragment {fragment_id} root node {} exceeds the wire node identity",
+                fragment.root().get()
+            ))
+        })?;
+        let facts = FragmentFacts {
+            fragment_id,
+            dop_domain: fragment.dop_domain(),
+            sink_targets: package_sink_targets(fragment, edges)?,
+            root_plan_node_id,
+            declares_table_writer: fragment
+                .nodes()
+                .values()
+                .any(|node| matches!(node.kind, NodeKind::TableWriter { .. })),
+            // The package states the fragment's complete runtime-filter
+            // participation itself; no binding table is attached to it later.
+            carries_runtime_filter_bindings: true,
+        };
+        let frozen = wire::FrozenFragment {
+            package: encode_checked_package(package, limits, control)?.into(),
+            ..Default::default()
         };
         let content = FrozenBytes::freeze(frozen.encode_to_vec().into());
         #[cfg(test)]
@@ -206,6 +269,53 @@ fn contains_writer(node: &plan::DistributedNode) -> bool {
         node.payload.as_ref(),
         Some(plan::distributed_node::Payload::TableWriter(_))
     ) || node.children.iter().any(contains_writer)
+}
+
+/// A physical fragment's static sink branches, in the order its sink declares
+/// them, each addressed by the destination of the plan edge it feeds.
+fn package_sink_targets(
+    fragment: &Fragment,
+    edges: &BTreeMap<EdgeId, Edge>,
+) -> Result<Box<[StaticSinkTarget]>, PackageFreezeError> {
+    let fragment_id = fragment.id();
+    let branches = match fragment.sink() {
+        FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => Vec::new(),
+        FragmentSink::Stream { edge } => vec![*edge],
+        FragmentSink::Multicast { edges } => edges.to_vec(),
+        FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
+    };
+    branches
+        .into_iter()
+        .map(|edge_id| {
+            let edge = edges.get(&edge_id).ok_or_else(|| {
+                PackageFreezeError::Facts(format!(
+                    "fragment {} sinks into absent edge {}",
+                    fragment_id.get(),
+                    edge_id.get()
+                ))
+            })?;
+            if edge.source.fragment != fragment_id {
+                return Err(PackageFreezeError::Facts(format!(
+                    "fragment {} sinks into edge {} produced by fragment {}",
+                    fragment_id.get(),
+                    edge_id.get(),
+                    edge.source.fragment.get()
+                )));
+            }
+            let target_exchange_node_id =
+                i32::try_from(edge.destination.node.get()).map_err(|_| {
+                    PackageFreezeError::Facts(format!(
+                        "edge {} destination node {} exceeds the wire node identity",
+                        edge_id.get(),
+                        edge.destination.node.get()
+                    ))
+                })?;
+            Ok(StaticSinkTarget {
+                target_fragment_id: u32::from(edge.destination.fragment.get()),
+                target_exchange_node_id,
+            })
+        })
+        .collect()
 }
 
 /// The static sink branches, in the order the plan declares them. A sink

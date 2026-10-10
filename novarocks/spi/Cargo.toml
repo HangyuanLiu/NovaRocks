@@ -17,6 +17,7 @@ bytes.workspace = true
 futures.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-secret.workspace = true
+novarocks-type-contract.workspace = true
 sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 url.workspace = true

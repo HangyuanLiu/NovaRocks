@@ -234,21 +234,26 @@ pub(crate) enum PreparedAggregateError {
 
 impl fmt::Display for PreparedAggregateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use novarocks_functions::aggregate_format::AggregateFailureStage;
         match self {
             Self::StatePointerCount { expected, actual } => write!(
                 formatter,
                 "aggregate state pointer count {actual} does not match input row count {expected}"
             ),
-            Self::Input(message) => write!(formatter, "aggregate input: {message}"),
-            Self::CreateState(message) => write!(formatter, "create aggregate state: {message}"),
-            Self::Update(message) => write!(formatter, "update aggregate state: {message}"),
-            Self::Merge(message) => write!(formatter, "merge aggregate state: {message}"),
-            Self::BuildIntermediate(message) => {
-                write!(formatter, "build aggregate intermediate output: {message}")
-            }
-            Self::BuildFinal(message) => {
-                write!(formatter, "build aggregate final output: {message}")
-            }
+            Self::Input(message) => AggregateFailureStage::Input.message(message).fmt(formatter),
+            Self::CreateState(message) => AggregateFailureStage::CreateState
+                .message(message)
+                .fmt(formatter),
+            Self::Update(message) => AggregateFailureStage::Update
+                .message(message)
+                .fmt(formatter),
+            Self::Merge(message) => AggregateFailureStage::Merge.message(message).fmt(formatter),
+            Self::BuildIntermediate(message) => AggregateFailureStage::BuildIntermediate
+                .message(message)
+                .fmt(formatter),
+            Self::BuildFinal(message) => AggregateFailureStage::BuildFinal
+                .message(message)
+                .fmt(formatter),
         }
     }
 }
@@ -763,10 +768,16 @@ where
         &self,
         context: &AggregatePrepareContext<'_>,
     ) -> Result<Arc<dyn ErasedAggregateKernel>, String> {
-        self.family
+        let kernel = self
+            .family
             .prepare(context.selected, context.options)
-            .map(|kernel| Arc::new(TypedKernelAdapter { kernel }) as Arc<dyn ErasedAggregateKernel>)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if kernel.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked {
+            return Err(
+                "legacy typed aggregate cannot supply an allocation-tracked state allocator".into(),
+            );
+        }
+        Ok(Arc::new(TypedKernelAdapter { kernel }) as Arc<dyn ErasedAggregateKernel>)
     }
 }
 
@@ -956,6 +967,9 @@ where
 
     fn retained_memory_policy(&self) -> RetainedMemoryPolicy {
         match self.kernel.memory_policy() {
+            AggregateStateMemoryPolicy::AllocationTracked => {
+                RetainedMemoryPolicy::AllocationTracked
+            }
             AggregateStateMemoryPolicy::FixedZero => RetainedMemoryPolicy::FixedZero,
             AggregateStateMemoryPolicy::BoundedRetained {
                 max_retained_bytes_per_state,
@@ -971,6 +985,11 @@ where
         offset: usize,
         _tracker: Option<Arc<MemTracker>>,
     ) -> Result<(), PreparedAggregateError> {
+        if self.kernel.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked {
+            return Err(PreparedAggregateError::CreateState(
+                "legacy typed aggregate cannot supply an allocation-tracked state allocator".into(),
+            ));
+        }
         let state = self
             .kernel
             .create_state()
@@ -1284,6 +1303,20 @@ mod tests {
             argument_types: &[DataType],
         ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
             if argument_types != [DataType::Int64] {
+                return Err(FunctionResolutionError::NoMatchingSignature {
+                    candidates: 1,
+                    binding_enforced: true,
+                });
+            }
+            Ok(resolved_signature())
+        }
+
+        fn resolve_update_signature(
+            &self,
+            selected_overload: &AggregateOverloadIdentity,
+            argument_types: &[DataType],
+        ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+            if selected_overload != &overload_identity() || argument_types != [DataType::Int64] {
                 return Err(FunctionResolutionError::NoMatchingSignature {
                     candidates: 1,
                     binding_enforced: true,

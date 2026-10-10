@@ -37,7 +37,10 @@ use crate::provider_types::{IcebergReadTypes, IcebergReadView};
 
 use super::{HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, IcebergRuntimeRelation};
 
+mod program_fields;
+mod program_recipe;
 mod recipe;
+pub(crate) use program_fields::{public_read_schema, system_public_read_schema};
 pub use recipe::IcebergReadRecipeCompiler;
 
 pub(crate) use crate::contract_revision::ICEBERG_CONTRACT_REVISION as ICEBERG_READ_CODEC_REVISION;
@@ -87,6 +90,9 @@ where
     }
 
     fn private_rejection(&self, error: ConnectorCodecError) -> ConnectorCodecError {
+        if error.compile_control_error().is_some() {
+            return error.with_path(ConnectorFieldPath::root("provider_payload"));
+        }
         ConnectorCodecError::new(
             ConnectorFieldPath::root("provider_payload"),
             error.kind(),

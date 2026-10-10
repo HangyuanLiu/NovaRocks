@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, PipelineOperation};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -73,7 +75,7 @@ pub enum DriverState {
     PendingFinish,
     Finished,
     Canceled,
-    Failed(String),
+    Failed(ExecutionFailure),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +214,7 @@ pub struct PipelineDriver {
     driver_dependency_wait_time: Option<CounterRef>,
     operator_counters: Vec<OperatorCounters>,
     runtime_state: Arc<RuntimeState>,
+    query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     fragment_instance_id: Option<(i64, i64)>,
     event_sink: Arc<dyn FragmentEventSink>,
     state: DriverState,
@@ -253,6 +256,7 @@ pub struct PipelineDriver {
 /// positional argument for every service that must be installed before an
 /// asynchronous operator can start.
 pub(crate) struct PipelineDriverBindings {
+    query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     event_sink: Arc<dyn FragmentEventSink>,
     prebound_operator_mem_trackers: Option<Vec<Option<Arc<MemTracker>>>>,
 }
@@ -265,7 +269,22 @@ impl PipelineDriverBindings {
         Self {
             event_sink,
             prebound_operator_mem_trackers,
+            query_memory: None,
         }
+    }
+    pub(crate) fn with_query_memory(
+        mut self,
+        binding: Option<crate::runtime::query_memory::QueryMemoryBinding>,
+    ) -> Self {
+        self.query_memory = binding;
+        self
+    }
+    #[allow(
+        dead_code,
+        reason = "Formal invocation scope installation is a separate accepted slice."
+    )]
+    pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
+        self.query_memory.as_ref()
     }
 }
 
@@ -309,6 +328,13 @@ fn record_dictionary_carrier_stats(counters: &OperatorCounters, stats: Dictionar
 }
 
 impl PipelineDriver {
+    #[allow(
+        dead_code,
+        reason = "Formal invocation scope installation is a separate accepted slice."
+    )]
+    pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
+        self.query_memory.as_ref()
+    }
     pub fn new(
         driver_id: i32,
         operators: Vec<Box<dyn Operator>>,
@@ -317,6 +343,7 @@ impl PipelineDriver {
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
     ) -> Self {
+        let query_memory = runtime_state.query_memory().cloned();
         Self::new_with_event_sink(
             driver_id,
             operators,
@@ -324,7 +351,8 @@ impl PipelineDriver {
             operator_profiles,
             runtime_state,
             fragment_instance_id,
-            PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), None),
+            PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), None)
+                .with_query_memory(query_memory),
         )
     }
 
@@ -338,6 +366,7 @@ impl PipelineDriver {
         bindings: PipelineDriverBindings,
     ) -> Self {
         let PipelineDriverBindings {
+            query_memory,
             event_sink,
             prebound_operator_mem_trackers,
         } = bindings;
@@ -484,6 +513,7 @@ impl PipelineDriver {
             driver_dependency_wait_time,
             operator_counters,
             runtime_state,
+            query_memory,
             fragment_instance_id,
             event_sink,
             state: DriverState::Ready,
@@ -667,7 +697,7 @@ impl PipelineDriver {
     /// The executor catches a panic around `process`. Route it through the
     /// same operator cleanup and PendingFinish latch as an ordinary failure.
     pub(crate) fn fail_after_panic(&mut self, error: String) -> DriverState {
-        self.finish_with_state(DriverState::Failed(error))
+        self.finish_with_state(DriverState::Failed(error.into()))
     }
 
     fn fail_operators(&mut self) {
@@ -862,7 +892,7 @@ impl PipelineDriver {
         }
     }
 
-    fn terminal_sink_error_on_worker(&self) -> Option<String> {
+    fn terminal_sink_error_on_worker(&self) -> Option<ExecutionFailure> {
         self.operators.last()?.as_processor_ref()?.execution_error()
     }
 
@@ -992,7 +1022,7 @@ impl PipelineDriver {
         })
     }
 
-    fn source_block_decision_on_worker(&mut self) -> Result<WorkerBlockDecision, String> {
+    fn source_block_decision_on_worker(&mut self) -> ExecutionResult<WorkerBlockDecision> {
         let before = self.source_observable_on_worker();
         let sink = self.terminal_sink_observable_on_worker();
         let wait = match (&before, &sink) {
@@ -1057,11 +1087,12 @@ impl PipelineDriver {
             StableObservableSnapshot::Missing => Err(format!(
                 "pipeline source {} is blocked without a readiness observable",
                 self.source_name()
-            )),
+            )
+            .into()),
         }
     }
 
-    fn internal_sink_block_decision_on_worker(&self) -> Result<WorkerBlockDecision, String> {
+    fn internal_sink_block_decision_on_worker(&self) -> ExecutionResult<WorkerBlockDecision> {
         if self.operators.len() <= 2 {
             return Ok(WorkerBlockDecision::NoBlocker);
         }
@@ -1109,7 +1140,7 @@ impl PipelineDriver {
         Ok(WorkerBlockDecision::NoBlocker)
     }
 
-    fn terminal_sink_block_decision_on_worker(&self) -> Result<WorkerBlockDecision, String> {
+    fn terminal_sink_block_decision_on_worker(&self) -> ExecutionResult<WorkerBlockDecision> {
         let before = self.terminal_sink_observable_on_worker();
         let generation = before.as_ref().map(|observable| observable.generation());
         if self.terminal_sink_ready_on_worker() {
@@ -1131,7 +1162,8 @@ impl PipelineDriver {
             StableObservableSnapshot::Missing => Err(format!(
                 "pipeline sink {} is blocked without a readiness observable",
                 self.sink_name()
-            )),
+            )
+            .into()),
         }
     }
 
@@ -1409,14 +1441,14 @@ impl PipelineDriver {
         counters.mem_allocated.set(tracker.allocated());
     }
 
-    fn drive_dataflow(&mut self, made_progress: &mut bool) -> Result<bool, String> {
+    fn drive_dataflow(&mut self, made_progress: &mut bool) -> ExecutionResult<bool> {
         self.drive_push_edges(made_progress)?;
         let root_yielded = self.drive_pull_edges(made_progress)?;
         self.drive_push_edges(made_progress)?;
         Ok(root_yielded)
     }
 
-    fn drive_push_edges(&mut self, made_progress: &mut bool) -> Result<(), String> {
+    fn drive_push_edges(&mut self, made_progress: &mut bool) -> ExecutionResult<()> {
         let edge_count = self.edge_chunks.len();
         if edge_count == 0 {
             return Ok(());
@@ -1429,7 +1461,7 @@ impl PipelineDriver {
             let downstream_idx = e + 1;
             let downstream_name = {
                 let Some(downstream_op) = self.operators.get(downstream_idx) else {
-                    return Err("pipeline operator index out of bounds".to_string());
+                    return Err("pipeline operator index out of bounds".to_string().into());
                 };
                 let downstream_name = downstream_op.name().to_string();
                 let downstream = downstream_op.as_processor_ref().ok_or_else(|| {
@@ -1441,10 +1473,11 @@ impl PipelineDriver {
                 let chunk = self.edge_chunks[e].as_ref().expect("checked is_some");
                 let accepted = match self.edge_root_input.as_ref() {
                     Some((edge, input)) if *edge == e => {
-                        downstream.can_accept_root_input(chunk, input)?
+                        downstream.can_accept_root_input(chunk, input)
                     }
-                    _ => downstream.can_accept_input(chunk)?,
-                };
+                    _ => downstream.can_accept_input(chunk),
+                }
+                .map_err(|error| error.at_operator(downstream_idx, PipelineOperation::Admission))?;
                 if !accepted {
                     continue;
                 }
@@ -1512,7 +1545,7 @@ impl PipelineDriver {
             let start = Instant::now();
             let result = {
                 let Some(downstream_op) = self.operators.get_mut(downstream_idx) else {
-                    return Err("pipeline operator index out of bounds".to_string());
+                    return Err("pipeline operator index out of bounds".to_string().into());
                 };
                 let downstream = downstream_op.as_processor_mut().ok_or_else(|| {
                     format!(
@@ -1563,10 +1596,7 @@ impl PipelineDriver {
                     *made_progress = true;
                 }
                 Err(err) => {
-                    return Err(format!(
-                        "pipeline push into operator {} (edge {} -> {}) failed: {}",
-                        downstream_name, e, downstream_idx, err
-                    ));
+                    return Err(err.at_operator(downstream_idx, PipelineOperation::Push));
                 }
             }
         }
@@ -1574,7 +1604,7 @@ impl PipelineDriver {
         Ok(())
     }
 
-    fn drive_pull_edges(&mut self, made_progress: &mut bool) -> Result<bool, String> {
+    fn drive_pull_edges(&mut self, made_progress: &mut bool) -> ExecutionResult<bool> {
         let edge_count = self.edge_chunks.len();
         if edge_count == 0 {
             return Ok(false);
@@ -1629,7 +1659,9 @@ impl PipelineDriver {
             }
             if !retained_root_input && let Some(input) = downstream.take_prepared_root_input() {
                 if self.edge_root_input.is_some() {
-                    return Err("pipeline acquired more than one terminal root edge".to_string());
+                    return Err("pipeline acquired more than one terminal root edge"
+                        .to_string()
+                        .into());
                 }
                 self.edge_root_input = Some((e, input));
             }
@@ -1735,10 +1767,7 @@ impl PipelineDriver {
             let maybe = match maybe {
                 Ok(value) => value,
                 Err(err) => {
-                    return Err(format!(
-                        "pipeline pull from operator {} (edge {} -> {}) failed: {}",
-                        upstream_name, upstream_idx, e, err
-                    ));
+                    return Err(err.at_operator(upstream_idx, PipelineOperation::Pull));
                 }
             };
             if let Some(mut chunk) = maybe {
@@ -1761,7 +1790,7 @@ impl PipelineDriver {
         Ok(root_yielded)
     }
 
-    fn propagate_edge_closure(&mut self, made_progress: &mut bool) -> Result<(), String> {
+    fn propagate_edge_closure(&mut self, made_progress: &mut bool) -> ExecutionResult<()> {
         for e in 0..self.edge_chunks.len() {
             if self.edge_closed[e] {
                 continue;
@@ -1791,7 +1820,7 @@ impl PipelineDriver {
         Ok(())
     }
 
-    fn drive_set_finishing(&mut self, made_progress: &mut bool) -> Result<(), String> {
+    fn drive_set_finishing(&mut self, made_progress: &mut bool) -> ExecutionResult<()> {
         if self.operators.len() < 2 {
             return Ok(());
         }
@@ -1825,10 +1854,7 @@ impl PipelineDriver {
                 counters.operator_total_time.add(elapsed_ns);
             }
             if let Err(err) = result {
-                return Err(format!(
-                    "pipeline set_finishing on operator {} (idx {}) failed: {}",
-                    op_name, idx, err
-                ));
+                return Err(err.at_operator(idx, PipelineOperation::Finishing));
             }
             debug!(
                 "Driver set_finishing: driver_id={} op_idx={} op_name={} success. edge_closed[{}]={}",
@@ -1861,15 +1887,14 @@ impl Drop for PipelineDriver {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::fragment::ExecutionResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::{BlockedReason, DriverState, Observable, PipelineDriver};
     use crate::exec::chunk::Chunk;
-    use crate::exec::pipeline::operator::{
-        FinishWatch, FinishingWait, Operator, ProcessorOperator,
-    };
+    use crate::exec::pipeline::operator::{FinishWatch, FinishingWait, Operator, ProcessorOperator};
     use crate::runtime::runtime_state::RuntimeState;
 
     /// A source that is finished before the driver's first turn, so the edge
@@ -1904,15 +1929,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-            Err("the finished source accepts no input".to_string())
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+            Err("the finished source accepts no input".to_string().into())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -1953,15 +1978,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-            Err("the finished source accepts no input".to_string())
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+            Err("the finished source accepts no input".to_string().into())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -2047,15 +2072,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             let prior_calls = self.set_finishing_calls.fetch_add(1, Ordering::SeqCst);
             // The turn is what pushes owed output, exactly as the exchange
             // sink flushes its parked payload and sends its end-of-stream
@@ -2314,15 +2339,15 @@ mod terminal_signal_tests {
             panic!("active source polling must remain on a driver worker")
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -2354,16 +2379,16 @@ mod terminal_signal_tests {
             self.output.is_some()
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.output = Some(chunk);
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(self.output.take())
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -2395,19 +2420,21 @@ mod terminal_signal_tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             if !self.need_input() {
-                return Err("recovering terminal received input while blocked".to_string());
+                return Err("recovering terminal received input while blocked"
+                    .to_string()
+                    .into());
             }
             self.pushed.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -2442,15 +2469,15 @@ mod terminal_signal_tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -2486,11 +2513,13 @@ mod terminal_signal_tests {
             self.phase.load(Ordering::Acquire) == 1
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-            Err("synchronous join completion does not accept input".to_string())
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+            Err("synchronous join completion does not accept input"
+                .to_string()
+                .into())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             if self
                 .phase
                 .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
@@ -2502,7 +2531,7 @@ mod terminal_signal_tests {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -2530,15 +2559,17 @@ mod terminal_signal_tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-            Err("dependency-blocked join cannot accept input".to_string())
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+            Err("dependency-blocked join cannot accept input"
+                .to_string()
+                .into())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -2570,15 +2601,15 @@ mod terminal_signal_tests {
             self.has_output
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -2963,7 +2994,7 @@ mod terminal_signal_tests {
                 "ACTIVATION_PROBE"
             }
 
-            fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            fn activate(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -3031,7 +3062,7 @@ mod terminal_signal_tests {
         );
 
         assert_eq!(
-            driver.finish_with_state(DriverState::Failed("first failure".to_string())),
+            driver.finish_with_state(DriverState::Failed("first failure".to_string().into())),
             DriverState::PendingFinish
         );
         assert_eq!(
@@ -3044,8 +3075,129 @@ mod terminal_signal_tests {
         pending.store(false, Ordering::SeqCst);
         assert_eq!(
             driver.cancel_for_fragment_abort(),
-            DriverState::Failed("first failure".to_string())
+            DriverState::Failed("first failure".to_string().into())
         );
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    struct TypedErrorSink(ExecutionFailure, PipelineOperation);
+    impl Operator for TypedErrorSink {
+        fn name(&self) -> &str {
+            "TypedErrorSink"
+        }
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+    impl ProcessorOperator for TypedErrorSink {
+        fn need_input(&self) -> bool {
+            true
+        }
+        fn has_output(&self) -> bool {
+            false
+        }
+        fn can_accept_input(&self, _: &Chunk) -> ExecutionResult<bool> {
+            if self.1 == PipelineOperation::Admission {
+                Err(self.0.clone())
+            } else {
+                Ok(true)
+            }
+        }
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
+            if self.1 == PipelineOperation::Push {
+                Err(self.0.clone())
+            } else {
+                Ok(())
+            }
+        }
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+            Ok(None)
+        }
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn typed_failure_push_admission_and_finishing_preserve_cause_and_exact_operator_context() {
+        use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureContext, PipelineOperation};
+        for operation in [
+            PipelineOperation::Push,
+            PipelineOperation::Admission,
+            PipelineOperation::Finishing,
+        ] {
+            let original: ExecutionFailure =
+                novarocks_functions::KernelFailure::ResourceExhausted.into();
+            let mut driver = PipelineDriver::new(
+                41,
+                vec![
+                    Box::new(TypedErrorSink(original.clone(), operation)),
+                    Box::new(TypedErrorSink(original.clone(), operation)),
+                ],
+                None,
+                vec![],
+                Arc::new(RuntimeState::default()),
+                None,
+            );
+            let mut progress = false;
+            let error = if operation == PipelineOperation::Finishing {
+                driver.edge_closed[0] = true;
+                driver.drive_set_finishing(&mut progress).unwrap_err()
+            } else {
+                driver.edge_chunks[0] = Some(Chunk::default());
+                let error = driver.drive_push_edges(&mut progress).unwrap_err();
+                assert_eq!(
+                    driver.edge_chunks[0].is_some(),
+                    operation == PipelineOperation::Admission
+                );
+                error
+            };
+            assert_eq!(error.cause(), original.cause());
+            assert_eq!(
+                error.context(),
+                Some(ExecutionFailureContext {
+                    operator_ordinal: 1,
+                    operation
+                })
+            );
+            assert!(!progress);
+        }
+    }
+
+    #[test]
+    fn typed_failure_pending_finish_keeps_first_kernel_cause_and_single_signal() {
+        use ExecutionFailure;
+        let pending = Arc::new(AtomicBool::new(true));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let mut driver = signal_counting_driver(
+            Arc::clone(&pending),
+            Arc::clone(&cancel_count),
+            Arc::clone(&failure_count),
+        );
+        let first: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
+        assert_eq!(
+            driver.finish_with_state(DriverState::Failed(first.clone())),
+            DriverState::PendingFinish
+        );
+        assert_eq!(
+            driver.finish_with_state(DriverState::Failed(
+                novarocks_functions::KernelFailure::Cancelled.into()
+            )),
+            DriverState::PendingFinish
+        );
+        assert_eq!(
+            driver.cancel_for_fragment_abort(),
+            DriverState::PendingFinish
+        );
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+        pending.store(false, Ordering::SeqCst);
+        assert_eq!(driver.process(Duration::ZERO), DriverState::Failed(first));
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
     }

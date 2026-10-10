@@ -181,13 +181,18 @@ impl JoinRefreshDescriptor {
                     pair.left_column.column_id
                 ));
             }
-            if pair.left_column.data_type != pair.right_column.data_type {
+            if pair.left_column.value_type.logical_type != pair.right_column.value_type.logical_type
+                || !novarocks_type_contract::arrow_data_types_exact(
+                    &pair.left_column.value_type.data_type,
+                    &pair.right_column.value_type.data_type,
+                )
+            {
                 return Err(format!(
                     "join refresh descriptor join key pair type mismatch: left {} is {:?}, right {} is {:?}",
                     pair.left_column.column_id,
-                    pair.left_column.data_type,
+                    pair.left_column.value_type.data_type,
                     pair.right_column.column_id,
-                    pair.right_column.data_type
+                    pair.right_column.value_type.data_type
                 ));
             }
         }
@@ -199,8 +204,8 @@ impl JoinRefreshDescriptor {
             .action_column
             .name
             .eq_ignore_ascii_case(crate::common::CHANGE_OP_COLUMN)
-            || self.action_column.data_type != DataType::Int8
-            || self.action_column.nullable
+            || self.action_column.value_type.data_type != DataType::Int8
+            || self.action_column.value_type.nullable
             || !self.action_column.is_internal
         {
             return Err("join refresh descriptor has invalid action column".to_string());
@@ -213,8 +218,8 @@ impl JoinRefreshDescriptor {
             .join_apply_key_column
             .name
             .eq_ignore_ascii_case(crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
-            || self.join_apply_key_column.data_type != DataType::Utf8
-            || self.join_apply_key_column.nullable
+            || self.join_apply_key_column.value_type.data_type != DataType::Utf8
+            || self.join_apply_key_column.value_type.nullable
             || !self.join_apply_key_column.is_internal
         {
             return Err("join refresh descriptor has invalid join apply-key column".to_string());
@@ -370,8 +375,8 @@ fn validate_row_id_column(side: &str, column: &OutputColumn) -> Result<(), Strin
     if !column
         .name
         .eq_ignore_ascii_case(crate::common::ICEBERG_ROW_ID_COL)
-        || column.data_type != DataType::Int64
-        || column.nullable
+        || column.value_type.data_type != DataType::Int64
+        || column.value_type.nullable
         || !column.is_internal
     {
         return Err(format!(
@@ -382,9 +387,7 @@ fn validate_row_id_column(side: &str, column: &OutputColumn) -> Result<(), Strin
 }
 
 fn output_column_shape_matches(output: &OutputColumn, source: &OutputColumn) -> bool {
-    output.data_type == source.data_type
-        && output.nullable == source.nullable
-        && output.is_internal == source.is_internal
+    output.value_type == source.value_type && output.is_internal == source.is_internal
 }
 
 fn output_columns_eq(left: &[OutputColumn], right: &[OutputColumn]) -> bool {
@@ -398,8 +401,7 @@ fn output_columns_eq(left: &[OutputColumn], right: &[OutputColumn]) -> bool {
 fn output_column_eq(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
         && left.name == right.name
-        && left.data_type == right.data_type
-        && left.nullable == right.nullable
+        && left.value_type == right.value_type
         && left.is_internal == right.is_internal
 }
 
@@ -416,8 +418,8 @@ mod tests {
     ) -> OutputColumn {
         OutputColumn {
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             column_id: ColumnId(id),
             is_internal,
         }
@@ -596,8 +598,8 @@ mod tests {
         desc.mode = JoinRefreshMode::Full;
         desc.branches.clear();
         desc.needs_target_locator = false;
-        desc.join_key_pairs[0].left_column.nullable = true;
-        desc.join_key_pairs[0].right_column.nullable = false;
+        desc.join_key_pairs[0].left_column.value_type.nullable = true;
+        desc.join_key_pairs[0].right_column.value_type.nullable = false;
 
         desc.validate().expect("full refresh descriptor");
     }
@@ -672,14 +674,17 @@ mod tests {
     #[test]
     fn rejects_output_mapping_with_type_mismatch() {
         let mut desc = valid_descriptor();
-        desc.output_mappings[0].mv_output_column.data_type = DataType::Utf8;
+        desc.output_mappings[0]
+            .mv_output_column
+            .value_type
+            .data_type = DataType::Utf8;
         assert_invalid(desc, "does not match source column");
     }
 
     #[test]
     fn rejects_output_mapping_with_nullability_mismatch() {
         let mut desc = valid_descriptor();
-        desc.output_mappings[0].mv_output_column.nullable = true;
+        desc.output_mappings[0].mv_output_column.value_type.nullable = true;
         assert_invalid(desc, "does not match source column");
     }
 
@@ -693,14 +698,14 @@ mod tests {
     #[test]
     fn rejects_descriptor_with_invalid_left_row_id_column() {
         let mut desc = valid_descriptor();
-        desc.left_row_id_column.data_type = DataType::Utf8;
+        desc.left_row_id_column.value_type.data_type = DataType::Utf8;
         assert_invalid(desc, "invalid left row-id column");
     }
 
     #[test]
     fn rejects_descriptor_with_invalid_right_row_id_column() {
         let mut desc = valid_descriptor();
-        desc.right_row_id_column.nullable = true;
+        desc.right_row_id_column.value_type.nullable = true;
         assert_invalid(desc, "invalid right row-id column");
     }
 
@@ -714,14 +719,14 @@ mod tests {
     #[test]
     fn rejects_join_key_pair_with_type_mismatch() {
         let mut desc = valid_descriptor();
-        desc.join_key_pairs[0].right_column.data_type = DataType::Utf8;
+        desc.join_key_pairs[0].right_column.value_type.data_type = DataType::Utf8;
         assert_invalid(desc, "join key pair type mismatch");
     }
 
     #[test]
     fn allows_join_key_pair_with_nullability_mismatch() {
         let mut desc = valid_descriptor();
-        desc.join_key_pairs[0].right_column.nullable = true;
+        desc.join_key_pairs[0].right_column.value_type.nullable = true;
 
         desc.validate()
             .expect("join key nullability follows SQL equality semantics");
@@ -738,14 +743,14 @@ mod tests {
     #[test]
     fn rejects_descriptor_with_invalid_action_column() {
         let mut desc = valid_descriptor();
-        desc.action_column.data_type = DataType::Int64;
+        desc.action_column.value_type.data_type = DataType::Int64;
         assert_invalid(desc, "invalid action column");
     }
 
     #[test]
     fn rejects_descriptor_with_invalid_join_apply_key_column() {
         let mut desc = valid_descriptor();
-        desc.join_apply_key_column.nullable = true;
+        desc.join_apply_key_column.value_type.nullable = true;
         assert_invalid(desc, "invalid join apply-key column");
     }
 

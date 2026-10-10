@@ -24,10 +24,3 @@ pub(crate) fn is_largeint(data_type: &DataType) -> bool {
             if *width == crate::largeint::LARGEINT_BYTE_WIDTH
     )
 }
-
-pub(crate) fn is_integer(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}

@@ -2318,6 +2318,7 @@ mod tests {
                     FrozenRootOutput::ClientRows(render),
                 ))
                 .unwrap(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
         let window = scope

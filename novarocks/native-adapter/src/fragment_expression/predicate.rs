@@ -176,16 +176,22 @@ pub(crate) fn lower_between(
     )?;
     let low = lower_required_child(&between.low, path.clone().field("low"), arena, input_layout)?;
     let high = lower_required_child(&between.high, path.field("high"), arena, input_layout)?;
-    if between.negated {
-        let lt_low = arena.push_typed(ExprNode::Lt(operand, low), DataType::Boolean);
-        let gt_high = arena.push_typed(ExprNode::Gt(operand, high), DataType::Boolean);
-        Ok(arena.push_typed(ExprNode::Or(lt_low, gt_high), data_type))
-    } else {
-        let ge_low = arena.push_typed(ExprNode::Ge(operand, low), DataType::Boolean);
-        let le_high = arena.push_typed(ExprNode::Le(operand, high), DataType::Boolean);
-        let in_range = arena.push_typed(ExprNode::And(ge_low, le_high), DataType::Boolean);
-        Ok(in_range)
-    }
+    let expansion = novarocks_type_contract::NativeBetweenPlan::new(between.negated);
+    let comparison = |operator, right| match operator {
+        novarocks_type_contract::ComparisonOperator::Lt => ExprNode::Lt(operand, right),
+        novarocks_type_contract::ComparisonOperator::Le => ExprNode::Le(operand, right),
+        novarocks_type_contract::ComparisonOperator::Gt => ExprNode::Gt(operand, right),
+        novarocks_type_contract::ComparisonOperator::Ge => ExprNode::Ge(operand, right),
+        _ => unreachable!("original BETWEEN expansion uses ordered comparisons"),
+    };
+    let lower = arena.push_typed(comparison(expansion.lower(), low), DataType::Boolean);
+    let upper = arena.push_typed(comparison(expansion.upper(), high), DataType::Boolean);
+    let connective = match expansion.connective() {
+        novarocks_type_contract::ControlShape::Conjunction => ExprNode::And(lower, upper),
+        novarocks_type_contract::ControlShape::Disjunction => ExprNode::Or(lower, upper),
+        _ => unreachable!("original BETWEEN expansion uses AND or OR"),
+    };
+    Ok(arena.push_typed(connective, data_type))
 }
 
 pub(crate) fn lower_like(

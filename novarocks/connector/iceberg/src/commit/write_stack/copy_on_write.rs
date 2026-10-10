@@ -388,7 +388,83 @@ fn validate_matched_rows(
 }
 
 /// Everything the frozen base of one copy-on-write session provides.
-pub(crate) struct IcebergCowFreezeInput<'a> {
+/// The original statistics input with an optional provider-owned source
+/// projection. Both implementations share the original branch math below.
+pub(crate) trait IcebergCowBaseFile {
+    fn stats(&self) -> &DataFileWithStats;
+    fn attach_source(
+        &mut self,
+        owner: &ConnectorProviderBindingKey,
+        source: ConnectorWriteRewriteSource,
+    ) -> Result<ConnectorWriteRewriteSource, ConnectorError>;
+}
+
+impl IcebergCowBaseFile for DataFileWithStats {
+    fn stats(&self) -> &DataFileWithStats {
+        self
+    }
+    fn attach_source(
+        &mut self,
+        _owner: &ConnectorProviderBindingKey,
+        source: ConnectorWriteRewriteSource,
+    ) -> Result<ConnectorWriteRewriteSource, ConnectorError> {
+        Ok(source)
+    }
+}
+
+/// Typed facts kept by move from the original ReadSnapshot/Stats projection.
+/// The source is attached only after original match and branch validation.
+pub(crate) struct IcebergCowFrozenBaseFile {
+    file: Option<crate::manifest::FrozenReadFileWithStats>,
+    metadata: crate::iceberg::spec::TableMetadataRef,
+    access: std::sync::Arc<crate::loaded_table::IcebergAttemptTableAccess>,
+}
+
+impl IcebergCowFrozenBaseFile {
+    pub(crate) fn new(
+        file: crate::manifest::FrozenReadFileWithStats,
+        metadata: crate::iceberg::spec::TableMetadataRef,
+        access: std::sync::Arc<crate::loaded_table::IcebergAttemptTableAccess>,
+    ) -> Self {
+        Self {
+            file: Some(file),
+            metadata,
+            access,
+        }
+    }
+}
+
+impl IcebergCowBaseFile for IcebergCowFrozenBaseFile {
+    fn stats(&self) -> &DataFileWithStats {
+        &self
+            .file
+            .as_ref()
+            .expect("frozen COW file is consumed once")
+            .stats
+    }
+
+    fn attach_source(
+        &mut self,
+        owner: &ConnectorProviderBindingKey,
+        source: ConnectorWriteRewriteSource,
+    ) -> Result<ConnectorWriteRewriteSource, ConnectorError> {
+        let file = self.file.take().expect("frozen COW file is consumed once");
+        let pending =
+            crate::typed_read::frozen_source::IcebergCowPendingReadSource::from_original_branch(
+                owner.clone(),
+                &source,
+                self.metadata.clone(),
+                self.access.clone(),
+                file.into_read_file(),
+            )?;
+        let receipt = novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter::<
+            crate::typed_boundary::IcebergTypedBoundary,
+        >::freeze_source(owner.clone(), std::sync::Arc::new(pending));
+        Ok(source.with_frozen_read_source(receipt))
+    }
+}
+
+pub(crate) struct IcebergCowFreezeInput<'a, F: IcebergCowBaseFile = DataFileWithStats> {
     pub owner: &'a ConnectorProviderBindingKey,
     pub catalog: &'a ConnectorInstanceId,
     pub namespace: &'a str,
@@ -398,7 +474,7 @@ pub(crate) struct IcebergCowFreezeInput<'a> {
     /// Every live data file of the frozen base snapshot. The session already
     /// reads them for its own admission, so the freeze takes them rather than
     /// issuing a second manifest walk.
-    pub base_files: Vec<DataFileWithStats>,
+    pub base_files: Vec<F>,
     /// The provider-signed writer input every branch consumes.
     pub input: &'a ConnectorWriteInputShape,
     pub base_version_digest: [u8; 32],
@@ -411,10 +487,10 @@ pub(crate) struct IcebergCowFreezeInput<'a> {
 /// one rewrite branch per touched old file in path order, then the append
 /// branch when the statement has net-new rows. Deterministic order is what
 /// lets the frontend name a branch by its ordinal without a second identity.
-pub(crate) fn freeze_copy_on_write_branches(
+pub(crate) fn freeze_copy_on_write_branches<F: IcebergCowBaseFile>(
     selection: &ConnectorRowMutationSelection,
     match_contract: &ConnectorMutationMatchContract,
-    mut freeze: IcebergCowFreezeInput<'_>,
+    mut freeze: IcebergCowFreezeInput<'_, F>,
 ) -> Result<Vec<IcebergCowBranchRecipe>, ConnectorError> {
     validate_match_contract(match_contract, selection, &freeze)?;
     let layout = IcebergCowSelectionLayout::resolve(match_contract)?;
@@ -425,10 +501,10 @@ pub(crate) fn freeze_copy_on_write_branches(
 
     let mut by_path = BTreeMap::new();
     for file in std::mem::take(&mut freeze.base_files) {
-        if !rewrites.contains_key(&file.path) {
+        if !rewrites.contains_key(&file.stats().path) {
             continue;
         }
-        let path = file.path.clone();
+        let path = file.stats().path.clone();
         if by_path.insert(path.clone(), file).is_some() {
             return Err(corrupt(format!(
                 "Iceberg copy-on-write base contains duplicate data file `{path}`"
@@ -444,10 +520,11 @@ pub(crate) fn freeze_copy_on_write_branches(
     let mut recipes = Vec::with_capacity(rewrites.len() + usize::from(!append_ordinals.is_empty()));
     for (old_file, rows) in &rewrites {
         let data_file = by_path
-            .get(old_file)
+            .get_mut(old_file)
             .ok_or_else(|| corrupt("Iceberg copy-on-write base lost a matched data file"))?;
-        validate_matched_rows(old_file, rows, data_file)?;
-        let rewrite_source = freeze_branch_source(&freeze, data_file.clone())?;
+        validate_matched_rows(old_file, rows, data_file.stats())?;
+        let rewrite_source = freeze_branch_source(&freeze, data_file.stats().clone())?;
+        let rewrite_source = data_file.attach_source(freeze.owner, rewrite_source)?;
         recipes.push(IcebergCowBranchRecipe {
             input: IcebergCowBranchInput::Rewrite {
                 old_file: old_file.clone(),
@@ -469,10 +546,10 @@ pub(crate) fn freeze_copy_on_write_branches(
     Ok(recipes)
 }
 
-fn validate_match_contract(
+fn validate_match_contract<F: IcebergCowBaseFile>(
     contract: &ConnectorMutationMatchContract,
     selection: &ConnectorRowMutationSelection,
-    freeze: &IcebergCowFreezeInput<'_>,
+    freeze: &IcebergCowFreezeInput<'_, F>,
 ) -> Result<(), ConnectorError> {
     contract.validate_selection(selection)?;
     if contract.owner() != freeze.owner
@@ -535,8 +612,8 @@ fn validate_match_contract(
 
 /// Freeze the read contract of one rewrite branch: the single old data file it
 /// re-reads, pinned at the base snapshot the session froze.
-fn freeze_branch_source(
-    freeze: &IcebergCowFreezeInput<'_>,
+fn freeze_branch_source<F: IcebergCowBaseFile>(
+    freeze: &IcebergCowFreezeInput<'_, F>,
     data_file: DataFileWithStats,
 ) -> Result<ConnectorWriteRewriteSource, ConnectorError> {
     let explicit_file = data_file_with_stats_to_iceberg_data_file_info(data_file);
@@ -893,7 +970,7 @@ mod tests {
             table_name: "t",
             metadata: &metadata,
             snapshot_id: 1,
-            base_files: Vec::new(),
+            base_files: Vec::<DataFileWithStats>::new(),
             input: &input,
             base_version_digest,
             max_handle_payload_bytes: 1024,

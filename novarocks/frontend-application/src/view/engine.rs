@@ -362,12 +362,17 @@ impl ViewEngine for FrontendViewEngine {
                 novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
                 self.catalog_application(),
             );
+        let control =
+            crate::query_execution::planning::sql_compile_control_from_connector_request(context);
         let columns = novarocks_sql::planning::catalog::analyze_view_query(
             query,
             &provider,
             database,
             self.function_catalog(),
-        )?
+            self.kernel.constant_policy(),
+            &control,
+        )
+        .map_err(|error| error.to_string())?
         .into_iter()
         .map(|column| {
             Ok(ViewColumnDefinition {
@@ -504,6 +509,7 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
                     .collect::<Result<Vec<_>, String>>()?,
             ),
             SqlType::Variant => type_name("VARIANT", vec![]),
+            SqlType::Uuid => type_name("UUID", vec![]),
         })
     }
 
@@ -592,6 +598,7 @@ mod tests {
                 None,
                 fixture.registry.clone(),
                 Arc::new(EmptyViewService),
+                crate::application::test_constant_policy(),
             ));
             let result = engine.list_external_views(
                 "catalog",

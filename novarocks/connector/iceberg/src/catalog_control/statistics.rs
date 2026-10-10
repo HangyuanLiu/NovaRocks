@@ -47,7 +47,7 @@ use crate::catalog::error::CatalogOutcome;
 use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
 use crate::catalog::{CatalogTableName, CatalogTransactionStart};
 use crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
-use crate::iceberg::spec::{PrimitiveType, Type};
+use crate::iceberg::spec::Type;
 use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at_with_control};
 use crate::metadata::{IcebergMetadata, IcebergTablePayload};
 use crate::reconcile_payload::{
@@ -417,7 +417,12 @@ impl StatisticsCollection for IcebergMetadata {
                             "resolve the schema of the measured Iceberg snapshot: {error}"
                         ))
                     })?;
-                let requirements = collection_requirements(&schema, &request.selection)?;
+                let sql_schema = crate::scalar_integer_domain::metadata_sql_schema(
+                    physical.table.metadata(),
+                    &schema,
+                )?;
+                let requirements =
+                    collection_requirements(&schema, sql_schema.as_ref(), &request.selection)?;
                 (
                     Some(snapshot_id),
                     Some(snapshot.sequence_number()),
@@ -875,10 +880,9 @@ fn cleanup_uncommitted_statistics_file(
 
 fn collection_requirements(
     schema: &crate::iceberg::spec::Schema,
+    arrow_schema: &arrow::datatypes::Schema,
     selection: &StatisticsColumnSelection,
 ) -> Result<Vec<StatisticsRequiredAggregation>, ConnectorError> {
-    let arrow_schema = crate::iceberg::arrow::schema_to_arrow_schema(schema)
-        .map_err(|error| corrupt(format!("convert measured Iceberg schema: {error}")))?;
     let explicit = match selection {
         StatisticsColumnSelection::Default => None,
         StatisticsColumnSelection::Explicit(columns) => Some(
@@ -899,10 +903,11 @@ fn collection_requirements(
         {
             continue;
         }
-        let Some(primitive) = (match iceberg_field.field_type.as_ref() {
-            Type::Primitive(primitive) => Some(primitive),
-            _ => None,
-        }) else {
+        // Preserve ANALYZE's existing VARIANT capability boundary. Its SQL
+        // byte carrier is supported by collect-on-write, but ANALYZE did not
+        // admit the storage Struct representation before this type migration.
+        let supported_storage = matches!(iceberg_field.field_type.as_ref(), Type::Primitive(primitive) if !matches!(primitive, crate::iceberg::spec::PrimitiveType::Variant));
+        if !supported_storage {
             if explicit.is_some() {
                 return Err(unsupported_column(
                     &iceberg_field.name,
@@ -914,15 +919,7 @@ fn collection_requirements(
         let arrow_field = arrow_schema.fields().get(ordinal).ok_or_else(|| {
             corrupt("Iceberg and Arrow statistics schemas have different field counts")
         })?;
-        // UUID is an Iceberg physical 16-byte value. Its aggregate input is
-        // declared from the Iceberg type itself, never guessed from an Utf8
-        // field emitted by another schema adapter.
-        let data_type = if matches!(primitive, PrimitiveType::Uuid) {
-            DataType::FixedSizeBinary(16)
-        } else {
-            arrow_field.data_type().clone()
-        };
-        if !supports_theta_input_type(&data_type) {
+        if !supports_theta_input_type(arrow_field.data_type()) {
             if explicit.is_some() {
                 return Err(unsupported_column(
                     &iceberg_field.name,
@@ -931,11 +928,16 @@ fn collection_requirements(
             }
             continue;
         }
+        let value_type = crate::statistics_value_type::statistics_input_value_type(
+            iceberg_field,
+            arrow_field,
+            arrow_field,
+        )
+        .map_err(corrupt)?;
         let input = StatisticsScanColumn::try_new(
             ordinal,
             Arc::<str>::from(iceberg_field.name.as_str()),
-            data_type,
-            !iceberg_field.required,
+            value_type,
         )?;
         let artifact = StatisticsArtifactIdentity::try_new(
             vec![iceberg_field.id],
@@ -1476,7 +1478,8 @@ mod tests {
         OutputFile, Storage, StorageConfig, StorageFactory,
     };
     use crate::iceberg::spec::{
-        FormatVersion, Operation, PartitionSpec, Snapshot, SortOrder, Summary, TableMetadataBuilder,
+        FormatVersion, Operation, PartitionSpec, PrimitiveType, Snapshot, SortOrder, Summary,
+        TableMetadataBuilder,
     };
     use crate::iceberg::table::Table;
     use crate::iceberg::{Error as IcebergError, TableIdent};
@@ -2137,6 +2140,9 @@ mod tests {
             .expect("schema");
         let requirements = collection_requirements(
             &schema,
+            crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
+                .unwrap()
+                .as_ref(),
             &StatisticsColumnSelection::Explicit(vec![Arc::from("u")]),
         )
         .expect("UUID requirement");
@@ -2145,6 +2151,40 @@ mod tests {
             requirements[0].input().data_type(),
             &DataType::FixedSizeBinary(16)
         );
+        assert_eq!(
+            requirements[0].input().value_type().logical_type,
+            novarocks_type_contract::ValueLogicalType::Uuid
+        );
+        assert!(requirements[0].input().value_type().nullable);
+    }
+
+    #[test]
+    fn ordinary_fixed16_collection_input_has_no_inferred_uuid_or_largeint_domain() {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                8,
+                "fixed",
+                Type::Primitive(PrimitiveType::Fixed(16)),
+            ))])
+            .build()
+            .expect("schema");
+        let requirements = collection_requirements(
+            &schema,
+            crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
+                .unwrap()
+                .as_ref(),
+            &StatisticsColumnSelection::Explicit(vec![Arc::from("fixed")]),
+        )
+        .expect("fixed requirement");
+        assert_eq!(requirements.len(), 1);
+        let input = requirements[0].input().value_type();
+        assert_eq!(input.data_type, DataType::FixedSizeBinary(16));
+        assert_eq!(
+            input.logical_type,
+            novarocks_type_contract::ValueLogicalType::Physical
+        );
+        assert!(!input.nullable);
     }
 
     #[test]
@@ -2161,14 +2201,104 @@ mod tests {
         assert!(
             collection_requirements(
                 &schema,
+                crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
+                    .unwrap()
+                    .as_ref(),
                 &StatisticsColumnSelection::Explicit(vec![Arc::from("v")]),
             )
             .is_err()
         );
         assert!(
-            collection_requirements(&schema, &StatisticsColumnSelection::Default)
-                .expect("default selection")
-                .is_empty()
+            collection_requirements(
+                &schema,
+                crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
+                    .unwrap()
+                    .as_ref(),
+                &StatisticsColumnSelection::Default
+            )
+            .expect("default selection")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn collection_preserves_actual_property_domains_and_plain_carriers() {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(crate::iceberg::spec::NestedField::optional(
+                    1,
+                    "h",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(crate::iceberg::spec::NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(crate::iceberg::spec::NestedField::optional(
+                    3,
+                    "n",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(crate::iceberg::spec::NestedField::optional(
+                    4,
+                    "raw",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(crate::iceberg::spec::NestedField::optional(
+                    5,
+                    "fixed",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let properties = [
+            ("novarocks.logical_type.h".into(), "hll".into()),
+            ("novarocks.logical_type.b".into(), "bitmap".into()),
+            ("novarocks.logical_type.n".into(), "largeint".into()),
+        ]
+        .into();
+        let sql_schema = crate::scalar_integer_domain::sql_schema(&schema, &properties).unwrap();
+        let requirements = collection_requirements(
+            &schema,
+            sql_schema.as_ref(),
+            &StatisticsColumnSelection::Default,
+        )
+        .unwrap();
+        use novarocks_type_contract::ValueLogicalType;
+        assert_eq!(
+            requirements
+                .iter()
+                .map(|requirement| requirement.input().value_type().logical_type)
+                .collect::<Vec<_>>(),
+            vec![
+                ValueLogicalType::Hll,
+                ValueLogicalType::Bitmap,
+                ValueLogicalType::LargeInt,
+                ValueLogicalType::Physical,
+                ValueLogicalType::Physical
+            ]
+        );
+        assert_eq!(
+            requirements
+                .iter()
+                .map(|requirement| requirement.input().data_type().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                DataType::Binary,
+                DataType::Binary,
+                DataType::FixedSizeBinary(16),
+                DataType::Binary,
+                DataType::FixedSizeBinary(16)
+            ]
+        );
+        assert_eq!(
+            requirements
+                .iter()
+                .map(|requirement| requirement.artifact().input_fields().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![2], vec![3], vec![4], vec![5]]
         );
     }
 

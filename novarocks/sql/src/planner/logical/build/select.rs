@@ -18,8 +18,10 @@
 use crate::analysis::cte::CTERegistry;
 use crate::analysis::*;
 use crate::column_id::{ColumnId, ColumnRefFactory};
+use crate::compiler::SqlCompileError;
 use crate::planner::logical::*;
 use crate::planner::payload::*;
+use novarocks_type_contract::PureCompileControl;
 
 use super::aggregate::{
     collect_non_agg_column_refs, dedup_group_by_exprs, expr_column_id, prepare_repeat_input,
@@ -37,8 +39,9 @@ pub(super) fn plan_select_scoped(
     select: ResolvedSelect,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
-    plan_select_scoped_with_source(select, None, cte_registry, factory)
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
+    plan_select_scoped_with_source(select, None, cte_registry, factory, control)
 }
 
 pub(super) fn plan_select_scoped_with_source(
@@ -46,7 +49,8 @@ pub(super) fn plan_select_scoped_with_source(
     source: Option<LogicalPlanNode>,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
     // Keep the analyzer-owned occurrence identities before Repeat/Aggregate
@@ -57,8 +61,7 @@ pub(super) fn plan_select_scoped_with_source(
         .map(|item| {
             (
                 item.output_column_id,
-                item.expr.data_type.clone(),
-                item.expr.nullable,
+                item.expr.value_type.clone(),
             )
         })
         .collect();
@@ -71,7 +74,7 @@ pub(super) fn plan_select_scoped_with_source(
     let mut current = match source {
         Some(source) => source,
         None => match select.from.take() {
-            Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
+            Some(relation) => plan_relation_scoped(relation, cte_registry, factory, control)?,
             None => LogicalPlanNode::new(
                 LogicalPlanKind::Values(PlanValuesNode {
                     rows: vec![vec![]],
@@ -92,6 +95,7 @@ pub(super) fn plan_select_scoped_with_source(
         ApplyClause::Where,
         cte_registry,
         factory,
+        control,
     )?;
     current = wrap_predicate_applies(
         current,
@@ -99,6 +103,7 @@ pub(super) fn plan_select_scoped_with_source(
         ApplyClause::Where,
         cte_registry,
         factory,
+        control,
     )?;
 
     if let Some(predicate) = select.filter.take() {
@@ -118,6 +123,7 @@ pub(super) fn plan_select_scoped_with_source(
         ApplyClause::AggregateInput,
         cte_registry,
         factory,
+        control,
     )?;
 
     if let Some(mut repeat_info) = select.repeat.take() {
@@ -127,7 +133,8 @@ pub(super) fn plan_select_scoped_with_source(
             &mut repeat_info,
             REPEAT_GROUP_QUALIFIER,
             factory,
-        );
+            control,
+        )?;
         current = LogicalPlanNode::new(
             LogicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: repeat_info.repeat_column_ref_list,
@@ -164,7 +171,7 @@ pub(super) fn plan_select_scoped_with_source(
                     .map(|s| s.output_column.column_id),
             );
             let mut extra_gb = Vec::new();
-            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
+            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb, control)?;
             for col in extra_gb {
                 // Skip output columns of HAVING apply specs — they are
                 // provided by the Apply node above the Aggregate, not below.
@@ -177,14 +184,15 @@ pub(super) fn plan_select_scoped_with_source(
             }
         }
 
-        let aggregate_group_by = dedup_group_by_exprs(&select.group_by);
+        let aggregate_group_by = dedup_group_by_exprs(&select.group_by, control)?;
         let (project_items, agg_calls, output_columns, rewritten_having) =
             split_projection_for_aggregate(
                 &select.projection,
                 &aggregate_group_by,
                 select.having.as_ref(),
                 factory,
-            );
+                control,
+            )?;
         current = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: aggregate_group_by,
@@ -204,6 +212,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Having,
             cte_registry,
             factory,
+            control,
         )?;
         current = wrap_predicate_applies(
             current,
@@ -211,6 +220,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Having,
             cte_registry,
             factory,
+            control,
         )?;
 
         if let Some(having) = rewritten_having {
@@ -230,6 +240,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Projection,
             cte_registry,
             factory,
+            control,
         )?;
 
         transfer_projection_provenance(&analyzed_projection_facts, &project_items, factory)?;
@@ -242,6 +253,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Projection,
             cte_registry,
             factory,
+            control,
         )?;
 
         current = build_window_and_project(current, select.projection.clone(), factory)?;
@@ -269,7 +281,7 @@ pub(super) fn plan_select_scoped_with_source(
 /// Carry its analyzed facts to the replacement symbol before duplicate output
 /// IDs are separated. Repeated symbols must agree even when one fact is None.
 fn transfer_projection_provenance(
-    analyzed_facts: &[(ColumnId, arrow::datatypes::DataType, bool)],
+    analyzed_facts: &[(ColumnId, novarocks_type_contract::FunctionValueType)],
     rewritten: &[ProjectItem],
     factory: &mut ColumnRefFactory,
 ) -> Result<(), String> {
@@ -277,21 +289,24 @@ fn transfer_projection_provenance(
         return Err("same-value projection rewrite changed its occurrence count".into());
     }
     let mut sources_by_target = std::collections::HashMap::new();
-    for ((source, data_type, nullable), item) in analyzed_facts.iter().zip(rewritten) {
+    for ((source, value_type), item) in analyzed_facts.iter().zip(rewritten) {
         let source = *source;
         if source == ColumnId::UNSET || item.output_column_id == ColumnId::UNSET {
             // Legacy construction tests may omit analyzer IDs; there is no
             // source fact to transfer from an unset identity.
             continue;
         }
-        if *data_type != item.expr.data_type {
+        if value_type.data_type != item.expr.value_type.data_type {
             return Err("same-value projection rewrite changed its declared carrier".into());
+        }
+        if value_type.logical_type != item.expr.value_type.logical_type {
+            return Err("same-value projection rewrite changed its declared logical identity".into());
         }
         // A symbol can be nullable at an outer-join boundary while its
         // producing expression is non-null (for example a match indicator).
         // Compare the expressions at this rewrite boundary; symbol transfer
         // and output adaptation separately check their declared contracts.
-        if *nullable && !item.expr.nullable {
+        if value_type.nullable && !item.expr.value_type.nullable {
             return Err("same-value projection rewrite narrowed its declared nullability".into());
         }
         if let Some(previous) = sources_by_target.insert(item.output_column_id, source)
@@ -302,7 +317,7 @@ fn transfer_projection_provenance(
             return Err("same-value projection rewrite merged conflicting source domains".into());
         }
     }
-    for ((source, _, _), item) in analyzed_facts.iter().zip(rewritten) {
+    for ((source, _), item) in analyzed_facts.iter().zip(rewritten) {
         let source = *source;
         if source != ColumnId::UNSET && item.output_column_id != ColumnId::UNSET {
             factory
@@ -338,14 +353,13 @@ fn build_distinct(
                 qualifier: None,
                 column: item.output_name.clone(),
             },
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
         });
         output_columns.push(OutputColumn {
             column_id: cid,
             name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
+
             is_internal: false,
         });
     }

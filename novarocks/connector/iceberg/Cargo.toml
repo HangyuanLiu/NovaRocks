@@ -65,6 +65,7 @@ novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true
 novarocks-types.workspace = true
+novarocks-type-contract.workspace = true
 
 [dev-dependencies]
 faststr = "0.2"

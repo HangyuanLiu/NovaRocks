@@ -25,8 +25,6 @@
 //!
 //! Mirrors StarRocks's `SplitAggregateRule` / `AggType.java` convention.
 
-use arrow::datatypes::DataType;
-
 use crate::column_id::ColumnId;
 use crate::common::OutputColumn;
 use crate::optimizer::memo::{MExpr, Memo};
@@ -55,9 +53,16 @@ impl Rule for SplitDistinctAgg {
         matches!(op, Operator::LogicalAggregate(a) if a.aggregates.iter().any(|c| c.distinct))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalAggregate(agg) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         // Ordered aggregates need all order-by inputs available at the update
         // phase. The current split-distinct lowering only preserves the
@@ -65,14 +70,18 @@ impl Rule for SplitDistinctAgg {
         // aggregates like `array_agg(distinct x order by y)` lose `y` in the
         // GLOBAL phase. Fall back to the single-stage aggregate for semantic
         // correctness until multi-phase ordered DISTINCT is implemented.
-        if agg.aggregates.iter().any(|call| !call.order_by.is_empty()) {
-            return vec![];
+        if agg
+            .aggregates
+            .iter()
+            .any(|call| !call.source.order_by().is_empty())
+        {
+            return Ok(vec![]);
         }
 
         // Validate single-DISTINCT-column precondition.
         let distinct_col = match extract_single_distinct_col(&memo.scalars, &agg.aggregates) {
             Some(c) => c,
-            None => return vec![], // multi-column DISTINCT, or multiple different DISTINCT cols
+            None => return Ok(vec![]), // multi-column DISTINCT, or multiple different DISTINCT cols
         };
 
         // Partition aggregates into DISTINCT-bearing (which are deduped away at LOCAL)
@@ -87,7 +96,6 @@ impl Rule for SplitDistinctAgg {
             .iter()
             .map(|idx| agg.aggregates[*idx].clone())
             .collect();
-
         // Stateful sketch/bitmap aggregates preserve null/empty-state semantics
         // across the current split-distinct phase boundaries poorly. Fall back
         // to the single-stage plan for correctness until their merge path is
@@ -96,10 +104,10 @@ impl Rule for SplitDistinctAgg {
             .iter()
             .any(|call| split_distinct_sensitive_agg(call.name.as_str()))
         {
-            return vec![];
+            return Ok(vec![]);
         }
 
-        if agg.group_by.is_empty() {
+        Ok(if agg.group_by.is_empty() {
             apply_four_phase(
                 expr,
                 memo,
@@ -107,7 +115,8 @@ impl Rule for SplitDistinctAgg {
                 distinct_col,
                 &non_distinct,
                 &non_distinct_indices,
-            )
+                control,
+            )?
         } else {
             apply_three_phase(
                 expr,
@@ -117,8 +126,9 @@ impl Rule for SplitDistinctAgg {
                 distinct_col,
                 &non_distinct,
                 &non_distinct_indices,
-            )
-        }
+                control,
+            )?
+        })
     }
 }
 
@@ -135,21 +145,24 @@ fn extract_single_distinct_col(
 ) -> Option<ScalarId> {
     let mut distinct_calls = calls.iter().filter(|c| c.distinct);
     let first = distinct_calls.next()?;
-    if first.args.len() != 1 {
+    if first.source.arguments().len() != 1 {
         return None;
     }
-    if !matches!(arena.node(first.args[0]), ScalarNode::ColumnRef(_)) {
+    if !matches!(
+        arena.node(first.source.arguments()[0]),
+        ScalarNode::ColumnRef(_)
+    ) {
         return None;
     }
     for c in distinct_calls {
-        if c.args.len() != 1 {
+        if c.source.arguments().len() != 1 {
             return None;
         }
-        if c.args[0] != first.args[0] {
+        if c.source.arguments()[0] != first.source.arguments()[0] {
             return None;
         }
     }
-    Some(first.args[0])
+    Some(first.source.arguments()[0])
 }
 
 fn split_distinct_sensitive_agg(name: &str) -> bool {
@@ -181,8 +194,16 @@ fn rebind_distinct_arg_to_phase_output(
     mut call: ScalarAggregateSpec,
     phase_output: ScalarId,
 ) -> ScalarAggregateSpec {
-    if call.distinct && call.args.len() == 1 {
-        call.args = vec![phase_output];
+    if call.distinct && call.source.arguments().len() == 1 {
+        let arguments = vec![phase_output];
+        let order_by = call.source.order_by().to_vec();
+        let binding = call.source.binding().clone();
+        // This phase is a genuine update only when its source was authored.
+        call.source = if call.source.logical_parts().is_some() {
+            crate::binding::AggregateArgumentSource::logical_update(arguments, order_by, binding)
+        } else {
+            crate::binding::AggregateArgumentSource::uncertified(arguments, order_by, binding)
+        };
     }
     call
 }
@@ -201,8 +222,8 @@ fn group_output_column_from_expr(
     OutputColumn {
         column_id,
         name,
-        data_type: arena.data_type(expr).clone(),
-        nullable: arena.nullable(expr),
+        value_type: arena.value_type(expr).clone(),
+
         is_internal: false,
     }
 }
@@ -243,24 +264,30 @@ fn aggregate_output_columns(
                 name: scalar_expr::aggregate_display_name(
                     arena,
                     &call.name,
-                    &call.args,
+                    call.source.arguments(),
                     call.distinct,
-                    &call.order_by,
+                    call.source.order_by(),
                 ),
                 // A phase that hands its calls on publishes the state it
                 // built, not the result the statement asked for. Reading the
                 // parent's type for it would name the type of a value this
                 // phase never produces.
-                data_type: match publishes {
-                    PhaseOutput::State => crate::functions::aggregate_selection(&call.resolved)
-                        .intermediate_type
-                        .data_type
-                        .clone(),
-                    PhaseOutput::Result => source_output
-                        .map(|output| output.data_type.clone())
-                        .unwrap_or(DataType::Null),
+                value_type: {
+                    let mut value_type = match publishes {
+                        PhaseOutput::State => {
+                            crate::functions::aggregate_selection(call.source.binding())
+                                .intermediate_type
+                                .clone()
+                        }
+                        PhaseOutput::Result => {
+                            crate::functions::aggregate_result_type(call.source.binding()).clone()
+                        }
+                    };
+                    // Widen only the phase-output root, preserving its full domain.
+                    value_type.nullable = true;
+                    value_type
                 },
-                nullable: true,
+
                 is_internal: true,
             }
         })
@@ -296,6 +323,10 @@ fn scalar_key_matches(arena: &ScalarArena, left: ScalarId, right: ScalarId) -> b
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The original request control accompanies existing distinct aggregate stage inputs."
+)]
 fn apply_three_phase(
     expr: &MExpr,
     memo: &mut Memo,
@@ -304,7 +335,8 @@ fn apply_three_phase(
     distinct_col: ScalarId,
     non_distinct: &[ScalarAggregateSpec],
     non_distinct_indices: &[usize],
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by plus the
     // DISTINCT column when it is not already a group key.
     let mut gb_with_distinct = group_by.to_vec();
@@ -347,8 +379,8 @@ fn apply_three_phase(
             OutputColumn {
                 column_id,
                 name,
-                data_type: memo.scalars.data_type(*expr).clone(),
-                nullable: memo.scalars.nullable(*expr),
+                value_type: memo.scalars.value_type(*expr).clone(),
+
                 is_internal: layout_column
                     .map(|output| output.is_internal)
                     .unwrap_or(false),
@@ -399,7 +431,8 @@ fn apply_three_phase(
         &mut memo.scalars,
         &gb_with_distinct_outputs,
         gb_with_distinct_outputs.len(),
-    );
+        control,
+    )?;
     let distinct_phase_arg = dg_group_by
         .get(distinct_phase_arg_idx)
         .copied()
@@ -434,7 +467,7 @@ fn apply_three_phase(
         .map(|call| rebind_distinct_arg_to_phase_output(call, distinct_phase_arg))
         .collect();
     if distinct_aggs.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
     let mut global_aggs = Vec::with_capacity(distinct_aggs.len() + non_distinct.len());
     global_aggs.push(distinct_aggs[0].clone());
@@ -470,11 +503,12 @@ fn apply_three_phase(
         &mut memo.scalars,
         &gb_with_distinct_outputs,
         group_by.len(),
-    );
+        control,
+    )?;
     let global_output_layout =
         AggregateOutputLayout::new(global_group_columns, global_aggregate_columns);
 
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
             // Reference DISTINCT_GLOBAL's original group outputs (drop the
@@ -487,7 +521,7 @@ fn apply_three_phase(
             is_merge: global_merge,
         }),
         children: vec![dg_group],
-    }]
+    }])
 }
 
 fn apply_four_phase(
@@ -497,13 +531,15 @@ fn apply_four_phase(
     distinct_col: ScalarId,
     non_distinct: &[ScalarAggregateSpec],
     non_distinct_indices: &[usize],
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     let distinct_group_outputs = phase_group_output_columns(&memo.scalars, &[distinct_col]);
     let distinct_group_by = aggregate_group_key_output_ref(
         &mut memo.scalars,
         &distinct_group_outputs,
         distinct_group_outputs.len(),
-    );
+        control,
+    )?;
     let distinct_phase_arg = distinct_group_by.first().copied().unwrap_or(distinct_col);
     let partial_output_columns = aggregate_phase_output_columns(
         &memo.scalars,
@@ -571,7 +607,7 @@ fn apply_four_phase(
         .map(|call| rebind_distinct_arg_to_phase_output(call, distinct_phase_arg))
         .collect();
     if distinct_aggs.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
     let mut phase_aggs = Vec::with_capacity(distinct_aggs.len() + non_distinct.len());
     phase_aggs.push(distinct_aggs[0].clone());
@@ -631,7 +667,7 @@ fn apply_four_phase(
     );
     let global_output_layout = AggregateOutputLayout::new(vec![], global_aggregate_columns);
 
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
             group_by: vec![],
@@ -641,7 +677,7 @@ fn apply_four_phase(
             is_merge: global_merge,
         }),
         children: vec![dl_group],
-    }]
+    }])
 }
 
 #[cfg(test)]
@@ -683,8 +719,7 @@ mod tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -763,8 +798,18 @@ mod tests {
             output.column_id = output_id;
             call.output_column_id = output_id;
         }
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let output_layout = AggregateOutputLayout::new(
             output_columns
                 .iter()
@@ -783,31 +828,31 @@ mod tests {
     fn count_distinct(arg_name: &str) -> AggregateCall {
         AggregateCall {
             name: "count".into(),
-            args: vec![col(arg_name)],
             distinct: true,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: test_col_id(&format!("count_distinct_{arg_name}")),
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], true),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col(arg_name)],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], true),
+            ),
         }
     }
 
     fn array_agg_distinct(arg_name: &str) -> AggregateCall {
         AggregateCall {
             name: "array_agg".into(),
-            args: vec![col(arg_name)],
             distinct: true,
             result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
                 "item",
                 DataType::Int64,
                 true,
             ))),
-            order_by: vec![],
             output_column_id: test_col_id(&format!("array_agg_distinct_{arg_name}")),
-            resolved: crate::functions::test_resolved_aggregate(
-                "array_agg",
-                &[DataType::Int64],
-                true,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col(arg_name)],
+                vec![],
+                crate::functions::test_resolved_aggregate("array_agg", &[DataType::Int64], true),
             ),
         }
     }
@@ -815,12 +860,14 @@ mod tests {
     fn sum_non_distinct(arg_name: &str) -> AggregateCall {
         AggregateCall {
             name: "sum".into(),
-            args: vec![col(arg_name)],
             distinct: false,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: test_col_id(&format!("sum_{arg_name}")),
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col(arg_name)],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         }
     }
 
@@ -843,8 +890,8 @@ mod tests {
             outputs.push(OutputColumn {
                 column_id,
                 name,
-                data_type: expr.data_type.clone(),
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 is_internal: false,
             });
         }
@@ -856,8 +903,11 @@ mod tests {
                     call.output_column_id
                 },
                 name: format!("agg_{idx}"),
-                data_type: call.result_type.clone(),
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    call.result_type.clone(),
+                    true,
+                ),
+
                 is_internal: false,
             });
         }
@@ -868,8 +918,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -881,8 +931,18 @@ mod tests {
         full_output_columns: Vec<OutputColumn>,
         public_output_columns: Vec<OutputColumn>,
     ) -> LogicalAggregateOp {
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let output_layout = AggregateOutputLayout::new(
             full_output_columns
                 .iter()
@@ -968,12 +1028,14 @@ mod tests {
         );
         let aggregate = AggregateCall {
             name: "count".to_string(),
-            args: vec![col("a"), col("b")],
             distinct: true,
             result_type: DataType::Int64,
-            order_by: Vec::new(),
             output_column_id: test_col_id("multi_distinct_count_a_b"),
-            resolved,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col("a"), col("b")],
+                Vec::new(),
+                resolved,
+            ),
         };
         let expression = MExpr {
             id: memo.next_expr_id(),
@@ -986,7 +1048,16 @@ mod tests {
             children: vec![scan_group],
         };
 
-        assert!(SplitDistinctAgg.apply(&expression, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &expression,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1004,7 +1075,16 @@ mod tests {
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1020,23 +1100,25 @@ mod tests {
                 vec![
                     AggregateCall {
                         name: "array_agg".into(),
-                        args: vec![col("name")],
                         distinct: false,
                         result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
                             "item",
                             DataType::Int64,
                             true,
                         ))),
-                        order_by: vec![crate::analysis::SortItem {
-                            expr: col("id"),
-                            asc: true,
-                            nulls_first: true,
-                        }],
                         output_column_id: fallback_output_id(1),
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "array_agg",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![col("name")],
+                            vec![crate::analysis::SortItem {
+                                expr: col("id"),
+                                asc: true,
+                                nulls_first: true,
+                            }],
+                            crate::functions::test_resolved_aggregate(
+                                "array_agg",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     count_distinct("name"),
@@ -1045,7 +1127,16 @@ mod tests {
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1062,15 +1153,17 @@ mod tests {
                     count_distinct("x"),
                     AggregateCall {
                         name: "ds_hll_count_distinct".into(),
-                        args: vec![col("x")],
                         distinct: false,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: fallback_output_id(1),
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "ds_hll_count_distinct",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![col("x")],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "ds_hll_count_distinct",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -1078,7 +1171,16 @@ mod tests {
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1093,30 +1195,41 @@ mod tests {
                 vec![col("g")],
                 vec![AggregateCall {
                     name: "array_agg".into(),
-                    args: vec![col("name")],
                     distinct: true,
                     result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
                         "item",
                         DataType::Int64,
                         true,
                     ))),
-                    order_by: vec![crate::analysis::SortItem {
-                        expr: col("id"),
-                        asc: true,
-                        nulls_first: true,
-                    }],
                     output_column_id: fallback_output_id(1),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "array_agg",
-                        &[DataType::Int64],
-                        true,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col("name")],
+                        vec![crate::analysis::SortItem {
+                            expr: col("id"),
+                            asc: true,
+                            nulls_first: true,
+                        }],
+                        crate::functions::test_resolved_aggregate(
+                            "array_agg",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     ),
                 }],
                 vec![],
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1124,16 +1237,22 @@ mod tests {
         // count(distinct x) + sum(distinct x) -- same col. Accepts both.
         let sum_distinct_x = AggregateCall {
             name: "sum".into(),
-            args: vec![col("x")],
             distinct: true,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: fallback_output_id(1),
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], true),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col("x")],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], true),
+            ),
         };
         let mut memo = Memo::new();
-        let calls =
-            intern_aggregate_calls(&mut memo.scalars, &[count_distinct("x"), sum_distinct_x]);
+        let calls = intern_aggregate_calls(
+            &mut memo.scalars,
+            &[count_distinct("x"), sum_distinct_x],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let col_out = extract_single_distinct_col(&memo.scalars, &calls);
         assert!(
             col_out.is_some(),
@@ -1161,29 +1280,44 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "g".into(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one multi-phase alternative");
 
         // Top: GLOBAL, group_by=[g], aggregates[0] = count(distinct x), aggregates[1] = sum(a) (merge)
@@ -1239,7 +1373,13 @@ mod tests {
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one multi-phase alternative");
 
         let dg_group = &memo.groups[out[0].children[0]];
@@ -1282,7 +1422,13 @@ mod tests {
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one multi-phase alternative");
 
         let top = match &out[0].op {
@@ -1293,7 +1439,8 @@ mod tests {
         assert_eq!(top.group_by.len(), 2);
         assert_eq!(top.aggregates.len(), 1);
         let arg = top.aggregates[0]
-            .args
+            .source
+            .arguments()
             .first()
             .copied()
             .expect("distinct arg");
@@ -1323,28 +1470,32 @@ mod tests {
                 vec![
                     AggregateCall {
                         name: "count".into(),
-                        args: vec![col_with_id("x", 5)],
                         distinct: true,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: count_output.column_id,
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            true,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![col_with_id("x", 5)],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                true,
+                            ),
                         ),
                     },
                     AggregateCall {
                         name: "sum".into(),
-                        args: vec![col_with_id("a", 6)],
                         distinct: false,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: sum_output.column_id,
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![col_with_id("a", 6)],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -1358,7 +1509,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1400,28 +1557,32 @@ mod tests {
                 vec![
                     AggregateCall {
                         name: "count".into(),
-                        args: vec![x],
                         distinct: true,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: ColumnId::new_for_test(7),
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            true,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![x],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                true,
+                            ),
                         ),
                     },
                     AggregateCall {
                         name: "sum".into(),
-                        args: vec![a],
                         distinct: false,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: ColumnId::new_for_test(8),
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -1429,22 +1590,31 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::new_for_test(9),
                         name: "g_alias".into(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(7),
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(8),
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1452,7 +1622,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1516,7 +1692,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1535,6 +1717,162 @@ mod tests {
     }
 
     #[test]
+    fn four_phase_preserves_actual_selected_opaque_and_largeint_states() {
+        use novarocks_functions::FunctionArgument;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        for (name, source) in [
+            (
+                "min",
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
+            ),
+            (
+                "sum",
+                FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    false,
+                    ValueLogicalType::LargeInt,
+                )
+                .unwrap(),
+            ),
+        ] {
+            let arguments = [FunctionArgument::Value {
+                value_type: source.clone(),
+                constant: None,
+            }];
+            let resolved = crate::functions::builtin_sql_function_catalog()
+                .resolve_aggregate_binding(
+                    name,
+                    1,
+                    &arguments,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+            let resolved = crate::binding::SqlFunctionBinding::new(
+                resolved,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            );
+            let mut result = crate::functions::aggregate_result_type(&resolved).clone();
+            result.nullable = true;
+            let mut state = crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .clone();
+            state.nullable = true;
+            let input = TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: test_col_id("a"),
+                    qualifier: None,
+                    column: "a".into(),
+                },
+                value_type: source.clone(),
+            };
+            let call = AggregateCall {
+                name: name.into(),
+                distinct: false,
+                result_type: result.data_type.clone(),
+                output_column_id: ColumnId(202),
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![input],
+                    vec![],
+                    resolved.clone(),
+                ),
+            };
+            let count = count_distinct("x");
+            let count_result =
+                crate::functions::aggregate_result_type(count.source.binding()).clone();
+            let columns = vec![
+                OutputColumn {
+                    column_id: count.output_column_id,
+                    name: "count(distinct x)".into(),
+                    value_type: count_result,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId(202),
+                    name: format!("{name}(a)"),
+                    value_type: result.clone(),
+                    is_internal: false,
+                },
+            ];
+            let mut memo = Memo::new();
+            let id = memo.next_expr_id();
+            let child = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
+                    rows: vec![],
+                    columns: vec![
+                        output_column(1, "x"),
+                        OutputColumn {
+                            column_id: test_col_id("a"),
+                            name: "a".into(),
+                            value_type: source,
+                            is_internal: false,
+                        },
+                    ],
+                }),
+                children: vec![],
+            });
+            let aggregate = single_agg(&mut memo, vec![], vec![count, call], columns);
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalAggregate(aggregate.clone()),
+                children: vec![child],
+            };
+            let alternatives = SplitDistinctAgg
+                .apply(
+                    &expr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+            assert_eq!(alternatives.len(), 1);
+            let Operator::PhysicalHashAggregate(global) = &alternatives[0].op else {
+                panic!("GLOBAL");
+            };
+            assert_eq!(global.output_layout.aggregate_columns[1].value_type, result);
+            assert_eq!(global.output_columns[1].value_type, result);
+            let mut group = alternatives[0].children[0];
+            for (mode, ordinal) in [
+                (AggMode::DistinctLocal, 1),
+                (AggMode::DistinctGlobal, 0),
+                (AggMode::Local, 0),
+            ] {
+                let expression = &memo.groups[group].physical_exprs[0];
+                let Operator::PhysicalHashAggregate(phase) = &expression.op else {
+                    panic!("aggregate phase");
+                };
+                assert_eq!(phase.mode, mode);
+                assert_eq!(
+                    phase.output_layout.aggregate_columns[ordinal].value_type,
+                    state
+                );
+                assert!(std::ptr::eq(
+                    phase.aggregates[ordinal].source.binding().resolved(),
+                    resolved.resolved()
+                ));
+                group = expression.children[0];
+            }
+            // Even when the public result is pruned, the selected result has
+            // an exact domain; absence of a layout name never becomes Null.
+            let mut pruned = aggregate.clone();
+            pruned.output_layout.aggregate_columns.clear();
+            let projected = aggregate_output_columns(
+                &memo.scalars,
+                &pruned,
+                &aggregate.aggregates[1..],
+                &[1],
+                PhaseOutput::Result,
+            );
+            assert_eq!(projected[0].value_type, result);
+        }
+    }
+
+    #[test]
     fn four_phase_chain_when_scalar() {
         let mut memo = Memo::new();
         let sg = scan_group(&mut memo);
@@ -1549,22 +1887,34 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
 
         // Top: GLOBAL, scalar, [count(x) merge, sum(a) merge]
@@ -1624,28 +1974,32 @@ mod tests {
                 vec![
                     AggregateCall {
                         name: "count".into(),
-                        args: vec![col_with_id("x", 5)],
                         distinct: true,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: count_output.column_id,
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            true,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![col_with_id("x", 5)],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                true,
+                            ),
                         ),
                     },
                     AggregateCall {
                         name: "sum".into(),
-                        args: vec![col_with_id("a", 6)],
                         distinct: false,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: sum_output.column_id,
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![col_with_id("a", 6)],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -1655,7 +2009,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1693,41 +2053,47 @@ mod tests {
                 vec![
                     AggregateCall {
                         name: "sum".into(),
-                        args: vec![a],
                         distinct: false,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: sum_output,
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     AggregateCall {
                         name: "count".into(),
-                        args: vec![b],
                         distinct: false,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: count_output,
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![b],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     AggregateCall {
                         name: "count".into(),
-                        args: vec![x],
                         distinct: true,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: distinct_output,
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            true,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![x],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                true,
+                            ),
                         ),
                     },
                 ],
@@ -1735,22 +2101,31 @@ mod tests {
                     OutputColumn {
                         column_id: sum_output,
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: count_output,
                         name: "count(b)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: distinct_output,
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1758,7 +2133,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1831,29 +2212,40 @@ mod tests {
                 vec![],
                 vec![AggregateCall {
                     name: "count".into(),
-                    args: vec![x],
                     distinct: true,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: ColumnId::new_for_test(8),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "count",
-                        &[DataType::Int64],
-                        true,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![x],
+                        vec![],
+                        crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     ),
                 }],
                 vec![OutputColumn {
                     column_id: ColumnId::new_for_test(8),
                     name: "count(distinct x)".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
             )),
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let dl_group = &memo.groups[out[0].children[0]];
         let dg_group = &memo.groups[dl_group.physical_exprs[0].children[0]];
@@ -1900,41 +2292,47 @@ mod tests {
                 vec![
                     AggregateCall {
                         name: "count".into(),
-                        args: vec![x_phase],
                         distinct: true,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: ColumnId::new_for_test(8),
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            true,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![x_phase],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                true,
+                            ),
                         ),
                     },
                     AggregateCall {
                         name: "sum".into(),
-                        args: vec![a],
                         distinct: false,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: ColumnId::new_for_test(9),
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     AggregateCall {
                         name: "count".into(),
-                        args: vec![x_duplicate],
                         distinct: true,
                         result_type: DataType::Int64,
-                        order_by: vec![],
                         output_column_id: ColumnId::new_for_test(10),
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            true,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![x_duplicate],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                true,
+                            ),
                         ),
                     },
                 ],
@@ -1942,22 +2340,31 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::new_for_test(8),
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(9),
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(10),
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1965,7 +2372,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let dl_group = &memo.groups[out[0].children[0]];
         let dl = match &dl_group.physical_exprs[0].op {
@@ -1977,14 +2390,85 @@ mod tests {
             .aggregates
             .iter()
             .filter(|call| call.distinct)
-            .map(|call| match materialize(&memo.scalars, call.args[0]).kind {
-                ExprKind::ColumnRef { column_id, .. } => column_id,
-                other => panic!("expected ColumnRef arg, got {:?}", other),
-            })
+            .map(
+                |call| match materialize(&memo.scalars, call.source.arguments()[0]).kind {
+                    ExprKind::ColumnRef { column_id, .. } => column_id,
+                    other => panic!("expected ColumnRef arg, got {:?}", other),
+                },
+            )
             .collect::<Vec<_>>();
         assert_eq!(
             distinct_arg_ids,
             vec![ColumnId::new_for_test(5), ColumnId::new_for_test(5)]
         );
+    }
+
+    #[test]
+    fn distinct_rebind_preserves_authored_origin_and_never_certifies_state_only() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut arena = crate::optimizer::scalar::ScalarArena::with_constant_policy(
+            crate::constant::test_constant_policy(),
+        );
+        let arguments = intern_exprs(&mut arena, &[col("x"), col("a")], &control).unwrap();
+        let original = arguments[0];
+        let phase_output = arguments[1];
+        let binding = crate::functions::test_resolved_aggregate("count", &[DataType::Int64], true);
+        for authored in [false, true] {
+            let source = if authored {
+                crate::binding::AggregateArgumentSource::logical_update(
+                    vec![original],
+                    vec![],
+                    binding.clone(),
+                )
+            } else {
+                crate::binding::AggregateArgumentSource::uncertified(
+                    vec![original],
+                    vec![],
+                    binding.clone(),
+                )
+            };
+            let original_binding = source.binding().clone();
+            let rebound = rebind_distinct_arg_to_phase_output(
+                ScalarAggregateSpec {
+                    output_column_id: test_col_id("count_distinct_x"),
+                    name: "count".to_string(),
+                    distinct: true,
+                    source,
+                },
+                phase_output,
+            );
+            assert_eq!(rebound.source.arguments(), &[phase_output]);
+            assert_eq!(rebound.source.logical_parts().is_some(), authored);
+            assert!(std::ptr::eq(
+                rebound.source.binding().resolved(),
+                original_binding.resolved()
+            ));
+            assert_eq!(
+                rebound.source.binding().decimal_overflow_policy(),
+                original_binding.decimal_overflow_policy()
+            );
+        }
+    }
+
+    #[test]
+    fn non_distinct_rebind_keeps_original_logical_channel() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut arena = crate::optimizer::scalar::ScalarArena::with_constant_policy(
+            crate::constant::test_constant_policy(),
+        );
+        let arguments = intern_exprs(&mut arena, &[col("x"), col("a")], &control).unwrap();
+        let call = ScalarAggregateSpec {
+            output_column_id: test_col_id("sum_a"),
+            name: "sum".to_string(),
+            distinct: false,
+            source: crate::binding::AggregateArgumentSource::logical_update(
+                vec![arguments[0]],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
+        };
+        let rebound = rebind_distinct_arg_to_phase_output(call, arguments[1]);
+        assert_eq!(rebound.source.arguments(), &[arguments[0]]);
+        assert!(rebound.source.logical_parts().is_some());
     }
 }

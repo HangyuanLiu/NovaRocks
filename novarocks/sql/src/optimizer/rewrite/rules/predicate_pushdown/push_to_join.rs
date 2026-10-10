@@ -21,6 +21,7 @@
 //! derivation operate directly on memo-owned `ScalarId`s, and tree construction
 //! remains local to the `OptExpr` rewrite path.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -63,7 +64,11 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
             || matches!(&expr.op, Operator::LogicalJoin(join) if join.condition.is_some())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
         let throws = match &expr.op {
@@ -111,7 +116,8 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
                     right,
                     join_req,
                     &mut arena,
-                );
+                    &ctx.control_view(),
+                )?;
                 if changed {
                     Ok(RewriteResult::Changed(new_join_expr))
                 } else {
@@ -130,7 +136,8 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
                     right,
                     required_output_columns,
                     &mut arena,
-                ) {
+                    &ctx.control_view(),
+                )? {
                     Some(result) => Ok(RewriteResult::Changed(result)),
                     None => Ok(RewriteResult::Unchanged),
                 }
@@ -153,7 +160,8 @@ fn push_filter_predicates_opt(
     right: OptExpr,
     required_output_columns: Option<HashSet<ColumnId>>,
     arena: &mut ScalarArena,
-) -> (OptExpr, bool) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(OptExpr, bool), SqlCompileError> {
     let mut left_ids = collect_output_ids_opt(&left);
     let mut right_ids = collect_output_ids_opt(&right);
     left_ids.remove(&ColumnId::UNSET);
@@ -177,7 +185,8 @@ fn push_filter_predicates_opt(
             &right_ids,
             &join_groups,
             &filter_groups,
-        );
+            control,
+        )?;
         append_new_derived_conjuncts_opt(
             &mut conjuncts,
             derived,
@@ -216,8 +225,9 @@ fn push_filter_predicates_opt(
             },
             (true, true) => {
                 if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
-                    let (implied_left, implied_right) =
-                        extract_implied_or_side_filters(arena, conj, &left_ids, &right_ids);
+                    let (implied_left, implied_right) = extract_implied_or_side_filters(
+                        arena, conj, &left_ids, &right_ids, control,
+                    )?;
                     for pred in implied_left {
                         if !subtree_has_predicate_opt(&left, pred, arena) {
                             left_preds.push(pred);
@@ -241,7 +251,7 @@ fn push_filter_predicates_opt(
                     remaining.push(conj);
                 } else {
                     let (factored, or_remaining) =
-                        factor_common_eq_from_or(arena, conj, &left_ids, &right_ids);
+                        factor_common_eq_from_or(arena, conj, &left_ids, &right_ids, control)?;
                     if !factored.is_empty() {
                         join_preds.extend(factored);
                         if let Some(rem) = or_remaining {
@@ -277,7 +287,8 @@ fn push_filter_predicates_opt(
     let new_left = if left_preds.is_empty() {
         left
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, left_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, left_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -289,7 +300,8 @@ fn push_filter_predicates_opt(
     let new_right = if right_preds.is_empty() {
         right
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, right_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, right_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -299,7 +311,7 @@ fn push_filter_predicates_opt(
     };
 
     // Merge new join predicates with the existing join condition.
-    let new_condition = merge_join_conditions(arena, join.condition, join_preds);
+    let new_condition = merge_join_conditions(arena, join.condition, join_preds, control)?;
 
     // Upgrade CROSS JOIN to INNER when join predicates were extracted.
     let new_join_type = if join.join_type == JoinKind::Cross && new_condition.is_some() {
@@ -317,8 +329,8 @@ fn push_filter_predicates_opt(
     );
     new_join.required_output_columns = required_output_columns;
 
-    let result = wrap_remaining_filter_opt_scalar(new_join, remaining, arena);
-    (result, pushed_any)
+    let result = wrap_remaining_filter_opt_scalar(new_join, remaining, arena, control)?;
+    Ok((result, pushed_any))
 }
 
 fn push_join_condition_predicates_opt(
@@ -327,12 +339,15 @@ fn push_join_condition_predicates_opt(
     right: OptExpr,
     required_output_columns: Option<HashSet<ColumnId>>,
     arena: &mut ScalarArena,
-) -> Option<OptExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     if !matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
-        return None;
+        return Ok(None);
     }
 
-    let cond_id = join.condition?;
+    let Some(cond_id) = join.condition else {
+        return Ok(None);
+    };
 
     let mut left_ids = collect_output_ids_opt(&left);
     let mut right_ids = collect_output_ids_opt(&right);
@@ -350,7 +365,8 @@ fn push_join_condition_predicates_opt(
         &right_ids,
         &condition_groups,
         &condition_groups,
-    );
+        control,
+    )?;
     append_new_derived_conjuncts_opt(
         &mut conjuncts,
         derived,
@@ -385,18 +401,19 @@ fn push_join_condition_predicates_opt(
     let new_condition = if residual_preds.is_empty() {
         None
     } else {
-        scalar_expr::combine_conjuncts(arena, residual_preds)
+        scalar_expr::combine_conjuncts(arena, residual_preds, control)?
     };
     let upgrades_cross = join.join_type == JoinKind::Cross && new_condition.is_some();
 
     if !pushed_any && !upgrades_cross {
-        return None;
+        return Ok(None);
     }
 
     let new_left = if left_preds.is_empty() {
         left
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, left_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, left_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -408,7 +425,8 @@ fn push_join_condition_predicates_opt(
     let new_right = if right_preds.is_empty() {
         right
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, right_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, right_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -431,7 +449,7 @@ fn push_join_condition_predicates_opt(
         vec![new_left, new_right],
     );
     result.required_output_columns = required_output_columns;
-    Some(result)
+    Ok(Some(result))
 }
 
 fn classify_sides_by_column_ids(
@@ -553,7 +571,8 @@ fn merge_join_conditions(
     arena: &mut ScalarArena,
     existing: Option<ScalarId>,
     new_preds: Vec<ScalarId>,
-) -> Option<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
     let mut all = Vec::new();
     let mut seen = HashSet::new();
     if let Some(cond) = existing {
@@ -570,7 +589,7 @@ fn merge_join_conditions(
             all.push(pred);
         }
     }
-    scalar_expr::combine_conjuncts(arena, all)
+    scalar_expr::combine_conjuncts(arena, all, control)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -584,11 +603,12 @@ fn extract_implied_or_side_filters(
     expr: ScalarId,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
-) -> (Vec<ScalarId>, Vec<ScalarId>) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<ScalarId>, Vec<ScalarId>), SqlCompileError> {
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let branch_count = branches.len();
 
@@ -608,30 +628,33 @@ fn extract_implied_or_side_filters(
         }
 
         if !left_conjuncts.is_empty() {
-            left_terms
-                .push(scalar_expr::combine_conjuncts(arena, left_conjuncts).expect("non-empty"));
+            left_terms.push(
+                scalar_expr::combine_conjuncts(arena, left_conjuncts, control)?.expect("non-empty"),
+            );
         }
         if !right_conjuncts.is_empty() {
-            right_terms
-                .push(scalar_expr::combine_conjuncts(arena, right_conjuncts).expect("non-empty"));
+            right_terms.push(
+                scalar_expr::combine_conjuncts(arena, right_conjuncts, control)?
+                    .expect("non-empty"),
+            );
         }
     }
 
     let left_filters = if left_terms.len() == branch_count {
-        scalar_expr::combine_disjuncts(arena, left_terms)
+        scalar_expr::combine_disjuncts(arena, left_terms, control)?
             .into_iter()
             .collect()
     } else {
         Vec::new()
     };
     let right_filters = if right_terms.len() == branch_count {
-        scalar_expr::combine_disjuncts(arena, right_terms)
+        scalar_expr::combine_disjuncts(arena, right_terms, control)?
             .into_iter()
             .collect()
     } else {
         Vec::new()
     };
-    (left_filters, right_filters)
+    Ok((left_filters, right_filters))
 }
 
 fn classify_implied_filter_side(
@@ -653,11 +676,12 @@ fn factor_common_eq_from_or(
     expr: ScalarId,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
-) -> (Vec<ScalarId>, Option<ScalarId>) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<ScalarId>, Option<ScalarId>), SqlCompileError> {
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
-        return (vec![], None);
+        return Ok((vec![], None));
     }
 
     let branch_conjuncts: Vec<Vec<ScalarId>> = branches
@@ -685,7 +709,7 @@ fn factor_common_eq_from_or(
     }
 
     if common_eqs.is_empty() {
-        return (vec![], None);
+        return Ok((vec![], None));
     }
 
     let mut new_branches = Vec::new();
@@ -696,22 +720,27 @@ fn factor_common_eq_from_or(
             .copied()
             .collect();
         if remaining.is_empty() {
-            new_branches.push(scalar_expr::bool_literal(arena, true));
+            new_branches.push(scalar_expr::bool_literal(arena, true, control)?);
         } else {
-            new_branches.push(scalar_expr::combine_conjuncts(arena, remaining).expect("non-empty"));
+            new_branches.push(
+                scalar_expr::combine_conjuncts(arena, remaining, control)?.expect("non-empty"),
+            );
         }
     }
 
-    let or_remaining = if new_branches
-        .iter()
-        .all(|branch| scalar_expr::is_true_literal(arena, *branch))
-    {
+    let mut all_true = true;
+    for branch in &new_branches {
+        if !scalar_expr::is_true_literal(arena, *branch, control)? {
+            all_true = false;
+            break;
+        }
+    }
+    let or_remaining = if all_true {
         None
     } else {
-        scalar_expr::combine_disjuncts(arena, new_branches)
+        scalar_expr::combine_disjuncts(arena, new_branches, control)?
     };
-
-    (common_eqs, or_remaining)
+    Ok((common_eqs, or_remaining))
 }
 
 fn is_cross_side_eq(
@@ -777,16 +806,14 @@ mod tests {
                 qualifier: Some(alias.to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
     fn int_lit(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -798,8 +825,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -811,8 +837,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -820,8 +845,8 @@ mod tests {
         OutputColumn {
             column_id: col_id(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -860,7 +885,7 @@ mod tests {
         }))
     }
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -889,7 +914,12 @@ mod tests {
     #[test]
     fn filter_join_pushes_filter_and_derived_opposite_side_predicate() {
         let mut arena = ScalarArena::new();
-        let join_condition = intern_typed(&mut arena, &eq(col("l", "a", 1), col("r", "b", 2)));
+        let join_condition = intern_typed(
+            &mut arena,
+            &eq(col("l", "a", 1), col("r", "b", 2)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -897,7 +927,12 @@ mod tests {
             }),
             vec![scan("l", &[("a", 1)]), scan("r", &[("b", 2)])],
         );
-        let filter_id = intern_typed(&mut arena, &eq(col("l", "a", 1), int_lit(7)));
+        let filter_id = intern_typed(
+            &mut arena,
+            &eq(col("l", "a", 1), int_lit(7)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let input = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_id,
@@ -932,7 +967,9 @@ mod tests {
                 eq(col("l", "a", 1), col("r", "b", 2)),
                 eq(col("l", "a", 1), int_lit(7)),
             ),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let input = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -968,22 +1005,23 @@ mod tests {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         for policy in [OutputNull, ReportError] {
             let mut arena = ScalarArena::new();
-            let source = arena.intern(ScalarNode::ColumnRef(col_id(1)), DataType::Int64, true);
+            let source = arena.intern(
+                ScalarNode::ColumnRef(col_id(1)),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            );
             let cast = arena.intern(
                 ScalarNode::Cast {
                     child: source,
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: policy,
                 },
-                DataType::Decimal128(9, 0),
-                true,
+                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
             );
             let literal = arena.intern(
                 ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
                     LiteralValue::Decimal("1".to_string()),
                 )),
-                DataType::Decimal128(9, 0),
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), false),
             );
             let predicate = arena.intern(
                 ScalarNode::BinaryOp {
@@ -992,8 +1030,7 @@ mod tests {
                     op: BinOp::Eq,
                     decimal_overflow_policy: OutputNull,
                 },
-                DataType::Boolean,
-                true,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
             );
             let join = OptExpr::new(
                 Operator::LogicalJoin(LogicalJoinOp {
@@ -1011,5 +1048,90 @@ mod tests {
                 policy == ReportError
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod selected_boolean_factor_tests {
+    use super::*;
+    use arrow::array::{Array, BooleanArray};
+    use arrow::datatypes::DataType;
+    use novarocks_functions::ConstantPool;
+    use novarocks_type_contract::{CompilePhase, FunctionValueType};
+    use std::sync::Arc;
+
+    #[test]
+    fn factor_common_join_equality_removes_actual_selected_true_constant_residuals() {
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let source_type = FunctionValueType::new(DataType::Boolean, false);
+        let pool = ConstantPool::try_new(
+            Arc::new(source_type.try_to_field("source.bool").unwrap()),
+            source_type.clone(),
+            BooleanArray::from(vec![false, true]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            control,
+        )
+        .unwrap();
+        let selected_true = arena
+            .intern_observed(
+                ScalarNode::Constant(pool.value(1).unwrap()),
+                source_type.clone(),
+                control,
+            )
+            .unwrap();
+        let left_column = ColumnId::new_for_test(701);
+        let right_column = ColumnId::new_for_test(702);
+        let left = arena
+            .intern_observed(
+                ScalarNode::ColumnRef(left_column),
+                FunctionValueType::new(DataType::Int64, false),
+                control,
+            )
+            .unwrap();
+        let right = arena
+            .intern_observed(
+                ScalarNode::ColumnRef(right_column),
+                FunctionValueType::new(DataType::Int64, false),
+                control,
+            )
+            .unwrap();
+        let mut binary = |op, left, right| {
+            arena
+                .intern_observed(
+                    ScalarNode::BinaryOp {
+                        op,
+                        left,
+                        right,
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                    source_type.clone(),
+                    control,
+                )
+                .unwrap()
+        };
+        let equality = binary(BinOp::Eq, left, right);
+        let first = binary(BinOp::And, equality, selected_true);
+        let second = binary(BinOp::And, selected_true, equality);
+        let disjunction = binary(BinOp::Or, first, second);
+        let node_count = arena.node_count();
+        let (common, residual) = factor_common_eq_from_or(
+            &mut arena,
+            disjunction,
+            &HashSet::from([left_column]),
+            &HashSet::from([right_column]),
+            control,
+        )
+        .unwrap();
+        assert_eq!(common, vec![equality]);
+        assert_eq!(residual, None);
+        assert_eq!(arena.node_count(), node_count);
+        let ScalarNode::Constant(actual) = arena.node(selected_true) else {
+            panic!("expected original constant");
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert_eq!(actual.try_boolean().unwrap(), Some(true));
     }
 }

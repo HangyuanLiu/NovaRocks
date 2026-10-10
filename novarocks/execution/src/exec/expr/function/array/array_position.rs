@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 fn is_row_constant_expr(arena: &ExprArena, expr: ExprId) -> bool {
     match arena.node(expr) {
-        Some(ExprNode::Literal(_)) => true,
+        Some(ExprNode::Constant(_) | ExprNode::Literal(_)) => true,
         Some(ExprNode::SlotId(_)) => false,
         Some(ExprNode::ArrayExpr { elements }) => elements
             .iter()

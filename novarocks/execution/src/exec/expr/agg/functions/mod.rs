@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::array::ArrayRef;
+mod aggregate_basic_adapter;
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     AggregateImplementationIdentity, AggregateStateFormatIdentity, FunctionKind,
@@ -383,10 +384,13 @@ macro_rules! builtin_aggregate {
         builtin_aggregate!($name, $function, "legacy-exec-v1")
     };
     ($name:literal, $function:expr, $implementation:literal) => {
+        builtin_aggregate!($name, $function, $implementation, "state-v1")
+    };
+    ($name:literal, $function:expr, $implementation:literal, $state:literal) => {
         BuiltinAggregateImplementation {
             canonical_name: $name,
             implementation_contract: concat!("novarocks/", $name, "/", $implementation),
-            expected_state_format: concat!("novarocks/", $name, "/state-v1"),
+            expected_state_format: concat!("novarocks/", $name, "/", $state),
             function: $function,
         }
     };
@@ -418,7 +422,8 @@ static BUILTIN_AGGREGATE_IMPLEMENTATIONS: &[BuiltinAggregateImplementation] = &[
     builtin_aggregate!("count_if", &COUNT_IF),
     builtin_aggregate!("group_concat", &GROUP_CONCAT),
     builtin_aggregate!("string_agg", &GROUP_CONCAT),
-    builtin_aggregate!("sum", &SUM),
+    // The exact SUM state travels wider than its result (R-SUM-exact).
+    builtin_aggregate!("sum", &SUM, "legacy-exec-v2", "state-v2"),
     builtin_aggregate!("count_state_merge", &COUNT_STATE_MERGE),
     builtin_aggregate!("avg_state_merge", &AVG_STATE_MERGE),
     builtin_aggregate!("min_state_merge", &MIN_STATE_MERGE),
@@ -742,3 +747,6 @@ mod registry_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod legacy_aggregate_format_baseline_tests;

@@ -252,6 +252,7 @@ fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
         }
         ExprKind::Lambda { body, .. } => collect_typed_expr_column_ids(body, out),
         ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::SubqueryPlaceholder { .. } => {}
     }
@@ -298,7 +299,7 @@ fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> 
 }
 
 fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
-    eq.left.data_type == eq.right.data_type
+    eq.left.value_type.data_type == eq.right.value_type.data_type
 }
 
 #[derive(Clone, Debug)]
@@ -394,10 +395,10 @@ fn bind_expression_to_columns(
         match &mut bound.kind {
             ExprKind::ColumnRef { column_id, .. } => {
                 let input = columns_by_id.get(column_id)?;
-                if expression.data_type != input.data_type {
+                if expression.value_type.data_type != input.value_type.data_type {
                     return None;
                 }
-                bound.nullable = input.nullable;
+                bound.value_type.nullable = input.value_type.nullable;
             }
             ExprKind::BinaryOp { left, right, .. } => {
                 **left = bind(left, columns_by_id)?;
@@ -474,6 +475,7 @@ fn bind_expression_to_columns(
                 }
             }
             ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::SubqueryPlaceholder { .. } => {}
         }
@@ -1560,11 +1562,17 @@ mod tests {
         );
         boundary.output_columns = vec![
             OutputColumn {
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType {
+                    nullable: true,
+                    ..out_col(1, "left_key").value_type
+                },
                 ..out_col(1, "left_key")
             },
             OutputColumn {
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType {
+                    nullable: true,
+                    ..out_col(3, "right_key").value_type
+                },
                 ..out_col(3, "right_key")
             },
         ];
@@ -1603,7 +1611,7 @@ mod tests {
         else {
             panic!("coalesced probe expression")
         };
-        assert!(args.iter().all(|argument| argument.nullable));
+        assert!(args.iter().all(|argument| argument.value_type.nullable));
     }
 
     #[test]
@@ -1640,7 +1648,7 @@ mod tests {
     #[test]
     fn probe_binding_preserves_logical_name_with_direct_input_nullability() {
         let mut input_column = out_col(1, "input_key");
-        input_column.nullable = true;
+        input_column.value_type.nullable = true;
         let child = leaf(vec![input_column]);
         let mut parent = values_node(1.0, vec![child]);
         parent.output_columns = vec![out_col(1, "outer_alias")];
@@ -1648,7 +1656,7 @@ mod tests {
         assert!(place_probe(&mut parent, 9, &[col_ref(1, "outer_alias")]));
         let probe = &parent.probe_runtime_filters[0];
         assert!(
-            probe.probe_expr.nullable,
+            probe.probe_expr.value_type.nullable,
             "binding metadata must match the exact direct-input schema"
         );
         let ExprKind::ColumnRef { column, .. } = &probe.probe_expr.kind else {
@@ -2125,8 +2133,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -2142,8 +2150,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
         }
     }
 
@@ -2154,16 +2161,14 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn typed_expr(kind: ExprKind) -> TypedExpr {
         TypedExpr {
             kind,
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -2183,8 +2188,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 

@@ -296,6 +296,15 @@ impl MemoryAuthority {
         }
         true
     }
+    /// Checks capability ownership only. This grants no funding domain.
+    pub fn validate_account(&self, account: &crate::AccountHandle) -> Result<(), CapacityError> {
+        if !Arc::ptr_eq(&self.shared, &account.0.shared) {
+            return Err(CapacityError::Invalid {
+                detail: "account belongs to another authority",
+            });
+        }
+        Ok(())
+    }
     /// No actionable shared shortage can escape before a bounded sweep and
     /// exact recheck under current target/policy qualification.
     pub fn request_domain(
@@ -304,10 +313,8 @@ impl MemoryAuthority {
         bytes: u64,
         budget: usize,
     ) -> RequestOutcome {
-        if !Arc::ptr_eq(&self.shared, &account.0.shared) {
-            return RequestOutcome::Refused(CapacityError::Invalid {
-                detail: "account belongs to another authority",
-            });
+        if let Err(error) = self.validate_account(account) {
+            return RequestOutcome::Refused(error);
         }
         match account.create_domain(bytes) {
             Ok(domain) => RequestOutcome::Granted(domain),

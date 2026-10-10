@@ -210,6 +210,7 @@ pub enum MvProductErrorKind {
 pub struct MvProductError {
     kind: MvProductErrorKind,
     message: String,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl MvProductError {
@@ -217,7 +218,21 @@ impl MvProductError {
         Self {
             kind,
             message: message.into(),
+            compile_control: None,
         }
+    }
+
+    pub fn with_compile_control(
+        mut self,
+        error: Option<novarocks_type_contract::CompileControlError>,
+    ) -> Self {
+        self.compile_control = error;
+        self
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub const fn kind(&self) -> MvProductErrorKind {

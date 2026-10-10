@@ -26,6 +26,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 
 use super::read_stack::{
     ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit, ConnectorReadSplitFacts,
@@ -118,6 +121,7 @@ pub enum ConnectorCodecErrorKind {
     Unsupported,
     Capacity,
     VersionMismatch,
+    CompileControl(CompileControlError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,6 +160,24 @@ impl ConnectorCodecError {
     pub fn detail(&self) -> &str {
         &self.detail
     }
+
+    /// Preserve the exact caller control failure across codec diagnostic paths.
+    pub const fn compile_control_error(&self) -> Option<CompileControlError> {
+        match self.kind {
+            ConnectorCodecErrorKind::CompileControl(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Attach an enclosing field path without changing a typed failure cause.
+    pub fn with_path(mut self, path: ConnectorFieldPath) -> Self {
+        self.path = if path.is_bounded() {
+            path
+        } else {
+            ConnectorFieldPath::root("connector_payload")
+        };
+        self
+    }
 }
 
 impl fmt::Display for ConnectorCodecError {
@@ -168,7 +190,24 @@ impl fmt::Display for ConnectorCodecError {
     }
 }
 
-impl Error for ConnectorCodecError {}
+impl Error for ConnectorCodecError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            ConnectorCodecErrorKind::CompileControl(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<CompileControlError> for ConnectorCodecError {
+    fn from(error: CompileControlError) -> Self {
+        Self {
+            path: ConnectorFieldPath::root("connector_payload"),
+            kind: ConnectorCodecErrorKind::CompileControl(error),
+            detail: Arc::from(error.to_string()),
+        }
+    }
+}
 
 impl From<ConnectorCodecContractError> for ConnectorCodecError {
     fn from(error: ConnectorCodecContractError) -> Self {
@@ -303,6 +342,7 @@ impl Drop for ConnectorDecodeDepthGuard<'_> {
 pub struct ConnectorDecodeContext<'a> {
     expected_header: &'a ConnectorEnvelopeHeader,
     ledger: &'a mut ConnectorDecodeLedger,
+    compile_checkpoints: Option<CompileCheckpoints<'a>>,
 }
 
 impl<'a> ConnectorDecodeContext<'a> {
@@ -313,7 +353,45 @@ impl<'a> ConnectorDecodeContext<'a> {
         Self {
             expected_header,
             ledger,
+            compile_checkpoints: None,
         }
+    }
+
+    /// Pure preparation borrows the original caller control; the decoded value
+    /// retains no control object. Structural byte limits remain independent.
+    pub fn try_new_for_compile(
+        expected_header: &'a ConnectorEnvelopeHeader,
+        ledger: &'a mut ConnectorDecodeLedger,
+        control: &'a dyn PureCompileControl,
+    ) -> Result<Self, ConnectorCodecError> {
+        let checkpoints = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
+        Ok(Self {
+            expected_header,
+            ledger,
+            compile_checkpoints: Some(checkpoints),
+        })
+    }
+
+    pub const fn is_compile_observed(&self) -> bool {
+        self.compile_checkpoints.is_some()
+    }
+
+    /// Account one completed bounded decoder operation. Legacy runtime decoding
+    /// has no compile scope; pure preparation must use try_new_for_compile.
+    pub fn observe_compile_step(&mut self) -> Result<(), ConnectorCodecError> {
+        if let Some(checkpoints) = &mut self.compile_checkpoints {
+            checkpoints.step()?;
+        }
+        Ok(())
+    }
+
+    /// Observe the tail before handing work or values to another owner. Opaque
+    /// library calls still require finite input bounds of their own.
+    pub fn flush_compile_control(&mut self) -> Result<(), ConnectorCodecError> {
+        if let Some(checkpoints) = &mut self.compile_checkpoints {
+            checkpoints.flush()?;
+        }
+        Ok(())
     }
 
     pub const fn expected_header(&self) -> &ConnectorEnvelopeHeader {
@@ -756,5 +834,208 @@ mod tests {
         assert!(!error.detail().contains("canary"));
         assert!(error.detail().contains("password=[REDACTED]"));
         assert!(error.detail().len() <= MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES);
+    }
+
+    struct CompileOwner {
+        calls: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+        failure_at: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for CompileOwner {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((phase, units));
+            if let Some((index, error)) = self.failure_at
+                && calls.len() == index
+            {
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+    fn compile_ledger() -> ConnectorDecodeLedger {
+        ConnectorDecodeLedger::new(
+            ConnectorDecodeLimits::try_new(1024, 1024, 1024, 1024, 8).unwrap(),
+        )
+    }
+
+    #[test]
+    fn compile_decode_entry_refuses_each_control_cause_before_work() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let owner = CompileOwner {
+                calls: Default::default(),
+                failure_at: Some((1, cause)),
+            };
+            let expected = header(ConnectorCodecCategory::ReadTable, 1);
+            let mut ledger = compile_ledger();
+            let error =
+                match ConnectorDecodeContext::try_new_for_compile(&expected, &mut ledger, &owner) {
+                    Ok(_) => panic!("entry control failure must refuse decoding"),
+                    Err(error) => error,
+                };
+            assert_eq!(error.kind(), ConnectorCodecErrorKind::CompileControl(cause));
+            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(ledger.raw_bytes(), 0);
+            assert_eq!(ledger.items(), 0);
+            assert_eq!(
+                *owner.calls.lock().unwrap(),
+                vec![(CompilePhase::ProviderValidation, 0)]
+            );
+        }
+    }
+
+    #[test]
+    fn compile_decode_work_observes_bounded_intervals_and_exact_tail() {
+        let owner = CompileOwner {
+            calls: Default::default(),
+            failure_at: None,
+        };
+        let expected = header(ConnectorCodecCategory::ReadTable, 1);
+        let mut ledger = compile_ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut ledger, &owner).unwrap();
+        for _ in 0..519 {
+            context.ledger().charge_items(1).unwrap();
+            context.observe_compile_step().unwrap();
+        }
+        context.flush_compile_control().unwrap();
+        assert_eq!(context.ledger().items(), 519);
+        assert_eq!(
+            *owner.calls.lock().unwrap(),
+            vec![
+                (CompilePhase::ProviderValidation, 0),
+                (CompilePhase::ProviderValidation, 256),
+                (CompilePhase::ProviderValidation, 256),
+                (CompilePhase::ProviderValidation, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_decode_failure_latches_and_ledger_rollback_does_not_reset_control() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let owner = CompileOwner {
+                calls: Default::default(),
+                failure_at: Some((2, cause)),
+            };
+            let expected = header(ConnectorCodecCategory::ReadTable, 1);
+            let mut ledger = compile_ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut ledger, &owner)
+                    .unwrap();
+            let structural_checkpoint = context.ledger().checkpoint();
+            for _ in 0..255 {
+                context.ledger().charge_items(1).unwrap();
+                context.observe_compile_step().unwrap();
+            }
+            let first = context.observe_compile_step().unwrap_err();
+            context.ledger().rollback(structural_checkpoint);
+            assert_eq!(context.ledger().items(), 0);
+            assert_eq!(
+                context
+                    .observe_compile_step()
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+            assert_eq!(
+                context
+                    .flush_compile_control()
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+            assert_eq!(first.compile_control_error(), Some(cause));
+            assert_eq!(
+                *owner.calls.lock().unwrap(),
+                vec![
+                    (CompilePhase::ProviderValidation, 0),
+                    (CompilePhase::ProviderValidation, 256),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn compile_decode_tail_can_refuse_success_with_original_control_cause() {
+        let cause = CompileControlError::DeadlineExceeded;
+        let owner = CompileOwner {
+            calls: Default::default(),
+            failure_at: Some((2, cause)),
+        };
+        let expected = header(ConnectorCodecCategory::ReadTable, 1);
+        let mut ledger = compile_ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut ledger, &owner).unwrap();
+        for _ in 0..3 {
+            context.observe_compile_step().unwrap();
+        }
+        let error = context.flush_compile_control().unwrap_err();
+        assert_eq!(error.compile_control_error(), Some(cause));
+        assert_eq!(
+            *owner.calls.lock().unwrap(),
+            vec![
+                (CompilePhase::ProviderValidation, 0),
+                (CompilePhase::ProviderValidation, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_codec_paths_keep_typed_cause_and_diagnostics_do_not_invent_one() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = ConnectorCodecError::from(cause)
+                .with_path(ConnectorFieldPath::root("columns").index(17));
+            assert_eq!(error.path().to_string(), "columns[17]");
+            assert_eq!(error.compile_control_error(), Some(cause));
+            let mut too_deep = ConnectorFieldPath::root("root");
+            for _ in 0..MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH {
+                too_deep = too_deep.field("child");
+            }
+            let bounded_error = error.clone().with_path(too_deep);
+            assert_eq!(bounded_error.path().to_string(), "connector_payload");
+            assert_eq!(bounded_error.compile_control_error(), Some(cause));
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+        }
+        let diagnostic = ConnectorCodecError::new(
+            ConnectorFieldPath::root("payload"),
+            ConnectorCodecErrorKind::Capacity,
+            "pure compilation was cancelled",
+        );
+        assert_eq!(diagnostic.compile_control_error(), None);
+        assert!(diagnostic.source().is_none());
+    }
+
+    #[test]
+    fn legacy_decode_context_keeps_structural_budget_without_compile_owner() {
+        let expected = header(ConnectorCodecCategory::ReadTable, 1);
+        let mut ledger = compile_ledger();
+        let mut context = ConnectorDecodeContext::new(&expected, &mut ledger);
+        assert!(!context.is_compile_observed());
+        context.validate_header(&expected).unwrap();
+        for _ in 0..519 {
+            context.ledger().charge_items(1).unwrap();
+            context.observe_compile_step().unwrap();
+        }
+        context.flush_compile_control().unwrap();
+        assert_eq!(context.ledger().items(), 519);
+        assert_eq!(context.expected_header(), &expected);
     }
 }

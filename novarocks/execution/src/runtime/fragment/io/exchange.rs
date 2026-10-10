@@ -140,11 +140,13 @@ impl TestExchangeReceiverPort {
 #[cfg(test)]
 impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
     fn register(&self, registration: super::ExchangeReceiverRegistration) -> Result<(), String> {
-        self.registry.try_register_expected_chunk_schema(
-            Self::key(registration.key),
-            registration.expected_senders,
-            registration.expected_chunk_schema,
-        )
+        self.registry
+            .try_register_expected_chunk_schema_with_binding(
+                Self::key(registration.key),
+                registration.expected_senders,
+                registration.expected_chunk_schema,
+                registration.column_binding,
+            )
     }
 
     fn push(

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -121,7 +122,11 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         // --- Step 1: Destructure Filter -> optional Project -> Window -> Sort ---
         let Operator::LogicalFilter(ref filter_op) = expr.op else {
             return Ok(RewriteResult::Unchanged);
@@ -406,10 +411,12 @@ mod tests {
     use crate::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::optimizer::scalar::{ScalarArena, SortKey};
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -422,16 +429,14 @@ mod tests {
                 qualifier: None,
                 column: format!("rk_{}", id.0),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn int_typed(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -443,8 +448,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -472,8 +476,7 @@ mod tests {
                 high: Box::new(int_typed(high_v)),
                 negated: false,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -484,15 +487,18 @@ mod tests {
                 list: values.iter().map(|&v| int_typed(v)).collect(),
                 negated: false,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
     fn rank_upper_bound_typed(predicate: TypedExpr, rank_col: ColumnId) -> Option<usize> {
         let mut arena = ScalarArena::new();
-        let predicate =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &predicate);
+        let predicate = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &predicate,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         rank_upper_bound(&arena, predicate, rank_col)
     }
 
@@ -507,15 +513,20 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
 
     fn make_sort_key(arena: &mut ScalarArena, id: ColumnId) -> SortKey {
         SortKey {
-            expr: crate::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(id)),
+            expr: crate::planner::optimizer_bridge::scalar::intern_typed(
+                arena,
+                &col_typed(id),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
             asc: true,
             nulls_first: true,
             display: None,
@@ -523,8 +534,12 @@ mod tests {
     }
 
     fn make_sort_opt(arena: &mut ScalarArena, p_id: ColumnId) -> OptExpr {
-        let partition_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &col_typed(p_id),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sort_key = make_sort_key(arena, p_id);
         OptExpr::new(
             Operator::LogicalSort(SortOp {
@@ -539,8 +554,12 @@ mod tests {
 
     fn make_sort_opt_with_limit(arena: &mut ScalarArena, p_id: ColumnId, limit: usize) -> OptExpr {
         use crate::common::SqlTopNType;
-        let partition_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &col_typed(p_id),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sort_key = make_sort_key(arena, p_id);
         OptExpr::new(
             Operator::LogicalSort(SortOp {
@@ -572,8 +591,12 @@ mod tests {
         output_column_id: ColumnId,
         p_id: ColumnId,
     ) -> ScalarWindowSpec {
-        let partition_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &col_typed(p_id),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sort_key = make_sort_key(arena, p_id);
         ScalarWindowSpec {
             output_column_id,
@@ -597,8 +620,12 @@ mod tests {
         p_id: ColumnId,
         order_id: ColumnId,
     ) -> ScalarWindowSpec {
-        let partition_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &col_typed(p_id),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let order_key = make_sort_key(arena, order_id);
         ScalarWindowSpec {
             output_column_id,
@@ -630,7 +657,12 @@ mod tests {
     }
 
     fn filter_opt(arena: &mut ScalarArena, input: OptExpr, predicate: TypedExpr) -> OptExpr {
-        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(arena, &predicate);
+        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &predicate,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![input],
@@ -645,7 +677,12 @@ mod tests {
         let scalar_items = items
             .into_iter()
             .map(|(expr, out_id)| {
-                let expr_id = crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr);
+                let expr_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+                    arena,
+                    &expr,
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap();
                 ScalarProjectItem {
                     expr: expr_id,
                     output_name: format!("c_{}", out_id.0),
@@ -1144,8 +1181,12 @@ mod tests {
         let mut arena = ScalarArena::new();
 
         // Sort keyed on partition=[p_id], order=[a_id]
-        let partition_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &col_typed(p_id));
+        let partition_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_typed(p_id),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sort_key_p = make_sort_key(&mut arena, p_id);
         let sort_key_a = make_sort_key(&mut arena, a_id);
         let sort = OptExpr::new(
@@ -1203,8 +1244,12 @@ mod tests {
         let o_id = ColumnId::new_for_test(103);
         let mut arena = ScalarArena::new();
 
-        let partition_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &col_typed(p_id));
+        let partition_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_typed(p_id),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sort_key_p = make_sort_key(&mut arena, p_id);
         let sort_key_o = make_sort_key(&mut arena, o_id);
         let sort = OptExpr::new(
@@ -1252,8 +1297,7 @@ mod tests {
                 target: target.clone(),
                 decimal_overflow_policy: policy,
             },
-            data_type: target,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(target, true),
         }
     }
 
@@ -1282,8 +1326,10 @@ mod tests {
                     expr: Box::new(decimal_cast_typed(col_typed(amount), policy)),
                     negated: true,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
             };
             let predicate = binop_typed(le_typed(col_typed(rank), 1), BinOp::And, checked);
             let plan = filter_opt(&mut arena, window, predicate);

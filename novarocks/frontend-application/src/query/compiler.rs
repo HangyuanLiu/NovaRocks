@@ -38,7 +38,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
 };
-use crate::query_execution::planning::sql_cancellation_observation;
+use crate::query_execution::planning::sql_compile_control_from_execution;
 use crate::query_execution::planning::time_travel::{
     TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
 };
@@ -55,8 +55,8 @@ use novarocks_query_application::view::ViewRequestContext;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
-    ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent,
-    SqlCompiler, SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    ExplainLevel, SqlAnalyzeRequest, SqlCompileError, SqlCompileIntent, SqlCompiler,
+    SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
 use novarocks_sql::planning::catalog::TableLookupMode;
 
@@ -121,12 +121,55 @@ impl FrontendQueryPurpose {
 pub(crate) enum FrontendQueryCompilerError {
     Engine(String),
     Analyze(AnalyzeError),
+    Control(novarocks_type_contract::CompileControlError),
 }
 
 impl FrontendQueryCompilerError {
     fn from_compile(error: SqlCompileError) -> Self {
         match error {
-            SqlCompileError::Analyze(error) => Self::Analyze(error),
+            SqlCompileError::Analyze(error) => match error.control_error() {
+                Some(control) => Self::Control(control),
+                None => Self::Analyze(error),
+            },
+            SqlCompileError::Cancelled => {
+                Self::Control(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            SqlCompileError::DeadlineExceeded => {
+                Self::Control(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+            }
+            SqlCompileError::ResourceExhausted => {
+                Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
+            }
+            error => Self::Engine(error.to_string()),
+        }
+    }
+    fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
+        match error {
+            novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => Self::Engine(error),
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
+                Self::Engine(message.into())
+            }
+        }
+    }
+    fn from_completion(
+        error: &novarocks_query_application::preparation::FinalPlanCompletionError,
+    ) -> Self {
+        use novarocks_query_application::preparation::FinalPlanCompletionError as E;
+        match error {
+            E::Cancelled { .. } => {
+                Self::Control(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            E::DeadlineExceeded => {
+                Self::Control(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+            }
+            E::ResourceExhausted => {
+                Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
+            }
+            E::Analyze { error } => match error.control_error() {
+                Some(control) => Self::Control(control),
+                None => Self::Analyze(error.clone()),
+            },
             error => Self::Engine(error.to_string()),
         }
     }
@@ -186,6 +229,7 @@ fn reject_quarantined_mv_targets(
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
@@ -219,6 +263,7 @@ struct FrontendDistributedAttemptFactory {
         Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
     profile_plan: Arc<novarocks_physical_plan::PhysicalPlan>,
     profile_annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
+    profile_control: novarocks_sql::compiler::SqlCompileControl,
     planning_started_at: std::time::Instant,
     effect_tracker: StatementEffectTracker,
 }
@@ -249,6 +294,7 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
                 Arc::clone(&self.profile_annotations),
                 self.planning_started_at.elapsed(),
                 std::time::Instant::now(),
+                self.profile_control.clone(),
             ),
         ))
     }
@@ -290,9 +336,11 @@ impl FrontendQueryCompiler {
         mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
             query,
             view,
             system_tables,
@@ -301,6 +349,10 @@ impl FrontendQueryCompiler {
             mv_storage_observation,
             connector_blocking_io,
         }
+    }
+
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 
     pub(crate) fn prepare_statement(
@@ -376,7 +428,7 @@ impl FrontendQueryCompiler {
                         self.mv_storage_observation.as_ref(),
                     )?)
                 };
-                let analyzed = SqlCompiler::analyze(self.analyze_request(
+                let request = self.analyze_request(
                     &query,
                     current_catalog,
                     current_database,
@@ -391,8 +443,10 @@ impl FrontendQueryCompiler {
                             analyze: false,
                         }
                     },
-                )?)
-                .map_err(FrontendQueryCompilerError::from_compile)?;
+                )?;
+                let explain_control = request.control().clone();
+                let analyzed = SqlCompiler::analyze(request)
+                    .map_err(FrontendQueryCompilerError::from_compile)?;
                 reject_quarantined_mv_targets(
                     materializer.query_table_bindings().as_ref(),
                     self.mv_readiness.as_ref(),
@@ -410,18 +464,13 @@ impl FrontendQueryCompiler {
                     SqlCompiler::optimize(SqlOptimizeRequest::new(
                         analyzed,
                         &statistics,
-                        SqlCompileControl::new(
-                            context.execution().deadline(),
-                            sql_cancellation_observation(
-                                context.execution().cancellation().clone(),
-                            ),
-                        ),
+                        explain_control.clone(),
                     ))
                     .map_err(FrontendQueryCompilerError::from_compile)?
                 };
                 Ok(PreparedQueryOperation::explain_lines(
                     output
-                        .into_explain_lines(level, force_logical_explain)
+                        .into_explain_lines(level, force_logical_explain, &explain_control)
                         .map_err(FrontendQueryCompilerError::from_compile)?,
                 )?)
             }
@@ -562,28 +611,26 @@ impl FrontendQueryCompiler {
             SqlPlanningEnvironment::Distributed,
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
+            sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
+        let control = request.control().clone();
         let completed = self
             .connector_blocking_io
             .runtime()
             .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
-            .map_err(|failure| match failure.error() {
-                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
-                    error,
-                } => FrontendQueryCompilerError::Analyze(error.clone()),
-                error => FrontendQueryCompilerError::Engine(error.to_string()),
-            })?;
+            .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         let lines = completed
             .candidate()
-            .render_explain_lines(novarocks_sql::compiler::ExplainRenderBudget::default())
-            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
+            .render_explain_lines(
+                novarocks_sql::compiler::ExplainRenderBudget::default(),
+                &control,
+            )
+            .map_err(|error| FrontendQueryCompilerError::from_completion(&error))?;
         Ok(PreparedQueryOperation::explain_lines(lines)
             .map_err(FrontendQueryCompilerError::Engine)?)
     }
@@ -650,10 +697,9 @@ impl FrontendQueryCompiler {
             SqlPlanningEnvironment::Distributed,
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
+            sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
@@ -662,6 +708,7 @@ impl FrontendQueryCompiler {
         // actual preparation edge under the reserved logical query identity;
         // the older analyze/optimize hooks belong to the sealed path and no
         // longer run for this statement shape.
+        let encoding_control = request.control().clone();
         let completed = crate::preparation_diagnostics::observe_result(
             "compile",
             "final_plan_complete",
@@ -673,22 +720,14 @@ impl FrontendQueryCompiler {
                 )
             },
         )
-        .map_err(|failure| match failure.error() {
-            // A statement the analyzer rejected reaches the client as the
-            // analyzer stated it -- code, phase and place in the text --
-            // exactly as it does when the sealed path compiles it.
-            novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
-                error,
-            } => FrontendQueryCompilerError::Analyze(error.clone()),
-            error => FrontendQueryCompilerError::Engine(error.to_string()),
-        })?;
+        .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         // Resolve application purpose before the plan is shared with Native
         // projection. Presentation uses one FE offset, never the BE clock.
         let root_output = match purpose {
             FrontendQueryPurpose::ClientRows => {
                 novarocks_result_contract::FrozenRootOutput::ClientRows(
-                    novarocks_sql::compiler::client_render_schema(
-                        completed.candidate().plan(),
+                    novarocks_sql::compiler::client_render_schema_from_port(
+                        completed.candidate().original_public_result_port(),
                         chrono::Local::now().offset().local_minus_utc(),
                     )
                     .map_err(FrontendQueryCompilerError::Engine)?,
@@ -698,8 +737,7 @@ impl FrontendQueryCompiler {
                 novarocks_result_contract::FrozenRootOutput::ScalarValue(
                     completed
                         .candidate()
-                        .plan()
-                        .result_port()
+                        .original_public_result_port()
                         .and_then(|port| port.scalar_schema.clone())
                         .ok_or_else(|| {
                             FrontendQueryCompilerError::Engine(
@@ -719,11 +757,12 @@ impl FrontendQueryCompiler {
             .map_err(|(error, _returned)| FrontendQueryCompilerError::Engine(error.to_string()))?;
         // What this statement delivers is a property of the frozen plan, read
         // before the plan is consumed by encoding.
-        let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
-            novarocks_query_application::api::QueryExecutionKind::Read,
-            completed.candidate().plan(),
-        )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        let output =
+            novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+                novarocks_query_application::api::QueryExecutionKind::Read,
+                completed.candidate(),
+            )
+            .map_err(FrontendQueryCompilerError::Engine)?;
         #[cfg(debug_assertions)]
         let selected_mv_rewrite = completed
             .candidate()
@@ -734,9 +773,13 @@ impl FrontendQueryCompiler {
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
             self.functions.as_ref(),
+            self.query.static_plan_carrier(),
+            self.constant_policy(),
             None,
+            execution.sql_semantics().sql_mode().allow_throw_exception(),
+            &encoding_control,
         )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        .map_err(FrontendQueryCompilerError::from_encode)?;
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
@@ -830,41 +873,41 @@ impl FrontendQueryCompiler {
             SqlPlanningEnvironment::Distributed,
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
+            sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
+        let encoding_control = request.control().clone();
         let completed = self
             .connector_blocking_io
             .runtime()
             .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
-            .map_err(|failure| match failure.error() {
-                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
-                    error,
-                } => FrontendQueryCompilerError::Analyze(error.clone()),
-                error => FrontendQueryCompilerError::Engine(error.to_string()),
-            })?;
+            .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         let completed = completed
             .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
             .map_err(|(error, _returned)| FrontendQueryCompilerError::Engine(error.to_string()))?;
         let plan = Arc::clone(completed.candidate().plan());
         let annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]> =
             completed.candidate().display_annotations().to_vec().into();
-        let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
-            novarocks_query_application::api::QueryExecutionKind::Read,
-            &plan,
-        )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        let output =
+            novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+                novarocks_query_application::api::QueryExecutionKind::Read,
+                completed.candidate(),
+            )
+            .map_err(FrontendQueryCompilerError::Engine)?;
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
             self.functions.as_ref(),
+            self.query.static_plan_carrier(),
+            self.constant_policy(),
             None,
+            execution.sql_semantics().sql_mode().allow_throw_exception(),
+            &encoding_control,
         )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        .map_err(FrontendQueryCompilerError::from_encode)?;
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description = novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
             novarocks_query_application::api::QueryExecutionKind::Read,
@@ -907,6 +950,7 @@ impl FrontendQueryCompiler {
                 Arc::clone(&annotations),
                 planning_started_at.elapsed(),
                 std::time::Instant::now(),
+                encoding_control.clone(),
             );
         let operation =
             PreparedQueryDistributedOperation::new(request, completion, logical_reservation)
@@ -921,9 +965,13 @@ impl FrontendQueryCompiler {
                         execution.cancellation().clone(),
                         execution.optimizer_settings().clone(),
                         execution.sql_semantics().clone(),
+                    )
+                    .with_optional_fold_dependency_observer(
+                        execution.fold_dependency_observer().cloned(),
                     ),
                     profile_plan: plan,
                     profile_annotations: annotations,
+                    profile_control: encoding_control,
                     planning_started_at,
                     effect_tracker: StatementEffectTracker::read_only(),
                 }));
@@ -955,10 +1003,9 @@ impl FrontendQueryCompiler {
             self.functions.as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
             mv_definitions,
-            SqlCompileControl::new(
-                execution.deadline(),
-                sql_cancellation_observation(execution.cancellation().clone()),
-            ),
+            self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
+            sql_compile_control_from_execution(execution),
         ))
     }
 
@@ -1109,6 +1156,42 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
         level,
         explain.logical || matches!(explain.format, ExplainFormat::Logical),
     )
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn query_compile_encode_and_analyze_preserve_control_category() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let errors = [
+                FrontendQueryCompilerError::from_compile(control.into()),
+                FrontendQueryCompilerError::from_encode(
+                    novarocks_plan_codec::PhysicalEncodeError::Control(control),
+                ),
+                FrontendQueryCompilerError::from_compile(SqlCompileError::Analyze(
+                    AnalyzeError::control(control),
+                )),
+            ];
+            for error in errors {
+                assert!(
+                    matches!(error, FrontendQueryCompilerError::Control(actual) if actual == control)
+                );
+            }
+            assert!(matches!(
+                FrontendQueryCompilerError::from_encode(
+                    novarocks_plan_codec::PhysicalEncodeError::Invalid(control.to_string())
+                ),
+                FrontendQueryCompilerError::Engine(_)
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

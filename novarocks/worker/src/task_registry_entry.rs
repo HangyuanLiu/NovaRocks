@@ -37,7 +37,7 @@ use novarocks_execution_contract::task_execution::operation::{
     QueryContextReceipt, QuiesceQueryContextReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, CancelReason, FinalTaskInfo, TaskStatus, TerminationDetail,
+    AbortCause, CancelReason, FinalTaskInfo, TaskFailureCategory, TaskStatus, TerminationDetail,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{StageId, TaskId};
@@ -86,6 +86,7 @@ impl EstablishRecord {
 pub(super) struct CreationFailure {
     pub(super) outcome: OperationOutcome,
     pub(super) detail: String,
+    pub(super) category: TaskFailureCategory,
 }
 
 /// The reservation one creation owner holds on a task identity.

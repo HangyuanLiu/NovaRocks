@@ -80,6 +80,16 @@ class RendererTests(RendererCase):
         self.assertEqual(env['NOVAROCKS_STATE_STORE_PATH'], str(self.entry / 'frontend-state.sqlite'))
         fe = tomllib.loads((final / 'fe.toml').read_text())
         be = tomllib.loads((final / 'be.toml').read_text())
+        profile = fe['runtime']['frontend_constant_policy']
+        self.assertEqual(profile, {
+            'max_rows': 1048576, 'max_array_nodes': 1048576,
+            'max_logical_elements': 16777216, 'max_retained_buffer_bytes': 1073741824,
+            'max_type_depth': 64, 'max_type_nodes': 4096, 'max_dictionary_depth': 64,
+            'max_metadata_bytes': 1048576, 'max_library_validation_work': 1073741824,
+            'max_library_validation_bytes': 4294967296,
+        })
+        self.assertNotIn('frontend_constant_policy', be['runtime'])
+        self.assertEqual(fe['runtime']['query_control_task_update_rpc_timeout_ms'], 5000)
         self.assertEqual(fe['state_store']['path'], manifest['novarocks']['state_store_path'])
         self.assertEqual(fe['native_trust'], be['native_trust'])
         self.assertEqual(fe['native_trust']['shared_secret'], '${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}')

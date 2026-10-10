@@ -59,11 +59,15 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use bytes::Bytes;
+use novarocks_connector_contract::PureProviderCompileError;
 use novarocks_fs::{FileReadContext, FileReadRange};
 use novarocks_spi::connector::read_stack::{
     ConnectorPollBudget, ConnectorSession, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, FunctionValueType, ValueLogicalType, ValueTypeError,
+};
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 use crate::access_binding::IcebergReadBinding;
@@ -187,17 +191,34 @@ fn iceberg_primitive_to_arrow(primitive: &PrimitiveType) -> Result<DataType, Con
 /// against the frozen schema (see [`project_system_relation_columns`]), never
 /// by ID. They are minted fresh for every derivation and are never compared
 /// against a table field.
-struct MetadataRelationFieldIds {
+struct MetadataRelationFieldIds<'a> {
     next: i32,
+    supplied: Option<std::slice::Iter<'a, i32>>,
 }
 
-impl MetadataRelationFieldIds {
+impl<'a> MetadataRelationFieldIds<'a> {
     /// Iceberg field IDs are positive, so the first one is 1.
     const fn new() -> Self {
-        Self { next: 1 }
+        Self {
+            next: 1,
+            supplied: None,
+        }
+    }
+
+    fn supplied(ids: &'a [i32]) -> Self {
+        Self {
+            next: 1,
+            supplied: Some(ids.iter()),
+        }
     }
 
     fn take(&mut self) -> Result<i32, ConnectorError> {
+        if let Some(ids) = self.supplied.as_mut() {
+            return ids
+                .next()
+                .copied()
+                .ok_or_else(|| invalid("system column identity has too few mirror fields"));
+        }
         let field_id = self.next;
         self.next = self.next.checked_add(1).ok_or_else(|| {
             internal("iceberg metadata relation exhausted its column identity field ids")
@@ -207,17 +228,34 @@ impl MetadataRelationFieldIds {
 }
 
 /// The Iceberg mirror of one frozen metadata-relation Arrow field.
+/// The legacy schema authors use the same mirror without compile callbacks.
 fn metadata_relation_field(
     field: &Field,
-    ids: &mut MetadataRelationFieldIds,
+    ids: &mut MetadataRelationFieldIds<'_>,
 ) -> Result<NestedField, ConnectorError> {
-    let field_type = metadata_relation_type(field.data_type(), ids)?;
+    metadata_relation_field_observed(field, ids, &mut || Ok(()))
+}
+fn metadata_relation_type(
+    data_type: &DataType,
+    ids: &mut MetadataRelationFieldIds<'_>,
+) -> Result<Type, ConnectorError> {
+    metadata_relation_type_observed(data_type, ids, &mut || Ok(()))
+}
+
+fn metadata_relation_field_observed<E: From<ConnectorError>>(
+    field: &Field,
+    ids: &mut MetadataRelationFieldIds<'_>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<NestedField, E> {
+    let field_type = metadata_relation_type_observed(field.data_type(), ids, observe)?;
     let field_id = ids.take()?;
-    Ok(if field.is_nullable() {
+    let field = if field.is_nullable() {
         NestedField::optional(field_id, field.name(), field_type)
     } else {
         NestedField::required(field_id, field.name(), field_type)
-    })
+    };
+    observe()?;
+    Ok(field)
 }
 
 /// The Iceberg mirror of one frozen metadata-relation Arrow type.
@@ -232,10 +270,11 @@ fn metadata_relation_field(
 /// type and not a downgrade of some base-table `uuid`: the frozen schema
 /// already renders a UUID partition value or bound as text, so `string` is what
 /// the column *is* here.
-fn metadata_relation_type(
+fn metadata_relation_type_observed<E: From<ConnectorError>>(
     data_type: &DataType,
-    ids: &mut MetadataRelationFieldIds,
-) -> Result<Type, ConnectorError> {
+    ids: &mut MetadataRelationFieldIds<'_>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Type, E> {
     let primitive = match data_type {
         DataType::Boolean => Some(PrimitiveType::Boolean),
         DataType::Int32 => Some(PrimitiveType::Int),
@@ -262,39 +301,59 @@ fn metadata_relation_type(
         _ => None,
     };
     if let Some(primitive) = primitive {
+        observe()?;
         return Ok(Type::Primitive(primitive));
     }
-    match data_type {
+    let result: Result<Type, E> = match data_type {
         DataType::Struct(fields) => {
             let mut mirrored = Vec::with_capacity(fields.len());
             for field in fields {
-                mirrored.push(Arc::new(metadata_relation_field(field.as_ref(), ids)?));
+                mirrored.push(Arc::new(metadata_relation_field_observed(
+                    field.as_ref(),
+                    ids,
+                    observe,
+                )?));
+                observe()?;
             }
             Ok(Type::Struct(StructType::new(mirrored)))
         }
         DataType::List(element) => Ok(Type::List(ListType::new(Arc::new(
-            metadata_relation_field(element.as_ref(), ids)?,
+            metadata_relation_field_observed(element.as_ref(), ids, observe)?,
         )))),
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
                 return Err(internal(
                     "an iceberg metadata relation map carries entries that are not a struct",
-                ));
+                )
+                .into());
             };
             let [key, value] = fields.as_ref() else {
                 return Err(internal(
                     "an iceberg metadata relation map must carry exactly a key and a value",
-                ));
+                )
+                .into());
             };
             Ok(Type::Map(MapType::new(
-                Arc::new(metadata_relation_field(key.as_ref(), ids)?),
-                Arc::new(metadata_relation_field(value.as_ref(), ids)?),
+                Arc::new(metadata_relation_field_observed(
+                    key.as_ref(),
+                    ids,
+                    observe,
+                )?),
+                Arc::new(metadata_relation_field_observed(
+                    value.as_ref(),
+                    ids,
+                    observe,
+                )?),
             )))
         }
         other => Err(unsupported(format!(
             "an iceberg metadata relation column carrier {other:?} has no iceberg type"
-        ))),
-    }
+        ))
+        .into()),
+    };
+    let result = result?;
+    observe()?;
+    Ok(result)
 }
 
 /// The Iceberg mirror of one frozen metadata-relation schema, as a ROW.
@@ -305,6 +364,187 @@ fn metadata_relation_row(schema: &SchemaRef) -> Result<Type, ConnectorError> {
         fields.push(Arc::new(metadata_relation_field(field.as_ref(), &mut ids)?));
     }
     Ok(Type::Struct(StructType::new(fields)))
+}
+
+#[derive(Debug)]
+enum SystemMirrorError {
+    Control(CompileControlError),
+    Source(ConnectorError),
+}
+impl From<ConnectorError> for SystemMirrorError {
+    fn from(error: ConnectorError) -> Self {
+        Self::Source(error)
+    }
+}
+impl From<CompileControlError> for SystemMirrorError {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+impl From<ValueTypeError> for SystemMirrorError {
+    fn from(error: ValueTypeError) -> Self {
+        Self::Source(invalid(error.to_string()))
+    }
+}
+
+/// Validate the original System Arrow source against its private storage mirror.
+/// Synthetic identity IDs are supplied in the original postorder; they are not
+/// table IDs or a canonical numbering requirement. Unknown public metadata is
+/// retained by the caller. Opaque Arrow clones and SDK identity construction
+/// have surrounding observations, not an internal cooperation/MEM guarantee.
+pub(crate) fn system_column_field_for_compile(
+    kind: IcebergSystemTableType,
+    column: &IcebergColumnHandle,
+    field: &Field,
+    logical: ValueLogicalType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<NestedField, PureProviderCompileError<ConnectorError>> {
+    work.flush()?;
+    let result = (|| -> Result<NestedField, SystemMirrorError> {
+        if !column.is_base_column() {
+            return Err(unsupported(
+                "system relation reader does not project a nested column handle",
+            )
+            .into());
+        }
+        // Reuse the exact original closed field authors for static columns.
+        // Only the documented schema-derived ROW positions use frozen public
+        // shape: the reference itself does not contain table schema/specs.
+        let dynamic = matches!(
+            (kind, field.name().as_str()),
+            (
+                IcebergSystemTableType::Files,
+                "partition" | "lower_bounds" | "upper_bounds"
+            ) | (IcebergSystemTableType::Partitions, "partition" | "data")
+        );
+        work.step()?;
+        // Only the optional partition ROW varies within the closed data_file
+        // structure. Its remaining fields keep the exact original author.
+        let mut entries_partition = None;
+        if kind == IcebergSystemTableType::Entries
+            && field.name() == "data_file"
+            && let DataType::Struct(children) = field.data_type()
+        {
+            for child in children {
+                let is_partition = child.name() == "partition";
+                work.step()?;
+                if is_partition {
+                    let is_row = matches!(child.data_type(), DataType::Struct(_));
+                    work.step()?;
+                    if !is_row {
+                        return Err(
+                            invalid("system data_file partition is not its frozen ROW").into()
+                        );
+                    }
+                    entries_partition = Some(child.data_type());
+                    break;
+                }
+            }
+        }
+        work.flush()?;
+        let fixed = match kind {
+            IcebergSystemTableType::Files => files_fields(
+                (field.name() == "partition").then_some(field.data_type()),
+                matches!(field.name().as_str(), "lower_bounds" | "upper_bounds")
+                    .then_some(field.data_type()),
+            ),
+            IcebergSystemTableType::Entries => entries_fields(entries_partition),
+            IcebergSystemTableType::Snapshots => snapshots_fields(),
+            IcebergSystemTableType::History => history_fields(),
+            IcebergSystemTableType::Refs => refs_fields(),
+            IcebergSystemTableType::Manifests => manifests_fields(),
+            IcebergSystemTableType::Partitions => partitions_fields(
+                (field.name() == "partition").then_some(field.data_type()),
+                (field.name() == "data").then_some(field.data_type()),
+            ),
+        };
+        work.flush()?;
+        let mut expected = None;
+        for candidate in &fixed {
+            let same = candidate.name() == field.name();
+            work.step()?;
+            if same {
+                expected = Some(candidate);
+                break;
+            }
+        }
+        let expected =
+            expected.ok_or_else(|| unsupported("system relation has no such output column"))?;
+        let same_nullable = expected.is_nullable() == field.is_nullable();
+        work.step()?;
+        if !same_nullable {
+            return Err(
+                invalid("system column NULL contract differs from its source declaration").into(),
+            );
+        }
+        if dynamic {
+            let is_row = matches!(field.data_type(), DataType::Struct(_))
+                && logical == ValueLogicalType::Physical;
+            work.step()?;
+            if !is_row {
+                return Err(
+                    invalid("system schema-derived column is not its frozen physical ROW").into(),
+                );
+            }
+        } else {
+            work.flush()?;
+            let expected_type = FunctionValueType::try_from_field(expected)?;
+            let actual_type = FunctionValueType {
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                logical_type: logical,
+            };
+            work.flush()?;
+            let same = expected_type
+                .same_value_domain_observed::<SystemMirrorError>(&actual_type, || {
+                    work.step().map_err(SystemMirrorError::Control)
+                })?;
+            if !same {
+                return Err(invalid(
+                    "system column differs from its exact Arrow source declaration",
+                )
+                .into());
+            }
+        }
+        // IDs are private identity vocabulary; mirror construction consumes
+        // each once in the same child-first order as the original author.
+        let mut pending = vec![(column.base_column_identity(), false)];
+        let mut ids = Vec::new();
+        while let Some((identity, visited)) = pending.pop() {
+            if visited {
+                ids.push(identity.field_id());
+                work.step()?;
+            } else {
+                pending.push((identity, true));
+                work.step()?;
+                for child in identity.children().iter().rev() {
+                    pending.push((child, false));
+                    work.step()?;
+                }
+            }
+        }
+        let mut source = MetadataRelationFieldIds::supplied(&ids);
+        let mirrored =
+            metadata_relation_field_observed::<SystemMirrorError>(field, &mut source, &mut || {
+                work.step().map_err(SystemMirrorError::Control)
+            })?;
+        let exhausted = source.supplied.as_ref().is_some_and(|ids| ids.len() == 0);
+        work.step()?;
+        if !exhausted {
+            return Err(invalid("system column identity has unused mirror fields").into());
+        }
+        Ok(mirrored)
+    })();
+    match result {
+        Err(SystemMirrorError::Control(cause)) => Err(PureProviderCompileError::Control(cause)),
+        result => {
+            work.flush()?;
+            result.map_err(|error| match error {
+                SystemMirrorError::Source(error) => PureProviderCompileError::Provider(error),
+                SystemMirrorError::Control(cause) => PureProviderCompileError::Control(cause),
+            })
+        }
+    }
 }
 
 /// The column handles one worker system relation publishes, in frozen order.

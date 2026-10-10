@@ -25,6 +25,7 @@
 //! here unless an earlier rewrite consumed them. Join is handled by
 //! `RewriteJoinDeltaRule` in the same stage's fixpoint.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
@@ -66,7 +67,11 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, _ctx| apply_plan(plan))
     }
 }
@@ -187,7 +192,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
-    fn ctx_with_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
+    fn ctx_with_arena() -> (RewriteContext<'static>, Rc<RefCell<ScalarArena>>) {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(Rc::clone(&arena));
@@ -217,8 +222,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: ColumnId(1),
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 predicates: Vec::new(),
@@ -253,8 +261,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: ColumnId(1),
@@ -271,8 +281,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![input],
@@ -389,6 +401,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
             "unexpected error: {err}"
@@ -419,6 +434,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("Iceberg IMV rewrite does not support this union shape"),
             "unexpected error: {err}"
@@ -501,6 +519,9 @@ mod tests {
         let err = rule
             .apply(nested_expr, &mut ctx)
             .expect_err("aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
             "got: {err}"

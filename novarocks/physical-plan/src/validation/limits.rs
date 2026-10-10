@@ -46,8 +46,6 @@ pub struct PlanLimits {
     pub plan_edges: usize,
     /// Runtime filters in one plan.
     pub plan_runtime_filters: usize,
-    /// Sealed-artifact references in one plan.
-    pub plan_artifact_refs: usize,
     /// Total steps a plan-wide semantic trace may take before it gives up.
     pub plan_semantic_trace_work: usize,
 
@@ -89,7 +87,6 @@ impl PlanLimits {
         plan_fragments: 16_384,
         plan_edges: 65_536,
         plan_runtime_filters: 65_536,
-        plan_artifact_refs: 65_536,
         plan_semantic_trace_work: 1 << 20,
 
         fragment_nodes: 4_096,

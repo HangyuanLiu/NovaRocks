@@ -1075,11 +1075,13 @@ impl TaskExecutionRegistry {
             let rejection = if state.context_state(context) != QueryContextState::Active {
                 Some((
                     OperationOutcome::ContextTerminalReceipt,
+                    TaskFailureCategory::Protocol,
                     "the query context closed before task admission",
                 ))
             } else if bytes > self.config.max_preparing_bytes {
                 Some((
                     OperationOutcome::ResourceExhausted,
+                    TaskFailureCategory::ResourceExhausted,
                     "one task exceeds the accepted preparation byte bound",
                 ))
             } else if state
@@ -1091,11 +1093,13 @@ impl TaskExecutionRegistry {
             {
                 Some((
                     OperationOutcome::PreparationBusy,
+                    TaskFailureCategory::ResourceExhausted,
                     "query context reached its accepted preparation task bound",
                 ))
             } else if state.prepare_charges.len() >= self.config.max_preparing_tasks {
                 Some((
                     OperationOutcome::PreparationBusy,
+                    TaskFailureCategory::ResourceExhausted,
                     "backend reached its accepted preparation task bound",
                 ))
             } else if bytes
@@ -1106,14 +1110,16 @@ impl TaskExecutionRegistry {
             {
                 Some((
                     OperationOutcome::PreparationBusy,
+                    TaskFailureCategory::ResourceExhausted,
                     "backend reached its accepted preparation byte bound",
                 ))
             } else {
                 None
             };
-            if let Some((outcome, detail)) = rejection {
+            if let Some((outcome, category, detail)) = rejection {
                 cell.fail(CreationFailure {
                     outcome,
+                    category,
                     detail: detail.to_owned(),
                 });
                 state
@@ -1138,6 +1144,7 @@ impl TaskExecutionRegistry {
                 let detail = rejection.detail().to_string();
                 cell.fail(CreationFailure {
                     outcome,
+                    category: rejection.category(),
                     detail: detail.clone(),
                 });
                 state
@@ -1301,6 +1308,7 @@ impl TaskExecutionRegistry {
         let _ = transaction.abandon(
             job.request.envelope().operation_id(),
             OperationOutcome::ResourceExhausted,
+            TaskFailureCategory::ResourceExhausted,
             detail,
         );
     }
@@ -1452,6 +1460,7 @@ impl TaskExecutionRegistry {
             return transaction.abandon(
                 operation,
                 OperationOutcome::InvalidStateOrRequest,
+                rejection.category(),
                 rejection.detail(),
             );
         }
@@ -1470,6 +1479,7 @@ impl TaskExecutionRegistry {
                 return transaction.abandon(
                     operation,
                     OperationOutcome::InvalidStateOrRequest,
+                    rejection.category(),
                     rejection.detail().as_str(),
                 );
             }
@@ -1479,6 +1489,7 @@ impl TaskExecutionRegistry {
             return transaction.abandon(
                 operation,
                 OperationOutcome::InvalidStateOrRequest,
+                rejection.category(),
                 rejection.detail().as_str(),
             );
         }
@@ -1496,6 +1507,7 @@ impl TaskExecutionRegistry {
             return transaction.abandon(
                 operation,
                 OperationOutcome::InvalidStateOrRequest,
+                rejection.category(),
                 rejection.detail().as_str(),
             );
         }
@@ -1512,7 +1524,7 @@ impl TaskExecutionRegistry {
             Err(rejection) => {
                 let outcome = rejection.outcome();
                 let detail = rejection.detail().to_owned();
-                return transaction.abandon(operation, outcome, detail);
+                return transaction.abandon(operation, outcome, rejection.category(), detail);
             }
         };
 
@@ -1543,7 +1555,7 @@ impl TaskExecutionRegistry {
                     _ => OperationOutcome::InvalidStateOrRequest,
                 };
                 let detail = rejection.detail().as_str().to_owned();
-                return transaction.abandon(operation, outcome, detail);
+                return transaction.abandon(operation, outcome, rejection.category(), detail);
             }
         };
 
@@ -4165,11 +4177,13 @@ impl CreationTransaction<'_> {
         &mut self,
         operation: TaskOperationId,
         outcome: OperationOutcome,
+        category: TaskFailureCategory,
         detail: impl Into<String>,
     ) -> CreateTaskOutcome {
         let detail = detail.into();
         let failure = CreationFailure {
             outcome,
+            category,
             detail: detail.clone(),
         };
         if self.cell.accepted_status().is_some() {
@@ -4202,6 +4216,7 @@ impl CreationTransaction<'_> {
             if closed && self.cell.accepted_status().is_none() {
                 let failure = CreationFailure {
                     outcome: OperationOutcome::ContextTerminalReceipt,
+                    category: TaskFailureCategory::Protocol,
                     detail: "the query context closed while this task was being created".to_owned(),
                 };
                 self.cell.fail(failure.clone());
@@ -4311,6 +4326,7 @@ impl Drop for CreationTransaction<'_> {
         }
         let failure = self.failure.clone().unwrap_or(CreationFailure {
             outcome: OperationOutcome::InvalidStateOrRequest,
+            category: TaskFailureCategory::Protocol,
             detail: "the creation transaction did not complete".to_owned(),
         });
         let accepted = self.cell.accepted_status();
@@ -4327,11 +4343,6 @@ impl Drop for CreationTransaction<'_> {
                 Some(PreparationStop::Cancel(reason)) => TerminationDetail::Canceled(reason),
                 Some(PreparationStop::Abort(cause)) => TerminationDetail::Aborted(cause),
                 None => {
-                    let category = if failure.outcome == OperationOutcome::ResourceExhausted {
-                        TaskFailureCategory::ResourceExhausted
-                    } else {
-                        TaskFailureCategory::Protocol
-                    };
                     let detail =
                         novarocks_execution_contract::SafeDetail::new(failure.detail.clone())
                             .unwrap_or_else(|_| {
@@ -4342,7 +4353,7 @@ impl Drop for CreationTransaction<'_> {
                             });
                     TerminationDetail::Failed(
                         novarocks_execution_contract::TaskFailure::new_in_phase(
-                            category,
+                            failure.category,
                             detail,
                             novarocks_execution_contract::TaskFailurePhase::Preparation,
                         ),
@@ -4542,9 +4553,7 @@ mod registry_lock_observation_tests {
 mod preparation_snapshot_tests {
     use super::*;
     use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
-    use novarocks_types::{
-        AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId,
-    };
+    use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::mpsc;
 

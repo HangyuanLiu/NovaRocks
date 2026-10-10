@@ -625,6 +625,8 @@ mod tests {
                     builtin_sql_function_catalog(),
                     novarocks_sql::compiler::noop_constant_evaluator(),
                     None,
+                    crate::completed_plan_fixture::test_constant_policy(),
+                    novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                     SqlCompileControl::unbounded(),
                 );
                 let pending = SqlCompiler::analyze(request)

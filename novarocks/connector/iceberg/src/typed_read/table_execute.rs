@@ -47,6 +47,20 @@ use super::schema_binding::IcebergMetadataColumn;
 use super::split::{IcebergDeleteFile, IcebergDeleteFileContent, IcebergFileFormat};
 use super::table_handle::IcebergTableHandle;
 
+/// A rewrite result retains its metadata field ID under the procedure's exact
+/// output name. This same pure author serves planning and program validation.
+pub(crate) fn rewrite_position_delete_pseudo_column(
+    name: &str,
+    metadata: IcebergMetadataColumn,
+) -> Result<super::IcebergColumnHandle, ConnectorError> {
+    use crate::iceberg::spec::{NestedField, Type};
+    super::IcebergColumnHandle::base_column(&NestedField::optional(
+        metadata.field_id(),
+        name,
+        Type::Primitive(metadata.declared_type()),
+    ))
+}
+
 /// The exact output contract of the rewrite-position-delete page source.
 ///
 /// These are the two columns an Iceberg position-delete file holds, in the

@@ -647,6 +647,7 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
                     novarocks_sql::compiler::build_builtin_engine_function_catalog()
                         .expect("builtin function catalog"),
                 ),
+                crate::application::test_constant_policy(),
             )
             .with_catalog_desired_state_source(
                 CatalogDesiredStateSourceInput::ManagedControllerUnsupported,

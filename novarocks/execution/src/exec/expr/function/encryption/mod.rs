@@ -47,3 +47,13 @@ pub use sha2::eval_sha2;
 pub use sm3::eval_sm3;
 pub use to_base64::eval_to_base64;
 pub use to_binary::eval_to_binary;
+
+#[cfg(test)]
+pub(crate) mod legacy_aes_family_original_baseline_tests;
+
+#[cfg(test)]
+mod legacy_aes_demand_original_tests;
+
+#[cfg(test)]
+#[path = "legacy_aes_atomic_parent_baseline_tests.rs"]
+mod legacy_aes_atomic_parent_baseline_tests;

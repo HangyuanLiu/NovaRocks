@@ -132,14 +132,15 @@ fn command_error(kind: CommandErrorKind, error: impl Into<String>) -> CommandErr
     CommandError::new(kind, error.into())
 }
 
-fn execute_product_command_edge<F>(
+fn execute_product_command_edge<F, E>(
     executor: QueryBlockingExecutor,
     request_context: RequestContext,
     command_context: CommandContext,
     call: F,
 ) -> CommandFuture
 where
-    F: FnOnce(&RequestContext, &CommandContext) -> Result<StatementResult, String> + Send + 'static,
+    F: FnOnce(&RequestContext, &CommandContext) -> Result<StatementResult, E> + Send + 'static,
+    E: Into<CommandError> + 'static,
 {
     Box::pin(async move {
         if request_context.execution().cancellation().is_cancelled() {
@@ -174,8 +175,7 @@ where
                     )
                 })?;
                 let window = command_context.result_window_alias();
-                let result = call(&request_context, &command_context)
-                    .map_err(|error| command_error(CommandErrorKind::Failed, error));
+                let result = call(&request_context, &command_context).map_err(Into::into);
                 // The receipt retains this alias even if the awaiting future
                 // disappears while the blocking worker is still producing.
                 Ok((result, window))
@@ -360,19 +360,26 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
             command_context,
             move |context, command_context| match command {
                 novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command) => {
-                    maintenance_read.execute_command(
+                    maintenance_read
+                        .execute_command(
+                            &command,
+                            context.session().current_catalog(),
+                            context.session().current_database(),
+                        )
+                        .map_err(CommandError::from)
+                }
+                command => maintenance
+                    .execute_command(
                         &command,
                         context.session().current_catalog(),
                         context.session().current_database(),
+                        context.execution(),
+                        command_context.connector_context(),
                     )
-                }
-                command => maintenance.execute_command(
-                    &command,
-                    context.session().current_catalog(),
-                    context.session().current_database(),
-                    context.execution(),
-                    command_context.connector_context(),
-                ),
+                    .map_err(|error| match error.compile_control {
+                        Some(control) => CommandError::from_compile_control(control),
+                        None => CommandError::from(error.message),
+                    }),
             },
         )
     }
@@ -700,6 +707,7 @@ impl SpecializedStatementRoute for TypedCommandRoute {
 
 enum RoutedExecutionError {
     Engine(String),
+    Control(novarocks_type_contract::CompileControlError),
     User(UserError),
     Publication {
         message: String,
@@ -715,7 +723,9 @@ fn dml_statement_result(
 
 fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExecutionError> {
     result.map_err(|error| {
-        if let Some(user_error) = error.user_error().cloned() {
+        if let Some(control) = error.compile_control_error() {
+            RoutedExecutionError::Control(control)
+        } else if let Some(user_error) = error.user_error().cloned() {
             RoutedExecutionError::User(user_error)
         } else if let Some(engine_error_code) = error.engine_error_code() {
             RoutedExecutionError::Engine(format!("[{}] {error}", engine_error_code.as_str()))
@@ -878,7 +888,10 @@ async fn execute_product_statement(
     let result = router
         .execute(command, request_context, command_context)
         .await
-        .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+        .map_err(|error| match error.compile_control_error() {
+            Some(control) => RoutedExecutionError::Control(control),
+            None => RoutedExecutionError::Engine(error.to_string()),
+        });
     Ok((result, execution_owner))
 }
 
@@ -1407,6 +1420,17 @@ impl FrontendQuerySession {
             Ok(operation) => Ok(operation),
             Err(FrontendQueryCompilerError::Engine(error)) => {
                 Err(GovernedPreparationError::Service(internal_error(error)))
+            }
+            Err(FrontendQueryCompilerError::Control(error)) => {
+                let failure = QueryServiceError::from_compile_control(error);
+                if matches!(
+                    error,
+                    novarocks_type_contract::CompileControlError::ResourceExhausted
+                ) {
+                    Err(GovernedPreparationError::Service(failure))
+                } else {
+                    Err(GovernedPreparationError::Cancelled(failure))
+                }
             }
             Err(FrontendQueryCompilerError::Analyze(error)) => {
                 Err(GovernedPreparationError::Service(
@@ -2000,6 +2024,9 @@ impl FrontendQuerySession {
                                     FrontendQueryCompilerError::Engine(error) => {
                                         RoutedExecutionError::Engine(error)
                                     }
+                                    FrontendQueryCompilerError::Control(error) => {
+                                        RoutedExecutionError::Control(error)
+                                    }
                                     FrontendQueryCompilerError::Analyze(error) => {
                                         RoutedExecutionError::User(error.to_user_error(Some(&sql)))
                                     }
@@ -2367,7 +2394,10 @@ impl FrontendQuerySession {
                 let result = command_executor
                     .execute_materialized_view(&statement, &context, &command_context)
                     .await
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+                    .map_err(|error| match error.compile_control_error() {
+                        Some(control) => RoutedExecutionError::Control(control),
+                        None => RoutedExecutionError::Engine(error.to_string()),
+                    });
                 Ok((result, execution_owner))
             }),
             ParsedStatement::View(statement) => Box::pin(async move {
@@ -2478,6 +2508,9 @@ impl FrontendQuerySession {
             )),
             Err(error) => Ok(self.governed_typed_error(
                 match error {
+                    RoutedExecutionError::Control(error) => {
+                        QueryServiceError::from_compile_control(error)
+                    }
                     RoutedExecutionError::Engine(error) => internal_error(error),
                     RoutedExecutionError::User(error) => QueryServiceError::from_user_error(error),
                     RoutedExecutionError::Publication { message, terminal } => {

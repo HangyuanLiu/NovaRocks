@@ -764,7 +764,9 @@ fn expression_facts(
     let expression = unwrap_nested(expression);
     let (kind, function_identity) = match &expression.kind {
         ExprKind::ColumnRef { .. } => (SqlMvPersistenceExpressionKind::Field, None),
-        ExprKind::Literal(_) => (SqlMvPersistenceExpressionKind::Literal, None),
+        ExprKind::Literal(_) | ExprKind::Constant(_) => {
+            (SqlMvPersistenceExpressionKind::Literal, None)
+        }
         ExprKind::Cast { .. } => (SqlMvPersistenceExpressionKind::Cast, None),
         ExprKind::FunctionCall { name, .. }
         | ExprKind::AggregateCall { name, .. }
@@ -1000,6 +1002,7 @@ fn walk_expression<'a>(
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => Ok(()),
     }
 }
@@ -1040,8 +1043,8 @@ fn output_columns(query: &ResolvedQuery) -> Vec<(String, DataType, bool)> {
                 .map(|item| {
                     (
                         item.output_name.clone(),
-                        item.expr.data_type.clone(),
-                        item.expr.nullable,
+                        item.expr.value_type.data_type.clone(),
+                        item.expr.value_type.nullable,
                     )
                 })
                 .collect(),
@@ -1054,8 +1057,8 @@ fn output_columns(query: &ResolvedQuery) -> Vec<(String, DataType, bool)> {
             .map(|column| {
                 (
                     column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
+                    column.value_type.data_type.clone(),
+                    column.value_type.nullable,
                 )
             })
             .collect()
@@ -1450,7 +1453,9 @@ mod tests {
         ] {
             let input = input(sql);
             let documents = input.create_persistence_facts().expect("persistence facts");
-            let refresh = input.refresh_contract().expect("refresh contract");
+            let refresh = input
+                .refresh_contract(&crate::compiler::SqlCompileControl::unbounded())
+                .expect("refresh contract");
 
             let documented = documents
                 .relation_occurrences()

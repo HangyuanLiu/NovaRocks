@@ -17,6 +17,7 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
+use novarocks_functions::string_repeat_pad_core::{OriginalPadProjection, pad_into};
 use std::sync::Arc;
 
 fn eval_pad_impl(
@@ -46,48 +47,15 @@ fn eval_pad_impl(
         }
         let s = s_arr.value(i);
         let target_len = len_arr.value(i);
-        if target_len < 0 {
-            out.push(None);
-            continue;
-        }
-        let target_len = target_len as usize;
-        if target_len > super::common::OLAP_STRING_MAX_LENGTH {
-            out.push(None);
-            continue;
-        }
-        let pad = p_arr.value(i);
-        let source_chars: Vec<char> = s.chars().collect();
-        let source_len = source_chars.len();
-
-        let result = if target_len <= source_len || pad.is_empty() {
-            source_chars.iter().take(target_len).collect::<String>()
-        } else {
-            let pad_chars: Vec<char> = pad.chars().collect();
-            let needed = target_len - source_len;
-
-            // Build exactly the required number of fill characters in one pass.
-            let mut fill = String::new();
-            for idx in 0..needed {
-                fill.push(pad_chars[idx % pad_chars.len()]);
-            }
-
-            if left {
-                let mut composed = String::with_capacity(fill.len() + s.len());
-                composed.push_str(&fill);
-                composed.push_str(s);
-                composed
-            } else {
-                let mut composed = String::with_capacity(s.len() + fill.len());
-                composed.push_str(s);
-                composed.push_str(&fill);
-                composed
-            }
-        };
-
-        if result.len() > super::common::OLAP_STRING_MAX_LENGTH {
-            out.push(None);
-        } else {
-            out.push(Some(result));
+        match pad_into(
+            s,
+            target_len,
+            || p_arr.value(i),
+            left,
+            OriginalPadProjection::new(&mut out),
+        ) {
+            Ok(()) => (),
+            Err(impossible) => match impossible {},
         }
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)

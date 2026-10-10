@@ -96,10 +96,13 @@ impl WriteStatisticsContract {
                 )
             })?;
             let actual = actual.field();
-            if declared.name() != actual.name()
-                || declared.data_type() != actual.data_type()
-                || declared.nullable() != actual.is_nullable()
-            {
+            let actual_value_type = novarocks_type_contract::FunctionValueType::try_from_field(
+                actual,
+            )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })?;
+            if declared.name() != actual.name() || declared.value_type() != &actual_value_type {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     "write statistics aggregate input does not exactly match the target field",
@@ -316,6 +319,7 @@ pub struct ConnectorWriteTargetPlan {
 #[derive(Clone, Debug)]
 pub struct ConnectorWriteRewriteSource {
     source: ConnectorTableHandle,
+    frozen_read_source: Option<crate::connector::read_stack::ConnectorFrozenReadSource>,
     /// Exactly the files this target rewrites. Its commit replaces precisely
     /// these, so the read that produces its rows is defined by the same set
     /// rather than by anything re-derived.
@@ -340,6 +344,7 @@ impl ConnectorWriteRewriteSource {
     ) -> Self {
         Self {
             source,
+            frozen_read_source: None,
             pinned_source,
             base_version_digest,
             scan_schema,
@@ -347,6 +352,22 @@ impl ConnectorWriteRewriteSource {
             match_tokens,
             written_version_token,
         }
+    }
+
+    /// Attach the provider's exact observation after original source signing.
+    /// This does not reinterpret the signed schema, tokens or file set.
+    pub fn with_frozen_read_source(
+        mut self,
+        source: crate::connector::read_stack::ConnectorFrozenReadSource,
+    ) -> Self {
+        self.frozen_read_source = Some(source);
+        self
+    }
+
+    pub fn frozen_read_source(
+        &self,
+    ) -> Option<&crate::connector::read_stack::ConnectorFrozenReadSource> {
+        self.frozen_read_source.as_ref()
     }
 
     pub const fn source(&self) -> &ConnectorTableHandle {
@@ -1266,16 +1287,14 @@ mod tests {
     fn statistics_requirement(
         ordinal: usize,
         name: &str,
-        data_type: arrow::datatypes::DataType,
-        nullable: bool,
+        value_type: novarocks_type_contract::FunctionValueType,
         field_id: i32,
     ) -> StatisticsRequiredAggregation {
         StatisticsRequiredAggregation::try_new(
             crate::connector::StatisticsScanColumn::try_new(
                 ordinal,
                 Arc::<str>::from(name),
-                data_type,
-                nullable,
+                value_type,
             )
             .expect("scan column"),
             "$test_stat",
@@ -1293,8 +1312,10 @@ mod tests {
             vec![statistics_requirement(
                 0,
                 "v",
-                arrow::datatypes::DataType::Int64,
-                true,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
                 1,
             )],
         )
@@ -1302,10 +1323,42 @@ mod tests {
         assert_eq!(contract.requirements().len(), 1);
 
         for mismatch in [
-            statistics_requirement(0, "V", arrow::datatypes::DataType::Int64, true, 1),
-            statistics_requirement(0, "v", arrow::datatypes::DataType::Int32, true, 1),
-            statistics_requirement(0, "v", arrow::datatypes::DataType::Int64, false, 1),
-            statistics_requirement(1, "v", arrow::datatypes::DataType::Int64, true, 1),
+            statistics_requirement(
+                0,
+                "V",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+                1,
+            ),
+            statistics_requirement(
+                0,
+                "v",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int32,
+                    true,
+                ),
+                1,
+            ),
+            statistics_requirement(
+                0,
+                "v",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+                1,
+            ),
+            statistics_requirement(
+                1,
+                "v",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+                1,
+            ),
         ] {
             assert_eq!(
                 WriteStatisticsContract::try_new(&input, vec![mismatch])
@@ -1316,11 +1369,115 @@ mod tests {
         }
     }
 
+    fn statistics_input_shape(field: arrow::datatypes::Field) -> ConnectorWriteInputShape {
+        ConnectorWriteInputShape::Data {
+            fields: vec![ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                field,
+            )],
+        }
+    }
+
+    #[test]
+    fn statistics_contract_keeps_uuid_and_variant_root_identity() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        for (carrier, logical) in [
+            (
+                arrow::datatypes::DataType::FixedSizeBinary(16),
+                ValueLogicalType::Uuid,
+            ),
+            (
+                arrow::datatypes::DataType::LargeBinary,
+                ValueLogicalType::Variant,
+            ),
+        ] {
+            let semantic = FunctionValueType::try_with_logical_type(carrier.clone(), true, logical)
+                .expect("authored semantic input");
+            let physical = FunctionValueType::new(carrier, true);
+            let semantic_input =
+                statistics_input_shape(semantic.try_to_field("v").expect("tagged semantic field"));
+            let contract = WriteStatisticsContract::try_new(
+                &semantic_input,
+                vec![statistics_requirement(0, "v", semantic.clone(), 1)],
+            )
+            .expect("exact semantic statistics contract");
+            assert_eq!(contract.requirements()[0].input().value_type(), &semantic);
+
+            let physical_input =
+                statistics_input_shape(physical.try_to_field("v").expect("physical field"));
+            WriteStatisticsContract::try_new(
+                &physical_input,
+                vec![statistics_requirement(0, "v", physical.clone(), 1)],
+            )
+            .expect("exact physical statistics contract");
+
+            for (input, declared) in [(&semantic_input, physical), (&physical_input, semantic)] {
+                let error = WriteStatisticsContract::try_new(
+                    input,
+                    vec![statistics_requirement(0, "v", declared, 1)],
+                )
+                .expect_err("same carrier cannot erase or establish a root identity");
+                assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+                assert_eq!(
+                    error.message(),
+                    "write statistics aggregate input does not exactly match the target field",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn statistics_contract_rejects_unknown_and_invalid_field_tags() {
+        use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY};
+
+        for (carrier, tag, expected) in [
+            (
+                arrow::datatypes::DataType::FixedSizeBinary(16),
+                "unknown",
+                "unknown logical type metadata",
+            ),
+            (
+                arrow::datatypes::DataType::LargeBinary,
+                "uuid",
+                "invalid Arrow carrier for Uuid",
+            ),
+            (
+                arrow::datatypes::DataType::FixedSizeBinary(16),
+                "variant",
+                "invalid Arrow carrier for Variant",
+            ),
+        ] {
+            let field = arrow::datatypes::Field::new("v", carrier.clone(), true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into());
+            let input = statistics_input_shape(field);
+            let error = WriteStatisticsContract::try_new(
+                &input,
+                vec![statistics_requirement(
+                    0,
+                    "v",
+                    FunctionValueType::new(carrier, true),
+                    1,
+                )],
+            )
+            .expect_err("invalid field identity cannot be admitted");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(error.message(), expected);
+        }
+    }
+
     #[test]
     fn statistics_contract_rejects_duplicate_artifact_identity() {
         let input = input_shape();
-        let requirement =
-            statistics_requirement(0, "v", arrow::datatypes::DataType::Int64, true, 1);
+        let requirement = statistics_requirement(
+            0,
+            "v",
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
+            1,
+        );
         assert_eq!(
             WriteStatisticsContract::try_new(&input, vec![requirement.clone(), requirement])
                 .expect_err("duplicate identity")

@@ -22,6 +22,7 @@
 //! current Iceberg snapshot: the refresh pin is the read upper bound.
 
 pub(crate) use crate::common::ImvVersionRole;
+use crate::compiler::SqlCompileError;
 use crate::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
@@ -67,7 +68,11 @@ impl LogicalRewriteRule for BindIcebergScanRule {
         ) && matches!(&plan.unary_input().kind, LogicalPlanKind::Scan(_))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
                 "BindIcebergScan requires ImvExtension in RewriteContext".to_string()
@@ -301,8 +306,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId(1),
                 name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             }],
             predicates: Vec::new(),
@@ -431,8 +436,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: ColumnId::new_for_test(9),
             name: ImvActionColumn::NAME.to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: false,
         });
         let plan = LogicalPlanNode::new(

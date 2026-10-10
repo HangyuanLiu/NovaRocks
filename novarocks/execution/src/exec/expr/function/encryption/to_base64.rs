@@ -21,13 +21,15 @@ use arrow::array::{ArrayRef, StringArray};
 use std::sync::Arc;
 
 fn should_prefer_latin1_bytes(arena: &ExprArena, arg: ExprId) -> bool {
-    matches!(
-        arena.node(arg),
+    let name = match arena.node(arg) {
         Some(ExprNode::FunctionCall {
             kind: FunctionKind::Encryption(name),
             ..
-        }) if matches!(*name, "aes_encrypt" | "from_base64" | "to_binary")
-    )
+        }) => Some(*name),
+        _ => None,
+    };
+    novarocks_type_contract::ToBase64ByteSource::from_immediate_encryption_identity(name)
+        .prefers_latin1()
 }
 
 pub fn eval_to_base64(
@@ -42,28 +44,15 @@ pub fn eval_to_base64(
 
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
-        if input.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let fallback;
-        let bytes = if prefer_latin1 {
-            if let Some(s) = input.utf8(row) {
-                fallback = super::common::latin1_string_to_bytes(s);
-                fallback.as_deref().unwrap_or_else(|| input.bytes(row))
+        out.push(novarocks_functions::builtin::to_base64_shared::encode_row(
+            &input,
+            row,
+            if prefer_latin1 {
+                novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1
             } else {
-                input.bytes(row)
-            }
-        } else {
-            input.bytes(row)
-        };
-        if bytes.is_empty() {
-            out.push(None);
-            continue;
-        }
-
-        out.push(Some(super::common::encode_base64(bytes)));
+                novarocks_type_contract::ToBase64ByteSource::Ordinary
+            },
+        ));
     }
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)

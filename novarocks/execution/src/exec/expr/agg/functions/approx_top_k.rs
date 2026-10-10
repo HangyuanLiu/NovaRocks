@@ -14,213 +14,64 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::cmp::Ordering;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder, ListArray, StructArray, new_null_array};
+use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder};
+#[cfg(test)]
+use arrow::array::{ListArray, StructArray};
 use arrow::datatypes::DataType;
-use arrow_buffer::OffsetBuffer;
 
-use crate::exec::expr::agg::{
-    AggregateAllocator, AggregateHashMap, AggregateVec, RetainedMemoryPolicy, aggregate_hash_map,
-};
+use crate::exec::expr::agg::{AggregateAllocator, RetainedMemoryPolicy};
 use crate::exec::node::aggregate::AggFunction;
 use crate::runtime::mem_tracker::MemTracker;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    AggScalarValue, TrackedAggScalarValue, aggregate_vec_with_capacity, build_scalar_array,
-    scalar_from_array, tracked_optional_key_fingerprint, tracked_scalar_from_array,
-    tracked_scalar_to_output,
-};
+use super::common::{AggScalarValue, TrackedAggScalarValue};
 
+#[cfg(test)]
+use super::common::{build_scalar_array, scalar_from_array, tracked_scalar_from_array};
 pub(super) struct ApproxTopKAgg;
 
-const DEFAULT_K: usize = 5;
-const MAX_COUNTER_NUM: usize = 100_000;
-
-struct TopKEntry {
+#[repr(transparent)]
+struct ApproxTopKState(novarocks_functions::approx_top_k_core::ApproxTopKState<AggregateAllocator>);
+impl ApproxTopKState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        Self(
+            novarocks_functions::approx_top_k_core::ApproxTopKState::new(AggregateAllocator::new(
+                tracker,
+            )),
+        )
+    }
+}
+impl std::ops::Deref for ApproxTopKState {
+    type Target = novarocks_functions::approx_top_k_core::ApproxTopKState<AggregateAllocator>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ApproxTopKState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+fn update_one(
+    state: &mut ApproxTopKState,
     value: Option<TrackedAggScalarValue>,
     count: i64,
+) -> Result<(), String> {
+    novarocks_functions::approx_top_k_core::update_one(&mut state.0, value, count)
 }
-
+fn enforce_counter_limit(state: &mut ApproxTopKState) {
+    novarocks_functions::approx_top_k_core::enforce_counter_limit(&mut state.0)
+}
+fn serialize_state(state: &ApproxTopKState) -> Vec<u8> {
+    novarocks_functions::approx_top_k_core::serialize_state(&state.0)
+}
 #[cfg(test)]
 struct DecodedTopKEntry {
     value: Option<AggScalarValue>,
     count: i64,
-}
-
-struct TrackedDecodedTopK {
-    k: usize,
-    counter_num: usize,
-    entries: AggregateVec<TopKEntry>,
-}
-
-struct ApproxTopKState {
-    allocator: AggregateAllocator,
-    initialized: bool,
-    k: usize,
-    counter_num: usize,
-    counts: AggregateHashMap<AggregateVec<u8>, TopKEntry>,
-}
-
-impl ApproxTopKState {
-    fn new(tracker: Arc<MemTracker>) -> Self {
-        let allocator = AggregateAllocator::new(tracker);
-        Self {
-            counts: aggregate_hash_map(allocator.clone()),
-            allocator,
-            initialized: false,
-            k: DEFAULT_K,
-            counter_num: default_counter_num(DEFAULT_K),
-        }
-    }
-}
-
-fn default_counter_num(k: usize) -> usize {
-    (2 * k).clamp(100, MAX_COUNTER_NUM)
-}
-
-fn clamp_k(v: i64) -> Option<usize> {
-    if v <= 0 {
-        return None;
-    }
-    let v = usize::try_from(v).ok()?;
-    if v == 0 || v > MAX_COUNTER_NUM {
-        return None;
-    }
-    Some(v)
-}
-
-fn clamp_counter_num(v: i64, k: usize) -> Option<usize> {
-    if v <= 0 {
-        return None;
-    }
-    let v = usize::try_from(v).ok()?;
-    if v == 0 || v > MAX_COUNTER_NUM {
-        return None;
-    }
-    Some(v.max(k))
-}
-
-fn scalar_to_i64(value: &Option<AggScalarValue>) -> Option<i64> {
-    match value {
-        Some(AggScalarValue::Int64(v)) => Some(*v),
-        Some(AggScalarValue::Float64(v)) => Some(*v as i64),
-        Some(AggScalarValue::Decimal128(v)) => i64::try_from(*v).ok(),
-        Some(AggScalarValue::Decimal256(v)) => v.to_string().parse::<i64>().ok(),
-        _ => None,
-    }
-}
-
-fn encode_optional_scalar(value: &Option<AggScalarValue>) -> Vec<u8> {
-    fn encode_into(buf: &mut Vec<u8>, value: &AggScalarValue) {
-        match value {
-            AggScalarValue::Bool(v) => {
-                buf.push(1);
-                buf.push(*v as u8);
-            }
-            AggScalarValue::Int64(v) => {
-                buf.push(2);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Float64(v) => {
-                buf.push(3);
-                buf.extend_from_slice(&v.to_bits().to_le_bytes());
-            }
-            AggScalarValue::Utf8(v) => {
-                buf.push(4);
-                let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(v.as_bytes());
-            }
-            AggScalarValue::Date32(v) => {
-                buf.push(5);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Timestamp(v) => {
-                buf.push(6);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal128(v) => {
-                buf.push(7);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal256(v) => {
-                buf.push(11);
-                let text = v.to_string();
-                let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(text.as_bytes());
-            }
-            AggScalarValue::Binary(v) => {
-                buf.push(12);
-                let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(v);
-            }
-            AggScalarValue::Struct(items) => {
-                buf.push(8);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                }
-            }
-            AggScalarValue::Map(items) => {
-                buf.push(9);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                for (k, v) in items {
-                    match k {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                    match v {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                }
-            }
-            AggScalarValue::List(items) => {
-                buf.push(10);
-                let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                buf.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            buf.push(1);
-                            encode_into(buf, v);
-                        }
-                        None => buf.push(0),
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    match value {
-        Some(v) => {
-            out.push(1);
-            encode_into(&mut out, v);
-        }
-        None => out.push(0),
-    }
-    out
 }
 
 #[cfg(test)]
@@ -389,238 +240,6 @@ fn decode_optional_scalar(bytes: &[u8]) -> Result<Option<AggScalarValue>, String
     Ok(Some(value))
 }
 
-fn decode_optional_scalar_tracked(
-    bytes: &[u8],
-    allocator: &AggregateAllocator,
-) -> Result<Option<TrackedAggScalarValue>, String> {
-    fn need(bytes: &[u8], pos: usize, len: usize, label: &str) -> Result<(), String> {
-        if pos.checked_add(len).is_none_or(|end| end > bytes.len()) {
-            Err(format!("approx_top_k decode {label}: buffer too short"))
-        } else {
-            Ok(())
-        }
-    }
-    fn read_u32(bytes: &[u8], pos: &mut usize, label: &str) -> Result<usize, String> {
-        need(bytes, *pos, 4, label)?;
-        let value = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-        *pos += 4;
-        Ok(value)
-    }
-    fn decode_optional(
-        bytes: &[u8],
-        pos: &mut usize,
-        allocator: &AggregateAllocator,
-    ) -> Result<Option<TrackedAggScalarValue>, String> {
-        need(bytes, *pos, 1, "optional marker")?;
-        let present = bytes[*pos];
-        *pos += 1;
-        match present {
-            0 => Ok(None),
-            1 => decode_value(bytes, pos, allocator).map(Some),
-            _ => Err("approx_top_k decode: invalid optional marker".to_string()),
-        }
-    }
-    fn decode_values(
-        bytes: &[u8],
-        pos: &mut usize,
-        allocator: &AggregateAllocator,
-        label: &str,
-    ) -> Result<AggregateVec<Option<TrackedAggScalarValue>>, String> {
-        let len = read_u32(bytes, pos, label)?;
-        let mut values =
-            aggregate_vec_with_capacity(allocator, len, "reserve approx_top_k nested scalar")?;
-        for _ in 0..len {
-            values.push(decode_optional(bytes, pos, allocator)?);
-        }
-        Ok(values)
-    }
-    fn decode_value(
-        bytes: &[u8],
-        pos: &mut usize,
-        allocator: &AggregateAllocator,
-    ) -> Result<TrackedAggScalarValue, String> {
-        need(bytes, *pos, 1, "tag")?;
-        let tag = bytes[*pos];
-        *pos += 1;
-        macro_rules! fixed {
-            ($len:expr, $label:literal, $ctor:expr) => {{
-                need(bytes, *pos, $len, $label)?;
-                let raw: [u8; $len] = bytes[*pos..*pos + $len].try_into().unwrap();
-                *pos += $len;
-                $ctor(raw)
-            }};
-        }
-        Ok(match tag {
-            1 => {
-                need(bytes, *pos, 1, "bool")?;
-                let value = bytes[*pos] != 0;
-                *pos += 1;
-                TrackedAggScalarValue::Bool(value)
-            }
-            2 => fixed!(8, "int64", |raw| TrackedAggScalarValue::Int64(
-                i64::from_le_bytes(raw)
-            )),
-            3 => fixed!(8, "float64", |raw| TrackedAggScalarValue::Float64(
-                f64::from_bits(u64::from_le_bytes(raw))
-            )),
-            4 | 12 => {
-                let len = read_u32(bytes, pos, "byte length")?;
-                need(bytes, *pos, len, "byte payload")?;
-                let value = crate::exec::expr::agg::aggregate_bytes(
-                    allocator.clone(),
-                    &bytes[*pos..*pos + len],
-                )?;
-                *pos += len;
-                if tag == 4 {
-                    std::str::from_utf8(&value)
-                        .map_err(|error| format!("approx_top_k decode utf8: {error}"))?;
-                    TrackedAggScalarValue::Utf8(value)
-                } else {
-                    TrackedAggScalarValue::Binary(value)
-                }
-            }
-            5 => fixed!(4, "date32", |raw| TrackedAggScalarValue::Date32(
-                i32::from_le_bytes(raw)
-            )),
-            6 => fixed!(8, "timestamp", |raw| TrackedAggScalarValue::Timestamp(
-                i64::from_le_bytes(raw)
-            )),
-            7 => fixed!(16, "decimal128", |raw| {
-                TrackedAggScalarValue::Decimal128(i128::from_le_bytes(raw))
-            }),
-            8 => TrackedAggScalarValue::Struct(decode_values(
-                bytes,
-                pos,
-                allocator,
-                "struct length",
-            )?),
-            9 => {
-                let len = read_u32(bytes, pos, "map length")?;
-                let mut entries =
-                    aggregate_vec_with_capacity(allocator, len, "reserve approx_top_k map scalar")?;
-                for _ in 0..len {
-                    entries.push((
-                        decode_optional(bytes, pos, allocator)?,
-                        decode_optional(bytes, pos, allocator)?,
-                    ));
-                }
-                TrackedAggScalarValue::Map(entries)
-            }
-            10 => TrackedAggScalarValue::List(decode_values(bytes, pos, allocator, "list length")?),
-            11 => {
-                let len = read_u32(bytes, pos, "decimal256 length")?;
-                need(bytes, *pos, len, "decimal256 payload")?;
-                let text = std::str::from_utf8(&bytes[*pos..*pos + len])
-                    .map_err(|error| format!("approx_top_k decode decimal256: {error}"))?;
-                *pos += len;
-                TrackedAggScalarValue::Decimal256(
-                    text.parse()
-                        .map_err(|error| format!("approx_top_k decode decimal256: {error}"))?,
-                )
-            }
-            other => return Err(format!("approx_top_k decode: unknown tag {other}")),
-        })
-    }
-
-    let mut pos = 0;
-    let value = decode_optional(bytes, &mut pos, allocator)?;
-    if pos != bytes.len() {
-        return Err("approx_top_k decode: trailing bytes".to_string());
-    }
-    Ok(value)
-}
-
-fn ensure_initialized(state: &mut ApproxTopKState) {
-    if !state.initialized {
-        state.initialized = true;
-        state.k = DEFAULT_K;
-        state.counter_num = default_counter_num(DEFAULT_K);
-    }
-}
-
-fn evict_one_counter(state: &mut ApproxTopKState) -> i64 {
-    let victim = state
-        .counts
-        .iter()
-        .min_by(|(left_key, left), (right_key, right)| {
-            left.count
-                .cmp(&right.count)
-                .then_with(|| left_key.cmp(right_key))
-        })
-        .map(|(key, entry)| (key as *const AggregateVec<u8> as usize, entry.count));
-    let Some((key_address, count)) = victim else {
-        return 0;
-    };
-    state
-        .counts
-        .retain(|key, _| key as *const AggregateVec<u8> as usize != key_address);
-    count
-}
-
-fn enforce_counter_limit(state: &mut ApproxTopKState) {
-    while state.counts.len() > state.counter_num {
-        evict_one_counter(state);
-    }
-}
-
-fn update_one(
-    state: &mut ApproxTopKState,
-    value: Option<TrackedAggScalarValue>,
-    count: i64,
-) -> Result<(), String> {
-    if count <= 0 {
-        return Ok(());
-    }
-    ensure_initialized(state);
-    let key = tracked_optional_key_fingerprint(&value, &state.allocator)?;
-    if let Some(entry) = state.counts.get_mut(&key) {
-        entry.count = entry.count.saturating_add(count);
-        return Ok(());
-    }
-    let inherited = if state.counts.len() >= state.counter_num {
-        evict_one_counter(state)
-    } else {
-        0
-    };
-    state.counts.try_reserve(1).map_err(|_| {
-        state
-            .allocator
-            .allocation_error("reserve approx_top_k counter")
-    })?;
-    state.counts.insert(
-        key,
-        TopKEntry {
-            value,
-            count: inherited.saturating_add(count),
-        },
-    );
-    Ok(())
-}
-
-fn serialize_state(state: &ApproxTopKState) -> Vec<u8> {
-    let mut out = Vec::new();
-    let k = u32::try_from(state.k).unwrap_or(DEFAULT_K as u32);
-    let counter_num = u32::try_from(state.counter_num).unwrap_or(MAX_COUNTER_NUM as u32);
-    out.extend_from_slice(&k.to_le_bytes());
-    out.extend_from_slice(&counter_num.to_le_bytes());
-    let count = u32::try_from(state.counts.len()).unwrap_or(u32::MAX);
-    out.extend_from_slice(&count.to_le_bytes());
-    for entry in state.counts.values() {
-        let value = entry
-            .value
-            .as_ref()
-            .map(tracked_scalar_to_output)
-            .transpose()
-            .expect("tracked approx_top_k value must materialize");
-        let value_bytes = encode_optional_scalar(&value);
-        let len = u32::try_from(value_bytes.len()).unwrap_or(u32::MAX);
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&value_bytes);
-        out.extend_from_slice(&entry.count.to_le_bytes());
-    }
-    out
-}
-
 #[cfg(test)]
 fn deserialize_state(bytes: &[u8]) -> Result<(usize, usize, Vec<DecodedTopKEntry>), String> {
     if bytes.len() < 12 {
@@ -677,146 +296,18 @@ fn deserialize_state(bytes: &[u8]) -> Result<(usize, usize, Vec<DecodedTopKEntry
     Ok((k, counter_num, entries))
 }
 
-fn deserialize_state_tracked(
-    bytes: &[u8],
-    allocator: &AggregateAllocator,
-) -> Result<TrackedDecodedTopK, String> {
-    if bytes.len() < 12 {
-        return Err("approx_top_k merge payload too short".to_string());
-    }
-    let k = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let counter_num = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let entry_num = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    if entry_num > MAX_COUNTER_NUM {
-        return Err(format!(
-            "approx_top_k merge entry count {entry_num} exceeds {MAX_COUNTER_NUM}"
-        ));
-    }
-    let mut entries =
-        aggregate_vec_with_capacity(allocator, entry_num, "reserve approx_top_k decoded entries")?;
-    let mut pos = 12usize;
-    for _ in 0..entry_num {
-        let value_len_end = pos
-            .checked_add(4)
-            .ok_or_else(|| "approx_top_k decode entry length overflow".to_string())?;
-        let value_len_bytes = bytes
-            .get(pos..value_len_end)
-            .ok_or_else(|| "approx_top_k decode entry len failed".to_string())?;
-        let value_len = u32::from_le_bytes(value_len_bytes.try_into().unwrap()) as usize;
-        pos = value_len_end;
-        let value_end = pos
-            .checked_add(value_len)
-            .ok_or_else(|| "approx_top_k decode value length overflow".to_string())?;
-        let count_end = value_end
-            .checked_add(8)
-            .ok_or_else(|| "approx_top_k decode count offset overflow".to_string())?;
-        let value_bytes = bytes
-            .get(pos..value_end)
-            .ok_or_else(|| "approx_top_k decode value out of bounds".to_string())?;
-        let count_bytes = bytes
-            .get(value_end..count_end)
-            .ok_or_else(|| "approx_top_k decode count out of bounds".to_string())?;
-        entries.push(TopKEntry {
-            value: decode_optional_scalar_tracked(value_bytes, allocator)?,
-            count: i64::from_le_bytes(count_bytes.try_into().unwrap()),
-        });
-        pos = count_end;
-    }
-    if pos != bytes.len() {
-        return Err("approx_top_k decode trailing bytes".to_string());
-    }
-    Ok(TrackedDecodedTopK {
-        k,
-        counter_num,
-        entries,
-    })
-}
-
-fn sorted_top_entries(state: &ApproxTopKState) -> Vec<(&AggregateVec<u8>, &TopKEntry)> {
-    let mut entries = state.counts.iter().collect::<Vec<_>>();
-    entries.sort_by(|(lk, lv), (rk, rv)| match rv.count.cmp(&lv.count) {
-        Ordering::Equal => lk.cmp(rk),
-        other => other,
-    });
-    if entries.len() > state.k {
-        entries.truncate(state.k);
-    }
-    entries
-}
-
 fn output_topk_array(
     output_type: &DataType,
     offset: usize,
     group_states: &[AggStatePtr],
 ) -> Result<ArrayRef, String> {
-    let DataType::List(list_field) = output_type else {
-        return Err(format!(
-            "approx_top_k output type must be LIST<STRUCT>, got {:?}",
-            output_type
-        ));
-    };
-    let DataType::Struct(struct_fields) = list_field.data_type() else {
-        return Err(format!(
-            "approx_top_k list element type must be STRUCT, got {:?}",
-            list_field.data_type()
-        ));
-    };
-    if struct_fields.len() < 2 {
-        return Err("approx_top_k output struct must have at least 2 fields".to_string());
-    }
-
-    let mut offsets = Vec::with_capacity(group_states.len() + 1);
-    offsets.push(0_i32);
-    let mut current: i64 = 0;
-    let mut items = Vec::new();
-    let mut counts = Vec::new();
-    let mut extras: Vec<Vec<Option<AggScalarValue>>> =
-        (2..struct_fields.len()).map(|_| Vec::new()).collect();
-
-    for &base in group_states {
-        let state = unsafe { &*((base as *mut u8).add(offset) as *const ApproxTopKState) };
-        let top_entries = sorted_top_entries(state);
-        current += top_entries.len() as i64;
-        if current > i32::MAX as i64 {
-            return Err("approx_top_k output offset overflow".to_string());
-        }
-        offsets.push(current as i32);
-        for (_key, entry) in top_entries {
-            items.push(
-                entry
-                    .value
-                    .as_ref()
-                    .map(tracked_scalar_to_output)
-                    .transpose()?,
-            );
-            counts.push(Some(AggScalarValue::Int64(entry.count)));
-            for extra in &mut extras {
-                extra.push(None);
-            }
-        }
-    }
-
-    let item_array = build_scalar_array(struct_fields[0].data_type(), items)?;
-    let count_array = build_scalar_array(struct_fields[1].data_type(), counts)?;
-    let mut struct_columns = vec![item_array, count_array];
-    for (idx, field) in struct_fields.iter().enumerate().skip(2) {
-        let values = std::mem::take(&mut extras[idx - 2]);
-        if values.is_empty() {
-            struct_columns.push(new_null_array(field.data_type(), 0));
-        } else {
-            struct_columns.push(build_scalar_array(field.data_type(), values)?);
-        }
-    }
-    let struct_array = StructArray::new(struct_fields.clone(), struct_columns, None);
-    let list_array = ListArray::new(
-        list_field.clone(),
-        OffsetBuffer::new(offsets.into()),
-        Arc::new(struct_array),
-        None,
-    );
-    Ok(Arc::new(list_array))
+    novarocks_functions::approx_top_k_core::output_topk_array(
+        output_type,
+        group_states.iter().map(|&base| unsafe {
+            &(*((base as *mut u8).add(offset) as *const ApproxTopKState)).0
+        }),
+    )
 }
-
 impl AggregateFunction for ApproxTopKAgg {
     fn build_spec_from_type(
         &self,
@@ -950,48 +441,10 @@ impl AggregateFunction for ApproxTopKAgg {
             return Err("approx_top_k input view mismatch".to_string());
         };
 
-        if let Some(struct_arr) = array.as_any().downcast_ref::<StructArray>() {
-            let cols = struct_arr.columns();
-            if cols.is_empty() {
-                return Err("approx_top_k struct input must have at least 1 field".to_string());
-            }
-            for (row, &base) in state_ptrs.iter().enumerate() {
-                let state =
-                    unsafe { &mut *((base as *mut u8).add(offset) as *mut ApproxTopKState) };
-                ensure_initialized(state);
-                if cols.len() >= 2 {
-                    let k = scalar_to_i64(&scalar_from_array(&cols[1], row)?).and_then(clamp_k);
-                    if let Some(k) = k {
-                        state.k = k;
-                        state.counter_num = state.counter_num.max(k);
-                    }
-                }
-                if cols.len() >= 3 {
-                    let counter = scalar_to_i64(&scalar_from_array(&cols[2], row)?)
-                        .and_then(|v| clamp_counter_num(v, state.k));
-                    if let Some(counter) = counter {
-                        state.counter_num = counter;
-                        enforce_counter_limit(state);
-                    }
-                } else {
-                    state.counter_num = state.counter_num.max(default_counter_num(state.k));
-                }
-                let value = if struct_arr.is_null(row) {
-                    None
-                } else {
-                    tracked_scalar_from_array(&cols[0], row, &state.allocator)?
-                };
-                update_one(state, value, 1)?;
-            }
-            return Ok(());
-        }
-
+        novarocks_functions::approx_top_k_core::check_update_array(array)?;
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ApproxTopKState) };
-            ensure_initialized(state);
-            state.counter_num = state.counter_num.max(default_counter_num(state.k));
-            let value = tracked_scalar_from_array(array, row, &state.allocator)?;
-            update_one(state, value, 1)?;
+            novarocks_functions::approx_top_k_core::update_row(&mut state.0, array, row)?;
         }
         Ok(())
     }
@@ -1012,22 +465,7 @@ impl AggregateFunction for ApproxTopKAgg {
             }
             let payload = array.value(row);
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ApproxTopKState) };
-            let decoded = deserialize_state_tracked(payload, &state.allocator)?;
-            ensure_initialized(state);
-            let has_entries = !decoded.entries.is_empty();
-            if has_entries {
-                if decoded.k > 0 {
-                    state.k = decoded.k.min(MAX_COUNTER_NUM);
-                }
-                if decoded.counter_num > 0 {
-                    state.counter_num = decoded.counter_num.max(state.k).min(MAX_COUNTER_NUM);
-                    enforce_counter_limit(state);
-                }
-            }
-            for entry in decoded.entries {
-                update_one(state, entry.value, entry.count)?;
-            }
-            enforce_counter_limit(state);
+            novarocks_functions::approx_top_k_core::merge_payload(&mut state.0, payload)?;
         }
         Ok(())
     }
@@ -1128,3 +566,7 @@ mod retained_bytes_tests {
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "approx_top_k_original_baseline_tests.rs"]
+mod original_baseline_tests;

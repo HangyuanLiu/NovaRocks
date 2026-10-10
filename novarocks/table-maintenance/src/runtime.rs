@@ -84,6 +84,7 @@ pub struct JobRecord<T, O> {
     pub state: MaintenanceJobState,
     pub outcome: Option<O>,
     pub error_message: Option<String>,
+    pub compile_control: Option<novarocks_type_contract::CompileControlError>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
@@ -153,52 +154,84 @@ impl std::error::Error for RuntimeError {}
 pub struct TerminalError {
     pub state: MaintenanceJobState,
     pub message: String,
+    pub compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl TerminalError {
+    pub fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
+        let mut failure = Self::pre_dispatch_failed(error.to_string());
+        failure.compile_control = Some(error);
+        failure
+    }
+    pub fn with_compile_control(
+        mut self,
+        error: Option<novarocks_type_contract::CompileControlError>,
+    ) -> Self {
+        self.compile_control = error;
+        self
+    }
     pub fn pre_dispatch_failed(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::PreDispatchFailed,
             message: message.into(),
+            compile_control: None,
         }
     }
     pub fn failed(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::Failed,
             message: message.into(),
+            compile_control: None,
         }
     }
     pub fn target_replaced(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::TargetReplaced,
             message: message.into(),
+            compile_control: None,
         }
     }
     pub fn cancelled_before_dispatch(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::CancelledBeforeDispatch,
             message: message.into(),
+            compile_control: None,
         }
     }
     pub fn known_uncommitted(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::KnownUncommitted,
             message: message.into(),
+            compile_control: None,
         }
     }
     pub fn commit_unknown(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::CommitUnknown,
             message: message.into(),
+            compile_control: None,
         }
     }
     pub fn known_committed_finalization_failed(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::KnownCommittedFinalizationFailed,
             message: message.into(),
+            compile_control: None,
         }
     }
 }
+
+impl From<String> for TerminalError {
+    fn from(error: String) -> Self {
+        Self::pre_dispatch_failed(error)
+    }
+}
+impl fmt::Display for TerminalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for TerminalError {}
 
 struct RuntimeState<T, O, P> {
     active: HashMap<i64, JobRecord<T, O>>,
@@ -285,6 +318,7 @@ where
             state: MaintenanceJobState::Pending,
             outcome: None,
             error_message: None,
+            compile_control: None,
             created_at_ms: request.created_at_ms,
             started_at_ms: None,
             finished_at_ms: None,
@@ -360,6 +394,7 @@ where
             Err(error) => {
                 terminal.state = error.state;
                 terminal.error_message = Some(error.message);
+                terminal.compile_control = error.compile_control;
             }
         }
         terminal.finished_at_ms = Some(at_ms);
@@ -602,6 +637,34 @@ mod tests {
                 .expect("cancellation state")
         );
     }
+    #[tokio::test]
+    async fn completed_job_retains_control_separately_from_publication_state() {
+        use novarocks_type_contract::CompileControlError;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let runtime: ProcessRuntime<String, (), ()> = ProcessRuntime::new();
+            let job = runtime.submit(create("orders", 1), ()).await.unwrap();
+            runtime.claim_next(2).await.unwrap().unwrap();
+            let failure = TerminalError::known_uncommitted("cohort compile failed")
+                .with_compile_control(Some(control));
+            runtime.finish(job.job_id, Err(failure), 3).await.unwrap();
+            let terminal = runtime.wait_for_completion(job.job_id).await.unwrap();
+            assert_eq!(terminal.compile_control, Some(control));
+            assert_eq!(terminal.state, MaintenanceJobState::KnownUncommitted);
+            assert_eq!(
+                terminal.error_message.as_deref(),
+                Some("cohort compile failed")
+            );
+            runtime
+                .submit(create("orders", 4), ())
+                .await
+                .expect("exact terminal released target");
+        }
+    }
+
     #[tokio::test]
     async fn per_job_cancel_retains_pending_and_running_work_until_actual_finish() {
         for dispatch in [false, true] {

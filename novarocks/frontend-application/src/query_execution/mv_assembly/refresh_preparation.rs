@@ -153,7 +153,7 @@ pub(crate) fn freeze_statement_refresh_rewrite_context(
         Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>,
         novarocks_spi::connector::ConnectorControlPlanningLease,
     ),
-    String,
+    novarocks_sql::compiler::SqlCompileError,
 > {
     let target = crate::mv::domain::refresh::target::resolve_refresh_target(
         current_catalog,
@@ -222,7 +222,7 @@ pub(crate) fn frozen_refresh_aggregate_analysis(
         novarocks_sql::planning::mv::SqlMvAggregateCalls,
         novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
     )>,
-    String,
+    novarocks_sql::compiler::SqlCompileError,
 > {
     if projection.facts.interpretation().aggregates.is_empty() {
         return Ok(None);
@@ -250,7 +250,10 @@ fn build_aggregate_layout_for_refresh_select_sql(
     current_database: &str,
     select_sql: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout, String> {
+) -> Result<
+    novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
+    novarocks_sql::compiler::SqlCompileError,
+> {
     let visible_query = parse_mv_select_query(select_sql)?;
     let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
         current_catalog,
@@ -266,11 +269,17 @@ fn build_aggregate_layout_for_refresh_select_sql(
         current_database,
         &visible_query,
         ports.function_catalog().as_ref(),
+        ports.constant_policy(),
+        ports.sql_emission_mode(),
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        ),
     )?;
     let facts = visible_analysis
         .refresh_input
         .aggregate_layout_facts(&visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
     novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
+        .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
 }
 
 impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
@@ -542,7 +551,7 @@ fn prepare_managed_repartition_transition(
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     retained_target: &RetainedRepartitionTarget,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedManagedRepartitionTransition, String> {
+) -> Result<PreparedManagedRepartitionTransition, novarocks_sql::compiler::SqlCompileError> {
     let target = IcebergMvTarget {
         catalog: contract
             .target
@@ -558,7 +567,7 @@ fn prepare_managed_repartition_transition(
     if !interpretation.branches.is_empty() && !interpretation.aggregates.is_empty() {
         return Err(
             "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION does not support branch UNION ALL aggregates"
-                .to_string(),
+                .to_string().into(),
         );
     }
     let query = canonical_mv_select_query(&projection)?;
@@ -587,16 +596,27 @@ fn prepare_managed_repartition_transition(
         novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
         source.catalog_application(),
     );
+    let completion_control =
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        );
     let analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
         current_catalog,
         &provider,
         current_database,
         &query,
         source.function_catalog().as_ref(),
+        source.constant_policy(),
+        source.sql_emission_mode(),
+        completion_control.clone(),
     )?;
     validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
-    if derive_fragment_property(&analysis)?.is_composed_aggregate_schema_contract_fallback() {
-        return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
+    if derive_fragment_property(&analysis, &completion_control)?
+        .is_composed_aggregate_schema_contract_fallback()
+    {
+        return Err("partitioned composed aggregate Iceberg MV is not supported"
+            .to_string()
+            .into());
     }
 
     // Both the prior specification and the physical field IDs come from the
@@ -790,7 +810,10 @@ fn prepare_frontend_first_refresh_write(
     repartition_transition: Option<&PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication), String> {
+) -> Result<
+    (PreparedMvFirstRefreshWrite, AdmittedMvDataPublication),
+    novarocks_sql::compiler::SqlCompileError,
+> {
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
             "Iceberg MV first-refresh target has no connector catalog".to_string()
@@ -813,7 +836,9 @@ fn prepare_frontend_first_refresh_write(
         .map_err(|error| format!("derive MV first-refresh write lease: {error}"))?;
     if !write_lease.matches_provider_binding_key(&observed_binding) {
         return Err(
-            "MV first-refresh target connector generation changed during admission".to_string(),
+            "MV first-refresh target connector generation changed during admission"
+                .to_string()
+                .into(),
         );
     }
     let projection = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
@@ -956,7 +981,9 @@ fn prepare_frontend_first_refresh_write(
             contract.state_baseline,
             RefreshStateBaseline::SnapshotBacked { .. }
         ) {
-            return Err("MV first-refresh join requires a snapshot-backed baseline".to_string());
+            return Err("MV first-refresh join requires a snapshot-backed baseline"
+                .to_string()
+                .into());
         }
         let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
             connector_control: source.connector_control(),
@@ -1514,7 +1541,7 @@ fn prepare_frontend_incremental_write(
     attempt: &MvRefreshAttemptIdentity,
     observed_binding: ConnectorProviderBindingKey,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedIncrementalRefreshWork, String> {
+) -> Result<PreparedIncrementalRefreshWork, novarocks_sql::compiler::SqlCompileError> {
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
             "Iceberg MV incremental refresh target has no connector catalog".to_string()
@@ -1542,13 +1569,17 @@ fn prepare_frontend_incremental_write(
     } = &contract.state_baseline
     else {
         return Err(
-            "MV incremental refresh requires a snapshot-backed target baseline".to_string(),
+            "MV incremental refresh requires a snapshot-backed target baseline"
+                .to_string()
+                .into(),
         );
     };
     let definition_occurrences = &projection.facts.definition().relation_occurrences;
     if definition_occurrences.len() != contract.base_refs.len() {
         return Err(
-            "MV incremental refresh base facts do not retain every D occurrence".to_string(),
+            "MV incremental refresh base facts do not retain every D occurrence"
+                .to_string()
+                .into(),
         );
     }
     let pin = RefreshSnapshotPin::try_from_occurrences(
@@ -1823,7 +1854,8 @@ fn prepare_frontend_incremental_write(
             },
             publication_intent,
         )
-        .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication));
+        .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication))
+        .map_err(novarocks_sql::compiler::SqlCompileError::Compilation);
     }
 
     let loaded_bases = rewrite
@@ -1988,4 +2020,5 @@ fn prepare_frontend_incremental_write(
         publication_intent,
     )
     .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication))
+    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
 }

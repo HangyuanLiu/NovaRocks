@@ -205,6 +205,7 @@ fn finish_topn(
                 columns: Box::from([key, order]),
             },
             kind: NodeKind::TopN {
+                reduction: crate::TopNReduction::Rows,
                 order_by: Box::from([sort_expr(order_expression, NullOrdering::Last)]),
                 limit: 10,
                 offset: 0,
@@ -296,6 +297,7 @@ fn finish_topn_reduction(
                 columns: Box::from([partial_value]),
             },
             kind: NodeKind::TopN {
+                reduction: crate::TopNReduction::Rows,
                 order_by: Box::from([sort_expr(partial_order, NullOrdering::Last)]),
                 limit: partial_limit,
                 offset: partial_offset,
@@ -371,6 +373,7 @@ fn finish_topn_reduction(
                 columns: Box::from([final_value]),
             },
             kind: NodeKind::TopN {
+                reduction: crate::TopNReduction::Rows,
                 order_by: Box::from([sort_expr(final_order, NullOrdering::Last)]),
                 limit: final_limit,
                 offset: final_offset,
@@ -435,15 +438,19 @@ fn finish_topn_reduction(
 
 fn window_function() -> BoundFunction {
     BoundFunction {
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            semantic_parameters: Box::default(),
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error:
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+        }),
         function_id: FunctionId::try_new("builtin/row_number/v1").unwrap(),
         overload: FunctionOverloadId::try_new("row-number-empty").unwrap(),
         kind: FunctionKind::Window,
         argument_types: Box::default(),
         result_type: ty(DataType::Int64, false),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
     }
 }
 
@@ -992,19 +999,22 @@ fn finish_table_function_with_sink(
             },
             kind: NodeKind::TableFunction {
                 function: BoundTableFunction {
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: if volatile {
+                            FunctionVolatility::Volatile
+                        } else {
+                            FunctionVolatility::Immutable
+                        },
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/generate_one/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("empty-to-i64").unwrap(),
                     argument_types: Box::default(),
                     result_types: Box::from([ty(DataType::Int64, false)]),
-                    volatility: if volatile {
-                        FunctionVolatility::Volatile
-                    } else {
-                        FunctionVolatility::Immutable
-                    },
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 arguments: Box::default(),
                 outputs,

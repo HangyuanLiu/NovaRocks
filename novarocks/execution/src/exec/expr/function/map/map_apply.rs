@@ -455,7 +455,7 @@ fn collect_slot_ids(arena: &ExprArena, expr_id: ExprId, out: &mut HashSet<SlotId
     while let Some(id) = stack.pop() {
         let Some(node) = arena.node(id) else { continue };
         match node {
-            ExprNode::Literal(_) => {}
+            ExprNode::Constant(_) | ExprNode::Literal(_) => {}
             ExprNode::SlotId(slot_id) => {
                 out.insert(*slot_id);
             }

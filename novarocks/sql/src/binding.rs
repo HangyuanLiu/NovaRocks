@@ -23,6 +23,21 @@
 //! layers and are copied into the final physical-plan contract only at its
 //! lowering boundary.
 
+mod call_arguments;
+pub(crate) use call_arguments::{
+    CapturedLogicalCallArguments, LogicalCallArgumentCaptureError, capture_logical_call_arguments,
+    move_authored_call_arguments_observed,
+};
+
+mod aggregate_request;
+mod aggregate_source;
+pub(crate) use aggregate_request::{
+    AggregateRequestCaptureError, CapturedAggregateLogicalRequest,
+    capture_aggregate_logical_request,
+};
+pub(crate) mod observed;
+pub(crate) use aggregate_source::{AggregateArgumentSource, AggregateLogicalSourceIdentity};
+
 use std::{
     num::{NonZeroU32, NonZeroU64},
     ops::Deref,
@@ -36,15 +51,177 @@ use std::{
 /// Sharing keeps expression nodes compact while preserving one exact binding
 /// from analysis through optimization and physical lowering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct SqlFunctionBinding(Arc<novarocks_functions::ResolvedFunctionBinding>);
+pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
+
+/// Captured at an actual logical GROUP_CONCAT call in its lexical SELECT scope.
+/// The optional raw limit distinguishes missing admission from a real value.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GroupConcatSourceFacts {
+    pub legacy: bool,
+    pub max_len: Option<i64>,
+}
+impl GroupConcatSourceFacts {
+    /// Original lexical values and sparse identities, shared with lowering.
+    pub(crate) fn parameter_entries(&self) -> Option<[(
+        novarocks_type_contract::SemanticParameterId,
+        novarocks_type_contract::SemanticParameterValue,
+    ); 2]> {
+        use novarocks_type_contract::{SemanticParameterId as I, SemanticParameterValue as V};
+        let raw = self.max_len?;
+        Some([
+            (I::new(if self.legacy { 2 } else { 1 }), V::GroupConcatLegacy(self.legacy)),
+            (I::new(3), V::GroupConcatMaxLen(raw)),
+        ])
+    }
+    pub fn environment(&self) -> [novarocks_type_contract::SemanticParameterRef; 2] {
+        use novarocks_type_contract::{
+            SemanticParameterId as I, SemanticParameterKey as K, SemanticParameterRef as R,
+        };
+        [
+            R {
+                id: I::new(if self.legacy { 2 } else { 1 }),
+                expected_key: K::GroupConcatLegacy,
+            },
+            R {
+                id: I::new(3),
+                expected_key: K::GroupConcatMaxLen,
+            },
+        ]
+    }
+}
+
+/// Positive evidence of the constructor that supplied an exact result target.
+/// It is not inferred from a function name, selected result or source absence.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum SqlResultConstraintOrigin {
+    Unconstrained,
+    EmptyArrayLiteral,
+    ValueDomainConversion {
+        /// The original full final assignment/CAST target, before the one
+        /// conversion owner chose its explicit intermediate contract.
+        final_target: novarocks_functions::FunctionValueType,
+    },
+}
+
+/// One call's exact selection and authored semantic policy. The selected
+/// overload remains catalog-owned; a SQL scope does not redefine its identity.
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct SqlFunctionCallFacts {
+    resolved: novarocks_functions::ResolvedFunctionBinding,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    /// A real producer-supplied result target, separate from inferred selection.
+    result_constraint: Option<novarocks_functions::FunctionValueType>,
+    result_constraint_origin: SqlResultConstraintOrigin,
+    group_concat: Option<GroupConcatSourceFacts>,
+    aggregate_state_source: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
+}
 
 impl SqlFunctionBinding {
-    pub(crate) fn new(binding: novarocks_functions::ResolvedFunctionBinding) -> Self {
-        Self(Arc::new(binding))
+    pub(crate) fn new(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> Self {
+        Self(Arc::new(SqlFunctionCallFacts {
+            resolved,
+            decimal_overflow_policy,
+            result_constraint: None,
+            result_constraint_origin: SqlResultConstraintOrigin::Unconstrained,
+            group_concat: None,
+            aggregate_state_source: None,
+        }))
+    }
+
+    /// Preserve the exact target supplied to the original binding owner.
+    /// An inferred selected result must never be passed as this constraint.
+    pub(crate) fn new_with_empty_array_constraint(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint: novarocks_functions::FunctionValueType,
+    ) -> Self {
+        Self(Arc::new(SqlFunctionCallFacts {
+            resolved,
+            decimal_overflow_policy,
+            result_constraint: Some(result_constraint),
+            result_constraint_origin: SqlResultConstraintOrigin::EmptyArrayLiteral,
+            group_concat: None,
+            aggregate_state_source: None,
+        }))
+    }
+
+    /// The actual conversion constructors retain both original targets. The
+    /// captured request still borrows the original intermediate constraint.
+    /// A later computed target requires its own same-emission derivation.
+    pub(crate) fn new_with_conversion_constraint(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint: novarocks_functions::FunctionValueType,
+        final_target: novarocks_functions::FunctionValueType,
+    ) -> Self {
+        Self(Arc::new(SqlFunctionCallFacts {
+            resolved,
+            decimal_overflow_policy,
+            result_constraint: Some(result_constraint),
+            result_constraint_origin: SqlResultConstraintOrigin::ValueDomainConversion {
+                final_target,
+            },
+            group_concat: None,
+            aggregate_state_source: None,
+        }))
+    }
+
+    pub(crate) fn with_group_concat_source(mut self, facts: GroupConcatSourceFacts) -> Self {
+        let old = &self.0;
+        self.0 = Arc::new(SqlFunctionCallFacts {
+            resolved: old.resolved.clone(),
+            decimal_overflow_policy: old.decimal_overflow_policy,
+            result_constraint: old.result_constraint.clone(),
+            result_constraint_origin: old.result_constraint_origin.clone(),
+            group_concat: Some(facts),
+            aggregate_state_source: old.aggregate_state_source.clone(),
+        });
+        self
+    }
+    /// Retain the actual lexical aggregate producer's DISTINCT and ORDER facts.
+    /// This receipt is independent of a consuming merge call's execution flags.
+    pub(crate) fn with_aggregate_state_source(
+        mut self,
+        facts: novarocks_type_contract::AggregateStateInterpretation,
+    ) -> Self {
+        let old = &self.0;
+        self.0 = Arc::new(SqlFunctionCallFacts {
+            resolved: old.resolved.clone(),
+            decimal_overflow_policy: old.decimal_overflow_policy,
+            result_constraint: old.result_constraint.clone(),
+            result_constraint_origin: old.result_constraint_origin.clone(),
+            group_concat: old.group_concat.clone(),
+            aggregate_state_source: Some(Arc::new(facts)),
+        });
+        self
+    }
+    pub(crate) fn aggregate_state_source(
+        &self,
+    ) -> Option<&novarocks_type_contract::AggregateStateInterpretation> {
+        self.0.aggregate_state_source.as_deref()
+    }
+
+    pub(crate) fn group_concat_source(&self) -> Option<&GroupConcatSourceFacts> {
+        self.0.group_concat.as_ref()
+    }
+
+    pub fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {
+        self.0.result_constraint.as_ref()
+    }
+
+    pub fn result_constraint_origin(&self) -> &SqlResultConstraintOrigin {
+        &self.0.result_constraint_origin
     }
 
     pub fn resolved(&self) -> &novarocks_functions::ResolvedFunctionBinding {
-        self.0.as_ref()
+        &self.0.resolved
+    }
+
+    pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.0.decimal_overflow_policy
     }
 }
 
@@ -59,12 +236,6 @@ impl Deref for SqlFunctionBinding {
 
     fn deref(&self) -> &Self::Target {
         self.resolved()
-    }
-}
-
-impl From<novarocks_functions::ResolvedFunctionBinding> for SqlFunctionBinding {
-    fn from(binding: novarocks_functions::ResolvedFunctionBinding) -> Self {
-        Self::new(binding)
     }
 }
 
@@ -214,3 +385,6 @@ mod tests {
         assert_eq!(first_scope.get(), NonZeroU64::new(17).unwrap());
     }
 }
+
+#[cfg(test)]
+mod aggregate_identity_tests;

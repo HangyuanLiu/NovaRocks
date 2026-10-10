@@ -192,7 +192,8 @@ fn test_sum_bool_counts_true_as_one() {
         inputs: vec![ExprId(0)],
         input_is_intermediate: false,
         types: Some(AggTypeSignature {
-            intermediate_type: Some(DataType::Int64),
+            // An integer SUM travels as its exact DECIMAL(38, 0) state.
+            intermediate_type: Some(DataType::Decimal128(38, 0)),
             output_type: Some(DataType::Int64),
             input_arg_type: Some(DataType::Boolean),
         }),
@@ -238,7 +239,8 @@ fn test_sum_bool_null_when_all_null() {
         inputs: vec![ExprId(0)],
         input_is_intermediate: false,
         types: Some(AggTypeSignature {
-            intermediate_type: Some(DataType::Int64),
+            // An integer SUM travels as its exact DECIMAL(38, 0) state.
+            intermediate_type: Some(DataType::Decimal128(38, 0)),
             output_type: Some(DataType::Int64),
             input_arg_type: Some(DataType::Boolean),
         }),

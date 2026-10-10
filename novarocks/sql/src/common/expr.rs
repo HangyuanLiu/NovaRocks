@@ -35,8 +35,7 @@ pub enum JoinKind {
 pub(crate) struct LambdaParam {
     pub name: String,
     pub slot_id: i32,
-    pub data_type: DataType,
-    pub nullable: bool,
+    pub value_type: novarocks_type_contract::FunctionValueType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

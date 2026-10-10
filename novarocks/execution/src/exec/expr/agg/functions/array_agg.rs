@@ -14,272 +14,57 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, ListArray, MapArray, NullArray, StringArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
-};
-use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
-use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
-
-use crate::exec::expr::agg::{
-    AggregateAllocator, AggregateHashSet, AggregateVec, RetainedMemoryPolicy, aggregate_hash_set,
-};
-use crate::exec::node::aggregate::AggFunction;
-use crate::runtime::mem_tracker::MemTracker;
-use novarocks_types::largeint;
-
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    TrackedAggScalarValue, aggregate_vec_with_capacity, compare_scalar_values, key_fingerprint,
-    tracked_optional_key_fingerprint, tracked_scalar_from_array, tracked_scalar_to_output,
+use crate::exec::expr::agg::{AggregateAllocator, RetainedMemoryPolicy};
+use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::MemTracker;
+use arrow::array::{Array, ArrayRef, ListArray, StructArray};
+use arrow::datatypes::{DataType, Field, Fields};
+use novarocks_functions::{
+    aggregate_scalar::ScalarWork,
+    builtin::aggregate_array_core::{self as core, ArrayAggConfig, ArrayAggKind},
 };
-
+use std::sync::Arc;
+type ArrayAggState = core::ArrayAggState<AggregateAllocator>;
 pub(super) struct ArrayAggAgg;
-
-#[derive(Clone, Debug)]
-enum ArrayAggValue {
-    Bool(bool),
-    Int64(i64),
-    Float64(f64),
-    Utf8(String),
-    Date32(i32),
-    Timestamp(i64),
-    Decimal128(i128),
-    Struct(Vec<Option<ArrayAggValue>>),
-    List(Vec<Option<ArrayAggValue>>),
-}
-
-struct ArrayAggState {
-    allocator: AggregateAllocator,
-    rows: AggregateVec<AggregateVec<Option<TrackedAggScalarValue>>>,
-    distinct_seen: AggregateHashSet<AggregateVec<u8>>,
-}
-
-impl ArrayAggState {
-    fn new(tracker: Arc<MemTracker>) -> Self {
-        let allocator = AggregateAllocator::new(tracker);
-        Self {
-            rows: AggregateVec::new_in(allocator.clone()),
-            distinct_seen: aggregate_hash_set(allocator.clone()),
-            allocator,
-        }
-    }
-
-    fn push_row(&mut self, row: AggregateVec<Option<TrackedAggScalarValue>>) -> Result<(), String> {
-        self.rows
-            .try_reserve(1)
-            .map_err(|_| self.allocator.allocation_error("reserve array_agg row"))?;
-        self.rows.push(row);
-        Ok(())
-    }
-}
-
-fn distinct_key(value: &Option<ArrayAggValue>) -> Vec<u8> {
-    match value {
-        None => vec![0],
-        Some(v) => {
-            let mut out = vec![1];
-            out.extend(key_fingerprint(&to_common_scalar(v)));
-            out
-        }
-    }
-}
-
-fn is_distinct_kind(kind: &AggKind) -> bool {
-    match kind {
-        AggKind::ArrayAgg { is_distinct, .. } => *is_distinct,
-        AggKind::ArrayUniqueAgg => true,
-        _ => false,
-    }
-}
-
-fn order_by_kind(kind: &AggKind) -> (&[bool], &[bool]) {
-    match kind {
+fn config(spec: &AggSpec) -> ArrayAggConfig<'_> {
+    let kind = match &spec.kind {
         AggKind::ArrayAgg {
+            is_distinct,
             is_asc_order,
             nulls_first,
-            ..
-        } => (is_asc_order.as_slice(), nulls_first.as_slice()),
-        _ => (&[], &[]),
-    }
-}
-
-fn compare_optional_values(
-    left: &Option<ArrayAggValue>,
-    right: &Option<ArrayAggValue>,
-    asc: bool,
-    nulls_first: bool,
-) -> Result<Ordering, String> {
-    let ord = match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => {
-            if nulls_first {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Some(_), None) => {
-            if nulls_first {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Some(left), Some(right)) => {
-            let left = to_common_scalar(left);
-            let right = to_common_scalar(right);
-            let ord = compare_scalar_values(&left, &right)?;
-            if asc { ord } else { ord.reverse() }
-        }
+        } => ArrayAggKind::Array {
+            distinct: *is_distinct,
+            ascending: is_asc_order,
+            nulls_first,
+        },
+        AggKind::ArrayUniqueAgg => ArrayAggKind::Unique,
+        other => unreachable!("unexpected kind for array_agg: {:?}", other),
     };
-    Ok(ord)
+    ArrayAggConfig {
+        kind,
+        output_type: &spec.output_type,
+        intermediate_type: &spec.intermediate_type,
+        input_arg_type: spec.input_arg_type.as_ref(),
+    }
 }
-
+fn merge_input_list_array(array: &ArrayRef) -> Result<(&ListArray, Option<&StructArray>), String> {
+    core::merge_input_list_array(array).map_err(|e| e.to_string())
+}
+use super::common::tracked_optional_key_fingerprint;
+#[cfg(test)]
+use core::ArrayAggValue;
+#[cfg(test)]
+fn distinct_key(value: &Option<ArrayAggValue>) -> Vec<u8> {
+    core::distinct_key(value, &mut ScalarWork::new(None))
+        .expect("legacy fingerprint observer cannot fail")
+}
+#[cfg(test)]
 fn to_common_scalar(value: &ArrayAggValue) -> super::common::AggScalarValue {
-    match value {
-        ArrayAggValue::Bool(v) => super::common::AggScalarValue::Bool(*v),
-        ArrayAggValue::Int64(v) => super::common::AggScalarValue::Int64(*v),
-        ArrayAggValue::Float64(v) => super::common::AggScalarValue::Float64(*v),
-        ArrayAggValue::Utf8(v) => super::common::AggScalarValue::Utf8(v.clone()),
-        ArrayAggValue::Date32(v) => super::common::AggScalarValue::Date32(*v),
-        ArrayAggValue::Timestamp(v) => super::common::AggScalarValue::Timestamp(*v),
-        ArrayAggValue::Decimal128(v) => super::common::AggScalarValue::Decimal128(*v),
-        ArrayAggValue::Struct(items) => super::common::AggScalarValue::Struct(
-            items
-                .iter()
-                .map(|item| item.as_ref().map(to_common_scalar))
-                .collect(),
-        ),
-        ArrayAggValue::List(items) => super::common::AggScalarValue::List(
-            items
-                .iter()
-                .map(|item| item.as_ref().map(to_common_scalar))
-                .collect(),
-        ),
-    }
+    core::to_common_scalar(value, &mut ScalarWork::new(None))
+        .expect("legacy scalar observer cannot fail")
 }
-
-fn array_value_from_tracked(value: &TrackedAggScalarValue) -> Result<ArrayAggValue, String> {
-    array_value_from_common(tracked_scalar_to_output(value)?)
-}
-
-fn array_value_from_common(value: super::common::AggScalarValue) -> Result<ArrayAggValue, String> {
-    use super::common::AggScalarValue;
-    Ok(match value {
-        AggScalarValue::Bool(value) => ArrayAggValue::Bool(value),
-        AggScalarValue::Int64(value) => ArrayAggValue::Int64(value),
-        AggScalarValue::Float64(value) => ArrayAggValue::Float64(value),
-        AggScalarValue::Utf8(value) => ArrayAggValue::Utf8(value),
-        AggScalarValue::Date32(value) => ArrayAggValue::Date32(value),
-        AggScalarValue::Timestamp(value) => ArrayAggValue::Timestamp(value),
-        AggScalarValue::Decimal128(value) => ArrayAggValue::Decimal128(value),
-        AggScalarValue::Struct(values) => ArrayAggValue::Struct(
-            values
-                .into_iter()
-                .map(|value| value.map(array_value_from_common).transpose())
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        AggScalarValue::List(values) => ArrayAggValue::List(
-            values
-                .into_iter()
-                .map(|value| value.map(array_value_from_common).transpose())
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        AggScalarValue::Map(entries) => ArrayAggValue::List(
-            entries
-                .into_iter()
-                .map(|(key, value)| {
-                    Ok(Some(ArrayAggValue::Struct(vec![
-                        key.map(array_value_from_common).transpose()?,
-                        value.map(array_value_from_common).transpose()?,
-                    ])))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        ),
-        AggScalarValue::Decimal256(_) | AggScalarValue::Binary(_) => {
-            return Err(
-                "array_agg tracked scalar type is not supported by its output ABI".to_string(),
-            );
-        }
-    })
-}
-
-fn sort_rows(
-    rows: &mut [Vec<Option<ArrayAggValue>>],
-    is_asc_order: &[bool],
-    nulls_first: &[bool],
-) -> Result<(), String> {
-    let order_by_num = is_asc_order.len();
-    if order_by_num == 0 {
-        return Ok(());
-    }
-    let mut error: Option<String> = None;
-    rows.sort_by(|left, right| {
-        if error.is_some() {
-            return Ordering::Equal;
-        }
-        for key in 0..order_by_num {
-            let col = 1 + key;
-            let l = left.get(col).cloned().unwrap_or(None);
-            let r = right.get(col).cloned().unwrap_or(None);
-            match compare_optional_values(&l, &r, is_asc_order[key], nulls_first[key]) {
-                Ok(Ordering::Equal) => continue,
-                Ok(ord) => return ord,
-                Err(err) => {
-                    error = Some(err);
-                    return Ordering::Equal;
-                }
-            }
-        }
-        Ordering::Equal
-    });
-    if let Some(err) = error {
-        return Err(err);
-    }
-    Ok(())
-}
-
-fn extract_final_values(
-    spec: &AggSpec,
-    state: &ArrayAggState,
-) -> Result<Vec<Option<ArrayAggValue>>, String> {
-    let mut rows = state
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|value| value.as_ref().map(array_value_from_tracked).transpose())
-                .collect::<Result<Vec<_>, String>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (is_asc_order, nulls_first) = order_by_kind(&spec.kind);
-    sort_rows(&mut rows, is_asc_order, nulls_first)?;
-
-    let distinct = is_distinct_kind(&spec.kind);
-    let mut out = Vec::with_capacity(rows.len());
-    let mut seen = HashSet::new();
-    for row in rows {
-        let value = row.first().cloned().unwrap_or(None);
-        if distinct {
-            let key = distinct_key(&value);
-            if seen.insert(key) {
-                out.push(value);
-            }
-        } else {
-            out.push(value);
-        }
-    }
-    Ok(out)
-}
-
 fn first_field_item_type(field: &Field) -> Result<DataType, String> {
     match field.data_type() {
         DataType::List(item) => Ok(item.data_type().clone()),
@@ -373,552 +158,6 @@ fn build_default_intermediate_type(arg_types: &[DataType]) -> DataType {
         .collect::<Vec<_>>();
     DataType::Struct(Fields::from(fields))
 }
-
-fn reconcile_field_to_field(
-    expected: &Arc<Field>,
-    actual: &Arc<Field>,
-    context: &str,
-) -> Result<Arc<Field>, String> {
-    let data_type = reconcile_data_type(expected.data_type(), actual.data_type(), context)?;
-    let nullable = if expected.is_nullable() == actual.is_nullable() {
-        expected.is_nullable()
-    } else {
-        actual.is_nullable()
-    };
-    if &data_type == expected.data_type() && nullable == expected.is_nullable() {
-        Ok(expected.clone())
-    } else {
-        Ok(Arc::new(Field::new(expected.name(), data_type, nullable)))
-    }
-}
-
-fn reconcile_field_to_data_type(
-    expected: &Arc<Field>,
-    actual: &DataType,
-    context: &str,
-) -> Result<Arc<Field>, String> {
-    let data_type = reconcile_data_type(expected.data_type(), actual, context)?;
-    if &data_type == expected.data_type() {
-        Ok(expected.clone())
-    } else {
-        Ok(Arc::new(Field::new(
-            expected.name(),
-            data_type,
-            expected.is_nullable(),
-        )))
-    }
-}
-
-fn reconcile_data_type(
-    expected: &DataType,
-    actual: &DataType,
-    context: &str,
-) -> Result<DataType, String> {
-    if expected == actual {
-        return Ok(expected.clone());
-    }
-    match (expected, actual) {
-        (DataType::Map(_, expected_ordered), DataType::Map(_, actual_ordered))
-            if expected_ordered == actual_ordered =>
-        {
-            Ok(actual.clone())
-        }
-        (DataType::List(expected_item), DataType::List(actual_item)) => Ok(DataType::List(
-            reconcile_field_to_field(expected_item, actual_item, context)?,
-        )),
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
-            if expected_fields.len() == actual_fields.len() =>
-        {
-            let fields = expected_fields
-                .iter()
-                .zip(actual_fields.iter())
-                .map(|(expected_field, actual_field)| {
-                    reconcile_field_to_field(expected_field, actual_field, context)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataType::Struct(Fields::from(fields)))
-        }
-        _ => Err(format!(
-            "{context} type mismatch: expected {:?}, got {:?}",
-            expected, actual
-        )),
-    }
-}
-
-fn reconcile_fields_for_columns(
-    expected_fields: &Fields,
-    columns: &[ArrayRef],
-    context: &str,
-) -> Result<Fields, String> {
-    if expected_fields.len() != columns.len() {
-        return Err(format!(
-            "{context} field count mismatch: expected {}, got {}",
-            expected_fields.len(),
-            columns.len()
-        ));
-    }
-    let fields = expected_fields
-        .iter()
-        .zip(columns.iter())
-        .map(|(expected_field, column)| {
-            reconcile_field_to_data_type(expected_field, column.data_type(), context)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Fields::from(fields))
-}
-
-fn append_value(
-    state: &mut ArrayAggState,
-    value: Option<TrackedAggScalarValue>,
-    distinct: bool,
-) -> Result<(), String> {
-    if distinct {
-        let key = tracked_optional_key_fingerprint(&value, &state.allocator)?;
-        if state.distinct_seen.contains(&key) {
-            return Ok(());
-        }
-        let mut row =
-            aggregate_vec_with_capacity(&state.allocator, 1, "reserve array_agg distinct row")?;
-        row.push(value);
-        state
-            .rows
-            .try_reserve(1)
-            .map_err(|_| state.allocator.allocation_error("reserve array_agg row"))?;
-        state.distinct_seen.try_reserve(1).map_err(|_| {
-            state
-                .allocator
-                .allocation_error("reserve array_agg distinct key")
-        })?;
-        state.distinct_seen.insert(key);
-        state.rows.push(row);
-    } else {
-        let mut row = aggregate_vec_with_capacity(&state.allocator, 1, "reserve array_agg row")?;
-        row.push(value);
-        state.push_row(row)?;
-    }
-    Ok(())
-}
-
-fn unwrap_update_value_array<'a>(
-    spec: &AggSpec,
-    array: &'a ArrayRef,
-) -> Result<(&'a ArrayRef, Option<&'a StructArray>), String> {
-    let Some(wrapper) = array.as_any().downcast_ref::<StructArray>() else {
-        return Ok((array, None));
-    };
-    let Some(expected_item_type) = spec.input_arg_type.as_ref() else {
-        return Ok((array, None));
-    };
-    let first = wrapper.columns().first().ok_or_else(|| {
-        "array_agg struct input must contain at least 1 field for value extraction".to_string()
-    })?;
-    let first_matches_expected = first.data_type() == expected_item_type
-        || reconcile_data_type(
-            expected_item_type,
-            first.data_type(),
-            "array_agg update input",
-        )
-        .is_ok();
-    if first_matches_expected {
-        Ok((first, Some(wrapper)))
-    } else {
-        Ok((array, None))
-    }
-}
-
-fn build_scalar_array(
-    output_type: &DataType,
-    values: Vec<Option<ArrayAggValue>>,
-) -> Result<ArrayRef, String> {
-    match output_type {
-        DataType::Null => {
-            if values.iter().any(|value| value.is_some()) {
-                return Err("scalar output type mismatch for Null".to_string());
-            }
-            Ok(Arc::new(NullArray::new(values.len())) as ArrayRef)
-        }
-        DataType::Boolean => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Bool(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Boolean".to_string()),
-                }
-            }
-            Ok(Arc::new(BooleanArray::from(out)) as ArrayRef)
-        }
-        DataType::Int8 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Int64(v)) => {
-                        let v = i8::try_from(v).map_err(|_| "int8 overflow".to_string())?;
-                        out.push(Some(v));
-                    }
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Int8".to_string()),
-                }
-            }
-            Ok(Arc::new(Int8Array::from(out)) as ArrayRef)
-        }
-        DataType::Int16 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Int64(v)) => {
-                        let v = i16::try_from(v).map_err(|_| "int16 overflow".to_string())?;
-                        out.push(Some(v));
-                    }
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Int16".to_string()),
-                }
-            }
-            Ok(Arc::new(Int16Array::from(out)) as ArrayRef)
-        }
-        DataType::Int32 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Int64(v)) => {
-                        let v = i32::try_from(v).map_err(|_| "int32 overflow".to_string())?;
-                        out.push(Some(v));
-                    }
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Int32".to_string()),
-                }
-            }
-            Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
-        }
-        DataType::Int64 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Int64(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Int64".to_string()),
-                }
-            }
-            Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
-        }
-        DataType::Float32 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Float64(v)) => out.push(Some(v as f32)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Float32".to_string()),
-                }
-            }
-            Ok(Arc::new(Float32Array::from(out)) as ArrayRef)
-        }
-        DataType::Float64 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Float64(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Float64".to_string()),
-                }
-            }
-            Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
-        }
-        DataType::Utf8 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Utf8(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Utf8".to_string()),
-                }
-            }
-            Ok(Arc::new(StringArray::from(out)) as ArrayRef)
-        }
-        DataType::Date32 => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Date32(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Date32".to_string()),
-                }
-            }
-            Ok(Arc::new(Date32Array::from(out)) as ArrayRef)
-        }
-        DataType::Timestamp(unit, tz) => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Timestamp(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Timestamp".to_string()),
-                }
-            }
-            let tz = tz.as_deref().map(|s| s.to_string());
-            let array: ArrayRef = match unit {
-                TimeUnit::Second => {
-                    let arr = TimestampSecondArray::from(out);
-                    if let Some(tz) = tz {
-                        Arc::new(arr.with_timezone(tz))
-                    } else {
-                        Arc::new(arr)
-                    }
-                }
-                TimeUnit::Millisecond => {
-                    let arr = TimestampMillisecondArray::from(out);
-                    if let Some(tz) = tz {
-                        Arc::new(arr.with_timezone(tz))
-                    } else {
-                        Arc::new(arr)
-                    }
-                }
-                TimeUnit::Microsecond => {
-                    let arr = TimestampMicrosecondArray::from(out);
-                    if let Some(tz) = tz {
-                        Arc::new(arr.with_timezone(tz))
-                    } else {
-                        Arc::new(arr)
-                    }
-                }
-                TimeUnit::Nanosecond => {
-                    let arr = TimestampNanosecondArray::from(out);
-                    if let Some(tz) = tz {
-                        Arc::new(arr.with_timezone(tz))
-                    } else {
-                        Arc::new(arr)
-                    }
-                }
-            };
-            Ok(array)
-        }
-        DataType::Decimal128(precision, scale) => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Decimal128(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for Decimal128".to_string()),
-                }
-            }
-            let arr = Decimal128Array::from(out)
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
-            Ok(Arc::new(arr) as ArrayRef)
-        }
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(ArrayAggValue::Decimal128(v)) => out.push(Some(v)),
-                    None => out.push(None),
-                    _ => return Err("scalar output type mismatch for LargeInt".to_string()),
-                }
-            }
-            largeint::array_from_i128(&out)
-        }
-        DataType::Struct(fields) => {
-            if fields.is_empty() {
-                return Err("array_agg cannot build Struct output with no fields".to_string());
-            }
-            let mut null_builder = NullBufferBuilder::new(values.len());
-            let mut by_field: Vec<Vec<Option<ArrayAggValue>>> = (0..fields.len())
-                .map(|_| Vec::with_capacity(values.len()))
-                .collect();
-            for value in values {
-                match value {
-                    None => {
-                        null_builder.append_null();
-                        for field_values in &mut by_field {
-                            field_values.push(None);
-                        }
-                    }
-                    Some(ArrayAggValue::Struct(items)) => {
-                        if items.len() != fields.len() {
-                            return Err(format!(
-                                "scalar output type mismatch for Struct: expected {} fields, got {}",
-                                fields.len(),
-                                items.len()
-                            ));
-                        }
-                        null_builder.append_non_null();
-                        for (idx, item) in items.into_iter().enumerate() {
-                            by_field[idx].push(item);
-                        }
-                    }
-                    Some(other) => {
-                        return Err(format!(
-                            "scalar output type mismatch for Struct: got {:?}",
-                            other
-                        ));
-                    }
-                }
-            }
-            let mut columns = Vec::with_capacity(fields.len());
-            for (idx, field) in fields.iter().enumerate() {
-                columns.push(build_scalar_array(
-                    field.data_type(),
-                    std::mem::take(&mut by_field[idx]),
-                )?);
-            }
-            let output_fields =
-                reconcile_fields_for_columns(fields, &columns, "array_agg struct output")?;
-            let out = StructArray::new(output_fields, columns, null_builder.finish());
-            Ok(Arc::new(out) as ArrayRef)
-        }
-        DataType::Map(entries_field, ordered) => {
-            let DataType::Struct(entry_fields) = entries_field.data_type() else {
-                return Err(format!(
-                    "array_agg map entries field must be Struct, got {:?}",
-                    entries_field.data_type()
-                ));
-            };
-            if entry_fields.len() != 2 {
-                return Err(format!(
-                    "array_agg map entries field must contain key/value, got {} fields",
-                    entry_fields.len()
-                ));
-            }
-
-            let mut key_values = Vec::new();
-            let mut value_values = Vec::new();
-            let mut offsets = Vec::with_capacity(values.len() + 1);
-            offsets.push(0_i32);
-            let mut current: i64 = 0;
-            let mut null_builder = NullBufferBuilder::new(values.len());
-
-            for value in values {
-                match value {
-                    None => {
-                        null_builder.append_null();
-                        offsets.push(current as i32);
-                    }
-                    Some(ArrayAggValue::List(items)) => {
-                        null_builder.append_non_null();
-                        for item in items {
-                            let Some(ArrayAggValue::Struct(entry)) = item else {
-                                return Err("scalar output type mismatch for Map entry".to_string());
-                            };
-                            if entry.len() != 2 {
-                                return Err(format!(
-                                    "scalar output type mismatch for Map entry field count: expected 2, got {}",
-                                    entry.len()
-                                ));
-                            }
-                            key_values.push(entry[0].clone());
-                            value_values.push(entry[1].clone());
-                            current += 1;
-                            if current > i32::MAX as i64 {
-                                return Err("array_agg map offset overflow".to_string());
-                            }
-                        }
-                        offsets.push(current as i32);
-                    }
-                    Some(other) => {
-                        return Err(format!(
-                            "scalar output type mismatch for Map: got {:?}",
-                            other
-                        ));
-                    }
-                }
-            }
-
-            let key_array = build_scalar_array(entry_fields[0].data_type(), key_values)?;
-            let value_array = build_scalar_array(entry_fields[1].data_type(), value_values)?;
-            let entries_fields = if key_array.null_count() > 0 && !entry_fields[0].is_nullable() {
-                let mut adjusted = entry_fields.iter().cloned().collect::<Vec<_>>();
-                adjusted[0] = Arc::new(Field::new(
-                    entry_fields[0].name(),
-                    entry_fields[0].data_type().clone(),
-                    true,
-                ));
-                Fields::from(adjusted)
-            } else {
-                entry_fields.clone()
-            };
-            let entries =
-                StructArray::new(entries_fields.clone(), vec![key_array, value_array], None);
-            let entries_field = Arc::new(Field::new(
-                entries_field.name(),
-                DataType::Struct(entries_fields),
-                entries_field.is_nullable(),
-            ));
-            let out = MapArray::new(
-                entries_field,
-                OffsetBuffer::new(offsets.into()),
-                entries,
-                null_builder.finish(),
-                *ordered,
-            );
-            Ok(Arc::new(out) as ArrayRef)
-        }
-        DataType::List(field) => {
-            let mut flattened = Vec::<Option<ArrayAggValue>>::new();
-            let mut offsets = Vec::with_capacity(values.len() + 1);
-            offsets.push(0_i32);
-            let mut current: i64 = 0;
-            let mut null_builder = NullBufferBuilder::new(values.len());
-            for value in values {
-                match value {
-                    None => {
-                        null_builder.append_null();
-                        offsets.push(current as i32);
-                    }
-                    Some(ArrayAggValue::List(items)) => {
-                        current += items.len() as i64;
-                        if current > i32::MAX as i64 {
-                            return Err("array_agg offset overflow".to_string());
-                        }
-                        flattened.extend(items);
-                        null_builder.append_non_null();
-                        offsets.push(current as i32);
-                    }
-                    Some(other) => {
-                        return Err(format!(
-                            "scalar output type mismatch for List: got {:?}",
-                            other
-                        ));
-                    }
-                }
-            }
-            let child_values = build_scalar_array(field.data_type(), flattened)?;
-            let list_field = reconcile_field_to_data_type(
-                field,
-                child_values.data_type(),
-                "array_agg list item",
-            )?;
-            let out = ListArray::new(
-                list_field,
-                OffsetBuffer::new(offsets.into()),
-                child_values,
-                null_builder.finish(),
-            );
-            Ok(Arc::new(out) as ArrayRef)
-        }
-        other => Err(format!("unsupported scalar output type: {:?}", other)),
-    }
-}
-
-fn merge_input_list_array(array: &ArrayRef) -> Result<(&ListArray, Option<&StructArray>), String> {
-    if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
-        return Ok((list, None));
-    }
-    if let Some(struct_arr) = array.as_any().downcast_ref::<StructArray>() {
-        if struct_arr.num_columns() < 1 {
-            return Err(format!(
-                "array_agg merge struct input expects at least 1 field, got {}",
-                struct_arr.num_columns()
-            ));
-        }
-        let list = struct_arr
-            .column(0)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| "array_agg merge struct field[0] must be ListArray".to_string())?;
-        return Ok((list, Some(struct_arr)));
-    }
-    Err("array_agg merge input must be ListArray or StructArray".to_string())
-}
-
 impl AggregateFunction for ArrayAggAgg {
     fn build_spec_from_type(
         &self,
@@ -1042,7 +281,10 @@ impl AggregateFunction for ArrayAggAgg {
             "allocation-tracked array_agg requires an aggregate memory tracker".to_string()
         })?;
         unsafe {
-            std::ptr::write(ptr as *mut ArrayAggState, ArrayAggState::new(tracker));
+            std::ptr::write(
+                ptr as *mut ArrayAggState,
+                ArrayAggState::new(AggregateAllocator::new(tracker)),
+            );
         }
         Ok(())
     }
@@ -1072,53 +314,50 @@ impl AggregateFunction for ArrayAggAgg {
         let AggInputView::Any(array) = input else {
             return Err("array_agg batch input type mismatch".to_string());
         };
-        if matches!(spec.kind, AggKind::ArrayUniqueAgg)
-            && let Some(list) = array.as_any().downcast_ref::<ListArray>()
-        {
-            let values = list.values();
-            let offsets = list.value_offsets();
+        let config = config(spec);
+        if matches!(spec.kind, AggKind::ArrayUniqueAgg) && array.as_any().is::<ListArray>() {
             for (row, &base) in state_ptrs.iter().enumerate() {
-                if list.is_null(row) {
-                    continue;
-                }
                 let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
-                let start = offsets[row] as usize;
-                let end = offsets[row + 1] as usize;
-                for idx in start..end {
-                    let value = tracked_scalar_from_array(values, idx, &state.allocator)?;
-                    append_value(state, value, true)?;
-                }
+                core::update_row(
+                    state,
+                    config.kind,
+                    std::iter::once((*array, row)),
+                    false,
+                    false,
+                    &mut ScalarWork::new(None),
+                )
+                .map_err(|e| e.to_string())?;
             }
             return Ok(());
         }
-
-        let (value_array, wrapper_array) = unwrap_update_value_array(spec, array)?;
-        if let Some(wrapper) = wrapper_array {
-            for (row, &base) in state_ptrs.iter().enumerate() {
-                let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
-                let mut row_values = aggregate_vec_with_capacity(
-                    &state.allocator,
-                    wrapper.num_columns(),
-                    "reserve array_agg input row",
-                )?;
-                if wrapper.is_null(row) {
-                    for _ in 0..wrapper.num_columns() {
-                        row_values.push(None);
-                    }
-                } else {
-                    for col in wrapper.columns() {
-                        row_values.push(tracked_scalar_from_array(col, row, &state.allocator)?);
-                    }
-                }
-                state.push_row(row_values)?;
-            }
-        } else {
-            for (row, &base) in state_ptrs.iter().enumerate() {
-                let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
-                let value = tracked_scalar_from_array(value_array, row, &state.allocator)?;
-                append_value(state, value, false)?;
+        let (value, wrapper) =
+            core::unwrap_update_value_array(&config, array, &mut ScalarWork::new(None))
+                .map_err(|e| e.to_string())?;
+        for (row, &base) in state_ptrs.iter().enumerate() {
+            let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
+            if let Some(wrapper) = wrapper {
+                core::update_row(
+                    state,
+                    config.kind,
+                    wrapper.columns().iter().map(|col| (col, row)),
+                    true,
+                    wrapper.is_null(row),
+                    &mut ScalarWork::new(None),
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                core::update_row(
+                    state,
+                    config.kind,
+                    std::iter::once((value, row)),
+                    false,
+                    false,
+                    &mut ScalarWork::new(None),
+                )
+                .map_err(|e| e.to_string())?;
             }
         }
+
         Ok(())
     }
 
@@ -1132,61 +371,13 @@ impl AggregateFunction for ArrayAggAgg {
         let AggInputView::Any(array) = input else {
             return Err("array_agg merge input type mismatch".to_string());
         };
-        let (first_list, struct_arr) = merge_input_list_array(array)?;
-        let first_values = first_list.values();
-        let first_offsets = first_list.value_offsets();
-
+        // Preserve original validation before any group iteration, including an empty batch.
+        let _ = core::merge_input_list_array(array).map_err(|e| e.to_string())?;
+        let config = config(spec);
         for (row, &base) in state_ptrs.iter().enumerate() {
-            if struct_arr.map(|s| s.is_null(row)).unwrap_or(false) || first_list.is_null(row) {
-                continue;
-            }
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
-            let start = first_offsets[row] as usize;
-            let end = first_offsets[row + 1] as usize;
-            for idx in start..end {
-                if matches!(spec.kind, AggKind::ArrayUniqueAgg) {
-                    let value = tracked_scalar_from_array(first_values, idx, &state.allocator)?;
-                    append_value(state, value, true)?;
-                    continue;
-                }
-                if let Some(struct_arr) = struct_arr {
-                    let mut row_values = aggregate_vec_with_capacity(
-                        &state.allocator,
-                        struct_arr.num_columns(),
-                        "reserve array_agg merge row",
-                    )?;
-                    for (col_idx, col) in struct_arr.columns().iter().enumerate() {
-                        let list = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                            format!(
-                                "array_agg merge struct field[{}] must be ListArray",
-                                col_idx
-                            )
-                        })?;
-                        if list.is_null(row) {
-                            row_values.push(None);
-                            continue;
-                        }
-                        let offsets = list.value_offsets();
-                        if offsets[row] != first_offsets[row]
-                            || offsets[row + 1] != first_offsets[row + 1]
-                        {
-                            return Err(format!(
-                                "array_agg merge struct field[{}] offsets mismatch",
-                                col_idx
-                            ));
-                        }
-                        row_values.push(tracked_scalar_from_array(
-                            list.values(),
-                            idx,
-                            &state.allocator,
-                        )?);
-                    }
-                    state.push_row(row_values)?;
-                } else {
-                    let value = tracked_scalar_from_array(first_values, idx, &state.allocator)?;
-                    append_value(state, value, false)?;
-                }
-            }
+            core::merge_row(state, config.kind, array, row, &mut ScalarWork::new(None))
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -1198,147 +389,15 @@ impl AggregateFunction for ArrayAggAgg {
         group_states: &[AggStatePtr],
         output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        let target_type = if output_intermediate {
-            &spec.intermediate_type
-        } else {
-            &spec.output_type
-        };
-        match target_type {
-            DataType::List(list_field) => {
-                let mut flattened = Vec::<Option<ArrayAggValue>>::new();
-                let mut out_offsets = Vec::with_capacity(group_states.len() + 1);
-                out_offsets.push(0_i32);
-                let mut current: i64 = 0;
-                for &base in group_states {
-                    let state =
-                        unsafe { &*((base as *mut u8).add(offset) as *const ArrayAggState) };
-                    let values = if output_intermediate {
-                        state
-                            .rows
-                            .iter()
-                            .map(|row| {
-                                row.first()
-                                    .and_then(Option::as_ref)
-                                    .map(array_value_from_tracked)
-                                    .transpose()
-                            })
-                            .collect::<Result<Vec<_>, _>>()?
-                    } else {
-                        extract_final_values(spec, state)?
-                    };
-                    current += values.len() as i64;
-                    if current > i32::MAX as i64 {
-                        return Err("array_agg offset overflow".to_string());
-                    }
-                    out_offsets.push(current as i32);
-                    flattened.extend(values);
-                }
-                let values = build_scalar_array(list_field.data_type(), flattened)?;
-                let output_list_field = reconcile_field_to_data_type(
-                    list_field,
-                    values.data_type(),
-                    "array_agg output list item",
-                )?;
-                let list_out = ListArray::new(
-                    output_list_field,
-                    OffsetBuffer::new(out_offsets.into()),
-                    values,
-                    None,
-                );
-                Ok(Arc::new(list_out) as ArrayRef)
-            }
-            DataType::Struct(fields) => {
-                let first = fields.first().ok_or_else(|| {
-                    "array_agg struct target type must contain at least 1 field".to_string()
-                })?;
-                let DataType::List(first_list_field) = first.data_type() else {
-                    return Err(format!(
-                        "array_agg struct field[0] must be List, got {:?}",
-                        first.data_type()
-                    ));
-                };
-                let mut flattened_by_col: Vec<Vec<Option<ArrayAggValue>>> =
-                    (0..fields.len()).map(|_| Vec::new()).collect();
-                let mut out_offsets = Vec::with_capacity(group_states.len() + 1);
-                out_offsets.push(0_i32);
-                let mut current: i64 = 0;
-
-                for &base in group_states {
-                    let state =
-                        unsafe { &*((base as *mut u8).add(offset) as *const ArrayAggState) };
-                    let rows = if output_intermediate {
-                        state
-                            .rows
-                            .iter()
-                            .map(|row| {
-                                row.iter()
-                                    .map(|value| {
-                                        value.as_ref().map(array_value_from_tracked).transpose()
-                                    })
-                                    .collect::<Result<Vec<_>, String>>()
-                            })
-                            .collect::<Result<Vec<_>, _>>()?
-                    } else {
-                        extract_final_values(spec, state)?
-                            .into_iter()
-                            .map(|value| vec![value])
-                            .collect()
-                    };
-                    current += rows.len() as i64;
-                    if current > i32::MAX as i64 {
-                        return Err("array_agg offset overflow".to_string());
-                    }
-                    out_offsets.push(current as i32);
-                    for row in rows {
-                        for (col_idx, values) in flattened_by_col.iter_mut().enumerate() {
-                            values.push(row.get(col_idx).cloned().unwrap_or(None));
-                        }
-                    }
-                }
-
-                let mut columns = Vec::with_capacity(fields.len());
-                for (idx, field) in fields.iter().enumerate() {
-                    let DataType::List(list_field) = field.data_type() else {
-                        return Err(format!(
-                            "array_agg struct field[{}] must be List, got {:?}",
-                            idx,
-                            field.data_type()
-                        ));
-                    };
-                    let values = if idx == 0 {
-                        build_scalar_array(
-                            first_list_field.data_type(),
-                            flattened_by_col[idx].clone(),
-                        )?
-                    } else {
-                        build_scalar_array(list_field.data_type(), flattened_by_col[idx].clone())?
-                    };
-                    let output_list_field = reconcile_field_to_data_type(
-                        list_field,
-                        values.data_type(),
-                        "array_agg intermediate list item",
-                    )?;
-                    let list = ListArray::new(
-                        output_list_field,
-                        OffsetBuffer::new(out_offsets.clone().into()),
-                        values,
-                        None,
-                    );
-                    columns.push(Arc::new(list) as ArrayRef);
-                }
-
-                let output_fields = reconcile_fields_for_columns(
-                    fields,
-                    &columns,
-                    "array_agg intermediate struct output",
-                )?;
-                Ok(Arc::new(StructArray::new(output_fields, columns, None)) as ArrayRef)
-            }
-            other => Err(format!(
-                "array_agg target type must be List or Struct(List...), got {:?}",
-                other
-            )),
-        }
+        core::build_array(
+            &config(spec),
+            group_states
+                .iter()
+                .map(|&base| unsafe { &*((base as *mut u8).add(offset) as *const ArrayAggState) }),
+            output_intermediate,
+            &mut ScalarWork::new(None),
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -1792,3 +851,7 @@ mod tests {
         assert!(values.is_null(2));
     }
 }
+
+#[cfg(test)]
+#[path = "../../legacy_array_agg_baseline_tests.rs"]
+mod legacy_array_agg_baseline_tests;

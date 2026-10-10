@@ -44,10 +44,12 @@ pub(crate) mod codec;
 pub mod control;
 pub(crate) mod copy_on_write;
 pub mod domain;
+pub(crate) mod equality_schema;
 pub mod execution;
 pub(crate) mod flavor;
 pub mod old_delete;
 pub mod planning;
+pub(crate) mod program_recipe;
 pub(crate) mod repartition;
 pub(crate) mod runtime;
 
@@ -78,3 +80,4 @@ pub use planning::{
     IcebergWriteBranchPlan, IcebergWriteSessionPlanInput, IcebergWriteTargetPlan,
     plan_branch_session, plan_write_session,
 };
+pub use program_recipe::IcebergWriteRecipeCompiler;

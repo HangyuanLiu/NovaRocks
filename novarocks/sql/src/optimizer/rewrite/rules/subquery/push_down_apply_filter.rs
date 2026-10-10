@@ -26,6 +26,7 @@
 //! were correlated). `need_check_max_rows` stays `true` — no aggregate
 //! means `ScalarApplyToJoin`'s with-check branch must add the row guard.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use super::decorrelate_util::{all_binary_eq_opt, orient_eq_opt, partition_conjuncts_opt};
@@ -56,10 +57,14 @@ impl LogicalRewriteRule for PushDownApplyFilter {
         matches_expr(expr, &arena.borrow())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, &mut arena)? {
+        match apply_expr(expr, &mut arena, &ctx.control_view())? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -80,7 +85,11 @@ fn matches_expr(expr: &OptExpr, arena: &ScalarArena) -> bool {
     inner_has_correlated_nonagg_filter(expr.right(), arena, &corr_ids)
 }
 
-fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
+fn apply_expr(
+    expr: OptExpr,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -97,8 +106,9 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
     let corr_ids: HashSet<ColumnId> = apply.correlation_column_ids.iter().copied().collect();
 
     // Peel the optional leading Project and extract the filter node.
-    let peeled = peel_inner(right, arena, &corr_ids)
-        .ok_or_else(|| "PushDownApplyFilter: inner shape mismatch".to_string())?;
+    let peeled = peel_inner(right, arena, &corr_ids).ok_or_else(|| {
+        SqlCompileError::Compilation("PushDownApplyFilter: inner shape mismatch".to_string())
+    })?;
 
     // Split the Filter predicate into (correlated, residual).
     let predicate = peeled.filter.predicate;
@@ -109,9 +119,9 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
         return Ok(None);
     }
     if !all_binary_eq_opt(arena, &correlated) {
-        return Err(
+        return Err(SqlCompileError::Compilation(
             "non-EQ correlated predicate in correlated subquery is not supported".to_string(),
-        );
+        ));
     }
 
     // Require each correlated EQ conjunct's inner side to be a ColumnRef.
@@ -130,7 +140,7 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
     let new_filter_input = if residual.is_empty() {
         peeled.filter_input
     } else {
-        let Some(predicate) = scalar_utils::combine_and(arena, residual) else {
+        let Some(predicate) = scalar_utils::combine_and(arena, residual, control)? else {
             return Ok(None);
         };
         scalar_utils::filter(peeled.filter_input, predicate)
@@ -298,7 +308,7 @@ mod tests {
     const OUTER_K: ColumnId = ColumnId(100); // t1.k as seen inside the subquery
     const APPLY_OUT: ColumnId = ColumnId(20); // the Apply's output column
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
@@ -319,8 +329,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, false),
         }
     }
 
@@ -331,8 +340,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, true),
         }
     }
 
@@ -344,8 +352,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -357,8 +364,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -370,8 +376,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -392,15 +397,21 @@ mod tests {
                     OutputColumn {
                         column_id: T2_K,
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: T2_V2,
                         name: "v2".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -425,8 +436,7 @@ mod tests {
             col_ref(T2_V2, "v2", DataType::Int64),
             TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(5)),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
         );
         let combined_pred = and_expr(corr_pred, residual_pred);
@@ -460,8 +470,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: OUTER_K,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -476,8 +489,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,
@@ -628,8 +644,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,
@@ -647,8 +666,11 @@ mod tests {
                         columns: vec![OutputColumn {
                             column_id: OUTER_K,
                             name: "k".to_string(),
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
+
                             is_internal: false,
                         }],
                     }),
@@ -720,22 +742,23 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
-                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: MAX_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "max",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("max", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![OutputColumn {
                     column_id: MAX_RESULT,
                     name: "max(v2)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -751,8 +774,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -802,8 +828,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: APPLY_OUT,

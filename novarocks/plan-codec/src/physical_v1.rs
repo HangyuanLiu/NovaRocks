@@ -934,9 +934,6 @@ impl std::error::Error for WireLayoutError {}
 /// This runs before a wire layout or protobuf tree is allocated. It never
 /// patches unsupported semantics into a nearby v1 shape.
 pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1PreflightError> {
-    if !plan.artifact_refs().is_empty() {
-        return Err(PhysicalV1PreflightError::ArtifactReferences);
-    }
     for fragment in plan.fragments().values() {
         validate_native_v1_tree_depth(fragment).map_err(|error| {
             PhysicalV1PreflightError::TreeDepth {
@@ -1037,11 +1034,6 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
             }
         }
         match fragment.sink() {
-            FragmentSink::SealedArtifact(_) => {
-                return Err(PhysicalV1PreflightError::SealedArtifactSink {
-                    fragment: fragment.id(),
-                });
-            }
             FragmentSink::Noop => {
                 return Err(PhysicalV1PreflightError::NoopSink {
                     fragment: fragment.id(),
@@ -1162,7 +1154,7 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                     LiteralValue::UInt64(_)
                     | LiteralValue::Time64(_)
                     | LiteralValue::Timestamp(_)
-                    | LiteralValue::IntervalMonthDayNano(_),
+                    | LiteralValue::IntervalMonthDayNano { .. },
                 ) => {
                     return Err(PhysicalV1PreflightError::ExpressionShape {
                         fragment: fragment.id(),
@@ -1181,10 +1173,20 @@ fn v1_window_bound_is_literal(fragment: &Fragment, bound: &WindowBound) -> bool 
     let (WindowBound::Preceding(expression) | WindowBound::Following(expression)) = bound else {
         return true;
     };
-    matches!(
-        fragment.expressions().get(*expression).map(|node| &node.kind),
-        Some(ExprKind::Literal(LiteralValue::Int64(value))) if *value >= 0
-    )
+    let Some(node) = fragment.expressions().get(*expression) else {
+        return false;
+    };
+    match &node.kind {
+        // This unobserved shape gate cannot consume selected backing values.
+        // The complete encoder validates the source table first, then its
+        // original-control window projection checks NULL and nonnegative value.
+        ExprKind::Constant(_) => {
+            node.ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
+                && node.ty.data_type == arrow::datatypes::DataType::Int64
+        }
+        ExprKind::Literal(LiteralValue::Int64(value)) => *value >= 0,
+        _ => false,
+    }
 }
 
 fn validate_v1_function_identity(
@@ -1241,13 +1243,9 @@ fn validate_v1_function_identity(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PhysicalV1PreflightError {
-    ArtifactReferences,
     TreeDepth {
         fragment: FragmentId,
         reason: Box<str>,
-    },
-    SealedArtifactSink {
-        fragment: FragmentId,
     },
     NoopSink {
         fragment: FragmentId,
@@ -1280,16 +1278,9 @@ pub enum PhysicalV1PreflightError {
 impl fmt::Display for PhysicalV1PreflightError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ArtifactReferences => formatter
-                .write_str("native wire v1 cannot encode sealed artifact references losslessly"),
             Self::TreeDepth { fragment, reason } => write!(
                 formatter,
                 "native wire v1 cannot encode fragment {} safely: {reason}",
-                fragment.get()
-            ),
-            Self::SealedArtifactSink { fragment } => write!(
-                formatter,
-                "native wire v1 cannot encode sealed artifact sink in fragment {}",
                 fragment.get()
             ),
             Self::NoopSink { fragment } => write!(
@@ -1396,6 +1387,43 @@ mod tests {
         let mut builder = FragmentBuilder::new(FragmentId::new(11));
         let values = builder.reserve_node_id().unwrap();
         let boolean = ValueType::new(DataType::Boolean, false);
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        let constant = novarocks_constant_contract::ConstantValue::from_boolean(
+            std::sync::Arc::new(arrow::datatypes::Field::new(
+                "predicate",
+                DataType::Boolean,
+                false,
+            )),
+            boolean.clone(),
+            true,
+            novarocks_constant_contract::ConstantPolicy {
+                max_rows: 8,
+                max_array_nodes: 8,
+                max_logical_elements: 64,
+                max_retained_buffer_bytes: 65536,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 16,
+                max_metadata_bytes: 65536,
+                max_library_validation_work: 65536,
+                max_library_validation_bytes: 65536,
+            },
+            novarocks_type_contract::CompilePhase::Encode,
+            &Control,
+        )
+        .unwrap();
+        let pool = novarocks_physical_plan::ConstantPoolId::new(0);
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        constants.insert(pool, constant.pool().clone()).unwrap();
         let mut predicates = Vec::with_capacity(CONJUNCTS);
         let mut columns = Vec::with_capacity(CONJUNCTS);
         for ordinal in 0..CONJUNCTS {
@@ -1404,7 +1432,10 @@ mod tests {
                     .add_expression(
                         values,
                         boolean.clone(),
-                        ExprKind::Literal(LiteralValue::Boolean(true)),
+                        ExprKind::Constant(novarocks_physical_plan::ConstantReference {
+                            pool,
+                            ordinal: 0,
+                        }),
                     )
                     .unwrap(),
             );
@@ -1454,6 +1485,10 @@ mod tests {
             values,
             &predicates,
             crate::physical_expr::ValueResolution::NodeInput,
+            crate::physical_expr::ExpressionEncodingContext {
+                constants: &constants,
+                control: &Control,
+            },
         )
         .expect("encode a wide conjunction");
 
@@ -1461,6 +1496,172 @@ mod tests {
         // ceil(log2(512)) + one level for the literal leaves.
         assert!(depth <= 11, "wire nesting depth {depth} is not logarithmic");
         assert!(depth >= 10, "unexpected shape: depth {depth}");
+    }
+
+    #[test]
+    fn checked_window_shape_projects_selected_ordinal_and_refuses_negative_or_null() {
+        use arrow::array::{Array, Int64Array};
+        use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
+        use novarocks_physical_plan::{
+            ConstantPoolId, ConstantPools, ConstantReference, WindowFrame,
+        };
+        use novarocks_type_contract::{
+            CompileControlError, CompilePhase, PureCompileControl, WindowFrameExclusion,
+            WindowFrameUnits,
+        };
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Control {
+            trace: Mutex<Vec<(CompilePhase, u32)>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                let mut trace = self.trace.lock().unwrap();
+                trace.push((phase, units));
+                if let Some((position, cause)) = self.refusal {
+                    if position == trace.len() - 1 {
+                        return Err(cause);
+                    }
+                }
+                Ok(())
+            }
+        }
+        let ty = ValueType::new(DataType::Int64, true);
+        let pool = ConstantPool::try_new(
+            Arc::new(arrow::datatypes::Field::new(
+                "offset",
+                DataType::Int64,
+                true,
+            )),
+            ty.clone(),
+            Int64Array::from(vec![Some(-1), Some(7), None]).to_data(),
+            ConstantPolicy {
+                max_rows: 8,
+                max_array_nodes: 8,
+                max_logical_elements: 64,
+                max_retained_buffer_bytes: 65536,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 16,
+                max_metadata_bytes: 65536,
+                max_library_validation_work: 65536,
+                max_library_validation_bytes: 65536,
+            },
+            CompilePhase::Encode,
+            &Control::default(),
+        )
+        .unwrap();
+        let pool_id = ConstantPoolId::new(u32::MAX);
+        let mut constants = ConstantPools::empty();
+        constants.insert(pool_id, pool).unwrap();
+        for ordinal in [1, 0, 2] {
+            let mut builder = FragmentBuilder::new(FragmentId::new(11));
+            let node = builder.reserve_node_id().unwrap();
+            let expression = builder
+                .add_expression(
+                    node,
+                    ty.clone(),
+                    ExprKind::Constant(ConstantReference {
+                        pool: pool_id,
+                        ordinal,
+                    }),
+                )
+                .unwrap();
+            let value = builder
+                .add_value(
+                    ty.clone(),
+                    ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal: 0,
+                    },
+                )
+                .unwrap();
+            builder
+                .insert_node_unchecked(PhysicalNode {
+                    id: node,
+                    inputs: Box::default(),
+                    required_inputs: Box::default(),
+                    output_properties: properties(),
+                    output: OutputPort {
+                        node,
+                        columns: Box::from([value]),
+                    },
+                    kind: NodeKind::Values {
+                        rows: Box::from([Box::from([expression])]),
+                    },
+                })
+                .unwrap();
+            let fragment = builder
+                .finish_definition(
+                    node,
+                    FragmentSink::Noop,
+                    PipelineDopDomain {
+                        min: 1,
+                        max: 1,
+                        requires_power_of_two: false,
+                    },
+                )
+                .unwrap();
+            let frame = WindowFrame {
+                units: WindowFrameUnits::Rows,
+                start: super::WindowBound::Preceding(expression),
+                end: super::WindowBound::CurrentRow,
+                exclusion: WindowFrameExclusion::NoOthers,
+            };
+            // Shape alone does not authorize the selected payload. All three
+            // precise Int64 sources reach the original observed value owner.
+            assert!(super::v1_window_bound_is_literal(&fragment, &frame.start));
+            let control = Control::default();
+            let result = crate::physical_expr::encode_window_frame(
+                &fragment,
+                &frame,
+                crate::physical_expr::ExpressionEncodingContext {
+                    constants: &constants,
+                    control: &control,
+                },
+            );
+            if ordinal == 1 {
+                assert_eq!(
+                    result.unwrap().start.unwrap().bound,
+                    Some(novarocks_proto_models::expr::window_bound::Bound::Preceding(7))
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(crate::PhysicalEncodeError::Invalid(_))
+                ));
+            }
+            let trace = control.trace.into_inner().unwrap();
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                for position in 0..trace.len() {
+                    let control = Control {
+                        trace: Mutex::new(Vec::new()),
+                        refusal: Some((position, cause)),
+                    };
+                    assert_eq!(
+                        crate::physical_expr::encode_window_frame(
+                            &fragment,
+                            &frame,
+                            crate::physical_expr::ExpressionEncodingContext {
+                                constants: &constants,
+                                control: &control
+                            }
+                        ),
+                        Err(crate::PhysicalEncodeError::Control(cause))
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=position]);
+                }
+            }
+        }
     }
 
     fn repeated_projection_fragment() -> (

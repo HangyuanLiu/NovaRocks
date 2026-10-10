@@ -1653,21 +1653,35 @@ fn partition_metadata_payload(files: &[IcebergDataFileInfo]) -> Result<String, S
 }
 
 pub(crate) fn metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, ConnectorError> {
+    use crate::typed_read::{
+        ALWAYS_BOUND_METADATA_COLUMNS, IcebergMetadataColumn, ROW_LINEAGE_METADATA_COLUMNS,
+    };
     names
         .iter()
         .map(|name| {
-            let (data_type, nullable) = match name.as_str() {
-                "_file" => (arrow::datatypes::DataType::Utf8, false),
-                "_pos" | "_row_id" => (arrow::datatypes::DataType::Int64, false),
-                "_last_updated_sequence_number" => (arrow::datatypes::DataType::Int64, true),
-                other => {
+            let metadata = ALWAYS_BOUND_METADATA_COLUMNS
+                .into_iter()
+                .chain(ROW_LINEAGE_METADATA_COLUMNS)
+                .find(|metadata| metadata.column_name() == name)
+                .ok_or_else(|| corrupt(format!("unknown Iceberg metadata column `{name}`")))?;
+            let data_type = match metadata {
+                IcebergMetadataColumn::Path => arrow::datatypes::DataType::Utf8,
+                IcebergMetadataColumn::RowPosition
+                | IcebergMetadataColumn::RowId
+                | IcebergMetadataColumn::LastUpdatedSequenceNumber => {
+                    arrow::datatypes::DataType::Int64
+                }
+                IcebergMetadataColumn::IsDeleted => {
                     return Err(corrupt(format!(
-                        "unknown Iceberg metadata column `{other}`"
+                        "Iceberg metadata column `{name}` is not stated to SQL"
                     )));
                 }
             };
+            // The NULL contract is the column's own: the read binding mints the
+            // handle a frozen read publishes from the same owner, so the type a
+            // scan is planned with is exactly the type its read publishes.
             Ok(Arc::new(
-                Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+                Field::new(name, data_type, metadata.nullable()).with_metadata(HashMap::from([(
                     novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
                     "true".to_string(),
                 )])),

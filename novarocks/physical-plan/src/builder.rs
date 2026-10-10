@@ -20,22 +20,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use arrow_schema::DataType;
+use novarocks_type_contract::SemanticParameters;
 
 use crate::{
-    ArtifactRefId, Edge, EdgeId, ExprArena, ExprId, ExprKind, ExprNode, Fragment, FragmentId,
-    FragmentParts, FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode, PhysicalPlan,
-    PhysicalPlanParts, PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts,
-    ResultPort, RuntimeFilter, RuntimeFilterId, SealedArtifactRef, ValidationErrors, ValueDef,
-    ValueId, ValueOrigin, ValueType, validate_fragment_definition, validate_plan,
+    Edge, EdgeId, ExprArena, ExprId, ExprKind, ExprNode, Fragment, FragmentId, FragmentParts,
+    FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode, PhysicalPlan, PhysicalPlanParts,
+    PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts, ResultPort, RuntimeFilter,
+    RuntimeFilterId, ValidationErrors, ValueDef, ValueId, ValueOrigin, ValueType,
+    validate_fragment_definition, validate_plan,
 };
 
-/// Mutable construction state. It cannot be encoded, scheduled or viewed as a
-/// complete plan; `finish` consumes it and publishes only validated output.
+mod nullability_rebind;
+mod structure;
+pub use nullability_rebind::{NullabilityRebindError, UnpublishedNullabilityEditor};
+pub use structure::FragmentStructureError;
+pub(crate) use structure::admit_structure_counts;
+
+#[cfg(test)]
+#[path = "builder/structure_tests.rs"]
+mod structure_tests;
+
+/// Mutable construction state. It cannot be encoded or scheduled as a complete
+/// plan. A structural definition still requires actual call/property proofs
+/// and final package publication; finishing a construction stage is not that
+/// publication.
 pub struct FragmentBuilder {
     id: FragmentId,
     next_value: u32,
     next_expr: u32,
-    next_node: u32,
+    next_node: Option<u32>,
     values: BTreeMap<ValueId, ValueDef>,
     expressions: ExprArena,
     nodes: BTreeMap<NodeId, PhysicalNode>,
@@ -48,7 +61,7 @@ impl FragmentBuilder {
             id,
             next_value: 0,
             next_expr: 0,
-            next_node: 0,
+            next_node: Some(0),
             values: BTreeMap::new(),
             expressions: ExprArena::default(),
             nodes: BTreeMap::new(),
@@ -70,11 +83,11 @@ impl FragmentBuilder {
     }
 
     pub fn reserve_node_id(&mut self) -> Result<NodeId, BuildError> {
-        let id = NodeId::new(self.next_node);
-        self.next_node = self
+        let next = self
             .next_node
-            .checked_add(1)
             .ok_or(BuildError::IdentitySpaceExhausted("node"))?;
+        let id = NodeId::new(next);
+        self.next_node = next.checked_add(1);
         Ok(id)
     }
 
@@ -191,7 +204,8 @@ impl FragmentBuilder {
             &self.expressions,
             predicates.iter().copied(),
             true,
-        );
+        )
+        .map_err(BuildError::MissingLegacyMetadata)?;
         let output_properties =
             crate::derive_filter_output_properties(&input_properties, replica_deterministic);
         self.insert_node_unchecked(PhysicalNode {
@@ -367,6 +381,7 @@ impl FragmentBuilder {
             output_properties,
             output: OutputPort { node, columns },
             kind: NodeKind::TopN {
+                reduction: crate::TopNReduction::Rows,
                 order_by,
                 limit,
                 offset,
@@ -409,7 +424,8 @@ impl FragmentBuilder {
             &self.expressions,
             expressions.iter().map(|(expression, _)| *expression),
             true,
-        );
+        )
+        .map_err(BuildError::MissingLegacyMetadata)?;
         let output_properties = crate::derive_project_output_properties(
             &input_properties,
             &output,
@@ -966,11 +982,9 @@ impl FragmentBuilder {
     /// exist to reject, which is the only way to prove they are rejected.
     pub fn insert_node_unchecked(&mut self, node: PhysicalNode) -> Result<(), BuildError> {
         let id = node.id;
-        let next_node = self.next_node.max(
-            id.get()
-                .checked_add(1)
-                .ok_or(BuildError::IdentitySpaceExhausted("node"))?,
-        );
+        let next_node = self
+            .next_node
+            .and_then(|next| id.get().checked_add(1).map(|after| next.max(after)));
         match self.nodes.entry(id) {
             Entry::Vacant(entry) => {
                 entry.insert(node);
@@ -1000,7 +1014,20 @@ impl FragmentBuilder {
         sink: FragmentSink,
         dop_domain: PipelineDopDomain,
     ) -> Result<Fragment, ValidationErrors> {
-        let fragment = Fragment::from(FragmentParts {
+        let (mut parts, runtime_filters) = self.into_fragment_parts(root, sink, dop_domain);
+        parts.runtime_filters = runtime_filters.into_iter().collect();
+        let fragment = Fragment::from(parts);
+        validate_fragment_definition(&fragment)?;
+        Ok(fragment)
+    }
+
+    fn into_fragment_parts(
+        self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop_domain: PipelineDopDomain,
+    ) -> (FragmentParts, BTreeSet<RuntimeFilterId>) {
+        let parts = FragmentParts {
             id: self.id,
             root,
             values: self.values,
@@ -1008,21 +1035,24 @@ impl FragmentBuilder {
             nodes: self.nodes,
             sink,
             dop_domain,
-            runtime_filters: self.runtime_filters.into_iter().collect(),
-        });
-        validate_fragment_definition(&fragment)?;
-        Ok(fragment)
+            // The author installs the exact ordered references before this
+            // unpublished construction input reaches any validator.
+            runtime_filters: Box::default(),
+            call_requests: crate::FragmentCallRequests::unpublished_empty(self.id),
+        };
+        (parts, self.runtime_filters)
     }
 }
 
 pub struct PlanBuilder {
+    constants: crate::ConstantPools,
+    parameters: SemanticParameters,
     version: PlanVersionId,
     next_edge: u32,
     fragments: BTreeMap<FragmentId, Fragment>,
     edges: BTreeMap<EdgeId, Edge>,
     runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     result_port: Option<ResultPort>,
-    artifact_refs: BTreeMap<ArtifactRefId, SealedArtifactRef>,
     required: RequiredContracts,
     annotations: Vec<PlanAnnotation>,
 }
@@ -1030,16 +1060,41 @@ pub struct PlanBuilder {
 impl PlanBuilder {
     pub fn new(version: PlanVersionId) -> Self {
         Self {
+            constants: crate::ConstantPools::empty(),
+            // An empty table supplies no semantic value or implicit flag.
+            parameters: SemanticParameters::default(),
             version,
             next_edge: 0,
             fragments: BTreeMap::new(),
             edges: BTreeMap::new(),
             runtime_filters: BTreeMap::new(),
             result_port: None,
-            artifact_refs: BTreeMap::new(),
             required: RequiredContracts::default(),
             annotations: Vec::new(),
         }
+    }
+
+    pub fn constants(&self) -> &crate::ConstantPools {
+        &self.constants
+    }
+
+    pub fn with_constant_pools(mut self, constants: crate::ConstantPools) -> Self {
+        self.constants = constants;
+        self
+    }
+
+    pub fn insert_constant_pool(
+        &mut self,
+        id: crate::ConstantPoolId,
+        pool: crate::ConstantPool,
+    ) -> Result<(), crate::ConstantReferenceError> {
+        self.constants.insert(id, pool)
+    }
+
+    /// Install the authored parameter values consumed by exact expression refs.
+    pub fn with_semantic_parameters(mut self, parameters: SemanticParameters) -> Self {
+        self.parameters = parameters;
+        self
     }
 
     pub fn with_required_contracts(mut self, required: RequiredContracts) -> Self {
@@ -1103,30 +1158,92 @@ impl PlanBuilder {
         Ok(())
     }
 
-    pub fn add_artifact_ref(&mut self, artifact: SealedArtifactRef) -> Result<(), BuildError> {
-        let id = artifact.id;
-        match self.artifact_refs.entry(id) {
-            Entry::Vacant(entry) => {
-                entry.insert(artifact);
-            }
-            Entry::Occupied(_) => return Err(BuildError::DuplicateArtifactRef(id)),
-        }
-        Ok(())
-    }
-
     pub fn add_annotation(&mut self, annotation: PlanAnnotation) {
         self.annotations.push(annotation);
     }
 
     // Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
-    pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
+    pub fn finish_observed(
+        self,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<PhysicalPlan, PlanConstructionError> {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
+            constants: self.constants,
+            parameters: self.parameters,
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,
             runtime_filters: self.runtime_filters,
             result_port: self.result_port,
-            artifact_refs: self.artifact_refs,
+            required: self.required,
+            annotations: self.annotations.into_boxed_slice(),
+        });
+        validate_plan_observed(&plan, control)?;
+        Ok(plan)
+    }
+    pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
+        if self.fragments.values().any(|fragment| {
+            !fragment.call_requests().entries().is_empty()
+                || fragment.expressions().iter().any(|(_, node)| {
+                    matches!(
+                        node.kind,
+                        crate::ExprKind::FunctionCall { .. } | crate::ExprKind::WindowCall { .. }
+                    )
+                })
+                || fragment
+                    .expressions()
+                    .iter()
+                    .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+                || fragment.nodes().values().any(|node| match &node.kind {
+                    crate::NodeKind::Aggregate { calls, .. } => !calls.is_empty(),
+                    crate::NodeKind::TopN {
+                        reduction: crate::TopNReduction::GroupedStates { calls, .. },
+                        ..
+                    } => !calls.is_empty(),
+                    crate::NodeKind::TableWriter { target } => {
+                        !target.partial_aggregates.is_empty()
+                    }
+                    crate::NodeKind::TableFinish(finish) => !finish.final_aggregates.is_empty(),
+                    crate::NodeKind::TableFunction { .. } => true,
+                    _ => false,
+                })
+                || fragment.nodes().values().any(|node| {
+                    let special = |constant: &crate::UnpivotConstant| {
+                        crate::constants::collection_reference(constant).is_some()
+                    };
+                    match &node.kind {
+                        crate::NodeKind::Unpivot { spec } => spec
+                            .mappings
+                            .iter()
+                            .any(|mapping| mapping.constants.iter().any(special)),
+                        crate::NodeKind::TableFinish(spec) => {
+                            spec.grouped_unpivot.as_ref().is_some_and(|grouped| {
+                                grouped
+                                    .mappings
+                                    .iter()
+                                    .any(|mapping| mapping.constants.iter().any(special))
+                            })
+                        }
+                        _ => false,
+                    }
+                })
+        }) || !self.constants.entries().is_empty()
+        {
+            let mut errors = crate::validation::ValidationContext::new();
+            errors.push(crate::ValidationError::new(
+                "constants",
+                "checked constants and original call requests require caller-observed plan publication",
+            ));
+            return Err(crate::ValidationErrors::from_collector(errors));
+        }
+        let plan = PhysicalPlan::from(PhysicalPlanParts {
+            constants: self.constants,
+            parameters: self.parameters,
+            version: self.version,
+            fragments: self.fragments,
+            edges: self.edges,
+            runtime_filters: self.runtime_filters,
+            result_port: self.result_port,
             required: self.required,
             annotations: self.annotations.into_boxed_slice(),
         });
@@ -1137,6 +1254,7 @@ impl PlanBuilder {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildError {
+    MissingLegacyMetadata(crate::MissingLegacyBindingMetadata),
     IdentitySpaceExhausted(&'static str),
     DuplicateFragment(FragmentId),
     DuplicateNode(NodeId),
@@ -1144,7 +1262,6 @@ pub enum BuildError {
     DuplicateExpression(ExprId),
     DuplicateEdge(EdgeId),
     DuplicateRuntimeFilter(RuntimeFilterId),
-    DuplicateArtifactRef(ArtifactRefId),
     DuplicateResultPort,
     /// A node names an input that has not been inserted yet. Fragments are
     /// built bottom up, so this is always an ordering mistake.
@@ -1227,6 +1344,7 @@ pub enum RequiredInputs {
 impl fmt::Display for BuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingLegacyMetadata(error) => error.fmt(formatter),
             Self::IdentitySpaceExhausted(kind) => {
                 write!(formatter, "{kind} identity space exhausted")
             }
@@ -1323,12 +1441,156 @@ impl fmt::Display for BuildError {
                 "node {} has {inputs} inputs but {requirements} input requirements",
                 node.get()
             ),
-            Self::DuplicateArtifactRef(id) => {
-                write!(formatter, "duplicate artifact reference {}", id.get())
-            }
             Self::DuplicateResultPort => formatter.write_str("result port is already set"),
         }
     }
 }
 
 impl std::error::Error for BuildError {}
+
+#[cfg(test)]
+mod sparse_node_identity_tests {
+    use super::*;
+
+    fn add_empty_values(builder: &mut FragmentBuilder, id: u32) {
+        builder
+            .add_values(
+                NodeId::new(id),
+                Box::from([Box::<[ExprId]>::default()]),
+                Box::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_max_node_is_valid_and_only_later_reservation_is_exhausted() {
+        let mut builder = FragmentBuilder::new(FragmentId::new(7));
+        add_empty_values(&mut builder, u32::MAX);
+        for _ in 0..2 {
+            assert!(matches!(
+                builder.reserve_node_id(),
+                Err(BuildError::IdentitySpaceExhausted("node"))
+            ));
+        }
+        let fragment = builder
+            .finish_definition(
+                NodeId::new(u32::MAX),
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(fragment.root().get(), u32::MAX);
+        assert_eq!(fragment.nodes().len(), 1);
+    }
+
+    #[test]
+    fn monotone_reservation_returns_both_last_legal_ids_without_wraparound() {
+        let mut builder = FragmentBuilder::new(FragmentId::new(7));
+        add_empty_values(&mut builder, u32::MAX - 2);
+        assert_eq!(builder.reserve_node_id().unwrap().get(), u32::MAX - 1);
+        assert_eq!(builder.reserve_node_id().unwrap().get(), u32::MAX);
+        assert!(matches!(
+            builder.reserve_node_id(),
+            Err(BuildError::IdentitySpaceExhausted("node"))
+        ));
+        // Explicit sparse insertion does not reopen automatic allocation.
+        add_empty_values(&mut builder, 0);
+        assert!(matches!(
+            builder.reserve_node_id(),
+            Err(BuildError::IdentitySpaceExhausted("node"))
+        ));
+    }
+
+    #[test]
+    fn duplicate_max_node_reports_duplicate_and_keeps_the_original_node() {
+        let mut builder = FragmentBuilder::new(FragmentId::new(7));
+        add_empty_values(&mut builder, u32::MAX);
+        assert!(matches!(
+            builder.add_values(NodeId::new(u32::MAX), Box::default(), Box::default()),
+            Err(BuildError::DuplicateNode(id)) if id.get() == u32::MAX
+        ));
+        let fragment = builder
+            .finish_definition(
+                NodeId::new(u32::MAX),
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let NodeKind::Values { rows } = &fragment.nodes()[&fragment.root()].kind else {
+            panic!("original node was replaced");
+        };
+        assert_eq!(rows.len(), 1);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanConstructionError {
+    Requests(crate::CallRequestError),
+    Constants(crate::ConstantReferenceError),
+    Structure(crate::ValidationErrors),
+}
+impl From<crate::CallRequestError> for PlanConstructionError {
+    fn from(error: crate::CallRequestError) -> Self {
+        match error {
+            crate::CallRequestError::Control(cause) => {
+                Self::Constants(crate::ConstantReferenceError::Control(cause))
+            }
+            other => Self::Requests(other),
+        }
+    }
+}
+impl From<crate::ConstantReferenceError> for PlanConstructionError {
+    fn from(error: crate::ConstantReferenceError) -> Self {
+        Self::Constants(error)
+    }
+}
+impl From<crate::ValidationErrors> for PlanConstructionError {
+    fn from(error: crate::ValidationErrors) -> Self {
+        Self::Structure(error)
+    }
+}
+impl fmt::Display for PlanConstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requests(error) => error.fmt(formatter),
+            Self::Constants(error) => error.fmt(formatter),
+            Self::Structure(error) => error.fmt(formatter),
+        }
+    }
+}
+impl std::error::Error for PlanConstructionError {}
+
+/// Publish/consume a complete source using the caller's original observation.
+/// The unobserved structural validator alone does not admit checked sources.
+pub fn validate_plan_observed(
+    plan: &PhysicalPlan,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PlanConstructionError> {
+    for fragment in plan.fragments().values() {
+        fragment
+            .call_requests()
+            .validate_fragment(fragment, control)
+            .map_err(PlanConstructionError::from)?;
+    }
+    crate::constants::validate_plan_constants_observed(plan, control)?;
+    // Structural validation is still an opaque legacy traversal. Observe its
+    // entry and ordinary/success completion with the original control without
+    // claiming internal cooperative work or an allocation grant.
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .map_err(crate::ConstantReferenceError::from)?;
+    let result = validate_plan(plan).map_err(PlanConstructionError::from);
+    work.step().map_err(crate::ConstantReferenceError::from)?;
+    work.finish().map_err(crate::ConstantReferenceError::from)?;
+    result
+}

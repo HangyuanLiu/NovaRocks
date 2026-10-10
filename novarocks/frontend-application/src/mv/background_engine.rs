@@ -290,7 +290,8 @@ fn preparation_error(error: RefreshError) -> MvBackgroundEngineError {
         | RefreshErrorKind::CommitUnknown
         | RefreshErrorKind::MetadataFinalizeFailed => MvBackgroundEngineErrorKind::TerminalFailure,
     };
-    MvBackgroundEngineError::new(kind, error.message)
+    MvBackgroundEngineError::new(kind, error.message.clone())
+        .with_compile_control(error.compile_control_error())
 }
 
 fn repository_error(
@@ -329,5 +330,20 @@ mod tests {
     fn definition_preparation_error_remains_blocked() {
         let error = preparation_error(RefreshError::user("stored MV contract is incompatible"));
         assert_eq!(error.kind(), MvBackgroundEngineErrorKind::InvalidDefinition);
+    }
+    #[test]
+    fn background_preparation_terminal_retains_control_without_changing_policy_kind() {
+        use novarocks_type_contract::CompileControlError;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = preparation_error(RefreshError::from(
+                novarocks_sql::compiler::SqlCompileError::from(control),
+            ));
+            assert_eq!(error.compile_control_error(), Some(control));
+            assert_eq!(error.kind(), MvBackgroundEngineErrorKind::InvalidDefinition);
+        }
     }
 }

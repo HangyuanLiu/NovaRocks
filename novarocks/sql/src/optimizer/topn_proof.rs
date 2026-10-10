@@ -73,7 +73,7 @@ pub(crate) fn collect_column_ids(arena: &ScalarArena, expr: ScalarId) -> ColumnI
 fn collect_column_ids_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ColumnId>) {
     match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) => out.push(*column_id),
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_column_ids_inner(arena, *left, out);
             collect_column_ids_inner(arena, *right, out);
@@ -291,8 +291,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
@@ -303,8 +302,7 @@ mod tests {
                 qualifier: Some(qualifier.to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Utf8,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, nullable),
         }
     }
 
@@ -325,7 +323,10 @@ mod tests {
     }
 
     fn scalar_col(arena: &mut ScalarArena, id: u32, ty: DataType, nullable: bool) -> ScalarSortKey {
-        let expr = arena.intern(ScalarNode::ColumnRef(ColumnId(id)), ty, nullable);
+        let expr = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(id)),
+            novarocks_type_contract::FunctionValueType::new(ty, nullable),
+        );
         ScalarSortKey {
             expr,
             asc: true,
@@ -368,8 +369,14 @@ mod tests {
     #[test]
     fn collect_column_ids_finds_nested_binary_columns() {
         let mut arena = ScalarArena::new();
-        let left = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
-        let right = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let left = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let right = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let expr = arena.intern(
             ScalarNode::BinaryOp {
                 op: crate::common::BinOp::Add,
@@ -377,8 +384,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         let columns = collect_column_ids(&arena, expr);
@@ -393,13 +399,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let unset = arena.intern(
             ScalarNode::ColumnRef(ColumnId::UNSET),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let lit = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let expr = arena.intern(
             ScalarNode::BinaryOp {
@@ -408,8 +412,7 @@ mod tests {
                 right: lit,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         assert!(collect_column_ids(&arena, expr).is_empty());
@@ -420,8 +423,18 @@ mod tests {
         let mut eq = EquivalenceClasses::default();
         eq.merge_pair(ColumnId(1), ColumnId(2));
         let mut arena = ScalarArena::new();
-        let left_items = intern_sort_items(&mut arena, &[sort_item(1, true, false)]);
-        let right_items = intern_sort_items(&mut arena, &[sort_item(2, true, false)]);
+        let left_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(2, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let left = sort_keys_to_keys(&arena, &left_items).unwrap();
         let right = sort_keys_to_keys(&arena, &right_items).unwrap();
         assert!(sort_keys_equivalent(&left, &right, Some(&eq)));
@@ -430,9 +443,24 @@ mod tests {
     #[test]
     fn sort_keys_reject_direction_or_null_order_mismatch() {
         let mut arena = ScalarArena::new();
-        let asc_items = intern_sort_items(&mut arena, &[sort_item(1, true, false)]);
-        let desc_items = intern_sort_items(&mut arena, &[sort_item(1, false, false)]);
-        let nulls_first_items = intern_sort_items(&mut arena, &[sort_item(1, true, true)]);
+        let asc_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let desc_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, false, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let nulls_first_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, true, true)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let asc = sort_keys_to_keys(&arena, &asc_items).unwrap();
         let desc = sort_keys_to_keys(&arena, &desc_items).unwrap();
         let nulls_first = sort_keys_to_keys(&arena, &nulls_first_items).unwrap();
@@ -491,17 +519,34 @@ mod tests {
             ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(7)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 output_name: "lit".to_string(),
                 output_column_id: ColumnId(11),
             },
         ];
         let mut arena = ScalarArena::new();
-        let project_items = intern_project_items(&mut arena, &project_items);
-        let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, true, false)]);
-        let sort_11 = intern_sort_items(&mut arena, &[sort_item(11, true, false)]);
+        let project_items = intern_project_items(
+            &mut arena,
+            &project_items,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let sort_10 = intern_sort_items(
+            &mut arena,
+            &[sort_item(10, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let sort_11 = intern_sort_items(
+            &mut arena,
+            &[sort_item(11, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let source_columns = ColumnIdSet::from_columns([ColumnId(1)]);
 
         assert_eq!(
@@ -525,8 +570,7 @@ mod tests {
         let output_key = scalar_col(&mut arena, 10, DataType::Utf8, false);
         let literal = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let project_items = vec![
             ScalarProjectItem {
@@ -622,8 +666,18 @@ mod tests {
             output_column_id: ColumnId(10),
         }];
         let mut arena = ScalarArena::new();
-        let project_items = intern_project_items(&mut arena, &project_items);
-        let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, false, true)]);
+        let project_items = intern_project_items(
+            &mut arena,
+            &project_items,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let sort_10 = intern_sort_items(
+            &mut arena,
+            &[sort_item(10, false, true)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let source_columns = ColumnIdSet::from_columns([ColumnId(1)]);
 
         let remapped =

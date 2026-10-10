@@ -16,39 +16,15 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
-use std::sync::Arc;
-
-const SEC_TO_TIME_CAP_SECONDS: i64 = 839 * 3600 + 59 * 60 + 59;
-
-pub fn format_sec_to_time(seconds: i64) -> String {
-    let clamped = seconds.clamp(-SEC_TO_TIME_CAP_SECONDS, SEC_TO_TIME_CAP_SECONDS);
-    let sign = if clamped < 0 { "-" } else { "" };
-    let abs = clamped.abs();
-    let hour = abs / 3600;
-    let minute = (abs % 3600) / 60;
-    let second = abs % 60;
-    format!("{sign}{hour:02}:{minute:02}:{second:02}")
-}
-
+use arrow::array::ArrayRef;
+use novarocks_functions::builtin::calendar_sec_to_time::evaluate_legacy_sec_to_time;
+pub use novarocks_functions::builtin::calendar_sec_to_time::format_sec_to_time;
 pub fn eval_sec_to_time(
     arena: &ExprArena,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let arr = arena.eval(args[0], chunk)?;
-    let arr = arr
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "sec_to_time expects int".to_string())?;
-    let mut out = Vec::with_capacity(arr.len());
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            out.push(None);
-        } else {
-            out.push(Some(format_sec_to_time(arr.value(i))));
-        }
-    }
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    let array = arena.eval(args[0], chunk)?;
+    evaluate_legacy_sec_to_time(&array)
 }

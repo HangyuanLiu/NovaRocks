@@ -84,49 +84,65 @@ impl NativeMembershipProducerBinding {
                 spec.build_key_index
             ));
         }
-        let expected_null_semantics = match eq_null_safe.get(spec.build_key_index).copied() {
+        Self::checked(
+            spec.contract(),
+            spec.build_key_index,
+            eq_null_safe,
+            || {
+                arena.data_type(spec.build_expr_id).cloned().ok_or_else(|| {
+                    format!(
+                        "native runtime-filter binding_id={} build expression has no frozen data type",
+                        spec.binding_id()
+                    )
+                })
+            },
+            session,
+        )
+    }
+
+    /// The checks every hash-join membership producer passes, whatever
+    /// supplies its build key: the key's null-safe equality flag fixes the
+    /// membership NULL semantics, and `key_type`, the frozen type of the
+    /// evaluated build key, must be the membership key type.
+    fn checked(
+        contract: &execution::RuntimeFilterProducerContract,
+        join_key_ordinal: usize,
+        eq_null_safe: &[bool],
+        key_type: impl FnOnce() -> Result<arrow::datatypes::DataType, String>,
+        session: execution::RuntimeFilterSessionRef,
+    ) -> Result<Self, String> {
+        let binding_id = contract.binding_id().get();
+        let expected_null_semantics = match eq_null_safe.get(join_key_ordinal).copied() {
             Some(false) => execution::RuntimeFilterNullSemantics::NeverMatches,
             Some(true) => execution::RuntimeFilterNullSemantics::NullSafeEqual,
             None => {
                 return Err(format!(
-                    "native runtime-filter binding_id={} join key ordinal {} has no null-safe equality flag",
-                    spec.binding_id(),
-                    spec.build_key_index
+                    "native runtime-filter binding_id={binding_id} join key ordinal {join_key_ordinal} has no null-safe equality flag"
                 ));
             }
         };
-        let data_type = arena.data_type(spec.build_expr_id).ok_or_else(|| {
-            format!(
-                "native runtime-filter binding_id={} build expression has no frozen data type",
-                spec.binding_id()
-            )
-        })?;
-        if spec.contract().kind() != execution::RuntimeFilterProducerKind::Membership {
+        let data_type = key_type()?;
+        if contract.kind() != execution::RuntimeFilterProducerKind::Membership {
             return Err(format!(
-                "native runtime-filter binding_id={} hash join producer requires a membership producer contract",
-                spec.binding_id()
+                "native runtime-filter binding_id={binding_id} hash join producer requires a membership producer contract"
             ));
         }
-        let RuntimeFilterExecutionContract::Membership(membership_schema) =
-            spec.contract().contract()
+        let RuntimeFilterExecutionContract::Membership(membership_schema) = contract.contract()
         else {
             return Err(format!(
-                "native runtime-filter binding_id={} hash join producer requires a membership contract",
-                spec.binding_id()
+                "native runtime-filter binding_id={binding_id} hash join producer requires a membership contract"
             ));
         };
-        if membership_schema.data_type() != data_type
+        if membership_schema.data_type() != &data_type
             || membership_schema.null_semantics() != expected_null_semantics
         {
             return Err(format!(
-                "native runtime-filter binding_id={} membership schema does not match build key ordinal {}",
-                spec.binding_id(),
-                spec.build_key_index
+                "native runtime-filter binding_id={binding_id} membership schema does not match build key ordinal {join_key_ordinal}"
             ));
         }
         Ok(Self {
-            join_key_ordinal: spec.build_key_index,
-            contract: spec.contract().clone(),
+            join_key_ordinal,
+            contract: contract.clone(),
             session,
             coordinator: Arc::new(NativeProducerInstanceCoordinator::default()),
         })
@@ -151,14 +167,7 @@ impl NativeRuntimeFilterProducerFactory {
         session: execution::RuntimeFilterSessionRef,
         local_partition_count: i32,
     ) -> Result<Self, String> {
-        let local_partition_count = u32::try_from(local_partition_count).map_err(|_| {
-            format!(
-                "native runtime-filter build DOP {local_partition_count} cannot be represented as a partition count"
-            )
-        })?;
-        if local_partition_count == 0 {
-            return Err("native runtime-filter build DOP must be positive".to_string());
-        }
+        let local_partition_count = checked_local_partition_count(local_partition_count)?;
         let bindings = specs
             .iter()
             .map(|spec| {
@@ -167,6 +176,36 @@ impl NativeRuntimeFilterProducerFactory {
                     build_keys,
                     eq_null_safe,
                     arena,
+                    Arc::clone(&session),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            bindings,
+            local_partition_count,
+        })
+    }
+
+    /// The membership producers of one compiled hash join. Each producer is
+    /// the build-key ordinal it observes and its runtime contract;
+    /// `build_key_type` gives the static type of the compiled build-key root
+    /// at an ordinal, which is the type of every key array it evaluates.
+    pub(crate) fn from_compiled(
+        producers: &[(usize, execution::RuntimeFilterProducerContract)],
+        eq_null_safe: &[bool],
+        mut build_key_type: impl FnMut(usize) -> Result<arrow::datatypes::DataType, String>,
+        session: execution::RuntimeFilterSessionRef,
+        local_partition_count: i32,
+    ) -> Result<Self, String> {
+        let local_partition_count = checked_local_partition_count(local_partition_count)?;
+        let bindings = producers
+            .iter()
+            .map(|(join_key_ordinal, contract)| {
+                NativeMembershipProducerBinding::checked(
+                    contract,
+                    *join_key_ordinal,
+                    eq_null_safe,
+                    || build_key_type(*join_key_ordinal),
                     Arc::clone(&session),
                 )
             })
@@ -236,6 +275,18 @@ impl NativeRuntimeFilterProducerFactory {
             completed: false,
         })
     }
+}
+
+fn checked_local_partition_count(local_partition_count: i32) -> Result<u32, String> {
+    let local_partition_count = u32::try_from(local_partition_count).map_err(|_| {
+        format!(
+            "native runtime-filter build DOP {local_partition_count} cannot be represented as a partition count"
+        )
+    })?;
+    if local_partition_count == 0 {
+        return Err("native runtime-filter build DOP must be positive".to_string());
+    }
+    Ok(local_partition_count)
 }
 
 pub(crate) struct NativeRuntimeFilterProducerSet {

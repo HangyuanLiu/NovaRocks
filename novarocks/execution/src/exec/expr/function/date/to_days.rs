@@ -14,10 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{BC_EPOCH_JULIAN, extract_date_array, julian_from_date};
+use super::common::extract_date_array;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Int64Array};
+use novarocks_functions::calendar_julian::day_number_from_date;
 use std::sync::Arc;
 
 pub fn eval_to_days(
@@ -30,7 +31,7 @@ pub fn eval_to_days(
     let dates = extract_date_array(&arr)?;
     let mut out = Vec::with_capacity(dates.len());
     for date in dates {
-        let v = date.map(|d| (julian_from_date(d) - BC_EPOCH_JULIAN) as i64);
+        let v = date.map(day_number_from_date);
         out.push(v);
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)

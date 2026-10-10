@@ -16,10 +16,11 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, ListArray, UInt32Array};
-use arrow::compute::take;
-use std::sync::Arc;
-
+use arrow::array::{Array, ArrayRef, MapArray};
+use novarocks_functions::{
+    Selection,
+    builtin::map_projection_core::{MapPart, ProjectionFailure, project_observed},
+};
 pub fn eval_map_keys(
     arena: &ExprArena,
     expr: ExprId,
@@ -29,18 +30,28 @@ pub fn eval_map_keys(
     let map_arr = arena.eval(args[0], chunk)?;
     let map = map_arr
         .as_any()
-        .downcast_ref::<arrow::array::MapArray>()
+        .downcast_ref::<MapArray>()
         .ok_or_else(|| format!("map_keys expects MapArray, got {:?}", map_arr.data_type()))?;
     let field = super::common::output_list_field(
         arena.data_type(expr),
         map.keys().data_type(),
         "map_keys",
     )?;
-    let (sorted_offsets, sorted_indices) = super::common::sorted_map_offsets_and_indices(map)?;
-    let sorted_indices = UInt32Array::from(sorted_indices);
-    let sorted_keys = take(map.keys().as_ref(), &sorted_indices, None)
-        .map_err(|e| format!("map_keys: failed to reorder keys: {}", e))?;
-    let list = ListArray::new(field, sorted_offsets, sorted_keys, map.nulls().cloned());
-    let out = Arc::new(list) as ArrayRef;
+    let out = project_observed(
+        map,
+        MapPart::Keys,
+        field,
+        Selection::all(map.len()),
+        |_, row| Ok::<_, String>(row),
+        None,
+        |_, _, _| Ok(()),
+        || map.nulls().cloned(),
+        |_, _| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .map_err(|e| match e {
+        ProjectionFailure::Data(s) | ProjectionFailure::Control(s) => s,
+        ProjectionFailure::Take(s) => format!("map_keys: failed to reorder keys: {s}"),
+    })?;
     super::common::cast_output(out, arena.data_type(expr), "map_keys")
 }

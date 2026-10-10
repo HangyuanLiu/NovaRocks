@@ -36,6 +36,7 @@ use novarocks_spi::connector::write_stack::{
 };
 
 use crate::analysis::{ExprKind, LiteralValue, TypedExpr, UnpivotConstant};
+use crate::binding::SqlFunctionBinding;
 use crate::compiler::SqlFunctionCatalog;
 use novarocks_functions::ResolvedFunctionBinding;
 
@@ -47,7 +48,8 @@ const MAX_UNPIVOT_OUTPUT_BYTES: usize =
 pub struct WriterPartialAggregateCall {
     pub(crate) input_slot_id: u32,
     pub(crate) function_name: String,
-    pub(crate) resolved: ResolvedFunctionBinding,
+    pub(crate) source:
+        crate::binding::AggregateArgumentSource<TypedExpr, crate::analysis::SortItem>,
     pub(crate) intermediate_slot_id: u32,
 }
 
@@ -58,8 +60,11 @@ impl WriterPartialAggregateCall {
     pub fn function_name(&self) -> &str {
         &self.function_name
     }
-    pub const fn resolved(&self) -> &ResolvedFunctionBinding {
-        &self.resolved
+    pub fn resolved(&self) -> &ResolvedFunctionBinding {
+        self.source.binding().resolved()
+    }
+    pub fn binding(&self) -> &SqlFunctionBinding {
+        self.source.binding()
     }
     pub const fn intermediate_slot_id(&self) -> u32 {
         self.intermediate_slot_id
@@ -80,7 +85,8 @@ impl WriterPartialAggregatePlan {
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregateCall {
     pub(crate) function_name: String,
-    pub(crate) resolved: ResolvedFunctionBinding,
+    pub(crate) source:
+        crate::binding::AggregateArgumentSource<TypedExpr, crate::analysis::SortItem>,
     pub(crate) intermediate_input_slot_id: u32,
     pub(crate) final_output_slot_id: u32,
 }
@@ -89,8 +95,11 @@ impl WriterFinalAggregateCall {
     pub fn function_name(&self) -> &str {
         &self.function_name
     }
-    pub const fn resolved(&self) -> &ResolvedFunctionBinding {
-        &self.resolved
+    pub fn resolved(&self) -> &ResolvedFunctionBinding {
+        self.source.binding().resolved()
+    }
+    pub fn binding(&self) -> &SqlFunctionBinding {
+        self.source.binding()
     }
     pub const fn intermediate_input_slot_id(&self) -> u32 {
         self.intermediate_input_slot_id
@@ -261,7 +270,11 @@ pub struct WriterStatisticsTargetInput<'a> {
 pub fn plan_writer_statistics(
     targets: &[WriterStatisticsTargetInput<'_>],
     functions: &dyn SqlFunctionCatalog,
-) -> Result<WriterAuxiliaryPlan, String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<WriterAuxiliaryPlan, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     if targets.is_empty() {
         return Ok(WriterAuxiliaryPlan::empty());
     }
@@ -272,7 +285,8 @@ pub fn plan_writer_statistics(
         if previous_target.is_some_and(|previous: WriteTargetOrdinal| previous >= target.target) {
             return Err(
                 "write aggregate targets must be listed in strictly ascending ordinal order"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         previous_target = Some(target.target);
@@ -280,13 +294,15 @@ pub fn plan_writer_statistics(
             return Err(format!(
                 "write aggregate plan contains duplicate target {}",
                 target.target.get()
-            ));
+            )
+            .into());
         }
     }
     if targets.iter().all(|target| target.requirements.is_empty()) {
         return WriterAuxiliaryPlan::without_requirements(
             targets.iter().map(|target| target.target),
-        );
+        )
+        .map_err(Into::into);
     }
 
     let mut next_slot = first_free_internal_slot(targets)?;
@@ -295,11 +311,11 @@ pub fn plan_writer_statistics(
     let mut partial_by_target = BTreeMap::new();
     let mut final_calls = Vec::new();
     let mut mappings = Vec::new();
-    let mut shared_channels = HashMap::<(ResolvedFunctionBinding, usize), (u32, u32)>::new();
+    let mut shared_channels = HashMap::<(SqlFunctionBinding, usize), (u32, u32)>::new();
 
     for target in targets {
         let mut partial_calls = Vec::with_capacity(target.requirements.len());
-        let mut occurrence_by_signature = HashMap::<ResolvedFunctionBinding, usize>::new();
+        let mut occurrence_by_signature = HashMap::<SqlFunctionBinding, usize>::new();
         for requirement in target.requirements {
             let input = target
                 .input_schema
@@ -312,15 +328,17 @@ pub fn plan_writer_statistics(
                         target.target.get()
                     )
                 })?;
+            let input_value_type =
+                novarocks_type_contract::FunctionValueType::try_from_field(input)
+                    .map_err(|error| error.to_string())?;
             if input.name() != requirement.input().name()
-                || input.data_type() != requirement.input().data_type()
-                || input.is_nullable() != requirement.input().nullable()
+                || &input_value_type != requirement.input().value_type()
             {
                 return Err(format!(
                     "write aggregate input ordinal {} does not match the pinned column for target {}",
                     requirement.input().ordinal(),
                     target.target.get()
-                ));
+                ).into());
             }
             let input_expr = TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -330,8 +348,7 @@ pub fn plan_writer_statistics(
                     qualifier: None,
                     column: requirement.input().name().to_string(),
                 },
-                data_type: requirement.input().data_type().clone(),
-                nullable: requirement.input().nullable(),
+                value_type: requirement.input().value_type().clone(),
             };
             let resolved = crate::functions::resolve_sql_aggregate_binding(
                 functions,
@@ -339,21 +356,36 @@ pub fn plan_writer_statistics(
                 std::slice::from_ref(&input_expr),
                 &[],
                 true,
+                constant_policy,
+                control,
             )
-            .map_err(|error| {
-                format!(
+            .map_err(|error| match error {
+                novarocks_functions::FunctionBindingError::Control(error) => {
+                    crate::compiler::SqlCompileError::from(error)
+                }
+                error => crate::compiler::SqlCompileError::Compilation(format!(
                     "resolve trusted write aggregate `{}` for {:?}: {error}",
                     requirement.function_name(),
                     requirement.input().data_type()
-                )
+                )),
             })?;
-            if crate::functions::aggregate_result_type(&resolved).data_type != DataType::Binary {
+            if crate::functions::aggregate_result_type(&resolved).data_type != DataType::Binary
+                || crate::functions::aggregate_result_type(&resolved).logical_type
+                    != novarocks_type_contract::ValueLogicalType::Physical
+            {
                 return Err(format!(
                     "write aggregate `{}` output {:?} cannot feed the binary Root value slot",
                     requirement.function_name(),
                     crate::functions::aggregate_result_type(&resolved).data_type
-                ));
+                )
+                .into());
             }
+            let resolved = SqlFunctionBinding::new(resolved, decimal_overflow_policy);
+            let source = crate::binding::AggregateArgumentSource::logical_update(
+                vec![input_expr],
+                Vec::new(),
+                resolved.clone(),
+            );
             let occurrence = occurrence_by_signature.entry(resolved.clone()).or_default();
             let shared_key = (resolved.clone(), *occurrence);
             *occurrence = occurrence
@@ -371,16 +403,20 @@ pub fn plan_writer_statistics(
                     WriterAuxiliaryChannel::try_new(
                         intermediate_slot_id,
                         format!("auxiliary_channel_{ordinal}"),
-                        crate::functions::aggregate_selection(&resolved)
-                            .intermediate_type
-                            .data_type
-                            .clone(),
+                        {
+                            let mut transport_type =
+                                crate::functions::aggregate_selection(&resolved)
+                                    .intermediate_type
+                                    .clone();
+                            transport_type.nullable = true;
+                            transport_type
+                        },
                     )
                     .map_err(|error| error.to_string())?,
                 );
                 final_calls.push(WriterFinalAggregateCall {
                     function_name: requirement.function_name().to_string(),
-                    resolved: resolved.clone(),
+                    source: source.clone(),
                     intermediate_input_slot_id: intermediate_slot_id,
                     final_output_slot_id,
                 });
@@ -390,7 +426,7 @@ pub fn plan_writer_statistics(
             partial_calls.push(WriterPartialAggregateCall {
                 input_slot_id: target_input_slot_id(requirement.input().ordinal())?,
                 function_name: requirement.function_name().to_string(),
-                resolved: resolved.clone(),
+                source,
                 intermediate_slot_id,
             });
             mappings.push(WriteUnpivotMapping {
@@ -402,8 +438,10 @@ pub fn plan_writer_statistics(
                         kind: ExprKind::Literal(LiteralValue::String(
                             requirement.artifact().blob_type().to_string(),
                         )),
-                        data_type: DataType::Utf8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            false,
+                        ),
                     }),
                     UnpivotConstant::Utf8Map(Vec::new()),
                 ],
@@ -496,7 +534,7 @@ fn validate_plan(
     let channels = schema
         .auxiliary_channels()
         .iter()
-        .map(|channel| (channel.slot_id(), channel.data_type()))
+        .map(|channel| (channel.slot_id(), channel.value_type()))
         .collect::<BTreeMap<_, _>>();
     let partial_slots = partial_by_target
         .values()
@@ -512,11 +550,11 @@ fn validate_plan(
         let Some(data_type) = channels.get(&call.intermediate_input_slot_id) else {
             return Err("write final aggregate reads an unknown auxiliary slot".to_string());
         };
-        if **data_type
-            != crate::functions::aggregate_selection(&call.resolved)
-                .intermediate_type
-                .data_type
-        {
+        let mut transport_type = crate::functions::aggregate_selection(call.source.binding())
+            .intermediate_type
+            .clone();
+        transport_type.nullable = true;
+        if **data_type != transport_type {
             return Err(
                 "write aggregate intermediate type differs from its typed tail".to_string(),
             );
@@ -590,7 +628,12 @@ mod tests {
 
     fn requirement(field_id: i32) -> StatisticsRequiredAggregation {
         StatisticsRequiredAggregation::try_new(
-            StatisticsScanColumn::try_new(0, "k", DataType::Int64, false).expect("input"),
+            StatisticsScanColumn::try_new(
+                0,
+                "k",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .expect("input"),
             "binary_stat",
             StatisticsArtifactIdentity::try_new(vec![field_id], "generic-binary")
                 .expect("identity"),
@@ -611,7 +654,12 @@ mod tests {
         let input_schema = input_schema();
         let required = vec![
             StatisticsRequiredAggregation::try_new(
-                StatisticsScanColumn::try_new(0, "k", DataType::Int64, false).expect("input"),
+                StatisticsScanColumn::try_new(
+                    0,
+                    "k",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("input"),
                 "count",
                 StatisticsArtifactIdentity::try_new(vec![11], "generic-binary").expect("identity"),
             )
@@ -625,9 +673,53 @@ mod tests {
                 requirements: &required,
             }],
             &build_builtin_engine_function_catalog().expect("builtin function catalog"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("count does not produce a binary artifact body");
-        assert!(plan.contains("binary Root value slot"));
+        assert!(plan.to_string().contains("binary Root value slot"));
+    }
+
+    #[test]
+    fn writer_auxiliary_validation_rejects_same_carrier_with_changed_state_domain() {
+        let schema = input_schema();
+        let required = vec![requirement(11)];
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let plan = plan_writer_statistics(
+            &[WriterStatisticsTargetInput {
+                target,
+                input_schema: &schema,
+                requirements: &required,
+            }],
+            &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let original = &plan.schema().auxiliary_channels()[0];
+        let changed = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            original.data_type().clone(),
+            true,
+            novarocks_type_contract::ValueLogicalType::Hll,
+        )
+        .unwrap();
+        let changed_schema = WriterMultiplexSchema::try_new(vec![
+            WriterAuxiliaryChannel::try_new(original.slot_id(), original.name(), changed).unwrap(),
+        ])
+        .unwrap();
+        let error = super::validate_plan(
+            &changed_schema,
+            &plan.partial_by_target,
+            plan.final_plan.calls(),
+            plan.final_plan.unpivot().unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("intermediate type differs from its typed tail"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -650,6 +742,9 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
         assert_eq!(
@@ -681,6 +776,9 @@ mod tests {
                 requirements: &requirements,
             }],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
         assert_eq!(plan.schema().auxiliary_channels().len(), 2);
@@ -707,6 +805,9 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
         assert_eq!(plan.schema().auxiliary_channels().len(), 2);
@@ -748,8 +849,48 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("unordered targets");
-        assert!(error.contains("strictly ascending"));
+        assert!(error.to_string().contains("strictly ascending"));
+    }
+
+    #[test]
+    fn writer_statistics_partial_and_final_keep_the_authored_statement_policy() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+        let schema = input_schema();
+        let requirements = vec![requirement(11)];
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let mut authored = Vec::new();
+        for policy in [OutputNull, ReportError] {
+            let plan = plan_writer_statistics(
+                &[WriterStatisticsTargetInput {
+                    target,
+                    input_schema: &schema,
+                    requirements: &requirements,
+                }],
+                &binary_catalog(),
+                policy,
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let partial = plan.partial_for(target).unwrap();
+            let partial = &partial.calls()[0];
+            let final_call = &plan.final_plan().calls()[0];
+            assert_eq!(partial.binding().decimal_overflow_policy(), policy);
+            assert_eq!(final_call.binding().decimal_overflow_policy(), policy);
+            assert!(std::ptr::eq(partial.resolved(), final_call.resolved()));
+            assert_eq!(
+                partial.intermediate_slot_id(),
+                final_call.intermediate_input_slot_id()
+            );
+            authored.push(final_call.binding().clone());
+        }
+        assert_eq!(authored[0].resolved(), authored[1].resolved());
+        assert_ne!(authored[0], authored[1]);
     }
 }

@@ -108,6 +108,9 @@ pub(crate) trait DmlQueryExecutionKernel:
     + crate::query_execution::planning::statistics::QueryStatisticsResolver
 {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
+    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy;
+    /// The static carrier the kernel's composition chose for every plan.
+    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier;
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
@@ -126,6 +129,14 @@ pub(crate) trait DmlQueryExecutionKernel:
 impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
         self.function_catalog().as_ref()
+    }
+
+    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy()
+    }
+
+    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+        self.static_plan_carrier()
     }
 
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
@@ -162,6 +173,14 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
         self.function_catalog().as_ref()
+    }
+
+    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy()
+    }
+
+    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+        self.static_plan_carrier()
     }
 
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
@@ -1351,6 +1370,10 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             &maintenance_execution
         }
     };
+    let query_opts = Some(match query_opts {
+        Some(options) => options,
+        None => crate::query_execution::contract::synthetic_statement_query_options(execution),
+    });
     let optimizer_settings = execution.optimizer_settings().clone();
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
@@ -1392,12 +1415,8 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     }
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
@@ -1412,6 +1431,8 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         DmlQueryExecutionKernel::function_catalog(state),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        DmlQueryExecutionKernel::constant_policy(state),
+        DmlQueryExecutionKernel::static_plan_carrier(state).sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)
@@ -1423,6 +1444,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         Arc::clone(&table_bindings),
         connector_context,
     )?;
+    let completion_control = compile_control.clone();
     let optimize_request =
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
     // A write session both selects the dataflow shape and owns the recipes
@@ -1463,17 +1485,21 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             ordinal,
             sink.accepted_field_names().into_iter().collect(),
         )]),
+        session: write_session.as_ref(),
     };
 
     // Optimize the write, then freeze the reads it states. The plan addresses
     // each scan by the occurrence its read was accounted for under, so the
     // reads are frozen before the plan is lowered rather than after.
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
         optimize_request,
         sink,
         ordinal,
         statistics_requirements,
         &optimizer_settings,
+        decimal_overflow_policy,
+        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -1506,18 +1532,22 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
                 handle: write_handle,
             },
         ])?,
+        &completion_control,
     )?;
-    let version = plan.version();
+    let version = plan.plan().version();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .and_then(|candidate| {
-                candidate.freeze_root_output(
-                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
-                    ),
-                )
-            })
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            plan,
+            &completion_control,
+        )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -1525,7 +1555,11 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         DmlQueryExecutionKernel::function_catalog(state),
+        DmlQueryExecutionKernel::static_plan_carrier(state),
+        DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
+        &completion_control,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
         encoded,

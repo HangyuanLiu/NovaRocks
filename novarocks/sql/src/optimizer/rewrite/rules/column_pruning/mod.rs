@@ -89,8 +89,10 @@ pub(crate) fn auto_fill_column_id(ctx: &mut RewriteContext) -> Option<ColumnId> 
             f.create(
                 None,
                 "auto_fill".to_string(),
-                arrow::datatypes::DataType::Int8,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int8,
+                    false,
+                ),
             )
         })?;
     Some(id)
@@ -159,8 +161,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }
     }
@@ -172,8 +174,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
@@ -322,14 +323,18 @@ mod tests {
                         op: BinOp::Eq,
                         right: Box::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
-                            data_type: DataType::Utf8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Utf8,
+                                false,
+                            ),
                         }),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![scan],
@@ -392,30 +397,34 @@ mod tests {
                 group_by: vec![col_ref(id_b, "b")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_ref(id_c, "c")],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: out_sum,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int32],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(id_c, "c")],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int32], false),
                     ),
                 }],
                 output_columns: vec![
                     OutputColumn {
                         column_id: out_b,
                         name: "b".to_string(),
-                        data_type: DataType::Int32,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int32,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: out_sum,
                         name: "sum_c".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],

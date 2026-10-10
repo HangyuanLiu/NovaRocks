@@ -26,10 +26,7 @@ fn identity(value: &str) -> FunctionOverloadId {
 }
 
 fn value_type(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType {
-        data_type,
-        nullable,
-    }
+    FunctionValueType::new(data_type, nullable)
 }
 
 fn argument(data_type: DataType, nullable: bool) -> FunctionArgument {
@@ -39,15 +36,53 @@ fn argument(data_type: DataType, nullable: bool) -> FunctionArgument {
     }
 }
 
-fn literal_argument(constant: FunctionLiteral) -> FunctionArgument {
+fn literal_argument(constant: crate::ConstantValue) -> FunctionArgument {
     FunctionArgument::Value {
-        value_type: value_type(DataType::Utf8, false),
+        value_type: constant.value_type().clone(),
         constant: Some(constant),
     }
 }
 
+fn constant_policy() -> crate::ConstantPolicy {
+    crate::ConstantPolicy {
+        max_rows: 4096,
+        max_array_nodes: 64,
+        max_logical_elements: 16384,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 64,
+        max_dictionary_depth: 8,
+        max_metadata_bytes: 65536,
+        max_library_validation_work: 4 << 20,
+        max_library_validation_bytes: 4 << 20,
+    }
+}
+fn text_constant(text: Option<&str>) -> crate::ConstantValue {
+    let ty = value_type(DataType::Utf8, text.is_none());
+    let field = Arc::new(ty.try_to_field("fixture").unwrap());
+    match text {
+        Some(text) => crate::ConstantValue::from_utf8(
+            field,
+            ty,
+            text,
+            constant_policy(),
+            CompilePhase::FunctionSpecialization,
+            crate::binding_test_control(),
+        ),
+        None => crate::ConstantValue::null(
+            field,
+            ty,
+            constant_policy(),
+            CompilePhase::FunctionSpecialization,
+            crate::binding_test_control(),
+        ),
+    }
+    .unwrap()
+}
+
 fn request(arguments: &[FunctionArgument]) -> FunctionBindingRequest<'_> {
     FunctionBindingRequest {
+        expected_result_type: None,
         arguments,
         logical_argument_count: arguments.len(),
     }
@@ -64,6 +99,8 @@ fn semantics() -> FunctionSemantics {
 
 fn overload(id: &str, pattern: &str) -> FunctionOverloadDeclaration {
     FunctionOverloadDeclaration {
+        effects: None,
+        semantics: semantics(),
         identity: identity(id),
         argument_pattern: pattern.into(),
         result_pattern: "T".into(),
@@ -73,17 +110,17 @@ fn overload(id: &str, pattern: &str) -> FunctionOverloadDeclaration {
 
 fn declaration(
     kind: FunctionKind,
-    overloads: Vec<FunctionOverloadDeclaration>,
+    mut overloads: Vec<FunctionOverloadDeclaration>,
 ) -> FunctionBindingDeclaration {
-    let mut semantics = semantics();
     if matches!(kind, FunctionKind::Aggregate | FunctionKind::Window) {
-        semantics.intrinsic_row_error =
-            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated;
+        for overload in &mut overloads {
+            overload.semantics.intrinsic_row_error =
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated;
+        }
     }
     FunctionBindingDeclaration::try_new(
         FunctionId::try_new("test/function/v1").unwrap(),
         kind,
-        semantics,
         overloads,
     )
     .unwrap()
@@ -99,6 +136,7 @@ impl FunctionBindingResolver for EchoResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.resolutions.fetch_add(1, Ordering::Relaxed);
         let [FunctionArgument::Value { value_type, .. }] = request.arguments else {
@@ -117,6 +155,7 @@ impl FunctionBindingResolver for EchoResolver {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         self.validations.fetch_add(1, Ordering::Relaxed);
         let [FunctionArgument::Value { value_type, .. }] = request.arguments else {
@@ -191,10 +230,20 @@ fn parametric_identity_is_stable_and_validation_never_resolves_again() {
     let integers = [argument(DataType::Int64, false)];
     let strings = [argument(DataType::Utf8, true)];
     let integer = catalog
-        .resolve_bound_user("ECHO", FunctionKind::Scalar, request(&integers))
+        .resolve_bound_user(
+            "ECHO",
+            FunctionKind::Scalar,
+            request(&integers),
+            crate::binding_test_control(),
+        )
         .unwrap();
     let string = catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&strings))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&strings),
+            crate::binding_test_control(),
+        )
         .unwrap();
     assert_eq!(integer.function_id, string.function_id);
     assert_eq!(integer.selected.overload, string.selected.overload);
@@ -203,9 +252,11 @@ fn parametric_identity_is_stable_and_validation_never_resolves_again() {
         string.selected.argument_types
     );
     catalog
-        .validate_bound(&integer, request(&integers))
+        .validate_bound(&integer, request(&integers), crate::binding_test_control())
         .unwrap();
-    catalog.validate_bound(&string, request(&strings)).unwrap();
+    catalog
+        .validate_bound(&string, request(&strings), crate::binding_test_control())
+        .unwrap();
     assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 2);
     assert_eq!(resolver.validations.load(Ordering::Relaxed), 2);
 }
@@ -215,10 +266,20 @@ fn frozen_identity_kind_types_and_semantics_fail_closed() {
     let catalog = echo_catalog(Arc::new(EchoResolver::default()));
     let args = [argument(DataType::Decimal128(12, 3), true)];
     let bound = catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&args))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&args),
+            crate::binding_test_control(),
+        )
         .unwrap();
-    let assert_rejected =
-        |changed| assert!(catalog.validate_bound(&changed, request(&args)).is_err());
+    let assert_rejected = |changed| {
+        assert!(
+            catalog
+                .validate_bound(&changed, request(&args), crate::binding_test_control())
+                .is_err()
+        )
+    };
     let mut changed = bound.clone();
     changed.function_id = FunctionId::try_new("missing/function/v1").unwrap();
     assert_rejected(changed);
@@ -252,6 +313,7 @@ struct NamedStructResolver;
 impl NamedStructResolver {
     fn selection(
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         let [
             name,
@@ -264,17 +326,16 @@ impl NamedStructResolver {
             return Err(FunctionBindingError::NoMatchingOverload);
         };
         let FunctionArgument::Value {
-            constant: Some(FunctionLiteral::Utf8(name)),
+            constant: Some(value),
             ..
         } = name
         else {
             return Err(invalid("field name must be a compile-time string"));
         };
-        let field = Field::new(
-            name.as_ref(),
-            field_type.data_type.clone(),
-            field_type.nullable,
-        );
+        let Some(name) = value.utf8_observed(CompilePhase::FunctionSpecialization, control)? else {
+            return Err(invalid("field name must be a compile-time string"));
+        };
+        let field = Field::new(name, field_type.data_type.clone(), field_type.nullable);
         Ok(FunctionBindingSelection {
             overload: identity("test/named-struct/T/v1"),
             argument_types: request
@@ -295,16 +356,18 @@ impl FunctionBindingResolver for NamedStructResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        Self::selection(request)
+        Self::selection(request, control)
     }
 
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        if selected != &Self::selection(request)? {
+        if selected != &Self::selection(request, control)? {
             return Err(invalid(
                 "selected field schema differs from its literal argument",
             ));
@@ -328,22 +391,43 @@ fn literal_dependent_binding_distinguishes_constant_null_nonconstant_and_changed
     ];
     assert!(
         catalog
-            .resolve_bound_user("echo", FunctionKind::Scalar, request(&args))
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Scalar,
+                request(&args),
+                crate::binding_test_control()
+            )
             .is_err()
     );
-    args[0] = literal_argument(FunctionLiteral::Null);
+    args[0] = literal_argument(text_constant(None));
     assert!(
         catalog
-            .resolve_bound_user("echo", FunctionKind::Scalar, request(&args))
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Scalar,
+                request(&args),
+                crate::binding_test_control()
+            )
             .is_err()
     );
-    args[0] = literal_argument(FunctionLiteral::Utf8("field_a".into()));
+    args[0] = literal_argument(text_constant(Some("field_a")));
     let bound = catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&args))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&args),
+            crate::binding_test_control(),
+        )
         .unwrap();
-    catalog.validate_bound(&bound, request(&args)).unwrap();
-    args[0] = literal_argument(FunctionLiteral::Utf8("field_b".into()));
-    assert!(catalog.validate_bound(&bound, request(&args)).is_err());
+    catalog
+        .validate_bound(&bound, request(&args), crate::binding_test_control())
+        .unwrap();
+    args[0] = literal_argument(text_constant(Some("field_b")));
+    assert!(
+        catalog
+            .validate_bound(&bound, request(&args), crate::binding_test_control())
+            .is_err()
+    );
 }
 
 #[test]
@@ -360,13 +444,19 @@ fn catalog_digest_covers_explicit_binding_contract_and_ignores_registration_orde
         match field {
             0 => changed.function_id = FunctionId::try_new("test/function/v2").unwrap(),
             1 => changed.overloads[0].identity = identity("test/echo/T/v2"),
-            2 => changed.semantics.volatility = FunctionVolatility::Stable,
-            3 => changed.semantics.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit,
-            4 => changed.semantics.failure_behavior = FunctionFailureBehavior::ReturnsNull,
+            2 => changed.overloads[0].semantics.volatility = FunctionVolatility::Stable,
+            3 => {
+                changed.overloads[0].semantics.argument_evaluation =
+                    FunctionArgumentEvaluation::ShortCircuit
+            }
+            4 => {
+                changed.overloads[0].semantics.failure_behavior =
+                    FunctionFailureBehavior::ReturnsNull
+            }
             5 => changed.overloads[0].argument_pattern = "(U)".into(),
             6 => changed.overloads[0].result_pattern = "U".into(),
             7 => {
-                changed.semantics.intrinsic_row_error =
+                changed.overloads[0].semantics.intrinsic_row_error =
                     novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
             }
             _ => unreachable!(),
@@ -381,7 +471,6 @@ fn declarations_reject_duplicate_identity_ambiguous_patterns_and_wrong_state_kin
         FunctionBindingDeclaration::try_new(
             FunctionId::try_new("test/function/v1").unwrap(),
             FunctionKind::Scalar,
-            semantics(),
             overloads,
         )
     };
@@ -393,6 +482,8 @@ fn declarations_reject_duplicate_identity_ambiguous_patterns_and_wrong_state_kin
     assert!(make(vec![first.clone(), overload("other/v1", "(T)")]).is_err());
     let mut aggregate = first;
     aggregate.aggregate = Some(AggregateBindingDeclaration {
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         intermediate_pattern: "binary".into(),
         state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
     });
@@ -461,12 +552,22 @@ fn hidden_bound_functions_require_trusted_resolution_and_legacy_calls_do_not_dis
     let catalog = builder.seal_bound().unwrap();
     let args = [argument(DataType::Int64, false)];
     assert_eq!(
-        catalog.resolve_bound_user("hidden", FunctionKind::Scalar, request(&args)),
+        catalog.resolve_bound_user(
+            "hidden",
+            FunctionKind::Scalar,
+            request(&args),
+            crate::binding_test_control()
+        ),
         Err(FunctionBindingError::HiddenFunction)
     );
     assert!(
         catalog
-            .resolve_bound_trusted("hidden", FunctionKind::Scalar, request(&args))
+            .resolve_bound_trusted(
+                "hidden",
+                FunctionKind::Scalar,
+                request(&args),
+                crate::binding_test_control()
+            )
             .is_ok()
     );
     assert!(
@@ -497,6 +598,7 @@ impl FunctionBindingResolver for AggregateResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         if request.logical_argument_count != 1 || request.arguments.is_empty() {
             return Err(FunctionBindingError::NoMatchingOverload);
@@ -510,6 +612,8 @@ impl FunctionBindingResolver for AggregateResolver {
                 .collect(),
             result_type: FunctionResultType::Scalar(value_type(DataType::Int64, true)),
             aggregate: Some(AggregateBindingSelection {
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 intermediate_type: value_type(DataType::Binary, false),
                 state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
             }),
@@ -520,6 +624,7 @@ impl FunctionBindingResolver for AggregateResolver {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if request.logical_argument_count != 1
             || selected
@@ -540,6 +645,8 @@ impl FunctionBindingResolver for AggregateResolver {
 fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical_arity() {
     let mut overload = overload("test/aggregate/T/v1", "(T; order_by...)");
     overload.aggregate = Some(AggregateBindingDeclaration {
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         intermediate_pattern: "binary not null".into(),
         state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
     });
@@ -552,17 +659,29 @@ fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical
         argument(DataType::Utf8, true),
     ];
     let request = FunctionBindingRequest {
+        expected_result_type: None,
         arguments: &args,
         logical_argument_count: 1,
     };
     let bound = catalog
-        .resolve_bound_user("echo", FunctionKind::Aggregate, request)
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Aggregate,
+            request,
+            crate::binding_test_control(),
+        )
         .unwrap();
-    catalog.validate_bound(&bound, request).unwrap();
+    catalog
+        .validate_bound(&bound, request, crate::binding_test_control())
+        .unwrap();
     let mut changed = bound.clone();
     changed.selected.aggregate.as_mut().unwrap().state_format =
         AggregateStateFormatIdentity::try_new("state/v2").unwrap();
-    assert!(catalog.validate_bound(&changed, request).is_err());
+    assert!(
+        catalog
+            .validate_bound(&changed, request, crate::binding_test_control())
+            .is_err()
+    );
     let mut changed = bound.clone();
     changed
         .selected
@@ -571,15 +690,29 @@ fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical
         .unwrap()
         .intermediate_type
         .nullable = true;
-    assert!(catalog.validate_bound(&changed, request).is_err());
+    assert!(
+        catalog
+            .validate_bound(&changed, request, crate::binding_test_control())
+            .is_err()
+    );
     let changed_request = FunctionBindingRequest {
+        expected_result_type: None,
         logical_argument_count: 2,
         ..request
     };
-    assert!(catalog.validate_bound(&bound, changed_request).is_err());
     assert!(
         catalog
-            .resolve_bound_user("echo", FunctionKind::Aggregate, changed_request)
+            .validate_bound(&bound, changed_request, crate::binding_test_control())
+            .is_err()
+    );
+    assert!(
+        catalog
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Aggregate,
+                changed_request,
+                crate::binding_test_control()
+            )
             .is_err()
     );
 }
@@ -619,17 +752,79 @@ fn bound_catalog_rejects_unmigrated_definitions_without_inventing_identities() {
     let catalog = builder.seal().unwrap();
     let args = [argument(DataType::Int64, false)];
     assert_eq!(
-        catalog.resolve_bound_user("legacy", FunctionKind::Aggregate, request(&args)),
+        catalog.resolve_bound_user(
+            "legacy",
+            FunctionKind::Aggregate,
+            request(&args),
+            crate::binding_test_control()
+        ),
         Err(FunctionBindingError::MissingBindingDeclaration)
     );
 }
 
 struct FixedResolver(FunctionBindingSelection);
 
+#[test]
+fn selected_overload_semantics_are_exact_with_conservative_name_metadata() {
+    let mut stable = overload("test/stable/v1", "(Int32)");
+    stable.semantics.volatility = FunctionVolatility::Stable;
+    let mut volatile = overload("test/volatile/v1", "(Int64)");
+    volatile.semantics.volatility = FunctionVolatility::Volatile;
+    volatile.semantics.intrinsic_row_error =
+        novarocks_type_contract::FunctionIntrinsicRowError::MayRaise;
+    volatile.semantics.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
+    for (chosen, data_type) in [(&stable, DataType::Int32), (&volatile, DataType::Int64)] {
+        let declaration = declaration(FunctionKind::Scalar, vec![stable.clone(), volatile.clone()]);
+        assert_eq!(declaration.volatility(), FunctionVolatility::Volatile);
+        let ty = value_type(data_type.clone(), false);
+        let selection = FunctionBindingSelection {
+            overload: chosen.identity.clone(),
+            argument_types: Box::from([FunctionArgumentType::Value(ty.clone())]),
+            result_type: FunctionResultType::Scalar(ty),
+            aggregate: None,
+        };
+        let catalog = catalog(Arc::new(FixedResolver(selection)), declaration);
+        let args = [argument(data_type, false)];
+        let bound = catalog
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Scalar,
+                request(&args),
+                crate::binding_test_control(),
+            )
+            .unwrap();
+        assert_eq!(bound.semantics, chosen.semantics);
+        catalog
+            .validate_bound(&bound, request(&args), crate::binding_test_control())
+            .unwrap();
+        let mut forged = bound;
+        forged.semantics = if chosen == &stable {
+            volatile.semantics
+        } else {
+            stable.semantics
+        };
+        assert!(
+            catalog
+                .validate_bound(&forged, request(&args), crate::binding_test_control())
+                .is_err()
+        );
+    }
+    let first = declaration(FunctionKind::Scalar, vec![stable.clone(), volatile.clone()]);
+    let digest = catalog(Arc::new(EchoResolver::default()), first).digest();
+    stable.semantics.volatility = FunctionVolatility::Immutable;
+    let changed = declaration(FunctionKind::Scalar, vec![stable, volatile]);
+    assert_eq!(changed.volatility(), FunctionVolatility::Volatile);
+    assert_ne!(
+        digest,
+        catalog(Arc::new(EchoResolver::default()), changed).digest()
+    );
+}
+
 impl FunctionBindingResolver for FixedResolver {
     fn resolve(
         &self,
         _request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         Ok(self.0.clone())
     }
@@ -638,6 +833,7 @@ impl FunctionBindingResolver for FixedResolver {
         &self,
         selected: &FunctionBindingSelection,
         _request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if selected != &self.0 {
             return Err(invalid("selected fixed signature differs"));
@@ -665,10 +861,21 @@ fn worker_validation_requires_explicitly_coerced_argument_types() {
     let original = [argument(DataType::Int64, false)];
     let coerced = [argument(DataType::Int32, false)];
     let bound = catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&original))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&original),
+            crate::binding_test_control(),
+        )
         .unwrap();
-    assert!(catalog.validate_bound(&bound, request(&original)).is_err());
-    catalog.validate_bound(&bound, request(&coerced)).unwrap();
+    assert!(
+        catalog
+            .validate_bound(&bound, request(&original), crate::binding_test_control())
+            .is_err()
+    );
+    catalog
+        .validate_bound(&bound, request(&coerced), crate::binding_test_control())
+        .unwrap();
 }
 
 fn higher_order_catalog(arguments: &[FunctionArgument]) -> EngineFunctionCatalog {
@@ -715,36 +922,66 @@ fn higher_order_binding_rejects_scalar_impersonation_in_both_directions() {
     let arguments = higher_order_arguments();
     let catalog = higher_order_catalog(&arguments);
     let bound = catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&arguments),
+            crate::binding_test_control(),
+        )
         .unwrap();
-    catalog.validate_bound(&bound, request(&arguments)).unwrap();
+    catalog
+        .validate_bound(&bound, request(&arguments), crate::binding_test_control())
+        .unwrap();
 
     // The scalar has the lambda body's exact result type and nullability.
     let mut scalar_arguments = arguments.clone();
     scalar_arguments[0] = argument(DataType::Utf8, false);
     assert!(
         catalog
-            .validate_bound(&bound, request(&scalar_arguments))
+            .validate_bound(
+                &bound,
+                request(&scalar_arguments),
+                crate::binding_test_control()
+            )
             .is_err()
     );
     assert!(
         catalog
-            .resolve_bound_user("echo", FunctionKind::Scalar, request(&scalar_arguments))
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Scalar,
+                request(&scalar_arguments),
+                crate::binding_test_control()
+            )
             .is_err()
     );
 
     let scalar_catalog = higher_order_catalog(&scalar_arguments);
     let scalar_bound = scalar_catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&scalar_arguments))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&scalar_arguments),
+            crate::binding_test_control(),
+        )
         .unwrap();
     assert!(
         scalar_catalog
-            .validate_bound(&scalar_bound, request(&arguments))
+            .validate_bound(
+                &scalar_bound,
+                request(&arguments),
+                crate::binding_test_control()
+            )
             .is_err()
     );
     assert!(
         scalar_catalog
-            .resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments))
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Scalar,
+                request(&arguments),
+                crate::binding_test_control()
+            )
             .is_err()
     );
 }
@@ -754,7 +991,12 @@ fn higher_order_binding_freezes_lambda_arity_parameter_types_and_result_type() {
     let arguments = higher_order_arguments();
     let catalog = higher_order_catalog(&arguments);
     let bound = catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&arguments),
+            crate::binding_test_control(),
+        )
         .unwrap();
     for (parameters, result) in [
         (vec![], value_type(DataType::Utf8, false)),
@@ -785,11 +1027,20 @@ fn higher_order_binding_freezes_lambda_arity_parameter_types_and_result_type() {
             parameter_types: parameters.into_boxed_slice(),
             result_type: result,
         };
-        assert!(catalog.validate_bound(&bound, request(&changed)).is_err());
+        assert!(
+            catalog
+                .validate_bound(&bound, request(&changed), crate::binding_test_control())
+                .is_err()
+        );
         if changed_arity {
             assert!(
                 catalog
-                    .resolve_bound_user("echo", FunctionKind::Scalar, request(&changed))
+                    .resolve_bound_user(
+                        "echo",
+                        FunctionKind::Scalar,
+                        request(&changed),
+                        crate::binding_test_control()
+                    )
                     .is_err()
             );
         }
@@ -803,10 +1054,22 @@ fn aggregate_order_by_update_channels_cannot_be_lambdas() {
         higher_order_arguments()[0].clone(),
     ];
     let request = FunctionBindingRequest {
+        expected_result_type: None,
         arguments: &arguments,
         logical_argument_count: 1,
     };
-    assert!(validate_request(FunctionKind::Aggregate, request).is_err());
+    assert!(
+        validate_request(
+            FunctionKind::Aggregate,
+            request,
+            &mut CompileCheckpoints::try_new(
+                crate::binding_test_control(),
+                CompilePhase::FunctionSpecialization
+            )
+            .unwrap()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -827,7 +1090,12 @@ fn undeclared_selected_overload_is_rejected_during_resolution() {
     );
     let args = [argument(DataType::Int64, false)];
     assert!(matches!(
-        catalog.resolve_bound_user("echo", FunctionKind::Scalar, request(&args)),
+        catalog.resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&args),
+            crate::binding_test_control()
+        ),
         Err(FunctionBindingError::UnknownOverload(_))
     ));
 }
@@ -853,23 +1121,33 @@ fn table_and_window_bindings_have_distinct_result_shapes() {
             declaration(kind, vec![overload("test/result/v1", "()")]),
         );
         let bound = catalog
-            .resolve_bound_user("echo", kind, request(&[]))
+            .resolve_bound_user("echo", kind, request(&[]), crate::binding_test_control())
             .unwrap();
-        catalog.validate_bound(&bound, request(&[])).unwrap();
+        catalog
+            .validate_bound(&bound, request(&[]), crate::binding_test_control())
+            .unwrap();
         let mut changed = bound.clone();
         changed.selected.result_type = if kind == FunctionKind::Table {
             FunctionResultType::Scalar(scalar.clone())
         } else {
             FunctionResultType::Relation(relation.clone())
         };
-        assert!(catalog.validate_bound(&changed, request(&[])).is_err());
+        assert!(
+            catalog
+                .validate_bound(&changed, request(&[]), crate::binding_test_control())
+                .is_err()
+        );
         let mut changed = bound;
         changed.kind = if kind == FunctionKind::Table {
             FunctionKind::Window
         } else {
             FunctionKind::Table
         };
-        assert!(catalog.validate_bound(&changed, request(&[])).is_err());
+        assert!(
+            catalog
+                .validate_bound(&changed, request(&[]), crate::binding_test_control())
+                .is_err()
+        );
     }
 }
 
@@ -889,15 +1167,17 @@ fn intrinsic_row_error_is_independent_of_catching_and_closed_by_function_kind() 
             let mut selected = overload("test/intrinsic/T/v1", "(T)");
             if kind == FunctionKind::Aggregate {
                 selected.aggregate = Some(AggregateBindingDeclaration {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_pattern: "binary".into(),
                     state_format: AggregateStateFormatIdentity::try_new("test/intrinsic/state-v1")
                         .unwrap(),
                 });
             }
+            selected.semantics = semantics;
             let result = FunctionBindingDeclaration::try_new(
                 FunctionId::try_new("test/intrinsic/v1").unwrap(),
                 kind,
-                semantics,
                 [selected],
             );
             assert_eq!(
@@ -914,13 +1194,434 @@ fn intrinsic_row_error_is_independent_of_catching_and_closed_by_function_kind() 
     let catalog = catalog(Arc::new(EchoResolver::default()), declaration);
     let arguments = [argument(DataType::Int32, false)];
     let original = catalog
-        .resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments))
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&arguments),
+            crate::binding_test_control(),
+        )
         .unwrap();
     let mut forged = original.clone();
     forged.semantics.intrinsic_row_error = Own::MayRaise;
     assert!(
         catalog
-            .validate_bound(&forged, request(&arguments))
+            .validate_bound(&forged, request(&arguments), crate::binding_test_control())
             .is_err()
     );
+}
+
+#[test]
+fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
+    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+    let declaration = declaration(
+        FunctionKind::Scalar,
+        vec![overload("test/echo/T/v1", "(T)")],
+    );
+    let catalog = catalog(Arc::new(EchoResolver::default()), declaration);
+    let typed =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap();
+    let arguments = [FunctionArgument::Value {
+        value_type: typed,
+        constant: None,
+    }];
+    let bound = catalog
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&arguments),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let mut forged = bound.clone();
+    forged.selected.argument_types = Box::from([FunctionArgumentType::Value(
+        FunctionValueType::new(DataType::Utf8, false),
+    )]);
+    assert!(
+        catalog
+            .validate_bound(&forged, request(&arguments), crate::binding_test_control())
+            .is_err()
+    );
+    let malformed = [FunctionArgument::Value {
+        value_type: FunctionValueType {
+            data_type: DataType::Int64,
+            nullable: false,
+            logical_type: ValueLogicalType::Json,
+        },
+        constant: None,
+    }];
+    assert!(
+        catalog
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Scalar,
+                request(&malformed),
+                crate::binding_test_control()
+            )
+            .is_err()
+    );
+    let nested = [argument(
+        DataType::List(Arc::new(
+            Field::new("item", DataType::Utf8, true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
+        )),
+        false,
+    )];
+    assert!(
+        catalog
+            .resolve_bound_user(
+                "echo",
+                FunctionKind::Scalar,
+                request(&nested),
+                crate::binding_test_control()
+            )
+            .is_err()
+    );
+    let mut invalid = bound.clone();
+    invalid.selected.result_type = FunctionResultType::Scalar(FunctionValueType {
+        data_type: DataType::Int64,
+        nullable: false,
+        logical_type: ValueLogicalType::Variant,
+    });
+    assert!(
+        catalog
+            .validate_bound(&invalid, request(&arguments), crate::binding_test_control())
+            .is_err()
+    );
+}
+
+#[test]
+fn binding_type_gate_observes_original_control_before_resolver() {
+    struct StopAtBatch {
+        error: CompileControlError,
+        observations: std::sync::Mutex<Vec<u32>>,
+    }
+    impl PureCompileControl for StopAtBatch {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::FunctionSpecialization);
+            self.observations.lock().unwrap().push(units);
+            if units == 256 {
+                Err(self.error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let nested = DataType::Struct(
+        (0..320)
+            .map(|i| Arc::new(Field::new(format!("field_{i}"), DataType::Int64, false)))
+            .collect(),
+    );
+    let arguments = [argument(nested, false)];
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let resolver = Arc::new(EchoResolver::default());
+        let catalog = catalog(
+            resolver.clone(),
+            declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
+        );
+        let control = StopAtBatch {
+            error,
+            observations: Default::default(),
+        };
+        assert_eq!(
+            catalog.resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments), &control),
+            Err(FunctionBindingError::Control(error))
+        );
+        assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
+        let observed = control.observations.lock().unwrap();
+        assert_eq!(observed[0], 0);
+        assert_eq!(
+            observed.iter().copied().find(|units| *units != 0),
+            Some(256)
+        );
+    }
+}
+
+#[test]
+fn resolver_control_failure_survives_later_wrapper_observation() {
+    struct Owner(CompileControlError);
+    impl FunctionBindingResolver for Owner {
+        fn resolve(
+            &self,
+            _: FunctionBindingRequest<'_>,
+            control: &dyn PureCompileControl,
+        ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+            // This is the callee's first failure, after the engine flushed its tail.
+            control.checkpoint(CompilePhase::FunctionSpecialization, 7)?;
+            Err(self.0.into())
+        }
+        fn validate_selected(
+            &self,
+            _: &FunctionBindingSelection,
+            _: FunctionBindingRequest<'_>,
+            _: &dyn PureCompileControl,
+        ) -> Result<(), FunctionBindingError> {
+            unreachable!()
+        }
+    }
+    struct Observe(std::sync::Mutex<Vec<u32>>);
+    impl PureCompileControl for Observe {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut observations = self.0.lock().unwrap();
+            if observations.last() == Some(&7) {
+                return Err(CompileControlError::ResourceExhausted);
+            }
+            observations.push(units);
+            Ok(())
+        }
+    }
+    let arguments = [argument(DataType::Int64, false)];
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let catalog = catalog(
+            Arc::new(Owner(error)),
+            declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
+        );
+        let control = Observe(Default::default());
+        assert_eq!(
+            catalog.resolve_bound_trusted(
+                "echo",
+                FunctionKind::Scalar,
+                request(&arguments),
+                &control
+            ),
+            Err(FunctionBindingError::Control(error))
+        );
+        assert_eq!(control.0.lock().unwrap().last(), Some(&7));
+    }
+}
+
+struct ConstantTraceControl {
+    trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+    stop: Option<(usize, CompileControlError)>,
+}
+impl ConstantTraceControl {
+    fn new(stop: Option<(usize, CompileControlError)>) -> Self {
+        Self {
+            trace: Default::default(),
+            stop,
+        }
+    }
+}
+impl PureCompileControl for ConstantTraceControl {
+    fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        let mut trace = self.trace.lock().unwrap();
+        if let Some((at, _)) = self.stop {
+            assert!(trace.len() < at, "no callback after primary refusal");
+        }
+        trace.push((phase, units));
+        match self.stop {
+            Some((at, error)) if trace.len() == at => Err(error),
+            _ => Ok(()),
+        }
+    }
+}
+fn check_constant_prefixes(
+    call: impl Fn(&dyn PureCompileControl) -> Result<bool, FunctionBindingError>,
+    expected: bool,
+) {
+    let baseline = ConstantTraceControl::new(None);
+    assert_eq!(call(&baseline).unwrap(), expected);
+    let trace = baseline.trace.into_inner().unwrap();
+    assert_eq!(trace.first().unwrap().1, 0);
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in 1..=trace.len() {
+            let control = ConstantTraceControl::new(Some((at, error)));
+            assert_eq!(call(&control), Err(FunctionBindingError::Control(error)));
+            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+        }
+    }
+}
+fn pooled_integer(rows: Vec<Option<i64>>, ordinal: u32) -> FunctionArgument {
+    use arrow_array::{Array, Int64Array};
+    let ty = value_type(DataType::Int64, true);
+    let pool = crate::ConstantPool::try_new(
+        Arc::new(ty.try_to_field("source").unwrap()),
+        ty,
+        Int64Array::from(rows).to_data(),
+        constant_policy(),
+        CompilePhase::FunctionSpecialization,
+        crate::binding_test_control(),
+    )
+    .unwrap();
+    literal_argument(pool.value(ordinal).unwrap())
+}
+#[test]
+fn constant_arguments_compare_selected_values_without_pool_or_ordinal_identity() {
+    let left = pooled_integer(vec![Some(-99), Some(42), None], 1);
+    let right = pooled_integer(vec![Some(42), Some(7), Some(8)], 0);
+    check_constant_prefixes(
+        |control| left.equals_observed(&right, CompilePhase::FunctionSpecialization, control),
+        true,
+    );
+    let changed = pooled_integer(vec![Some(99), Some(43)], 1);
+    check_constant_prefixes(
+        |control| left.equals_observed(&changed, CompilePhase::FunctionSpecialization, control),
+        false,
+    );
+    let null = pooled_integer(vec![Some(42), None], 1);
+    let second_null = pooled_integer(vec![None, Some(-9)], 0);
+    check_constant_prefixes(
+        |control| null.equals_observed(&second_null, CompilePhase::FunctionSpecialization, control),
+        true,
+    );
+    let nonconstant = argument(DataType::Int64, true);
+    check_constant_prefixes(
+        |control| null.equals_observed(&nonconstant, CompilePhase::FunctionSpecialization, control),
+        false,
+    );
+    check_constant_prefixes(
+        |control| {
+            nonconstant.equals_observed(&nonconstant, CompilePhase::FunctionSpecialization, control)
+        },
+        true,
+    );
+}
+#[test]
+fn constant_argument_request_type_mismatch_refuses_before_resolver_and_observes_tail() {
+    let constant = match pooled_integer(vec![Some(42)], 0) {
+        FunctionArgument::Value {
+            constant: Some(value),
+            ..
+        } => value,
+        _ => unreachable!(),
+    };
+    for ty in [
+        value_type(DataType::Int64, false),
+        value_type(DataType::Float64, true),
+    ] {
+        let arguments = [FunctionArgument::Value {
+            value_type: ty,
+            constant: Some(constant.clone()),
+        }];
+        let resolver = Arc::new(EchoResolver::default());
+        let catalog = catalog(
+            resolver.clone(),
+            declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
+        );
+        let call = |control: &dyn PureCompileControl| {
+            catalog.resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments), control)
+        };
+        let baseline = ConstantTraceControl::new(None);
+        assert!(matches!(
+            call(&baseline),
+            Err(FunctionBindingError::InvalidBinding(_))
+        ));
+        assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
+        let trace = baseline.trace.into_inner().unwrap();
+        assert!(trace.len() >= 2, "ordinary refusal must observe completion");
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at in 1..=trace.len() {
+                let control = ConstantTraceControl::new(Some((at, error)));
+                assert_eq!(call(&control), Err(FunctionBindingError::Control(error)));
+                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+}
+#[test]
+fn argument_observed_comparison_keeps_full_lambda_and_nominal_types() {
+    let physical = value_type(DataType::FixedSizeBinary(16), true);
+    let largeint = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        novarocks_type_contract::ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let lambda = |ty: FunctionValueType| FunctionArgument::Lambda {
+        parameter_types: vec![ty.clone()].into_boxed_slice(),
+        result_type: ty,
+    };
+    let left = lambda(largeint.clone());
+    let same = lambda(largeint);
+    let changed = lambda(physical);
+    check_constant_prefixes(
+        |control| left.equals_observed(&same, CompilePhase::FunctionSpecialization, control),
+        true,
+    );
+    check_constant_prefixes(
+        |control| left.equals_observed(&changed, CompilePhase::FunctionSpecialization, control),
+        false,
+    );
+    let field = |metadata: &str| {
+        value_type(
+            DataType::Struct(
+                vec![Arc::new(
+                    Field::new("child", DataType::Int64, true).with_metadata(
+                        [("provider".to_owned(), metadata.to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                )]
+                .into(),
+            ),
+            true,
+        )
+    };
+    check_constant_prefixes(
+        |control| {
+            lambda(field("original")).equals_observed(
+                &lambda(field("changed")),
+                CompilePhase::FunctionSpecialization,
+                control,
+            )
+        },
+        false,
+    );
+}
+
+#[test]
+fn catalog_nonconstant_argument_keeps_concrete_neutral_carrier() {
+    let arg = FunctionArgument::Value {
+        value_type: value_type(DataType::Int64, false),
+        constant: None,
+    };
+    assert_eq!(
+        arg.argument_type(),
+        FunctionArgumentType::Value(value_type(DataType::Int64, false))
+    );
+    let args = [arg];
+    let request = FunctionBindingRequest {
+        arguments: &args,
+        logical_argument_count: 1,
+        expected_result_type: None,
+    };
+    // Both paths borrow the same concrete neutral data; no adapter or clone.
+    let neutral: novarocks_function_contract::FunctionBindingRequest<'_> = request;
+    let copied = neutral;
+    assert!(std::ptr::eq(request.arguments, copied.arguments));
+    assert!(copied.expected_result_type.is_none());
+    let resolver = Arc::new(EchoResolver::default());
+    let catalog = catalog(
+        resolver.clone(),
+        declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
+    );
+    let binding = catalog
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request,
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    catalog
+        .validate_bound(&binding, request, crate::binding_test_control())
+        .unwrap();
+    assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 1);
 }

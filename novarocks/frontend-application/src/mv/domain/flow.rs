@@ -165,10 +165,12 @@ pub fn create_mv_with_ports(
     db: &str,
     stmt: &MvCreateStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
     crate::connector::validate_request_context(connector_context)?;
     if storage_engine_for_create(stmt)? != MvStorageEngine::Iceberg {
-        return Err("materialized view backend must be Iceberg".to_string());
+        return Err("materialized view backend must be Iceberg"
+            .to_string()
+            .into());
     }
     let engine = crate::mv::domain::iceberg_refresh::IcebergMvCreateProviderAdapter::new_with_ports(
         ports.clone(),
@@ -183,7 +185,10 @@ pub fn create_mv_with_ports(
                 current_database: db,
             },
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| match error.compile_control_error() {
+            Some(control) => control.into(),
+            None => novarocks_sql::compiler::SqlCompileError::Compilation(error.to_string()),
+        })?;
     Ok(StatementResult::Ok)
 }
 

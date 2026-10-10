@@ -125,18 +125,27 @@ fn decode_writer_multiplex_schema(
     let channels = wire.columns[WRITE_RELATION_COLUMN_COUNT..]
         .iter()
         .zip(actual.fields()[WRITE_RELATION_COLUMN_COUNT..].iter())
-        .map(|(column, field)| {
-            WriterAuxiliaryChannel::try_new(
-                column.slot_id,
-                field.name().clone(),
-                field.data_type().clone(),
-            )
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("columns"),
-                    format!("writer multiplex auxiliary channel: {error}"),
-                )
-            })
+        .enumerate()
+        .map(|(offset, (column, field))| {
+            let field_path = path
+                .clone()
+                .field("columns")
+                .index(WRITE_RELATION_COLUMN_COUNT + offset)
+                .field("field");
+            let value_type = novarocks_type_contract::FunctionValueType::try_from_field(field)
+                .map_err(|error| {
+                    NativeFragmentDecodeError::invalid_value(
+                        field_path.clone(),
+                        format!("writer multiplex auxiliary channel type: {error}"),
+                    )
+                })?;
+            WriterAuxiliaryChannel::try_new(column.slot_id, field.name().clone(), value_type)
+                .map_err(|error| {
+                    NativeFragmentDecodeError::invalid_value(
+                        field_path,
+                        format!("writer multiplex auxiliary channel: {error}"),
+                    )
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let contract = WriterMultiplexSchema::try_new(channels).map_err(|error| {
@@ -1282,8 +1291,12 @@ mod tests {
 
     fn writer_payload_with_count_partial(input_slot_id: u32) -> plan::TableWriterNode {
         let mut writer = writer_payload();
-        let channel = WriterAuxiliaryChannel::try_new(17, "count_partial", DataType::Int64)
-            .expect("count channel");
+        let channel = WriterAuxiliaryChannel::try_new(
+            17,
+            "count_partial",
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        )
+        .expect("count channel");
         let relation = WriterMultiplexSchema::try_new(vec![channel]).expect("writer relation");
         writer.writer_multiplex_schema = Some(writer_multiplex_schema(&relation));
         writer.partial_aggregate_plan = Some(plan::WriterPartialAggregatePlan {
@@ -1633,7 +1646,10 @@ mod tests {
             WriterAuxiliaryChannel::try_new(
                 17,
                 "dictionary",
-                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                    true,
+                ),
             )
             .expect("dictionary channel"),
         ])

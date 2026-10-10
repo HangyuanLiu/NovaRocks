@@ -14,9 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::array::{
-    ArrayRef, BinaryArray, BinaryBuilder, Float64Builder, StringBuilder, StructArray,
-};
+use arrow::array::{ArrayRef, BinaryArray};
 use arrow::datatypes::DataType;
 
 use crate::exec::node::aggregate::AggFunction;
@@ -33,138 +31,6 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
         "corr" => Some(AggKind::Corr),
         _ => None,
     }
-}
-
-enum NumericView<'a> {
-    Int(IntArrayView<'a>),
-    Float(FloatArrayView<'a>),
-}
-
-impl<'a> NumericView<'a> {
-    fn new(array: &'a ArrayRef) -> Result<Self, String> {
-        match array.data_type() {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                Ok(Self::Int(IntArrayView::new(array)?))
-            }
-            DataType::Float32 | DataType::Float64 => Ok(Self::Float(FloatArrayView::new(array)?)),
-            other => Err(format!("covar/corr unsupported input type: {:?}", other)),
-        }
-    }
-
-    fn value_at(&self, row: usize) -> Option<f64> {
-        match self {
-            NumericView::Int(view) => view.value_at(row).map(|v| v as f64),
-            NumericView::Float(view) => view.value_at(row),
-        }
-    }
-}
-
-fn update_covar_state(state: &mut CovarState, x: f64, y: f64) {
-    state.count += 1;
-    let count = state.count as f64;
-    let old_mean_x = state.mean_x;
-    let old_mean_y = state.mean_y;
-    state.mean_x = old_mean_x + (x - old_mean_x) / count;
-    state.mean_y = old_mean_y + (y - old_mean_y) / count;
-    state.c2 += (x - old_mean_x) * (y - state.mean_y);
-}
-
-fn update_corr_state(state: &mut CorrState, x: f64, y: f64) {
-    state.count += 1;
-    let count = state.count as f64;
-    let old_mean_x = state.mean_x;
-    let old_mean_y = state.mean_y;
-    state.mean_x = old_mean_x + (x - old_mean_x) / count;
-    state.mean_y = old_mean_y + (y - old_mean_y) / count;
-    state.c2 += (x - old_mean_x) * (y - state.mean_y);
-    state.m2x += (x - old_mean_x) * (x - state.mean_x);
-    state.m2y += (y - old_mean_y) * (y - state.mean_y);
-}
-
-fn merge_covar_state(state: &mut CovarState, mean_x: f64, mean_y: f64, c2: f64, count: i64) {
-    if count == 0 {
-        return;
-    }
-    if state.count == 0 {
-        state.mean_x = mean_x;
-        state.mean_y = mean_y;
-        state.c2 = c2;
-        state.count = count;
-        return;
-    }
-    let delta_x = state.mean_x - mean_x;
-    let delta_y = state.mean_y - mean_y;
-    let sum_count = state.count + count;
-    let sum_count_f = sum_count as f64;
-    let factor = (state.count as f64) * (count as f64) / sum_count_f;
-    state.mean_x = mean_x + delta_x * (state.count as f64 / sum_count_f);
-    state.mean_y = mean_y + delta_y * (state.count as f64 / sum_count_f);
-    state.c2 = c2 + state.c2 + (delta_x * delta_y) * factor;
-    state.count = sum_count;
-}
-
-fn merge_corr_state(
-    state: &mut CorrState,
-    mean_x: f64,
-    mean_y: f64,
-    c2: f64,
-    count: i64,
-    m2x: f64,
-    m2y: f64,
-) {
-    if count == 0 {
-        return;
-    }
-    if state.count == 0 {
-        state.mean_x = mean_x;
-        state.mean_y = mean_y;
-        state.c2 = c2;
-        state.m2x = m2x;
-        state.m2y = m2y;
-        state.count = count;
-        return;
-    }
-    let delta_x = state.mean_x - mean_x;
-    let delta_y = state.mean_y - mean_y;
-    let sum_count = state.count + count;
-    let sum_count_f = sum_count as f64;
-    let factor = (state.count as f64) * (count as f64) / sum_count_f;
-    state.mean_x = mean_x + delta_x * (state.count as f64 / sum_count_f);
-    state.mean_y = mean_y + delta_y * (state.count as f64 / sum_count_f);
-    state.c2 = c2 + state.c2 + (delta_x * delta_y) * factor;
-    state.m2x = m2x + state.m2x + (delta_x * delta_x) * factor;
-    state.m2y = m2y + state.m2y + (delta_y * delta_y) * factor;
-    state.count = sum_count;
-}
-
-fn parse_covar_state(bytes: &[u8]) -> Result<(f64, f64, f64, i64), String> {
-    if bytes.len() != 32 {
-        return Err(format!(
-            "covar intermediate binary size mismatch: expected 32, got {}",
-            bytes.len()
-        ));
-    }
-    let mean_x = f64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let mean_y = f64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let c2 = f64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let count = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
-    Ok((mean_x, mean_y, c2, count))
-}
-
-fn parse_corr_state(bytes: &[u8]) -> Result<(f64, f64, f64, i64, f64, f64), String> {
-    if bytes.len() != 48 {
-        return Err(format!(
-            "corr intermediate binary size mismatch: expected 48, got {}",
-            bytes.len()
-        ));
-    }
-    let mean_x = f64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let mean_y = f64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let c2 = f64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let count = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
-    let m2x = f64::from_le_bytes(bytes[32..40].try_into().unwrap());
-    let m2y = f64::from_le_bytes(bytes[40..48].try_into().unwrap());
-    Ok((mean_x, mean_y, c2, count, m2x, m2y))
 }
 
 impl AggregateFunction for CovarCorrAgg {
@@ -282,41 +148,7 @@ impl AggregateFunction for CovarCorrAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        let AggInputView::Any(array) = input else {
-            return Err("covar/corr batch input type mismatch".to_string());
-        };
-        let struct_arr = array
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| "covar/corr expects struct input".to_string())?;
-        if struct_arr.num_columns() != 2 {
-            return Err("covar/corr expects 2 arguments".to_string());
-        }
-        let left = struct_arr.column(0);
-        let right = struct_arr.column(1);
-        let left_view = NumericView::new(left)?;
-        let right_view = NumericView::new(right)?;
-
-        for (row, &base) in state_ptrs.iter().enumerate() {
-            let Some(x) = left_view.value_at(row) else {
-                continue;
-            };
-            let Some(y) = right_view.value_at(row) else {
-                continue;
-            };
-            match spec.kind {
-                AggKind::CovarPop | AggKind::CovarSamp => {
-                    let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut CovarState) };
-                    update_covar_state(state, x, y);
-                }
-                AggKind::Corr => {
-                    let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut CorrState) };
-                    update_corr_state(state, x, y);
-                }
-                _ => return Err("covar/corr kind mismatch".to_string()),
-            }
-        }
-        Ok(())
+        super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
 
     fn merge_batch(
@@ -326,75 +158,10 @@ impl AggregateFunction for CovarCorrAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        match input {
-            AggInputView::Binary(arr) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let bytes = arr.value(row);
-                    match spec.kind {
-                        AggKind::CovarPop | AggKind::CovarSamp => {
-                            let (mean_x, mean_y, c2, count) = parse_covar_state(bytes)?;
-                            let state =
-                                unsafe { &mut *((base as *mut u8).add(offset) as *mut CovarState) };
-                            merge_covar_state(state, mean_x, mean_y, c2, count);
-                        }
-                        AggKind::Corr => {
-                            let (mean_x, mean_y, c2, count, m2x, m2y) = parse_corr_state(bytes)?;
-                            let state =
-                                unsafe { &mut *((base as *mut u8).add(offset) as *mut CorrState) };
-                            merge_corr_state(state, mean_x, mean_y, c2, count, m2x, m2y);
-                        }
-                        _ => return Err("covar/corr kind mismatch".to_string()),
-                    }
-                }
-                Ok(())
-            }
-            AggInputView::Utf8(view) => {
-                let mut values = Vec::with_capacity(view.len());
-                for i in 0..view.len() {
-                    values.push(view.value_at(i));
-                }
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    let Some(text) = values[row].as_deref() else {
-                        continue;
-                    };
-                    let parts: Vec<&str> = text.split(',').collect();
-                    match spec.kind {
-                        AggKind::CovarPop | AggKind::CovarSamp => {
-                            if parts.len() != 4 {
-                                return Err("covar utf8 state expects 4 parts".to_string());
-                            }
-                            let mean_x = parts[0].parse::<f64>().map_err(|e| e.to_string())?;
-                            let mean_y = parts[1].parse::<f64>().map_err(|e| e.to_string())?;
-                            let c2 = parts[2].parse::<f64>().map_err(|e| e.to_string())?;
-                            let count = parts[3].parse::<i64>().map_err(|e| e.to_string())?;
-                            let state =
-                                unsafe { &mut *((base as *mut u8).add(offset) as *mut CovarState) };
-                            merge_covar_state(state, mean_x, mean_y, c2, count);
-                        }
-                        AggKind::Corr => {
-                            if parts.len() != 6 {
-                                return Err("corr utf8 state expects 6 parts".to_string());
-                            }
-                            let mean_x = parts[0].parse::<f64>().map_err(|e| e.to_string())?;
-                            let mean_y = parts[1].parse::<f64>().map_err(|e| e.to_string())?;
-                            let c2 = parts[2].parse::<f64>().map_err(|e| e.to_string())?;
-                            let count = parts[3].parse::<i64>().map_err(|e| e.to_string())?;
-                            let m2x = parts[4].parse::<f64>().map_err(|e| e.to_string())?;
-                            let m2y = parts[5].parse::<f64>().map_err(|e| e.to_string())?;
-                            let state =
-                                unsafe { &mut *((base as *mut u8).add(offset) as *mut CorrState) };
-                            merge_corr_state(state, mean_x, mean_y, c2, count, m2x, m2y);
-                        }
-                        _ => return Err("covar/corr kind mismatch".to_string()),
-                    }
-                }
-                Ok(())
-            }
-            _ => Err("covar/corr merge input type mismatch".to_string()),
+        if !matches!(input, AggInputView::Binary(_) | AggInputView::Utf8(_)) {
+            return Err("covar/corr merge input type mismatch".to_owned());
         }
+        super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
 
     fn build_array(
@@ -404,126 +171,7 @@ impl AggregateFunction for CovarCorrAgg {
         group_states: &[AggStatePtr],
         output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        if output_intermediate {
-            match spec.intermediate_type {
-                DataType::Binary => {
-                    let mut builder = BinaryBuilder::new();
-                    for &base in group_states {
-                        match spec.kind {
-                            AggKind::CovarPop | AggKind::CovarSamp => {
-                                let state = unsafe {
-                                    &*((base as *mut u8).add(offset) as *const CovarState)
-                                };
-                                if state.count == 0 {
-                                    builder.append_null();
-                                    continue;
-                                }
-                                let mut buf = [0u8; 32];
-                                buf[0..8].copy_from_slice(&state.mean_x.to_le_bytes());
-                                buf[8..16].copy_from_slice(&state.mean_y.to_le_bytes());
-                                buf[16..24].copy_from_slice(&state.c2.to_le_bytes());
-                                buf[24..32].copy_from_slice(&state.count.to_le_bytes());
-                                builder.append_value(buf);
-                            }
-                            AggKind::Corr => {
-                                let state = unsafe {
-                                    &*((base as *mut u8).add(offset) as *const CorrState)
-                                };
-                                if state.count == 0 {
-                                    builder.append_null();
-                                    continue;
-                                }
-                                let mut buf = [0u8; 48];
-                                buf[0..8].copy_from_slice(&state.mean_x.to_le_bytes());
-                                buf[8..16].copy_from_slice(&state.mean_y.to_le_bytes());
-                                buf[16..24].copy_from_slice(&state.c2.to_le_bytes());
-                                buf[24..32].copy_from_slice(&state.count.to_le_bytes());
-                                buf[32..40].copy_from_slice(&state.m2x.to_le_bytes());
-                                buf[40..48].copy_from_slice(&state.m2y.to_le_bytes());
-                                builder.append_value(buf);
-                            }
-                            _ => return Err("covar/corr kind mismatch".to_string()),
-                        }
-                    }
-                    return Ok(std::sync::Arc::new(builder.finish()));
-                }
-                DataType::Utf8 => {
-                    let mut builder = StringBuilder::new();
-                    for &base in group_states {
-                        match spec.kind {
-                            AggKind::CovarPop | AggKind::CovarSamp => {
-                                let state = unsafe {
-                                    &*((base as *mut u8).add(offset) as *const CovarState)
-                                };
-                                if state.count == 0 {
-                                    builder.append_null();
-                                } else {
-                                    builder.append_value(format!(
-                                        "{},{},{},{}",
-                                        state.mean_x, state.mean_y, state.c2, state.count
-                                    ));
-                                }
-                            }
-                            AggKind::Corr => {
-                                let state = unsafe {
-                                    &*((base as *mut u8).add(offset) as *const CorrState)
-                                };
-                                if state.count == 0 {
-                                    builder.append_null();
-                                } else {
-                                    builder.append_value(format!(
-                                        "{},{},{},{},{},{}",
-                                        state.mean_x,
-                                        state.mean_y,
-                                        state.c2,
-                                        state.count,
-                                        state.m2x,
-                                        state.m2y
-                                    ));
-                                }
-                            }
-                            _ => return Err("covar/corr kind mismatch".to_string()),
-                        }
-                    }
-                    return Ok(std::sync::Arc::new(builder.finish()));
-                }
-                _ => {
-                    return Err("covar/corr intermediate type mismatch".to_string());
-                }
-            }
-        }
-
-        let mut builder = Float64Builder::new();
-        for &base in group_states {
-            match spec.kind {
-                AggKind::CovarPop => {
-                    let state = unsafe { &*((base as *mut u8).add(offset) as *const CovarState) };
-                    if state.count == 0 {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(state.c2 / state.count as f64);
-                    }
-                }
-                AggKind::CovarSamp => {
-                    let state = unsafe { &*((base as *mut u8).add(offset) as *const CovarState) };
-                    if state.count <= 1 {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(state.c2 / (state.count as f64 - 1.0));
-                    }
-                }
-                AggKind::Corr => {
-                    let state = unsafe { &*((base as *mut u8).add(offset) as *const CorrState) };
-                    if state.count < 2 || state.m2x <= 0.0 || state.m2y <= 0.0 {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(state.c2 / state.m2x.sqrt() / state.m2y.sqrt());
-                    }
-                }
-                _ => return Err("covar/corr kind mismatch".to_string()),
-            }
-        }
-        Ok(std::sync::Arc::new(builder.finish()))
+        super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
 }
 

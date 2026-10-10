@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -252,22 +254,26 @@ impl ProcessorOperator for PartitionedJoinProbeProcessorOperator {
             && (self.core.is_build_loaded() || self.state.is_partition_ready(self.partition))
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         self.init_profile_if_needed();
         if self.finishing {
-            return Err("partitioned join probe received input after set_finishing".to_string());
+            return Err("partitioned join probe received input after set_finishing"
+                .to_string()
+                .into());
         }
         if self.pending_output.is_some() {
             return Err(
-                "partitioned join probe received input while output buffer is full".to_string(),
+                "partitioned join probe received input while output buffer is full"
+                    .to_string()
+                    .into(),
             );
         }
         if !self.core.is_build_loaded() && !self.state.is_partition_ready(self.partition) {
             if self.buffered.len() >= self.max_buffered_probe_chunks {
-                return Err("partitioned join probe buffer is full".to_string());
+                return Err("partitioned join probe buffer is full".to_string().into());
             }
             if !chunk.is_empty() {
                 self.buffered_rows = self.buffered_rows.saturating_add(chunk.len() as u64);
@@ -287,7 +293,7 @@ impl ProcessorOperator for PartitionedJoinProbeProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if self.pending_output.is_none() {
             if self.core.has_pending_output() {
                 self.pending_output = self.core.pop_pending_output()?;
@@ -317,7 +323,7 @@ impl ProcessorOperator for PartitionedJoinProbeProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }

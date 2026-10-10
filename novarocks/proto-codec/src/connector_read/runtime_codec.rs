@@ -87,7 +87,11 @@ impl fmt::Display for ConnectorReadCodecError {
     }
 }
 
-impl std::error::Error for ConnectorReadCodecError {}
+impl std::error::Error for ConnectorReadCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.protocol)
+    }
+}
 
 /// FE-to-wire half of the connector read codec contract.
 ///
@@ -533,6 +537,7 @@ fn wire_error(owner: &str, error: ConnectorCodecError) -> ConnectorReadCodecErro
         ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
         ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
         ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
+        ConnectorCodecErrorKind::CompileControl(cause) => ProtocolErrorKind::CompileControl(cause),
     };
     ConnectorReadCodecError::new(
         owner,
@@ -664,5 +669,47 @@ impl DecodedConnectorReadScan {
 
     pub const fn work_source(&self) -> ConnectorReadWorkSource {
         self.work_source
+    }
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn provider_control_adapter_preserves_exact_typed_cause() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = wire_error("paimon", ConnectorCodecError::from(cause));
+            let outer_source = std::error::Error::source(&error).unwrap();
+            assert_eq!(
+                outer_source.downcast_ref::<ProtocolError>(),
+                Some(error.protocol())
+            );
+            assert_eq!(
+                error.protocol().kind(),
+                ProtocolErrorKind::CompileControl(cause)
+            );
+            assert_eq!(
+                std::error::Error::source(error.protocol())
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+        }
+        let diagnostic = wire_error(
+            "paimon",
+            ConnectorCodecError::new(
+                novarocks_spi::connector::ConnectorFieldPath::root("payload"),
+                ConnectorCodecErrorKind::Capacity,
+                "pure compilation was cancelled",
+            ),
+        );
+        assert_eq!(diagnostic.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert!(std::error::Error::source(diagnostic.protocol()).is_none());
     }
 }

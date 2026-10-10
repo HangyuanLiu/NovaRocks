@@ -29,6 +29,9 @@ pub mod backend_task_execution;
 #[cfg(any(test, feature = "test-support"))]
 pub mod backend_test_support;
 pub mod catalog_prune_rpc;
+pub mod compiled_runtime_filter;
+pub mod compiled_scan_binding;
+pub mod compiled_writer_binding;
 pub mod connector_write_data_plane;
 #[cfg(any(test, feature = "test-support"))]
 pub mod connector_write_test_support;
@@ -104,6 +107,7 @@ pub mod runtime_filter_terminal;
 pub mod runtime_filter_test_support;
 pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
+pub mod static_package_admission;
 pub mod task_execution_observation;
 pub mod task_protocol;
 pub mod task_protocol_fault;

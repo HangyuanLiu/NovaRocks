@@ -22,6 +22,7 @@ novarocks-result-contract.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-execution-contract.workspace = true
 novarocks-spi.workspace = true
+novarocks-type-contract.workspace = true
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }

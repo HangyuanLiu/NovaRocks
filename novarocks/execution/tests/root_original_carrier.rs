@@ -25,6 +25,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::pipeline::driver::{DriverState, PipelineDriver};
 use novarocks_execution::exec::pipeline::operator::{Operator, ProcessorOperator};
+use novarocks_execution::runtime::fragment::ExecutionResult;
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::{OperatorProfiles, Profiler};
 use novarocks_execution::runtime::runtime_state::RuntimeState;
@@ -64,15 +65,15 @@ impl ProcessorOperator for OneChunkSource {
         self.chunk.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-        Err("the source does not accept input".to_string())
+    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        Err("the source does not accept input".to_string().into())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(self.chunk.take())
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 }
@@ -126,11 +127,11 @@ macro_rules! receiver_processor_readiness {
             false
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.finished = true;
             Ok(())
         }
@@ -148,7 +149,7 @@ impl ProcessorOperator for OriginalReceiver {
         panic!("original input must bypass dictionary hydration and profiler inspection")
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         assert!(Arc::ptr_eq(&self.schema, &chunk.chunk_schema_ref()));
         assert_eq!(chunk.columns().len(), self.arrays.len());
         for (actual, original) in chunk.columns().iter().zip(&self.arrays) {
@@ -176,7 +177,7 @@ impl ProcessorOperator for OrdinaryReceiver {
     receiver_processor_readiness!();
 
     // Keep the default takes_original_input/accepts_encoded_column behavior.
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         assert_eq!(chunk.columns()[0].data_type(), &DataType::Utf8);
         *self.received.lock().unwrap() = Some(chunk);
         Ok(())

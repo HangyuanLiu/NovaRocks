@@ -16,9 +16,11 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Int32Array};
-use std::sync::Arc;
-
+use arrow::array::{Array, ArrayRef};
+use novarocks_functions::{
+    Selection,
+    builtin::map_size_core::{MapSizeFailure, count_observed, map_input},
+};
 pub fn eval_map_size(
     arena: &ExprArena,
     expr: ExprId,
@@ -27,20 +29,15 @@ pub fn eval_map_size(
 ) -> Result<ArrayRef, String> {
     let _ = chunk;
     let map_arr = arena.eval(args[0], chunk)?;
-    let map = map_arr
-        .as_any()
-        .downcast_ref::<arrow::array::MapArray>()
-        .ok_or_else(|| format!("map_size expects MapArray, got {:?}", map_arr.data_type()))?;
-    let offsets = map.value_offsets();
-
-    let mut out = Vec::with_capacity(map.len());
-    for row in 0..map.len() {
-        if map.is_null(row) {
-            out.push(None);
-        } else {
-            out.push(Some(offsets[row + 1] - offsets[row]));
-        }
-    }
-    let out = Arc::new(Int32Array::from(out)) as ArrayRef;
+    let map = map_input(map_arr.as_ref())?;
+    let out = count_observed(
+        map,
+        Selection::all(map.len()),
+        |_, row| Ok::<_, String>(row),
+        &mut |_| Ok(()),
+    )
+    .map_err(|failure| match failure {
+        MapSizeFailure::Data(message) | MapSizeFailure::Control(message) => message,
+    })?;
     super::common::cast_output(out, arena.data_type(expr), "map_size")
 }

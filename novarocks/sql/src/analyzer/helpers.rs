@@ -21,7 +21,421 @@ use arrow::datatypes::{DataType, Field, Fields};
 use novarocks_parser::{ast, printer};
 
 use crate::analyze_error::AnalyzeError;
-use novarocks_types::logical::{LogicalType, field_with_logical_type};
+
+/// Preserve the authored domain while changing a scope's null padding.
+pub(super) fn with_nullability(
+    mut ty: novarocks_type_contract::FunctionValueType,
+    nullable: bool,
+) -> novarocks_type_contract::FunctionValueType {
+    ty.nullable = nullable;
+    ty
+}
+
+/// A read-only SQL spelling projection of the sole value-domain identity.
+pub(crate) fn sql_logical_projection(
+    logical: novarocks_type_contract::ValueLogicalType,
+) -> Option<novarocks_types::schema::SqlType> {
+    use novarocks_type_contract::ValueLogicalType as V;
+    use novarocks_types::schema::SqlType as S;
+    match logical {
+        V::Json => Some(S::Json),
+        V::Hll => Some(S::Hll),
+        V::Bitmap => Some(S::Bitmap),
+        V::Variant => Some(S::Variant),
+        V::LargeInt => Some(S::LargeInt),
+        _ => None,
+    }
+}
+
+enum ColumnProjectionError {
+    Source(novarocks_types::ColumnValueTypeError),
+    Control(novarocks_type_contract::CompileControlError),
+}
+impl From<novarocks_types::ColumnValueTypeError> for ColumnProjectionError {
+    fn from(error: novarocks_types::ColumnValueTypeError) -> Self {
+        Self::Source(error)
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for ColumnProjectionError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Source(error.into())
+    }
+}
+
+/// Catalog declaration validation borrows the original request's control.
+pub(super) fn column_value_type(
+    column: &novarocks_types::schema::ColumnDef,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .map_err(AnalyzeError::control)?;
+    let result = column
+        .declared_value_type_observed(|| work.step().map_err(ColumnProjectionError::Control))
+        .map_err(|error| match error {
+            ColumnProjectionError::Control(error) => AnalyzeError::control(error),
+            ColumnProjectionError::Source(error) => {
+                AnalyzeError::internal(format!("invalid catalog column `{}`: {error}", column.name))
+            }
+        });
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.control_error().is_some())
+    {
+        return result;
+    }
+    work.finish().map_err(AnalyzeError::control)?;
+    result
+}
+
+pub(super) fn validate_value_type(
+    ty: &novarocks_type_contract::FunctionValueType,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), AnalyzeError> {
+    use novarocks_functions::KernelFailure;
+    use novarocks_type_contract::{CompileCheckpoints, CompileControlError, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+        .map_err(AnalyzeError::control)?;
+    let result = novarocks_functions::validate_function_value_type_observed(ty, &mut work).map_err(
+        |error| match error {
+            KernelFailure::Cancelled => AnalyzeError::control(CompileControlError::Cancelled),
+            KernelFailure::DeadlineExceeded => {
+                AnalyzeError::control(CompileControlError::DeadlineExceeded)
+            }
+            KernelFailure::ResourceExhausted => {
+                AnalyzeError::control(CompileControlError::ResourceExhausted)
+            }
+            error => AnalyzeError::internal(error.to_string()),
+        },
+    );
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.control_error().is_some())
+    {
+        return result;
+    }
+    work.finish().map_err(AnalyzeError::control)?;
+    result
+}
+
+pub(super) fn field_value_type(
+    field: &Field,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
+    let logical_type = novarocks_type_contract::field_logical_type(field)
+        .map_err(|error| AnalyzeError::internal(error.to_string()))?;
+    let ty = novarocks_type_contract::FunctionValueType {
+        data_type: field.data_type().clone(),
+        nullable: field.is_nullable(),
+        logical_type,
+    };
+    validate_value_type(&ty, control)?;
+    Ok(ty)
+}
+
+/// The SQL assignment-common owner preserves established domains and NULL
+/// neutrality. Mixed JSON/string deliberately selects the existing STRING
+/// domain; lowering must represent that semantic conversion by its exact owner,
+/// rather than admitting an identity-erasing primitive carrier cast.
+pub(super) fn assignment_common_value_type(
+    left: &novarocks_type_contract::FunctionValueType,
+    right: &novarocks_type_contract::FunctionValueType,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
+    validate_value_type(left, control)?;
+    validate_value_type(right, control)?;
+    let nullable = left.nullable || right.nullable;
+    if left.data_type == DataType::Null {
+        return Ok(with_nullability(right.clone(), nullable));
+    }
+    if right.data_type == DataType::Null {
+        return Ok(with_nullability(left.clone(), nullable));
+    }
+    let carrier = novarocks_types::wider_type(&left.data_type, &right.data_type);
+    let logical_type = common_root(left, right, &carrier);
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+        .map_err(AnalyzeError::control)?;
+    let data_type = common_nested_metadata(&carrier, &left.data_type, &right.data_type, &mut work)?;
+    work.finish().map_err(AnalyzeError::control)?;
+    let value = novarocks_type_contract::FunctionValueType {
+        data_type,
+        nullable,
+        logical_type,
+    };
+    validate_value_type(&value, control)?;
+    // The ordinary fallback domain is authored by the existing assignment
+    // rule. It does not establish JSON or LARGEINT from an Arrow carrier.
+    debug_assert!(
+        logical_type != ValueLogicalType::Json
+            || left.logical_type == ValueLogicalType::Json
+                && right.logical_type == ValueLogicalType::Json
+    );
+    Ok(value)
+}
+
+fn common_root(
+    left: &novarocks_type_contract::FunctionValueType,
+    right: &novarocks_type_contract::FunctionValueType,
+    target: &DataType,
+) -> novarocks_type_contract::ValueLogicalType {
+    use novarocks_type_contract::ValueLogicalType as V;
+    if left.data_type == DataType::Null {
+        return right.logical_type;
+    }
+    if right.data_type == DataType::Null {
+        return left.logical_type;
+    }
+    if left.logical_type == right.logical_type && left.logical_type.validate_carrier(target).is_ok()
+    {
+        return left.logical_type;
+    }
+    let integer = |ty: &novarocks_type_contract::FunctionValueType| {
+        ty.logical_type == V::Physical
+            && matches!(
+                ty.data_type,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            )
+    };
+    if matches!(target, DataType::FixedSizeBinary(16))
+        && ((left.logical_type == V::LargeInt && integer(right))
+            || (right.logical_type == V::LargeInt && integer(left)))
+    {
+        return V::LargeInt;
+    }
+    V::Physical
+}
+
+fn common_nested_metadata(
+    target: &DataType,
+    left: &DataType,
+    right: &DataType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<DataType, AnalyzeError> {
+    work.step().map_err(AnalyzeError::control)?;
+    if left == &DataType::Null {
+        return Ok(right.clone());
+    }
+    if right == &DataType::Null {
+        return Ok(left.clone());
+    }
+    let field = |target: &Arc<Field>,
+                 left: &Arc<Field>,
+                 right: &Arc<Field>,
+                 work: &mut novarocks_type_contract::CompileCheckpoints<'_>|
+     -> Result<Arc<Field>, AnalyzeError> {
+        work.step().map_err(AnalyzeError::control)?;
+        let left_type = novarocks_type_contract::FunctionValueType {
+            data_type: left.data_type().clone(),
+            nullable: left.is_nullable(),
+            logical_type: novarocks_type_contract::field_logical_type(left)
+                .map_err(|e| AnalyzeError::internal(e.to_string()))?,
+        };
+        let right_type = novarocks_type_contract::FunctionValueType {
+            data_type: right.data_type().clone(),
+            nullable: right.is_nullable(),
+            logical_type: novarocks_type_contract::field_logical_type(right)
+                .map_err(|e| AnalyzeError::internal(e.to_string()))?,
+        };
+        let logical = common_root(&left_type, &right_type, target.data_type());
+        let data_type = common_nested_metadata(
+            target.data_type(),
+            left.data_type(),
+            right.data_type(),
+            work,
+        )?;
+        let mut metadata = left.metadata().clone();
+        metadata.remove(novarocks_type_contract::NR_LOGICAL_TYPE_KEY);
+        if let Some(value) = logical.metadata_value() {
+            metadata.insert(
+                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
+                value.to_string(),
+            );
+        }
+        Ok(Arc::new(
+            target
+                .as_ref()
+                .clone()
+                .with_data_type(data_type)
+                .with_metadata(metadata),
+        ))
+    };
+    Ok(match (target, left, right) {
+        (DataType::List(target), DataType::List(left), DataType::List(right)) => {
+            DataType::List(field(target, left, right, work)?)
+        }
+        (DataType::LargeList(target), DataType::LargeList(left), DataType::LargeList(right)) => {
+            DataType::LargeList(field(target, left, right, work)?)
+        }
+        (
+            DataType::FixedSizeList(target, size),
+            DataType::FixedSizeList(left, _),
+            DataType::FixedSizeList(right, _),
+        ) => DataType::FixedSizeList(field(target, left, right, work)?, *size),
+        (DataType::Map(target, sorted), DataType::Map(left, _), DataType::Map(right, _)) => {
+            DataType::Map(field(target, left, right, work)?, *sorted)
+        }
+        (DataType::Struct(target), DataType::Struct(left), DataType::Struct(right))
+            if target.len() == left.len() && target.len() == right.len() =>
+        {
+            let mut left_by_name = std::collections::BTreeMap::new();
+            let mut right_by_name = std::collections::BTreeMap::new();
+            for source in left.iter() {
+                work.step().map_err(AnalyzeError::control)?;
+                left_by_name.entry(source.name().as_str()).or_insert(source);
+            }
+            for source in right.iter() {
+                work.step().map_err(AnalyzeError::control)?;
+                right_by_name
+                    .entry(source.name().as_str())
+                    .or_insert(source);
+            }
+            let mut fields = Vec::with_capacity(target.len());
+            for (ordinal, target) in target.iter().enumerate() {
+                work.step().map_err(AnalyzeError::control)?;
+                // The existing wider-type owner may align STRUCTs by name.
+                let l = left_by_name
+                    .get(target.name().as_str())
+                    .copied()
+                    .unwrap_or(&left[ordinal]);
+                let r = right_by_name
+                    .get(target.name().as_str())
+                    .copied()
+                    .unwrap_or(&right[ordinal]);
+                fields.push(field(target, l, r, work)?);
+            }
+            DataType::Struct(Fields::from(fields))
+        }
+        _ => target.clone(),
+    })
+}
+
+/// A JSON declaration does not validate existing ordinary non-NULL strings.
+/// NULL has no value to convert and can carry the declared target domain.
+pub(super) fn declared_cast_value_type(
+    source: &crate::analysis::TypedExpr,
+    mut declared: novarocks_type_contract::FunctionValueType,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
+    if matches!(
+        source.kind,
+        crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Null)
+    ) {
+        return Ok(declared);
+    }
+    if declared.logical_type == ValueLogicalType::Json
+        && source.value_type.logical_type != ValueLogicalType::Json
+        && source.value_type.data_type != DataType::Null
+    {
+        declared.logical_type = ValueLogicalType::Physical;
+    }
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+        .map_err(AnalyzeError::control)?;
+    declared.data_type =
+        cast_json_metadata(&declared.data_type, &source.value_type.data_type, &mut work)?;
+    work.finish().map_err(AnalyzeError::control)?;
+    Ok(declared)
+}
+
+fn cast_json_metadata(
+    target: &DataType,
+    source: &DataType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<DataType, AnalyzeError> {
+    work.step().map_err(AnalyzeError::control)?;
+    if source == &DataType::Null {
+        return Ok(target.clone());
+    }
+    let field = |target: &Arc<Field>,
+                 source: &Arc<Field>,
+                 work: &mut novarocks_type_contract::CompileCheckpoints<'_>|
+     -> Result<Arc<Field>, AnalyzeError> {
+        work.step().map_err(AnalyzeError::control)?;
+        let mut metadata = target.metadata().clone();
+        if novarocks_type_contract::field_logical_type(target)
+            == Ok(novarocks_type_contract::ValueLogicalType::Json)
+            && novarocks_type_contract::field_logical_type(source)
+                != Ok(novarocks_type_contract::ValueLogicalType::Json)
+            && source.data_type() != &DataType::Null
+        {
+            metadata.remove(novarocks_type_contract::NR_LOGICAL_TYPE_KEY);
+        }
+        let data_type = cast_json_metadata(target.data_type(), source.data_type(), work)?;
+        Ok(Arc::new(
+            target
+                .as_ref()
+                .clone()
+                .with_data_type(data_type)
+                .with_metadata(metadata),
+        ))
+    };
+    Ok(match (target, source) {
+        (DataType::List(target), DataType::List(source)) => {
+            DataType::List(field(target, source, work)?)
+        }
+        (DataType::LargeList(target), DataType::LargeList(source)) => {
+            DataType::LargeList(field(target, source, work)?)
+        }
+        (DataType::FixedSizeList(target, size), DataType::FixedSizeList(source, _)) => {
+            DataType::FixedSizeList(field(target, source, work)?, *size)
+        }
+        (DataType::Map(target, sorted), DataType::Map(source, _)) => {
+            DataType::Map(field(target, source, work)?, *sorted)
+        }
+        (DataType::Struct(target), DataType::Struct(source)) if target.len() == source.len() => {
+            let mut fields = Vec::with_capacity(target.len());
+            for (target, source) in target.iter().zip(source) {
+                work.step().map_err(AnalyzeError::control)?;
+                fields.push(field(target, source, work)?);
+            }
+            DataType::Struct(Fields::from(fields))
+        }
+        _ => target.clone(),
+    })
+}
+
+fn declared_root(sql_type: &ast::TypeName) -> novarocks_type_contract::ValueLogicalType {
+    use novarocks_type_contract::ValueLogicalType as V;
+    match sql_type
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("json" | "jsonb") => V::Json,
+        Some("variant") => V::Variant,
+        Some("largeint") => V::LargeInt,
+        Some("hll") => V::Hll,
+        Some("bitmap") => V::Bitmap,
+        _ => V::Physical,
+    }
+}
+
+/// The AST declaration establishes identity; its carrier alone never does.
+pub(super) fn sql_type_to_value_type(
+    sql_type: &ast::TypeName,
+    nullable: bool,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
+    // The existing recursive parser type conversion remains an opaque source
+    // conversion here; the resulting complete domain has observed validation.
+    let ty = novarocks_type_contract::FunctionValueType {
+        data_type: sql_type_to_arrow(sql_type)?,
+        nullable,
+        logical_type: declared_root(sql_type),
+    };
+    validate_value_type(&ty, control)?;
+    Ok(ty)
+}
 
 // ---------------------------------------------------------------------------
 // SQL type -> Arrow type conversion
@@ -36,18 +450,15 @@ fn nested_field_with_logical_type(
 ) -> Result<Field, AnalyzeError> {
     let arrow = sql_type_to_arrow(sql_type)?;
     let mut field = Field::new(name, arrow, nullable);
-    if is_json_sql_type(sql_type) {
-        field = field_with_logical_type(field, LogicalType::Json);
+    if let Some(value) = declared_root(sql_type).metadata_value() {
+        let mut metadata = field.metadata().clone();
+        metadata.insert(
+            novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
+            value.to_string(),
+        );
+        field = field.with_metadata(metadata);
     }
     Ok(field)
-}
-
-fn is_json_sql_type(sql_type: &novarocks_parser::ast::TypeName) -> bool {
-    sql_type
-        .name
-        .parts
-        .last()
-        .is_some_and(|part| matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb"))
 }
 
 pub(super) fn sql_type_to_arrow(

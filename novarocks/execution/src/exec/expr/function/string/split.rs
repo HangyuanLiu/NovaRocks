@@ -16,15 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, ListBuilder, StringArray, StringBuilder};
-use std::sync::Arc;
+use arrow::array::ArrayRef;
 
-/// Evaluate split function.
-/// Semantics align with StarRocks:
-/// - split(str, delim) returns ARRAY<VARCHAR>
-/// - empty delimiter splits into UTF-8 characters
-/// - empty string with non-empty delimiter yields [""]
-/// - if any argument is NULL, result is NULL
 pub fn eval_split(
     arena: &ExprArena,
     str_expr: ExprId,
@@ -33,52 +26,5 @@ pub fn eval_split(
 ) -> Result<ArrayRef, String> {
     let str_array = arena.eval(str_expr, chunk)?;
     let delim_array = arena.eval(delim_expr, chunk)?;
-
-    let str_arr = str_array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "split: first argument must be a string array".to_string())?;
-    let delim_arr = delim_array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "split: second argument must be a string array".to_string())?;
-
-    let len = str_arr.len();
-    if delim_arr.len() != len {
-        return Err("split: argument length mismatch".to_string());
-    }
-
-    let value_builder = StringBuilder::new();
-    let mut list_builder = ListBuilder::new(value_builder);
-
-    for row in 0..len {
-        if str_arr.is_null(row) || delim_arr.is_null(row) {
-            list_builder.append(false);
-            continue;
-        }
-
-        let haystack = str_arr.value(row);
-        let delimiter = delim_arr.value(row);
-
-        if delimiter.is_empty() {
-            for ch in haystack.chars() {
-                let mut buf = [0u8; 4];
-                let s = ch.encode_utf8(&mut buf);
-                list_builder.values().append_value(s);
-            }
-            list_builder.append(true);
-            continue;
-        }
-
-        let mut start = 0usize;
-        while let Some(pos) = haystack[start..].find(delimiter) {
-            let end = start + pos;
-            list_builder.values().append_value(&haystack[start..end]);
-            start = end + delimiter.len();
-        }
-        list_builder.values().append_value(&haystack[start..]);
-        list_builder.append(true);
-    }
-
-    Ok(Arc::new(list_builder.finish()))
+    novarocks_functions::builtin::string_split::evaluate_legacy(&str_array, &delim_array)
 }

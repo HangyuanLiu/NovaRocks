@@ -624,11 +624,45 @@ fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
         | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
         ProtocolErrorKind::Conflict => tonic::Status::already_exists(detail),
         ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
+        ProtocolErrorKind::CompileControl(cause) => match cause {
+            novarocks_type_contract::CompileControlError::Cancelled => {
+                tonic::Status::cancelled(detail)
+            }
+            novarocks_type_contract::CompileControlError::DeadlineExceeded => {
+                tonic::Status::deadline_exceeded(detail)
+            }
+            novarocks_type_contract::CompileControlError::ResourceExhausted => {
+                tonic::Status::resource_exhausted(detail)
+            }
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pure_compile_protocol_control_uses_exact_transport_status() {
+        use novarocks_type_contract::CompileControlError;
+        for (cause, code) in [
+            (CompileControlError::Cancelled, tonic::Code::Cancelled),
+            (
+                CompileControlError::DeadlineExceeded,
+                tonic::Code::DeadlineExceeded,
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                tonic::Code::ResourceExhausted,
+            ),
+        ] {
+            let error = novarocks_proto_codec::ProtocolError::new(
+                novarocks_proto_codec::FieldPath::root("provider_payload"),
+                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause),
+                cause.to_string(),
+            );
+            assert_eq!(super::status_from_contract_error(error).code(), code);
+        }
+    }
     use std::net::SocketAddr;
     use std::sync::Arc;
 
