@@ -2541,6 +2541,16 @@ pub(crate) mod external_listing_tests {
             self.incarnation
         }
 
+        fn admit(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
+            request.context.check_active()?;
+            assert!(
+                matches!(&request.operation, ConnectorCatalogMutationOperation::DropNamespace { namespace, .. }
+                    if namespace.instance_id == self.descriptor.instance_id && namespace.namespace.as_ref() == "db")
+            );
+            self.call("admit");
+            Ok(())
+        }
+
         fn execute(
             &self,
             _: ConnectorCatalogMutationRequest,
@@ -2566,11 +2576,17 @@ pub(crate) mod external_listing_tests {
     fn drop_database_force_listing_errors_precede_every_destructive_mutation() {
         for kind in error_kinds() {
             for (point, calls) in [
-                (FailurePoint::NamespaceExists, vec!["namespace_exists"]),
-                (FailurePoint::Tables, vec!["namespace_exists", "tables:db"]),
+                (
+                    FailurePoint::NamespaceExists,
+                    vec!["admit", "namespace_exists"],
+                ),
+                (
+                    FailurePoint::Tables,
+                    vec!["admit", "namespace_exists", "tables:db"],
+                ),
                 (
                     FailurePoint::Views,
-                    vec!["namespace_exists", "tables:db", "views"],
+                    vec!["admit", "namespace_exists", "tables:db", "views"],
                 ),
             ] {
                 let fixture = ListingFixture::new(point, kind);
