@@ -3361,7 +3361,7 @@ impl IcebergWriteSessionControl {
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
+                crate::manifest::extract_cow_data_files_with_stats_at(&owned, snapshot_id).await
             })
             .map_err(|error| unavailable(error.to_string()))?
             .map_err(unavailable)

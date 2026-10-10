@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::delete_semantics::{
     DataFileFact, DeleteCandidateIndex, DeleteContentAddress, DeleteKind, DeleteObservation,
-    DeleteReadFacts, EntrySequence, EqualityFieldGroup, FieldMetrics, FileMetrics,
+    DeleteReadFacts, EntrySequence, EqualityFieldGroup, FieldMetrics, FileMetrics, LoadView,
     ManifestDeleteObservation, POSITION_FILE_PATH_FIELD_ID, PinnedEndpointFacts, RawDeleteEntry,
     RawDeleteFile, ReadDomain, ReadObservationId, StatisticsPolicy, TypedPartition,
 };
@@ -235,6 +235,38 @@ pub(crate) async fn build_read_snapshot_in_domain(
     domain: Arc<ReadDomain>,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<IcebergReadSnapshot, String> {
+    let snapshot_id = domain.endpoint().snapshot_id();
+    let files = observe_read_files::<DataFile>(table, domain, control).await?;
+    Ok(IcebergReadSnapshot {
+        snapshot_id: Some(snapshot_id),
+        files,
+    })
+}
+
+/// COW needs the same validated read facts, but not the scan metadata graph.
+pub(crate) async fn build_cow_read_files_at_with_control(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<Vec<CowReadFile>, String> {
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    let schema = snapshot
+        .schema(metadata)
+        .map_err(|e| format!("resolve snapshot schema: {e}"))?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+    observe_read_files::<CowDataFileProjection>(table, domain, control).await
+}
+
+/// One common observation retains the original entry, delete and lineage checks.
+/// Only the data-file storage projection differs between scan and COW callers.
+async fn observe_read_files<P: ObservedDataFileProjection>(
+    table: &Table,
+    domain: Arc<ReadDomain>,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<Vec<P::File>, String> {
     check_read_control(control)?;
     let metadata = table.metadata();
     if domain.endpoint().table_uuid() != metadata.uuid()
@@ -333,7 +365,7 @@ pub(crate) async fn build_read_snapshot_in_domain(
                     .map_err(|e| e.to_string())?;
                     let values = resolved_partition_values(df.partition(), &partition_type);
                     observed_data.push((
-                        df.clone(),
+                        P::capture(df, &field_id_to_name),
                         data,
                         values,
                         manifest_file.manifest_path.clone(),
@@ -445,37 +477,144 @@ pub(crate) async fn build_read_snapshot_in_domain(
             }
         };
         let deletes = logical.load_view(policy);
-        files.push(IcebergReadFile {
-            path: df.file_path().to_string(),
-            size: i64::try_from(df.file_size_in_bytes())
-                .map_err(|_| format!("file size too large: {}", df.file_path()))?,
-            record_count: Some(
-                i64::try_from(df.record_count()).map_err(|_| "record count too large")?,
-            ),
-            column_stats: column_stats(&df, &field_id_to_name),
-            partition_spec_id: Some(data.partition().spec_id()),
-            partition_key: iceberg_partition_key(&partition_values),
-            partition_values: Some(partition_values),
-            manifest_path: Some(manifest_path),
-            first_row_id,
-            data_sequence_number: Some(data.sequence().get()),
-            manifest: Arc::new(IcebergDataFileMetadata {
-                file_format: df.file_format(),
-                split_offsets: df.split_offsets().unwrap_or_default().to_vec(),
-                key_metadata: df.key_metadata().unwrap_or_default().to_vec(),
-                value_counts: df.value_counts().clone(),
-                null_value_counts: df.null_value_counts().clone(),
-                nan_value_counts: df.nan_value_counts().clone(),
-                lower_bounds: df.lower_bounds().clone(),
-                upper_bounds: df.upper_bounds().clone(),
-            }),
-            deletes,
-        });
+        files.push(df.into_file(
+            FinalReadFileFacts {
+                partition_spec_id: data.partition().spec_id(),
+                data_sequence_number: data.sequence().get(),
+                partition_values,
+                manifest_path,
+                first_row_id,
+                deletes,
+            },
+            &field_id_to_name,
+        )?);
     }
-    Ok(IcebergReadSnapshot {
-        snapshot_id: Some(snapshot_id),
-        files,
-    })
+    Ok(files)
+}
+
+/// All final conversions still occur after complete manifest/delete validation.
+struct FinalReadFileFacts {
+    partition_spec_id: i32,
+    data_sequence_number: i64,
+    partition_values: Struct,
+    manifest_path: String,
+    first_row_id: Option<i64>,
+    deletes: LoadView,
+}
+
+trait ObservedDataFileProjection: Sized {
+    type File;
+
+    fn capture(df: &DataFile, field_id_to_name: &HashMap<i32, String>) -> Self;
+
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+    ) -> Result<Self::File, String>;
+}
+
+impl ObservedDataFileProjection for DataFile {
+    type File = IcebergReadFile;
+
+    fn capture(df: &DataFile, _field_id_to_name: &HashMap<i32, String>) -> Self {
+        df.clone()
+    }
+
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+    ) -> Result<Self::File, String> {
+        Ok(IcebergReadFile {
+            path: self.file_path().to_string(),
+            size: i64::try_from(self.file_size_in_bytes())
+                .map_err(|_| format!("file size too large: {}", self.file_path()))?,
+            record_count: Some(
+                i64::try_from(self.record_count()).map_err(|_| "record count too large")?,
+            ),
+            column_stats: column_stats(&self, field_id_to_name),
+            partition_spec_id: Some(facts.partition_spec_id),
+            partition_key: iceberg_partition_key(&facts.partition_values),
+            partition_values: Some(facts.partition_values),
+            manifest_path: Some(facts.manifest_path),
+            first_row_id: facts.first_row_id,
+            data_sequence_number: Some(facts.data_sequence_number),
+            manifest: Arc::new(IcebergDataFileMetadata {
+                file_format: self.file_format(),
+                split_offsets: self.split_offsets().unwrap_or_default().to_vec(),
+                key_metadata: self.key_metadata().unwrap_or_default().to_vec(),
+                value_counts: self.value_counts().clone(),
+                null_value_counts: self.null_value_counts().clone(),
+                nan_value_counts: self.nan_value_counts().clone(),
+                lower_bounds: self.lower_bounds().clone(),
+                upper_bounds: self.upper_bounds().clone(),
+            }),
+            deletes: facts.deletes,
+        })
+    }
+}
+
+/// Only fields consumed by the COW manifest projection are copied while the
+/// original SDK DataFile is borrowed. No DataFile or scan metadata is retained.
+struct CowDataFileProjection {
+    path: String,
+    file_size_in_bytes: u64,
+    record_count: u64,
+    column_stats: Option<HashMap<String, IcebergColumnStats>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CowReadFile {
+    pub path: String,
+    pub size: i64,
+    pub record_count: Option<i64>,
+    pub column_stats: Option<HashMap<String, IcebergColumnStats>>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_key: Option<String>,
+    pub partition_values: Option<Struct>,
+    pub manifest_path: Option<String>,
+    pub first_row_id: Option<i64>,
+    pub data_sequence_number: Option<i64>,
+    pub deletes: LoadView,
+}
+
+impl ObservedDataFileProjection for CowDataFileProjection {
+    type File = CowReadFile;
+
+    fn capture(df: &DataFile, field_id_to_name: &HashMap<i32, String>) -> Self {
+        Self {
+            path: df.file_path().to_owned(),
+            file_size_in_bytes: df.file_size_in_bytes(),
+            record_count: df.record_count(),
+            column_stats: column_stats(df, field_id_to_name),
+        }
+    }
+
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        _field_id_to_name: &HashMap<i32, String>,
+    ) -> Result<Self::File, String> {
+        // Preserve the original final iteration's fallible conversion order.
+        let size = i64::try_from(self.file_size_in_bytes)
+            .map_err(|_| format!("file size too large: {}", self.path))?;
+        let record_count =
+            i64::try_from(self.record_count).map_err(|_| "record count too large")?;
+        Ok(CowReadFile {
+            path: self.path,
+            size,
+            record_count: Some(record_count),
+            column_stats: self.column_stats,
+            partition_spec_id: Some(facts.partition_spec_id),
+            partition_key: iceberg_partition_key(&facts.partition_values),
+            partition_values: Some(facts.partition_values),
+            manifest_path: Some(facts.manifest_path),
+            first_row_id: facts.first_row_id,
+            data_sequence_number: Some(facts.data_sequence_number),
+            deletes: facts.deletes,
+        })
+    }
 }
 
 fn resolved_partition_values(
@@ -1771,5 +1910,281 @@ mod tests {
             canonical["schemas"][0]["identifier-field-ids"],
             serde_json::json!([1, 2])
         );
+    }
+
+    fn assert_cow_data_file_parity(
+        ordinary: &crate::manifest::DataFileWithStats,
+        cow: &crate::manifest::DataFileWithStats,
+    ) {
+        assert_eq!(ordinary.path, cow.path);
+        assert_eq!(ordinary.size, cow.size);
+        assert_eq!(ordinary.record_count, cow.record_count);
+        assert_eq!(
+            serde_json::to_value(&ordinary.column_stats).unwrap(),
+            serde_json::to_value(&cow.column_stats).unwrap()
+        );
+        assert_eq!(ordinary.partition_spec_id, cow.partition_spec_id);
+        assert_eq!(ordinary.partition_key, cow.partition_key);
+        assert_eq!(ordinary.partition_values, cow.partition_values);
+        assert_eq!(ordinary.manifest_path, cow.manifest_path);
+        assert_eq!(ordinary.partition_field_values, cow.partition_field_values);
+        assert_eq!(ordinary.first_row_id, cow.first_row_id);
+        assert_eq!(ordinary.data_sequence_number, cow.data_sequence_number);
+        assert_eq!(ordinary.delete_files, cow.delete_files);
+    }
+
+    async fn compare_cow_extraction(table: &Table) -> Vec<crate::manifest::DataFileWithStats> {
+        let ordinary = crate::manifest::extract_data_files_with_stats_at(table, 77)
+            .await
+            .unwrap();
+        let cow = crate::manifest::extract_cow_data_files_with_stats_at(table, 77)
+            .await
+            .unwrap();
+        assert_eq!(ordinary.len(), cow.len());
+        for (ordinary, cow) in ordinary.iter().zip(&cow) {
+            assert_cow_data_file_parity(ordinary, cow);
+        }
+        cow
+    }
+
+    #[tokio::test]
+    async fn cow_extraction_matches_partition_statistics_and_attached_delete_facts() {
+        use crate::iceberg::spec::Datum;
+        let partition = || Struct::from_iter([Some(Literal::string("emea"))]);
+        let mut a = file("a", DataContentType::Data, partition());
+        a.value_counts(HashMap::from([(1, 10)]))
+            .null_value_counts(HashMap::from([(1, 0)]))
+            .column_sizes(HashMap::from([(1, 80)]))
+            .lower_bounds(HashMap::from([(1, Datum::long(0))]))
+            .upper_bounds(HashMap::from([(1, Datum::long(9))]))
+            .key_metadata(Some(vec![9; 4096]))
+            .split_offsets(Some(vec![0, 128, 512]));
+        let b = file("b", DataContentType::Data, partition())
+            .build()
+            .unwrap();
+        let mut position = file("position", DataContentType::PositionDeletes, partition());
+        position.referenced_data_file(Some("a".to_owned()));
+        let mut equality = file("equality", DataContentType::EqualityDeletes, partition());
+        equality.equality_ids(Some(vec![1]));
+        let mut vector = file("vector", DataContentType::PositionDeletes, partition());
+        vector
+            .file_format(DataFileFormat::Puffin)
+            .referenced_data_file(Some("b".to_owned()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(32));
+        let table = table(
+            vec![
+                vec![(a.build().unwrap(), 5), (b, 5)],
+                vec![
+                    (position.build().unwrap(), 5),
+                    (equality.build().unwrap(), 6),
+                ],
+                vec![(vector.build().unwrap(), 5)],
+            ],
+            Some(1),
+            true,
+        )
+        .await;
+        let files = compare_cow_extraction(&table).await;
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(files[0].delete_files.len(), 2);
+        assert_eq!(files[1].delete_files.len(), 2);
+        assert_eq!(files[0].partition_field_values[0].source_column, "region");
+        assert_eq!(
+            files[0].column_stats.as_ref().unwrap()["id"].lower_bound,
+            Some(0_i64.to_le_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn cow_extraction_keeps_all_live_files_and_inherited_first_row_ids() {
+        let mut a = file("before", DataContentType::Data, Struct::empty());
+        a.record_count(3);
+        let mut b = file("after", DataContentType::Data, Struct::empty());
+        b.record_count(7);
+        let table = table(
+            vec![vec![(a.build().unwrap(), 5), (b.build().unwrap(), 5)]],
+            None,
+            false,
+        )
+        .await;
+        let files = compare_cow_extraction(&table).await;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "before");
+        assert_eq!(files[1].path, "after");
+        assert_eq!(files[0].first_row_id, Some(0));
+        assert_eq!(files[1].first_row_id, Some(3));
+        assert_eq!(files[0].record_count, Some(3));
+        assert_eq!(files[1].record_count, Some(7));
+    }
+
+    #[tokio::test]
+    async fn cow_extraction_retains_complete_attached_delete_validation_and_error_priority() {
+        for (variant, expected) in [
+            (0, "older"),
+            (1, "deletion vector"),
+            (2, "encrypted"),
+            (3, "unsupported Iceberg delete format"),
+        ] {
+            let deletes = match variant {
+                0 => vec![(dv("puffin", "a", 4, 2), 4)],
+                1 => vec![(dv("puffin", "a", 4, 2), 5), (dv("puffin", "a", 4, 2), 5)],
+                2 => vec![(
+                    file(
+                        "encrypted",
+                        DataContentType::PositionDeletes,
+                        Struct::empty(),
+                    )
+                    .referenced_data_file(Some("a".to_owned()))
+                    .key_metadata(Some(vec![1]))
+                    .build()
+                    .unwrap(),
+                    5,
+                )],
+                _ => vec![(
+                    file(
+                        "unsupported",
+                        DataContentType::PositionDeletes,
+                        Struct::empty(),
+                    )
+                    .referenced_data_file(Some("a".to_owned()))
+                    .file_format(DataFileFormat::Avro)
+                    .build()
+                    .unwrap(),
+                    5,
+                )],
+            };
+            let table = table(
+                vec![vec![(data("a"), 5), (data("other"), 5)], deletes],
+                None,
+                false,
+            )
+            .await;
+            // Both extractors observe all entries before final projection.
+            let ordinary = match crate::manifest::extract_data_files_with_stats_at(&table, 77).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("ordinary extraction accepted invalid attached delete"),
+            };
+            let cow = match crate::manifest::extract_cow_data_files_with_stats_at(&table, 77).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("COW extraction accepted invalid attached delete"),
+            };
+            assert!(ordinary.contains(expected), "{ordinary}");
+            assert_eq!(cow, ordinary);
+        }
+    }
+
+    #[test]
+    fn cow_borrowed_projection_owns_only_final_fields_and_keeps_raw_size_until_finish() {
+        use crate::iceberg::spec::Datum;
+        let original = file("borrowed", DataContentType::Data, Struct::empty())
+            .file_size_in_bytes(u64::MAX)
+            .value_counts(HashMap::from([(1, 10)]))
+            .lower_bounds(HashMap::from([(1, Datum::long(0))]))
+            .key_metadata(Some(vec![7; 8192]))
+            .split_offsets(Some((0..1024).collect()))
+            .build()
+            .unwrap();
+        let names = HashMap::from([(1, "id".to_owned())]);
+        let projected = CowDataFileProjection::capture(&original, &names);
+        // Enumerating every stored field prevents silently retaining a DataFile
+        // or scan metadata Arc in this projection in a later refactor.
+        let CowDataFileProjection {
+            path,
+            file_size_in_bytes,
+            record_count,
+            column_stats: stats,
+        } = projected;
+        assert_eq!(path, original.file_path());
+        assert_ne!(path.as_ptr(), original.file_path().as_ptr());
+        assert_eq!(file_size_in_bytes, u64::MAX);
+        assert_eq!(record_count, original.record_count());
+        assert_eq!(
+            serde_json::to_value(stats).unwrap(),
+            serde_json::to_value(column_stats(&original, &names)).unwrap()
+        );
+        assert_eq!(original.key_metadata().unwrap(), &[7; 8192]);
+        assert_eq!(original.split_offsets().unwrap().len(), 1024);
+    }
+
+    struct RejectFinalProjection;
+
+    impl ObservedDataFileProjection for RejectFinalProjection {
+        type File = ();
+
+        fn capture(_df: &DataFile, _names: &HashMap<i32, String>) -> Self {
+            Self
+        }
+
+        fn into_file(
+            self,
+            _facts: FinalReadFileFacts,
+            _names: &HashMap<i32, String>,
+        ) -> Result<Self::File, String> {
+            Err("final projection canary".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn cow_observation_preserves_delete_failure_before_fallible_final_projection() {
+        let valid = table(vec![vec![(data("a"), 5)]], None, false).await;
+        let domain =
+            mint_read_domain(valid.metadata(), 77, valid.metadata().current_schema()).unwrap();
+        let canary = observe_read_files::<RejectFinalProjection>(&valid, domain, None)
+            .await
+            .unwrap_err();
+        assert_eq!(canary, "final projection canary");
+
+        let invalid = table(
+            vec![vec![(data("a"), 5)], vec![(dv("puffin", "a", 4, 2), 4)]],
+            None,
+            false,
+        )
+        .await;
+        let domain =
+            mint_read_domain(invalid.metadata(), 77, invalid.metadata().current_schema()).unwrap();
+        let actual = observe_read_files::<RejectFinalProjection>(&invalid, domain, None)
+            .await
+            .unwrap_err();
+        assert!(actual.contains("older"), "{actual}");
+        assert_ne!(actual, canary);
+    }
+
+    fn final_facts_from_read(file: IcebergReadFile) -> FinalReadFileFacts {
+        FinalReadFileFacts {
+            partition_spec_id: file.partition_spec_id.unwrap(),
+            data_sequence_number: file.data_sequence_number.unwrap(),
+            partition_values: file.partition_values.unwrap(),
+            manifest_path: file.manifest_path.unwrap(),
+            first_row_id: file.first_row_id,
+            deletes: file.deletes,
+        }
+    }
+
+    #[tokio::test]
+    async fn cow_final_size_conversion_matches_original_without_early_rejection() {
+        let table = table(vec![vec![(data("a"), 5)]], None, false).await;
+        let mut snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
+        let read = snapshot.files.pop().unwrap();
+        let original = file("a", DataContentType::Data, Struct::empty())
+            .file_size_in_bytes(u64::MAX)
+            .build()
+            .unwrap();
+        let names = HashMap::new();
+        let captured = CowDataFileProjection::capture(&original, &names);
+        assert_eq!(captured.file_size_in_bytes, u64::MAX);
+        let ordinary = original
+            .into_file(final_facts_from_read(read.clone()), &names)
+            .unwrap_err();
+        let cow = captured
+            .into_file(final_facts_from_read(read), &names)
+            .unwrap_err();
+        assert_eq!(ordinary, "file size too large: a");
+        assert_eq!(cow, ordinary);
     }
 }

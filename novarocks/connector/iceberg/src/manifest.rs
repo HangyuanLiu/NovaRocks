@@ -379,6 +379,68 @@ pub(crate) async fn extract_data_files_with_stats_at_with_control(
         .collect()
 }
 
+/// COW extracts the same complete live-file facts without constructing scan-only
+/// DataFile clones or the unused IcebergDataFileMetadata graph.
+pub(crate) async fn extract_cow_data_files_with_stats_at(
+    table: &Table,
+    snapshot_id: i64,
+) -> Result<Vec<DataFileWithStats>, String> {
+    extract_cow_data_files_with_stats_at_with_control(table, snapshot_id, None).await
+}
+
+pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<Vec<DataFileWithStats>, String> {
+    let metadata = table.metadata();
+    let snapshot_schema = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
+        .schema(metadata)
+        .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
+    let files =
+        crate::read_snapshot::build_cow_read_files_at_with_control(table, snapshot_id, control)
+            .await?;
+    files
+        .into_iter()
+        .map(|file| {
+            if let Some(control) = control {
+                control.check_active().map_err(|error| error.to_string())?;
+            }
+            let partition_field_values =
+                match (file.partition_spec_id, file.partition_values.as_ref()) {
+                    (Some(spec_id), Some(partition_values)) => partition_field_values(
+                        metadata,
+                        snapshot_schema.as_ref(),
+                        spec_id,
+                        partition_values,
+                    )?,
+                    _ => Vec::new(),
+                };
+            let delete_files = file
+                .deletes
+                .members()
+                .map(|fact| canonical_delete_to_catalog_delete(fact))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataFileWithStats {
+                path: file.path,
+                size: file.size,
+                record_count: file.record_count,
+                column_stats: file.column_stats,
+                partition_spec_id: file.partition_spec_id,
+                partition_key: file.partition_key,
+                partition_values: file.partition_values,
+                manifest_path: file.manifest_path,
+                partition_field_values,
+                first_row_id: file.first_row_id,
+                data_sequence_number: file.data_sequence_number,
+                delete_files,
+            })
+        })
+        .collect()
+}
+
 pub async fn extract_data_files_with_stats(
     table: &Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
