@@ -32,6 +32,8 @@ UPDATE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mor_lineage_${uuid
 -- query 2
 -- @result_contains=SPARK_MOR_UPDATE_LINEAGE_OK
 shell: set -eu
+interop_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/interop-${uuid0}"
+mkdir -p "$interop_dir"
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-iru5-interop-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
@@ -39,10 +41,10 @@ cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_MOR_UPDATE_LINEAGE_OK") { Iru5SparkCommitInterop.verifyMor(spark, "ice_rest.nr_compat_${suite_uuid0}.mor_lineage_${uuid0}", "update") }
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
-  printf '%s\n' "$spark_out"
+  printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_MOR_UPDATE_LINEAGE_OK.log"
   exit 1
 }
-printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_MOR_UPDATE_LINEAGE_OK.log"
 printf '%s\n' "$spark_out" | grep -Fx 'SPARK_MOR_UPDATE_LINEAGE_OK'
 
 -- query 3
@@ -56,6 +58,8 @@ WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value);
 -- query 4
 -- @result_contains=SPARK_MOR_MERGE_LINEAGE_OK
 shell: set -eu
+interop_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/interop-${uuid0}"
+mkdir -p "$interop_dir"
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-iru5-interop-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
@@ -63,10 +67,10 @@ cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_MOR_MERGE_LINEAGE_OK") { Iru5SparkCommitInterop.verifyMor(spark, "ice_rest.nr_compat_${suite_uuid0}.mor_lineage_${uuid0}", "merge") }
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
-  printf '%s\n' "$spark_out"
+  printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_MOR_MERGE_LINEAGE_OK.log"
   exit 1
 }
-printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_MOR_MERGE_LINEAGE_OK.log"
 printf '%s\n' "$spark_out" | grep -Fx 'SPARK_MOR_MERGE_LINEAGE_OK'
 
 -- query 5
@@ -76,6 +80,8 @@ INSERT INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mor_lineage_$
 -- query 6
 -- @result_contains=SPARK_MOR_APPEND_LINEAGE_OK
 shell: set -eu
+interop_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/interop-${uuid0}"
+mkdir -p "$interop_dir"
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-iru5-interop-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
@@ -83,10 +89,10 @@ cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_MOR_APPEND_LINEAGE_OK") { Iru5SparkCommitInterop.verifyMor(spark, "ice_rest.nr_compat_${suite_uuid0}.mor_lineage_${uuid0}", "append") }
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
-  printf '%s\n' "$spark_out"
+  printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_MOR_APPEND_LINEAGE_OK.log"
   exit 1
 }
-printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_MOR_APPEND_LINEAGE_OK.log"
 printf '%s\n' "$spark_out" | grep -Fx 'SPARK_MOR_APPEND_LINEAGE_OK'
 
 -- query 7

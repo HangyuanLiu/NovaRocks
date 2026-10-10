@@ -57,6 +57,8 @@ ORDER BY first_write;
 -- query 4
 -- @result_contains=SPARK_HISTORICAL_ALLOCATION_OK
 shell: set -eu
+interop_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/interop-${uuid0}"
+mkdir -p "$interop_dir"
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-iru5-interop-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
@@ -64,10 +66,10 @@ cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_HISTORICAL_ALLOCATION_OK") { Iru5SparkCommitInterop.verifyFirstHistoricalAssignment(spark, "ice_rest.nr_compat_${suite_uuid0}.up_unpartitioned_${uuid0}", 4L); Iru5SparkCommitInterop.verifyFirstHistoricalAssignment(spark, "ice_rest.nr_compat_${suite_uuid0}.up_partitioned_${uuid0}", 5L) }
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
-  printf '%s\n' "$spark_out"
+  printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_HISTORICAL_ALLOCATION_OK.log"
   exit 1
 }
-printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_HISTORICAL_ALLOCATION_OK.log"
 printf '%s\n' "$spark_out" | grep -Fx 'SPARK_HISTORICAL_ALLOCATION_OK'
 
 -- query 5

@@ -23,6 +23,8 @@
 -- query 1
 -- @result_contains=SPARK_SHARED_PUFFIN_READY
 shell: set -eu
+interop_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/interop-${uuid0}"
+mkdir -p "$interop_dir"
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-iru5-interop-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
@@ -30,10 +32,10 @@ cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_SHARED_PUFFIN_READY") { Iru5SparkCommitInterop.createSharedPuffin(spark, "ice_rest.nr_compat_${suite_uuid0}.shared_puffin_${uuid0}") }
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
-  printf '%s\n' "$spark_out"
+  printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_SHARED_PUFFIN_READY.log"
   exit 1
 }
-printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_SHARED_PUFFIN_READY.log"
 printf '%s\n' "$spark_out" | grep -Fx 'SPARK_SHARED_PUFFIN_READY'
 
 -- query 2
@@ -43,6 +45,8 @@ DELETE FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.shared_puffin
 -- query 3
 -- @result_contains=SPARK_SHARED_PUFFIN_DELETE_OK
 shell: set -eu
+interop_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/interop-${uuid0}"
+mkdir -p "$interop_dir"
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-iru5-interop-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
@@ -50,10 +54,10 @@ cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_SHARED_PUFFIN_DELETE_OK") { Iru5SparkCommitInterop.verifySharedPuffin(spark, "ice_rest.nr_compat_${suite_uuid0}.shared_puffin_${uuid0}", false) }
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
-  printf '%s\n' "$spark_out"
+  printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_SHARED_PUFFIN_DELETE_OK.log"
   exit 1
 }
-printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_SHARED_PUFFIN_DELETE_OK.log"
 printf '%s\n' "$spark_out" | grep -Fx 'SPARK_SHARED_PUFFIN_DELETE_OK'
 
 -- query 4
@@ -63,6 +67,8 @@ UPDATE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.shared_puffin_${uu
 -- query 5
 -- @result_contains=SPARK_SHARED_PUFFIN_UPDATE_OK
 shell: set -eu
+interop_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/interop-${uuid0}"
+mkdir -p "$interop_dir"
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-iru5-interop-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
@@ -70,10 +76,10 @@ cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_SHARED_PUFFIN_UPDATE_OK") { Iru5SparkCommitInterop.verifySharedPuffin(spark, "ice_rest.nr_compat_${suite_uuid0}.shared_puffin_${uuid0}", true) }
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
-  printf '%s\n' "$spark_out"
+  printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_SHARED_PUFFIN_UPDATE_OK.log"
   exit 1
 }
-printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tee "$interop_dir/SPARK_SHARED_PUFFIN_UPDATE_OK.log"
 printf '%s\n' "$spark_out" | grep -Fx 'SPARK_SHARED_PUFFIN_UPDATE_OK'
 
 -- query 6

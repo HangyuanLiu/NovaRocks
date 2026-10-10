@@ -37,7 +37,9 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows VALUES (2,
 -- query 2
 -- @result_contains=IRU5_READ_TRAFFIC_BASELINE_OK
 shell: set -eu
-python3 - '${iceberg_rest_uri}' "${TMPDIR:-/tmp}/iru5-read-${uuid0}.json" <<'PYTHON'
+artifact_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/native-lake-${uuid0}"
+mkdir -p "$artifact_dir"
+python3 - '${iceberg_rest_uri}' "$artifact_dir/traffic-before.json" <<'PYTHON'
 import json, sys, urllib.request
 with urllib.request.urlopen(sys.argv[1].rstrip('/') + '/_fixture/catalog-traffic', timeout=10) as response:
     traffic = json.load(response)
@@ -79,15 +81,20 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows 
 -- query 8
 -- @result_contains=IRU5_READ_DEPENDENCY_CONFLICT_OK
 shell: set -eu
-traffic_file="${TMPDIR:-/tmp}/iru5-read-${uuid0}.json"
+artifact_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/native-lake-${uuid0}"
+traffic_file="$artifact_dir/traffic-before.json"
 tmp_scala=$(mktemp "${TMPDIR:-/tmp}/iru5-read-conflict-XXXXXX.scala")
-trap 'rm -f "$tmp_scala" "$traffic_file"' EXIT
-python3 - '${iceberg_rest_uri}' "$traffic_file" <<'PYTHON'
+trap 'rm -f "$tmp_scala"' EXIT
+python3 - '${iceberg_rest_uri}' "$traffic_file" "$artifact_dir/traffic-after.json" <<'PYTHON'
 import json, sys, urllib.request
 with open(sys.argv[2]) as saved:
     before = json.load(saved)
 with urllib.request.urlopen(sys.argv[1].rstrip('/') + '/_fixture/catalog-traffic', timeout=10) as response:
     after = json.load(response)
+with open(sys.argv[3], 'w') as saved:
+    json.dump(after, saved, indent=2, sort_keys=True)
+print('IRU5_TRAFFIC_BEFORE ' + json.dumps(before, sort_keys=True))
+print('IRU5_TRAFFIC_AFTER ' + json.dumps(after, sort_keys=True))
 assert after['by_status'].get('409', 0) - before['by_status'].get('409', 0) == 2, (before, after)
 assert after['table_commit_requests'] - before['table_commit_requests'] == 2, (before, after)
 print('IRU5_READ_TWO_REAL_409_OK')
@@ -99,6 +106,7 @@ for ((suffix, expectedSnapshots) <- Seq(("delete_rows", 2), ("optimize_rows", 3)
   val name = s"ice_rest.ns_${uuid0}.$suffix"
   val table = Spark3Util.loadIcebergTable(spark, name)
   val snapshots = table.snapshots().asScala.toSeq.sortBy(_.sequenceNumber())
+  snapshots.foreach(s => println(s"IRU5_READ_SNAPSHOT table=$suffix id=${s.snapshotId()} parent=${s.parentId()} sequence=${s.sequenceNumber()} operation=${s.operation()}"))
   require(snapshots.size == expectedSnapshots, s"stale Nova $suffix result was published")
   require(snapshots.forall(_.operation() == "append"), s"unexpected read-derived mutation reached $suffix")
   val current = table.currentSnapshot()
@@ -112,8 +120,11 @@ for ((suffix, expectedSnapshots) <- Seq(("delete_rows", 2), ("optimize_rows", 3)
 }
 println("IRU5_READ_DEPENDENCY_CONFLICT_OK")
 SPARK_SCALA
-spark_out=$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)
+spark_status=0
+spark_out=$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1) || spark_status=$?
+printf '%s\n' "$spark_out" > "$artifact_dir/spark-readback.log"
 printf '%s\n' "$spark_out"
+[ "$spark_status" -eq 0 ]
 printf '%s\n' "$spark_out" | grep -F IRU5_READ_DEPENDENCY_CONFLICT_OK
 
 -- query 9

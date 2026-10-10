@@ -39,7 +39,9 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES (1, '
 -- query 2
 -- @result_contains=IRU5_APPEND_TRAFFIC_BASELINE_OK
 shell: set -eu
-python3 - '${iceberg_rest_uri}' "${TMPDIR:-/tmp}/iru5-append-${uuid0}.json" <<'PYTHON'
+artifact_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/native-lake-${uuid0}"
+mkdir -p "$artifact_dir"
+python3 - '${iceberg_rest_uri}' "$artifact_dir/traffic-before.json" <<'PYTHON'
 import json, sys, urllib.request
 with urllib.request.urlopen(sys.argv[1].rstrip('/') + '/_fixture/catalog-traffic', timeout=10) as response:
     traffic = json.load(response)
@@ -65,15 +67,20 @@ SELECT id, writer FROM lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows O
 -- independently proves the actual parent, sequences and row allocation.
 -- @result_contains=IRU5_APPEND_REPREPARE_OK
 shell: set -eu
-traffic_file="${TMPDIR:-/tmp}/iru5-append-${uuid0}.json"
+artifact_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/native-lake-${uuid0}"
+traffic_file="$artifact_dir/traffic-before.json"
 tmp_scala=$(mktemp "${TMPDIR:-/tmp}/iru5-append-readback-XXXXXX.scala")
-trap 'rm -f "$tmp_scala" "$traffic_file"' EXIT
-python3 - '${iceberg_rest_uri}' "$traffic_file" <<'PYTHON'
+trap 'rm -f "$tmp_scala"' EXIT
+python3 - '${iceberg_rest_uri}' "$traffic_file" "$artifact_dir/traffic-after.json" <<'PYTHON'
 import json, sys, urllib.request
 with open(sys.argv[2]) as saved:
     before = json.load(saved)
 with urllib.request.urlopen(sys.argv[1].rstrip('/') + '/_fixture/catalog-traffic', timeout=10) as response:
     after = json.load(response)
+with open(sys.argv[3], 'w') as saved:
+    json.dump(after, saved, indent=2, sort_keys=True)
+print('IRU5_TRAFFIC_BEFORE ' + json.dumps(before, sort_keys=True))
+print('IRU5_TRAFFIC_AFTER ' + json.dumps(after, sort_keys=True))
 assert after['by_status'].get('409', 0) - before['by_status'].get('409', 0) == 1, (before, after)
 assert after['table_commit_requests'] - before['table_commit_requests'] == 2, (before, after)
 print('IRU5_APPEND_REAL_409_OK')
@@ -84,6 +91,7 @@ import org.apache.iceberg.spark.Spark3Util
 val name = "ice_rest.ns_${uuid0}.append_rows"
 val table = Spark3Util.loadIcebergTable(spark, name)
 val snapshots = table.snapshots().asScala.toSeq.sortBy(_.sequenceNumber())
+snapshots.foreach(s => println(s"IRU5_APPEND_SNAPSHOT id=${s.snapshotId()} parent=${s.parentId()} sequence=${s.sequenceNumber()} operation=${s.operation()}"))
 require(snapshots.size == 3, "a rejected Nova attempt committed a stale snapshot")
 require(snapshots.forall(_.operation() == "append"), "unexpected mutation in append race")
 val current = table.currentSnapshot()
@@ -97,12 +105,16 @@ require(rows.map(_.getLong(2)).distinct.size == rows.size, "conflicting attempts
 require(rows(1).getLong(3) == parent.sequenceNumber(), "Spark row does not belong to actual parent")
 require(rows(2).getLong(3) == current.sequenceNumber(), "Nova row inherited a predicted or stale sequence")
 val entries = spark.sql(s"SELECT sequence_number, file_sequence_number FROM $name.entries WHERE status = 1 AND snapshot_id = ${current.snapshotId()}").collect().toSeq
+entries.foreach(r => println(s"IRU5_APPEND_ENTRY data_sequence=${r.getLong(0)} file_sequence=${r.getLong(1)}"))
 require(entries.nonEmpty, "successful append has no actual added entries")
 require(entries.forall(r => r.getLong(0) == current.sequenceNumber() && r.getLong(1) == current.sequenceNumber()), "added manifest entry sequence inheritance differs from actual publication")
 println("IRU5_APPEND_REPREPARE_OK")
 SPARK_SCALA
-spark_out=$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)
+spark_status=0
+spark_out=$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1) || spark_status=$?
+printf '%s\n' "$spark_out" > "$artifact_dir/spark-readback.log"
 printf '%s\n' "$spark_out"
+[ "$spark_status" -eq 0 ]
 printf '%s\n' "$spark_out" | grep -F IRU5_APPEND_REPREPARE_OK
 
 -- query 6

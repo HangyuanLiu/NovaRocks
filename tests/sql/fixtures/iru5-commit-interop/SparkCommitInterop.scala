@@ -16,7 +16,8 @@
 // under the License.
 
 import scala.collection.JavaConverters._
-import org.apache.iceberg._
+import org.apache.iceberg.{DataFile, FileFormat, HasTableOperations, IcebergBuild,
+  PartitionData, Snapshot, Table, TableMetadata}
 import org.apache.iceberg.data.{GenericAppenderFactory, GenericRecord}
 import org.apache.iceberg.deletes.{BaseDVFileWriter, PositionDeleteIndex}
 import org.apache.iceberg.encryption.EncryptedFiles
