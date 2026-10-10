@@ -92,9 +92,10 @@ impl CowFailure {
         failure
     }
 
-    // This method is invoked only by query::dml_result inside the original
-    // synchronous command closure. The original WorkOwner/window still live
-    // in execute_synchronous_stage. No raw cause enters its output receipt.
+    // Frontend command boundaries invoke this inside the original synchronous
+    // closure, including the fail-closed CTAS mapper for an invalid COW error.
+    // The original WorkOwner/window still live in execute_synchronous_stage;
+    // no raw cause enters its output receipt.
     pub(crate) fn retire_on_original_worker(
         self,
         terminal: Option<&novarocks_spi::connector::LakePublicationTerminal>,

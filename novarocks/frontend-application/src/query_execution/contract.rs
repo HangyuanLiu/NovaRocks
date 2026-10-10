@@ -647,19 +647,30 @@ impl DistributedQueryError {
     }
 
     pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
-        match crate::dml::error::DmlExecutionError::from_compile(error) {
-            crate::dml::error::DmlExecutionError::Control(error) => {
-                Self::from_compile_control(error)
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        match error {
+            SqlCompileError::Cancelled => {
+                Self::from_compile_control(CompileControlError::Cancelled)
             }
-            crate::dml::error::DmlExecutionError::Analyze(error) => match error.control_error() {
+            SqlCompileError::DeadlineExceeded => {
+                Self::from_compile_control(CompileControlError::DeadlineExceeded)
+            }
+            SqlCompileError::ResourceExhausted => {
+                Self::from_compile_control(CompileControlError::ResourceExhausted)
+            }
+            SqlCompileError::Analyze(error) => match error.control_error() {
                 Some(error) => Self::from_compile_control(error),
                 None => Self::new(
                     DistributedQueryErrorKind::ContractViolation,
                     error.to_string(),
                 ),
             },
-            crate::dml::error::DmlExecutionError::Engine(error) => {
-                Self::new(DistributedQueryErrorKind::ContractViolation, error)
+            error @ (SqlCompileError::InvalidRequest(_) | SqlCompileError::Compilation(_)) => {
+                Self::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    error.to_string(),
+                )
             }
         }
     }

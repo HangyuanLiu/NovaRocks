@@ -313,13 +313,23 @@ impl CtasFailure {
     }
 
     fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
-        match crate::dml::error::DmlExecutionError::from_compile(error) {
-            crate::dml::error::DmlExecutionError::Control(error) => Self::control(error),
-            crate::dml::error::DmlExecutionError::Analyze(error) => match error.control_error() {
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        match error {
+            SqlCompileError::Cancelled => Self::control(CompileControlError::Cancelled),
+            SqlCompileError::DeadlineExceeded => {
+                Self::control(CompileControlError::DeadlineExceeded)
+            }
+            SqlCompileError::ResourceExhausted => {
+                Self::control(CompileControlError::ResourceExhausted)
+            }
+            SqlCompileError::Analyze(error) => match error.control_error() {
                 Some(error) => Self::control(error),
                 None => Self::analyze(error),
             },
-            crate::dml::error::DmlExecutionError::Engine(error) => internal_failure(error),
+            error @ (SqlCompileError::InvalidRequest(_) | SqlCompileError::Compilation(_)) => {
+                internal_failure(error.to_string())
+            }
         }
     }
     fn control(error: novarocks_type_contract::CompileControlError) -> Self {
@@ -1902,6 +1912,18 @@ impl CtasEngine for DmlExecutionKernel {
             crate::dml::error::DmlExecutionError::Control(error) => CtasFailure::control(error),
             crate::dml::error::DmlExecutionError::Analyze(error) => CtasFailure::analyze(error),
             crate::dml::error::DmlExecutionError::Engine(error) => internal_failure(error),
+            crate::dml::error::DmlExecutionError::Cow(error) => {
+                // This private CTAS planner never opens a COW session. Reject
+                // any future violation while still on the original synchronous
+                // command worker, retiring its raw cause under its own holder.
+                let detail = error.retire_on_original_worker(None);
+                let mut failure = internal_failure(
+                    "standard CTAS planning unexpectedly returned a copy-on-write failure",
+                );
+                failure.message.push_str(": ");
+                failure.message.push_str(&detail);
+                failure
+            }
         })?;
         let attempt_reservation = source
             .attempt_reservation
