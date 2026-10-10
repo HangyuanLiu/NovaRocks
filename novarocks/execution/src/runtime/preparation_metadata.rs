@@ -38,3 +38,46 @@ pub trait CompiledSchemaMetadataScope {
     where
         B: FnOnce() -> Result<ChunkSchemaRef, String>;
 }
+
+/// Borrowed only while the original synchronous graph is being prepared.
+pub(crate) enum CompiledMetadataMode<'a, H> {
+    Direct,
+    Hosted(&'a mut H),
+}
+pub(crate) struct DirectCompiledSchemaMetadataScope;
+impl CompiledSchemaMetadataScope for DirectCompiledSchemaMetadataScope {
+    fn materialize<B>(
+        &mut self,
+        _: &Arc<LocalProgram>,
+        _: ProjectSchemaSite,
+        _: &StaticLayout,
+        _: B,
+    ) -> ExecutionResult<ChunkSchemaRef>
+    where
+        B: FnOnce() -> Result<ChunkSchemaRef, String>,
+    {
+        unreachable!("the explicit Direct metadata mode never invokes a host")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparationMetadataFailure {
+    Request(novarocks_type_contract::MetadataRequestError),
+    Host(super::preparation_memory::PreparationMemoryRefusal),
+}
+impl std::fmt::Display for PreparationMetadataFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => write!(f, "metadata preparation request: {error}"),
+            Self::Host(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for PreparationMetadataFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::Host(error) => Some(error),
+        }
+    }
+}

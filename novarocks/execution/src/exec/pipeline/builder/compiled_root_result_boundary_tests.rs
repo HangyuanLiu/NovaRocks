@@ -18,7 +18,7 @@
 //! RootResult boundary probes using the original checked package fixture.
 use super::*;
 
-fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
+pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
     let mut builder = FragmentBuilder::new(FragmentId::new(57));
     let values = super::super::family_fixture::values(
         &mut builder,

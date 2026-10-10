@@ -740,3 +740,22 @@ impl ProcessorOperator for CompiledFilterProcessor {
         Ok(())
     }
 }
+
+#[cfg(feature = "test-support")]
+pub fn prepare_project_factory_for_test<H: CompiledSchemaMetadataScope>(
+    program: Arc<LocalProgram>,
+    site: ProjectSchemaSite,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<CompiledProjectProcessorFactory> {
+    match site {
+        ProjectSchemaSite::Project(node) => {
+            CompiledProjectProcessorFactory::try_new_with_metadata_host(program, node, error, host)
+        }
+        ProjectSchemaSite::FinalResult => {
+            CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
+                program, error, host,
+            )
+        }
+    }
+}
